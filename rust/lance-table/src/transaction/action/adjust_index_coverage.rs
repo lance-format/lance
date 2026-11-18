@@ -98,6 +98,7 @@ impl AdjustIndexCoverage {
                 self.uuid, self.name, segment.fields, segment.covering_fields
             )));
         }
+        let is_supported = segment.supports_fragment_bitmap_rewrite();
         let Some(bitmap) = segment.fragment_bitmap.as_mut() else {
             return Err(Error::invalid_input(format!(
                 "index segment {} records no fragment coverage, so there is nothing to adjust; \
@@ -105,6 +106,18 @@ impl AdjustIndexCoverage {
                 self.uuid
             )));
         };
+        if !added.is_empty() && !is_supported {
+            return Err(Error::not_supported(format!(
+                "Cannot extend coverage of index '{}' (segment {}): unsupported index type {:?} or version {}",
+                segment.name,
+                segment.uuid,
+                segment
+                    .index_details
+                    .as_ref()
+                    .map(|details| &details.type_url),
+                segment.index_version
+            )));
+        }
         for fragment in added {
             bitmap.insert(fragment);
         }
@@ -248,6 +261,7 @@ mod tests {
     fn covering(name: &str, fragments: impl IntoIterator<Item = u32>) -> IndexMetadata {
         IndexMetadata {
             fragment_bitmap: Some(fragments.into_iter().collect()),
+            index_version: 0,
             ..sample_index_metadata(name)
         }
     }
@@ -282,6 +296,46 @@ mod tests {
             indices[0].fragment_bitmap,
             Some([0, 2].into_iter().collect())
         );
+    }
+
+    #[rstest]
+    #[case::future("lance.table.BTreeIndexDetails", 2)]
+    #[case::unknown("example.BTreeIndexDetails", 0)]
+    fn test_unsupported_index_coverage_can_only_shrink(
+        #[case] details_type: &str,
+        #[case] index_version: i32,
+    ) {
+        let mut segment = covering("by_a", [0, 1]);
+        segment.index_details = Some(Arc::new(prost_types::Any {
+            type_url: format!("type.googleapis.com/{details_type}"),
+            value: vec![],
+        }));
+        segment.index_version = index_version;
+        let error = apply_with_indices(
+            &manifest_with_reserved_ids(),
+            vec![adjust(
+                segment.uuid,
+                "by_a",
+                vec![Ref::Committed(2)],
+                vec![1],
+            )],
+            vec![segment.clone()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot extend coverage of index 'by_a'")
+        );
+
+        let (_, indices) = apply_with_indices(
+            &manifest_with_reserved_ids(),
+            vec![adjust(segment.uuid, "by_a", vec![], vec![1])],
+            vec![segment],
+        )
+        .unwrap();
+        assert_eq!(indices[0].fragment_bitmap, Some([0].into_iter().collect()));
     }
 
     #[test]

@@ -1354,7 +1354,8 @@ impl Transaction {
                         {
                             continue;
                         }
-                        let results_are_row_addrs = index.results_are_row_addrs();
+                        let results_are_row_addrs = index.supports_fragment_bitmap_rewrite()
+                            && index.results_are_row_addrs();
                         let can_follow_stable_row_ids = index.can_follow_stable_row_ids();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap = if !(can_follow_stable_row_ids
@@ -4057,6 +4058,55 @@ mod tests {
             vec![1, 1],
             "append must cost one visit per appended fragment, regardless of table size"
         );
+    }
+
+    #[rstest]
+    #[case::inverted("lance.table.InvertedIndexDetails", 4)]
+    #[case::vector("lance.index.pb.VectorIndexDetails", 4)]
+    #[case::btree("lance.table.BTreeIndexDetails", 2)]
+    #[case::unknown("example.BTreeIndexDetails", 0)]
+    fn rewrite_does_not_expand_unsupported_index_coverage(
+        #[case] details_type: &str,
+        #[case] index_version: i32,
+        #[values(false, true)] deferred: bool,
+    ) {
+        let manifest = make_stable_row_id_manifest(vec![Fragment::new(1), Fragment::new(2)]);
+        let mut index = sample_index_metadata("id_idx");
+        index.index_version = index_version;
+        index.fragment_bitmap = Some(RoaringBitmap::from([1, 2]));
+        index.index_details = Some(Arc::new(prost_types::Any {
+            type_url: format!("type.googleapis.com/{details_type}"),
+            value: vec![],
+        }));
+        let fri = deferred.then(|| {
+            let mut entry = sample_index_metadata(FRAG_REUSE_INDEX_NAME);
+            entry.index_version = 0;
+            entry.fields.clear();
+            entry
+        });
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: manifest.fragments.as_ref().clone(),
+                    new_fragments: vec![Fragment {
+                        row_id_meta: Some(RowIdMeta::Inline(
+                            write_row_ids(&RowIdSequence::from(0..2)).into(),
+                        )),
+                        physical_rows: Some(2),
+                        ..Fragment::new(0)
+                    }],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: fri,
+            },
+            None,
+        );
+        let (_, indices) = transaction
+            .build_manifest(Some(&manifest), vec![index], "txn", &default_build_config())
+            .unwrap();
+        let index = indices.iter().find(|index| index.name == "id_idx").unwrap();
+        assert!(index.fragment_bitmap.as_ref().unwrap().is_empty());
     }
 
     #[rstest]

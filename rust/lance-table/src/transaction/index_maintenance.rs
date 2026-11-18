@@ -972,6 +972,18 @@ impl Transaction {
 
             let mut old_fragment_bitmap = RoaringBitmap::new();
             for (_, source) in &source_indices {
+                if !source.supports_fragment_bitmap_rewrite() {
+                    return Err(Error::not_supported(format!(
+                        "Cannot remap index '{}' (segment {}): unsupported index type {:?} or version {}",
+                        source.name,
+                        source.uuid,
+                        source
+                            .index_details
+                            .as_ref()
+                            .map(|details| &details.type_url),
+                        source.index_version
+                    )));
+                }
                 old_fragment_bitmap |= source.fragment_bitmap.as_ref().ok_or_else(|| {
                     Error::invalid_input(format!(
                         "Cannot rewrite index {} which did not store fragment bitmap",
@@ -1954,10 +1966,6 @@ mod tests {
 
     #[rstest::rstest]
     #[case::missing(None)]
-    #[case::opaque(Some(prost_types::Any {
-        type_url: "future.index".into(),
-        value: vec![0x98, 0x06, 0x01],
-    }))]
     // JsonIndexDetails { path: "x", target_details: {}, target_data_type: 999 }.
     #[case::json_future_type(Some(prost_types::Any {
         type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".into(),
@@ -2024,6 +2032,41 @@ mod tests {
         let mut indices = vec![index];
         Transaction::handle_rewrite_indices(&mut indices, &[replacement], &[]).unwrap();
         assert_eq!(indices[0].base_id, Some(7));
+    }
+
+    #[rstest]
+    #[case::future_version("lance.table.BTreeIndexDetails", 2)]
+    #[case::unknown_type("example.BTreeIndexDetails", 0)]
+    fn test_handle_rewrite_indices_rejects_unsupported_segments(
+        #[case] details_type: &str,
+        #[case] index_version: i32,
+    ) {
+        let mut index = create_test_index("idx", 1, 3, Some(RoaringBitmap::from([1, 2])), true);
+        index.index_details = Some(Arc::new(prost_types::Any {
+            type_url: format!("type.googleapis.com/{details_type}"),
+            value: vec![],
+        }));
+        index.index_version = index_version;
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id: Uuid::new_v4(),
+            new_index_details: index.index_details.as_deref().unwrap().clone(),
+            new_index_version: index_version as u32,
+            new_index_files: None,
+        };
+        let mut indices = vec![index.clone()];
+        let error = Transaction::handle_rewrite_indices(
+            &mut indices,
+            &[replacement],
+            &[RewriteGroup {
+                old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                new_fragments: vec![Fragment::new(3)],
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("Cannot remap index 'idx'"));
+        assert_eq!(indices, vec![index]);
     }
 
     #[test]
@@ -2186,6 +2229,40 @@ mod tests {
             indices[0].fragment_bitmap.as_ref().unwrap().contains(1),
             can_reuse
         );
+    }
+
+    #[rstest]
+    #[case::inverted("lance.table.InvertedIndexDetails", 3)]
+    #[case::vector("lance.index.pb.VectorIndexDetails", 3)]
+    #[case::json("lance.index.pb.JsonIndexDetails", 0)]
+    fn test_pure_row_rewrite_preserves_only_supported_versions(
+        #[case] details_type: &str,
+        #[case] supported_version: i32,
+    ) {
+        let mut supported = create_test_index("idx", 1, 2, Some(RoaringBitmap::from([0, 1])), true);
+        supported.index_details = Some(Arc::new(prost_types::Any {
+            type_url: format!("type.googleapis.com/{details_type}"),
+            value: vec![],
+        }));
+        supported.index_version = supported_version;
+        let mut future = supported.clone();
+        future.index_version = 100;
+        let before = future.clone();
+        let mut indices = vec![supported, future];
+        Transaction::register_pure_rewrite_rows_update_frags_in_indices(
+            &mut indices,
+            &[2],
+            &[0, 1],
+            &[2],
+            &HashMap::new(),
+            &create_test_schema(&[1, 2]),
+        )
+        .unwrap();
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from([0, 1, 2]))
+        );
+        assert_eq!(indices[1], before);
     }
 
     #[test]
@@ -2414,6 +2491,7 @@ mod tests {
                 }
                 Self::RegisterPureRewrite => {
                     indices[0].index_details = None;
+                    indices[0].index_version = 0;
                     let pure_update_frag_id = 10;
                     Transaction::register_pure_rewrite_rows_update_frags_in_indices(
                         &mut indices,
