@@ -29,6 +29,7 @@ jobs:
         env:
           LANCE_CPU_THREADS: 1
         run: |
+          cargo test --profile ci --locked -p lance-io --lib spill::tests:: -- --nocapture
           cargo test --profile ci --locked -p lance --lib dataset::admitted::prefetch:: -- --nocapture
           cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
           cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
@@ -36,4 +37,4 @@ jobs:
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-io -p lance --all-features --all-targets --no-deps -- -D warnings
