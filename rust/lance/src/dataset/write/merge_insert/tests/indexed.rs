@@ -2767,3 +2767,65 @@ async fn test_indexed_merge_insert_overlaid_keys(
         );
     }
 }
+
+/// A conditional update on an indexed, non-nullable primary key used to fail
+/// with "Primary key column and all its ancestors must not be nullable".
+/// <https://github.com/lance-format/lance/issues/11211>
+#[tokio::test]
+async fn test_indexed_merge_insert_update_if_primary_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(
+                "lance-schema:unenforced-primary-key".to_string(),
+                "true".to_string(),
+            )]
+            .into(),
+        ),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let batch = |ids: &[&str], ts: i64| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(Int64Array::from(vec![ts; ids.len()])),
+            ],
+        )
+        .unwrap()
+    };
+
+    let test_dir = TempStrDir::default();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch(&["a", "b"], 1))], schema.clone()),
+        &test_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["id"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    let ds = Arc::new(ds);
+
+    let (ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::update_if(&ds, "target.ts <= source.ts").unwrap())
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            [Ok(batch(&["b", "c"], 2))],
+            schema.clone(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_inserted_rows, 1);
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+}
