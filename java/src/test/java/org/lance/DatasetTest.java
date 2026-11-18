@@ -135,7 +135,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCreateWithInitialConfig(@TempDir Path tempDir) throws IOException {
+  void testCreateWithInitialConfig(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("initial_config").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       Schema schema = new TestUtils.SimpleTestDataset(allocator, path).getSchema();
