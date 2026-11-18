@@ -218,7 +218,9 @@ impl FullZipArrayInput {
     /// arrays materialize offsets, values and optional validity in one allocation,
     /// without intermediate definition levels. One List/LargeList layer over raw
     /// bytes similarly uses only the final parent and child allocations, without
-    /// dense repetition/definition levels. Deeper/compressed shapes retain the
+    /// dense repetition/definition levels. These raw paths initialize metadata
+    /// before copying values once; only complete allocations become Arrow buffers.
+    /// Deeper/compressed shapes retain the
     /// general admitted decoder. Consumed unzip scratch returns to this workspace
     /// only after its last shared view is gone; output aliases retain their full
     /// backing allocation.

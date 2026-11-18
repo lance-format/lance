@@ -89,30 +89,32 @@ fn materialize<const WIDTH: usize, const HAS_NULLS: bool>(
     plan: Plan,
     workspace: &mut Reservation,
 ) -> Result<Option<ArrayRef>> {
-    let Some(mut output) = workspace.try_allocate(plan.total)? else {
+    let Some(mut output) = workspace.try_allocate_writer(plan.total)? else {
         return Ok(None);
     };
+    // Keep offsets and validity in the initialized prefix; values are appended
+    // exactly once. Byte values need no padding or offset alignment.
+    output.extend_zeros(plan.offsets + plan.validity)?;
     let mut row = 0;
     let mut written = 0;
     let mut nulls = 0;
-    let replay = visit(
+    visit(
         &input.scheduler,
         std::slice::from_ref(&input.input),
         input.count,
         0..input.count,
         |_, def, _, value| {
-            output.as_mut()[plan.offsets + written..plan.offsets + written + value.len()]
-                .copy_from_slice(value);
+            output.extend_from_slice(value)?;
             written += value.len();
             if HAS_NULLS {
                 if def == 0 {
-                    output.as_mut()[plan.offsets + plan.values + row / 8] |= 1 << (row % 8);
+                    output.initialized_mut()[plan.offsets + row / 8] |= 1 << (row % 8);
                 } else {
                     nulls += 1;
                 }
             }
             row += 1;
-            let offset = &mut output.as_mut()[row * WIDTH..(row + 1) * WIDTH];
+            let offset = &mut output.initialized_mut()[row * WIDTH..(row + 1) * WIDTH];
             // WIDTH is monomorphized; preflight checked signed representability.
             if WIDTH == 4 {
                 offset.copy_from_slice(&(written as i32).to_ne_bytes());
@@ -121,21 +123,16 @@ fn materialize<const WIDTH: usize, const HAS_NULLS: bool>(
             }
             Ok(())
         },
-    );
-    if let Err(error) = replay {
-        output.recycle(workspace)?;
-        return Err(error);
-    }
+    )?;
     if row != plan.rows || written != plan.values || nulls != plan.nulls {
-        output.recycle(workspace)?;
         return Err(Error::internal(
             "flat FullZip replay disagrees with preflight",
         ));
     }
-    let storage = Buffer::from(output.freeze());
+    let storage = Buffer::from(output.finish()?);
     let nulls = HAS_NULLS.then(|| {
         NullBuffer::new(BooleanBuffer::new(
-            storage.slice_with_length(plan.offsets + plan.values, plan.validity),
+            storage.slice_with_length(plan.offsets, plan.validity),
             0,
             plan.rows,
         ))
@@ -146,7 +143,7 @@ fn materialize<const WIDTH: usize, const HAS_NULLS: bool>(
         ArrayData::builder(input.data_type.clone())
             .len(plan.rows)
             .add_buffer(storage.slice_with_length(0, plan.offsets))
-            .add_buffer(storage.slice_with_length(plan.offsets, plan.values))
+            .add_buffer(storage.slice_with_length(plan.offsets + plan.validity, plan.values))
             .nulls(nulls)
             .build()?,
     )))

@@ -91,7 +91,7 @@ impl Layout {
     fn nulls(&self, storage: &Buffer, rows: usize) -> Option<NullBuffer> {
         (self.validity != 0).then(|| {
             NullBuffer::new(BooleanBuffer::new(
-                storage.slice_with_length(self.offsets + self.values, self.validity),
+                storage.slice_with_length(self.offsets, self.validity),
                 0,
                 rows,
             ))
@@ -100,7 +100,7 @@ impl Layout {
 
     fn set_valid(&self, storage: &mut [u8], row: usize) {
         if self.validity != 0 {
-            storage[self.offsets + self.values + row / 8] |= 1 << (row % 8);
+            storage[self.offsets + row / 8] |= 1 << (row % 8);
         }
     }
 }
@@ -201,12 +201,15 @@ fn materialize<const PARENT: usize, const CHILD: usize>(
     let Some(mut lists) = work.try_allocate(parent.total)? else {
         return Ok(None);
     };
-    let Some(mut values) = work.try_allocate(child.total)? else {
+    let Some(mut values) = work.try_allocate_writer(child.total)? else {
         lists.recycle(work)?;
         return Ok(None);
     };
+    // Initialize metadata first so replay never exposes uninitialized bytes.
+    // The child payload follows it and is copied once; the parent has no values.
+    values.extend_zeros(child.offsets + child.validity)?;
     let mut state = State::default();
-    let replay = visit(
+    visit(
         &input.scheduler,
         std::slice::from_ref(&input.input),
         input.count,
@@ -220,29 +223,20 @@ fn materialize<const PARENT: usize, const CHILD: usize>(
                 }
             }
             if visible {
-                values.as_mut()
-                    [child.offsets + before.values..child.offsets + before.values + value.len()]
-                    .copy_from_slice(value);
+                values.extend_from_slice(value)?;
                 offset::<CHILD>(
-                    values.as_mut(),
+                    values.initialized_mut(),
                     before.children + 1,
                     before.values + value.len(),
                 );
                 if def == 0 {
-                    child.set_valid(values.as_mut(), before.children);
+                    child.set_valid(values.initialized_mut(), before.children);
                 }
             }
             state.push(rep, def, visible, value, null)
         },
-    );
-    if let Err(error) = replay {
-        lists.recycle(work)?;
-        values.recycle(work)?;
-        return Err(error);
-    }
+    )?;
     if state.counts != counts {
-        lists.recycle(work)?;
-        values.recycle(work)?;
         return Err(Error::internal(
             "raw FullZip list replay disagrees with preflight",
         ));
@@ -250,11 +244,11 @@ fn materialize<const PARENT: usize, const CHILD: usize>(
     offset::<PARENT>(lists.as_mut(), counts.rows, counts.children);
     // Separate aligned final owners avoid padding or alignment copies. Every
     // parent/child buffer alias retains its complete node's physical allocation.
-    let values = Buffer::from(values.freeze());
+    let values = Buffer::from(values.finish()?);
     let child_data = ArrayData::builder(leaf.clone())
         .len(counts.children)
         .add_buffer(values.slice_with_length(0, child.offsets))
-        .add_buffer(values.slice_with_length(child.offsets, child.values))
+        .add_buffer(values.slice_with_length(child.offsets + child.validity, child.values))
         .nulls(child.nulls(&values, counts.children))
         .build()?;
     let lists = Buffer::from(lists.freeze());

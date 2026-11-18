@@ -40,7 +40,7 @@ async fn flat_raw_uses_only_input_and_final_arrow_payload(
     )]
     data_type: DataType,
     #[values("flat", "nullable")] kind: &str,
-    #[values(0..4, 1..3, 1..2, 3..4)] rows: Range<u64>,
+    #[values(0..4, 1..3, 1..2, 3..4, 3..12)] rows: Range<u64>,
 ) {
     let bits = if matches!(data_type, DataType::Binary | DataType::Utf8) {
         32
@@ -51,18 +51,21 @@ async fn flat_raw_uses_only_input_and_final_arrow_payload(
         bits,
         false,
         kind,
-        vec![
-            "hello α".as_bytes().to_vec(),
-            vec![],
-            "world β".as_bytes().to_vec(),
-            vec![],
-        ],
+        (0..12)
+            .map(|row| match row % 4 {
+                0 => "hello α".as_bytes().to_vec(),
+                2 => "world β".as_bytes().to_vec(),
+                _ => vec![],
+            })
+            .collect(),
     );
+    // The longer slice crosses a validity-byte boundary and includes null rows
+    // whose source values are nonempty. Neither may leak into output payload.
     let selected = f.values[rows.start as usize..rows.end as usize]
         .iter()
         .enumerate()
         .map(|(i, value)| {
-            (kind != "nullable" || i + rows.start as usize != 1).then_some(value.as_slice())
+            (kind != "nullable" || (i + rows.start as usize) % 3 != 1).then_some(value.as_slice())
         })
         .collect::<Vec<_>>();
     let expected = expected(&data_type, &selected);
