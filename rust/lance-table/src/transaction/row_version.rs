@@ -409,7 +409,7 @@ impl Transaction {
 
 /// Where the row id counter stands after handing out `count` ids from
 /// `next_row_id`, or an error once the counter is spent.
-fn advance_row_id_counter(next_row_id: u64, count: u64) -> Result<u64> {
+pub(super) fn advance_row_id_counter(next_row_id: u64, count: u64) -> Result<u64> {
     next_row_id.checked_add(count).ok_or_else(|| {
         Error::invalid_input(format!(
             "the row id counter is exhausted: assigning {count} row ids from {next_row_id} \
