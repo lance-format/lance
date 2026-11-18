@@ -349,8 +349,7 @@ async fn mint_mem_wal_dir_id(dataset: &Dataset) -> Result<String> {
         let dir_id = generate_mem_wal_dir_id(dataset.uri());
         let prefix = mem_wal_path(&base_path, &dir_id);
         let first = store
-            .inner
-            .list(Some(&prefix))
+            .list_objects(Some(&prefix))
             .next()
             .await
             .transpose()

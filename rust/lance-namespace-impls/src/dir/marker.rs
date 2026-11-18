@@ -3,9 +3,7 @@
 
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, ObjectStore as OSObjectStore, ObjectStoreExt, PutMode, PutOptions,
-};
+use object_store::{Error as ObjectStoreError, ObjectStoreExt, PutMode, PutOptions};
 
 /// Error from [`put_marker_file_atomic`].
 #[derive(Debug)]
@@ -61,8 +59,7 @@ pub async fn put_marker_file_atomic(
     };
 
     object_store
-        .inner
-        .put(&staging_path, bytes::Bytes::from_static(b"reserved").into())
+        .put_payload(&staging_path, bytes::Bytes::from_static(b"reserved").into())
         .await
         .map_err(|e| MarkerFileError::Other {
             message: format!("Failed to stage {}: {:?}", file_description, e),
@@ -71,27 +68,18 @@ pub async fn put_marker_file_atomic(
     // Successful rename consumes the staging object; every other path must
     // delete it (best-effort) so conflict/fallback races do not accumulate.
     let mut staging_consumed = false;
-    let publish_result = match object_store
-        .inner
-        .rename_if_not_exists(&staging_path, path)
-        .await
-    {
+    let publish_result = match object_store.rename_if_not_exists(&staging_path, path).await {
         Ok(()) => {
             staging_consumed = true;
             Ok(())
         }
         Err(ObjectStoreError::NotImplemented { .. })
         | Err(ObjectStoreError::NotSupported { .. }) => {
-            match object_store
-                .inner
-                .copy_if_not_exists(&staging_path, path)
-                .await
-            {
+            match object_store.copy_if_not_exists(&staging_path, path).await {
                 Ok(()) => Ok(()),
                 Err(ObjectStoreError::NotImplemented { .. })
                 | Err(ObjectStoreError::NotSupported { .. }) => object_store
-                    .inner
-                    .put_opts(
+                    .put_payload_opts(
                         path,
                         bytes::Bytes::from_static(b"reserved").into(),
                         PutOptions {

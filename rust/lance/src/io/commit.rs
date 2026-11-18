@@ -77,7 +77,6 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use log;
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -167,7 +166,7 @@ async fn read_transaction_file_pb(
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
-    let result = object_store.inner.get(&path).await?;
+    let result = object_store.read_object(&path).await?;
     let data = result.bytes().await?;
     Ok(pb::Transaction::decode(data)?)
 }

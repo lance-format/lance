@@ -1355,6 +1355,69 @@ impl ObjectStore {
         }
     }
 
+    /// Read an object directly, preserving request and body errors separately.
+    pub async fn read_object(&self, path: &Path) -> object_store::Result<object_store::GetResult> {
+        self.inner.get(path).await
+    }
+
+    /// Publish a payload without buffering it through a Lance writer.
+    pub async fn put_payload(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+    ) -> object_store::Result<WriteResult> {
+        self.put_payload_opts(path, payload, Default::default())
+            .await
+    }
+
+    /// Publish a payload with the caller's preconditions.
+    pub async fn put_payload_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<WriteResult> {
+        let size = payload.content_length();
+        let result = self.inner.put_opts(path, payload, options).await?;
+        Ok(WriteResult {
+            size,
+            e_tag: result.e_tag,
+        })
+    }
+
+    /// List objects with a single backend stream.
+    pub fn list_objects(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    /// Read one byte range in a single backend request.
+    pub async fn read_range(&self, path: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    /// Read metadata without fetching the object body.
+    pub async fn stat(&self, path: &Path) -> object_store::Result<ObjectMeta> {
+        self.inner.head(path).await
+    }
+
+    /// Rename an object using the provider's replacement semantics.
+    pub async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    /// Publish by rename only if the destination is absent.
+    pub async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename_if_not_exists(from, to).await
+    }
+
+    /// Copy only if the destination is absent.
+    pub async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+
     /// A helper function to create a file and write content to it.
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
         let mut writer = self.create(path).await?;
@@ -1604,7 +1667,7 @@ impl ObjectStore {
     ///
     /// This uses the provider's native conditional copy. An existing destination
     /// with the same size is treated as a successful retry.
-    pub async fn copy_if_not_exists(
+    pub async fn copy_if_not_exists_or_same_size(
         &self,
         source_path: &Path,
         destination_path: &Path,
@@ -4254,7 +4317,7 @@ mod tests {
         store.put(&destination, b"old").await.unwrap();
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 
@@ -4283,7 +4346,7 @@ mod tests {
         observations.part_count.store(0, Ordering::SeqCst);
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 

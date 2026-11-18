@@ -18,7 +18,6 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use tracing::{debug, info, instrument, warn};
@@ -571,8 +570,7 @@ impl MemTableFlusher {
     ) -> Result<()> {
         let data = bloom.to_bytes();
         self.object_store
-            .inner
-            .put(path, Bytes::from(data).into())
+            .put_payload(path, Bytes::from(data).into())
             .await
             .map_err(|e| Error::io(format!("Failed to write bloom filter: {}", e)))?;
         Ok(())

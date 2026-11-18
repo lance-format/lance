@@ -60,7 +60,6 @@ use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::{BasePath, Fragment, pb};
 use lance_table::io::deletion::DELETIONS_DIR;
-use object_store::ObjectStoreExt;
 use prost::Message;
 
 use crate::index::DatasetIndexExt;
@@ -362,11 +361,7 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let _ = existing_tracker.incremental_stats();
     let _ = request_tracker.incremental_stats();
 
-    base_store
-        .inner
-        .get_range(&base_location, 0..1)
-        .await
-        .unwrap();
+    base_store.read_range(&base_location, 0..1).await.unwrap();
 
     assert!(existing_tracker.incremental_stats().read_iops > 0);
     assert!(request_tracker.incremental_stats().read_iops > 0);
@@ -424,7 +419,7 @@ async fn test_store_params_for_base_resolves_base_scoped_options() {
         .join("data")
         .join("probe.lance");
     base_store.put(&probe, b"hello").await.unwrap();
-    let read = base_store.inner.get_range(&probe, 0..5).await.unwrap();
+    let read = base_store.read_range(&probe, 0..5).await.unwrap();
     assert_eq!(read.as_ref(), b"hello");
 }
 

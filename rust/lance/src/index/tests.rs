@@ -56,7 +56,6 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_testing::datagen::generate_random_array;
-use object_store::ObjectStoreExt;
 use roaring::RoaringBitmap;
 use rstest::rstest;
 use std::{

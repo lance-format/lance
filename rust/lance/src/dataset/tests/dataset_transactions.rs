@@ -810,8 +810,7 @@ fn ranged_read_bytes(stats: &IoStats) -> u64 {
 /// Manifest body bytes of the dataset handle's current version.
 async fn manifest_size(ds: &Dataset) -> u64 {
     ds.object_store
-        .inner
-        .head(&ds.manifest_location().path)
+        .stat(&ds.manifest_location().path)
         .await
         .unwrap()
         .size

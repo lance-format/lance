@@ -174,8 +174,7 @@ impl ManifestNamingScheme {
 /// And it should also run until completion before resuming other operations.
 pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Path) -> Result<()> {
     object_store
-        .inner
-        .list(Some(&dataset_base.clone().join(VERSIONS_DIR)))
+        .list_objects(Some(&dataset_base.clone().join(VERSIONS_DIR)))
         .try_filter(|res| {
             let res = if let Some(filename) = res.location.filename() {
                 ManifestNamingScheme::detect_scheme(filename) == Some(ManifestNamingScheme::V1)
@@ -188,7 +187,7 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
             let filename = meta.location.filename().unwrap();
             let version = ManifestNamingScheme::V1.parse_version(filename).unwrap();
             let path = ManifestNamingScheme::V2.manifest_path(dataset_base, version);
-            object_store.inner.rename(&meta.location, &path).await?;
+            object_store.rename(&meta.location, &path).await?;
             Ok(())
         })
         .await?;
@@ -414,7 +413,7 @@ async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Opti
 /// # }
 /// ```
 pub async fn read_version_hint(object_store: &ObjectStore, base: &Path) -> Result<Option<u64>> {
-    let result = match object_store.inner.get(&version_hint_path(base)).await {
+    let result = match object_store.read_object(&version_hint_path(base)).await {
         Ok(result) => result,
         Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -490,16 +489,14 @@ async fn probe_versions_upward(
     // Newer datasets use V2; fall back to V1 if the V2 path is not found.
     let mut scheme = ManifestNamingScheme::V2;
     let meta = match object_store
-        .inner
-        .head(&scheme.manifest_path(base, from_version))
+        .stat(&scheme.manifest_path(base, from_version))
         .await
     {
         Ok(meta) => meta,
         Err(ObjectStoreError::NotFound { .. }) => {
             scheme = ManifestNamingScheme::V1;
             match object_store
-                .inner
-                .head(&scheme.manifest_path(base, from_version))
+                .stat(&scheme.manifest_path(base, from_version))
                 .await
             {
                 Ok(meta) => meta,
@@ -514,11 +511,7 @@ async fn probe_versions_upward(
     let mut version = from_version;
     loop {
         let next = version + 1;
-        match object_store
-            .inner
-            .head(&scheme.manifest_path(base, next))
-            .await
-        {
+        match object_store.stat(&scheme.manifest_path(base, next)).await {
             Ok(meta) => {
                 probed.push((next, meta));
                 version = next;
@@ -594,8 +587,7 @@ async fn list_manifests_since_version_with_hint(
             futures::stream::iter((since_version + 1)..hint_version)
                 .map(|version| async move {
                     object_store
-                        .inner
-                        .head(&scheme.manifest_path(base, version))
+                        .stat(&scheme.manifest_path(base, version))
                         .await
                         .map(|meta| ManifestLocation {
                             version,
@@ -1556,7 +1548,7 @@ where
         let lease = LeaseGuard::new(self.lock(manifest.version).await?);
 
         // Head the location and make sure it's not already committed
-        match object_store.inner.head(&path).await {
+        match object_store.stat(&path).await {
             Ok(_) => {
                 // The path already exists, so it's already committed
                 // Release the lock
@@ -1664,11 +1656,7 @@ impl CommitHandler for RenameCommitHandler {
 
         let res = manifest_writer(object_store, manifest, indices, &tmp_path, transaction).await?;
 
-        match object_store
-            .inner
-            .rename_if_not_exists(&tmp_path, &path)
-            .await
-        {
+        match object_store.rename_if_not_exists(&tmp_path, &path).await {
             Ok(_) => {
                 // Successfully committed
                 write_version_hint(object_store, base_path, manifest.version).await;
@@ -1740,8 +1728,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
         let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
         let size = dummy_data.len() as u64;
         let res = object_store
-            .inner
-            .put_opts(
+            .put_payload_opts(
                 &path,
                 dummy_data.into(),
                 PutOptions {
@@ -2020,8 +2007,7 @@ mod tests {
             versions_dir.clone().join("irrelevant"),
         ];
         let actual_files = object_store
-            .inner
-            .list(Some(&versions_dir))
+            .list_objects(Some(&versions_dir))
             .map_ok(|res| res.location)
             .try_collect::<Vec<_>>()
             .await

@@ -50,7 +50,6 @@ use lance_table::io::commit::{
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 use rand::{Rng, seq::index::sample as sample_indices};
@@ -1509,7 +1508,7 @@ impl Dataset {
         } else if let Some(path) = &manifest.transaction_file {
             // Fallback: read external transaction file if present
             let path = self.transactions_dir().join(path.as_str());
-            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let data = self.object_store.read_object(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
             Transaction::try_from(transaction).map(Some)
         } else {
