@@ -105,7 +105,8 @@ class CompactionOptions(TypedDict, total=False):
     Maximum number of source fragments to compact in a single run. Tasks
     are included until adding the next task would exceed this limit,
     allowing for incremental compaction (e.g., compact 20 fragments at a
-    time). Fragments are processed oldest first.
+    time). Rewrite tasks are admitted first, in fragment order, then repack
+    tasks.
     (default: None, no limit)
     """
     max_source_rows: Optional[int]
@@ -118,7 +119,8 @@ class CompactionOptions(TypedDict, total=False):
     max_source_bytes: Optional[int]
     """
     Maximum number of source bytes to compact in a single run, measured as
-    the total size of the source fragments' data and overlay files. Tasks
+    the total size of the source fragments' data and overlay files (for a
+    column repack, only the data files holding the columns it moves). Tasks
     are included until adding the next task would exceed this limit.
     Blob v2 payloads live in separate blob files and are not counted, so
     this is not a cap on total compaction I/O for datasets with blob
@@ -142,6 +144,23 @@ class CompactionOptions(TypedDict, total=False):
     remain unchanged and act as boundaries, so fragments on opposite sides
     are not combined into the same task. Duplicate and unknown IDs are
     ignored. (default: None)
+    """
+    max_data_files_per_fragment: Optional[int]
+    """
+    Maximum number of data files a fragment may hold columns in before its
+    columns are repacked into fewer files. Each ``add_columns`` backfill adds
+    one file per fragment. A repack rewrites only the columns that move and
+    keeps rows, fragment ids and indices as they are. The file count is the
+    only repack trigger. (default: the table config
+    ``lance.compaction.max_data_files_per_fragment``, else None, no repack)
+    """
+    scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]]
+    """
+    Which tasks to plan: ``"rewrite_fragments"`` only rewrites fragments,
+    ``"repack_columns"`` only repacks columns, ``"all"`` does both.
+    ``"repack_columns"`` requires ``max_data_files_per_fragment``, as an option
+    or from the table config, and refuses the ``"force_binary_copy"`` mode.
+    (default: "all")
     """
     data_storage_version: Optional[str]
     """

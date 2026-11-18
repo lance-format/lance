@@ -734,6 +734,23 @@ pub async fn open_update_writer(
     schema: &Schema,
     allow_external_blob_outside_bases: bool,
 ) -> Result<Box<dyn GenericWriter>> {
+    open_update_writer_with_options(
+        version,
+        dataset,
+        schema,
+        allow_external_blob_outside_bases,
+        FileWriterOptions::default(),
+    )
+    .await
+}
+
+pub async fn open_update_writer_with_options(
+    version: ConcreteFileVersion,
+    dataset: &Dataset,
+    schema: &Schema,
+    allow_external_blob_outside_bases: bool,
+    file_writer_options: FileWriterOptions,
+) -> Result<Box<dyn GenericWriter>> {
     // Blob v1 columns are stored as Blob v2 from 2.2 on, as `Dataset::write`
     // does. The promoted children take ids above the table's so the file's
     // schema reuses none of them; the commit assigns the manifest's own.
@@ -764,6 +781,7 @@ pub async fn open_update_writer(
         dataset.session.store_registry(),
         external_base_resolver,
         allow_external_blob_outside_bases,
+        file_writer_options,
     );
     open_writer(
         version,

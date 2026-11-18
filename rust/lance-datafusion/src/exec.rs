@@ -7,13 +7,14 @@ use std::{
     collections::HashMap,
     fmt::{self, Formatter},
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
 
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::execution::memory_pool::PeakRecordingPool;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
@@ -32,10 +33,14 @@ use lance_core::{Error, Result, utils::tracing::StreamTracingExt};
 use tracing::Span;
 
 pub use lance_datafusion_exec::exec::{
-    ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
-    OneShotExec, RecordBatchExec, StrictBatchSizeExec, collect_execution_metrics,
+    ExecutionDiagnostics, ExecutionDiagnosticsCallback, ExecutionMetric, ExecutionMetricValue,
+    ExecutionOutcome, ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec,
+    LanceExecutionOptions, OneShotExec, OperatorMetrics, RecordBatchExec, StrictBatchSizeExec,
+    collect_execution_metrics, collect_operator_metrics, execute_plan_with_diagnostics,
 };
-use lance_datafusion_exec::exec::{execute_plan_with_context, new_runtime_env, new_session_config};
+use lance_datafusion_exec::exec::{
+    execute_plan_with_context, new_runtime_env, new_session_config, track_execution_memory,
+};
 
 use crate::udf::register_functions;
 
@@ -125,6 +130,22 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         SessionContext::new_with_config_rt(new_session_config(options), new_runtime_env(options));
     register_functions(&ctx);
     ctx
+}
+
+/// Build a fresh operation-owned session that records DataFusion pool reservations.
+///
+/// This records accounted allocations only, not process RSS, cache occupancy, or
+/// all Arrow buffers. It starts no sampler and preserves the configured limits.
+pub fn new_session_context_with_memory_tracking(
+    options: &LanceExecutionOptions,
+) -> Result<SessionContext> {
+    let mut runtime = Arc::try_unwrap(new_runtime_env(options))
+        .map_err(|_| Error::internal("new operation runtime unexpectedly shared"))?;
+    runtime.memory_pool = Arc::new(PeakRecordingPool::new(runtime.memory_pool));
+    let context =
+        SessionContext::new_with_config_rt(new_session_config(options), Arc::new(runtime));
+    register_functions(&context);
+    Ok(context)
 }
 
 /// Cache key for session contexts based on resolved configuration values.
@@ -218,7 +239,7 @@ fn get_task_context(
     // Build from the session state in place. `SessionContext::state` would clone
     // the whole state (every function map, rule list and option) only to drop
     // it, which is a measurable share of CPU for short queries.
-    let task_ctx = TaskContext::from(session_ctx);
+    let task_ctx = track_execution_memory(TaskContext::from(session_ctx), options);
     let Some(batch_size) = options.validated_batch_size()? else {
         return Ok(Arc::new(task_ctx));
     };
@@ -258,11 +279,123 @@ pub fn execute_plan_with_session_context(
     execute_plan_with_context(plan, options, task_context)
 }
 
+/// Execute under a session's configuration with an additional terminal diagnostic callback.
+///
+/// Applies the same per-execution batch override as [`execute_plan_with_session_context`].
+/// The original statistics callback remains exhaustion-only; diagnostics also report drop/errors.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use datafusion::{execution::context::SessionContext, physical_plan::ExecutionPlan};
+/// # use lance_datafusion::exec::{execute_plan_with_session_diagnostics, LanceExecutionOptions};
+/// # fn example(plan: Arc<dyn ExecutionPlan>, session: &SessionContext) -> lance_core::Result<()> {
+/// let stream = execute_plan_with_session_diagnostics(
+///     plan, LanceExecutionOptions::default(), session,
+///     Arc::new(|report| { let _outcome = report.outcome; }),
+/// )?;
+/// drop(stream); // Reports cancellation when output was not consumed.
+/// # Ok(())
+/// # }
+/// ```
+pub fn execute_plan_with_session_diagnostics(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    session: &SessionContext,
+    callback: ExecutionDiagnosticsCallback,
+) -> Result<SendableRecordBatchStream> {
+    let context = get_task_context(session, &options)?;
+    execute_plan_with_diagnostics(plan, options, context, callback)
+}
+
 pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<String> {
     analyze_plan_with_context(plan, options, None).await
+}
+
+/// Structured diagnostics from one execution, without retaining output batches.
+#[derive(Clone, Debug)]
+pub struct ExecutionAnalysis {
+    /// Formatted plan and metrics from the same execution as the structured fields.
+    pub plan: String,
+    /// Terminal execution state; only `Complete` denotes complete measurements.
+    pub outcome: ExecutionOutcome,
+    /// Execution error text on failure, absent on success.
+    pub error: Option<String>,
+    /// Independently measured execution wall time, excluding planning and cleanup.
+    pub elapsed: Duration,
+    /// Peak pool reservations in bytes, when the supplied context records them.
+    /// `None` means unsupported. This is the pool's lifetime high-water mark;
+    /// it is operation-exclusive only when the context belongs to this operation.
+    /// It excludes allocations not registered with DataFusion and is not RSS.
+    pub pool_peak_reserved_bytes: Option<usize>,
+    /// Backwards-compatible additive count/time summary.
+    pub summary: ExecutionSummaryCounts,
+    /// Unaggregated metrics, including operator memory gauges and peaks.
+    pub operators: Vec<OperatorMetrics>,
+}
+
+/// Execute a physical plan once and return structured diagnostics.
+///
+/// The output is drained batch by batch. Execution errors are retained in the
+/// returned partial report; invalid context configuration returns an error.
+/// Execution can perform writes: callers own transaction commit and cleanup.
+/// This uses a fresh pool recorder without starting a process memory sampler.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use datafusion::physical_plan::ExecutionPlan;
+/// # use lance_core::Result;
+/// # use lance_datafusion::exec::{analyze_plan_report, LanceExecutionOptions, ExecutionOutcome};
+/// # async fn example(plan: Arc<dyn ExecutionPlan>) -> Result<()> {
+/// let report = analyze_plan_report(plan, LanceExecutionOptions::default()).await?;
+/// assert_eq!(report.outcome, ExecutionOutcome::Complete);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn analyze_plan_report(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<ExecutionAnalysis> {
+    let session = new_session_context_with_memory_tracking(&options)?;
+    let context = get_task_context(&session, &options)?;
+    analyze_plan_report_with_context(plan, options, context).await
+}
+
+/// [`analyze_plan_report`] using an operation-owned context, including its resource limits.
+pub async fn analyze_plan_report_with_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    context: Arc<TaskContext>,
+) -> Result<ExecutionAnalysis> {
+    let memory_pool = context.memory_pool().clone();
+    let start = Instant::now();
+    let result = async {
+        let mut stream = execute_plan_with_context(plan.clone(), options, context)?;
+        while let Some(batch) = stream.next().await {
+            batch?;
+        }
+        Ok::<_, Error>(())
+    }
+    .await;
+    let elapsed = start.elapsed();
+    let mut summary = ExecutionSummaryCounts::default();
+    collect_execution_metrics(plan.as_ref(), &mut summary);
+    Ok(ExecutionAnalysis {
+        plan: format_plan(plan.clone()),
+        outcome: if result.is_ok() {
+            ExecutionOutcome::Complete
+        } else {
+            ExecutionOutcome::Failed
+        },
+        error: result.err().map(|error| error.to_string()),
+        elapsed,
+        pool_peak_reserved_bytes: PeakRecordingPool::from_pool(memory_pool.as_ref())
+            .map(|pool| pool.max_reserved()),
+        summary,
+        operators: collect_operator_metrics(plan.as_ref()),
+    })
 }
 
 /// Analyze a plan, optionally under a caller-provided [`TaskContext`].
@@ -563,7 +696,7 @@ pub async fn provider_to_stream(
 mod tests {
     use super::*;
     use arrow_array::record_batch;
-    use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::execution::memory_pool::{MemoryConsumer, PeakRecordingPool};
     use datafusion_common::DataFusionError;
 
     use datafusion::execution::memory_pool::MemoryLimit;
@@ -573,6 +706,82 @@ mod tests {
 
     // Serialize cache tests since they share global state
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn test_structured_analysis_reports_execution_failure() {
+        let batch = record_batch!(("x", Int32, [1, 2])).unwrap();
+        let source = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter([
+                Ok(batch),
+                Err(DataFusionError::Execution("source failed".to_owned())),
+            ]),
+        );
+        let report = analyze_plan_report(
+            Arc::new(OneShotExec::new(Box::pin(source))),
+            LanceExecutionOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, ExecutionOutcome::Failed);
+        assert!(report.error.as_ref().unwrap().contains("source failed"));
+        assert_eq!(report.summary.spilled_bytes(), None);
+        assert_eq!(report.operators[0].name, "OneShotExec");
+    }
+
+    #[tokio::test]
+    async fn test_structured_analysis_reports_success_and_start_failure() {
+        let batch = record_batch!(("x", Int32, [1, 2])).unwrap();
+        let plan = Arc::new(OneShotExec::from_batch(batch));
+        let report = analyze_plan_report(plan.clone(), LanceExecutionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.outcome, ExecutionOutcome::Complete);
+        assert_eq!(report.error, None);
+        assert_eq!(report.pool_peak_reserved_bytes, Some(0));
+        assert!(report.plan.contains("OneShotStream"));
+        let failed = analyze_plan_report(plan, LanceExecutionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(failed.outcome, ExecutionOutcome::Failed);
+        assert!(failed.error.unwrap().contains("already been executed"));
+    }
+
+    #[test]
+    fn test_operation_memory_peaks_are_isolated() {
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(1024),
+            target_partition: Some(1),
+            ..Default::default()
+        };
+        let first = new_session_context_with_memory_tracking(&options).unwrap();
+        let second = new_session_context_with_memory_tracking(&options).unwrap();
+        let first_pool = &first.runtime_env().memory_pool;
+        let second_pool = &second.runtime_env().memory_pool;
+        let first_reservation = MemoryConsumer::new("first").register(first_pool);
+        let second_reservation = MemoryConsumer::new("second").register(second_pool);
+        first_reservation.try_grow(512).unwrap();
+        second_reservation.try_grow(256).unwrap();
+        first_reservation.shrink(512);
+        assert_eq!(first_pool.reserved(), 0);
+        assert_eq!(
+            PeakRecordingPool::from_pool(first_pool.as_ref())
+                .unwrap()
+                .max_reserved(),
+            512
+        );
+        assert_eq!(
+            PeakRecordingPool::from_pool(second_pool.as_ref())
+                .unwrap()
+                .max_reserved(),
+            256
+        );
+        assert!(matches!(
+            first_pool.memory_limit(),
+            MemoryLimit::Finite(1024)
+        ));
+    }
 
     #[test]
     fn test_session_context_cache() {
@@ -705,21 +914,29 @@ mod tests {
         let default_options = LanceExecutionOptions::default();
         let session_ctx = get_session_context(&default_options);
         let task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
+        let other_task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
         // Lance operators key per-execution state on the task context's identity.
-        assert!(!Arc::ptr_eq(
-            &task_ctx,
-            &get_task_context(&session_ctx, &default_options).unwrap()
-        ));
+        assert!(!Arc::ptr_eq(&task_ctx, &other_task_ctx));
         assert_eq!(task_ctx.session_id(), session_ctx.session_id());
         assert_eq!(
             task_ctx.session_config().batch_size(),
             session_ctx.copied_config().batch_size()
         );
-        assert!(Arc::ptr_eq(
-            &task_ctx.runtime_env(),
-            &session_ctx.runtime_env()
-        ));
         assert!(task_ctx.scalar_functions().contains_key("contains_tokens"));
+        // Each execution records the peak of its own reservations, although all
+        // of them go to the session's pool.
+        let peak = |task_ctx: &TaskContext| {
+            PeakRecordingPool::from_pool(task_ctx.memory_pool().as_ref())
+                .unwrap()
+                .peak_reserved()
+        };
+        let reservation = MemoryConsumer::new("execution").register(task_ctx.memory_pool());
+        reservation.grow(1000);
+        let other_reservation =
+            MemoryConsumer::new("other execution").register(other_task_ctx.memory_pool());
+        other_reservation.grow(10);
+        assert_eq!(peak(&task_ctx), 1000);
+        assert_eq!(peak(&other_task_ctx), 10);
 
         let spill_options = LanceExecutionOptions {
             use_spilling: true,
@@ -738,16 +955,17 @@ mod tests {
                 .contains_key("contains_tokens")
         );
         // The batch size override applies to this execution only, and the
-        // execution still shares the session's memory pool.
+        // execution still reserves from the session's memory pool.
         assert_ne!(spill_session_ctx.copied_config().batch_size(), 17);
-        assert!(Arc::ptr_eq(
-            &spill_task_ctx.runtime_env(),
-            &spill_session_ctx.runtime_env()
-        ));
         assert!(matches!(
             spill_task_ctx.memory_pool().memory_limit(),
             MemoryLimit::Finite(limit) if limit == 64 * 1024 * 1024
         ));
+        let spill_reservation =
+            MemoryConsumer::new("spilling execution").register(spill_task_ctx.memory_pool());
+        spill_reservation.grow(1000);
+        assert_eq!(spill_session_ctx.runtime_env().memory_pool.reserved(), 1000);
+        assert_eq!(peak(&spill_task_ctx), 1000);
     }
 
     #[tokio::test]

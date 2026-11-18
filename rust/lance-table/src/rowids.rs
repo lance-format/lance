@@ -33,6 +33,7 @@ use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 pub use serde::{read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;
+use roaring::RoaringTreemap;
 use segment::{SegmentCursorState, U64Segment};
 use tracing::instrument;
 
@@ -274,6 +275,22 @@ impl RowIdSequence {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The row ids as a set, for comparing sequences by membership rather
+    /// than by their bounding ranges. A contiguous segment is inserted as one
+    /// range.
+    pub fn to_treemap(&self) -> RoaringTreemap {
+        let mut set = RoaringTreemap::new();
+        for segment in &self.0 {
+            match segment {
+                U64Segment::Range(range) => {
+                    set.insert_range(range.clone());
+                }
+                other => set.extend(other.iter()),
+            }
+        }
+        set
     }
 
     /// Returns the bounding range `[min, max]` across all row IDs in this sequence,
@@ -2677,5 +2694,18 @@ mod test {
             read_row_ids(write_row_ids(&runs_sequence).as_slice()).unwrap(),
             runs_sequence
         );
+    }
+
+    #[test]
+    fn encoded_u64_array_roundtrips_full_width_values() {
+        use crate::rowids::encoded_array::EncodedU64Array;
+
+        let values = vec![0, u32::MAX as u64, u32::MAX as u64 + 1];
+        let array = EncodedU64Array::from(values.clone());
+        assert!(matches!(array, EncodedU64Array::U64(_)));
+
+        let sequence = RowIdSequence(vec![U64Segment::SortedArray(array)]);
+        let decoded = read_row_ids(write_row_ids(&sequence).as_slice()).unwrap();
+        assert_eq!(decoded.iter().collect::<Vec<_>>(), values);
     }
 }

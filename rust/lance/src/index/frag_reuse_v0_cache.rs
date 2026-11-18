@@ -13,7 +13,7 @@ use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
 use prost::Message;
 use uuid::Uuid;
 
-use crate::dataset::index::frag_reuse::index_postdates_rewrite;
+use lance_table::system_index::frag_reuse::retention::index_postdates_rewrite;
 
 /// A content digest of each version of a v0 history, computed once per history.
 pub(super) struct V0HistoryDigests {
