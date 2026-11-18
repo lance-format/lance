@@ -897,7 +897,6 @@ pub(crate) async fn build_distributed_vector_index(
         }
 
         let dim = crate::index::vector::utils::get_vector_dim(filtered_dataset.schema(), column)?;
-        let metric_type = params.metric_type;
 
         let pre_codebook = pq_params
             .codebook
@@ -918,16 +917,14 @@ pub(crate) async fn build_distributed_vector_index(
         let codebook_fsl =
             arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
 
+        // Codes go to the nearest codeword by L2 for every metric, as in the
+        // single-node build; search takes the metric from the index metadata.
         Ok(ProductQuantizer::new(
             pq_params.num_sub_vectors,
             pq_params.num_bits as u32,
             dim,
             codebook_fsl,
-            if metric_type == MetricType::Cosine {
-                MetricType::L2
-            } else {
-                metric_type
-            },
+            MetricType::L2,
         ))
     };
 
