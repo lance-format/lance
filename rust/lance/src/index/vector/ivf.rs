@@ -6797,6 +6797,7 @@ mod tests {
                     query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                     dist_q_c: 0.0,
                     approx_mode: Default::default(),
+                    rq_graph_scoring: Default::default(),
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;
@@ -10340,8 +10341,60 @@ mod tests {
         let (mut dataset, vector_array) =
             generate_test_dataset_with_rows(test_uri, 0.0..1.0, 512).await;
 
-        let ivf_params = fast_ivf_params(nlist);
-        let pq_params = fast_pq_params(4, 8);
+        // The live build samples IVF training rows and initializes both k-means
+        // models from OS entropy, so this fixture's recall is a random variable
+        // whose tail crosses the assertion. Train both models here from fixed
+        // rows with the production trainers, then build the index with them.
+        // Partitioning, PQ encoding, HNSW construction and search are unchanged.
+        let flat = vector_array.values().as_primitive::<Float32Type>();
+        let mut train_ivf_params = fast_ivf_params(nlist);
+        let training_rows = nlist * train_ivf_params.sample_rate;
+        let training_sample =
+            FixedSizeListArray::try_new_from_values(flat.slice(0, training_rows * DIM), DIM as i32)
+                .unwrap();
+        train_ivf_params.centroids = Some(Arc::new(
+            FixedSizeListArray::try_new_from_values(flat.slice(0, nlist * DIM), DIM as i32)
+                .unwrap(),
+        ));
+        train_ivf_params.retrain = true;
+        let ivf_model = train_ivf_model_from_sample(
+            training_sample,
+            MetricType::L2,
+            &train_ivf_params,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+        let ivf_centroids = Arc::new(ivf_model.centroids.unwrap());
+
+        let transformer = lance_index::vector::ivf::new_ivf_transformer(
+            ivf_centroids.as_ref().clone(),
+            DistanceType::L2,
+            vec![],
+        );
+        let residuals = transformer.compute_residual(&vector_array).unwrap();
+        let initial_codebook = FixedSizeListArray::try_new_from_values(
+            residuals
+                .values()
+                .as_primitive::<Float32Type>()
+                .slice(0, 256 * DIM),
+            DIM as i32,
+        )
+        .unwrap();
+        let mut train_pq_params = fast_pq_params(4, 8);
+        train_pq_params.codebook = Some(Arc::new(initial_codebook));
+        let trained_pq = train_pq_params.build(&residuals, DistanceType::L2).unwrap();
+
+        let mut ivf_params = fast_ivf_params(nlist);
+        ivf_params.centroids = Some(ivf_centroids);
+        let mut pq_params = fast_pq_params(4, 8);
+        pq_params.codebook = Some(Arc::new(
+            trained_pq
+                .codebook
+                .values()
+                .as_primitive::<Float32Type>()
+                .clone(),
+        ));
         let hnsw_params = fast_hnsw_params();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             MetricType::L2,

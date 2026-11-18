@@ -2353,15 +2353,19 @@ impl FileFragment {
                 .collect::<Vec<_>>();
             sorted_deleted_ids.sort();
 
-            Cow::Owned(resolve_actual_row_ids(indices, &sorted_deleted_ids))
+            Cow::Owned(resolve_actual_row_ids(indices, &sorted_deleted_ids)?)
         } else {
             Cow::Borrowed(indices)
         };
 
         // Then call take rows
-        let batch = self
-            .take_rows(&row_ids, projection, FragReadConfig::default())
-            .await?;
+        let read_config = FragReadConfig::default().with_row_address(projection.fields.is_empty());
+        let batch = self.take_rows(&row_ids, projection, read_config).await?;
+
+        if projection.fields.is_empty() {
+            // Drop the internal address after selection and duplicate restoration.
+            return Ok(batch.project(&[])?);
+        }
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
         // for user-facing output.
@@ -3392,24 +3396,35 @@ impl FileFragment {
 /// One binary search over the sorted deletions finds `k`. For example, if
 /// deleted rows are [2, 3, 5], the counts are [2, 2, 3], and row 4 has all
 /// three deletions before it, so it is at physical row 7.
-pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]) -> Vec<u32> {
-    row_ids
-        .iter()
-        .map(|&row_id| {
-            let logical_index = row_id as usize;
-            // Deletion ids are unique and ascending, so `deleted[j] >= j`.
-            let (mut lo, mut hi) = (0, sorted_deleted_ids.len());
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if sorted_deleted_ids[mid] as usize - mid <= logical_index {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
+pub(crate) fn resolve_actual_row_ids(
+    row_ids: &[u32],
+    sorted_deleted_ids: &[u32],
+) -> Result<Vec<u32>> {
+    let mut physical_offsets = Vec::with_capacity(row_ids.len());
+    for &row_id in row_ids {
+        let logical_index = row_id as usize;
+        // Deletion ids are unique and ascending, so `deleted[j] >= j`.
+        let (mut lo, mut hi) = (0, sorted_deleted_ids.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if sorted_deleted_ids[mid] as usize - mid <= logical_index {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
-            (logical_index + lo) as u32
-        })
-        .collect()
+        }
+        let physical_offset = u32::try_from(lo)
+            .ok()
+            .and_then(|deleted_rows| row_id.checked_add(deleted_rows))
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Logical row index {row_id} plus {lo} preceding deletions exceeds maximum physical row offset {}",
+                    u32::MAX
+                ))
+            })?;
+        physical_offsets.push(physical_offset);
+    }
+    Ok(physical_offsets)
 }
 
 // Cache key for file metadata
@@ -4425,7 +4440,7 @@ impl FragmentReader {
 mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
+    use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatchIterator,
         StringArray,
@@ -6461,6 +6476,59 @@ mod tests {
             .unwrap();
     }
 
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::contiguous(&[0, 1])]
+    #[case::sorted(&[0, 1, 1])]
+    #[case::unsorted(&[1, 0, 1])]
+    #[tokio::test]
+    async fn test_take_empty_projection(
+        #[case] indices: &[u32],
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(false, true)] delete_row: bool,
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        if delete_row {
+            dataset.delete("i = 1").await.unwrap();
+        }
+        let fragment = dataset.get_fragment(0).unwrap();
+        let projection = dataset.schema().project::<&str>(&[]).unwrap();
+        dataset.object_store.io_stats_incremental();
+        let batch = fragment.take(indices, &projection).await.unwrap();
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), indices.len());
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| !request.path.as_ref().contains("/data/"))
+        );
+        let invalid_offset = if delete_row { 2 } else { 3 };
+        let error = fragment
+            .take(&[invalid_offset], &projection)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Invalid read params"), "{error}");
+    }
+
     /// A fragment with one data file per column group reads only the files
     /// that hold a requested field: the others are not even opened.
     #[tokio::test]
@@ -7362,20 +7430,23 @@ mod tests {
     fn test_resolve_actual_row_ids() {
         // Doc example on resolve_actual_row_ids: with deletions [2, 3, 5],
         // logical row 4 resolves to physical row 7.
-        assert_eq!(resolve_actual_row_ids(&[4], &[2, 3, 5]), vec![7]);
+        assert_eq!(resolve_actual_row_ids(&[4], &[2, 3, 5]).unwrap(), vec![7]);
 
         // Rows below every deletion map to themselves.
-        assert_eq!(resolve_actual_row_ids(&[0, 1], &[2, 3, 5]), vec![0, 1]);
+        assert_eq!(
+            resolve_actual_row_ids(&[0, 1], &[2, 3, 5]).unwrap(),
+            vec![0, 1]
+        );
         // Indices that land on deleted positions skip past them.
-        assert_eq!(resolve_actual_row_ids(&[2], &[2, 3, 5]), vec![4]);
-        assert_eq!(resolve_actual_row_ids(&[5], &[2, 3, 5]), vec![8]);
+        assert_eq!(resolve_actual_row_ids(&[2], &[2, 3, 5]).unwrap(), vec![4]);
+        assert_eq!(resolve_actual_row_ids(&[5], &[2, 3, 5]).unwrap(), vec![8]);
         // Repeated indices are resolved independently.
         assert_eq!(
-            resolve_actual_row_ids(&[0, 0, 1, 1], &[1]),
+            resolve_actual_row_ids(&[0, 0, 1, 1], &[1]).unwrap(),
             vec![0, 0, 2, 2]
         );
         // No deletions is the identity mapping.
-        assert_eq!(resolve_actual_row_ids(&[3, 7], &[]), vec![3, 7]);
+        assert_eq!(resolve_actual_row_ids(&[3, 7], &[]).unwrap(), vec![3, 7]);
     }
 
     #[test]
@@ -7396,7 +7467,10 @@ mod tests {
                 .collect();
             let indices: Vec<u32> = (0..live.len() as u32).rev().collect();
             let expected: Vec<u32> = indices.iter().map(|&i| live[i as usize]).collect();
-            assert_eq!(resolve_actual_row_ids(&indices, &deleted), expected);
+            assert_eq!(
+                resolve_actual_row_ids(&indices, &deleted).unwrap(),
+                expected
+            );
         }
     }
 
@@ -9300,5 +9374,59 @@ mod tests {
             "cache clones must share the per-scan scheduler map"
         );
         assert_eq!(cache.len(), 2);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fragment_logical_offset_overflow(
+        #[values(false, true)] stable_ids: bool,
+        #[values(false, true)] delete_row: bool,
+        #[values(false, true)] use_session: bool,
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids: stable_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        if delete_row {
+            dataset.delete("i = 1").await.unwrap();
+        }
+        let fragment = dataset.get_fragment(0).unwrap();
+        let session = fragment
+            .open_session(dataset.schema(), false)
+            .await
+            .unwrap();
+        let live = if use_session {
+            session.take(&[0, 1]).await.unwrap()
+        } else {
+            fragment.take(&[0, 1], dataset.schema()).await.unwrap()
+        };
+        assert_eq!(
+            live["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            if delete_row { &[0, 2] } else { &[0, 1] }
+        );
+        let error = if use_session {
+            session.take(&[u32::MAX]).await.unwrap_err()
+        } else {
+            fragment
+                .take(&[u32::MAX], dataset.schema())
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("4294967295"), "{error}");
     }
 }

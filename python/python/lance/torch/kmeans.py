@@ -118,7 +118,9 @@ class KMeans:
 
         is_numpy = _check_for_numpy(data) and isinstance(data, np.ndarray)
         if is_numpy or (_check_for_torch(data) and isinstance(data, torch.Tensor)):
-            indices = np.random.choice(data.shape[0], self.k)
+            # Use the seed when given; otherwise keep the global NumPy generator.
+            rng = np.random if self.seed is None else np.random.default_rng(self.seed)
+            indices = rng.choice(data.shape[0], self.k)
             if is_numpy:
                 data = torch.from_numpy(data)
             self.centroids = data[indices]

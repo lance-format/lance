@@ -3,8 +3,8 @@
 
 use std::mem::MaybeUninit;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
@@ -96,15 +96,19 @@ pub fn compute_f32_distance(query: &[f32], vector: &[f32], distance_type: Distan
 
 /// Zero-copy Arrow-backed vector store for active MemTables.
 ///
-/// The store is append-only and follows a single-writer / multi-reader model.
-/// Appended vector batches are retained by `Arc`, while id-to-batch lookup
-/// tables make `vector(id)` O(1).
+/// The store is append-only and follows a single-writer / multi-reader model;
+/// an internal lock serializes accidental concurrent appends, and readers never
+/// take it. Appended vector batches are retained by `Arc`, while id-to-batch
+/// lookup tables make `vector(id)` O(1).
 pub struct ArrowFixedSizeListVectorStore {
     batches: *mut MaybeUninit<StoredArrowBatch>,
     row_to_batch: *mut MaybeUninit<RowLookup>,
     row_ids: *mut MaybeUninit<u64>,
     committed_batches: AtomicUsize,
     committed_len: AtomicUsize,
+    /// Held by `append_batch` while it claims, fills and publishes slots, so
+    /// two callers sharing the store cannot write the same slots.
+    append_lock: Mutex<()>,
     capacity: usize,
     max_batches: usize,
     dim: usize,
@@ -112,9 +116,15 @@ pub struct ArrowFixedSizeListVectorStore {
     schema: SchemaRef,
 }
 
-// SAFETY: writes are single-threaded and publish initialized slots with
-// Release stores. Readers use Acquire loads and only read committed slots.
+// SAFETY: the store owns its three slot allocations. A stored batch holds an
+// `Arc` of the Arrow array and a pointer into that array's immutable values, so
+// both can move to another thread together with the store.
 unsafe impl Send for ArrowFixedSizeListVectorStore {}
+// SAFETY: `append_batch` writes only slots past the published lengths, holds
+// `append_lock` while it does, and publishes them with Release stores. Readers
+// load the lengths with Acquire and read only slots below them (snapshot reads
+// rely on the HNSW graph passing ids below the snapshot length), and those
+// slots are never written again.
 unsafe impl Sync for ArrowFixedSizeListVectorStore {}
 
 impl Drop for ArrowFixedSizeListVectorStore {
@@ -194,6 +204,7 @@ impl ArrowFixedSizeListVectorStore {
             row_ids: Box::into_raw(row_ids) as *mut MaybeUninit<u64>,
             committed_batches: AtomicUsize::new(0),
             committed_len: AtomicUsize::new(0),
+            append_lock: Mutex::new(()),
             capacity,
             max_batches,
             dim,
@@ -294,6 +305,16 @@ impl ArrowFixedSizeListVectorStore {
             )));
         };
 
+        // Held through the publishing stores at the end, so two appends never
+        // claim the same slots. Every store to the lengths happens under it,
+        // which makes the Relaxed loads below enough. A panicked append
+        // publishes nothing and leaves only `Copy` row slots behind, so a
+        // poisoned lock is still safe to take.
+        let _append_guard = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         // Exhaustion is a shard-construction bug (store sized below the memtable),
         // not caller input — hence `internal`, not `invalid_input`.
         let start = self.committed_len.load(Ordering::Relaxed);
@@ -321,15 +342,10 @@ impl ArrowFixedSizeListVectorStore {
             )));
         }
 
-        // SAFETY: slots are not visible until the Release stores below. The
-        // single writer reserves `batch_idx` and `start..end`.
+        // SAFETY: `append_lock` is held, so no other append can claim
+        // `batch_idx` or `start..end`, and both were bounds-checked above.
+        // Readers cannot see these slots until the Release stores below.
         unsafe {
-            self.batches
-                .add(batch_idx)
-                .write(MaybeUninit::new(StoredArrowBatch {
-                    _array: stored_array.clone(),
-                    values_ptr: values_f32.values().as_ptr(),
-                }));
             for offset in 0..num_rows {
                 self.row_to_batch
                     .add(start + offset)
@@ -347,6 +363,14 @@ impl ArrowFixedSizeListVectorStore {
                     .add(start + offset)
                     .write(MaybeUninit::new(row_id_start + original));
             }
+            // Written after the loop, which can panic on a row id overflow, so a
+            // panicked append never leaves an `Arc` in a slot that is not dropped.
+            self.batches
+                .add(batch_idx)
+                .write(MaybeUninit::new(StoredArrowBatch {
+                    _array: stored_array.clone(),
+                    values_ptr: values_f32.values().as_ptr(),
+                }));
         }
 
         self.committed_batches
@@ -496,8 +520,12 @@ impl VectorSource for VectorStoreSnapshot {
             self.visible_len
         );
         if self.contiguous_values_addr != 0 {
-            // SAFETY: this snapshot holds the store Arc, which retains the
-            // Arrow batch backing this pointer. The id was checked above.
+            // SAFETY: the HNSW graph passes only ids below this snapshot's
+            // length: search caps neighbor ids at it, and inserts check that it
+            // covers the range they build (debug builds also check above). The
+            // address is set only while batch 0 was the only published batch,
+            // so the whole visible prefix lies in that batch's values, which
+            // the store `Arc` held by this snapshot keeps alive.
             unsafe {
                 let ptr =
                     (self.contiguous_values_addr as *const f32).add(id as usize * self.store.dim);
@@ -665,5 +693,78 @@ mod tests {
             "all-null batch yields an empty node range"
         );
         assert_eq!(store.committed_len(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_appends_are_serialized() {
+        const WRITERS: usize = 8;
+        const APPENDS_PER_WRITER: usize = 50;
+        const ROWS: usize = WRITERS * APPENDS_PER_WRITER;
+        let store = Arc::new(
+            ArrowFixedSizeListVectorStore::try_new(ROWS, ROWS, 2, DistanceType::L2).unwrap(),
+        );
+        let start = Arc::new(Barrier::new(WRITERS));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let store = store.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..APPENDS_PER_WRITER)
+                        .map(|append| {
+                            let row_id = (writer * APPENDS_PER_WRITER + append) as u64;
+                            let vector = vec![row_id as f32, -(row_id as f32)];
+                            (row_id, store.append_batch(fsl(vector, 2), row_id).unwrap())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let appended: Vec<_> = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().unwrap())
+            .collect();
+
+        // Each append got its own one-row range, and the store holds what that
+        // append wrote there.
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.len(), ROWS);
+        for (row_id, ids) in appended {
+            assert_eq!(ids.len(), 1);
+            assert_eq!(snapshot.row_id(ids.start), row_id);
+            assert_eq!(
+                snapshot.vector(ids.start),
+                &[row_id as f32, -(row_id as f32)]
+            );
+        }
+    }
+
+    // The row id overflow below panics only where overflow checks are on.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_append_after_a_panicked_append() {
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(8, 2, 2, DistanceType::L2).unwrap());
+        // The second row's id overflows after the first row's slots are written.
+        let abandoned = fsl(vec![1.0, 2.0, 3.0, 4.0], 2);
+        let append = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.append_batch(abandoned.clone(), u64::MAX)
+        }));
+        assert!(append.is_err());
+        assert_eq!(store.committed_len(), 0);
+
+        // The poisoned lock does not block the next append, which reuses the slots.
+        assert_eq!(store.append_batch(fsl(vec![5.0, 6.0], 2), 7).unwrap(), 0..1);
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.row_id(0), 7);
+        assert_eq!(snapshot.vector(0), &[5.0, 6.0]);
+
+        drop(snapshot);
+        drop(store);
+        assert_eq!(
+            Arc::strong_count(&abandoned),
+            1,
+            "the panicked append left a reference to its batch behind"
+        );
     }
 }
