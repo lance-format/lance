@@ -9,7 +9,7 @@ use crate::{
     data::VariableWidthBlock,
 };
 
-fn expected(data_type: &DataType, values: &[Option<&[u8]>]) -> arrow_data::ArrayData {
+pub(super) fn expected(data_type: &DataType, values: &[Option<&[u8]>]) -> arrow_data::ArrayData {
     match data_type {
         DataType::Binary => BinaryArray::from(values.to_vec()).to_data(),
         DataType::LargeBinary => LargeBinaryArray::from(values.to_vec()).to_data(),

@@ -87,8 +87,44 @@ async fn real_columns_share_two_owned_read_phases(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
     #[values(false, true)] nullable_labels: bool,
+    #[values(false, true)] large_list: bool,
 ) {
     let mut expected = batches().remove(0);
+    if large_list {
+        let frames = expected
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let DataType::List(field) = frames.data_type() else {
+            unreachable!()
+        };
+        let frames: ArrayRef = Arc::new(arrow_array::LargeListArray::new(
+            field.clone(),
+            OffsetBuffer::new(
+                frames
+                    .value_offsets()
+                    .iter()
+                    .map(|v| i64::from(*v))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            frames.values().clone(),
+            frames.nulls().cloned(),
+        ));
+        let mut fields = expected.schema().fields().to_vec();
+        fields[1] = Arc::new(
+            fields[1]
+                .as_ref()
+                .clone()
+                .with_data_type(frames.data_type().clone()),
+        );
+        expected = RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            vec![expected.column(0).clone(), frames],
+        )
+        .unwrap();
+    }
     if nullable_labels {
         let mut fields = expected.schema().fields().to_vec();
         fields[0] = Arc::new(fields[0].as_ref().clone().with_nullable(true));
@@ -128,7 +164,7 @@ async fn real_columns_share_two_owned_read_phases(
     assert_eq!(io.singles.load(Ordering::SeqCst), 0);
     let output = input.decode_in(&mut work).unwrap().unwrap();
     assert_batch(&output, &(1..4), &expected);
-    let alias = output.column(0).slice(1, 1);
+    let alias = output.column(1).to_data().child_data()[0].buffers()[1].slice_with_length(0, 1);
     drop((output, work));
     assert!(budget.reserved() > 0);
     assert!(budget.try_reserve(65536).is_none());

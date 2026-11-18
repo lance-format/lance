@@ -25,7 +25,7 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify direct raw Arrow output and actual file composition
+      - name: Verify direct raw list output and actual file composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
