@@ -554,16 +554,16 @@ async fn test_commit_refuses_recording_mismatch_before_reserving_fragments(
         );
     }
     if matches!(mismatch, RecordingMismatch::IncompatibleIndexCreated) {
-        // NGram, not Bitmap: Bitmap now always creates an address-domain
-        // segment on a stable-row-id dataset (safe alongside the recorded
-        // moves by construction), so it can no longer illustrate this
-        // mismatch. NGram still stores row ids directly here.
+        // Inverted: the other scalar index types now always create an
+        // address-domain segment on a stable-row-id dataset (safe alongside
+        // the recorded moves by construction), so none of them can illustrate
+        // this mismatch. Inverted still stores row ids directly here.
         dataset
             .create_index(
                 &["cat"],
-                IndexType::NGram,
+                IndexType::Inverted,
                 Some("i_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
                 false,
             )
             .await

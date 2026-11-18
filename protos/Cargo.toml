@@ -1,0 +1,16 @@
+[package]
+name = "lance-protos"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Protobuf definitions for the Lance columnar format"
+readme.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["Cargo.toml", "src/**", "**/*.proto"]
+
+[lints]
+workspace = true

@@ -8,7 +8,9 @@ use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use lance::dataset::optimize::{CompactionMode, CompactionOptions, SourceBudgetMode};
+use lance::dataset::optimize::{
+    CompactionMode, CompactionOptions, CompactionScope, SourceBudgetMode,
+};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -301,6 +303,26 @@ pub fn build_compaction_options(
     Ok(compaction_options)
 }
 
+/// Apply the column repack options a Java `CompactionOptions` carries.
+pub fn apply_repack_options(
+    env: &mut JNIEnv,
+    options: &mut CompactionOptions,
+    max_data_files_per_fragment: &JObject, // Optional<Long>
+    scope: &JObject,                       // Optional<String>
+) -> Result<()> {
+    if let Some(max) = env.get_long_opt(max_data_files_per_fragment)? {
+        options.max_data_files_per_fragment = Some(usize::try_from(max).map_err(|_| {
+            Error::input_error(format!(
+                "max_data_files_per_fragment must be positive, got {max}"
+            ))
+        })?);
+    }
+    if let Some(scope) = env.get_string_opt(scope)? {
+        options.scope = CompactionScope::try_from(scope.as_str())?;
+    }
+    Ok(())
+}
+
 // Convert from Java Optional<Query> to Rust Option<Query>
 pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> {
     let query = env.get_optional(&query_obj, |env, java_obj| {
@@ -362,6 +384,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            // Java does not expose `rq_graph_scoring` yet.
+            rq_graph_scoring: Default::default(),
         };
         query.validate_search_effort()?;
         Ok(query)
@@ -743,6 +767,8 @@ pub fn to_java_string_obj<'local>(
 ///
 /// Maps numeric types to their boxed Java equivalents (Long, Double)
 /// and string types to Java String. Null ScalarValues produce JObject::null().
+/// A type without a conversion, or a UInt64 above `i64::MAX`, is an error:
+/// null is reserved for a genuinely null value.
 ///
 /// This is useful for exposing index statistics (e.g., zonemap min/max)
 /// to Java clients in a type-safe, Comparable-compatible way.
@@ -765,8 +791,13 @@ pub fn scalar_value_to_java<'a>(
         ScalarValue::UInt8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
         ScalarValue::UInt16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
         ScalarValue::UInt32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
-        // UInt64 may overflow i64, but for min/max stats this is acceptable
-        ScalarValue::UInt64(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt64(v) => {
+            let v = v
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| Error::runtime_error("UInt64 value exceeds Java long".to_string()))?;
+            to_java_long_obj(env, v)
+        }
 
         // Float types → Java Double
         ScalarValue::Float16(v) => to_java_double_obj(env, v.map(|x| f64::from(x.to_f32()))),
@@ -787,13 +818,11 @@ pub fn scalar_value_to_java<'a>(
         ScalarValue::TimestampMicrosecond(v, _) => to_java_long_obj(env, *v),
         ScalarValue::TimestampNanosecond(v, _) => to_java_long_obj(env, *v),
 
-        // For any unsupported type, return null (conservative: caller will skip)
-        _ => {
-            log::warn!(
-                "Unsupported ScalarValue type for Java conversion: {:?}",
-                value.data_type()
-            );
-            Ok(JObject::null())
-        }
+        // Null would be indistinguishable from an all-null zone; the caller
+        // must not hand this function a type it cannot represent.
+        other => Err(Error::runtime_error(format!(
+            "Unsupported ScalarValue type for Java conversion: {:?}",
+            other.data_type()
+        ))),
     }
 }

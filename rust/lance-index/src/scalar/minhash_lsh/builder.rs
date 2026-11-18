@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 
 use super::index::{scan_rows, signature_columns};
 use super::*;
+use crate::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 
 /// Signatures and band keys of one input batch, for rows that have tokens.
 struct SignedBatch {
@@ -27,11 +28,11 @@ struct SignedBatch {
 
 fn sign_batch(mut generator: SignatureGenerator, batch: RecordBatch) -> Result<SignedBatch> {
     let row_ids = batch
-        .column_by_name(ROW_ID)
+        .column_by_name(ROW_ADDR)
         .and_then(|column| column.as_primitive_opt::<UInt64Type>())
         .ok_or_else(|| {
             Error::invalid_input(format!(
-                "MinHash LSH training data must contain a non-null UInt64 column {ROW_ID}"
+                "MinHash LSH training data must contain a non-null UInt64 column {ROW_ADDR}"
             ))
         })?;
     let values = batch.column_by_name(VALUE_COLUMN_NAME).ok_or_else(|| {
@@ -842,8 +843,19 @@ impl MinHashLshIndexBuilder {
         data: SendableRecordBatchStream,
         store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
+        self.train_with_progress(data, store, &NoopIndexBuildProgress)
+            .await
+    }
+
+    /// [`Self::train`], reporting its stages to `progress`.
+    pub(super) async fn train_with_progress(
+        &self,
+        data: SendableRecordBatchStream,
+        store: &dyn IndexStore,
+        progress: &dyn IndexBuildProgress,
+    ) -> Result<Vec<IndexFile>> {
         let generator = SignatureGenerator::try_new(&self.params)?;
-        self.train_signed(text_signed_batches(data, generator), store)
+        self.train_signed(text_signed_batches(data, generator), store, progress)
             .await
     }
 
@@ -864,8 +876,12 @@ impl MinHashLshIndexBuilder {
         if let Some(new_data) = new_data {
             streams.push(Box::pin(text_signed_batches(new_data, generator)));
         }
-        self.train_signed(futures::stream::iter(streams).flatten(), store)
-            .await
+        self.train_signed(
+            futures::stream::iter(streams).flatten(),
+            store,
+            &NoopIndexBuildProgress,
+        )
+        .await
     }
 
     /// Write `signatures.lance` and `bands.lance` from signed batches,
@@ -874,10 +890,14 @@ impl MinHashLshIndexBuilder {
         &self,
         signed_batches: impl Stream<Item = Result<SignedBatch>> + Send,
         store: &dyn IndexStore,
+        progress: &dyn IndexBuildProgress,
     ) -> Result<Vec<IndexFile>> {
+        progress
+            .stage_start("compute_signatures", None, "rows")
+            .await?;
         let num_hashes = self.params.num_hashes as usize;
         let num_bands = self.params.num_bands as usize;
-        let schema = signatures_schema(self.params.num_hashes as i32);
+        let schema = signatures_schema(self.params.num_hashes as i32, true);
         let signature_write_rows = rows_per_batch(signature_row_bytes(num_hashes));
         let mut signatures_writer = store
             .new_index_file(SIGNATURES_FILENAME, schema.clone())
@@ -977,7 +997,11 @@ impl MinHashLshIndexBuilder {
             signatures_writer.finish_with_metadata(metadata),
             sorter.finish()
         )?;
+        progress.stage_complete("compute_signatures").await?;
+
+        progress.stage_start("write_bands", None, "files").await?;
         let bands_file = self.write_bands(store, &runs, num_docs).await?;
+        progress.stage_complete("write_bands").await?;
         Ok(vec![signatures_file, bands_file])
     }
 

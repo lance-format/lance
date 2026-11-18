@@ -669,6 +669,34 @@ Lance rewrites it to the `any_element` call above, so the two behave the same.
 has one parameter, and its body may only refer to that parameter's fields.
 Other lambdas, such as in `array_filter`, are not supported in filters.
 
+A `listelement` scalar index on the list column answers `any_element` filters
+from the index. Its `keys` name the element fields it indexes, in order:
+
+```python
+from lance.indices import IndexConfig
+
+dataset.create_scalar_index(
+    "detections",
+    IndexConfig(index_type="listelement", parameters={"keys": ["label", "confidence"]}),
+)
+```
+
+The index is used when the predicate fixes the first key with `=`, `IN` or
+`IS NULL`. Conditions on further keys narrow the search: equalities on a prefix
+of the keys, then one range on the next key. When the predicate has conditions
+the index cannot answer, such as one on a field that is not a key, the rows the
+index finds are rechecked with `any_element` itself, so the index never changes
+the result. Keys may be booleans, integers, floats, dates, timestamps, strings
+or binaries. The index follows its key fields through renames. If a key field
+is dropped or changes type, queries stop using the index and scan instead; drop
+and recreate it.
+
+!!! warning "Experimental"
+
+    The `listelement` index is an experimental format feature. Its files may
+    change incompatibly; after such a change the index must be rebuilt, but the
+    data itself is never rewritten.
+
 ### Random read
 
 One distinct feature of Lance, as columnar format, is that it allows you to read random samples quickly.
@@ -733,8 +761,9 @@ ordering of the data will be preserved.
 
 !!! note
 
-    Compaction creates a new version of the table. It does not delete the old
-    version of the table and the files referenced by it.
+    Compaction creates a new version of the table, or two when it both
+    rewrites fragments and repacks columns (see below). It does not delete the
+    old versions of the table and the files referenced by them.
 
 === "Python"
 
@@ -786,6 +815,44 @@ Run `compact_files()` before `optimize_indices()` or index rebuilds so Lance can
 secondary indices against the compacted fragments (see [Compaction and Rebuilding](indexing.md#compaction-and-rebuilding)).
 If your application needs logical row identifiers that remain constant across updates and compaction,
 enable [Stable Row IDs](row_ids.md).
+
+#### Repack columns
+
+Each `add_columns` backfill gives every fragment one more data file, and no
+compaction trigger counts data files, so those files pile up and slow down
+scans and random reads. Compaction can repack a fragment's columns into
+fewer data files instead. A repack moves no rows, so fragment ids, row
+addresses, deletions, data overlays and index coverage stay as they are.
+
+Repacking is off by default. Set `max_data_files_per_fragment`, as a
+`compact_files` argument or as the table config key
+`lance.compaction.max_data_files_per_fragment`, to repack a fragment that holds
+its columns in more files than this. The file count is the only thing that
+triggers a repack.
+
+`scope` limits a run to one kind of work: `"rewrite_fragments"`,
+`"repack_columns"`, or `"all"` (the default). `scope="repack_columns"` is
+refused without `max_data_files_per_fragment` or with the `force_binary_copy`
+compaction mode, since such a run could plan nothing. Repack tasks come after
+the rewrite tasks, so `max_source_fragments`, `max_source_rows` and
+`max_source_bytes` reach them only once the rewrites fit; use
+`scope="repack_columns"` to budget repacks on their own.
+
+```python
+dataset.optimize.compact_files(max_data_files_per_fragment=2)
+
+# Only repack.
+dataset.optimize.compact_files(max_data_files_per_fragment=1, scope="repack_columns")
+
+# Per fragment: live data files, file sizes, fields per file, dead-slot ratio,
+# overlay count.
+dataset.stats.column_layout_stats()
+```
+
+A repack only merges files it can empty. Files holding a blob column, a column
+only partly present in the fragment, or spilled row lineage stay as they are,
+so a fragment can stay above the limit. Fragments with legacy (V1) data files
+are not repacked.
 
 ### Cleanup old versions
 

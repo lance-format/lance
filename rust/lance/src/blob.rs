@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Builders and file-level writer helpers for Lance blob v2 columns.
+//! Blob column builders, file-level writers, and planned reads through blob handles.
 //!
 //! Logical blob input uses either `Struct<data: LargeBinary?, uri: Utf8?>` or the complete
 //! `Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>` shape. In the
@@ -49,6 +49,11 @@ use lance_io::{
 };
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
+
+pub use crate::dataset::blob::{
+    BlobFile, BlobReadRange, ReadBlobFile, ReadBlobFilesBuilder, ReadBlobFilesStream,
+    read_blob_file_ranges, read_blob_files,
+};
 
 use crate::dataset::BLOBS_DIR;
 use crate::{Error, Result};

@@ -13,7 +13,7 @@ The LanceNamespace ABC interface is provided by the lance_namespace package.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Union, overload
+from typing import Any, Dict, Mapping, Optional, Union
 
 from lance_namespace import (
     AlterTableAddColumnsRequest,
@@ -479,103 +479,68 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.list_table_versions(request.model_dump())
         return ListTableVersionsResponse.from_dict(response_dict)
 
-    @overload
     def create_table_version(
-        self, request: CreateTableVersionRequest
-    ) -> CreateTableVersionResponse: ...
-
-    @overload
-    def create_table_version(self, request: Dict[str, Any]) -> Dict[str, Any]: ...
-
-    def create_table_version(
-        self, request: Union[CreateTableVersionRequest, Dict[str, Any]]
-    ) -> Union[CreateTableVersionResponse, Dict[str, Any]]:
+        self, request: Union[CreateTableVersionRequest, Mapping[str, Any]]
+    ) -> CreateTableVersionResponse:
         """Create a table version (for external manifest store integration).
-
-        Dict requests return dicts for backward compatibility; request models
-        return the corresponding response model.
 
         Parameters
         ----------
-        request : CreateTableVersionRequest or dict
+        request : CreateTableVersionRequest or Mapping
             Request with the table id, the version number to create, the path
             to the staging manifest, and optionally its size and ETag
 
         Returns
         -------
-        CreateTableVersionResponse or dict
+        CreateTableVersionResponse
             Response with the created version and optional transaction id
         """
-        if not isinstance(request, CreateTableVersionRequest):
-            return self._inner.create_table_version(request)
-        response_dict = self._inner.create_table_version(request.model_dump())
+        if isinstance(request, CreateTableVersionRequest):
+            request = request.model_dump()
+        response_dict = self._inner.create_table_version(request)
         return CreateTableVersionResponse.from_dict(response_dict)
 
-    @overload
     def describe_table_version(
-        self, request: DescribeTableVersionRequest
-    ) -> DescribeTableVersionResponse: ...
-
-    @overload
-    def describe_table_version(self, request: Dict[str, Any]) -> Dict[str, Any]: ...
-
-    def describe_table_version(
-        self, request: Union[DescribeTableVersionRequest, Dict[str, Any]]
-    ) -> Union[DescribeTableVersionResponse, Dict[str, Any]]:
+        self, request: Union[DescribeTableVersionRequest, Mapping[str, Any]]
+    ) -> DescribeTableVersionResponse:
         """Describe a specific table version.
-
-        Dict requests return dicts for backward compatibility; request models
-        return the corresponding response model.
 
         Parameters
         ----------
-        request : DescribeTableVersionRequest or dict
+        request : DescribeTableVersionRequest or Mapping
             Request with the table id and optionally the version to describe
             (latest when omitted)
 
         Returns
         -------
-        DescribeTableVersionResponse or dict
+        DescribeTableVersionResponse
             Response whose ``version`` holds the version number, manifest path,
             manifest size, ETag and timestamp
         """
-        if not isinstance(request, DescribeTableVersionRequest):
-            return self._inner.describe_table_version(request)
-        response_dict = self._inner.describe_table_version(request.model_dump())
+        if isinstance(request, DescribeTableVersionRequest):
+            request = request.model_dump()
+        response_dict = self._inner.describe_table_version(request)
         return DescribeTableVersionResponse.from_dict(response_dict)
 
-    @overload
     def batch_delete_table_versions(
-        self, request: BatchDeleteTableVersionsRequest
-    ) -> BatchDeleteTableVersionsResponse: ...
-
-    @overload
-    def batch_delete_table_versions(
-        self, request: Dict[str, Any]
-    ) -> Dict[str, Any]: ...
-
-    def batch_delete_table_versions(
-        self, request: Union[BatchDeleteTableVersionsRequest, Dict[str, Any]]
-    ) -> Union[BatchDeleteTableVersionsResponse, Dict[str, Any]]:
+        self, request: Union[BatchDeleteTableVersionsRequest, Mapping[str, Any]]
+    ) -> BatchDeleteTableVersionsResponse:
         """Delete multiple table versions in a single request.
-
-        Dict requests return dicts for backward compatibility; request models
-        return the corresponding response model.
 
         Parameters
         ----------
-        request : BatchDeleteTableVersionsRequest or dict
+        request : BatchDeleteTableVersionsRequest or Mapping
             Request with the table id and the version ranges to delete
 
         Returns
         -------
-        BatchDeleteTableVersionsResponse or dict
+        BatchDeleteTableVersionsResponse
             Response with the number of deleted versions and optional
             transaction id
         """
-        if not isinstance(request, BatchDeleteTableVersionsRequest):
-            return self._inner.batch_delete_table_versions(request)
-        response_dict = self._inner.batch_delete_table_versions(request.model_dump())
+        if isinstance(request, BatchDeleteTableVersionsRequest):
+            request = request.model_dump()
+        response_dict = self._inner.batch_delete_table_versions(request)
         return BatchDeleteTableVersionsResponse.from_dict(response_dict)
 
     # Data manipulation operations
@@ -1121,103 +1086,68 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.list_table_versions(request.model_dump())
         return ListTableVersionsResponse.from_dict(response_dict)
 
-    @overload
     def create_table_version(
-        self, request: CreateTableVersionRequest
-    ) -> CreateTableVersionResponse: ...
-
-    @overload
-    def create_table_version(self, request: Dict[str, Any]) -> Dict[str, Any]: ...
-
-    def create_table_version(
-        self, request: Union[CreateTableVersionRequest, Dict[str, Any]]
-    ) -> Union[CreateTableVersionResponse, Dict[str, Any]]:
+        self, request: Union[CreateTableVersionRequest, Mapping[str, Any]]
+    ) -> CreateTableVersionResponse:
         """Create a table version (for external manifest store integration).
-
-        Dict requests return dicts for backward compatibility; request models
-        return the corresponding response model.
 
         Parameters
         ----------
-        request : CreateTableVersionRequest or dict
+        request : CreateTableVersionRequest or Mapping
             Request with the table id, the version number to create, the path
             to the staging manifest, and optionally its size and ETag
 
         Returns
         -------
-        CreateTableVersionResponse or dict
+        CreateTableVersionResponse
             Response with the created version and optional transaction id
         """
-        if not isinstance(request, CreateTableVersionRequest):
-            return self._inner.create_table_version(request)
-        response_dict = self._inner.create_table_version(request.model_dump())
+        if isinstance(request, CreateTableVersionRequest):
+            request = request.model_dump()
+        response_dict = self._inner.create_table_version(request)
         return CreateTableVersionResponse.from_dict(response_dict)
 
-    @overload
     def describe_table_version(
-        self, request: DescribeTableVersionRequest
-    ) -> DescribeTableVersionResponse: ...
-
-    @overload
-    def describe_table_version(self, request: Dict[str, Any]) -> Dict[str, Any]: ...
-
-    def describe_table_version(
-        self, request: Union[DescribeTableVersionRequest, Dict[str, Any]]
-    ) -> Union[DescribeTableVersionResponse, Dict[str, Any]]:
+        self, request: Union[DescribeTableVersionRequest, Mapping[str, Any]]
+    ) -> DescribeTableVersionResponse:
         """Describe a specific table version.
-
-        Dict requests return dicts for backward compatibility; request models
-        return the corresponding response model.
 
         Parameters
         ----------
-        request : DescribeTableVersionRequest or dict
+        request : DescribeTableVersionRequest or Mapping
             Request with the table id and optionally the version to describe
             (latest when omitted)
 
         Returns
         -------
-        DescribeTableVersionResponse or dict
+        DescribeTableVersionResponse
             Response whose ``version`` holds the version number, manifest path,
             manifest size, ETag and timestamp
         """
-        if not isinstance(request, DescribeTableVersionRequest):
-            return self._inner.describe_table_version(request)
-        response_dict = self._inner.describe_table_version(request.model_dump())
+        if isinstance(request, DescribeTableVersionRequest):
+            request = request.model_dump()
+        response_dict = self._inner.describe_table_version(request)
         return DescribeTableVersionResponse.from_dict(response_dict)
 
-    @overload
     def batch_delete_table_versions(
-        self, request: BatchDeleteTableVersionsRequest
-    ) -> BatchDeleteTableVersionsResponse: ...
-
-    @overload
-    def batch_delete_table_versions(
-        self, request: Dict[str, Any]
-    ) -> Dict[str, Any]: ...
-
-    def batch_delete_table_versions(
-        self, request: Union[BatchDeleteTableVersionsRequest, Dict[str, Any]]
-    ) -> Union[BatchDeleteTableVersionsResponse, Dict[str, Any]]:
+        self, request: Union[BatchDeleteTableVersionsRequest, Mapping[str, Any]]
+    ) -> BatchDeleteTableVersionsResponse:
         """Delete multiple table versions in a single request.
-
-        Dict requests return dicts for backward compatibility; request models
-        return the corresponding response model.
 
         Parameters
         ----------
-        request : BatchDeleteTableVersionsRequest or dict
+        request : BatchDeleteTableVersionsRequest or Mapping
             Request with the table id and the version ranges to delete
 
         Returns
         -------
-        BatchDeleteTableVersionsResponse or dict
+        BatchDeleteTableVersionsResponse
             Response with the number of deleted versions and optional
             transaction id
         """
-        if not isinstance(request, BatchDeleteTableVersionsRequest):
-            return self._inner.batch_delete_table_versions(request)
-        response_dict = self._inner.batch_delete_table_versions(request.model_dump())
+        if isinstance(request, BatchDeleteTableVersionsRequest):
+            request = request.model_dump()
+        response_dict = self._inner.batch_delete_table_versions(request)
         return BatchDeleteTableVersionsResponse.from_dict(response_dict)
 
     # Data manipulation operations

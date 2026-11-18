@@ -41,6 +41,7 @@ use tokio::sync::Barrier;
 
 use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
 use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure, copy_test_data_to_tmp};
+use futures::StreamExt as _;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use lance_core::Error;
@@ -231,6 +232,124 @@ async fn test_v2_manifest_path_commit() {
     assert!(dataset.manifest_location.naming_scheme == ManifestNamingScheme::V2);
 
     assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_versions_with_options(
+    #[values(true, false)] lexical_store: bool,
+    #[values(true, false)] enable_v2_manifest_paths: bool,
+) {
+    let tmp_dir = TempStrDir::default();
+    let test_uri = if lexical_store {
+        "memory://".to_string()
+    } else {
+        tmp_dir.as_str().to_string()
+    };
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    let schema = data.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |versions: Vec<crate::dataset::Version>| {
+        versions.into_iter().map(|v| v.version).collect::<Vec<_>>()
+    };
+
+    assert_eq!(ids(dataset.versions().await.unwrap()), vec![1, 2, 3, 4, 5]);
+    assert_eq!(dataset.count_versions().await.unwrap(), 5);
+
+    let cases = [
+        ((0, None, false), vec![1, 2, 3, 4, 5]),
+        ((0, None, true), vec![5, 4, 3, 2, 1]),
+        ((0, Some(2), true), vec![5, 4]),
+        ((2, Some(2), true), vec![3, 2]),
+        ((4, Some(2), true), vec![1]),
+        ((5, Some(2), true), vec![]),
+        ((1, Some(3), false), vec![2, 3, 4]),
+        ((3, None, false), vec![4, 5]),
+        ((0, Some(0), true), vec![]),
+    ];
+    for ((offset, limit, descending), expected) in cases {
+        let actual = ids(dataset
+            .versions_with_options(offset, limit, descending)
+            .await
+            .unwrap());
+        assert_eq!(
+            actual, expected,
+            "offset={offset}, limit={limit:?}, descending={descending}"
+        );
+    }
+
+    dataset.object_store.io_stats_incremental();
+    let full = dataset.versions().await.unwrap();
+    let full_reads = dataset.object_store.io_stats_incremental().read_iops;
+    dataset
+        .versions_with_options(0, Some(2), true)
+        .await
+        .unwrap();
+    let page_reads = dataset.object_store.io_stats_incremental().read_iops;
+    assert_eq!(full_reads - page_reads, 3);
+
+    let latest = dataset
+        .versions_with_options(0, Some(1), true)
+        .await
+        .unwrap();
+    assert_eq!(latest[0].version, full[4].version);
+    assert_eq!(latest[0].timestamp, full[4].timestamp);
+    assert_eq!(latest[0].metadata, full[4].metadata);
+    assert_eq!(latest[0].manifest_size, full[4].manifest_size);
+    assert!(latest[0].manifest_size.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_versions_with_options_excludes_detached() {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    let schema = data.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Arc::new(dataset);
+    let detached = CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(Transaction::new(
+            dataset.version().version,
+            Operation::Append { fragments: vec![] },
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(detached.version().version, dataset.version().version);
+
+    let page = dataset.versions_with_options(0, None, true).await.unwrap();
+    assert_eq!(page.iter().map(|v| v.version).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(dataset.count_versions().await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -1826,6 +1945,209 @@ async fn test_branch_clone_preserves_landed_commit(
         dataset.scan().try_into_batch().await.unwrap()
     );
     assert_eq!(branch.versions().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_reserve_branch_pins_source_until_completion() {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = dataset.scan().try_into_batch().await.unwrap();
+    dataset.tags().create("rc", 1).await.unwrap();
+
+    let reservation = dataset.reserve_branch("exp", "rc").await.unwrap();
+    assert_eq!(reservation.branch(), "exp");
+    assert_eq!(reservation.source_branch(), None);
+    assert_eq!(reservation.source_version(), 1);
+    let contents = dataset.branches().get("exp").await.unwrap();
+    assert_eq!(&contents.identifier, reservation.identifier());
+    assert_eq!(contents.parent_version, 1);
+    let error = dataset.reserve_branch("exp", 1).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+
+    // Only the ref exists until the reservation is completed.
+    assert!(dataset.list_branches().await.unwrap().contains_key("exp"));
+    assert!(dataset.checkout_branch("exp").await.is_err());
+    let branch_path = dataset
+        .branch_location()
+        .find_branch(Some("exp"))
+        .unwrap()
+        .path;
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Moving the tag or the source branch must not change the reserved source.
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    dataset.tags().update("rc", 2).await.unwrap();
+    let branch = dataset.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    let branch = dataset.checkout_branch("exp").await.unwrap();
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(
+        branch
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        dataset.branches().get("exp").await.unwrap().identifier,
+        contents.identifier
+    );
+}
+
+#[tokio::test]
+async fn test_reserve_branch_pins_latest_version_of_source_branch() {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut dev = dataset.create_branch("dev", 1, None).await.unwrap();
+    dev.append(id_rows(10, 2), None).await.unwrap();
+    let expected = dev.scan().try_into_batch().await.unwrap();
+
+    let reservation = dataset
+        .reserve_branch("child", ("dev", None))
+        .await
+        .unwrap();
+    assert_eq!(reservation.source_branch(), Some("dev"));
+    assert_eq!(reservation.source_version(), 2);
+    dev.append(id_rows(20, 2), None).await.unwrap();
+
+    let child = dataset.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
+    let contents = dataset.branches().get("child").await.unwrap();
+    assert_eq!(contents.parent_branch.as_deref(), Some("dev"));
+    assert_eq!(contents.parent_version, 2);
+}
+
+#[tokio::test]
+async fn test_complete_branch_rejects_a_removed_or_replaced_reservation() {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    let branch_path = dataset
+        .branch_location()
+        .find_branch(Some("exp"))
+        .unwrap()
+        .path;
+
+    let abandoned = dataset.reserve_branch("exp", 1).await.unwrap();
+    dataset.delete_branch("exp").await.unwrap();
+    let error = dataset.complete_branch(abandoned, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let replaced = dataset.reserve_branch("exp", 1).await.unwrap();
+    dataset.delete_branch("exp").await.unwrap();
+    let replacement = dataset.reserve_branch("exp", 2).await.unwrap();
+    let error = dataset.complete_branch(replaced, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        &dataset.branches().get("exp").await.unwrap().identifier,
+        replacement.identifier()
+    );
+
+    let branch = dataset.complete_branch(replacement, None).await.unwrap();
+    assert_eq!(branch.version().version, 2);
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        dataset.scan().try_into_batch().await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_complete_branch_commits_through_the_completing_handle() {
+    let tempdir = TempStrDir::default();
+    let dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let reservation = dataset.reserve_branch("exp", 1).await.unwrap();
+    let identifier = reservation.identifier().clone();
+
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let completer = DatasetBuilder::from_uri(dataset.uri())
+        .with_commit_handler(handler.clone())
+        .load()
+        .await
+        .unwrap();
+    handler.fail_next(AmbiguousFailure::FailOutright);
+    let error = completer
+        .complete_branch(reservation, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated outright commit failure"),
+        "{error}"
+    );
+    // As with create_branch, a failed clone keeps the reservation.
+    assert_eq!(
+        dataset.branches().get("exp").await.unwrap().identifier,
+        identifier
+    );
+    assert!(dataset.checkout_branch("exp").await.is_err());
 }
 
 #[rstest]
@@ -3874,6 +4196,274 @@ async fn test_branch() {
         .await
         .unwrap();
     assert!(branches.is_empty());
+}
+
+/// Delays every read under `_versions/` and records how many are in flight at once.
+///
+/// Also counts the manifest entries each listing actually yields, which is what a
+/// consumer can stop early on; the store may still have materialized every key.
+#[derive(Debug, Default)]
+struct ManifestReadProbe {
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+    listed_manifests: Arc<AtomicUsize>,
+}
+
+impl lance_io::object_store::WrappingObjectStore for ManifestReadProbe {
+    fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+        Arc::new(ManifestReadProbeStore {
+            inner: original,
+            in_flight: self.in_flight.clone(),
+            peak_in_flight: self.peak_in_flight.clone(),
+            listed_manifests: self.listed_manifests.clone(),
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+#[derive(Debug)]
+struct ManifestReadProbeStore {
+    inner: Arc<dyn OSObjectStore>,
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+    listed_manifests: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Display for ManifestReadProbeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ManifestReadProbeStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for ManifestReadProbeStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if !path.as_ref().contains("_versions/") {
+            return self.inner.get_opts(path, options).await;
+        }
+        let in_flight = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        self.peak_in_flight
+            .fetch_max(in_flight, AtomicOrdering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let result = self.inner.get_opts(path, options).await;
+        self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let listed_manifests = self.listed_manifests.clone();
+        self.inner
+            .list(prefix)
+            .map(move |entry| {
+                // Count the entries `list_manifests` accepts, not every key in the
+                // directory, and only once the stream yields them.
+                if entry
+                    .as_ref()
+                    .is_ok_and(|meta| ManifestLocation::try_from(meta.clone()).is_ok())
+                {
+                    listed_manifests.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                entry
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test]
+async fn test_versions_reads_manifests_concurrently() {
+    const VERSIONS: i32 = 12;
+
+    let mut dataset = Dataset::write(id_rows(0, 1), "memory://", None)
+        .await
+        .unwrap();
+    for i in 1..VERSIONS {
+        dataset.append(id_rows(i, 1), None).await.unwrap();
+    }
+
+    let probe = Arc::new(ManifestReadProbe::default());
+    let dataset = dataset.with_object_store_wrappers(vec![
+        probe.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+    ]);
+    // LANCE_IO_THREADS can legitimately reduce the window to one, so overlap is
+    // only required when the effective window permits it.
+    let effective_window = dataset.object_store.io_parallelism();
+    let versions = dataset.versions().await.unwrap();
+
+    let ids: Vec<u64> = versions.iter().map(|v| v.version).collect();
+    assert_eq!(ids, (1..=VERSIONS as u64).collect::<Vec<_>>());
+
+    let peak_in_flight = probe.peak_in_flight.load(AtomicOrdering::SeqCst);
+    let max_in_flight = (VERSIONS as usize).min(effective_window);
+    assert!(
+        peak_in_flight > 0,
+        "no manifest reads were observed through the probe"
+    );
+    assert!(
+        peak_in_flight <= max_in_flight,
+        "observed {peak_in_flight} concurrent manifest reads, but at most \
+         {max_in_flight} are expected for {VERSIONS} versions with an effective window of \
+         {effective_window}"
+    );
+    if effective_window > 1 {
+        assert!(
+            peak_in_flight > 1,
+            "manifests were read one at a time despite an effective window of {effective_window}"
+        );
+    }
+}
+
+/// A descending page on a lexically ordered store with V2 manifest names stops
+/// consuming the listing once the page is filled.
+#[tokio::test]
+async fn test_versions_descending_page_stops_listing_early() {
+    let dataset = write_versions("memory://", 5, true).await;
+    let probe = Arc::new(ManifestReadProbe::default());
+    let dataset = dataset.with_object_store_wrappers(vec![
+        probe.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+    ]);
+
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    let page = dataset
+        .versions_with_options(1, Some(2), true)
+        .await
+        .unwrap();
+    assert_eq!(version_ids(&page), vec![4, 3]);
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        3,
+        "a descending page of 2 at offset 1 should stop after 3 manifest entries"
+    );
+
+    // A zero limit returns without listing at all.
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    assert!(
+        dataset
+            .versions_with_options(0, Some(0), true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        0,
+        "a zero limit must not list any manifest"
+    );
+
+    // Ascending pages select from the full history, so they enumerate it.
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    let page = dataset
+        .versions_with_options(3, Some(2), false)
+        .await
+        .unwrap();
+    assert_eq!(version_ids(&page), vec![4, 5]);
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        5,
+        "an ascending page must enumerate every manifest location"
+    );
+}
+
+/// When the listing cannot stop early (V1 names, or a store whose listing is not
+/// lexically ordered) the descending page still selects the same versions, but it
+/// consumes the whole directory in order to sort it.
+#[rstest]
+#[case::v1_naming(false, false)]
+#[case::local_store(true, true)]
+#[tokio::test]
+async fn test_versions_descending_page_enumerates_all_when_it_cannot_stop_early(
+    #[case] local_store: bool,
+    #[case] enable_v2_manifest_paths: bool,
+) {
+    let temp_dir = TempStrDir::default();
+    let uri = if local_store {
+        temp_dir.as_str().to_string()
+    } else {
+        "memory://".to_string()
+    };
+    let dataset = write_versions(&uri, 5, enable_v2_manifest_paths).await;
+    let probe = Arc::new(ManifestReadProbe::default());
+    let dataset = dataset.with_object_store_wrappers(vec![
+        probe.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+    ]);
+    let context =
+        format!("local_store={local_store}, enable_v2_manifest_paths={enable_v2_manifest_paths}");
+
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    let page = dataset
+        .versions_with_options(1, Some(2), true)
+        .await
+        .unwrap();
+    assert_eq!(version_ids(&page), vec![4, 3], "{context}");
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        5,
+        "the page is selected by sorting, so every entry is consumed: {context}"
+    );
+}
+
+fn version_ids(versions: &[crate::dataset::Version]) -> Vec<u64> {
+    versions.iter().map(|version| version.version).collect()
+}
+
+async fn write_versions(uri: &str, count: i32, enable_v2_manifest_paths: bool) -> Dataset {
+    let mut dataset = Dataset::write(
+        id_rows(0, 1),
+        uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for i in 1..count {
+        dataset.append(id_rows(i, 1), None).await.unwrap();
+    }
+    dataset
 }
 
 fn id_rows(start: i32, rows: u64) -> impl RecordBatchReader + Send + 'static {
