@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -51,6 +52,7 @@ pub struct InsertBuilder<'a> {
     dest: WriteDestination<'a>,
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
+    initial_config: Option<HashMap<String, String>>,
     write_progress: Option<WriteProgressFn>,
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
@@ -62,6 +64,7 @@ impl<'a> InsertBuilder<'a> {
         Self {
             dest: dest.into(),
             params: None,
+            initial_config: None,
             write_progress: None,
             preassigned_data_file_name: None,
             inherited_field_ids: false,
@@ -71,6 +74,20 @@ impl<'a> InsertBuilder<'a> {
 
     pub fn with_params(mut self, params: &'a WriteParams) -> Self {
         self.params = Some(params);
+        self
+    }
+
+    /// Set manifest config for a new dataset's first version. This has no effect
+    /// on existing datasets. Explicit [`super::AutoCleanupParams`] take precedence.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance::dataset::InsertBuilder;
+    /// let builder = InsertBuilder::new("/tmp/example.lance")
+    ///     .with_initial_config(HashMap::from([("app.owner".into(), "analytics".into())]));
+    /// ```
+    pub fn with_initial_config(mut self, config: HashMap<String, String>) -> Self {
+        self.initial_config = Some(config);
         self
     }
 
@@ -272,19 +289,20 @@ impl<'a> InsertBuilder<'a> {
         ))
         .await?;
 
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
+        let transaction = self.build_transaction(written_schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
 
     fn build_transaction(
+        &self,
         schema: Schema,
         fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                let mut upsert_values = context.params.initial_config.clone().unwrap_or_default();
+                let mut upsert_values = self.initial_config.clone().unwrap_or_default();
                 if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
                     upsert_values.insert(
                         String::from("lance.auto_cleanup.interval"),
@@ -530,11 +548,11 @@ mod test {
         let batch = record_batch!(("id", Int32, [1])).unwrap();
         let params = WriteParams {
             mode,
-            initial_config: Some(HashMap::from([("app.owner".into(), "analytics".into())])),
             ..Default::default()
         };
         let dataset = InsertBuilder::new(dir.as_ref())
             .with_params(&params)
+            .with_initial_config(HashMap::from([("app.owner".into(), "analytics".into())]))
             .execute(vec![batch.clone()])
             .await
             .unwrap();
@@ -545,22 +563,22 @@ mod test {
 
         let params = WriteParams {
             mode: WriteMode::Overwrite,
-            initial_config: Some(HashMap::from([("app.owner".into(), "other".into())])),
             ..Default::default()
         };
         let updated = InsertBuilder::new(Arc::new(reopened))
             .with_params(&params)
+            .with_initial_config(HashMap::from([("app.owner".into(), "other".into())]))
             .execute(vec![batch.clone()])
             .await
             .unwrap();
         assert_eq!(updated.config().get("app.owner").unwrap(), "analytics");
         let params = WriteParams {
             mode: WriteMode::Append,
-            initial_config: Some(HashMap::from([("app.owner".into(), "other".into())])),
             ..Default::default()
         };
         let updated = InsertBuilder::new(Arc::new(updated))
             .with_params(&params)
+            .with_initial_config(HashMap::from([("app.owner".into(), "other".into())]))
             .execute(vec![batch])
             .await
             .unwrap();
@@ -571,15 +589,15 @@ mod test {
     async fn auto_cleanup_overrides_initial_config() {
         let dir = TempStrDir::default();
         let params = WriteParams {
-            initial_config: Some(HashMap::from([(
-                "lance.auto_cleanup.interval".into(),
-                "99".into(),
-            )])),
             auto_cleanup: Some(Default::default()),
             ..Default::default()
         };
         let dataset = InsertBuilder::new(dir.as_ref())
             .with_params(&params)
+            .with_initial_config(HashMap::from([(
+                "lance.auto_cleanup.interval".into(),
+                "99".into(),
+            )]))
             .execute(vec![record_batch!(("id", Int32, [1])).unwrap()])
             .await
             .unwrap();

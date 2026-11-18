@@ -24,7 +24,7 @@ use jni::sys::{jboolean, jlong};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::Ref;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{Dataset, ReadParams, WriteParams};
+use lance::dataset::{Dataset, InsertBuilder, ReadParams, WriteParams};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
@@ -107,9 +107,15 @@ impl BlockingDataset {
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
-        params: Option<WriteParams>,
+        params: WriteParams,
+        initial_config: HashMap<String, String>,
     ) -> Result<Self> {
-        let inner = block_on(Dataset::write(reader, uri, params))?;
+        let inner = block_on(
+            InsertBuilder::new(uri)
+                .with_params(&params)
+                .with_initial_config(initial_config)
+                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>),
+        )?;
         Ok(Self { inner })
     }
 
@@ -510,7 +516,7 @@ fn create_dataset<'local>(
     )?;
 
     let initial_config = JMap::from_env(env, &initial_config)?;
-    write_params.initial_config = Some(to_rust_map(env, &initial_config)?);
+    let initial_config = to_rust_map(env, &initial_config)?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
     if let Some((namespace, table_id)) = namespace_info {
@@ -552,7 +558,7 @@ fn create_dataset<'local>(
         });
     }
 
-    let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
+    let dataset = BlockingDataset::write(reader, &path_str, write_params, initial_config)?;
     dataset.into_java(env)
 }
 
