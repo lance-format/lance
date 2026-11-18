@@ -31,8 +31,14 @@
 //! delay are included in elapsed time. This is a Lance-path experiment, not
 //! PE/RPC/QN, external HTTP/IPC sink, or process-wide server acceptance.
 //!
-//! Build with `T210_SOURCE_HEAD=<verified full SHA>` and the pinned
-//! `release-with-debug` profile on a managed VM. Correctness tests below run in
+//! Build with `T210_SOURCE_HEAD=<verified full SHA> cargo build --locked
+//! --profile release-with-debug -p lance-examples --example admitted_dataset`
+//! on a managed VM. Do not build this harness as a `lance` package example: its
+//! dev-dependencies enable `lance-io/test-util`, which retains every I/O request
+//! and path until the tracker is dropped. That changes memory use with read count.
+//! Record the resolved feature graph and reject `lance-io/test-util` before
+//! measuring. Use this same artifact for all compared modes; historical
+//! test-util builds remain separate diagnostic evidence. Correctness tests run in
 //! CI without timing or process-memory measurement. Never run this benchmark on
 //! the developer laptop. No default scanner, dependency or format is changed.
 

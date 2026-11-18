@@ -12,6 +12,10 @@ categories.workspace = true
 rust-version.workspace = true
 
 [[example]]
+name = "admitted_dataset"
+path = "src/admitted_dataset.rs"
+
+[[example]]
 name = "full_text_search"
 path = "src/full_text_search.rs"
 
@@ -33,6 +37,8 @@ path = "src/write_read_ds.rs"
 
 [dependencies]
 arrow = { workspace = true }
+arrow-array.workspace = true
+blake3.workspace = true
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -41,6 +47,9 @@ futures = { workspace = true }
 lance = { workspace = true, features = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "goosefs"] }
 lance-index = { workspace = true }
 lance-core = { workspace = true }
+lance-encoding.workspace = true
+lance-file.workspace = true
+lance-io.workspace = true
 lance-linalg = { workspace = true }
 lance-datagen = { workspace = true }
 object_store = {workspace = true}
@@ -52,3 +61,9 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
 parquet = { workspace = true, features = ["snap"] }
 tokenizers = "0.22.2"
 rand.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
