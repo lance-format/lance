@@ -46,7 +46,7 @@ def load(sweep):
     with open(sweep / "sweep.jsonl") as f:
         runs = [json.loads(line) for line in f if line.strip()]
     for run in runs:
-        run["build"] = "profile" if run["profiled"] else "timing"
+        run["build"] = run["label"].rsplit("-", 1)[-1]
     return runs
 
 
@@ -131,8 +131,13 @@ class Results:
             r for r in self.runs if all(dict(key(r))[f] == v for f, v in fields.items())
         ]
 
+    def one(self, **fields):
+        """The first matching run, or None when the sweep skipped it."""
+        runs = self.select(**fields)
+        return runs[0] if runs else None
+
     def clean_secs(self, alg, dim, n, k, threads):
-        """Median training time of the unprofiled runs."""
+        """Median training time of the unprofiled runs, NaN without any."""
         runs = self.select(
             alg=alg,
             dim=dim,
@@ -143,6 +148,8 @@ class Results:
             threads=threads,
             build="timing",
         )
+        if not runs:
+            return float("nan")
         return float(np.median([r["train_secs"] for r in runs]))
 
     def mse_ratio(self, runs, resamples=1000):
@@ -150,7 +157,7 @@ class Results:
         95% bootstrap interval over queries drawn the same for both runs."""
         pairs = []
         for run in runs:
-            baseline = self.get(run, alg="lloyd", scale=1.0, epochs=3)
+            baseline = self.get(run, alg="lloyd", scale=1.0, epochs=3, build="timing")
             if baseline is not None:
                 pairs.append((self.dist(run), self.dist(baseline)))
         if not pairs:
@@ -198,7 +205,7 @@ def plot_dims(res, plt, n, k, dims):
                 threads=P,
                 build="profile",
             )[0]
-            single = res.select(
+            single = res.one(
                 alg=alg,
                 dim=dim,
                 rows=n,
@@ -207,13 +214,13 @@ def plot_dims(res, plt, n, k, dims):
                 epochs=3,
                 threads=1,
                 build="profile",
-            )[0]
+            )
             eff.append(
                 res.clean_secs(alg, dim, n, k, 1)
                 / (P * res.clean_secs(alg, dim, n, k, P))
             )
             idle.append(capacity_split(full)["idle"] / (P * full["train_secs"]))
-            inflation.append(busy(full) / busy(single) - 1)
+            inflation.append(busy(full) / busy(single) - 1 if single else np.nan)
             mse.append(res.mse_ratio(timing))
         med = np.array(med)
         axes[0, 0].errorbar(
@@ -261,15 +268,12 @@ def plot_dims(res, plt, n, k, dims):
                 )
 
             lloyd = {r["seed"]: r["train_secs"] for r in pick("lloyd")}
-            speedups.append(
-                np.median(
-                    [
-                        lloyd[r["seed"]] / r["train_secs"]
-                        for r in pick("emeans")
-                        if r["seed"] in lloyd
-                    ]
-                )
-            )
+            paired = [
+                lloyd[r["seed"]] / r["train_secs"]
+                for r in pick("emeans")
+                if r["seed"] in lloyd
+            ]
+            speedups.append(np.median(paired) if paired else np.nan)
         axes[0, 1].plot(dims, speedups, style, color=COLORS["emeans"], label=label)
     ceiling = [
         res.select(
@@ -321,7 +325,7 @@ def plot_dims_breakdown(res, plt, n, k, dims):
             bottoms = np.zeros(len(dims))
             totals = []
             for dim_index, dim in enumerate(dims):
-                run = res.select(
+                run = res.one(
                     alg=alg,
                     dim=dim,
                     rows=n,
@@ -330,7 +334,10 @@ def plot_dims_breakdown(res, plt, n, k, dims):
                     epochs=3,
                     threads=threads,
                     build="profile",
-                )[0]
+                )
+                if run is None:
+                    totals.append(None)
+                    continue
                 split = step_split(run) if threads == 1 else capacity_split(run)
                 total = run["train_secs"] * threads
                 totals.append(run["train_secs"])
@@ -355,6 +362,8 @@ def plot_dims_breakdown(res, plt, n, k, dims):
                         )
                     bottoms[dim_index] += share
             for dim_index, secs in enumerate(totals):
+                if secs is None:
+                    continue
                 axis.text(dim_index, 1.01, f"{secs:.3g}s", ha="center", fontsize=8)
             axis.set_xticks(range(len(dims)), [str(d) for d in dims])
             axis.set_xlabel("vector dimension")
@@ -380,7 +389,7 @@ def plot_root(res, plt, n, k, dims):
         share, train_eff, member_eff = [], [], []
         for dim in dims:
             full, single = (
-                res.select(
+                res.one(
                     alg=alg,
                     dim=dim,
                     rows=n,
@@ -389,7 +398,7 @@ def plot_root(res, plt, n, k, dims):
                     epochs=3,
                     threads=t,
                     build="profile",
-                )[0]
+                )
                 for t in (P, 1)
             )
             share.append(root_secs(full) / full["train_secs"])
@@ -397,6 +406,10 @@ def plot_root(res, plt, n, k, dims):
             def first(run, p):
                 return run["phases"][p]["first_secs"]
 
+            if single is None:
+                train_eff.append(np.nan)
+                member_eff.append(np.nan)
+                continue
             train_eff.append(
                 first(single, "node_train") / (P * first(full, "node_train"))
             )
@@ -527,10 +540,12 @@ def plot_threads(res, plt, n, k):
                 ),
                 key=lambda r: r["threads"],
             )
-            t1 = runs[0]["train_secs"]
+            # Without a one-thread run, speedup is extrapolated from the
+            # fewest threads measured as if those scaled perfectly.
+            reference = runs[0]["train_secs"] * runs[0]["threads"]
             axis.plot(
                 [r["threads"] for r in runs],
-                [t1 / r["train_secs"] for r in runs],
+                [reference / r["train_secs"] for r in runs],
                 "o-",
                 color=COLORS[alg],
                 label=NAMES[alg],
@@ -645,7 +660,7 @@ def summary(res, n, k, dims, large):
             row.append(f"{secs[alg]:.1f}")
         row.append(f"{secs['lloyd'] / secs['emeans']:.2f}x")
         prof = {
-            (alg, t): res.select(
+            (alg, t): res.one(
                 alg=alg,
                 dim=dim,
                 rows=n,
@@ -654,7 +669,7 @@ def summary(res, n, k, dims, large):
                 epochs=3,
                 threads=t,
                 build="profile",
-            )[0]
+            )
             for alg in ALGORITHMS
             for t in (1, P)
         }
@@ -663,7 +678,11 @@ def summary(res, n, k, dims, large):
             for alg in ALGORITHMS
             for t in (1, P)
         }
-        row.append(f"{clean[('lloyd', 1)] / clean[('emeans', 1)]:.2f}x")
+        row.append(
+            f"{clean[('lloyd', 1)] / clean[('emeans', 1)]:.2f}x"
+            if not np.isnan(clean[("emeans", 1)])
+            else ""
+        )
         mse = res.mse_ratio(
             res.select(
                 alg="emeans",
@@ -678,7 +697,8 @@ def summary(res, n, k, dims, large):
         )
         row.append(f"{mse[0]:.4f} [{mse[1]:.4f}, {mse[2]:.4f}]")
         for alg in ALGORITHMS:
-            row.append(f"{clean[(alg, 1)] / (P * clean[(alg, P)]):.0%}")
+            eff = clean[(alg, 1)] / (P * clean[(alg, P)])
+            row.append("" if np.isnan(eff) else f"{eff:.0%}")
         for alg in ALGORITHMS:
             full = prof[(alg, P)]
             row.append(f"{capacity_split(full)['idle'] / (P * full['train_secs']):.0%}")
@@ -694,7 +714,7 @@ def summary(res, n, k, dims, large):
     lines.append("|" + "---|" * (len(STEPS) + 4))
     for dim in dims:
         for alg in ALGORITHMS:
-            run = res.select(
+            run = res.one(
                 alg=alg,
                 dim=dim,
                 rows=n,
@@ -703,7 +723,9 @@ def summary(res, n, k, dims, large):
                 epochs=3,
                 threads=1,
                 build="profile",
-            )[0]
+            )
+            if run is None:
+                continue
             split = step_split(run)
             assign = (
                 split["node training: assign"]
@@ -715,6 +737,28 @@ def summary(res, n, k, dims, large):
                 + " | ".join(f"{split[s]:.1f}" for s in STEPS)
                 + f" | {assign / (assign + update):.1%} | "
                 f"{update / (assign + update):.1%} |"
+            )
+
+    baselines = res.select(rows=n, k=k, build="baseline")
+    if baselines:
+        lines.append("\n## e-means before and after this revision\n")
+        lines.append(
+            "Same seeds; `before` is `bin/emeans_bench_baseline`.\n\n"
+            "| d | before s | after s | speedup | MSE after / before |"
+        )
+        lines.append("|---|---|---|---|---|")
+        for dim in sorted({r["dim"] for r in baselines}):
+            pairs = [
+                (r, res.get(r, build="timing"))
+                for r in baselines
+                if r["dim"] == dim and res.get(r, build="timing")
+            ]
+            before = np.median([b["train_secs"] for b, _ in pairs])
+            after = np.median([a["train_secs"] for _, a in pairs])
+            mse = np.mean([res.dist(a).mean() / res.dist(b).mean() for b, a in pairs])
+            lines.append(
+                f"| {dim} | {before:.1f} | {after:.1f} | {before / after:.2f}x | "
+                f"{mse:.4f} |"
             )
 
     for param, values, title in [
@@ -852,7 +896,9 @@ def main():
     dims = sorted(
         {
             r["dim"]
-            for r in res.select(rows=n, k=k, alg="lloyd", build="profile", threads=1)
+            for r in res.select(
+                rows=n, k=k, alg="lloyd", build="timing", threads=res.max_threads
+            )
         }
     )
     plot_dims(res, plt, n, k, dims)

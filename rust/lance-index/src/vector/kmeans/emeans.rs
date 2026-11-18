@@ -62,12 +62,11 @@ const LARGE_DATASET_ROWS: usize = 2_000_000;
 /// about 20 µs of work, so per-task scheduling overhead stays negligible even
 /// for the 16-centroid nodes of hierarchical training.
 const MIN_TASK_DISTANCE_TERMS: usize = 1 << 16;
-/// Upper bound on the parallel tasks one batch is split into, which bounds the
-/// private sum tables a batch allocates.
+/// Upper bound on the parallel tasks one batch is split into, per pass.
 const MAX_BATCH_TASKS: usize = 64;
-/// Centroid sum tables up to this size are replicated per assignment task; see
-/// [`assign_batch`].
-const TASK_SUMS_MAX_BYTES: usize = 1024 * 1024;
+/// Minimum vector components a parallel summation task adds, about 5 µs of
+/// work, so small batches are summed by few tasks.
+const MIN_TASK_SUM_TERMS: usize = 1 << 14;
 
 /// How many vectors each e-means mini-batch holds.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -368,18 +367,6 @@ impl BatchStats {
         }
     }
 
-    fn add<N: Float>(&mut self, cluster: usize, vector: &[N], distance: f32) {
-        let dimension = vector.len();
-        self.counts[cluster] += 1.0;
-        for (sum, value) in self.sums[cluster * dimension..(cluster + 1) * dimension]
-            .iter_mut()
-            .zip(vector)
-        {
-            *sum += to_f64(*value);
-        }
-        self.loss += f64::from(distance);
-    }
-
     fn merge(&mut self, other: &Self) {
         for (count, other) in self.counts.iter_mut().zip(&other.counts) {
             *count += other;
@@ -391,27 +378,35 @@ impl BatchStats {
     }
 }
 
-/// Rows of a batch per parallel task: enough that a task scores at least
-/// `MIN_TASK_DISTANCE_TERMS` vector-centroid coordinate pairs, so the
+/// Rows of a batch per parallel assignment task: enough that a task scores at
+/// least `MIN_TASK_DISTANCE_TERMS` vector-centroid coordinate pairs, so the
 /// scheduling cost of a task stays small next to its work, and few enough that
-/// a batch yields at most `MAX_BATCH_TASKS` tasks. Derived only from the
-/// problem shape, never the thread count, so the summation order, and with it
-/// the trained centroids, is the same on every host.
+/// a batch yields at most `MAX_BATCH_TASKS` tasks.
 fn rows_per_task(batch_len: usize, k: usize, dimension: usize) -> usize {
     let min_rows = MIN_TASK_DISTANCE_TERMS.div_ceil(k * dimension);
     min_rows.max(batch_len.div_ceil(MAX_BATCH_TASKS)).max(1)
 }
 
+/// Clusters whose sums one parallel summation task owns: enough that a task
+/// adds about `MIN_TASK_SUM_TERMS` components, and at most `MAX_BATCH_TASKS`
+/// tasks per batch.
+fn clusters_per_task(batch_len: usize, k: usize, dimension: usize) -> usize {
+    let tasks = (batch_len * dimension / MIN_TASK_SUM_TERMS).clamp(1, MAX_BATCH_TASKS.min(k));
+    k.div_ceil(tasks)
+}
+
 /// Assigns every vector of `batch` (row ids into `values`) to its nearest
 /// centroid and returns the batch's per-cluster statistics.
 ///
-/// The batch is split into tasks of [`rows_per_task`] rows that run on the
-/// rayon pool, so it nests under the sibling sub-trees of hierarchical
-/// training and idle threads steal tasks from either. With a small centroid
-/// table each task also sums its own rows into a private table, merged in task
-/// order; a large table would be costly to replicate per task, so its tasks
-/// only assign and the sums are taken in one pass afterwards. A vector whose
-/// distances to every centroid are NaN joins no cluster.
+/// Both passes run on the rayon pool, so they nest under the sibling sub-trees
+/// of hierarchical training and idle threads steal tasks from either. The
+/// assignment pass splits the batch into tasks of [`rows_per_task`] rows. The
+/// summation pass splits the clusters into ranges of [`clusters_per_task`]:
+/// each task scans the assignments and adds the vectors that joined its
+/// clusters straight into the batch's table, so every component is added once
+/// and no per-task table is zeroed or merged. Sums are taken in batch order,
+/// independent of the thread count. A vector whose distances to every centroid
+/// are NaN joins no cluster.
 fn assign_batch<N: NearestCentroid>(
     values: &[N],
     dimension: usize,
@@ -419,54 +414,59 @@ fn assign_batch<N: NearestCentroid>(
     k: usize,
     batch: &[usize],
 ) -> BatchStats {
-    let rows_per_task = rows_per_task(batch.len(), k, dimension);
     let prepare_busy = profile::work(Work::Assign);
     let prepared = N::prepare_centroids(centroids, dimension);
     drop(prepare_busy);
-    let assign = |rows: &[usize]| {
-        let _busy = profile::work(Work::Assign);
-        let mut assignments = Vec::with_capacity(rows.len());
-        N::assign_rows(
-            values,
-            dimension,
-            centroids,
-            &prepared,
-            rows,
-            &mut assignments,
-        );
-        assignments
-    };
-    let accumulate = |stats: &mut BatchStats, rows: &[usize], assignments: &[Assignment]| {
-        let _busy = profile::work(Work::Update);
-        for (&row, assignment) in rows.iter().zip(assignments) {
-            if let Some((cluster, distance)) = *assignment {
-                let vector = &values[row * dimension..(row + 1) * dimension];
-                stats.add(cluster as usize, vector, distance);
-            }
-        }
-    };
+    let assignments: Vec<Assignment> = batch
+        .par_chunks(rows_per_task(batch.len(), k, dimension))
+        .flat_map_iter(|rows| {
+            let _busy = profile::work(Work::Assign);
+            let mut assignments = Vec::with_capacity(rows.len());
+            N::assign_rows(
+                values,
+                dimension,
+                centroids,
+                &prepared,
+                rows,
+                &mut assignments,
+            );
+            assignments
+        })
+        .collect();
 
     let mut stats = BatchStats::zeros(k, dimension);
-    if k * dimension * size_of::<f64>() <= TASK_SUMS_MAX_BYTES {
-        let partials: Vec<BatchStats> = batch
-            .par_chunks(rows_per_task)
-            .map(|rows| {
-                let mut partial = BatchStats::zeros(k, dimension);
-                accumulate(&mut partial, rows, &assign(rows));
-                partial
-            })
-            .collect();
-        let _busy = profile::work(Work::Update);
-        for partial in &partials {
-            stats.merge(partial);
-        }
-    } else {
-        let assignments: Vec<Assignment> = batch
-            .par_chunks(rows_per_task)
-            .flat_map_iter(assign)
-            .collect();
-        accumulate(&mut stats, batch, &assignments);
+    let counts_busy = profile::work(Work::Update);
+    for (cluster, distance) in assignments.iter().flatten() {
+        stats.counts[*cluster as usize] += 1.0;
+        stats.loss += f64::from(*distance);
     }
+    drop(counts_busy);
+    let clusters_per_task = clusters_per_task(batch.len(), k, dimension);
+    stats
+        .sums
+        .par_chunks_mut(clusters_per_task * dimension)
+        .enumerate()
+        .for_each(|(task, sums)| {
+            let _busy = profile::work(Work::Update);
+            let first_cluster = task * clusters_per_task;
+            for (&row, assignment) in batch.iter().zip(&assignments) {
+                let Some((cluster, _)) = *assignment else {
+                    continue;
+                };
+                let Some(local) = (cluster as usize).checked_sub(first_cluster) else {
+                    continue;
+                };
+                let Some(sum) = sums.get_mut(local * dimension..(local + 1) * dimension) else {
+                    continue;
+                };
+                for (sum, value) in sum
+                    .iter_mut()
+                    .zip(&values[row * dimension..(row + 1) * dimension])
+                {
+                    *sum += to_f64(*value);
+                }
+            }
+        });
     stats
 }
 
@@ -720,6 +720,59 @@ mod tests {
         revive_dead_clusters(&mut counts, &mut sums, 1, 0.1, &mut rng);
         assert_eq!(counts, vec![10.0, 2.0, 5.0]);
         assert_eq!(sums, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// Every summation task adds exactly the vectors of its clusters, whatever
+    /// the split: the batch statistics match a sequential pass.
+    #[rstest]
+    #[case::one_sum_task(256, 16, 8)]
+    #[case::one_cluster_per_task(256, 16, 1_024)]
+    #[case::cluster_ranges(4_096, 1_000, 64)]
+    fn test_assign_batch_matches_sequential_sums(
+        #[case] batch_len: usize,
+        #[case] k: usize,
+        #[case] dimension: usize,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(5);
+        let mut values: Vec<f32> = (0..2 * batch_len * dimension)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        // A NaN vector joins no cluster.
+        values[..dimension].fill(f32::NAN);
+        let centroids: Vec<f32> = values[batch_len * dimension..][..k * dimension].to_vec();
+        let mut batch: Vec<usize> = (1..2 * batch_len).collect();
+        batch.shuffle(&mut rng);
+        batch.truncate(batch_len - 1);
+        batch.push(0);
+
+        let stats = assign_batch(&values, dimension, &centroids, k, &batch);
+
+        let norms = f32::prepare_centroids(&centroids, dimension);
+        let mut assignments = Vec::new();
+        f32::assign_rows(
+            &values,
+            dimension,
+            &centroids,
+            &norms,
+            &batch,
+            &mut assignments,
+        );
+        let mut expected = BatchStats::zeros(k, dimension);
+        for (&row, assignment) in batch.iter().zip(&assignments) {
+            let Some((cluster, distance)) = *assignment else {
+                continue;
+            };
+            let cluster = cluster as usize;
+            expected.counts[cluster] += 1.0;
+            expected.loss += f64::from(distance);
+            for d in 0..dimension {
+                expected.sums[cluster * dimension + d] += f64::from(values[row * dimension + d]);
+            }
+        }
+        assert_eq!(stats.counts, expected.counts);
+        assert_eq!(stats.sums, expected.sums);
+        assert_eq!(stats.loss, expected.loss);
+        assert_eq!(stats.counts.iter().sum::<f64>(), (batch_len - 1) as f64);
     }
 
     #[rstest]
