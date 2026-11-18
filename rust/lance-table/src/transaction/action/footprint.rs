@@ -1,0 +1,1759 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! What an action set writes and what it requires of the version it lands on.
+//!
+//! Two concurrent action sets can both commit when neither writes anything the
+//! other writes. This is a structural test over coordinates rather than a
+//! matrix over operation pairs, so it stays a single rule as the vocabulary
+//! grows -- adding an action means saying which coordinates it writes, not
+//! extending an N-by-N table.
+//!
+//! Footprints are derived from the actions at conflict time and never
+//! serialized. A writer cannot pin down what a reader considers a conflict, and
+//! the rule can be tightened in a later release without a format change.
+//!
+//! Which coordinates an action writes is decided by that action, in its own
+//! module. This module holds the coordinate space and the comparison.
+
+use super::{Action, CompositeOperation, FieldRef, Ref};
+use crate::format::key_existence::KeyExistenceFilter;
+use crate::transaction::UpdateMap;
+use lance_core::datatypes::{Field, Schema};
+use roaring::RoaringTreemap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// One thing an action set writes.
+///
+/// Only committed coordinates appear. A minted fragment, field, or base has no
+/// id in the read version, so no concurrent writer can be naming the same
+/// thing; relocation re-resolves it against whatever version wins. Apply
+/// rejects a committed id above the read version's high-water mark, so a
+/// committed coordinate always names something the writer read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Coordinate {
+    /// Whether a committed fragment is still part of the dataset.
+    FragmentExistence(u64),
+    /// A committed fragment's deletion file.
+    FragmentDeletions(u64),
+    /// A committed fragment's per-row version sequences.
+    FragmentRowVersions(u64),
+    /// The data backing one field within one committed fragment.
+    FieldData { fragment: u64, field: i32 },
+    /// A field's definition in the schema.
+    FieldDefinition(i32),
+    /// The schema new rows and values are written in. Every set that adds
+    /// rows, or writes values for a committed field, requires it, because a
+    /// writer prepares them against the schema it read: a row minted later
+    /// carries no value for a non-nullable column added in between, and a value
+    /// written later may be a null under an ancestor or descendant made
+    /// required in between. A set that adds such a column, or makes a column
+    /// required, writes it. So does one that adds a child under a committed
+    /// parent, which a stale writer may write packed without the child. A stale
+    /// writer cannot name a field it does not write, so the field's own
+    /// coordinates cannot say this.
+    NewRowSchema,
+    /// A field's name. Names only have to be unique among siblings, but a
+    /// footprint has no schema to place a field among its siblings, so a name
+    /// coordinates table-wide: two writers adding a `c` under different structs
+    /// collide as if they had added it at the top level. The cost is a spurious
+    /// conflict in that case; the alternative is two fields called `c` side by
+    /// side, which no reader can tell apart.
+    FieldName(String),
+    /// A base path's name, where it has one. Names must be unique; an unset
+    /// name is an absent alias rather than a name shared with every other
+    /// unnamed base, so it coordinates nothing.
+    BaseName(String),
+    /// A base path's location, which the manifest requires to be unique.
+    BaseLocation(String),
+    /// One key in one of the manifest's string maps.
+    ConfigEntry { map: ConfigMap, key: String },
+    /// One of the table-wide keys declared through field metadata. Each is set
+    /// once, on one set of fields, so two writers declaring it on fields of
+    /// their own collide even though they name different fields' metadata.
+    UnenforcedKey(UnenforcedKey),
+    /// One index segment, by uuid.
+    IndexSegment(Uuid),
+}
+
+/// One of the string maps a manifest carries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConfigMap {
+    /// Dataset config.
+    Config,
+    /// Table metadata.
+    TableMetadata,
+    /// Schema-level metadata.
+    SchemaMetadata,
+    /// One field's metadata, by field id.
+    Field(i32),
+}
+
+/// A key the table declares once, across its fields, through reserved field
+/// metadata entries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UnenforcedKey {
+    Primary,
+    Clustering,
+}
+
+impl Coordinate {
+    /// The fragment this coordinate lives in, if it is fragment-scoped.
+    fn fragment(&self) -> Option<u64> {
+        match self {
+            Self::FragmentExistence(id)
+            | Self::FragmentDeletions(id)
+            | Self::FragmentRowVersions(id) => Some(*id),
+            Self::FieldData { fragment, .. } => Some(*fragment),
+            Self::FieldDefinition(_)
+            | Self::NewRowSchema
+            | Self::FieldName(_)
+            | Self::BaseName(_)
+            | Self::BaseLocation(_)
+            | Self::ConfigEntry { .. }
+            | Self::UnenforcedKey(_)
+            | Self::IndexSegment(_) => None,
+        }
+    }
+
+    /// The string map this coordinate is a key in, if it is one.
+    fn config_map(&self) -> Option<&ConfigMap> {
+        match self {
+            Self::ConfigEntry { map, .. } => Some(map),
+            _ => None,
+        }
+    }
+}
+
+/// How an action set touches a coordinate. Ordered weakest to strongest, so
+/// that a set touching one coordinate two ways is summarized by the maximum.
+///
+/// The whole conflict rule between two sets is the table in
+/// [`pair_conflicts`]: one row per mode of the set being committed, one column
+/// per mode of the set that committed before it. A new way of touching a
+/// coordinate is a new variant here and a new row and column there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Mode {
+    /// Needs the coordinate's values not to be replaced in place, but not the
+    /// fragment holding them to survive: what an index segment needs of the
+    /// data it describes. The format gives a reader no way to notice that the
+    /// values were replaced underneath a segment, but it does show that their
+    /// fragment was removed, and a segment naming a removed fragment either
+    /// reaches its rows through the fragment reuse history or loses that
+    /// coverage. So unlike [`Mode::Requires`], a removal of the fragment
+    /// does not collide with it; see [`Footprint::claims_conflict_with`].
+    RequiresUnlessRemoved,
+    /// Reads the coordinate and needs it to still hold what it read. Data
+    /// written for a committed field requires the field's definition, since
+    /// the values are encoded in the type it names. Unlike a write, two sets
+    /// may require the same coordinate -- two readers of one column do not
+    /// collide.
+    Requires,
+    /// Writes some of the coordinate and leaves the rest as it was. An overlay
+    /// is the case: new values for a subset of one field's cells in one
+    /// fragment. Two of these commute -- both land, the newer wins where they
+    /// overlap -- which is what sets it apart from a full write. So does a
+    /// move: it keeps every physical row where it was and leaves the overlays
+    /// alone, so the overlay's offsets still address its cells and the newer
+    /// overlay still wins them.
+    ///
+    /// It also serves as a conflict marker on a coordinate the set does not
+    /// change at all, where it needs exactly this row and column of the table:
+    /// collide with a full write, commute with other markers. An overlay's
+    /// claim on its fragment's deletions is the case; see
+    /// [`Footprint::write_part_of_deletions`].
+    WritesPart,
+    /// Replaces how the coordinate is stored without changing its values: a
+    /// re-encode with `data_change` false. It collides with a full write and
+    /// with another move, but not with a partial write or a requirement -- an
+    /// overlay still shadows the moved values, and an index segment built over
+    /// them still describes them.
+    Moves,
+    /// Replaces the coordinate. Two of these on one coordinate never commute.
+    Writes,
+}
+
+impl Mode {
+    /// Whether writing `region` wholesale leaves a claim of this mode on a
+    /// coordinate inside it intact: a removed fragment is visible in the
+    /// metadata, which is all [`Mode::RequiresUnlessRemoved`] needs.
+    fn is_released_by(self, region: &Region) -> bool {
+        self == Self::RequiresUnlessRemoved && matches!(region, Region::Fragment(_))
+    }
+}
+
+/// A part of the manifest an action set touches wholesale, without being able
+/// to enumerate the coordinates inside it. Compared against the other set by
+/// containment: a region write is a write of every coordinate the region holds.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Region {
+    /// A committed fragment: its existence, deletions, row versions, and the
+    /// data of every field in it.
+    Fragment(u64),
+    /// One of the manifest's string maps, every key included.
+    Map(ConfigMap),
+}
+
+impl Region {
+    fn contains(&self, coordinate: &Coordinate) -> bool {
+        match self {
+            Self::Fragment(id) => coordinate.fragment() == Some(*id),
+            Self::Map(map) => coordinate.config_map() == Some(map),
+        }
+    }
+}
+
+/// Whether a claim of mode `committing` collides with a claim of mode
+/// `committed` on the same coordinate, where the `committed` set landed after
+/// the `committing` set read.
+///
+/// | committing \ committed | Writes   | Moves    | WritesPart | Requires | RequiresUnlessRemoved |
+/// |------------------------|----------|----------|------------|----------|-----------------------|
+/// | Writes                 | conflict | conflict | conflict   | ok       | ok                    |
+/// | Moves                  | conflict | conflict | ok         | ok       | ok                    |
+/// | WritesPart             | conflict | ok       | ok         | ok       | ok                    |
+/// | Requires               | conflict | ok       | ok         | ok       | ok                    |
+/// | RequiresUnlessRemoved  | conflict | ok       | ok         | ok       | ok                    |
+///
+/// The requirement columns are all "ok": what the committed set required held
+/// when it committed, and it serialized first, so nothing arriving later can
+/// retroactively break it. The requirement rows are the open question, because
+/// the committing set read before the other landed. They collide with a full
+/// write and not a move or a partial one. A move leaves every value where a
+/// reader finds it. A segment built over a column an overlay then landed on is
+/// stamped with the version it read, the overlay carries the later version it
+/// committed at, and the read path masks the overlaid cells out of any segment
+/// older than the overlay.
+///
+/// The two requirement rows differ only where the write is a removal of the
+/// whole fragment, which reaches the coordinate through a [`Region`] rather
+/// than claiming it; that difference lives in
+/// [`Footprint::claims_conflict_with`].
+///
+/// The table is monotone along [`Mode`]'s order in every row and column, which
+/// is what lets one coordinate touched two ways by one set be summarized by
+/// its strongest mode.
+fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
+    match (committing, committed) {
+        (_, Mode::Writes) => true,
+        (Mode::Writes, Mode::Moves | Mode::WritesPart) => true,
+        (Mode::Moves, Mode::Moves) => true,
+        (Mode::Moves, Mode::WritesPart) => false,
+        (Mode::WritesPart, Mode::Moves | Mode::WritesPart) => false,
+        (Mode::Requires | Mode::RequiresUnlessRemoved, Mode::Moves | Mode::WritesPart) => false,
+        (_, Mode::Requires | Mode::RequiresUnlessRemoved) => false,
+    }
+}
+
+/// Something that must not have happened in a set that landed after this one
+/// read.
+///
+/// A [`Mode::Requires`] claim is checked against what the other set wrote, but
+/// never the reverse: what the committed set required held when it committed.
+/// That leaves a gap for a set that is valid only against the rows or values it
+/// read, such as a stricter nullability, whose validity a later write can
+/// revoke without touching any coordinate the first set names. The committed
+/// set is queried for the fact itself.
+///
+/// Preconditions are one-way by design. The set that landed first was valid
+/// when it landed, and a precondition says nothing about the order the other
+/// way around; that order is covered by the claims the later set makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Precondition {
+    /// No values were written for any committed field, in any fragment. An
+    /// added row counts as writing every field, since it holds a value -- if
+    /// only a null -- for each.
+    ///
+    /// Table-wide rather than per field: a footprint has no schema to relate
+    /// fields, so matching the field named would miss a null written into a
+    /// descendant of a struct made required, or a parent written whole. Both
+    /// users -- a tightened nullability and a replacement -- are rare, so the
+    /// spurious conflict with an unrelated write is cheap.
+    NoValuesWritten,
+    /// No fragment was added.
+    NoRowsAdded,
+    /// The field has the children it had when the set read it: none was
+    /// added under it. A drop names the children it read, deepest first; one
+    /// added since would be left without a parent.
+    ChildrenUnchanged(i32),
+}
+
+/// Everything an action set writes, and everything it requires to still hold
+/// when it lands: definitions it depends on, fragments that must survive, and
+/// preconditions on what a concurrent set may have written.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Footprint {
+    /// Every coordinate this set touches, with the strongest [`Mode`] it
+    /// touches it in.
+    ///
+    /// There is no region for a dropped field, the way there is for a removed
+    /// fragment. Dropping a field writes its definition, and anything that
+    /// depends on the field -- data written for it, its metadata, a child added
+    /// under it -- requires that definition, so the drop-then-write order is a
+    /// `Requires`-vs-`Writes` collision. The write-then-drop order is safe,
+    /// because [`DropField`](super::DropField) applies to every fragment the
+    /// manifest holds by then, including one a concurrent set just added, and
+    /// tombstones the field out of each.
+    claims: HashMap<Coordinate, Mode>,
+    /// Regions this set writes wholesale: fragments it removes, string maps it
+    /// replaces rather than merges into. A region write counts as a write of
+    /// every coordinate inside the region, and of the region itself -- two sets
+    /// replacing one map name no key in common, and still collide.
+    regions: HashMap<Region, Mode>,
+    /// Fragments this set needs to still be there, without writing anything a
+    /// concurrent set could name inside them. Data for a field this set mints,
+    /// written into a committed fragment, is the case this exists for: the
+    /// field id is invisible to a concurrent writer, so the cells are not a
+    /// coordinate, but they are gone if the fragment is.
+    ///
+    /// Not a `Requires` claim on the region, because the check is symmetric: a
+    /// removal that lands second destroys the cells just as surely as one that
+    /// lands first. And not a write of either strength (`Writes` or
+    /// `WritesPart`), because it must not collide with a concurrent write to
+    /// some other coordinate in the same fragment.
+    required_fragments: HashSet<u64>,
+    /// Facts about the table this set is valid only against. See
+    /// [`Precondition`].
+    preconditions: Vec<Precondition>,
+    /// Whether this set writes values for a committed field, in any fragment,
+    /// including one it mints. A fact for [`Precondition::NoValuesWritten`],
+    /// not a claim: two sets writing values commute, but a set that needs the
+    /// table to hold no new values cannot commit after either.
+    values_written: bool,
+    /// Whether this set adds a fragment.
+    rows_added: bool,
+    /// Committed fields this set adds a child under. A fact for
+    /// [`Precondition::ChildrenUnchanged`], not a claim: two sets adding children
+    /// under one parent do not collide through it.
+    children_added: HashSet<i32>,
+    /// Row ids this set's new fragments arrive carrying, out of a reservation
+    /// or kept by a compaction. A row id names one row, so two sets supplying
+    /// the same id collide. The exact set rather than a range, so two
+    /// compactions whose rows interleave in id order do not.
+    supplied_row_ids: RoaringTreemap,
+    /// Whether this set rewrites the table wholesale. Such a set collides with
+    /// every concurrent set, including one that records no claim at all -- an
+    /// append's rows would vanish or survive the reset depending on which
+    /// commit landed first -- so it is a flag rather than a region.
+    exclusive: bool,
+    /// Whether this set brings rows into the dataset that were not there
+    /// before. Coordinates cannot answer what the key assertions ask: two
+    /// writers inserting the same key write it into fragments of their own, so
+    /// their coordinates stay disjoint however badly the keys collide. Key
+    /// uniqueness is a claim about values, not about structure, so it is
+    /// checked by comparing this flag against the filters below.
+    ///
+    /// Set by any [`AddFragment`](super::AddFragment) that is a data change,
+    /// which over-approximates: the rows a merge insert updates arrive in a new
+    /// fragment too, and those carry no new key. The cost is a conflict between
+    /// two writers who only ever touched keys that were already there.
+    inserts_rows: bool,
+    /// The unique-key preconditions this set carries, one per
+    /// [`AssertUniqueKeys`](super::AssertUniqueKeys).
+    key_assertions: Vec<KeyAssertion>,
+    /// The cells this set read and needs unchanged, one per
+    /// [`AssertCellsUnchanged`](super::AssertCellsUnchanged).
+    cell_assertions: Vec<CellAssertion>,
+    /// What this set writes into logical indices. A segment's uuid is a
+    /// coordinate, but the thing two writers can collide over is the index the
+    /// segment joins, which is not a set of ids -- see [`IndexClaim`].
+    index_claims: Vec<IndexClaim>,
+}
+
+/// A claim about which keys an action set inserts, and over which columns.
+#[derive(Debug, Clone, PartialEq)]
+struct KeyAssertion {
+    key_fields: Vec<FieldRef>,
+    filter: KeyExistenceFilter,
+}
+
+/// Cells an action set read and needs unchanged: the declared fields in the
+/// selected fragments. Fragment granularity, which over-rejects a selection of
+/// some of a fragment's rows; refining it against overlay coverage is
+/// follow-up work.
+#[derive(Debug, Clone, PartialEq)]
+struct CellAssertion {
+    fields: HashSet<i32>,
+    fragments: HashSet<u64>,
+}
+
+impl CellAssertion {
+    /// Whether `committed` may have changed one of these cells: written the
+    /// data of a declared field in a selected fragment, wholly or by overlay;
+    /// redefined or dropped a declared field; or removed a selected fragment.
+    /// A deletion does not count, since a deleted row's value is invisible.
+    fn changed_by(&self, committed: &Footprint) -> bool {
+        let wrote_a_cell = committed
+            .claims
+            .iter()
+            .filter(|(_, mode)| **mode >= Mode::WritesPart)
+            .any(|(coordinate, _)| match coordinate {
+                Coordinate::FieldData { fragment, field } => {
+                    self.fragments.contains(fragment) && self.fields.contains(field)
+                }
+                Coordinate::FieldDefinition(field) => self.fields.contains(field),
+                Coordinate::FragmentExistence(fragment) => self.fragments.contains(fragment),
+                _ => false,
+            });
+        let removed_a_fragment = committed.regions.keys().any(|region| match region {
+            Region::Fragment(fragment) => self.fragments.contains(fragment),
+            Region::Map(_) => false,
+        });
+        wrote_a_cell || removed_a_fragment
+    }
+}
+
+/// What an action set writes into one logical index.
+///
+/// An index is the set of segments sharing a name, and the query path unions
+/// them, so two writers may extend one index at the same time -- what they may
+/// not do is describe the same rows twice, or disagree about what the index is.
+#[derive(Debug, Clone, PartialEq)]
+struct IndexClaim {
+    name: String,
+    /// What the set says the index is. `None` for an action that edits a
+    /// segment without restating the index's definition.
+    identity: Option<IndexIdentity>,
+    /// The committed fragments this set brings under the index, or `None` when
+    /// the reach is not stated -- what the system indices carry, and what makes
+    /// a claim collide with every other claim on the same index.
+    ///
+    /// Fragments this operation mints are left out. They have no id in the read
+    /// version, so a concurrent writer cannot be covering one.
+    coverage: Option<HashSet<u64>>,
+}
+
+/// What an index is, for the purpose of deciding whether two writers are
+/// building the same one.
+///
+/// Keyed fields, carried fields, and the index details compared byte for byte.
+/// `lance-table` cannot tell which details matter to a query, so any
+/// difference counts; a conflict is only a retry, so being strict costs
+/// little. The apply-time segment check is looser, since its rejections are
+/// permanent. The index version is left out: a newer library may write
+/// segments of the same index.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct IndexIdentity {
+    pub fields: Vec<FieldRef>,
+    /// Which of `fields` are merely carried: two writers that disagree about
+    /// this disagree about what the index answers for, not just what it holds.
+    pub covering_fields: Vec<FieldRef>,
+    pub index_details: Option<Arc<prost_types::Any>>,
+}
+
+impl IndexClaim {
+    fn conflicts_with(&self, other: &Self) -> bool {
+        if self.name != other.name {
+            return false;
+        }
+        if let (Some(ours), Some(theirs)) = (&self.identity, &other.identity)
+            && ours != theirs
+        {
+            return true;
+        }
+        match (&self.coverage, &other.coverage) {
+            (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
+            // An unstated reach could be any fragment, including one the other
+            // side is claiming.
+            _ => true,
+        }
+    }
+}
+
+impl Footprint {
+    /// Extend each dependency an index segment has on a field's data, keyed or
+    /// carried, to the fields that field is nested in or contains in `schema`.
+    ///
+    /// A footprint names fields by id alone, but one field's values can be
+    /// rewritten under another's id: a packed struct is stored and rewritten
+    /// under the parent's id while an index on a child records the child's,
+    /// and an index on a struct describes its children's values. The rewrite's
+    /// claims cannot be widened instead, or two writes of sibling children
+    /// would collide through their shared parent.
+    ///
+    /// Only the dependency widens, in the same unless-removed mode,
+    /// so a re-encode of a related field or a removal of the fragment still
+    /// leaves the segment alone. Call it once per schema the ids may be
+    /// resolved in; a field missing from `schema` keeps only its own id.
+    pub fn with_field_ancestry(mut self, schema: &Schema) -> Self {
+        let dependencies: Vec<(u64, i32)> = self
+            .claims
+            .iter()
+            .filter_map(|(coordinate, mode)| match (coordinate, mode) {
+                (Coordinate::FieldData { fragment, field }, Mode::RequiresUnlessRemoved) => {
+                    Some((*fragment, *field))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut related: HashMap<i32, Vec<i32>> = HashMap::new();
+        for (fragment, field) in dependencies {
+            let related = related
+                .entry(field)
+                .or_insert_with(|| containing_and_nested_fields(schema, field));
+            for related in related.iter().copied() {
+                self.claim(
+                    Coordinate::FieldData {
+                        fragment,
+                        field: related,
+                    },
+                    Mode::RequiresUnlessRemoved,
+                );
+            }
+        }
+        self
+    }
+
+    /// Whether this set can still commit on top of `committed`, a set that
+    /// landed after this one read.
+    ///
+    /// Coordinates and regions are compared through `pair_conflicts`, with
+    /// this set in the committing role and `committed` in the committed role.
+    /// That is where the one asymmetry lives: a requirement of this set is
+    /// tested against what `committed` wrote, never the reverse, because
+    /// `committed` serialized first and nothing arriving later can break what
+    /// it required. A set whose validity depends on what it read rather than on
+    /// a coordinate -- a tightened nullability, a replaced field -- adds
+    /// `Precondition`s, which are tested against the facts `committed`
+    /// recorded, and are likewise one-way.
+    ///
+    /// The value predicates -- key assertions, index claims -- are not
+    /// coordinates and are compared on their own terms, symmetrically.
+    pub fn conflicts_with(&self, committed: &Self) -> bool {
+        // A wholesale rewrite leaves nothing for a concurrent set to land on --
+        // not even an append, whose rows the reset would discard or resurrect
+        // depending on which commit won.
+        if self.exclusive || committed.exclusive {
+            return true;
+        }
+        if self.claims_conflict_with(committed) || self.preconditions_violated_by(committed) {
+            return true;
+        }
+        // One-way, like the preconditions: a set that landed first was valid
+        // when it landed, whatever it read.
+        if self
+            .cell_assertions
+            .iter()
+            .any(|assertion| assertion.changed_by(committed))
+        {
+            return true;
+        }
+        if !self
+            .supplied_row_ids
+            .is_disjoint(&committed.supplied_row_ids)
+        {
+            return true;
+        }
+        if self.required_fragment_removed_by(committed)
+            || committed.required_fragment_removed_by(self)
+        {
+            return true;
+        }
+        // Symmetric, unlike the coordinate requirements above. Dropping the
+        // second direction would let a plain append land a duplicate of a key
+        // a committed merge-insert asserted was absent -- correct if the
+        // assertion is a precondition on that commit, wrong if it is an
+        // invariant on the table.
+        //
+        // TODO(https://github.com/lance-format/lance/issues/10189): decide which
+        // reading holds as part of conflict parity with the legacy resolver;
+        // until then, keep the stricter one.
+        if self.key_assertion_violated_by(committed) || committed.key_assertion_violated_by(self) {
+            return true;
+        }
+        self.index_claims.iter().any(|ours| {
+            committed
+                .index_claims
+                .iter()
+                .any(|theirs| ours.conflicts_with(theirs))
+        })
+    }
+
+    /// Whether any coordinate touched by both sets, directly or through a
+    /// region, collides under [`pair_conflicts`] with this set committing after
+    /// `committed`.
+    ///
+    /// Every pair is enumerated from this side's point of view: our claims
+    /// against their claims and their regions, their claims against our
+    /// regions, and our regions against theirs. A region only matches a region
+    /// that is equal to it; containment is between a region and a coordinate.
+    fn claims_conflict_with(&self, committed: &Self) -> bool {
+        let ours_against_theirs = self.claims.iter().flat_map(|(coordinate, ours)| {
+            let same_coordinate = committed.claims.get(coordinate).copied();
+            let containing_regions = committed
+                .regions
+                .iter()
+                .filter(|(region, _)| region.contains(coordinate))
+                .filter(|(region, _)| !ours.is_released_by(region))
+                .map(|(_, theirs)| *theirs);
+            same_coordinate
+                .into_iter()
+                .chain(containing_regions)
+                .map(move |theirs| (*ours, theirs))
+        });
+        let theirs_inside_our_regions = committed.claims.iter().flat_map(|(coordinate, theirs)| {
+            self.regions
+                .iter()
+                .filter(|(region, _)| region.contains(coordinate))
+                .map(move |(_, ours)| (*ours, *theirs))
+        });
+        let same_region = self.regions.iter().filter_map(|(region, ours)| {
+            committed.regions.get(region).map(|theirs| (*ours, *theirs))
+        });
+        ours_against_theirs
+            .chain(theirs_inside_our_regions)
+            .chain(same_region)
+            .any(|(ours, theirs)| pair_conflicts(ours, theirs))
+    }
+
+    fn preconditions_violated_by(&self, committed: &Self) -> bool {
+        self.preconditions
+            .iter()
+            .any(|precondition| match precondition {
+                Precondition::NoValuesWritten => committed.rows_added || committed.values_written,
+                Precondition::NoRowsAdded => committed.rows_added,
+                Precondition::ChildrenUnchanged(field) => committed.children_added.contains(field),
+            })
+    }
+
+    /// Whether `other` removes a fragment this set needs to still be there.
+    fn required_fragment_removed_by(&self, other: &Self) -> bool {
+        self.required_fragments
+            .iter()
+            .any(|fragment| other.regions.contains_key(&Region::Fragment(*fragment)))
+    }
+
+    /// Whether `other` may have introduced a key this set asserts is not there.
+    ///
+    /// A set that asserts nothing has nothing to violate. A key can arrive two
+    /// ways. Writing into a key column of rows that are already there -- a
+    /// column rewrite, an overlay -- can put any value in it and says nothing
+    /// about which, so that is a violation outright. Inserting rows is the
+    /// other, and is only compatible if `other` says which keys it inserted
+    /// over the same columns, and the two filters provably do not intersect.
+    /// Anything less -- an unqualified insert, no assertion over these columns,
+    /// filters built with incomparable parameters -- leaves the assertion
+    /// unverifiable, which counts as a conflict.
+    fn key_assertion_violated_by(&self, other: &Self) -> bool {
+        if self.key_assertions.is_empty() {
+            return false;
+        }
+        if self
+            .key_assertions
+            .iter()
+            .any(|ours| other.writes_into_any_of(&ours.key_fields))
+        {
+            return true;
+        }
+        if !other.inserts_rows {
+            return false;
+        }
+        for ours in &self.key_assertions {
+            // Each assertion speaks for every row its set inserts, over its own
+            // key columns (see `AssertUniqueKeys`). An assertion of theirs
+            // over other columns hashes other values, so it says nothing about
+            // ours either way; one over the same columns says everything.
+            let mut over_same_columns = other
+                .key_assertions
+                .iter()
+                .filter(|theirs| theirs.key_fields == ours.key_fields)
+                .peekable();
+            if over_same_columns.peek().is_none() {
+                return true;
+            }
+            for theirs in over_same_columns {
+                match ours.filter.intersects(&theirs.filter) {
+                    Ok((false, _)) => {}
+                    // Either the keys really do overlap, or the two filters were
+                    // built with parameters that cannot be compared. Neither
+                    // clears the assertion.
+                    Ok((true, _)) | Err(_) => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether this set writes, wholly or in part, the data of any of `fields`
+    /// in some committed fragment.
+    fn writes_into_any_of(&self, fields: &[FieldRef]) -> bool {
+        self.claims
+            .iter()
+            .filter(|(_, mode)| **mode >= Mode::WritesPart)
+            .any(|(coordinate, _)| match coordinate {
+                Coordinate::FieldData { field, .. } => {
+                    fields.contains(&FieldRef::Committed(*field))
+                }
+                _ => false,
+            })
+    }
+
+    /// Record a claim on `coordinate`, keeping the strongest mode if the set
+    /// already touches it another way. See [`pair_conflicts`] for why the
+    /// strongest mode is the right summary.
+    fn claim(&mut self, coordinate: Coordinate, mode: Mode) {
+        self.claims
+            .entry(coordinate)
+            .and_modify(|current| *current = (*current).max(mode))
+            .or_insert(mode);
+    }
+
+    /// Record that this set writes `coordinate`. See [`Mode::Writes`].
+    pub(super) fn write(&mut self, coordinate: Coordinate) {
+        self.claim(coordinate, Mode::Writes);
+    }
+
+    /// Record that this set writes some of `coordinate`, leaving the rest as
+    /// it was. See [`Mode::WritesPart`].
+    fn write_part(&mut self, coordinate: Coordinate) {
+        self.claim(coordinate, Mode::WritesPart);
+    }
+
+    /// Record that this set reads `coordinate` and needs it to still hold what
+    /// it read. See [`Mode::Requires`].
+    pub(super) fn require(&mut self, coordinate: Coordinate) {
+        self.claim(coordinate, Mode::Requires);
+    }
+
+    /// The data of each field within `fragment`.
+    ///
+    /// A field this operation mints writes no coordinate -- no concurrent
+    /// writer can be naming one -- and neither does a fragment this operation
+    /// mints. But data written into a committed fragment lives or dies with
+    /// that fragment whichever kind of field it is for, so the fragment is
+    /// required to still be there: a concurrent compaction that removed it
+    /// would otherwise discard the new column's cells for those rows, and the
+    /// replacement fragment would read them back as null.
+    ///
+    /// Every committed field's definition is required. Values are written in
+    /// the type the schema names, so a concurrent
+    /// [`AlterField`](super::AlterField) changing its definition could leave the
+    /// manifest describing these values as something they are not, and a
+    /// concurrent [`DropField`](super::DropField) would leave a file carrying
+    /// data for a field the manifest no longer has. Both write the definition,
+    /// so both are caught when they land first. Landing second, a drop tombstones the field
+    /// out of every fragment's files, so it needs no symmetric check. A
+    /// replacement does, because it rewrites the values it read; see
+    /// [`Footprint`]'s `From<&CompositeOperation>`.
+    ///
+    /// This requires the whole definition, not the type alone, so it also
+    /// rejects a concurrent rename or nullability change that would not have
+    /// invalidated the data. That matches the granularity of the coordinate:
+    /// `AlterField` writes one `FieldDefinition` whichever facet it sets.
+    ///
+    /// Values for a committed field also require [`Coordinate::NewRowSchema`].
+    /// The definition required is only the field's own, so a concurrent
+    /// tightening of its parent struct or of a child would not otherwise
+    /// collide with a null written here.
+    pub(super) fn write_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        let fields: Vec<FieldRef> = fields.into_iter().collect();
+        if fields
+            .iter()
+            .copied()
+            .any(|field| committed_field(field).is_some())
+        {
+            self.values_written = true;
+            self.require(Coordinate::NewRowSchema);
+        }
+        self.claim_field_data(fragment, fields, Mode::Writes);
+    }
+
+    /// The data of each field within `fragment`, moved to new files without
+    /// changing any value: one half of a re-encode with `data_change` false.
+    ///
+    /// The same claims as [`Self::write_field_data`], except that no values
+    /// count as written, so a concurrent change that makes one of the fields
+    /// required is not invalidated by it, and the data is claimed as
+    /// [`Mode::Moves`], so a concurrent index build over it is not either.
+    pub(super) fn move_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        self.claim_field_data(fragment, fields, Mode::Moves);
+    }
+
+    fn claim_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+        mode: Mode,
+    ) {
+        let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
+        for field in fields.iter().copied() {
+            self.require(Coordinate::FieldDefinition(field));
+        }
+        let Some(fragment) = fragment.committed() else {
+            return;
+        };
+        self.require_fragment(fragment);
+        for field in fields {
+            self.claim(Coordinate::FieldData { fragment, field }, mode);
+        }
+    }
+
+    /// Record that this set writes some of the cells of each of `fields` in
+    /// `fragment`, leaving the rest as they were.
+    ///
+    /// As [`Self::write_field_data`], the definition of every committed field
+    /// and the new-row schema are required and the values count as written
+    /// whichever fragment they go in, so a minted fragment still depends on
+    /// the schema it was prepared against. Only a committed fragment has cells
+    /// a concurrent writer can name.
+    pub(super) fn write_partial_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        let committed_fragment = fragment.committed();
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.require(Coordinate::FieldDefinition(field));
+            self.require(Coordinate::NewRowSchema);
+            self.values_written = true;
+            if let Some(fragment) = committed_fragment {
+                self.write_part(Coordinate::FieldData { fragment, field });
+            }
+        }
+    }
+
+    /// Mark `fragment`'s deletions as a conflict point without changing them.
+    ///
+    /// Not a write: the set leaves the deletions as they were. The claim is a
+    /// [`Mode::WritesPart`] marker because that mode has exactly the pairing
+    /// needed -- it collides with any set that replaces the fragment's
+    /// deletions, in either order, and commutes with other markers. See
+    /// [`AddOverlays`](super::AddOverlays)'s footprint for why an overlay
+    /// needs it.
+    pub(super) fn write_part_of_deletions(&mut self, fragment: u64) {
+        self.write_part(Coordinate::FragmentDeletions(fragment));
+    }
+
+    /// Record that this set adds a fragment, whose rows were prepared against
+    /// the schema this set read. See [`Coordinate::NewRowSchema`].
+    pub(super) fn add_rows(&mut self) {
+        self.rows_added = true;
+        self.require(Coordinate::NewRowSchema);
+    }
+
+    /// Record row ids a fragment this set adds arrives carrying.
+    pub(super) fn supply_row_ids(&mut self, row_ids: &RoaringTreemap) {
+        self.supplied_row_ids |= row_ids;
+    }
+
+    /// Record that this set adds a column that rows must carry a value for, or
+    /// makes an existing one required. Rows a stale writer adds afterwards
+    /// would not carry one, and rows already added are not covered by what
+    /// this set read or wrote.
+    pub(super) fn add_required_column(&mut self) {
+        self.write(Coordinate::NewRowSchema);
+        self.preconditions.push(Precondition::NoRowsAdded);
+    }
+
+    /// Record that this set only holds if `field` has had no values written
+    /// since it read it, such as a stricter nullability the apply does not
+    /// check the values against. Checked table-wide; see
+    /// [`Precondition::NoValuesWritten`]. A field this set mints has no
+    /// concurrent writers, so it needs nothing.
+    pub(super) fn require_no_values_written(&mut self, field: FieldRef) {
+        if committed_field(field).is_some() {
+            self.preconditions.push(Precondition::NoValuesWritten);
+        }
+    }
+
+    /// Record that this set adds a child under `parent`.
+    pub(super) fn add_child(&mut self, parent: FieldRef) {
+        if let Some(parent) = committed_field(parent) {
+            self.children_added.insert(parent);
+        }
+    }
+
+    /// Record that this set only holds if no child was added under `field`
+    /// since it read it.
+    pub(super) fn require_children_unchanged(&mut self, field: FieldRef) {
+        if let Some(field) = committed_field(field) {
+            self.preconditions
+                .push(Precondition::ChildrenUnchanged(field));
+        }
+    }
+
+    /// Record that this set describes `fields` in `fragment` and needs their
+    /// values not to have been replaced in place, though the fragment may
+    /// since have been removed. See [`Mode::RequiresUnlessRemoved`].
+    ///
+    /// A fragment this operation mints records nothing: no concurrent writer
+    /// can have replaced data that did not exist when they planned.
+    pub(super) fn require_field_data_unless_removed(
+        &mut self,
+        fragment: u64,
+        fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.claim(
+                Coordinate::FieldData { fragment, field },
+                Mode::RequiresUnlessRemoved,
+            );
+        }
+    }
+
+    /// A field's entry in the schema.
+    pub(super) fn write_field_definition(&mut self, field: FieldRef) {
+        if let Some(field) = committed_field(field) {
+            self.write(Coordinate::FieldDefinition(field));
+        }
+    }
+
+    /// Record that this set depends on `field` still being defined as it was,
+    /// without redefining it: a child added under it, metadata written on it.
+    pub(super) fn require_field_definition(&mut self, field: FieldRef) {
+        if let Some(field) = committed_field(field) {
+            self.require(Coordinate::FieldDefinition(field));
+        }
+    }
+
+    /// Note that this set only works if `fragment` is still part of the dataset,
+    /// without claiming anything inside it.
+    pub(super) fn require_fragment(&mut self, fragment: u64) {
+        self.required_fragments.insert(fragment);
+    }
+
+    /// Record that this set adds a segment to `name`, defining the index as
+    /// `identity` and describing `coverage`.
+    pub(super) fn claim_index_segment(
+        &mut self,
+        name: String,
+        identity: IndexIdentity,
+        coverage: Option<impl IntoIterator<Item = Ref>>,
+    ) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: Some(identity),
+            coverage: coverage.map(committed_fragments),
+        });
+    }
+
+    /// Record that this set rewrites the index `name` wholesale, reaching
+    /// whatever segments it holds when the set applies.
+    pub(super) fn rewrite_index(&mut self, name: String) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: None,
+        });
+    }
+
+    /// Record that this set brings `fragments` under `name` by widening a
+    /// segment that is already there, without restating what the index is.
+    pub(super) fn extend_index_coverage(
+        &mut self,
+        name: String,
+        fragments: impl IntoIterator<Item = Ref>,
+    ) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: Some(committed_fragments(fragments)),
+        });
+    }
+
+    /// Note that this set brings in rows that were not in the dataset before.
+    pub(super) fn insert_rows(&mut self) {
+        self.inserts_rows = true;
+    }
+
+    /// Record a precondition that no concurrent commit inserted a colliding key.
+    ///
+    /// Only an assertion whose key columns are all committed is recorded. A
+    /// local key field names a column this operation mints, which no
+    /// concurrent writer can insert into, so the assertion has nothing to
+    /// guard against. Nor could it be matched: assertions are matched by key
+    /// columns, and a local token means a different column in each operation.
+    pub(super) fn assert_unique_keys(
+        &mut self,
+        key_fields: Vec<FieldRef>,
+        filter: KeyExistenceFilter,
+    ) {
+        if key_fields.iter().any(|field| field.committed().is_none()) {
+            return;
+        }
+        self.key_assertions
+            .push(KeyAssertion { key_fields, filter });
+    }
+
+    /// Record that this set read `fields` in `fragments` and needs those cells
+    /// unchanged by any set that lands after it read.
+    pub(super) fn assert_cells_unchanged(&mut self, fields: HashSet<i32>, fragments: HashSet<u64>) {
+        if fields.is_empty() || fragments.is_empty() {
+            return;
+        }
+        self.cell_assertions
+            .push(CellAssertion { fields, fragments });
+    }
+
+    /// Record that this set removes `fragment` outright: its existence, and
+    /// with it every coordinate inside it.
+    pub(super) fn remove_fragment(&mut self, fragment: u64) {
+        self.write(Coordinate::FragmentExistence(fragment));
+        self.regions
+            .insert(Region::Fragment(fragment), Mode::Writes);
+    }
+
+    /// Record an edit to one of the manifest's string maps: the keys it names,
+    /// or the whole map when it replaces rather than merges.
+    pub(super) fn write_map_update(&mut self, map: ConfigMap, update: &UpdateMap) {
+        if update.replace {
+            self.regions.insert(Region::Map(map), Mode::Writes);
+            return;
+        }
+        for entry in &update.update_entries {
+            self.write(Coordinate::ConfigEntry {
+                map: map.clone(),
+                key: entry.key.clone(),
+            });
+        }
+    }
+
+    /// Mark this set as rewriting the whole table, conflicting with any
+    /// concurrent set whatsoever.
+    pub(super) fn take_exclusive(&mut self) {
+        self.exclusive = true;
+    }
+}
+
+/// A schema field id a concurrent writer could also be naming, or `None` for
+/// a field this operation mints, which no one else can see yet. A reserved
+/// id is `None` too: a lineage column belongs to a fragment this operation
+/// adds, so no concurrent writer can name it either.
+fn committed_field(reference: FieldRef) -> Option<i32> {
+    reference.committed().filter(|id| *id >= 0)
+}
+
+/// The ids of the fields `id` is nested in or contains in `schema`, itself
+/// excluded: the relation [`field_affects_index`] tests, enumerated.
+///
+/// [`field_affects_index`]: crate::format::overlay::staleness::field_affects_index
+fn containing_and_nested_fields(schema: &Schema, id: i32) -> Vec<i32> {
+    fn collect_descendants(field: &Field, ids: &mut Vec<i32>) {
+        for child in &field.children {
+            ids.push(child.id);
+            collect_descendants(child, ids);
+        }
+    }
+    let Some(ancestry) = schema.field_ancestry_by_id(id) else {
+        return Vec::new();
+    };
+    let Some((field, ancestors)) = ancestry.split_last() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<i32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
+    collect_descendants(field, &mut ids);
+    ids
+}
+
+fn committed_fragments(fragments: impl IntoIterator<Item = Ref>) -> HashSet<u64> {
+    fragments
+        .into_iter()
+        .filter_map(|fragment| fragment.committed())
+        .collect()
+}
+
+/// Fields are compared by id alone; see [`Footprint::with_field_ancestry`] for
+/// relating an index's fields to the fields they are nested in or contain.
+impl From<&CompositeOperation> for Footprint {
+    fn from(composite_operation: &CompositeOperation) -> Self {
+        let mut footprint = Self::default();
+        for action in composite_operation.iter_actions() {
+            action.footprint(&mut footprint);
+        }
+
+        // Dropping a field and adding one by the same name is how a cast is
+        // spelled, since [`AlterField`](super::AlterField) has no type facet:
+        // the new field's data is rewritten from the dropped field's
+        // values as they were read. A footprint has no schema to match the
+        // names, so any drop alongside any add is treated as a replacement. The
+        // cost is a spurious conflict for an unrelated drop and add in one set.
+        let adds_field = composite_operation
+            .iter_actions()
+            .any(|action| matches!(action, Action::AddField(_)));
+        if adds_field {
+            for action in composite_operation.iter_actions() {
+                if let Action::DropField(drop) = action {
+                    footprint.require_no_values_written(drop.field);
+                }
+            }
+        }
+        footprint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{BasePath, DataFile};
+    use crate::transaction::action::test_support::{any_deletion_file, footprint};
+    use crate::transaction::action::{
+        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
+        RemoveFragment, SetDeletionFile, TombstoneFieldData,
+    };
+    use arrow_schema::{DataType, Field as ArrowField};
+    use lance_core::datatypes::Field;
+    use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
+
+    /// One coordinate touched two ways by one set is summarized by its
+    /// strongest mode, which is only sound while every row and column of the
+    /// table is monotone in that order.
+    #[test]
+    fn test_pair_conflicts_is_monotone_in_mode_order() {
+        let modes = [
+            Mode::RequiresUnlessRemoved,
+            Mode::Requires,
+            Mode::WritesPart,
+            Mode::Moves,
+            Mode::Writes,
+        ];
+        assert!(modes.windows(2).all(|pair| pair[0] < pair[1]));
+        for weaker in 0..modes.len() {
+            for stronger in weaker..modes.len() {
+                for other in modes {
+                    assert!(
+                        pair_conflicts(modes[stronger], other)
+                            >= pair_conflicts(modes[weaker], other),
+                        "row {:?} vs {:?} against {other:?}",
+                        modes[stronger],
+                        modes[weaker]
+                    );
+                    assert!(
+                        pair_conflicts(other, modes[stronger])
+                            >= pair_conflicts(other, modes[weaker]),
+                        "column {:?} vs {:?} against {other:?}",
+                        modes[stronger],
+                        modes[weaker]
+                    );
+                }
+            }
+        }
+    }
+
+    fn add_fragment(id: Ref) -> Action {
+        Action::AddFragment(AddFragment {
+            id,
+            physical_rows: 10,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    fn add_data_file(fragment: Ref, fields: &[i32]) -> Action {
+        add_data_file_for(
+            fragment,
+            fields
+                .iter()
+                .map(|field| FieldRef::Committed(*field))
+                .collect(),
+        )
+    }
+
+    fn add_data_file_for(fragment: Ref, field_ids: Vec<FieldRef>) -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment,
+            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+            field_ids,
+            data_change: true,
+            base: None,
+        })
+    }
+
+    /// Tombstone `field` in `fragment` and bind a new file for it, both
+    /// carrying `data_change`.
+    fn reencode(fragment: u64, field: i32, data_change: bool) -> Vec<Action> {
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment),
+                field_ids: vec![FieldRef::Committed(field)],
+                data_change,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment),
+                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                field_ids: vec![FieldRef::Committed(field)],
+                data_change,
+                base: None,
+            }),
+        ]
+    }
+
+    fn add_field(local: u32, name: &str, parent: Option<FieldRef>) -> Action {
+        Action::AddField(AddField {
+            local,
+            parent,
+            def: Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap(),
+        })
+    }
+
+    fn add_non_nullable_field(local: u32, name: &str) -> Action {
+        Action::AddField(AddField {
+            local,
+            parent: None,
+            def: Field::try_from(ArrowField::new(name, DataType::Int32, false)).unwrap(),
+        })
+    }
+
+    fn set_nullability(field: i32, nullable: bool) -> Action {
+        Action::AlterField(AlterField {
+            field: FieldRef::Committed(field),
+            name: None,
+            nullable: Some(nullable),
+        })
+    }
+
+    fn config_entry(key: &str) -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            config: Some(UpdateMap {
+                update_entries: vec![(key, Some("v")).into()],
+                replace: false,
+            }),
+            table_metadata: None,
+            schema_metadata: None,
+            field_metadata: Vec::new(),
+        })
+    }
+
+    fn tighten_local_field(local: u32) -> Action {
+        Action::AlterField(AlterField {
+            field: FieldRef::Local(local),
+            name: None,
+            nullable: Some(false),
+        })
+    }
+
+    fn append(field: i32) -> Vec<Action> {
+        vec![
+            add_fragment(Ref::Local(0)),
+            add_data_file(Ref::Local(0), &[field]),
+        ]
+    }
+
+    /// The add-column shape: mint a field, then back it in a committed fragment.
+    fn add_column(name: &str, fragment: u64) -> Vec<Action> {
+        vec![
+            add_field(1, name, None),
+            add_data_file_for(Ref::Committed(fragment), vec![FieldRef::Local(1)]),
+        ]
+    }
+
+    fn rename_field(field: i32, name: &str) -> Action {
+        Action::AlterField(AlterField {
+            field: FieldRef::Committed(field),
+            name: Some(name.into()),
+            nullable: None,
+        })
+    }
+
+    fn drop_field(field: i32) -> Action {
+        Action::DropField(DropField {
+            field: FieldRef::Committed(field),
+        })
+    }
+
+    fn tombstone(fragment: u64, fields: &[i32]) -> Action {
+        Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(fragment),
+            field_ids: fields.iter().map(|id| FieldRef::Committed(*id)).collect(),
+            data_change: true,
+        })
+    }
+
+    fn remove_fragment(fragment: u64) -> Action {
+        Action::RemoveFragment(RemoveFragment {
+            fragment: Ref::Committed(fragment),
+            data_change: true,
+        })
+    }
+
+    fn set_deletion_file(fragment: u64) -> Action {
+        Action::SetDeletionFile(SetDeletionFile {
+            fragment,
+            deletion_file: any_deletion_file(),
+            data_change: true,
+            base: None,
+        })
+    }
+
+    fn add_base(local: u32, name: &str, path: &str) -> Action {
+        Action::AddBase(AddBase {
+            local,
+            base: BasePath::new(0, path.into(), Some(name.into()), false),
+        })
+    }
+
+    fn add_unnamed_base(local: u32, path: &str) -> Action {
+        Action::AddBase(AddBase {
+            local,
+            base: BasePath::new(0, path.into(), None, false),
+        })
+    }
+
+    #[test]
+    fn test_minting_actions_write_nothing() {
+        let minting = footprint(vec![
+            add_fragment(Ref::Local(0)),
+            add_data_file(Ref::Local(0), &[0]),
+        ]);
+
+        // Two writers appending at the same time never collide.
+        assert!(!minting.conflicts_with(&minting.clone()));
+    }
+
+    #[rstest]
+    #[case::same_field_in_same_fragment(
+        vec![tombstone(0, &[1])],
+        vec![add_data_file(Ref::Committed(0), &[1])],
+        true,
+    )]
+    #[case::different_fields_in_same_fragment(
+        vec![tombstone(0, &[1])],
+        vec![add_data_file(Ref::Committed(0), &[2])],
+        false,
+    )]
+    #[case::same_field_in_different_fragments(
+        vec![tombstone(0, &[1])],
+        vec![tombstone(1, &[1])],
+        false,
+    )]
+    #[case::deletions_do_not_collide_with_field_data(
+        vec![set_deletion_file(0)],
+        vec![tombstone(0, &[1])],
+        false,
+    )]
+    #[case::concurrent_deletes_of_one_fragment(
+        vec![set_deletion_file(0)],
+        vec![set_deletion_file(0)],
+        true,
+    )]
+    #[case::removal_swallows_the_whole_fragment(
+        vec![remove_fragment(0)],
+        vec![tombstone(0, &[1])],
+        true,
+    )]
+    #[case::removal_leaves_other_fragments_alone(
+        vec![remove_fragment(0)],
+        vec![tombstone(1, &[1])],
+        false,
+    )]
+    // Two compactions of one fragment: the second would remove something the
+    // first already took away.
+    #[case::removing_the_same_fragment_twice(
+        vec![remove_fragment(0)],
+        vec![remove_fragment(0)],
+        true,
+    )]
+    // A new column's cells in a committed fragment are not a coordinate -- the
+    // field is minted -- but they are gone if the fragment is, whichever order
+    // the two land in.
+    #[case::adding_a_column_into_a_fragment_a_concurrent_set_removes(
+        add_column("c", 7),
+        vec![remove_fragment(7)],
+        true,
+    )]
+    #[case::adding_a_column_leaves_other_writes_to_the_fragment_alone(
+        add_column("c", 7),
+        vec![tombstone(7, &[2]), set_deletion_file(7)],
+        false,
+    )]
+    #[case::same_field_definition(
+        vec![rename_field(1, "a")],
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        true,
+    )]
+    #[case::different_field_definitions(
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: None })],
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(2), name: None, nullable: None })],
+        false,
+    )]
+    #[case::dropping_a_field_collides_with_altering_it(
+        vec![drop_field(1)],
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        true,
+    )]
+    #[case::dropping_a_field_leaves_other_fields_alone(
+        vec![drop_field(1)],
+        vec![tombstone(0, &[2])],
+        false,
+    )]
+    #[case::dropping_a_field_leaves_deletions_alone(
+        vec![drop_field(1)],
+        vec![set_deletion_file(0)],
+        false,
+    )]
+    #[case::dropping_a_field_a_concurrent_append_does_not_write(
+        vec![drop_field(1)],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
+        false,
+    )]
+    // Names coordinate table-wide, whether a writer takes one by adding a
+    // field or by renaming one to it.
+    #[case::adding_two_fields_with_the_same_name(
+        vec![add_field(0, "c", None)],
+        vec![add_field(0, "c", None)],
+        true,
+    )]
+    #[case::adding_two_fields_with_different_names(
+        vec![add_field(0, "c", None)],
+        vec![add_field(0, "d", None)],
+        false,
+    )]
+    #[case::adding_a_field_named_like_a_concurrent_rename(
+        vec![add_field(0, "c", None)],
+        vec![rename_field(1, "c")],
+        true,
+    )]
+    #[case::renaming_two_fields_to_the_same_name(
+        vec![rename_field(1, "c")],
+        vec![rename_field(2, "c")],
+        true,
+    )]
+    #[case::adding_the_same_name_under_different_parents(
+        vec![add_field(0, "c", Some(FieldRef::Committed(1)))],
+        vec![add_field(0, "c", Some(FieldRef::Committed(2)))],
+        true,
+    )]
+    #[case::bases_with_the_same_name(
+        vec![add_base(0, "a", "s3://bucket/one")],
+        vec![add_base(0, "a", "s3://bucket/two")],
+        true,
+    )]
+    #[case::bases_with_the_same_location(
+        vec![add_base(0, "a", "s3://bucket/one")],
+        vec![add_base(0, "b", "s3://bucket/one")],
+        true,
+    )]
+    #[case::unrelated_bases(
+        vec![add_base(0, "a", "s3://bucket/one")],
+        vec![add_base(0, "b", "s3://bucket/two")],
+        false,
+    )]
+    // The name is an optional alias. Two writers who both decline to set one
+    // have not picked the same name, so only their locations coordinate.
+    #[case::unnamed_bases_at_different_locations(
+        vec![add_unnamed_base(0, "s3://bucket/one")],
+        vec![add_unnamed_base(0, "s3://bucket/two")],
+        false,
+    )]
+    #[case::unnamed_bases_at_the_same_location(
+        vec![add_unnamed_base(0, "s3://bucket/one")],
+        vec![add_unnamed_base(0, "s3://bucket/one")],
+        true,
+    )]
+    // A reservation is meant to be one writer's alone, but nothing in the
+    // format enforces that, so claiming a reserved id has to be a write.
+    #[case::the_same_reserved_fragment_id(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![add_fragment(Ref::Committed(1))],
+        true,
+    )]
+    #[case::different_reserved_fragment_ids(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![add_fragment(Ref::Committed(2))],
+        false,
+    )]
+    #[case::claiming_a_reserved_id_a_concurrent_set_removes(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![remove_fragment(1)],
+        true,
+    )]
+    fn test_conflicts(
+        #[case] ours: Vec<Action>,
+        #[case] theirs: Vec<Action>,
+        #[case] expected: bool,
+    ) {
+        let ours = footprint(ours);
+        let theirs = footprint(theirs);
+        assert_eq!(ours.conflicts_with(&theirs), expected);
+        // The relation has to hold whichever side is asking.
+        assert_eq!(theirs.conflicts_with(&ours), expected);
+    }
+
+    /// Pairs whose answer depends on which set committed first, so each order
+    /// is stated rather than assumed to match the other.
+    ///
+    /// Anything that depends on a field -- data written for it, a child added
+    /// under it -- requires that field's definition, and a requirement is only
+    /// checked against what committed *after* the set was planned. A drop that
+    /// arrives second is safe, because applying it tombstones the field out of
+    /// every fragment's files, including one a concurrent set just added. A
+    /// set that is valid only against the values it read -- a replacement, a
+    /// tightening -- is not: it carries a precondition instead.
+    #[rstest]
+    // A cast is a drop, an add under the same name, and the data. The footprint
+    // has no schema to match the name, so any drop paired with an add counts as
+    // a replacement, and the replacement's data would miss a value a concurrent
+    // writer put in the dropped field.
+    #[case::a_replacement_landing_after_an_append(
+        vec![drop_field(1), add_field(0, "a", None)],
+        append(1),
+        true,
+    )]
+    #[case::a_replacement_landing_after_a_rewrite(
+        vec![drop_field(1), add_field(0, "a", None)],
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        true,
+    )]
+    // An added row counts as writing every field, so the replaced field's
+    // value in it -- null -- was never part of the replacement's data.
+    #[case::a_replacement_landing_after_an_append_omitting_the_field(
+        vec![drop_field(1), add_field(0, "a", None)],
+        append(2),
+        true,
+    )]
+    // The footprint cannot tell another field from a child of the replaced
+    // one, whose values the replacement also rewrites, so any value write
+    // collides.
+    #[case::a_replacement_landing_after_a_rewrite_of_another_field(
+        vec![drop_field(1), add_field(0, "a", None)],
+        vec![add_data_file(Ref::Committed(7), &[2])],
+        true,
+    )]
+    // The reverse order is already caught: the append requires the definition
+    // the replacement drops.
+    #[case::an_append_landing_after_a_replacement(
+        append(1),
+        vec![drop_field(1), add_field(0, "a", None)],
+        true,
+    )]
+    // New rows must carry a value for every non-nullable field, so a stale
+    // append cannot land after one is added, and an add cannot land after rows
+    // the add's data never covered. A nullable add needs neither.
+    #[case::an_append_landing_after_a_non_nullable_add(
+        append(1),
+        vec![add_non_nullable_field(0, "c")],
+        true,
+    )]
+    #[case::a_non_nullable_add_landing_after_an_append(
+        vec![add_non_nullable_field(0, "c")],
+        append(1),
+        true,
+    )]
+    #[case::an_append_landing_after_a_nullable_add(
+        append(1),
+        vec![add_field(0, "c", None)],
+        false,
+    )]
+    #[case::a_nullable_add_landing_after_an_append(
+        vec![add_field(0, "c", None)],
+        append(1),
+        false,
+    )]
+    // Tightening is valid against the version it read; values written since
+    // may hold nulls the apply never sees.
+    #[case::a_tightening_landing_after_an_append_to_the_field(
+        vec![set_nullability(1, false)],
+        append(1),
+        true,
+    )]
+    #[case::a_tightening_landing_after_a_rewrite_of_the_field(
+        vec![set_nullability(1, false)],
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        true,
+    )]
+    // A re-encode moves the field's values without changing any, so the
+    // tightening still holds against them.
+    #[case::a_tightening_landing_after_a_reencode_of_the_field(
+        vec![set_nullability(1, false)],
+        reencode(7, 1, false),
+        false,
+    )]
+    #[case::a_tightening_landing_after_a_data_changing_reencode_of_the_field(
+        vec![set_nullability(1, false)],
+        reencode(7, 1, true),
+        true,
+    )]
+    #[case::a_tightening_landing_after_an_append_omitting_the_field(
+        vec![set_nullability(1, false)],
+        append(2),
+        true,
+    )]
+    // The footprint has no schema to tell another field from a child or
+    // parent of the tightened one, so any value write collides, in either
+    // order: a null written into a child of a struct made required, or a
+    // struct written whole with a null child, breaks the tightening alike.
+    #[case::a_tightening_of_a_struct_landing_after_a_rewrite_of_its_child(
+        vec![set_nullability(1, false)],
+        vec![add_data_file(Ref::Committed(7), &[2])],
+        true,
+    )]
+    #[case::a_rewrite_of_a_child_landing_after_its_struct_was_tightened(
+        vec![add_data_file(Ref::Committed(7), &[2])],
+        vec![set_nullability(1, false)],
+        true,
+    )]
+    #[case::a_tightening_of_a_child_landing_after_a_rewrite_of_its_struct(
+        vec![set_nullability(2, false)],
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        true,
+    )]
+    #[case::a_rewrite_of_a_struct_landing_after_its_child_was_tightened(
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        vec![set_nullability(2, false)],
+        true,
+    )]
+    // Moving values changes none of them, and a set that writes no values has
+    // nothing for a tightening to object to.
+    #[case::a_reencode_landing_after_a_tightening(
+        reencode(7, 2, false),
+        vec![set_nullability(1, false)],
+        false,
+    )]
+    #[case::a_tightening_landing_after_a_config_update(
+        vec![set_nullability(1, false)],
+        vec![config_entry("k")],
+        false,
+    )]
+    #[case::a_config_update_landing_after_a_tightening(
+        vec![config_entry("k")],
+        vec![set_nullability(1, false)],
+        false,
+    )]
+    // Value writes only require the new-row schema, so they still commute
+    // with each other and with appends.
+    #[case::a_rewrite_landing_after_a_rewrite_of_another_fragment(
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        vec![add_data_file(Ref::Committed(8), &[1])],
+        false,
+    )]
+    #[case::a_rewrite_landing_after_an_append(
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        append(1),
+        false,
+    )]
+    #[case::an_append_landing_after_a_rewrite(
+        append(1),
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        false,
+    )]
+    #[case::an_append_landing_after_a_tightening(
+        append(1),
+        vec![set_nullability(1, false)],
+        true,
+    )]
+    // The append cannot name a field it does not write, so the tightening has
+    // to fence the schema new rows are written in.
+    #[case::an_append_omitting_the_field_landing_after_a_tightening(
+        append(2),
+        vec![set_nullability(1, false)],
+        true,
+    )]
+    // Adding a nullable field and tightening it in the same set is a
+    // non-nullable add by another name.
+    #[case::an_append_landing_after_a_local_field_is_added_and_tightened(
+        append(1),
+        vec![add_field(0, "c", None), tighten_local_field(0)],
+        true,
+    )]
+    #[case::a_local_field_added_and_tightened_landing_after_an_append(
+        vec![add_field(0, "c", None), tighten_local_field(0)],
+        append(1),
+        true,
+    )]
+    #[case::a_relaxation_landing_after_an_append(
+        vec![set_nullability(1, true)],
+        append(1),
+        false,
+    )]
+    #[case::an_append_landing_after_a_drop(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        vec![drop_field(1)],
+        true,
+    )]
+    #[case::a_drop_landing_after_an_append(
+        vec![drop_field(1)],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        false,
+    )]
+    #[case::a_rewrite_landing_after_a_drop(
+        vec![tombstone(0, &[1])],
+        vec![drop_field(1)],
+        true,
+    )]
+    #[case::a_drop_landing_after_a_rewrite(
+        vec![drop_field(1)],
+        vec![tombstone(0, &[1])],
+        false,
+    )]
+    // A struct is dropped children first, so a write to a child collides with
+    // the child's own drop rather than slipping past the parent's. Landing
+    // second, the drop tombstones the child's new data on apply.
+    #[case::a_write_to_a_child_landing_after_its_struct_was_dropped(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
+        vec![drop_field(2), drop_field(1)],
+        true,
+    )]
+    #[case::a_struct_dropped_after_a_write_to_a_child(
+        vec![drop_field(2), drop_field(1)],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
+        false,
+    )]
+    // A child added under a struct needs the struct to still be there. The
+    // reverse order is a precondition of the drop: it names the children it
+    // read, so a child added since would be left without its parent, and
+    // apply would reject the drop outright rather than let it retry.
+    #[case::a_child_landing_after_its_parent_was_dropped(
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        vec![drop_field(1)],
+        true,
+    )]
+    #[case::a_parent_dropped_after_a_child_was_added(
+        vec![drop_field(1)],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        true,
+    )]
+    #[case::a_struct_dropped_children_first_after_a_child_was_added(
+        vec![drop_field(2), drop_field(1)],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        true,
+    )]
+    #[case::a_struct_dropped_after_a_child_was_added_elsewhere(
+        vec![drop_field(4), drop_field(3)],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        false,
+    )]
+    #[case::a_struct_dropped_after_a_child_was_added_under_a_local_parent(
+        vec![drop_field(2), drop_field(1)],
+        vec![
+            add_field(0, "parent", None),
+            add_field(1, "child", Some(FieldRef::Local(0))),
+        ],
+        false,
+    )]
+    // A stale append may write the parent packed, without the new child.
+    #[case::an_append_landing_after_a_child_was_added_under_a_committed_parent(
+        append(2),
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        true,
+    )]
+    #[case::an_append_landing_after_a_child_was_added_under_a_local_parent(
+        append(2),
+        vec![
+            add_field(0, "parent", None),
+            add_field(1, "child", Some(FieldRef::Local(0))),
+        ],
+        false,
+    )]
+    fn test_directional_conflicts(
+        #[case] ours: Vec<Action>,
+        #[case] committed: Vec<Action>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            footprint(ours).conflicts_with(&footprint(committed)),
+            expected
+        );
+    }
+}
