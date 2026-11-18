@@ -3274,6 +3274,7 @@ mod tests {
             stream,
             store,
             Some(BloomFilterIndexBuilderParams::new(2, 0.01)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
