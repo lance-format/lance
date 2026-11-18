@@ -504,6 +504,7 @@ mod tests {
             query_parallelism: 1,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
         let input = if scenario == "empty" {
             candidates.slice(0, 0)

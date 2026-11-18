@@ -145,6 +145,11 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) aux_file_size: u64,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
+    /// Runtime-only: the quantizer with its prepared targets, shared by every
+    /// reconstruction of this entry, for the storages that retain one (PQ).
+    /// It is a plain value, set when the state is built, so the cache charges
+    /// for it on admission. Excluded from the CacheCodec wire format.
+    pub(crate) quantizer: Option<Quantizer>,
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
@@ -217,6 +222,89 @@ pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
 /// (far below [`GLOBAL_TOPK_CHUNK_BYTES`]) still leave the resident-partition bound
 /// expressible as a partition count: at most the prepare window plus two chunks.
 pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
+
+/// Fewest prepared-partition bytes one concurrent scoring task of a single
+/// query is given when a global-top-k chunk is split across CPU tasks.
+///
+/// A chunk is scored on one CPU thread unless it holds at least twice this
+/// many bytes, so small partitions keep the single-dispatch latency (#6475),
+/// while a query over large partitions, which otherwise ran on one core
+/// however idle the pool was, spreads its chunk over up to the compute CPUs.
+/// Each task costs a dispatch (~100µs); 1 MiB of PQ8 codes scores in several
+/// times that. Override with the `LANCE_IVF_SCORING_TASK_BYTES` environment
+/// variable.
+pub(crate) const DEFAULT_SCORING_TASK_BYTES: usize = 1024 * 1024;
+
+pub(crate) static SCORING_TASK_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let task_bytes = std::env::var("LANCE_IVF_SCORING_TASK_BYTES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_SCORING_TASK_BYTES")
+        })
+        .unwrap_or(DEFAULT_SCORING_TASK_BYTES);
+    assert!(
+        task_bytes > 0,
+        "LANCE_IVF_SCORING_TASK_BYTES must be greater than 0, got {task_bytes}"
+    );
+    task_bytes
+});
+
+/// Chunks scored by more than one task, for tests to observe the split.
+#[cfg(test)]
+pub(crate) static PARALLEL_SCORING_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Split `0..bytes.len()` into at most `max_tasks` contiguous ranges of
+/// roughly equal bytes, each holding at least `min_task_bytes` where the
+/// total allows; a total below `2 * min_task_bytes` is one range.
+fn balanced_byte_ranges(
+    bytes: &[usize],
+    min_task_bytes: usize,
+    max_tasks: usize,
+) -> Vec<Range<usize>> {
+    let total: usize = bytes.iter().sum();
+    let task_count = (total / min_task_bytes.max(1))
+        .clamp(1, max_tasks.max(1))
+        .min(bytes.len().max(1));
+    let target = total.div_ceil(task_count);
+    let mut ranges = Vec::with_capacity(task_count);
+    let mut start = 0;
+    let mut sum = 0;
+    for (index, &size) in bytes.iter().enumerate() {
+        sum += size;
+        // Close the range before the next partition overshoots the target, so
+        // a partition below the target still gets a task of its own.
+        let next = bytes.get(index + 1).copied();
+        if ranges.len() + 1 < task_count && next.is_some_and(|next| sum + next > target) {
+            ranges.push(start..index + 1);
+            start = index + 1;
+            sum = 0;
+        }
+    }
+    if start < bytes.len() {
+        ranges.push(start..bytes.len());
+    }
+    ranges
+}
+
+/// Merges per-task top-k heaps into the `capacity` best entries, into the
+/// first heap.
+fn merge_topk_heaps(
+    heaps: Vec<BinaryHeap<OrderedNode<u64>>>,
+    capacity: usize,
+) -> BinaryHeap<OrderedNode<u64>> {
+    let mut heaps = heaps.into_iter();
+    let mut merged = heaps.next().unwrap_or_default();
+    for node in heaps.flatten() {
+        if merged.len() < capacity {
+            merged.push(node);
+        } else if merged.peek().is_some_and(|worst| worst.dist > node.dist) {
+            merged.pop();
+            merged.push(node);
+        }
+    }
+    merged
+}
 
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
@@ -957,7 +1045,20 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
                 .and_then(|cache| cache.as_ref().and_then(|cache| cache.as_ref().cloned()))
                 .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
                 .unwrap_or_default()
+            + self.quantizer.deep_size_of_children(context)
     }
+}
+
+/// The quantizer a decoded state keeps for its partition storages: only the
+/// storages that retain one (PQ) get it built, so an RQ entry does not carry
+/// its rotation matrices for nothing.
+fn build_retained_quantizer<Q: Quantization>(
+    metadata: &<Q::Storage as QuantizerStorage>::Metadata,
+    distance_type: DistanceType,
+) -> Option<Quantizer> {
+    Q::retain_quantizer_for_partition_storage()
+        .then(|| Q::from_metadata(metadata, distance_type).ok())
+        .flatten()
 }
 
 /// Object-safe interface for a type-erased `IvfIndexState<Q>`.
@@ -977,6 +1078,10 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
         frag_reuse_index: Option<ResolvedRemapping>,
         context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>>;
+
+    /// Whether the state carries a prebuilt quantizer for its reconstructions.
+    #[cfg(test)]
+    fn has_quantizer(&self) -> bool;
 }
 
 /// Sized wrapper around `Arc<dyn IvfStateEntry>` for use as a cache value.
@@ -1052,6 +1157,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
             if !extra_bytes.is_empty() {
                 metadata.parse_buffer(extra_bytes)?;
             }
+            let quantizer = build_retained_quantizer::<Q>(&metadata, distance_type);
             Ok(IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
                 index_file_path: header.index_file_path,
                 uuid: header.uuid,
@@ -1065,6 +1171,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
+                quantizer,
             })))
         }
 
@@ -1119,6 +1226,11 @@ impl CacheCodecImpl for IvfStateEntryBox {
 }
 
 impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
+    #[cfg(test)]
+    fn has_quantizer(&self) -> bool {
+        self.quantizer.is_some()
+    }
+
     fn serialize_state(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let quantizer_metadata_json = serde_json::to_string(&self.metadata)
             .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;
@@ -2729,6 +2841,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
+            // The storage's own copy, when it retains one: building another
+            // would widen the codebook and prepare its targets a second time.
+            quantizer: self.storage.retained_quantizer().cloned(),
         }))
     }
 }
@@ -3791,6 +3906,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     )
     .await?;
 
+    let quantizer = state.quantizer.clone();
     let make_storage = |legacy| {
         IvfQuantizationStorage::from_cached_with_remapper(
             aux_reader,
@@ -3798,6 +3914,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
             state.metadata.clone(),
             state.distance_type,
             legacy,
+            quantizer,
         )
     };
     let storage = match frag_reuse_index {

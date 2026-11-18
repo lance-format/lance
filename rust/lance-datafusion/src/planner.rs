@@ -10,12 +10,15 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::membership::simplify_membership_regions;
+use crate::numeric_coercion::unwrap_widening_casts;
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::{OffsetBuffer, i256};
 use arrow_cast::cast_with_options;
+use arrow_cast::parse::string_to_datetime;
 use arrow_schema::{
     DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType as ArrowDataType, Field,
     SchemaRef, TimeUnit,
@@ -55,7 +58,7 @@ use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_core::datatypes::{Schema, parse_field_path};
 use lance_core::error::LanceOptionExt;
 
-use chrono::Utc;
+use chrono::{FixedOffset, Utc};
 use lance_core::{Error, Result};
 
 /// Encode a JSON string into a JSONB `LargeBinary` literal expression.
@@ -472,7 +475,7 @@ impl Planner {
         leaves
     }
 
-    fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
+    pub(crate) fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
         if exprs.is_empty() {
             return Err(Error::invalid_input("Binary expression has no operands"));
         }
@@ -945,9 +948,10 @@ impl Planner {
                 data_type, value, ..
             }) => {
                 let value = value.clone().into_string().expect_ok()?;
+                let data_type = with_utc_zone_if_offset(&value, self.parse_type(data_type)?);
                 Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
                     Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
-                    self.parse_type(data_type)?,
+                    data_type,
                 )))
             }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
@@ -1327,6 +1331,11 @@ impl Planner {
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
 
+        // After coercion, which is what casts a `Float32` column compared with a
+        // `Float64` literal, and before the float comparison rewrite, which would
+        // otherwise turn a comparison on the cast into ranges on the cast.
+        let expr = unwrap_widening_casts(expr, &df_schema)?;
+
         // Fold each comparison's own operands and rewrite it before anything above
         // it folds. `simplify` folds an operand and everything above it in one
         // pass, so a fully constant predicate whose zero appears only as a result
@@ -1337,13 +1346,17 @@ impl Planner {
         let expr =
             normalize_float_comparisons(expr, &|operand| simplifier.simplify(operand), &df_schema)?;
 
+        // Group compatible memberships before DataFusion shortens small IN lists
+        // to equality/OR expressions and loses their set structure.
+        let expr = simplify_membership_regions(expr, &|group| simplifier.simplify(group))?;
+        let expr = simplifier.simplify(expr)?;
+
         // Again after simplify, which is what expands `BETWEEN` into two
         // comparisons and folds the casts `coerce` inserts, so those forms only
         // become visible on this pass.
         //
         // Running the rewrite more than once is safe because its output is a fixed
         // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
-        let expr = simplifier.simplify(expr)?;
         let expr = rewrite_float_comparisons(expr, &df_schema)?;
 
         Ok(expr)
@@ -1379,6 +1392,26 @@ impl Planner {
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
         lance_datafusion_exec::expr::column_names_in_expr(expr)
     }
+}
+
+/// Gives a zoneless timestamp type the UTC zone when `value` has an explicit UTC offset,
+/// such as `2024-01-01T12:00:00Z`. Casting the string to the zoneless type keeps only its
+/// UTC wall time, which a column with a time zone then reads as local time in its own
+/// zone, while the zoned type keeps the instant. The result stays a cast rather than a
+/// literal so that DataFusion still coerces it against other column types, such as dates.
+fn with_utc_zone_if_offset(value: &str, data_type: ArrowDataType) -> ArrowDataType {
+    let ArrowDataType::Timestamp(unit, None) = data_type else {
+        return data_type;
+    };
+    // Only a string with its own offset parses to the same instant in every zone.
+    let has_offset = match (
+        string_to_datetime(&Utc, value),
+        FixedOffset::east_opt(3600).map(|zone| string_to_datetime(&zone, value)),
+    ) {
+        (Ok(utc), Some(Ok(other))) => utc == other,
+        _ => false,
+    };
+    ArrowDataType::Timestamp(unit, has_offset.then(|| Arc::from("+00:00")))
 }
 
 #[cfg(test)]
@@ -1424,6 +1457,597 @@ mod tests {
             err.to_string().contains("Unsupported SQL value"),
             "error should name the unsupported value for {filter}, got {err}"
         );
+    }
+
+    /// Compare complete arrays, including validity bits, across both optimizer passes.
+    fn assert_optimization_preserves_values(
+        planner: &Planner,
+        batch: &RecordBatch,
+        original: Expr,
+    ) -> Expr {
+        let evaluate = |expr: &Expr| {
+            planner
+                .create_physical_expr(expr)
+                .unwrap()
+                .evaluate(batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+        let expected = evaluate(&original);
+        let optimized = planner.optimize_expr(original.clone()).unwrap();
+        let twice = planner.optimize_expr(optimized.clone()).unwrap();
+        for actual in [&optimized, &twice] {
+            assert_eq!(
+                evaluate(actual).as_ref(),
+                expected.as_ref(),
+                "{original:?} => {actual:?}"
+            );
+        }
+        optimized
+    }
+
+    #[rstest]
+    #[case::equal_true("({}) = TRUE")]
+    #[case::equal_false("({}) = FALSE")]
+    #[case::not_equal_false("({}) <> FALSE")]
+    #[case::greater_false("({}) > FALSE")]
+    #[case::less_true("({}) < TRUE")]
+    #[case::is_distinct_false("({}) IS DISTINCT FROM FALSE")]
+    #[case::is_not_distinct_true("({}) IS NOT DISTINCT FROM TRUE")]
+    #[case::in_true("({}) IN (TRUE)")]
+    #[case::reverse_in_true("TRUE IN ({})")]
+    #[case::not_in_false("({}) NOT IN (FALSE)")]
+    #[case::or_false("({}) OR FALSE")]
+    #[case::and_true("({}) AND TRUE")]
+    #[case::cast("CAST(({}) AS BOOLEAN)")]
+    #[case::try_cast("TRY_CAST(({}) AS BOOLEAN)")]
+    #[case::is_true("({}) IS TRUE")]
+    #[case::is_not_true("({}) IS NOT TRUE")]
+    #[case::is_not_false("({}) IS NOT FALSE")]
+    fn test_wrapped_memberships_preserve_separators(#[case] wrapper: &str) {
+        let values = [Some("a"), Some("outside"), None];
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        for membership in [
+            "s IN ('a','b','c','d')",
+            "s NOT IN ('a','b','c','d')",
+            "s IN ('a',NULL)",
+        ] {
+            let wrapped = wrapper.replace("{}", membership);
+            for operator in ["AND", "OR"] {
+                let sql = format!(
+                    "((s IN ('a','b','c','d') {operator} t = 'a') {operator} ({wrapped})) {operator} t = 'a'"
+                );
+                let expr = planner.parse_filter(&sql).unwrap();
+                for original in [expr.clone(), !expr.clone(), expr.is_false()] {
+                    assert_optimization_preserves_values(&planner, &batch, original);
+                }
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::array_has("array_has(['x','y','z','w'], s)")]
+    #[case::array_has_eq_true("(array_has(['x','y','z','w'], s)) = TRUE")]
+    #[case::like_union("s LIKE 'x' OR s LIKE 'y'")]
+    #[case::or_false_boundary("s NOT IN ('a','b','c','d') OR FALSE")]
+    #[case::or_false_nullable_list("s NOT IN ('a', NULL) OR FALSE")]
+    #[case::absorbed_boundary(
+        "s NOT IN ('a','b','c','d') OR (s NOT IN ('a','b','c','d') AND t = 'x')"
+    )]
+    #[case::range_equality_boundary(
+        "(s >= 'x' AND s <= 'x') OR (s >= 'y' AND s <= 'y') OR (s >= 'z' AND s <= 'z') OR (s >= 'w' AND s <= 'w')"
+    )]
+    #[case::cast_column("CAST(s AS STRING) NOT IN ('a','b','c','d')")]
+    #[case::concat_identity("concat(s, '') NOT IN ('a','b','c','d')")]
+    fn test_hidden_memberships_preserve_separators(#[case] hidden: &str) {
+        let values = [Some("a"), Some("x"), Some("outside"), None];
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        for sql in [
+            format!("((s IN ('a','b','c','d') AND t='a') AND ({hidden})) AND t='a'"),
+            format!("(((s IN ('a','b','c','d') OR FALSE) AND t='a') AND ({hidden})) AND t='a'"),
+            format!("((s NOT IN ('a','b') OR t='a') OR (({hidden}) AND TRUE)) OR t='a'"),
+        ] {
+            let expr = planner.parse_filter(&sql).unwrap();
+            for original in [expr.clone(), !expr.clone(), expr.is_false()] {
+                assert_optimization_preserves_values(&planner, &batch, original);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::separated(
+        "s IN ('a','b','c','d') AND i = 1 AND s IN ('b','c')",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::reversed(
+        "s IN ('b','c') AND i = 1 AND s IN ('a','b','c','d')",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::duplicate(
+        "s IN ('a','b','b') AND i = 1 AND s IN ('b','a')",
+        "i = 1 AND s IN ('a','b')"
+    )]
+    #[case::nullable(
+        "s IN ('a','b',NULL) AND i = 1 AND s IN ('b',NULL)",
+        "s IN ('a','b',NULL) AND i = 1 AND s IN ('b',NULL)"
+    )]
+    #[case::disjoint(
+        "s IN ('a','b') AND i = 1 AND s IN ('c','d')",
+        "s IN ('a','b') AND i = 1 AND s IN ('c','d')"
+    )]
+    #[case::or_boundary(
+        "s IN ('a','b','c') AND (i = 1 OR s IN ('a','b'))",
+        "s IN ('a','b','c') AND (i = 1 OR s IN ('a','b'))"
+    )]
+    #[case::not_in(
+        "s NOT IN ('a','b','c') AND i = 1 AND s IN ('a','b')",
+        "s NOT IN ('a','b','c') AND i = 1 AND s IN ('a','b')"
+    )]
+    #[case::intersection("s IN ('a','b') AND i = 1 AND s IN ('b','c')", "i = 1 AND s = 'b'")]
+    #[case::difference(
+        "s IN ('a','b','c') AND i = 1 AND s NOT IN ('b','d')",
+        "i = 1 AND s IN ('a','c')"
+    )]
+    #[case::negative_union(
+        "s NOT IN ('a','b') AND i = 1 AND s NOT IN ('b','c')",
+        "i = 1 AND s NOT IN ('a','b','c')"
+    )]
+    #[case::three_memberships(
+        "s IN ('a','b','c','d') AND i = 1 AND s IN ('b','c','d') AND s NOT IN ('c','d')",
+        "i = 1 AND s = 'b'"
+    )]
+    #[case::equality("s = 'b' AND i = 1 AND s IN ('a','b','c')", "i = 1 AND s = 'b'")]
+    #[case::reversed_equality("'b' = s AND i = 1 AND s IN ('a','b','c')", "i = 1 AND s = 'b'")]
+    #[case::inequality(
+        "s IN ('a','b','c') AND i = 1 AND s <> 'b'",
+        "i = 1 AND s IN ('a','c')"
+    )]
+    #[case::folded_literal(
+        "s IN (concat('a', ''),'b','c') AND i = 1 AND s IN ('b','c')",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::right_nested(
+        "s IN ('a','b','c') AND (i = 1 AND s IN ('b','c'))",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::separated_or(
+        "s IN ('a','b') OR i = 1 OR s IN ('b','c')",
+        "i = 1 OR s IN ('a','b','c')"
+    )]
+    #[case::coerced_integer("i IN (1,2,3) AND s = 'b' AND i IN (1,2)", "s = 'b' AND i IN (1,2)")]
+    #[case::two_columns(
+        "i IN (1,2,3) AND s IN ('a','b','c') AND i IN (1,2) AND s = 'b'",
+        "i IN (1,2) AND s = 'b'"
+    )]
+    #[case::positive_union("s IN ('a','b') OR s IN ('b','c')", "s IN ('a','b','c')")]
+    #[case::boundary_becomes_same_operator(
+        "(s NOT IN ('a','b','c') OR s NOT IN ('a','b','d')) AND i IN (1,2,3) AND i IN (1,2)",
+        "s NOT IN ('a','b') AND i IN (1,2)"
+    )]
+    #[case::nested_not(
+        "i = 1 AND NOT (s IN ('a','b','c') AND i = 2 AND s IN ('b','c'))",
+        "i = 1 AND NOT (i = 2 AND s IN ('b','c'))"
+    )]
+    #[case::not_boolean(
+        "s IN ('a','b','c') AND NOT b AND s IN ('b','c')",
+        "NOT b AND s IN ('b','c')"
+    )]
+    #[case::not_greater_than(
+        "s IN ('a','b','c') AND NOT (i > 100) AND s IN ('b')",
+        "NOT (i > 100) AND s = 'b'"
+    )]
+    #[case::not_less_equal(
+        "s IN ('a','b','c') AND NOT (i <= 0) AND s IN ('b')",
+        "NOT (i <= 0) AND s = 'b'"
+    )]
+    #[case::not_reversed_comparison(
+        "s IN ('a','b','c') AND NOT (100 < i) AND s IN ('b')",
+        "NOT (100 < i) AND s = 'b'"
+    )]
+    #[case::not_double_comparison(
+        "s IN ('a','b','c') AND NOT NOT (i >= 0) AND s IN ('b')",
+        "i >= 0 AND s = 'b'"
+    )]
+    #[case::not_is_null(
+        "s IN ('a','b','c') AND NOT (i IS NULL) AND s IN ('b','c')",
+        "NOT (i IS NULL) AND s IN ('b','c')"
+    )]
+    #[case::independent_float(
+        "s IN ('a','b','c') AND f IN (1.0,2.0) AND s IN ('b','c')",
+        "f IN (1.0,2.0) AND s IN ('b','c')"
+    )]
+    #[case::independent_computed_membership(
+        "s IN ('a','b','c') AND lower(s) IN ('b') AND s IN ('b','c')",
+        "lower(s) IN ('b') AND s IN ('b','c')"
+    )]
+    #[case::column_comparison(
+        "s IN ('a','b','c') AND i = j AND s IN ('b','c')",
+        "i = j AND s IN ('b','c')"
+    )]
+    fn test_simplify_membership_regions(#[case] filter: &str, #[case] expected: &str) {
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                [Some("a"), Some("b"), Some("c"), Some("d"), None, None]
+            ),
+            ("i", Int64, [Some(1), Some(1), Some(0), None, Some(1), None]),
+            ("j", Int64, [Some(1), Some(2), Some(0), None, None, Some(1)]),
+            (
+                "b",
+                Boolean,
+                [Some(true), Some(false), None, Some(false), None, Some(true)]
+            ),
+            (
+                "f",
+                Float64,
+                [
+                    Some(1.0),
+                    Some(2.0),
+                    Some(f64::NAN),
+                    Some(-0.0),
+                    None,
+                    Some(0.0)
+                ]
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let original = planner.parse_filter(filter).unwrap();
+        let optimized = assert_optimization_preserves_values(&planner, &batch, original);
+        let expected = planner
+            .optimize_expr(planner.parse_filter(expected).unwrap())
+            .unwrap();
+        assert_eq!(optimized, expected);
+    }
+
+    #[test]
+    fn test_many_same_column_memberships() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+        // An odd count also exercises unpaired terms while building each level.
+        let mut level: Vec<_> = (0..1025)
+            .map(|i| {
+                col("s").in_list(
+                    vec![lit("a"), lit("b"), lit("c"), lit(format!("v{i}"))],
+                    false,
+                )
+            })
+            .collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| match pair {
+                    [left, right] => left.clone().and(right.clone()),
+                    [only] => only.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+        }
+        let optimized = planner.optimize_expr(level.pop().unwrap()).unwrap();
+        let expected = planner
+            .optimize_expr(col("s").in_list(vec![lit("a"), lit("b"), lit("c")], false))
+            .unwrap();
+        assert_eq!(optimized, expected);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MembershipSet {
+        A,
+        B,
+        AB,
+        Null,
+        ANull,
+        BNull,
+        ABNull,
+        Abc,
+    }
+
+    impl MembershipSet {
+        fn expression(self, column: &str, negated: bool) -> Expr {
+            let values: &[Option<&str>] = match self {
+                Self::A => &[Some("a")],
+                Self::B => &[Some("b")],
+                Self::AB => &[Some("a"), Some("b")],
+                Self::Null => &[None],
+                Self::ANull => &[Some("a"), None],
+                Self::BNull => &[Some("b"), None],
+                Self::ABNull => &[Some("a"), Some("b"), None],
+                Self::Abc => &[Some("a"), Some("b"), Some("c")],
+            };
+            col(column).in_list(
+                values
+                    .iter()
+                    .map(|v| lit(ScalarValue::Utf8(v.map(str::to_owned))))
+                    .collect(),
+                negated,
+            )
+        }
+    }
+
+    #[rstest]
+    #[case::all_positive([false, false, false, false])]
+    #[case::first_s_negative([true, false, false, false])]
+    #[case::first_t_negative([false, true, false, false])]
+    #[case::first_pair_negative([true, true, false, false])]
+    #[case::second_s_negative([false, false, true, false])]
+    #[case::both_s_negative([true, false, true, false])]
+    #[case::middle_pair_negative([false, true, true, false])]
+    #[case::first_three_negative([true, true, true, false])]
+    #[case::second_t_negative([false, false, false, true])]
+    #[case::outer_pair_negative([true, false, false, true])]
+    #[case::both_t_negative([false, true, false, true])]
+    #[case::only_second_s_positive([true, true, false, true])]
+    #[case::last_pair_negative([false, false, true, true])]
+    #[case::only_first_t_positive([true, false, true, true])]
+    #[case::last_three_negative([false, true, true, true])]
+    #[case::all_negative([true, true, true, true])]
+    fn test_interleaved_membership_groups(
+        #[case] negated: [bool; 4],
+        #[values(Operator::And, Operator::Or)] operator: Operator,
+        #[values(
+            MembershipSet::A,
+            MembershipSet::B,
+            MembershipSet::ANull,
+            MembershipSet::Abc
+        )]
+        first_set: MembershipSet,
+    ) {
+        let values = [Some("a"), Some("b"), Some("c"), Some("outside"), None];
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let join = |left: Expr, right: Expr| {
+            Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
+        };
+        for second_set in [MembershipSet::A, MembershipSet::B, MembershipSet::AB] {
+            for third_set in [
+                MembershipSet::A,
+                MembershipSet::B,
+                MembershipSet::AB,
+                MembershipSet::Null,
+                MembershipSet::ANull,
+                MembershipSet::BNull,
+                MembershipSet::ABNull,
+                MembershipSet::Abc,
+            ] {
+                let a = first_set.expression("s", negated[0]);
+                let b = second_set.expression("t", negated[1]);
+                let c = third_set.expression("s", negated[2]);
+                // These single-group cases do not depend on the fourth term.
+                for original in [
+                    join(join(a.clone(), b.clone()), c.clone()),
+                    join(c.clone(), join(b.clone(), a.clone())),
+                ] {
+                    for original in [original.clone(), !original] {
+                        assert_optimization_preserves_values(&planner, &batch, original);
+                    }
+                }
+                for fourth_set in [MembershipSet::A, MembershipSet::B, MembershipSet::AB] {
+                    let d = fourth_set.expression("t", negated[3]);
+                    // All five parenthesizations of four interleaved terms.
+                    for original in [
+                        join(join(join(a.clone(), b.clone()), c.clone()), d.clone()),
+                        join(join(a.clone(), join(b.clone(), c.clone())), d.clone()),
+                        join(a.clone(), join(join(b.clone(), c.clone()), d.clone())),
+                        join(a.clone(), join(b.clone(), join(c.clone(), d.clone()))),
+                        join(join(a.clone(), b.clone()), join(c.clone(), d)),
+                    ] {
+                        for original in [original.clone(), !original] {
+                            assert_optimization_preserves_values(&planner, &batch, original);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::in_list("s IN ('a')")]
+    #[case::equal("s = 'a'")]
+    #[case::not_equal("s <> 'a'")]
+    #[case::not_in("NOT (s IN ('a'))")]
+    #[case::not_equal_expr("NOT (s = 'a')")]
+    #[case::not_not_equal("NOT (s <> 'a')")]
+    fn test_membership_syntax_variants(#[case] left_sql: &str) {
+        let values = [Some("a"), Some("b"), None];
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let left = planner.parse_filter(left_sql).unwrap();
+        for right_sql in [
+            "t IN ('a')",
+            "t = 'a'",
+            "t <> 'a'",
+            "NOT (t IN ('a'))",
+            "NOT (t = 'a')",
+            "NOT (t <> 'a')",
+        ] {
+            let right = planner.parse_filter(right_sql).unwrap();
+            for expr in [
+                left.clone()
+                    .and(right.clone())
+                    .and(left.clone())
+                    .and(right.clone()),
+                left.clone()
+                    .and(right.clone().and(left.clone()))
+                    .and(right.clone()),
+                // Explicit NOT also covers the nullable contradiction regression.
+                left.clone()
+                    .and(right.clone())
+                    .and(Expr::Not(Box::new(left.clone())))
+                    .and(right),
+            ] {
+                for original in [expr.clone(), !expr] {
+                    assert_optimization_preserves_values(&planner, &batch, original);
+                }
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::float("f IN (1.0,2.0)", "f NOT IN (1.0,2.0)")]
+    #[case::computed("lower(s) IN ('a','b')", "lower(s) NOT IN ('a','b')")]
+    #[case::nullable("s IN ('a',NULL)", "s NOT IN ('a',NULL)")]
+    fn test_ineligible_memberships_keep_separators(#[case] left: &str, #[case] right: &str) {
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                [Some("a"), Some("b"), None, Some("C"), Some("a"), None]
+            ),
+            (
+                "t",
+                Utf8,
+                [Some("a"), Some("b"), Some("a"), None, Some("a"), None]
+            ),
+            (
+                "f",
+                Float64,
+                [
+                    Some(1.0),
+                    Some(2.0),
+                    None,
+                    Some(-0.0),
+                    Some(0.0),
+                    Some(f64::NAN)
+                ]
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        for operator in ["AND", "OR"] {
+            let sql =
+                format!("((({left}) {operator} t = 'a') {operator} ({right})) {operator} t = 'a'");
+            let original = planner.parse_filter(&sql).unwrap();
+            for expr in [original.clone(), !original] {
+                assert_optimization_preserves_values(&planner, &batch, expr);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::intersection("AND", false)]
+    #[case::union("OR", true)]
+    fn test_membership_preserves_float_normalization(#[case] operator: &str, #[case] value: bool) {
+        let batch = arrow_array::record_batch!(
+            (
+                "f",
+                Float64,
+                [
+                    Some(-0.0),
+                    Some(0.0),
+                    Some(f64::NAN),
+                    Some(-f64::NAN),
+                    Some(1.0),
+                    None
+                ]
+            ),
+            ("t", Utf8, vec![Some("a"); 6])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let sql = format!(
+            "((f IN (-0.0,0.0,'NaN'::DOUBLE) {operator} t = 'a') \
+            {operator} f NOT IN (0.0,'NaN'::DOUBLE)) {operator} t = 'a'"
+        );
+        let optimized = planner
+            .optimize_expr(planner.parse_filter(&sql).unwrap())
+            .unwrap();
+        let twice = planner.optimize_expr(optimized.clone()).unwrap();
+        // Lance normalizes both zero and NaN signs; Arrow's raw physical
+        // comparison is therefore not the reference for this input.
+        let expected = BooleanArray::from(vec![
+            Some(value),
+            Some(value),
+            Some(value),
+            Some(value),
+            Some(value),
+            if value { Some(true) } else { None },
+        ]);
+        for expr in [optimized, twice] {
+            let actual = planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(actual.as_ref(), &expected, "{expr:?}");
+        }
     }
 
     #[test]
@@ -2745,6 +3369,120 @@ mod tests {
             let result = result.into_array(batch.num_rows()).unwrap();
             assert_eq!(&expected, &result, "unexpected result for {}", expression);
         }
+    }
+
+    // 12:00:00 to 12:00:05 UTC, which is 07:00:00 to 07:00:05 in New York.
+    #[rstest]
+    #[case::utc_designator("ts >= TIMESTAMP '2024-01-01T12:00:03Z'", [3, 4, 5])]
+    #[case::numeric_offset("ts >= TIMESTAMP '2024-01-01 17:00:03+05:00'", [3, 4, 5])]
+    #[case::second_precision("ts = TIMESTAMP(0) '2024-01-01T12:00:02.9Z'", [2])]
+    #[case::in_list("ts IN (TIMESTAMP '2024-01-01T12:00:01Z', TIMESTAMP '2024-01-01T12:00:04Z')", [1, 4])]
+    #[case::between(
+        "ts BETWEEN TIMESTAMP '2024-01-01T11:00:00-01:00' AND TIMESTAMP '2024-01-01T12:00:01Z'",
+        [0, 1]
+    )]
+    #[case::no_offset_is_column_local_time("ts >= TIMESTAMP '2024-01-01 07:00:04'", [4, 5])]
+    fn test_sql_comparison_with_zoned_timestamp<const N: usize>(
+        #[case] filter: &str,
+        #[case] expected_rows: [usize; N],
+    ) {
+        let start = 1_704_110_400_000_000_i64;
+        let ts = TimestampMicrosecondArray::from_iter_values((0..6).map(|i| start + i * 1_000_000))
+            .with_timezone("America/New_York");
+        let batch = RecordBatch::try_from_iter(vec![("ts", Arc::new(ts) as ArrayRef)]).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+
+        let expected = BooleanArray::from_iter((0..6).map(|i| Some(expected_rows.contains(&i))));
+        assert_eq!(result.as_ref(), &expected, "unexpected result for {filter}");
+    }
+
+    #[test]
+    fn test_timestamp_with_offset_does_not_cast_zoned_column() {
+        let column_type =
+            DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into()));
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            column_type,
+            true,
+        )])));
+
+        let expr = planner
+            .parse_filter("ts >= TIMESTAMP '2024-01-01T12:00:00Z'")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+
+        assert_eq!(
+            expr,
+            col("ts").gt_eq(lit(ScalarValue::TimestampMicrosecond(
+                Some(1_704_110_400_000_000),
+                Some("America/New_York".into())
+            )))
+        );
+    }
+
+    // How `UpdateBuilder::set` turns a value into a column's type.
+    #[rstest]
+    #[case::zoned_column(Some("America/New_York"))]
+    #[case::zoneless_column(None)]
+    fn test_timestamp_with_offset_cast_to_column(#[case] column_tz: Option<&str>) {
+        let column_type = DataType::Timestamp(TimeUnit::Microsecond, column_tz.map(Arc::from));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            column_type.clone(),
+            true,
+        )]));
+        let planner = Planner::new(schema.clone());
+        let df_schema = DFSchema::try_from(schema.as_ref().clone()).unwrap();
+
+        let expr = planner
+            .parse_expr("TIMESTAMP '2024-01-01T17:00:00+05:00'")
+            .unwrap()
+            .cast_to(&column_type, &df_schema)
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+
+        assert_eq!(
+            expr,
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(1_704_110_400_000_000),
+                column_tz.map(Arc::from)
+            ))
+        );
+    }
+
+    #[rstest]
+    #[case::date32(Arc::new(arrow_array::Date32Array::from(vec![0, 1])) as ArrayRef)]
+    #[case::date64(Arc::new(arrow_array::Date64Array::from(vec![0, 86_400_000])) as ArrayRef)]
+    fn test_date_column_with_offset_timestamp(#[case] dates: ArrayRef) {
+        let batch = RecordBatch::try_from_iter(vec![("d", dates)]).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner
+            .parse_filter("d = TIMESTAMP '1970-01-01T00:00:00Z'")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+
+        assert_eq!(
+            result.as_ref(),
+            &BooleanArray::from(vec![Some(true), Some(false)])
+        );
     }
 
     #[test]
