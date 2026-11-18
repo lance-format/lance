@@ -100,11 +100,22 @@ fn lower(column: &Expr, op: Operator, operand: &Expr, schema: &Schema) -> Option
         scalar,
         ScalarValue::Float16(_) | ScalarValue::Float32(_) | ScalarValue::Float64(_)
     );
+    let mut needs_rewrite = is_float;
     let comparison = if scalar.is_null() {
         Comparison::Literal(op, ScalarValue::try_new_null(&data_type).ok()?)
     } else if !is_float {
-        // Operands the existing coercion already handles keep its behavior.
-        Comparison::Literal(op, safe_coerce_scalar(&scalar, &data_type)?)
+        match safe_coerce_scalar(&scalar, &data_type) {
+            // Operands the existing coercion already handles keep its behavior.
+            Some(value) => Comparison::Literal(op, value),
+            // An integer operand the column type cannot hold lies below its
+            // minimum when negative and above its maximum otherwise.
+            None if scalar.data_type().is_integer() => {
+                needs_rewrite = true;
+                let (value, _) = exact_value(&scalar)?;
+                out_of_range(op, !value.is_negative())?
+            }
+            None => return None,
+        }
     } else {
         let ScalarValue::Float64(Some(value)) = scalar.cast_to(&DataType::Float64).ok()? else {
             return None;
@@ -130,7 +141,7 @@ fn lower(column: &Expr, op: Operator, operand: &Expr, schema: &Schema) -> Option
         column: column.clone(),
         data_type,
         comparison,
-        needs_rewrite: is_float,
+        needs_rewrite,
     })
 }
 
@@ -280,7 +291,8 @@ fn lower_decimal(
 }
 
 /// Rewrites integer and decimal column comparisons against operands the
-/// existing coercion rejects or rounds: floats for integer columns, and
+/// existing coercion rejects or rounds: floats and integers outside the column
+/// type for integer columns, and
 /// integers and decimals whose exact value differs from what the coercion
 /// produces for decimal columns. Returns `None` for any other filter, so it
 /// keeps its current shape.
