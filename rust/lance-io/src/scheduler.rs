@@ -1708,8 +1708,7 @@ mod tests {
     use crate::{
         object_store::{
             DEFAULT_DOWNLOAD_RETRY_COUNT, DEFAULT_MAX_IOP_SIZE, ObjectStoreParams,
-            ObjectStoreProvider, ObjectStoreRegistry, StorageOptionsAccessor,
-            providers::local::FileStoreProvider,
+            ObjectStoreRegistry, StorageOptionsAccessor,
         },
         testing::MockObjectStore,
     };
@@ -3237,34 +3236,6 @@ mod tests {
         let scheduler = ScanScheduler::new(memory_store.clone(), config);
         assert!(!scheduler.uses_lite_scheduler());
 
-        // Use the local provider: a custom store with this URI need not support
-        // direct local I/O. Only scheduler selection is tested, so constructing
-        // the provider directly also covers platforms without io_uring reads.
-        let uring_store = Arc::new(
-            FileStoreProvider
-                .new_store(
-                    Url::parse("file+uring:///tmp").unwrap(),
-                    &ObjectStoreParams::default(),
-                )
-                .await
-                .unwrap(),
-        );
-        assert!(uring_store.prefers_lite_scheduler());
-        let config = SchedulerConfig {
-            io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler: None,
-        };
-        let scheduler = ScanScheduler::new(uring_store.clone(), config);
-        assert!(scheduler.uses_lite_scheduler());
-
-        // Explicit Some(false) overrides a file+uring:// store's preference
-        let config = SchedulerConfig {
-            io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler: Some(false),
-        };
-        let scheduler = ScanScheduler::new(uring_store, config);
-        assert!(!scheduler.uses_lite_scheduler());
-
         // Explicit Some(true) overrides a memory:// store's preference
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
@@ -3272,6 +3243,29 @@ mod tests {
         };
         let scheduler = ScanScheduler::new(memory_store, config);
         assert!(scheduler.uses_lite_scheduler());
+
+        // Only the built-in file provider declares io_uring, and it registers
+        // its file+uring:// scheme on Linux alone.
+        #[cfg(target_os = "linux")]
+        {
+            // A file+uring:// store should use the lite scheduler when config is None
+            let (uring_store, _) = ObjectStore::from_uri("file+uring:///tmp").await.unwrap();
+            assert!(uring_store.prefers_lite_scheduler());
+            let config = SchedulerConfig {
+                io_buffer_size_bytes: 256 * 1024 * 1024,
+                use_lite_scheduler: None,
+            };
+            let scheduler = ScanScheduler::new(uring_store.clone(), config);
+            assert!(scheduler.uses_lite_scheduler());
+
+            // Explicit Some(false) overrides a file+uring:// store's preference
+            let config = SchedulerConfig {
+                io_buffer_size_bytes: 256 * 1024 * 1024,
+                use_lite_scheduler: Some(false),
+            };
+            let scheduler = ScanScheduler::new(uring_store, config);
+            assert!(!scheduler.uses_lite_scheduler());
+        }
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]

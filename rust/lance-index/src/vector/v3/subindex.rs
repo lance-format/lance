@@ -257,6 +257,7 @@ mod tests {
             query_parallelism: 0,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            rq_graph_scoring: Default::default(),
         };
 
         let params: CapturedParams = query_params_from_processed(&query, &processed_key, 9.5);

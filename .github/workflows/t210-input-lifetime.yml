@@ -37,6 +37,14 @@ jobs:
           print(io[0])
           print("lance-examples benchmark has no lance-io/test-util feature")
           PYFEATURES
+      - name: Verify merged local-store routing and admitted I/O
+        env:
+          LANCE_CPU_THREADS: 1
+        run: |
+          cargo test --profile ci --locked -p lance-io --lib scheduler::tests::test_object_store_selects_scheduler -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib scheduler::read_into::tests:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib object_store::tests::test_local_io_uses_wrapped_backend -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib object_store::tests::test_external_view_counts_reads_once -- --nocapture
       - name: Verify initialized raw outputs and actual file composition
         env:
           LANCE_CPU_THREADS: 1
@@ -60,6 +68,6 @@ jobs:
       - name: Lint benchmark paths
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-examples --example admitted_dataset --no-deps -- -D warnings
-      - name: Lint changed encoding, file and Lance paths
+      - name: Lint merged I/O, encoding, file and Lance paths
         if: ${{ !cancelled() }}
-        run: cargo clippy --profile ci --locked -p lance-encoding -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings
+        run: cargo clippy --profile ci --locked -p lance-io -p lance-encoding -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings

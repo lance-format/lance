@@ -34,7 +34,7 @@ pub(super) struct LocalStagingPaths {
 
 impl LocalStagingPaths {
     pub(super) fn for_store(store: &ObjectStore) -> Option<Self> {
-        let has_local_root = store.has_direct_local_paths() || store.scheme == "file-object-store";
+        let has_local_root = store.has_absolute_local_mapping();
         if store.local_dir_operations.is_none() && !has_local_root {
             return None;
         }
@@ -97,7 +97,7 @@ impl ObjectStore {
     pub fn read_local_staging_files(&self, root: &Path) -> BoxStream<'_, Result<ObjectMeta>> {
         let local_root = if let Some(operations) = &self.local_dir_operations {
             operations.directory_to_filesystem(root)
-        } else if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+        } else if self.has_absolute_local_mapping() {
             Ok(PathBuf::from(crate::local::to_local_path(root)))
         } else {
             return stream::empty().boxed();

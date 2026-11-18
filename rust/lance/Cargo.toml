@@ -204,6 +204,10 @@ name = "scalar_index"
 harness = false
 
 [[bench]]
+name = "membership_planning"
+harness = false
+
+[[bench]]
 name = "index_visibility"
 harness = false
 
