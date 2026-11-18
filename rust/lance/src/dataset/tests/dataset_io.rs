@@ -3055,6 +3055,8 @@ async fn test_shallow_clone_cross_store(
     #[case] source_has_target: bool,
     #[case] target_has_target: bool,
 ) {
+    use object_store::ObjectStoreExt;
+
     let source_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
     let target_store: Arc<dyn object_store::ObjectStore> =

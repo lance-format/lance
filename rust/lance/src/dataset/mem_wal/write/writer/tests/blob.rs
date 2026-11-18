@@ -90,8 +90,7 @@ async fn test_dictionary_capacity_rejection_preserves_shared_blob_pack() {
     let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
     assert_eq!(sidecars.len(), 1);
     let payload = store
-        .inner
-        .get(&sidecars[0])
+        .read_object(&sidecars[0])
         .await
         .unwrap()
         .bytes()
