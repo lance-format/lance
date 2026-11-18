@@ -153,16 +153,16 @@ public class DatasetTest {
         assertEquals(1, reopened.version());
         assertEquals("analytics", reopened.getConfig().get("app.owner"));
         try (LanceScanner scanner = reopened.newScan();
-            ArrowReader reader = scanner.scanBatches();
-            Dataset streamed =
-                Dataset.write()
-                    .allocator(allocator)
-                    .reader(reader)
-                    .uri(tempDir.resolve("streamed_config").toString())
-                    .initialConfig(Map.of("app.owner", "events"))
-                    .execute()) {
-          assertEquals(1, streamed.version());
-          assertEquals("events", streamed.getConfig().get("app.owner"));
+            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          scanner.exportArrowStream(stream.memoryAddress());
+          try (Dataset streamed =
+              Dataset.write().allocator(allocator).stream(stream)
+                  .uri(tempDir.resolve("streamed_config").toString())
+                  .initialConfig(Map.of("app.owner", "events"))
+                  .execute()) {
+            assertEquals(1, streamed.version());
+            assertEquals("events", streamed.getConfig().get("app.owner"));
+          }
         }
       }
     }
