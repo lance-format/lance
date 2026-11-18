@@ -5,7 +5,7 @@ use crate::cli::LanceTableManifestArgs;
 use chrono::{DateTime, Utc};
 use lance_core::Result;
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_io::utils::read_message;
 use lance_table::feature_flags::{
     FLAG_BASE_PATHS, FLAG_COVERED_INDEX_METADATA, FLAG_DELETION_FILES,
@@ -67,7 +67,7 @@ enum TransactionSource {
 }
 
 struct ManifestSource {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     manifest_path: Path,
     dataset_base: Option<Path>,
 }
@@ -145,7 +145,7 @@ fn path_from_parts(parts: &[String]) -> Path {
 }
 
 async fn load_indices(
-    storage: &ObjectStore,
+    storage: &Storage,
     manifest_path: &Path,
     index_section: Option<usize>,
 ) -> OptionalSection<Vec<IndexView>> {
@@ -168,7 +168,7 @@ async fn load_indices(
 }
 
 async fn load_transaction(
-    storage: &ObjectStore,
+    storage: &Storage,
     manifest_path: &Path,
     dataset_base: Option<&Path>,
     manifest: &Manifest,
@@ -205,7 +205,7 @@ async fn load_transaction(
 }
 
 async fn read_external_transaction(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
 ) -> std::result::Result<pb::Transaction, String> {
     let result = storage
@@ -220,7 +220,7 @@ async fn read_external_transaction(
 }
 
 async fn read_section<M: Message + Default>(
-    storage: &ObjectStore,
+    storage: &Storage,
     manifest_path: &Path,
     position: usize,
 ) -> Result<M> {
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_transaction_error_includes_path() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let mut manifest = empty_manifest();
         manifest.transaction_file = Some("1.txn".to_string());
         let manifest_path = Path::from("dataset/_versions/1.manifest");

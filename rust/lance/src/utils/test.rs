@@ -917,7 +917,7 @@ impl CommitHandler for AmbiguousCommitHandler {
         manifest: &mut lance_table::format::Manifest,
         indices: Option<Vec<lance_table::format::IndexMetadata>>,
         base_path: &lance_core::storage::path::Path,
-        storage: &lance_io::object_store::ObjectStore,
+        storage: &lance_io::storage::Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<TableTransaction>,
@@ -997,7 +997,7 @@ impl CommitHandler for AmbiguousCommitHandler {
         &self,
         base_path: &lance_core::storage::path::Path,
         version: u64,
-        storage: &lance_io::object_store::ObjectStore,
+        storage: &lance_io::storage::Storage,
     ) -> lance_core::Result<ManifestLocation> {
         self.resolve_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_resolve.load(Ordering::SeqCst) {

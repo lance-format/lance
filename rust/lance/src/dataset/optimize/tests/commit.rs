@@ -1074,7 +1074,7 @@ async fn test_distributed_compact_concurrent_delete_no_resurrection() {
 async fn test_commit_compaction_leaves_data_for_gc_on_commit_failure() {
     use crate::dataset::builder::DatasetBuilder;
     use crate::utils::test::FailingProxyStore;
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
 
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
@@ -1115,7 +1115,7 @@ async fn test_commit_compaction_leaves_data_for_gc_on_commit_failure() {
 
     let mut dataset = DatasetBuilder::from_uri(&routed_uri)
         .with_read_params(crate::dataset::ReadParams {
-            store_options: Some(ObjectStoreParams {
+            store_options: Some(StorageParams {
                 backend_wrappers: vec![failing.clone()],
                 ..Default::default()
             }),
@@ -1145,7 +1145,7 @@ async fn test_commit_compaction_leaves_blob_v2_sidecars_for_gc_on_commit_failure
     use crate::BlobArrayBuilder;
     use crate::dataset::builder::DatasetBuilder;
     use crate::utils::test::FailingProxyStore;
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
 
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
@@ -1194,7 +1194,7 @@ async fn test_commit_compaction_leaves_blob_v2_sidecars_for_gc_on_commit_failure
 
     let mut dataset = DatasetBuilder::from_uri(&routed_uri)
         .with_read_params(crate::dataset::ReadParams {
-            store_options: Some(ObjectStoreParams {
+            store_options: Some(StorageParams {
                 backend_wrappers: vec![failing.clone()],
                 ..Default::default()
             }),

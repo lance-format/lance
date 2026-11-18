@@ -80,12 +80,12 @@ async fn test_opendal_stat() {
 // Stage 3: Lance Storage I/O tests
 // ============================================================
 
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 
-async fn get_lance_store() -> Arc<ObjectStore> {
+async fn get_lance_store() -> Arc<Storage> {
     let addr = std::env::var("GOOSEFS_MASTER_ADDR").unwrap_or("127.0.0.1:9200".into());
     let uri = format!("goosefs://{}/lance-test/lance-io", addr);
-    ObjectStore::from_uri(&uri).await.unwrap().0
+    Storage::from_uri(&uri).await.unwrap().0
 }
 
 #[ignore = "Requires GooseFS cluster"]
@@ -168,7 +168,7 @@ async fn test_lance_objectstore_large_file() {
 // Diagnostic: lance-io Storage advanced write modes
 // ============================================================
 
-use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::storage::{StorageParams, StorageRegistry};
 
 #[tokio::test]
 #[ignore = "Requires GooseFS cluster"]
@@ -182,9 +182,9 @@ async fn test_diag_lance_io_write_modes() {
 
     eprintln!("[DIAG] Creating Storage at: {}", root);
 
-    let params = ObjectStoreParams::default();
-    let registry = Arc::new(ObjectStoreRegistry::default());
-    let (storage, _path) = ObjectStore::from_uri_and_params(registry, &root, &params)
+    let params = StorageParams::default();
+    let registry = Arc::new(StorageRegistry::default());
+    let (storage, _path) = Storage::from_uri_and_params(registry, &root, &params)
         .await
         .expect("Failed to create Storage");
 
@@ -253,8 +253,8 @@ async fn test_diag_lance_io_write_modes() {
     assert!(
         matches!(
             conflict,
-            Err(lance_io::object_store::Error::AlreadyExists { .. })
-                | Err(lance_io::object_store::Error::Precondition { .. })
+            Err(lance_io::storage::Error::AlreadyExists { .. })
+                | Err(lance_io::storage::Error::Precondition { .. })
         ),
         "second PutMode::Create must fail with AlreadyExists/Precondition, got: {conflict:?}"
     );
@@ -302,7 +302,7 @@ async fn test_diag_lance_io_write_modes() {
 ///    expected (`NotFound` is the only accepted pre-cleanup error); any
 ///    other error fails the test rather than being silently ignored.
 /// 3. **Strict setup.** Every setup step uses `expect` so a transient
-///    `ObjectStore` construction or filename-parse error is surfaced
+///    `Storage` construction or filename-parse error is surfaced
 ///    rather than logged and skipped.
 /// 4. **Post-cleanup.** The winning path is removed on success; cleanup
 ///    must report `Ok` or `NotFound`.
@@ -327,9 +327,9 @@ async fn test_diag_concurrent_put_create_exactly_one_winner() {
         root, race_filename
     );
 
-    let params = ObjectStoreParams::default();
-    let registry = Arc::new(ObjectStoreRegistry::default());
-    let (storage, _path) = ObjectStore::from_uri_and_params(registry.clone(), &root, &params)
+    let params = StorageParams::default();
+    let registry = Arc::new(StorageRegistry::default());
+    let (storage, _path) = Storage::from_uri_and_params(registry.clone(), &root, &params)
         .await
         .expect("Failed to create Storage");
 

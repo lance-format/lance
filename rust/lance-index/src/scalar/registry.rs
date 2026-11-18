@@ -794,7 +794,7 @@ mod tests {
     use lance_core::cache::{
         CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend,
     };
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use tokio::sync::Notify;
 
     use crate::scalar::inverted::{
@@ -859,7 +859,7 @@ mod tests {
     }
 
     async fn empty_index_bindings() -> [(Arc<dyn IndexStore>, Arc<dyn ScalarIndex>); 2] {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
         let store_a: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
             Arc::new(storage.clone()),

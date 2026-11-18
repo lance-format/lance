@@ -94,12 +94,12 @@ async fn test_list_versions_under_ordering_and_limit() {
 /// back to consuming the whole directory. Asserts the consumption bound.
 #[tokio::test]
 async fn test_list_versions_under_early_stop_bounded_consumption() {
-    use lance_io::object_store::providers::memory::MemoryStoreProvider;
+    use lance_io::storage::providers::memory::MemoryStoreProvider;
     use lance_table::io::commit::ManifestNamingScheme;
 
     #[derive(Debug)]
     struct EntryCountingStore {
-        target: Arc<dyn lance_io::object_store::StorageBackend>,
+        target: Arc<dyn lance_io::storage::StorageBackend>,
         entries_listed: Arc<AtomicUsize>,
     }
 
@@ -110,14 +110,14 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
     }
 
     #[async_trait]
-    impl lance_io::object_store::StorageBackend for EntryCountingStore {
+    impl lance_io::storage::StorageBackend for EntryCountingStore {
         async fn list_paginated(
             &self,
             prefix: Option<&str>,
-            options: lance_io::object_store::PaginatedListOptions,
-        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            options: lance_io::storage::PaginatedListOptions,
+        ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
             let _ = (prefix, options);
-            Err(lance_io::object_store::Error::NotSupported {
+            Err(lance_io::storage::Error::NotSupported {
                 source: "native pagination is unavailable".into(),
             })
         }
@@ -126,7 +126,7 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             &self,
             path: &Path,
             ranges: &[std::ops::Range<u64>],
-        ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
             self.target.get_ranges(path, ranges).await
         }
 
@@ -143,7 +143,7 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
+        ) -> OSResult<Box<dyn lance_io::storage::backend::MultipartUpload>> {
             self.target.put_multipart_opts(location, opts).await
         }
 
@@ -182,7 +182,7 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             offset: &Path,
         ) -> futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+            lance_io::storage::Result<lance_io::storage::ObjectMeta>,
         > {
             let offset = offset.clone();
             futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
@@ -195,8 +195,8 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             &self,
             from: &Path,
             to: &Path,
-            opts: lance_io::object_store::RenameOptions,
-        ) -> lance_io::object_store::Result<()> {
+            opts: lance_io::storage::RenameOptions,
+        ) -> lance_io::storage::Result<()> {
             self.target.rename_opts(from, to, opts).await
         }
     }
@@ -207,16 +207,16 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
     }
 
     #[async_trait]
-    impl lance_io::object_store::ObjectStoreProvider for EntryCountingMemoryProvider {
+    impl lance_io::storage::StorageProvider for EntryCountingMemoryProvider {
         async fn new_backend(
             &self,
             base_path: Url,
-            _params: &ObjectStoreParams,
-        ) -> Result<lance_io::object_store::BackendConfig> {
-            let backend = lance_io::object_store::backend::native::from_object_store(Arc::new(
+            _params: &StorageParams,
+        ) -> Result<lance_io::storage::BackendConfig> {
+            let backend = lance_io::storage::backend::object_store::from_object_store(Arc::new(
                 object_store::memory::InMemory::new(),
             ));
-            let mut config = lance_io::object_store::BackendConfig::new(
+            let mut config = lance_io::storage::BackendConfig::new(
                 Arc::new(EntryCountingStore {
                     target: backend,
                     entries_listed: self.entries_listed.clone(),
@@ -241,7 +241,7 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
     }
 
     let entries_listed = Arc::new(AtomicUsize::new(0));
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    let registry = Arc::new(StorageRegistry::default());
     registry.insert(
         "memory-object-store",
         Arc::new(EntryCountingMemoryProvider {
@@ -294,16 +294,16 @@ struct CountingFileStoreProvider {
 }
 
 #[async_trait]
-impl lance_io::object_store::ObjectStoreProvider for CountingFileStoreProvider {
+impl lance_io::storage::StorageProvider for CountingFileStoreProvider {
     async fn new_backend(
         &self,
         base_path: Url,
-        _params: &ObjectStoreParams,
-    ) -> Result<lance_io::object_store::BackendConfig> {
-        let backend = lance_io::object_store::backend::native::from_object_store(Arc::new(
+        _params: &StorageParams,
+    ) -> Result<lance_io::storage::BackendConfig> {
+        let backend = lance_io::storage::backend::object_store::from_object_store(Arc::new(
             object_store::local::LocalFileSystem::new(),
         ));
-        Ok(lance_io::object_store::BackendConfig::new(
+        Ok(lance_io::storage::BackendConfig::new(
             Arc::new(CountingBackend::new(backend, self.listing_count.clone())),
             base_path.scheme(),
         ))
@@ -334,7 +334,7 @@ fn file_storage_uri(path: &str) -> String {
 
 #[allow(dead_code)]
 fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Session> {
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    let registry = Arc::new(StorageRegistry::default());
     registry.insert(
         "file-object-store",
         Arc::new(CountingFileStoreProvider { listing_count }),
@@ -346,7 +346,7 @@ fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Sessio
 // `list_with_delimiter` (the call `check_table_status` makes) and delegates
 // everything else, so a table can be created before failures are injected.
 use futures::stream::BoxStream;
-use lance_io::object_store::{
+use lance_io::storage::{
     CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutPayload,
     PutResult, Result as OSResult,
 };
@@ -363,7 +363,7 @@ enum ListBehavior {
 
 #[derive(Debug)]
 struct FailingListStore {
-    target: Arc<dyn lance_io::object_store::StorageBackend>,
+    target: Arc<dyn lance_io::storage::StorageBackend>,
     behavior: Arc<Mutex<Option<ListBehavior>>>,
 }
 
@@ -374,14 +374,14 @@ impl std::fmt::Display for FailingListStore {
 }
 
 #[async_trait]
-impl lance_io::object_store::StorageBackend for FailingListStore {
+impl lance_io::storage::StorageBackend for FailingListStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -399,7 +399,7 @@ impl lance_io::object_store::StorageBackend for FailingListStore {
         &self,
         location: &Path,
         opts: PutMultipartOptions,
-    ) -> OSResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
+    ) -> OSResult<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.target.put_multipart_opts(location, opts).await
     }
 
@@ -463,10 +463,8 @@ impl lance_io::object_store::StorageBackend for FailingListStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         let offset = offset.clone();
         futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
             self.list(prefix),
@@ -478,8 +476,8 @@ impl lance_io::object_store::StorageBackend for FailingListStore {
         &self,
         from: &Path,
         to: &Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.target.rename_opts(from, to, opts).await
     }
 }
@@ -490,16 +488,16 @@ struct FailingListStoreProvider {
 }
 
 #[async_trait]
-impl lance_io::object_store::ObjectStoreProvider for FailingListStoreProvider {
+impl lance_io::storage::StorageProvider for FailingListStoreProvider {
     async fn new_backend(
         &self,
         base_path: Url,
-        _params: &ObjectStoreParams,
-    ) -> Result<lance_io::object_store::BackendConfig> {
-        let backend = lance_io::object_store::backend::native::from_object_store(Arc::new(
+        _params: &StorageParams,
+    ) -> Result<lance_io::storage::BackendConfig> {
+        let backend = lance_io::storage::backend::object_store::from_object_store(Arc::new(
             object_store::local::LocalFileSystem::new(),
         ));
-        Ok(lance_io::object_store::BackendConfig::new(
+        Ok(lance_io::storage::BackendConfig::new(
             Arc::new(FailingListStore {
                 target: backend,
                 behavior: self.behavior.clone(),
@@ -522,7 +520,7 @@ impl lance_io::object_store::ObjectStoreProvider for FailingListStoreProvider {
 }
 
 fn build_failing_list_session(behavior: Arc<Mutex<Option<ListBehavior>>>) -> Arc<Session> {
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    let registry = Arc::new(StorageRegistry::default());
     registry.insert(
         "file-object-store",
         Arc::new(FailingListStoreProvider { behavior }),
@@ -1114,7 +1112,7 @@ async fn test_manifest_not_found_errors_include_full_table_id() {
 #[tokio::test]
 async fn test_manifest_conditional_copy_falls_back_without_overwrite() {
     use lance_io::testing::MockStorageBackend;
-    use lance_io::utils::testing::TestWrappingObjectStore;
+    use lance_io::utils::testing::TestBackendWrapper;
     let mut namespace = DirectoryNamespaceBuilder::new("memory://")
         .build()
         .await
@@ -1132,10 +1130,10 @@ async fn test_manifest_conditional_copy_falls_back_without_overwrite() {
         .await
         .unwrap();
     let mut storage = (*namespace.storage).clone();
-    storage.apply_wrapper(&TestWrappingObjectStore::new(|backend| {
+    storage.apply_wrapper(&TestBackendWrapper::new(|backend| {
         let mut mock = MockStorageBackend::new();
         mock.expect_copy_opts().returning(|_, _, _| {
-            Err(lance_io::object_store::Error::NotSupported {
+            Err(lance_io::storage::Error::NotSupported {
                 source: "copy unavailable".into(),
             })
         });
@@ -1162,7 +1160,7 @@ async fn test_manifest_conditional_copy_falls_back_without_overwrite() {
         .unwrap_err();
     assert!(matches!(
         error,
-        lance_io::object_store::Error::AlreadyExists { .. }
+        lance_io::storage::Error::AlreadyExists { .. }
     ));
     assert_eq!(
         namespace

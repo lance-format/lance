@@ -10,7 +10,7 @@ use arrow_array::{
 use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
-use lance::{Dataset, io::ObjectStore};
+use lance::{Dataset, io::Storage};
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
@@ -46,7 +46,7 @@ fn test_data_stream() -> SendableRecordBatchStream {
 impl BenchmarkFixture {
     fn test_store(tempdir: &TempStrDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.as_str();
-        let (storage, test_path) = ObjectStore::from_uri(test_path)
+        let (storage, test_path) = Storage::from_uri(test_path)
             .now_or_never()
             .unwrap()
             .unwrap();

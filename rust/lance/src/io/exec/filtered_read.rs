@@ -54,10 +54,10 @@ use lance_datafusion::utils::{
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
-use lance_io::object_store::{
-    METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, ObjectStore, StoreCounter,
-};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::storage::{
+    METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, Storage, StoreCounter,
+};
 use lance_select::{
     IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps, bitmap_to_ranges,
     ranges_to_bitmap, result::IndexExprResultWireFormat,
@@ -369,7 +369,7 @@ pub struct FilteredReadPartitionMetrics {
 }
 
 impl FilteredReadPartitionMetrics {
-    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, store: &ObjectStore) -> Self {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, store: &Storage) -> Self {
         Self {
             task_wait_time: metrics.new_time(TASK_WAIT_TIME_METRIC, partition),
             decode_time: metrics.new_time(DECODE_TIME_METRIC, partition),
@@ -520,7 +520,7 @@ struct FilteredReadStream {
     touched_fragments: usize,
     planned_rows: u64,
     /// The dataset's primary store, whose labels the scan's `metrics` counters carry
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
 }
 
 /// Below this many fragments there are too few handoffs to be worth

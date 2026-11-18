@@ -33,8 +33,8 @@ use lance_encoding::format::metadata;
 use lance_file::reader::{
     DEFAULT_READ_CHUNK_SIZE, FileReader as LanceFileReader, FileReaderOptions,
 };
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, ScanStats, SchedulerConfig};
+use lance_io::storage::Storage;
 use lance_io::utils::CachedFileSize;
 use serde_json::{Value, json};
 use tracing::field::{Field, Visit};
@@ -637,7 +637,7 @@ async fn describe_layout(config: &Config) -> Result<()> {
     }
 
     let data_path = dataset.data_dir().join(data_file.path.as_str());
-    let (storage, _) = ObjectStore::from_uri(&config.uri).await?;
+    let (storage, _) = Storage::from_uri(&config.uri).await?;
     let scheduler = ScanScheduler::new(storage, SchedulerConfig::new(8 * GIB));
     let file_scheduler = scheduler
         .open_file(&data_path, &CachedFileSize::unknown())
@@ -1525,7 +1525,7 @@ async fn run_scheduler_raw_case(
             .load()
             .await?,
     );
-    let (storage, _) = ObjectStore::from_uri(&config.uri).await?;
+    let (storage, _) = Storage::from_uri(&config.uri).await?;
     let scheduler_config = io_buffer_gib
         .map(|gib| SchedulerConfig::new(gib * GIB))
         .unwrap_or_else(|| SchedulerConfig::max_bandwidth(storage.as_ref()));
@@ -1829,7 +1829,7 @@ async fn run_case(
             .await?,
     );
     let projection = Arc::new(projected_schema(dataset.schema(), &config.columns)?);
-    let (storage, _) = ObjectStore::from_uri(&config.uri).await?;
+    let (storage, _) = Storage::from_uri(&config.uri).await?;
     let scheduler_config = io_buffer_gib
         .map(|gib| SchedulerConfig::new(gib * GIB))
         .unwrap_or_else(|| SchedulerConfig::max_bandwidth(storage.as_ref()));

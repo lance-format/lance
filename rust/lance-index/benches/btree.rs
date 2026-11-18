@@ -50,7 +50,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::tuple::planner::plan_tuple_predicate;
 use lance_index::scalar::{AnyQuery, SargableQuery, ScalarIndex};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -263,7 +263,7 @@ fn setup_int_many_fragment_index(
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
-                    Arc::new(ObjectStore::local()),
+                    Arc::new(Storage::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
                     get_cache(use_cache, "int_many_frag"),
                 ));
@@ -288,7 +288,7 @@ fn setup_int_unique_index(rt: &tokio::runtime::Runtime, use_cache: bool) -> Arc<
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
-                    Arc::new(ObjectStore::local()),
+                    Arc::new(Storage::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
                     get_cache(use_cache, "int_unique"),
                 ));
@@ -319,7 +319,7 @@ fn setup_int_low_card_index(rt: &tokio::runtime::Runtime, use_cache: bool) -> Ar
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
-                    Arc::new(ObjectStore::local()),
+                    Arc::new(Storage::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
                     get_cache(use_cache, "int_low_card"),
                 ));
@@ -347,7 +347,7 @@ fn setup_string_unique_index(
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
-                    Arc::new(ObjectStore::local()),
+                    Arc::new(Storage::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
                     get_cache(use_cache, "string_unique"),
                 ));
@@ -375,7 +375,7 @@ fn setup_string_low_card_index(
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
-                    Arc::new(ObjectStore::local()),
+                    Arc::new(Storage::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
                     get_cache(use_cache, "string_low_card"),
                 ));
@@ -943,7 +943,7 @@ async fn create_int_unique_row_addr_index(tempdir: &tempfile::TempDir) -> Arc<dy
             BatchCount::from(NUM_BATCHES as u32),
         );
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         Path::from_filesystem_path(tempdir.path()).unwrap(),
         Arc::new(LanceCache::no_cache()),
     ));

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_io::object_store::StorageOptionsAccessor;
+use lance_io::storage::StorageOptionsAccessor;
 use pyo3::prelude::*;
 
 use crate::rt;

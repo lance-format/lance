@@ -645,7 +645,7 @@ mod test {
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
     use lance_datafusion::exec::OneShotExec;
-    use lance_io::object_store::WrappingObjectStore;
+    use lance_io::storage::BackendWrapper;
     use lance_table::io::deletion::DELETIONS_DIR;
     use rstest::rstest;
 
@@ -877,7 +877,7 @@ mod test {
     /// delay on just those reads is what makes concurrency observable.
     #[derive(Debug)]
     struct DeletionReadCounter {
-        target: Arc<dyn lance_io::object_store::StorageBackend>,
+        target: Arc<dyn lance_io::storage::StorageBackend>,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
     }
@@ -902,14 +902,14 @@ mod test {
     }
 
     #[async_trait::async_trait]
-    impl lance_io::object_store::StorageBackend for DeletionReadCounter {
+    impl lance_io::storage::StorageBackend for DeletionReadCounter {
         async fn list_paginated(
             &self,
             prefix: Option<&str>,
-            options: lance_io::object_store::PaginatedListOptions,
-        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            options: lance_io::storage::PaginatedListOptions,
+        ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
             let _ = (prefix, options);
-            Err(lance_io::object_store::Error::NotSupported {
+            Err(lance_io::storage::Error::NotSupported {
                 source: "native pagination is unavailable".into(),
             })
         }
@@ -917,17 +917,17 @@ mod test {
         async fn put_opts(
             &self,
             location: &lance_core::storage::path::Path,
-            payload: lance_io::object_store::PutPayload,
-            opts: lance_io::object_store::PutOptions,
-        ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
+            payload: lance_io::storage::PutPayload,
+            opts: lance_io::storage::PutOptions,
+        ) -> lance_io::storage::Result<lance_io::storage::PutResult> {
             self.target.put_opts(location, payload, opts).await
         }
 
         async fn put_multipart_opts(
             &self,
             location: &lance_core::storage::path::Path,
-            opts: lance_io::object_store::PutMultipartOptions,
-        ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+            opts: lance_io::storage::PutMultipartOptions,
+        ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>>
         {
             self.target.put_multipart_opts(location, opts).await
         }
@@ -935,8 +935,8 @@ mod test {
         async fn get_opts(
             &self,
             location: &lance_core::storage::path::Path,
-            options: lance_io::object_store::GetOptions,
-        ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
+            options: lance_io::storage::GetOptions,
+        ) -> lance_io::storage::Result<lance_io::storage::GetResult> {
             if Self::is_deletion_path(location) {
                 self.enter().await;
             }
@@ -947,7 +947,7 @@ mod test {
             &self,
             location: &lance_core::storage::path::Path,
             ranges: &[std::ops::Range<u64>],
-        ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
             if Self::is_deletion_path(location) {
                 self.enter().await;
             }
@@ -958,11 +958,11 @@ mod test {
             &self,
             locations: futures::stream::BoxStream<
                 'static,
-                lance_io::object_store::Result<lance_core::storage::path::Path>,
+                lance_io::storage::Result<lance_core::storage::path::Path>,
             >,
         ) -> futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_core::storage::path::Path>,
+            lance_io::storage::Result<lance_core::storage::path::Path>,
         > {
             self.target.delete_stream(locations)
         }
@@ -972,7 +972,7 @@ mod test {
             prefix: Option<&lance_core::storage::path::Path>,
         ) -> futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+            lance_io::storage::Result<lance_io::storage::ObjectMeta>,
         > {
             self.target.list(prefix)
         }
@@ -980,7 +980,7 @@ mod test {
         async fn list_with_delimiter(
             &self,
             prefix: Option<&lance_core::storage::path::Path>,
-        ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
+        ) -> lance_io::storage::Result<lance_io::storage::ListResult> {
             self.target.list_with_delimiter(prefix).await
         }
 
@@ -988,8 +988,8 @@ mod test {
             &self,
             from: &lance_core::storage::path::Path,
             to: &lance_core::storage::path::Path,
-            opts: lance_io::object_store::CopyOptions,
-        ) -> lance_io::object_store::Result<()> {
+            opts: lance_io::storage::CopyOptions,
+        ) -> lance_io::storage::Result<()> {
             self.target.copy_opts(from, to, opts).await
         }
 
@@ -999,7 +999,7 @@ mod test {
             offset: &lance_core::storage::path::Path,
         ) -> futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+            lance_io::storage::Result<lance_io::storage::ObjectMeta>,
         > {
             let offset = offset.clone();
             futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
@@ -1012,8 +1012,8 @@ mod test {
             &self,
             from: &lance_core::storage::path::Path,
             to: &lance_core::storage::path::Path,
-            opts: lance_io::object_store::RenameOptions,
-        ) -> lance_io::object_store::Result<()> {
+            opts: lance_io::storage::RenameOptions,
+        ) -> lance_io::storage::Result<()> {
             self.target.rename_opts(from, to, opts).await
         }
     }
@@ -1024,12 +1024,12 @@ mod test {
         max_in_flight: Arc<AtomicUsize>,
     }
 
-    impl WrappingObjectStore for DeletionReadCounterWrapper {
+    impl BackendWrapper for DeletionReadCounterWrapper {
         fn wrap(
             &self,
             _store_prefix: &str,
-            original: Arc<dyn lance_io::object_store::StorageBackend>,
-        ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+            original: Arc<dyn lance_io::storage::StorageBackend>,
+        ) -> Arc<dyn lance_io::storage::StorageBackend> {
             Arc::new(DeletionReadCounter {
                 target: original,
                 in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1071,7 +1071,7 @@ mod test {
         let max_in_flight = Arc::new(AtomicUsize::new(0));
         let dataset = dataset.with_backend_wrappers([Arc::new(DeletionReadCounterWrapper {
             max_in_flight: max_in_flight.clone(),
-        }) as Arc<dyn WrappingObjectStore>]);
+        }) as Arc<dyn BackendWrapper>]);
 
         let mut scan = dataset.scan();
         scan.project(&[ROW_OFFSET]).unwrap();

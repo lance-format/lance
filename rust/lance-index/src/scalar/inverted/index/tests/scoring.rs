@@ -8,7 +8,7 @@ use super::*;
 async fn test_bm25_search_uses_global_idf() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -165,7 +165,7 @@ async fn load_test_index(
 ) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -195,7 +195,7 @@ async fn load_global_scoring_test_index(
 ) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -515,7 +515,7 @@ async fn test_no_impact_search_rejects_injected_negative_query_weight() {
 async fn test_chunked_modern_search_preserves_cold_and_prewarmed_results() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -803,7 +803,7 @@ async fn load_no_impact_bulk_conjunction_test_index(
 ) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1178,7 +1178,7 @@ async fn test_two_no_impact_partitions_share_global_scorer_and_threshold() {
 async fn test_and_query_returns_empty_when_exact_term_missing() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1235,7 +1235,7 @@ async fn test_and_query_returns_empty_when_exact_term_missing() {
 async fn test_and_query_accepts_same_position_alternatives() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1295,7 +1295,7 @@ async fn test_and_query_accepts_same_position_alternatives() {
 async fn test_phrase_query_accepts_same_position_alternatives() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

@@ -118,7 +118,7 @@ use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_io::{
     ReadBatchParams,
     local::to_local_path,
-    object_store::ObjectStore,
+    storage::Storage,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
@@ -2781,7 +2781,7 @@ pub(crate) async fn remap_index_file(
 ///
 #[allow(clippy::too_many_arguments)]
 async fn write_ivf_pq_file(
-    storage: &ObjectStore,
+    storage: &Storage,
     index_dir: Path,
     column: &str,
     index_name: &str,
@@ -3064,7 +3064,7 @@ pub(crate) async fn merge_remapped_segments(
 /// report progress through the provided callback.
 #[cfg(test)]
 pub(crate) async fn merge_segments_with_progress(
-    storage: &ObjectStore,
+    storage: &Storage,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
@@ -3088,7 +3088,7 @@ pub(crate) async fn merge_segments_with_progress(
 }
 
 async fn merge_segments_inner(
-    storage: &ObjectStore,
+    storage: &Storage,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
     row_filters: Option<Vec<lance_index::scalar::OldIndexDataFilter>>,
@@ -3157,7 +3157,7 @@ async fn merge_segments_inner(
 /// those input segments directly from `indices/<segment_uuid>/` and writes the
 /// merged auxiliary/index files into `final_dir`.
 async fn merge_segments_to_dir(
-    storage: &ObjectStore,
+    storage: &Storage,
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
@@ -3232,7 +3232,7 @@ fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
 }
 
 /// Best-effort reset of one target directory before rewriting it.
-async fn reset_final_segment_dir(storage: &ObjectStore, final_dir: &Path) -> Result<()> {
+async fn reset_final_segment_dir(storage: &Storage, final_dir: &Path) -> Result<()> {
     match storage.remove_dir_all(final_dir.clone()).await {
         Ok(()) => {}
         Err(Error::NotFound { .. }) => {}
@@ -3242,7 +3242,7 @@ async fn reset_final_segment_dir(storage: &ObjectStore, final_dir: &Path) -> Res
 }
 
 async fn write_root_vector_index_from_auxiliary(
-    storage: &ObjectStore,
+    storage: &Storage,
     index_dir: &Path,
     requested_index_type: Option<IndexType>,
     centroid_source_index_paths: &[Path],
@@ -3421,7 +3421,7 @@ async fn write_root_vector_index_from_auxiliary(
 }
 
 async fn read_hnsw_index_metadata_from_sources(
-    storage: &ObjectStore,
+    storage: &Storage,
     scheduler: &Arc<ScanScheduler>,
     source_index_paths: &[Path],
 ) -> Result<Option<IndexMetadata>> {
@@ -3477,7 +3477,7 @@ fn index_metadata_eq(left: &IndexMetadata, right: &IndexMetadata) -> bool {
 }
 
 async fn read_hnsw_build_params_from_sources(
-    storage: &ObjectStore,
+    storage: &Storage,
     scheduler: &Arc<ScanScheduler>,
     source_index_paths: &[Path],
 ) -> Result<HnswBuildParams> {

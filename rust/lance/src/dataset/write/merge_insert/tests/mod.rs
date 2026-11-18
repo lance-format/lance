@@ -72,7 +72,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
 use lance_index::IndexType;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 use lance_io::utils::testing::DelayConfig;
 use lance_linalg::distance::MetricType;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;

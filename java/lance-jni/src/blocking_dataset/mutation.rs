@@ -14,7 +14,7 @@ use jni::objects::{JMap, JObject, JString};
 use jni::sys::jlong;
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::io::ObjectStoreParams;
+use lance::io::StorageParams;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_table::io::commit::CommitHandler;
@@ -25,7 +25,7 @@ impl BlockingDataset {
     pub fn commit_transaction(
         &mut self,
         transaction: Transaction,
-        store_params: ObjectStoreParams,
+        store_params: StorageParams,
         detached: bool,
         enable_v2_manifest_paths: bool,
         use_stable_row_ids: Option<bool>,

@@ -3,8 +3,8 @@
 
 //! Testing utilities
 
-use crate::object_store::backend::{MultipartUpload, StorageBackend};
-use crate::object_store::{
+use crate::storage::backend::{MultipartUpload, StorageBackend};
+use crate::storage::{
     CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, ObjectMeta,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
 };
@@ -186,10 +186,10 @@ impl StorageBackend for ProxyBackend {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: crate::object_store::PaginatedListOptions,
-    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        options: crate::storage::PaginatedListOptions,
+    ) -> crate::storage::Result<crate::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(crate::object_store::Error::NotSupported {
+        Err(crate::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -280,8 +280,8 @@ impl StorageBackend for CountingBackend {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: crate::object_store::PaginatedListOptions,
-    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        options: crate::storage::PaginatedListOptions,
+    ) -> crate::storage::Result<crate::storage::PaginatedListResult> {
         self.listing_count.fetch_add(1, Ordering::SeqCst);
         self.target.list_paginated(prefix, options).await
     }
@@ -350,15 +350,15 @@ pub use delay::{DelayConfig, DelayedBackend};
 
 /// Install a test backend transformation through Storage's wrapper policy.
 ///
-pub struct TestWrappingObjectStore<F> {
+pub struct TestBackendWrapper<F> {
     transform: F,
 }
 
-impl<F> TestWrappingObjectStore<F>
+impl<F> TestBackendWrapper<F>
 where
     F: Fn(
-            Arc<dyn crate::object_store::backend::StorageBackend>,
-        ) -> Arc<dyn crate::object_store::backend::StorageBackend>
+            Arc<dyn crate::storage::backend::StorageBackend>,
+        ) -> Arc<dyn crate::storage::backend::StorageBackend>
         + Send
         + Sync,
 {
@@ -367,25 +367,25 @@ where
     }
 }
 
-impl<F> Debug for TestWrappingObjectStore<F> {
+impl<F> Debug for TestBackendWrapper<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TestWrappingObjectStore")
+        f.write_str("TestBackendWrapper")
     }
 }
 
-impl<F> crate::object_store::WrappingObjectStore for TestWrappingObjectStore<F>
+impl<F> crate::storage::BackendWrapper for TestBackendWrapper<F>
 where
     F: Fn(
-            Arc<dyn crate::object_store::backend::StorageBackend>,
-        ) -> Arc<dyn crate::object_store::backend::StorageBackend>
+            Arc<dyn crate::storage::backend::StorageBackend>,
+        ) -> Arc<dyn crate::storage::backend::StorageBackend>
         + Send
         + Sync,
 {
     fn wrap(
         &self,
         _store_prefix: &str,
-        backend: Arc<dyn crate::object_store::backend::StorageBackend>,
-    ) -> Arc<dyn crate::object_store::backend::StorageBackend> {
+        backend: Arc<dyn crate::storage::backend::StorageBackend>,
+    ) -> Arc<dyn crate::storage::backend::StorageBackend> {
         (self.transform)(backend)
     }
 }
@@ -396,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn offset_precedes_metadata_policy_and_policy_errors_propagate() {
-        let backend = crate::object_store::backend::native::from_object_store(Arc::new(
+        let backend = crate::storage::backend::object_store::from_object_store(Arc::new(
             object_store::memory::InMemory::new(),
         ));
         for name in ["a", "b", "c"] {
@@ -435,15 +435,15 @@ mod tests {
 
 /// Supplies an already-created test backend through the production registry path.
 #[derive(Debug, Clone)]
-pub struct TestObjectStoreProvider(pub crate::object_store::BackendConfig);
+pub struct TestStorageProvider(pub crate::storage::BackendConfig);
 
 #[async_trait]
-impl crate::object_store::ObjectStoreProvider for TestObjectStoreProvider {
+impl crate::storage::StorageProvider for TestStorageProvider {
     async fn new_backend(
         &self,
         _url: url::Url,
-        _params: &crate::object_store::ObjectStoreParams,
-    ) -> Result<crate::object_store::BackendConfig> {
+        _params: &crate::storage::StorageParams,
+    ) -> Result<crate::storage::BackendConfig> {
         Ok(self.0.clone())
     }
 
@@ -452,17 +452,17 @@ impl crate::object_store::ObjectStoreProvider for TestObjectStoreProvider {
         url: &url::Url,
         options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        match crate::object_store::ObjectStoreRegistry::default().get_provider(url.scheme()) {
+        match crate::storage::StorageRegistry::default().get_provider(url.scheme()) {
             Some(provider) => provider.calculate_storage_prefix(url, options),
             None => Ok(format!("{}${}", url.scheme(), url.authority())),
         }
     }
 }
 
-impl TestObjectStoreProvider {
+impl TestStorageProvider {
     /// Register the fixture under its scheme in an isolated registry.
-    pub fn registry(&self) -> Arc<crate::object_store::ObjectStoreRegistry> {
-        let registry = Arc::new(crate::object_store::ObjectStoreRegistry::default());
+    pub fn registry(&self) -> Arc<crate::storage::StorageRegistry> {
+        let registry = Arc::new(crate::storage::StorageRegistry::default());
         registry.insert(&self.0.scheme, Arc::new(self.clone()));
         registry
     }
@@ -471,8 +471,8 @@ impl TestObjectStoreProvider {
     pub fn build(
         &self,
         url: url::Url,
-        params: &crate::object_store::ObjectStoreParams,
-    ) -> crate::object_store::ObjectStore {
+        params: &crate::storage::StorageParams,
+    ) -> crate::storage::Storage {
         use futures::FutureExt;
         self.registry()
             .new_store(url, params)

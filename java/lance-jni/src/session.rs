@@ -14,7 +14,7 @@ use lance_core::cache::{
     BackendConfig, CacheActivity, CacheBackendDiagnostics, CacheBackendKind,
     CacheByTypeDiagnostics, CacheDiagnostics, CacheSnapshotMode, build_from_config, build_from_uri,
 };
-use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::storage::StorageRegistry;
 use prost::Message;
 
 use crate::block_on;
@@ -89,7 +89,7 @@ fn create_session(
     let session = LanceSession::with_cache_backends(
         index_cache,
         metadata_cache,
-        Arc::new(ObjectStoreRegistry::default()),
+        Arc::new(StorageRegistry::default()),
     );
 
     // Wrap in Arc and Box, then convert to raw pointer
@@ -544,7 +544,7 @@ mod tests {
         let session = LanceSession::with_cache_backends(
             CacheSpec::Size(0),
             CacheSpec::Size(2048),
-            Arc::new(ObjectStoreRegistry::default()),
+            Arc::new(StorageRegistry::default()),
         );
 
         let diagnostics = session_diagnostics_to_proto(&session.cache_diagnostics()).unwrap();

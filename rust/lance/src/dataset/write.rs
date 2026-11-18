@@ -28,9 +28,7 @@ use lance_file::versions::v1::writer::{
 };
 use lance_file::writer::{self as current_writer, FileWriteSummary};
 use lance_file::{versions as file_versions, writer::FileWriterOptions};
-use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
-};
+use lance_io::storage::{Storage, StorageParams, StorageRegistry, parse_base_scoped_key};
 use lance_io::traits::Writer;
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{BasePath, DataFile, Fragment};
@@ -579,15 +577,15 @@ pub struct WriteParams {
 
     /// Default object store params for the write.
     ///
-    /// ObjectStore options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
     /// apply only to the registered base path with that id, overriding the
     /// unscoped options that every base inherits.
-    pub store_params: Option<ObjectStoreParams>,
+    pub store_params: Option<StorageParams>,
 
     /// Exact object store params per base path URI, taking precedence over
     /// `base_<id>.<key>` storage options in [`Self::store_params`]. See
     /// [`Self::with_base_store_params`].
-    pub base_store_params: Option<HashMap<String, ObjectStoreParams>>,
+    pub base_store_params: Option<HashMap<String, StorageParams>>,
 
     pub progress: Arc<dyn WriteFragmentProgress>,
 
@@ -760,7 +758,7 @@ impl WriteParams {
         self.data_storage_version.unwrap_or_default().resolve()
     }
 
-    pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
+    pub fn store_registry(&self) -> Arc<StorageRegistry> {
         self.session
             .as_ref()
             .map(|s| s.store_registry())
@@ -776,7 +774,7 @@ impl WriteParams {
     pub fn with_base_store_params(
         mut self,
         base_path: impl AsRef<str>,
-        store_params: ObjectStoreParams,
+        store_params: StorageParams,
     ) -> Self {
         self.base_store_params
             .get_or_insert_with(HashMap::new)
@@ -937,7 +935,7 @@ fn balanced_row_counts(total_rows: usize, max_rows_per_file: usize) -> VecDeque<
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     dataset: Option<&Dataset>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_dir: &Path,
     schema: &Schema,
     mut buffered_reader: futures::stream::BoxStream<'static, Result<Vec<RecordBatch>>>,
@@ -952,7 +950,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     mut dictionary_budget: Option<DictionaryValueBudget>,
 ) -> Result<Vec<Fragment>>
 where
-    OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
+    OpenWriter: Fn(Arc<Storage>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
     OpenWriterFuture: Future<Output = Result<Box<dyn GenericWriter>>> + Send,
 {
     let options = WriterOptions {
@@ -1282,7 +1280,7 @@ where
 /// - Safe to call with an empty slice.
 /// - Must be called before the fragments are committed, otherwise live data may be deleted.
 pub(crate) async fn cleanup_data_fragments(
-    storage: &ObjectStore,
+    storage: &Storage,
     base_dir: &Path,
     target_bases: Option<&[TargetBaseInfo]>,
     fragments: &[Fragment],
@@ -1446,7 +1444,7 @@ pub async fn validate_and_resolve_target_bases(
             })?;
 
             let store_params = write_store_params_for_base(params, base_path);
-            let (target_storage, extracted_path) = ObjectStore::from_uri_and_params(
+            let (target_storage, extracted_path) = Storage::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
                 &store_params,
@@ -1475,7 +1473,7 @@ pub async fn validate_and_resolve_target_bases(
 pub(crate) async fn validate_and_resolve_target_bases_with_primary(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
-    primary_storage: &Arc<ObjectStore>,
+    primary_storage: &Arc<Storage>,
     primary_base_dir: &Path,
     primary_uri: &str,
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
@@ -1601,7 +1599,7 @@ fn append_external_base_candidate(
     base_path: &BasePath,
     store_prefix: String,
     extracted_path: Path,
-    store_params: ObjectStoreParams,
+    store_params: StorageParams,
     candidates: &mut Vec<ExternalBaseCandidate>,
     seen_base_ids: &mut HashSet<u32>,
 ) {
@@ -1625,7 +1623,7 @@ fn append_external_base_candidate(
 /// at warn, since ids are already assigned there and an unmatched id is much
 /// more likely a mistake.
 pub(crate) fn log_unregistered_base_scoped_options(
-    store_params: Option<&ObjectStoreParams>,
+    store_params: Option<&StorageParams>,
     base_paths: &HashMap<u32, BasePath>,
     level: log::Level,
 ) {
@@ -1649,7 +1647,7 @@ pub(crate) fn log_unregistered_base_scoped_options(
     }
 }
 
-fn write_store_params_for_base(params: &WriteParams, base_path: &BasePath) -> ObjectStoreParams {
+fn write_store_params_for_base(params: &WriteParams, base_path: &BasePath) -> StorageParams {
     // Exact per-URI bindings are used as-is. Otherwise the write-level default
     // params are resolved for the base scope: `base_<id>.<key>` storage
     // options overlay the shared defaults for that base.
@@ -1669,7 +1667,7 @@ fn write_store_params_for_base(params: &WriteParams, base_path: &BasePath) -> Ob
 
 async fn append_external_initial_bases(
     initial_bases: Option<&Vec<BasePath>>,
-    store_registry: Arc<ObjectStoreRegistry>,
+    store_registry: Arc<StorageRegistry>,
     params: &WriteParams,
     candidates: &mut Vec<ExternalBaseCandidate>,
     seen_base_ids: &mut HashSet<u32>,
@@ -1677,7 +1675,7 @@ async fn append_external_initial_bases(
     if let Some(initial_bases) = initial_bases {
         for base_path in initial_bases {
             let store_params = write_store_params_for_base(params, base_path);
-            let (store, extracted_path) = ObjectStore::from_uri_and_params(
+            let (store, extracted_path) = Storage::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
                 &store_params,
@@ -1710,7 +1708,7 @@ async fn build_external_base_resolver(
     if let Some(dataset) = dataset {
         for base_path in dataset.manifest.base_paths.values() {
             let store_params = dataset.store_params_for_base(Some(base_path));
-            let (store, extracted_path) = ObjectStore::from_uri_and_params(
+            let (store, extracted_path) = Storage::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
                 &store_params,
@@ -1781,7 +1779,7 @@ pub(super) async fn blob_v2_external_base_resolver(
 pub async fn write_fragments_internal(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
@@ -1807,7 +1805,7 @@ pub async fn write_fragments_internal(
 pub(crate) async fn write_fragments_internal_with_file_row_counts(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
@@ -1838,7 +1836,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
 pub(in crate::dataset) async fn write_fragments_internal_impl(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
@@ -2133,7 +2131,7 @@ pub(in crate::dataset) struct V2WriterAdapter {
 }
 
 pub(in crate::dataset) struct FilePromotion {
-    storage: ObjectStore,
+    storage: Storage,
     staging_path: Path,
     final_path: Path,
 }
@@ -2294,8 +2292,8 @@ pub(crate) struct WriterOptions {
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
-    source_store_registry: Arc<ObjectStoreRegistry>,
-    source_store_params: ObjectStoreParams,
+    source_store_registry: Arc<StorageRegistry>,
+    source_store_params: StorageParams,
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
     created_blob_payloads: Option<BlobPayloadInventory>,
@@ -2304,7 +2302,7 @@ pub(crate) struct WriterOptions {
 
 impl WriterOptions {
     pub(super) fn update(
-        source_store_registry: Arc<ObjectStoreRegistry>,
+        source_store_registry: Arc<StorageRegistry>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
     ) -> Self {
@@ -2339,7 +2337,7 @@ impl WriterOptions {
 }
 
 pub(crate) async fn open_v1_writer(
-    storage: &ObjectStore,
+    storage: &Storage,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
@@ -2370,7 +2368,7 @@ pub(crate) async fn open_v1_writer(
 
 pub(in crate::dataset) async fn open_current_writer<F>(
     create_file_writer: F,
-    storage: &ObjectStore,
+    storage: &Storage,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
@@ -2422,7 +2420,7 @@ where
 pub(in crate::dataset) async fn open_current_blob_v2_writer<F>(
     version: ConcreteFileVersion,
     create_file_writer: F,
-    storage: &ObjectStore,
+    storage: &Storage,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
@@ -2546,7 +2544,7 @@ pub struct TargetBaseInfo {
     /// The registered base id, or [`PRIMARY_BASE_ID`] for the dataset's
     /// primary storage.
     pub base_id: u32,
-    pub storage: Arc<ObjectStore>,
+    pub storage: Arc<Storage>,
     /// The base directory path (without /data subdirectory)
     pub base_dir: Path,
     /// Whether this base path is a dataset root.
@@ -2557,7 +2555,7 @@ pub struct TargetBaseInfo {
 
 struct WriterGenerator<OpenWriter> {
     /// Default object store (used when no target bases specified)
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     /// Default base directory (used when no target bases specified)
     base_dir: Path,
     schema: Schema,
@@ -2574,11 +2572,11 @@ struct WriterGenerator<OpenWriter> {
 
 impl<OpenWriter, OpenWriterFuture> WriterGenerator<OpenWriter>
 where
-    OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
+    OpenWriter: Fn(Arc<Storage>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
     OpenWriterFuture: Future<Output = Result<Box<dyn GenericWriter>>> + Send,
 {
     pub fn new(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_dir: &Path,
         schema: &Schema,
         open_writer: OpenWriter,
@@ -2656,7 +2654,7 @@ where
 async fn resolve_commit_handler(
     uri: &str,
     commit_handler: Option<Arc<dyn CommitHandler>>,
-    store_options: &Option<ObjectStoreParams>,
+    store_options: &Option<StorageParams>,
 ) -> Result<Arc<dyn CommitHandler>> {
     match commit_handler {
         None => commit_handler_from_url(uri, store_options).await,
@@ -2699,7 +2697,7 @@ mod tests {
     use lance_file::versions::v1::reader::FileReader as V1FileReader;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-    use lance_io::object_store::StorageOptionsAccessor;
+    use lance_io::storage::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
     use parquet_variant_compute::{
@@ -2708,7 +2706,7 @@ mod tests {
     use rstest::rstest;
 
     async fn open_v2_1_test_writer(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         schema: Schema,
         base_dir: Path,
         options: WriterOptions,
@@ -2914,7 +2912,7 @@ mod tests {
             async move {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-                let storage = Arc::new(ObjectStore::memory());
+                let storage = Arc::new(Storage::memory());
                 write_fragments_internal(
                     write_params.storage_version_or_default(),
                     None,
@@ -2992,7 +2990,7 @@ mod tests {
         let stream =
             RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let storage = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(Storage::memory());
 
         let (fragments, _) = write_fragments_internal_with_file_row_counts(
             ConcreteFileVersion::V2_0,
@@ -3048,7 +3046,7 @@ mod tests {
         let stream =
             RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let storage = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(Storage::memory());
 
         let (fragments, _) = write_fragments_internal_with_file_row_counts(
             ConcreteFileVersion::V2_0,
@@ -3131,7 +3129,7 @@ mod tests {
             async move {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-                let storage = Arc::new(ObjectStore::memory());
+                let storage = Arc::new(Storage::memory());
                 write_fragments_internal(
                     write_params.storage_version_or_default(),
                     None,
@@ -3230,7 +3228,7 @@ mod tests {
             async move {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-                let storage = Arc::new(ObjectStore::memory());
+                let storage = Arc::new(Storage::memory());
                 write_fragments_internal(
                     write_params.storage_version_or_default(),
                     None,
@@ -3345,7 +3343,7 @@ mod tests {
 
             let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-            let storage = Arc::new(ObjectStore::memory());
+            let storage = Arc::new(Storage::memory());
             let (fragments, _) = write_fragments_internal(
                 version.resolve(),
                 None,
@@ -3420,7 +3418,7 @@ mod tests {
             futures::stream::iter(std::iter::once(Ok(data.clone()))),
         ));
 
-        let storage = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(Storage::memory());
         let base_path = Path::from("test");
         let (fragments, written_schema) = write_fragments_internal(
             ConcreteFileVersion::V1,
@@ -3471,8 +3469,8 @@ mod tests {
     }
 
     #[cfg(feature = "azure")]
-    fn azure_store_params(account_name: &str) -> ObjectStoreParams {
-        ObjectStoreParams {
+    fn azure_store_params(account_name: &str) -> StorageParams {
+        StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("account_name".to_string(), account_name.to_string()),
@@ -3539,7 +3537,7 @@ mod tests {
     async fn test_validate_and_resolve_target_bases_uses_base_scoped_storage_options() {
         // A single flat storage options map carries per-base credentials via
         // the `base_<id>.<key>` convention; unscoped keys are shared defaults.
-        let store_params = ObjectStoreParams {
+        let store_params = StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("account_name".to_string(), "account-shared".to_string()),
@@ -3578,7 +3576,7 @@ mod tests {
     #[cfg(feature = "azure")]
     #[tokio::test]
     async fn test_base_store_params_take_precedence_over_base_scoped_options() {
-        let store_params = ObjectStoreParams {
+        let store_params = StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("account_key".to_string(), "dGVzdA==".to_string()),
@@ -3615,7 +3613,7 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_data_file_bases_writer_generator() {
         use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
         use std::sync::Arc;
 
         // Create test schema
@@ -3627,7 +3625,7 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
         // Create in-memory object store
-        let storage = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(Storage::memory());
         let base_dir = Path::from("test/bucket2");
 
         // Test WriterGenerator with explicit data file bases configuration
@@ -3661,7 +3659,7 @@ mod tests {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
         use std::sync::Arc;
 
         // Create test data
@@ -3679,7 +3677,7 @@ mod tests {
         .unwrap();
 
         // Create in-memory object store and writer
-        let storage = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(Storage::memory());
         let base_dir = Path::from("test/bucket2");
 
         let mut inner_writer = versions::open_writer(
@@ -3712,7 +3710,7 @@ mod tests {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
         use std::sync::Arc;
 
         // Create test schema
@@ -3724,9 +3722,9 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
         // Create in-memory object stores for different bases
-        let store1 = Arc::new(ObjectStore::memory());
-        let store2 = Arc::new(ObjectStore::memory());
-        let store3 = Arc::new(ObjectStore::memory());
+        let store1 = Arc::new(Storage::memory());
+        let store2 = Arc::new(Storage::memory());
+        let store3 = Arc::new(Storage::memory());
 
         // Create WriterGenerator with multiple target bases
         let target_bases = vec![
@@ -3751,7 +3749,7 @@ mod tests {
         ];
 
         let writer_generator = WriterGenerator::new(
-            Arc::new(ObjectStore::memory()),
+            Arc::new(Storage::memory()),
             &Path::from("default"),
             &schema,
             open_v2_1_test_writer,
@@ -4021,7 +4019,7 @@ mod tests {
                 "base1-value".to_string(),
             ),
         ]);
-        let store_params = ObjectStoreParams {
+        let store_params = StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 scoped_options.clone(),
             ))),
@@ -4570,7 +4568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_stream_write() {
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
 
         // Test writing an empty stream
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -4588,7 +4586,7 @@ mod tests {
             >()),
         ));
 
-        let storage = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(Storage::memory());
         let write_params = WriteParams {
             mode: WriteMode::Create,
             ..Default::default()
@@ -4687,12 +4685,12 @@ mod tests {
 
         use async_trait::async_trait;
         use futures::stream::BoxStream;
-        use lance_io::object_store::{
+        use lance_io::storage::{
             CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
             PutOptions, PutPayload, PutResult,
         };
 
-        // Create a custom ObjectStore that simulates disk full error
+        // Create a custom Storage that simulates disk full error
         #[derive(Debug)]
         struct DiskFullObjectStore;
 
@@ -4703,15 +4701,14 @@ mod tests {
         }
 
         #[async_trait]
-        impl lance_io::object_store::StorageBackend for DiskFullObjectStore {
+        impl lance_io::storage::StorageBackend for DiskFullObjectStore {
             async fn list_paginated(
                 &self,
                 prefix: Option<&str>,
-                options: lance_io::object_store::PaginatedListOptions,
-            ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult>
-            {
+                options: lance_io::storage::PaginatedListOptions,
+            ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
                 let _ = (prefix, options);
-                Err(lance_io::object_store::Error::NotSupported {
+                Err(lance_io::storage::Error::NotSupported {
                     source: "native pagination is unavailable".into(),
                 })
             }
@@ -4721,8 +4718,8 @@ mod tests {
                 _location: &lance_core::storage::path::Path,
                 _bytes: PutPayload,
                 _opts: PutOptions,
-            ) -> lance_io::object_store::Result<PutResult> {
-                Err(lance_io::object_store::Error::Generic {
+            ) -> lance_io::storage::Result<PutResult> {
+                Err(lance_io::storage::Error::Generic {
                     store: "DiskFullStore",
                     source: Box::new(io::Error::new(
                         ErrorKind::StorageFull,
@@ -4735,10 +4732,9 @@ mod tests {
                 &self,
                 _location: &lance_core::storage::path::Path,
                 _opts: PutMultipartOptions,
-            ) -> lance_io::object_store::Result<
-                Box<dyn lance_io::object_store::backend::MultipartUpload>,
-            > {
-                Err(lance_io::object_store::Error::NotSupported {
+            ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>>
+            {
+                Err(lance_io::storage::Error::NotSupported {
                     source: "Multipart upload not supported".into(),
                 })
             }
@@ -4747,8 +4743,8 @@ mod tests {
                 &self,
                 _location: &lance_core::storage::path::Path,
                 _options: GetOptions,
-            ) -> lance_io::object_store::Result<GetResult> {
-                Err(lance_io::object_store::Error::NotFound {
+            ) -> lance_io::storage::Result<GetResult> {
+                Err(lance_io::storage::Error::NotFound {
                     path: "".into(),
                     source: "".into(),
                 })
@@ -4758,9 +4754,9 @@ mod tests {
                 &self,
                 locations: BoxStream<
                     'static,
-                    lance_io::object_store::Result<lance_core::storage::path::Path>,
+                    lance_io::storage::Result<lance_core::storage::path::Path>,
                 >,
-            ) -> BoxStream<'static, lance_io::object_store::Result<lance_core::storage::path::Path>>
+            ) -> BoxStream<'static, lance_io::storage::Result<lance_core::storage::path::Path>>
             {
                 locations
             }
@@ -4768,7 +4764,7 @@ mod tests {
             fn list(
                 &self,
                 _prefix: Option<&lance_core::storage::path::Path>,
-            ) -> futures::stream::BoxStream<'static, lance_io::object_store::Result<ObjectMeta>>
+            ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<ObjectMeta>>
             {
                 Box::pin(futures::stream::empty())
             }
@@ -4776,7 +4772,7 @@ mod tests {
             async fn list_with_delimiter(
                 &self,
                 _prefix: Option<&lance_core::storage::path::Path>,
-            ) -> lance_io::object_store::Result<ListResult> {
+            ) -> lance_io::storage::Result<ListResult> {
                 Ok(ListResult {
                     common_prefixes: vec![],
                     objects: vec![],
@@ -4789,27 +4785,27 @@ mod tests {
                 _from: &lance_core::storage::path::Path,
                 _to: &lance_core::storage::path::Path,
                 _options: CopyOptions,
-            ) -> lance_io::object_store::Result<()> {
+            ) -> lance_io::storage::Result<()> {
                 Ok(())
             }
             async fn get_ranges(
                 &self,
-                location: &lance_io::object_store::Path,
+                location: &lance_io::storage::Path,
                 ranges: &[std::ops::Range<u64>],
-            ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+            ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
                 futures::future::try_join_all(ranges.iter().map(|range| {
-                    (self as &dyn lance_io::object_store::StorageBackend)
+                    (self as &dyn lance_io::storage::StorageBackend)
                         .get_range(location, range.clone())
                 }))
                 .await
             }
             fn list_with_offset(
                 &self,
-                prefix: Option<&lance_io::object_store::Path>,
-                offset: &lance_io::object_store::Path,
+                prefix: Option<&lance_io::storage::Path>,
+                offset: &lance_io::storage::Path,
             ) -> futures::stream::BoxStream<
                 'static,
-                lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+                lance_io::storage::Result<lance_io::storage::ObjectMeta>,
             > {
                 let offset = offset.clone();
                 Box::pin(futures::TryStreamExt::try_filter(
@@ -4819,28 +4815,28 @@ mod tests {
             }
             async fn rename_opts(
                 &self,
-                from: &lance_io::object_store::Path,
-                to: &lance_io::object_store::Path,
-                options: lance_io::object_store::RenameOptions,
-            ) -> lance_io::object_store::Result<()> {
+                from: &lance_io::storage::Path,
+                to: &lance_io::storage::Path,
+                options: lance_io::storage::RenameOptions,
+            ) -> lance_io::storage::Result<()> {
                 let mode = match options.target_mode {
-                    lance_io::object_store::RenameTargetMode::Create => {
-                        lance_io::object_store::CopyMode::Create
+                    lance_io::storage::RenameTargetMode::Create => {
+                        lance_io::storage::CopyMode::Create
                     }
-                    lance_io::object_store::RenameTargetMode::Overwrite => {
-                        lance_io::object_store::CopyMode::Overwrite
+                    lance_io::storage::RenameTargetMode::Overwrite => {
+                        lance_io::storage::CopyMode::Overwrite
                     }
                 };
                 self.copy_opts(
                     from,
                     to,
-                    lance_io::object_store::CopyOptions {
+                    lance_io::storage::CopyOptions {
                         mode,
                         extensions: options.extensions,
                     },
                 )
                 .await?;
-                (self as &dyn lance_io::object_store::StorageBackend)
+                (self as &dyn lance_io::storage::StorageBackend)
                     .delete(from)
                     .await
             }
@@ -4848,14 +4844,11 @@ mod tests {
 
         let storage = Arc::new({
             let url = url::Url::parse("mock:///test").unwrap();
-            let mut config = lance_io::object_store::BackendConfig::new(
-                Arc::new(DiskFullObjectStore),
-                url.scheme(),
-            );
-            config.io_parallelism = lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
+            let mut config =
+                lance_io::storage::BackendConfig::new(Arc::new(DiskFullObjectStore), url.scheme());
+            config.io_parallelism = lance_io::storage::DEFAULT_LOCAL_IO_PARALLELISM;
             config.list_is_lexically_ordered = true;
-            lance_io::utils::testing::TestObjectStoreProvider(config)
-                .build(url, &Default::default())
+            lance_io::utils::testing::TestStorageProvider(config).build(url, &Default::default())
         });
 
         // Create test data
@@ -5052,7 +5045,7 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
         let (storage, base_dir) =
-            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+            Storage::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
 
@@ -5114,7 +5107,7 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
         let (storage, base_dir) =
-            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+            Storage::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
 
@@ -5238,7 +5231,7 @@ mod tests {
         let arrow_schema = id_batch(0).schema();
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let (storage, base_dir) =
-            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+            Storage::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
         let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -5377,7 +5370,7 @@ mod tests {
         let test_uri = test_dir.as_str();
 
         let (storage, base_dir) =
-            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+            Storage::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
 
@@ -5429,21 +5422,21 @@ mod tests {
         let base1_dir = TempStrDir::default();
         let base2_dir = TempStrDir::default();
 
-        let (storage, base_dir) = ObjectStore::from_uri_and_params(
+        let (storage, base_dir) = Storage::from_uri_and_params(
             Default::default(),
             primary_dir.as_str(),
             &Default::default(),
         )
         .await
         .unwrap();
-        let (base1_store, base1_path) = ObjectStore::from_uri_and_params(
+        let (base1_store, base1_path) = Storage::from_uri_and_params(
             Default::default(),
             base1_dir.as_str(),
             &Default::default(),
         )
         .await
         .unwrap();
-        let (base2_store, base2_path) = ObjectStore::from_uri_and_params(
+        let (base2_store, base2_path) = Storage::from_uri_and_params(
             Default::default(),
             base2_dir.as_str(),
             &Default::default(),
@@ -5538,14 +5531,14 @@ mod tests {
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let (storage, base_dir) = ObjectStore::from_uri_and_params(
+        let (storage, base_dir) = Storage::from_uri_and_params(
             Default::default(),
             primary_dir.as_str(),
             &Default::default(),
         )
         .await
         .unwrap();
-        let (base1_store, base1_path) = ObjectStore::from_uri_and_params(
+        let (base1_store, base1_path) = Storage::from_uri_and_params(
             Default::default(),
             base1_dir.as_str(),
             &Default::default(),

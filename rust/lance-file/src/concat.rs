@@ -1161,12 +1161,12 @@ where
 /// # use std::sync::Arc;
 /// # use lance_core::Result;
 /// # use lance_file::concat::{concat_files, EncodedFileInput, FileConcatOptions, FileConcatResult, FileConcatTarget};
-/// # use lance_io::object_store::ObjectStore;
+/// # use lance_io::storage::Storage;
 /// # use lance_core::storage::path::Path;
 /// # async fn stitch(
 /// #     target: &FileConcatTarget,
 /// #     inputs: &[EncodedFileInput],
-/// #     output_store: Arc<ObjectStore>,
+/// #     output_store: Arc<Storage>,
 /// #     output_path: Path,
 /// # ) -> Result<FileConcatResult> {
 /// let store = output_store.clone();
@@ -1300,8 +1300,8 @@ mod tests {
 
     use lance_core::utils::tempfile::TempObjFile;
     use lance_io::{
-        object_store::{ObjectStore, ObjectStoreParams},
         scheduler::{ScanScheduler, SchedulerConfig},
+        storage::{Storage, StorageParams},
         traits::Writer,
         utils::CachedFileSize,
     };
@@ -1310,7 +1310,7 @@ mod tests {
     use super::*;
 
     async fn write_file(
-        store: &Arc<ObjectStore>,
+        store: &Arc<Storage>,
         path: &lance_core::storage::path::Path,
         version: ConcreteFileVersion,
         values: &[i32],
@@ -1330,7 +1330,7 @@ mod tests {
     }
 
     async fn input(
-        store: Arc<ObjectStore>,
+        store: Arc<Storage>,
         path: &lance_core::storage::path::Path,
         expected_num_rows: u64,
     ) -> EncodedFileInput {
@@ -1344,7 +1344,7 @@ mod tests {
 
     #[tokio::test]
     async fn concat_writes_relocated_metadata_and_reuses_single_input() {
-        let store = Arc::new(ObjectStore::local());
+        let store = Arc::new(Storage::local());
         let first_path = TempObjFile::default();
         let second_path = TempObjFile::default();
         let output_path = TempObjFile::default();
@@ -1419,10 +1419,10 @@ mod tests {
         #[values(1, 2)] batches_per_file: usize,
     ) {
         // Keep the small-file cache from hiding the payload read requests.
-        let (store, _) = ObjectStore::from_uri_and_params(
+        let (store, _) = Storage::from_uri_and_params(
             Arc::new(Default::default()),
             "memory://",
-            &ObjectStoreParams {
+            &StorageParams {
                 block_size: Some(64),
                 ..Default::default()
             },
@@ -1547,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_does_not_create_output() {
-        let store = Arc::new(ObjectStore::local());
+        let store = Arc::new(Storage::local());
         let first_path = TempObjFile::default();
         let second_path = TempObjFile::default();
         let schema = write_file(&store, &first_path, ConcreteFileVersion::V2_1, &[1]).await;
@@ -1580,7 +1580,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_input_is_unsupported_without_creating_output() {
-        let store = Arc::new(ObjectStore::local());
+        let store = Arc::new(Storage::local());
         let current_path = TempObjFile::default();
         let legacy_path = TempObjFile::default();
         let schema = write_file(&store, &current_path, ConcreteFileVersion::V2_1, &[1]).await;
@@ -1616,7 +1616,7 @@ mod tests {
 
     #[tokio::test]
     async fn incompatible_column_buffers_and_incomplete_metadata_are_rejected() {
-        let store = Arc::new(ObjectStore::local());
+        let store = Arc::new(Storage::local());
         let path = TempObjFile::default();
         let schema = write_file(&store, &path, ConcreteFileVersion::V2_1, &[1, 2]).await;
         let encoded_input = input(store, &path, 2).await;
@@ -1700,7 +1700,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_file_parts_reject_overlapping_blob_leases_before_output() {
-        let store = Arc::new(ObjectStore::local());
+        let store = Arc::new(Storage::local());
         let first_path = TempObjFile::default();
         let second_path = TempObjFile::default();
         let schema = write_file(&store, &first_path, ConcreteFileVersion::V2_1, &[1]).await;
@@ -1739,7 +1739,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_and_corrupt_inputs_are_errors_without_output() {
-        let store = Arc::new(ObjectStore::local());
+        let store = Arc::new(Storage::local());
         let valid_path = TempObjFile::default();
         let missing_path = TempObjFile::default();
         let corrupt_path = TempObjFile::default();

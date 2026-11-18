@@ -20,7 +20,7 @@ use lance_arrow::{
     BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, FieldExt, list::ListArrayExt, r#struct::StructArrayExt,
 };
 use lance_core::storage::path::Path;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::storage::{Storage, StorageParams, StorageRegistry};
 
 use super::external::{
     ExternalBaseResolver, collect_external_blob_uris, normalize_external_absolute_uri,
@@ -48,10 +48,10 @@ const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
 /// A caller that discards the write's result uses this inventory to delete
 /// exactly what the write created. Clones share the same inventory.
 #[derive(Debug, Clone, Default)]
-pub struct BlobPayloadInventory(Arc<Mutex<Vec<(ObjectStore, Path)>>>);
+pub struct BlobPayloadInventory(Arc<Mutex<Vec<(Storage, Path)>>>);
 
 impl BlobPayloadInventory {
-    fn record(&self, storage: &ObjectStore, path: &Path) {
+    fn record(&self, storage: &Storage, path: &Path) {
         self.0.lock().unwrap().push((storage.clone(), path.clone()));
     }
 
@@ -79,7 +79,7 @@ impl BlobPayloadInventory {
 fn new_managed_payload(
     base_id: Option<u32>,
     root: &Path,
-    storage: &ObjectStore,
+    storage: &Storage,
     created_payloads: Option<&BlobPayloadInventory>,
 ) -> (ManagedBlobLocation, Path) {
     let location = ManagedBlobLocation::new(base_id);
@@ -206,7 +206,7 @@ pub struct BlobPreprocessor {
     copied_dedicated: HashMap<u32, BlobDescriptor>,
     managed_base: Option<(Option<u32>, Path)>,
     created_payloads: Option<BlobPayloadInventory>,
-    storage: ObjectStore,
+    storage: Storage,
     data_dir: Path,
     data_file_key: String,
     blob_id_allocator: BlobIdAllocator,
@@ -220,8 +220,8 @@ pub struct BlobPreprocessor {
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
-    source_store_registry: Arc<ObjectStoreRegistry>,
-    source_store_params: ObjectStoreParams,
+    source_store_registry: Arc<StorageRegistry>,
+    source_store_params: StorageParams,
 }
 
 /// A logical slice of an external blob that can be materialized or streamed into Lance-managed
@@ -396,15 +396,15 @@ impl BlobWriteSource<'_> {
 impl BlobPreprocessor {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::dataset) fn new(
-        storage: ObjectStore,
+        storage: Storage,
         data_dir: Path,
         data_file_key: String,
         schema: &lance_core::datatypes::Schema,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
         external_blob_mode: ExternalBlobMode,
-        source_store_registry: Arc<ObjectStoreRegistry>,
-        source_store_params: ObjectStoreParams,
+        source_store_registry: Arc<StorageRegistry>,
+        source_store_params: StorageParams,
         pack_file_size_override: Option<usize>,
     ) -> Result<Self> {
         schema.check_blob_nesting(lance_core::datatypes::Field::is_blob_v2)?;
@@ -865,7 +865,7 @@ impl BlobPreprocessor {
         position: Option<u64>,
         size: Option<u64>,
     ) -> Result<ExternalBlobSource> {
-        let (storage, path) = ObjectStore::from_uri_and_params(
+        let (storage, path) = Storage::from_uri_and_params(
             self.source_store_registry.clone(),
             uri,
             &self.source_store_params,
@@ -1410,15 +1410,15 @@ mod tests {
             lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![field]))
                 .unwrap();
         let mut preprocessor = BlobPreprocessor::new(
-            ObjectStore::memory(),
+            Storage::memory(),
             Path::from("data"),
             "output".into(),
             &schema,
             None,
             false,
             ExternalBlobMode::Reference,
-            Arc::new(ObjectStoreRegistry::default()),
-            ObjectStoreParams::default(),
+            Arc::new(StorageRegistry::default()),
+            StorageParams::default(),
             None,
         )
         .unwrap()
@@ -1485,7 +1485,7 @@ mod tests {
         utils::tempfile::{TempDir, TempStrDir},
     };
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+    use lance_io::storage::{Storage, StorageParams, StorageRegistry};
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -2010,10 +2010,10 @@ mod tests {
         blob_len: usize,
         num_blobs: usize,
     ) -> Result<arrow_array::StructArray> {
-        let (storage, base_path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let (storage, base_path) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             "memory://blob_preprocessor",
-            &ObjectStoreParams::default(),
+            &StorageParams::default(),
         )
         .await
         .unwrap();
@@ -2038,8 +2038,8 @@ mod tests {
             None,
             false,
             ExternalBlobMode::Reference,
-            Arc::new(ObjectStoreRegistry::default()),
-            ObjectStoreParams::default(),
+            Arc::new(StorageRegistry::default()),
+            StorageParams::default(),
             pack_file_size_override,
         )?;
 
@@ -2273,10 +2273,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_inline_threshold_is_per_column() {
-        let (storage, base_path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let (storage, base_path) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             "memory://blob_preprocessor",
-            &ObjectStoreParams::default(),
+            &StorageParams::default(),
         )
         .await
         .unwrap();
@@ -2310,8 +2310,8 @@ mod tests {
             None,
             false,
             ExternalBlobMode::Reference,
-            Arc::new(ObjectStoreRegistry::default()),
-            ObjectStoreParams::default(),
+            Arc::new(StorageRegistry::default()),
+            StorageParams::default(),
             None,
         )
         .unwrap();
@@ -2364,10 +2364,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_pack_file_threshold_starts_new_packed_blob() {
-        let (storage, base_path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let (storage, base_path) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             "memory://blob_preprocessor",
-            &ObjectStoreParams::default(),
+            &StorageParams::default(),
         )
         .await
         .unwrap();
@@ -2397,8 +2397,8 @@ mod tests {
             None,
             false,
             ExternalBlobMode::Reference,
-            Arc::new(ObjectStoreRegistry::default()),
-            ObjectStoreParams::default(),
+            Arc::new(StorageRegistry::default()),
+            StorageParams::default(),
             Some(3),
         )
         .unwrap();

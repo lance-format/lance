@@ -8,7 +8,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
-use lance::io::ObjectStore;
+use lance::io::Storage;
 use lance_core::utils::tempfile::TempStrDir;
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ async fn read_dataset(data_path: &str) -> Result<(), Box<dyn std::error::Error>>
 } // End read dataset
 
 async fn clean_resources(data_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, base) = ObjectStore::from_uri(data_path).await?;
+    let (store, base) = Storage::from_uri(data_path).await?;
     store.remove_dir_all(base).await?;
     println!("Cleaned up resources at: {}", data_path);
     Ok(())

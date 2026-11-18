@@ -749,8 +749,8 @@ mod test {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::WrappingObjectStore;
-    use lance_io::object_store::{
+    use lance_io::storage::BackendWrapper;
+    use lance_io::storage::{
         CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
         PutOptions, PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult, path::Path,
     };
@@ -794,12 +794,12 @@ mod test {
         reads: Arc<BlockingDataFileReads>,
     }
 
-    impl WrappingObjectStore for BlockingDataFileStoreWrapper {
+    impl BackendWrapper for BlockingDataFileStoreWrapper {
         fn wrap(
             &self,
             _prefix: &str,
-            target: Arc<dyn lance_io::object_store::StorageBackend>,
-        ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+            target: Arc<dyn lance_io::storage::StorageBackend>,
+        ) -> Arc<dyn lance_io::storage::StorageBackend> {
             Arc::new(BlockingDataFileStore {
                 target,
                 reads: self.reads.clone(),
@@ -809,7 +809,7 @@ mod test {
 
     #[derive(Debug)]
     struct BlockingDataFileStore {
-        target: Arc<dyn lance_io::object_store::StorageBackend>,
+        target: Arc<dyn lance_io::storage::StorageBackend>,
         reads: Arc<BlockingDataFileReads>,
     }
 
@@ -820,14 +820,14 @@ mod test {
     }
 
     #[async_trait]
-    impl lance_io::object_store::StorageBackend for BlockingDataFileStore {
+    impl lance_io::storage::StorageBackend for BlockingDataFileStore {
         async fn list_paginated(
             &self,
             prefix: Option<&str>,
-            options: lance_io::object_store::PaginatedListOptions,
-        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            options: lance_io::storage::PaginatedListOptions,
+        ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
             let _ = (prefix, options);
-            Err(lance_io::object_store::Error::NotSupported {
+            Err(lance_io::storage::Error::NotSupported {
                 source: "native pagination is unavailable".into(),
             })
         }
@@ -836,12 +836,10 @@ mod test {
             &self,
             path: &Path,
             ranges: &[std::ops::Range<u64>],
-        ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
             object_store::coalesce_ranges(
                 ranges,
-                |range| {
-                    (self as &dyn lance_io::object_store::StorageBackend).get_range(path, range)
-                },
+                |range| (self as &dyn lance_io::storage::StorageBackend).get_range(path, range),
                 object_store::OBJECT_STORE_COALESCE_DEFAULT,
             )
             .await
@@ -860,7 +858,7 @@ mod test {
             &self,
             location: &Path,
             options: PutMultipartOptions,
-        ) -> ObjectStoreResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
+        ) -> ObjectStoreResult<Box<dyn lance_io::storage::backend::MultipartUpload>> {
             self.target.put_multipart_opts(location, options).await
         }
 
@@ -919,7 +917,7 @@ mod test {
             offset: &Path,
         ) -> futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+            lance_io::storage::Result<lance_io::storage::ObjectMeta>,
         > {
             let offset = offset.clone();
             futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
@@ -974,7 +972,7 @@ mod test {
                 reads: reads.clone(),
             },
         )
-            as Arc<dyn WrappingObjectStore>]));
+            as Arc<dyn BackendWrapper>]));
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
 

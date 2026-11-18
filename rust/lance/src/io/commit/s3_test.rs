@@ -8,7 +8,7 @@ use crate::{
     dataset::{
         CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder,
     },
-    io::{ObjectStoreParams, StorageOptionsAccessor},
+    io::{StorageOptionsAccessor, StorageParams},
 };
 use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -226,7 +226,7 @@ async fn test_concurrent_writers() {
     let io_tracker = Arc::new(IOTracker::default());
 
     // Create a table
-    let store_params = ObjectStoreParams {
+    let store_params = StorageParams {
         backend_wrappers: vec![io_tracker.clone()],
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             CONFIG
@@ -310,7 +310,7 @@ async fn test_ddb_open_iops() {
     let io_tracker = Arc::new(IOTracker::default());
 
     // Create a table
-    let store_params = ObjectStoreParams {
+    let store_params = StorageParams {
         backend_wrappers: vec![io_tracker.clone()],
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             CONFIG

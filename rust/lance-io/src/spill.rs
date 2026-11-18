@@ -75,7 +75,7 @@ pub trait SpillStore: Send + Sync + 'static {
 
 /// The readable half of a spill, and the owner of its backing storage.
 ///
-/// ObjectStore is reclaimed after it and all writers/readers have been dropped.
+/// Storage is reclaimed after it and all writers/readers have been dropped.
 /// The trait is object-safe so it can be returned as `Box<dyn Spill>` from [`SpillStore::new_spill`].
 #[async_trait]
 pub trait Spill: Send + Sync {
@@ -128,7 +128,7 @@ impl DiskQuota {
 /// The byte sink handed out by [`SpillStore::new_spill`].
 ///
 /// It optionally reserves a [`DiskQuota`] as bytes are written (keeping cap
-/// enforcement inside the spill store rather than in [`ObjectStore`], and
+/// enforcement inside the spill store rather than in [`Storage`], and
 /// working for any backend the store opens), and flips a shared `finished` flag
 /// on shutdown so the paired [`Spill`] knows the bytes are complete.
 struct SpillWriter {
@@ -561,7 +561,7 @@ impl SpillReadFile {
     fn read_range(
         self: Arc<Self>,
         range: Range<usize>,
-    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
+    ) -> BoxFuture<'static, crate::storage::Result<Bytes>> {
         Box::pin(async move {
             crate::local::join_local_io(tokio::task::spawn_blocking(move || {
                 // Keep both the file and quota in the blocking closure, whose
@@ -614,32 +614,29 @@ impl Reader for SpillReader {
     }
 
     fn io_parallelism(&self) -> usize {
-        crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM
+        crate::storage::DEFAULT_LOCAL_IO_PARALLELISM
     }
 
-    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::storage::Result<usize>> {
         Box::pin(async move { Ok(self.size) })
     }
 
-    fn get_range(
-        &self,
-        range: Range<usize>,
-    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, crate::storage::Result<Bytes>> {
         self.file.clone().read_range(range)
     }
 
-    fn get_all(&self) -> BoxFuture<'_, crate::object_store::Result<Bytes>> {
+    fn get_all(&self) -> BoxFuture<'_, crate::storage::Result<Bytes>> {
         self.get_range(0..self.size)
     }
 
-    fn get_stream(&self) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
+    fn get_stream(&self) -> BoxFuture<'_, crate::storage::Result<ByteStream>> {
         self.get_range_stream(0..self.size)
     }
 
     fn get_range_stream(
         &self,
         range: Range<usize>,
-    ) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
+    ) -> BoxFuture<'_, crate::storage::Result<ByteStream>> {
         let stream = self
             .file
             .clone()
@@ -651,7 +648,7 @@ impl Reader for SpillReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::ObjectStore;
+    use crate::storage::Storage;
     use rstest::rstest;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1126,14 +1123,14 @@ mod tests {
         #[async_trait]
         impl Spill for MemSpill {
             async fn reader(&self) -> Result<Box<dyn Reader>> {
-                ObjectStore::memory().open(&Path::from("/mem")).await
+                Storage::memory().open(&Path::from("/mem")).await
             }
         }
 
         #[async_trait]
         impl SpillStore for MemStore {
             async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)> {
-                let writer = ObjectStore::memory().create(&Path::from("/mem")).await?;
+                let writer = Storage::memory().create(&Path::from("/mem")).await?;
                 Ok((writer, Box::new(MemSpill)))
             }
         }

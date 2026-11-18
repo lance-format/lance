@@ -989,8 +989,8 @@ mod tests {
     use lance_file::reader::FileReaderOptions;
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::FileWriterOptions;
-    use lance_io::object_store::ObjectStore;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::storage::Storage;
     use lance_io::utils::CachedFileSize;
 
     use crate::vector::bq::transform::{
@@ -1592,7 +1592,7 @@ mod tests {
         let values: Vec<f32> = (0..rows).map(|row| row as f32).collect();
         let factors: ArrayRef = Arc::new(Float32Array::from(values));
         let batch = RecordBatch::try_from_iter([("factor", factors)]).unwrap();
-        let store = Arc::new(ObjectStore::memory());
+        let store = Arc::new(Storage::memory());
         let path = lance_core::storage::path::Path::from("resident/factors.lance");
         let mut writer = lance_file::versions::create_writer(
             LanceFileVersion::default().resolve(),

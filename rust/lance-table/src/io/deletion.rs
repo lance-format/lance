@@ -14,7 +14,7 @@ use lance_core::storage::path::Path;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
 use snafu::ResultExt;
@@ -71,7 +71,7 @@ pub async fn write_deletion_file(
     fragment_id: u64,
     read_version: u64,
     removed_rows: &DeletionVector,
-    storage: &ObjectStore,
+    storage: &Storage,
     inline_max_bytes: usize,
 ) -> Result<Option<DeletionFile>> {
     if inline_max_bytes > 0 && !removed_rows.is_empty() {
@@ -167,7 +167,7 @@ pub async fn read_deletion_file(
     fragment_id: u64,
     deletion_file: &DeletionFile,
     base: &Path,
-    storage: &ObjectStore,
+    storage: &Storage,
 ) -> Result<DeletionVector> {
     let span = tracing::Span::current();
     if let Some(encoded) = &deletion_file.inline {
@@ -258,9 +258,7 @@ mod test {
     async fn test_write_no_deletions() {
         let dv = DeletionVector::NoDeletions;
 
-        let (storage, path) = ObjectStore::from_uri("memory:///no_deletion")
-            .await
-            .unwrap();
+        let (storage, path) = Storage::from_uri("memory:///no_deletion").await.unwrap();
         let file = write_deletion_file(&path, 0, 0, &dv, &storage, 0)
             .await
             .unwrap();
@@ -272,7 +270,7 @@ mod test {
     #[tokio::test]
     async fn test_write_inline_within_budget() {
         let dv = DeletionVector::Set(HashSet::from_iter([3, 7, 1000]));
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let path = Path::from("/inline");
 
         let file = write_deletion_file(&path, 21, 12, &dv, &storage, 1024)
@@ -322,7 +320,7 @@ mod test {
         let fragment_id = 21;
         let read_version = 12;
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let path = Path::from("/write");
         let file = write_deletion_file(&path, fragment_id, read_version, &dv, &storage, 0)
             .await
@@ -375,7 +373,7 @@ mod test {
         let fragment_id = 21;
         let read_version = 12;
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let path = Path::from("/bitmap");
         let file = write_deletion_file(&path, fragment_id, read_version, &dv, &storage, 0)
             .await
@@ -416,7 +414,7 @@ mod test {
         let fragment_id = 21;
         let read_version = 12;
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let path = Path::from("/roundtrip");
         let file = write_deletion_file(&path, fragment_id, read_version, &dv, &storage, 0)
             .await
@@ -435,7 +433,7 @@ mod test {
         let fragment_id = 21;
         let read_version = 12;
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let path = Path::from("/bitmap");
         let file = write_deletion_file(&path, fragment_id, read_version, &dv, &storage, 0)
             .await

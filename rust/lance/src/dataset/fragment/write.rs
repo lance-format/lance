@@ -12,7 +12,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
@@ -158,7 +158,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
         let schema = promote_legacy_blobs(version, schema)?;
 
-        let (storage, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = Storage::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
@@ -230,7 +230,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let existing_base_paths = existing_dataset
             .as_ref()
             .map(|dataset| &dataset.manifest.base_paths);
-        let (storage, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = Storage::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
@@ -278,7 +278,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let (storage, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = Storage::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),

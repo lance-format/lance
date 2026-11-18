@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::fmt::{self, Display, Formatter};
 
-use crate::object_store::RenameOptions;
-use crate::object_store::backend::MultipartUpload;
-use crate::object_store::{
+use crate::storage::RenameOptions;
+use crate::storage::backend::MultipartUpload;
+use crate::storage::{
     CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
     PutPayload, PutResult, Result as OSResult, path::Path,
 };
@@ -17,8 +17,8 @@ mock! {
     pub StorageBackend {}
 
     #[async_trait]
-    impl crate::object_store::StorageBackend for StorageBackend {
-    async fn list_paginated<'a, 'b>(&'a self, prefix: Option<&'b str>, options: crate::object_store::PaginatedListOptions) -> crate::object_store::Result<crate::object_store::PaginatedListResult>;
+    impl crate::storage::StorageBackend for StorageBackend {
+    async fn list_paginated<'a, 'b>(&'a self, prefix: Option<&'b str>, options: crate::storage::PaginatedListOptions) -> crate::storage::Result<crate::storage::PaginatedListResult>;
 
         async fn put_opts(&self, location: &Path, bytes: PutPayload, opts: PutOptions) -> OSResult<PutResult>;
         async fn put_multipart_opts(

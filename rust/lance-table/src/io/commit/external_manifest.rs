@@ -14,9 +14,9 @@ use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
 };
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectMeta;
-use lance_io::object_store::ObjectStore;
-use lance_io::object_store::{Error as ObjectStoreError, path::Path};
+use lance_io::storage::ObjectMeta;
+use lance_io::storage::Storage;
+use lance_io::storage::{Error as ObjectStoreError, path::Path};
 use log::warn;
 use tracing::info;
 
@@ -39,7 +39,7 @@ pub async fn finalize_staged<S: ExternalManifestStore + ?Sized>(
     version: u64,
     staging_path: &Path,
     size: u64,
-    storage: &ObjectStore,
+    storage: &Storage,
     naming_scheme: ManifestNamingScheme,
 ) -> Result<ManifestLocation> {
     // Step 2: Copy staging to final path
@@ -229,7 +229,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         staging_path: &Path,
         size: u64,
         _e_tag: Option<String>,
-        storage: &ObjectStore,
+        storage: &Storage,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
         // Default implementation: staging-based workflow
@@ -268,7 +268,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
         staging_path: &Path,
         size: u64,
-        storage: &ObjectStore,
+        storage: &Storage,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
         finalize_staged(
@@ -397,7 +397,7 @@ pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNami
 /// manifest. Any ETag returned by that required HEAD is merely the current
 /// object's opaque generation metadata.
 async fn copy_or_verify_final_manifest(
-    storage: &ObjectStore,
+    storage: &Storage,
     staging_path: &Path,
     final_path: &Path,
     version: u64,
@@ -449,7 +449,7 @@ impl ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         location: ManifestLocation,
-        storage: &ObjectStore,
+        storage: &Storage,
     ) -> std::result::Result<ManifestLocation, Error> {
         match storage.stat(&location.path).await {
             Ok(ObjectMeta { size, e_tag, .. }) => {
@@ -516,7 +516,7 @@ impl ExternalManifestCommitHandler {
         staging_manifest_path: &Path,
         version: u64,
         size: u64,
-        store: &ObjectStore,
+        store: &Storage,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<ManifestLocation, Error> {
         // step 1: copy the manifest to the final location
@@ -593,7 +593,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         version: u64,
-        storage: &ObjectStore,
+        storage: &Storage,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<bool> {
         match self
@@ -619,7 +619,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         base_path: &Path,
         version: u64,
         path: &Path,
-        _storage: &ObjectStore,
+        _storage: &Storage,
     ) -> Result<bool> {
         match self
             .external_manifest_store
@@ -635,7 +635,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
     ) -> std::result::Result<ManifestLocation, Error> {
         let location = self
             .external_manifest_store
@@ -696,7 +696,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         version: u64,
-        storage: &ObjectStore,
+        storage: &Storage,
     ) -> std::result::Result<ManifestLocation, Error> {
         let location_res = self
             .external_manifest_store
@@ -786,7 +786,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_identity(
         &self,
         base_path: &Path,
-        _storage: &ObjectStore,
+        _storage: &Storage,
         version: u64,
     ) -> Result<Option<PredecessorIdentity>> {
         Ok(self
@@ -799,7 +799,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     fn list_manifest_locations<'a>(
         &self,
         base_path: &Path,
-        storage: &'a ObjectStore,
+        storage: &'a Storage,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         let store = self.external_manifest_store.clone();
@@ -826,7 +826,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     fn list_manifest_locations_since<'a>(
         &self,
         base_path: &Path,
-        storage: &'a ObjectStore,
+        storage: &'a Storage,
         since_version: u64,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         let store = self.external_manifest_store.clone();
@@ -857,7 +857,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: super::ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -916,7 +916,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_latest_identity(
         &self,
         base_path: &Path,
-        _storage: &ObjectStore,
+        _storage: &Storage,
     ) -> Result<Option<PredecessorIdentity>> {
         let Some((version, _)) = self
             .external_manifest_store
@@ -937,7 +937,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: super::ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1014,7 +1014,7 @@ impl ExternalManifestCommitHandler {
         base_path: &Path,
         version: u64,
         staging_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         error: Error,
     ) -> CommitError {
         let recorded_location = self
@@ -1038,7 +1038,7 @@ impl ExternalManifestCommitHandler {
 /// never repaired onto the canonical path.
 async fn recorded_as_final(
     mut location: ManifestLocation,
-    storage: &ObjectStore,
+    storage: &Storage,
 ) -> Result<ManifestLocation> {
     if location.size.is_none() {
         location.size = Some(storage.stat(&location.path).await?.size);
@@ -1046,7 +1046,7 @@ async fn recorded_as_final(
     Ok(location)
 }
 
-async fn delete_staging(storage: &ObjectStore, staging_path: &Path, why: &str) {
+async fn delete_staging(storage: &Storage, staging_path: &Path, why: &str) {
     match storage.delete(staging_path).await {
         Ok(()) => {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
@@ -1250,14 +1250,14 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
         storage
             .put_payload(
                 &final_path,
-                lance_io::object_store::PutPayload::from_static(b"manifest"),
+                lance_io::storage::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
@@ -1289,14 +1289,14 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
         storage
             .put_payload(
                 &final_path,
-                lance_io::object_store::PutPayload::from_static(b"manifest"),
+                lance_io::storage::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
@@ -1327,7 +1327,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
 
@@ -1355,7 +1355,7 @@ mod tests {
         storage
             .put_payload(
                 &committed.path,
-                lance_io::object_store::PutPayload::from(vec![0_u8; original.size as usize]),
+                lance_io::storage::PutPayload::from(vec![0_u8; original.size as usize]),
             )
             .await
             .unwrap();
@@ -1376,7 +1376,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let version = 1;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
@@ -1419,7 +1419,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let version = 1;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
@@ -1427,7 +1427,7 @@ mod tests {
         storage
             .put_payload(
                 &final_path,
-                lance_io::object_store::PutPayload::from_static(b"manifest"),
+                lance_io::storage::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
@@ -1452,14 +1452,14 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
         storage
             .put_payload(
                 &final_path,
-                lance_io::object_store::PutPayload::from_static(b"manifest"),
+                lance_io::storage::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
@@ -1489,7 +1489,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
         let version = manifest.version;
@@ -1559,7 +1559,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let version = 1;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
@@ -1660,7 +1660,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
 
@@ -1698,7 +1698,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
         let version = manifest.version;
@@ -1736,7 +1736,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_staging_verifies_existing_final_manifest() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let staging_path = Path::from("dataset/_versions/1.manifest-missing");
         let final_path = Path::from("dataset/_versions/1.manifest");
         let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
@@ -1761,7 +1761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_staging_rejects_missing_final_manifest() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let staging_path = Path::from("dataset/_versions/1.manifest-missing");
         let final_path = Path::from("dataset/_versions/1.manifest");
 
@@ -1775,7 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_staging_rejects_wrong_final_size() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let staging_path = Path::from("dataset/_versions/1.manifest-missing");
         let final_path = Path::from("dataset/_versions/1.manifest");
         storage
@@ -1801,7 +1801,7 @@ mod tests {
             external_manifest_store: external_store.clone(),
         };
 
-        let mut storage = ObjectStore::memory();
+        let mut storage = Storage::memory();
         let fail_next_copy = Arc::new(AtomicBool::new(true));
         let failed_copy_source = Arc::new(Mutex::new(None));
         let mut policy = ProxyBackendPolicy::new();
@@ -1818,7 +1818,7 @@ mod tests {
             }),
         );
         let policy = Arc::new(Mutex::new(policy));
-        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        storage.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
         ));
 
@@ -2118,12 +2118,12 @@ mod tests {
         store: &Arc<IdentifiedStore>,
     ) -> (
         ExternalManifestCommitHandler,
-        ObjectStore,
+        Storage,
         Path,
         PredecessorIdentity,
     ) {
         let handler = store.handler();
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("dataset");
         handler
             .commit(
@@ -2148,7 +2148,7 @@ mod tests {
 
     async fn commit_after_v2(
         handler: &ExternalManifestCommitHandler,
-        storage: &ObjectStore,
+        storage: &Storage,
         base_path: &Path,
         predecessor: &PredecessorIdentity,
     ) -> std::result::Result<ManifestLocation, CommitError> {
@@ -2168,7 +2168,7 @@ mod tests {
             .await
     }
 
-    async fn versions_dir_files(storage: &ObjectStore, base_path: &Path) -> Vec<String> {
+    async fn versions_dir_files(storage: &Storage, base_path: &Path) -> Vec<String> {
         let mut files: Vec<String> = storage
             .list(Some(base_path.clone().join(VERSIONS_DIR)))
             .map_ok(|meta| meta.location.filename().unwrap().to_string())
@@ -2282,7 +2282,7 @@ mod tests {
     }
     async fn listed_versions(
         handler: &ExternalManifestCommitHandler,
-        storage: &ObjectStore,
+        storage: &Storage,
         base_path: &Path,
     ) -> Vec<u64> {
         handler

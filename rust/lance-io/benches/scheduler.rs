@@ -6,8 +6,8 @@ use bytes::Bytes;
 use lance_core::Result;
 use lance_core::storage::path::Path;
 use lance_io::{
-    object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    storage::Storage,
     utils::CachedFileSize,
 };
 use rand::{RngCore, seq::SliceRandom};
@@ -35,13 +35,13 @@ impl Display for FullReadParams {
     }
 }
 
-async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
+async fn create_data(num_bytes: u64) -> (Arc<Storage>, Path) {
     let store_uri = std::env::var("STORE_URI").unwrap_or("/tmp/lance_bench".to_string());
     println!(
         "Reading from {}, use the environment variable STORE_URI to change this",
         store_uri
     );
-    let (obj_store, path) = ObjectStore::from_uri(&store_uri).await.unwrap();
+    let (obj_store, path) = Storage::from_uri(&store_uri).await.unwrap();
     let tmp_file = path.clone().join("foo.file");
 
     let mut some_data = vec![0; num_bytes as usize];

@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lance_core::storage::path::Path;
 use lance_core::{Error, FenceReason, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use tracing::instrument;
@@ -1034,7 +1034,7 @@ impl WalEntryData {
     ///
     /// The parsed WAL entry data, or an error if reading/parsing fails.
     #[instrument(name = "wal_entry_read", level = "debug", skip_all, fields(path = %path))]
-    pub async fn read(storage: &ObjectStore, path: &Path) -> Result<Self> {
+    pub async fn read(storage: &Storage, path: &Path) -> Result<Self> {
         // Read the file
         let data = storage
             .read_object(path)
@@ -1152,7 +1152,7 @@ pub struct WalReadEntry {
 /// retries with the next position. Checks fencing on conflict or PUT failure.
 #[derive(Debug)]
 pub struct WalAppender {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     shard_id: Uuid,
@@ -1170,7 +1170,7 @@ pub struct WalAppender {
 impl WalAppender {
     /// Open a WAL appender and claim a new writer epoch.
     pub async fn open(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         dir_id: &str,
         shard_id: Uuid,
@@ -1213,7 +1213,7 @@ impl WalAppender {
     /// first append.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_claimed_epoch(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         dir_id: &str,
         shard_id: Uuid,
@@ -1457,7 +1457,7 @@ impl WalAppender {
 ///
 /// The caller must already have raised the manifest epoch to `writer_epoch`.
 pub async fn fence_shard(
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: &Path,
     dir_id: &str,
     shard_id: Uuid,
@@ -1495,7 +1495,7 @@ pub async fn fence_shard(
 /// the epoch holder's job — a tailer holds no claim and writes no manifests.
 #[derive(Debug, Clone)]
 pub struct WalTailer {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     shard_id: Uuid,
@@ -1506,7 +1506,7 @@ pub struct WalTailer {
 
 impl WalTailer {
     /// Create a WAL tailer for a shard.
-    pub fn new(storage: Arc<ObjectStore>, base_path: Path, dir_id: &str, shard_id: Uuid) -> Self {
+    pub fn new(storage: Arc<Storage>, base_path: Path, dir_id: &str, shard_id: Uuid) -> Self {
         let manifest_store = Arc::new(ShardManifestStore::new(
             storage.clone(),
             &base_path,
@@ -1532,7 +1532,7 @@ impl WalTailer {
             .join(wal_entry_filename(entry_position));
         let data = match self.storage.read_object(&path).await {
             Ok(data) => data,
-            Err(lance_io::object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(lance_io::storage::Error::NotFound { .. }) => return Ok(None),
             Err(e) => {
                 return Err(Error::io(format!(
                     "failed to read WAL entry {} for shard {}: {}",
@@ -1815,7 +1815,7 @@ enum AtomicPutError {
 }
 
 async fn atomic_put(
-    storage: &ObjectStore,
+    storage: &Storage,
     dir: &Path,
     filename: &str,
     bytes: Bytes,
@@ -1826,8 +1826,8 @@ async fn atomic_put(
         .await
         .map(|_| ())
         .map_err(|error| match error {
-            lance_io::object_store::Error::AlreadyExists { .. }
-            | lance_io::object_store::Error::Precondition { .. } => AtomicPutError::AlreadyExists,
+            lance_io::storage::Error::AlreadyExists { .. }
+            | lance_io::storage::Error::Precondition { .. } => AtomicPutError::AlreadyExists,
             _ => AtomicPutError::Other(Error::io(format!(
                 "failed to create {} atomically: {}",
                 path, error
@@ -1838,7 +1838,7 @@ async fn atomic_put(
 /// Probe forward from a hint position to find the next unwritten position.
 /// Returns `None` if the hint position itself doesn't exist (stale hint).
 async fn probe_forward_from(
-    storage: &ObjectStore,
+    storage: &Storage,
     wal_dir: &Path,
     shard_id: Uuid,
     hint: u64,
@@ -1846,7 +1846,7 @@ async fn probe_forward_from(
     let path = wal_dir.clone().join(wal_entry_filename(hint));
     match storage.stat(&path).await {
         Ok(_) => {}
-        Err(lance_io::object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(lance_io::storage::Error::NotFound { .. }) => return Ok(None),
         Err(e) => {
             return Err(Error::io(format!(
                 "failed to check WAL entry {} for shard {}: {}",
@@ -1859,7 +1859,7 @@ async fn probe_forward_from(
         let p = wal_dir.clone().join(wal_entry_filename(pos));
         match storage.stat(&p).await {
             Ok(_) => pos += 1,
-            Err(lance_io::object_store::Error::NotFound { .. }) => return Ok(Some(pos)),
+            Err(lance_io::storage::Error::NotFound { .. }) => return Ok(Some(pos)),
             Err(e) => {
                 return Err(Error::io(format!(
                     "failed to check WAL entry {} for shard {}: {}",
@@ -1871,7 +1871,7 @@ async fn probe_forward_from(
     Ok(None)
 }
 
-async fn scan_next_position(storage: &ObjectStore, wal_dir: &Path, shard_id: Uuid) -> Result<u64> {
+async fn scan_next_position(storage: &Storage, wal_dir: &Path, shard_id: Uuid) -> Result<u64> {
     let mut max_position = None::<u64>;
     let mut stream = storage.list_objects(Some(wal_dir));
     while let Some(item) = stream.next().await {
@@ -1895,7 +1895,7 @@ async fn scan_next_position(storage: &ObjectStore, wal_dir: &Path, shard_id: Uui
     }
 }
 
-async fn scan_first_position(storage: &ObjectStore, wal_dir: &Path, shard_id: Uuid) -> Result<u64> {
+async fn scan_first_position(storage: &Storage, wal_dir: &Path, shard_id: Uuid) -> Result<u64> {
     let mut min_position = None::<u64>;
     let mut stream = storage.list_objects(Some(wal_dir));
     while let Some(item) = stream.next().await {
@@ -1924,10 +1924,10 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn create_local_store() -> (Arc<ObjectStore>, Path, TempDir) {
+    async fn create_local_store() -> (Arc<Storage>, Path, TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = format!("file://{}", temp_dir.path().display());
-        let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
+        let (store, path) = Storage::from_uri(&uri).await.unwrap();
         (store, path, temp_dir)
     }
 
@@ -1952,7 +1952,7 @@ mod tests {
     }
 
     fn build_test_flusher(
-        store: Arc<ObjectStore>,
+        store: Arc<Storage>,
         base_path: &Path,
         shard_id: Uuid,
         writer_epoch: u64,

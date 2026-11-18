@@ -24,7 +24,7 @@ pub(crate) use marker::{MarkerFileError, put_marker_file_atomic};
 
 use lance::session::Session;
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
@@ -170,7 +170,7 @@ pub struct DirectoryNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
     session: Option<Arc<Session>>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: Path,
     manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
     write_manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,

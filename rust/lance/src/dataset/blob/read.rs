@@ -1087,7 +1087,7 @@ mod tests {
     use lance_core::storage::path::Path;
     use lance_core::{Error, utils::tempfile::TempStrDir};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_table::format::BasePath;
     use rstest::rstest;
     use std::collections::HashMap;
@@ -1105,7 +1105,7 @@ mod tests {
     ) {
         let dir = TempStrDir::default();
         let root = Path::from_absolute_path(dir.to_string()).unwrap();
-        let mut writer = ManagedBlobWriter::try_new(ObjectStore::local(), root, base_id)
+        let mut writer = ManagedBlobWriter::try_new(Storage::local(), root, base_id)
             .await
             .unwrap();
         let payload_path = writer.path().clone();
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_blob_ranges_handles_overlaps_across_scheduler_splits() {
-        let max_iop_size = *lance_io::object_store::DEFAULT_MAX_IOP_SIZE;
+        let max_iop_size = *lance_io::storage::DEFAULT_MAX_IOP_SIZE;
         let value_size = max_iop_size + 12;
         let nested_start = value_size / 2 - 1;
         let nested_end = value_size;

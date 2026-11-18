@@ -42,8 +42,8 @@ use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{
     BuiltinIndexType, CreatedIndex, ScalarIndexParams, index_files_to_table,
 };
-use lance_io::object_store::{Error as ObjectStoreError, path::Path};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::storage::{Error as ObjectStoreError, path::Path};
+use lance_io::storage::{Storage, StorageParams};
 use lance_io::stream::RecordBatchStream as LanceRecordBatchStream;
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -975,7 +975,7 @@ pub struct ManifestNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
     session: Option<Arc<Session>>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: Path,
     manifest_dataset: DatasetConsistencyWrapper,
     /// Whether directory listing is enabled in dual mode
@@ -1073,7 +1073,7 @@ impl ManifestNamespace {
         root: String,
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
@@ -1102,7 +1102,7 @@ impl ManifestNamespace {
         root: String,
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
@@ -1129,7 +1129,7 @@ impl ManifestNamespace {
         root: String,
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         manifest_dataset: DatasetConsistencyWrapper,
         dir_listing_enabled: bool,
@@ -1250,7 +1250,7 @@ impl ManifestNamespace {
 
     /// Construct a full URI from root and relative location
     pub(crate) fn construct_full_uri(root: &str, relative_location: &str) -> Result<String> {
-        let mut base_url = lance_io::object_store::uri_to_url(root)?;
+        let mut base_url = lance_io::storage::uri_to_url(root)?;
 
         // Ensure the base URL has a trailing slash so that path segment mutation
         // appends rather than replaces the last path segment.
@@ -2055,7 +2055,7 @@ impl ManifestNamespace {
     /// file) — otherwise it would orphan files a committed manifest still references.
     async fn cleanup_staged_manifest_files(
         &self,
-        storage: &ObjectStore,
+        storage: &Storage,
         data_files: &HashSet<String>,
         index_uuids: &[Uuid],
     ) {
@@ -2080,7 +2080,7 @@ impl ManifestNamespace {
 
     async fn cleanup_uncommitted_manifest_index_dirs(
         &self,
-        storage: &ObjectStore,
+        storage: &Storage,
         index_uuids: impl IntoIterator<Item = Uuid>,
     ) {
         for index_uuid in index_uuids {
@@ -2556,7 +2556,7 @@ impl ManifestNamespace {
     }
 
     pub(crate) async fn path_has_actual_manifests(
-        storage: &ObjectStore,
+        storage: &Storage,
         table_path: &Path,
     ) -> Result<bool> {
         let versions_path = table_path
@@ -2919,12 +2919,10 @@ impl ManifestNamespace {
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
-        let store_options = ObjectStoreParams {
+        let store_options = StorageParams {
             storage_options_accessor: storage_options.as_ref().map(|opts| {
                 Arc::new(
-                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                        opts.clone(),
-                    ),
+                    lance_io::storage::StorageOptionsAccessor::with_static_options(opts.clone()),
                 )
             }),
             ..Default::default()
@@ -2955,12 +2953,10 @@ impl ManifestNamespace {
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
-        let store_options = ObjectStoreParams {
+        let store_options = StorageParams {
             storage_options_accessor: storage_options.as_ref().map(|opts| {
                 Arc::new(
-                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                        opts.clone(),
-                    ),
+                    lance_io::storage::StorageOptionsAccessor::with_static_options(opts.clone()),
                 )
             }),
             ..Default::default()
@@ -3024,10 +3020,10 @@ impl ManifestNamespace {
                 let empty_batch = RecordBatch::new_empty(schema.clone());
                 let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
 
-                let store_params = ObjectStoreParams {
+                let store_params = StorageParams {
                     storage_options_accessor: storage_options.as_ref().map(|opts| {
                         Arc::new(
-                            lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                            lance_io::storage::StorageOptionsAccessor::with_static_options(
                                 opts.clone(),
                             ),
                         )
@@ -3068,10 +3064,10 @@ impl ManifestNamespace {
                             "Manifest table was created by another process, loading it: {}",
                             manifest_path
                         );
-                        let recovery_store_options = ObjectStoreParams {
+                        let recovery_store_options = StorageParams {
                             storage_options_accessor: storage_options.as_ref().map(|opts| {
                                 Arc::new(
-                                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                    lance_io::storage::StorageOptionsAccessor::with_static_options(
                                         opts.clone(),
                                     ),
                                 )
@@ -3536,10 +3532,10 @@ impl LanceNamespace for ManifestNamespace {
             write_storage_options.extend(request_storage_options.clone());
         }
 
-        let store_params = ObjectStoreParams {
+        let store_params = StorageParams {
             storage_options_accessor: (!write_storage_options.is_empty()).then(|| {
                 Arc::new(
-                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                    lance_io::storage::StorageOptionsAccessor::with_static_options(
                         write_storage_options,
                     ),
                 )
@@ -4471,7 +4467,7 @@ mod tests {
     use lance::dataset::{WriteMode, WriteParams};
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::TempStdDir;
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+    use lance_io::storage::{Storage, StorageParams, StorageRegistry};
     use lance_namespace::LanceNamespace;
     use lance_namespace::error::NamespaceError;
     use lance_namespace::models::{
@@ -4500,10 +4496,10 @@ mod tests {
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
     ) -> ManifestNamespace {
-        let (storage, base_path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let (storage, base_path) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             root,
-            &ObjectStoreParams::default(),
+            &StorageParams::default(),
         )
         .await
         .unwrap();

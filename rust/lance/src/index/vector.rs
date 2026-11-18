@@ -61,7 +61,7 @@ use lance_index::vector::{
 };
 use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType, pb};
 use lance_io::object_reader::LazyReader;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::{IndexFile, IndexMetadata};
@@ -2131,7 +2131,7 @@ pub(crate) async fn open_vector_index(
 /// for older indices that did not record sizes, this falls back to `open`, which
 /// issues a HEAD to learn the size.
 pub(crate) async fn open_index_file(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
     file_name: &str,
     file_sizes: &HashMap<String, u64>,
@@ -2152,7 +2152,7 @@ pub(crate) async fn open_index_file(
 /// Other stores hold no descriptor, and their readers cache small files in
 /// memory, so they keep the regular reader.
 pub(crate) async fn open_cache_reader(
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     path: &Path,
     file_name: &str,
     file_sizes: &HashMap<String, u64>,
@@ -2975,12 +2975,12 @@ mod tests {
     async fn test_open_index_file_skips_head_when_size_known() {
         use lance_index::INDEX_FILE_NAME;
         use lance_io::assert_io_eq;
-        use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+        use lance_io::storage::{StorageParams, StorageRegistry};
 
-        let (store, base) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let (store, base) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             "memory:///",
-            &ObjectStoreParams::default(),
+            &StorageParams::default(),
         )
         .await
         .unwrap();

@@ -35,7 +35,7 @@ use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_io::local::to_local_path;
-use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy, TestWrappingObjectStore};
+use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy, TestBackendWrapper};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
@@ -45,9 +45,9 @@ use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure, copy_test_dat
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use lance_core::Error;
-use lance_io::object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStoreParams,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, WrappingObjectStore, path::Path,
+use lance_io::storage::{
+    BackendWrapper, CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, StorageParams, path::Path,
 };
 use rstest::rstest;
 use std::cmp::Ordering;
@@ -1441,7 +1441,7 @@ impl CommitHandler for DeleteBranchOnCommit {
         manifest: &mut lance_table::format::Manifest,
         indices: Option<Vec<lance_table::format::IndexMetadata>>,
         base_path: &Path,
-        storage: &lance_io::object_store::ObjectStore,
+        storage: &lance_io::storage::Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<lance_table::format::Transaction>,
@@ -1527,7 +1527,7 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
     let mut deleted = root.create_branch("a", 2, None).await.unwrap();
     root.create_branch("a/b", 1, None).await.unwrap();
     let mut store = root.storage.as_ref().clone();
-    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+    store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
         |backend| {
             Arc::new(DirectoryMarkerStore {
                 inner: backend,
@@ -2004,14 +2004,13 @@ async fn test_existing_branch_above_creation_limit(
 ) {
     let test_dir = copy_test_data_to_tmp("v14.0.2/long_branch.lance").unwrap();
     let mut dataset = if in_memory {
-        let provider = lance_io::utils::testing::TestObjectStoreProvider(
-            lance_io::object_store::BackendConfig::new(
-                lance_io::object_store::backend::native::from_object_store(Arc::new(
+        let provider =
+            lance_io::utils::testing::TestStorageProvider(lance_io::storage::BackendConfig::new(
+                lance_io::storage::backend::object_store::from_object_store(Arc::new(
                     object_store::memory::InMemory::new(),
                 )),
                 "memory",
-            ),
-        );
+            ));
         let session = Arc::new(Session::default());
         session
             .store_registry()
@@ -2167,7 +2166,7 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
                         std::fs::remove_file(to_local_path(path)).unwrap();
                     }
                 } else {
-                    return Err(lance_io::object_store::Error::PermissionDenied {
+                    return Err(lance_io::storage::Error::PermissionDenied {
                         path: path.to_string(),
                         source: "ref cannot be read".into(),
                     }
@@ -2179,7 +2178,7 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
     );
     let mut store = dataset.storage.as_ref().clone();
     let policy = Arc::new(Mutex::new(policy));
-    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+    store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
         |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
     ));
     dataset.refs.storage = Arc::new(store);
@@ -2288,7 +2287,7 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_file_bac
     );
     let mut store = dataset.storage.as_ref().clone();
     let policy = Arc::new(Mutex::new(policy));
-    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+    store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
         |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
     ));
     dataset.refs.storage = Arc::new(store);
@@ -2409,7 +2408,7 @@ async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_fil
     );
     let mut store = dataset.storage.as_ref().clone();
     let policy = Arc::new(Mutex::new(policy));
-    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+    store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
         |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
     ));
     dataset.refs.storage = Arc::new(store);
@@ -2496,7 +2495,7 @@ async fn test_concurrent_branch_deletes_and_listing(#[case] use_file_backend: bo
 
 #[derive(Debug)]
 struct DirectoryMarkerStore {
-    inner: Arc<dyn lance_io::object_store::StorageBackend>,
+    inner: Arc<dyn lance_io::storage::StorageBackend>,
     marker: Path,
     listings: AtomicUsize,
 }
@@ -2508,14 +2507,14 @@ impl std::fmt::Display for DirectoryMarkerStore {
 }
 
 #[async_trait::async_trait]
-impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
+impl lance_io::storage::StorageBackend for DirectoryMarkerStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -2524,7 +2523,7 @@ impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
         &self,
         path: &Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         self.inner.get_ranges(path, ranges).await
     }
 
@@ -2533,7 +2532,7 @@ impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
         path: &Path,
         payload: PutPayload,
         options: PutOptions,
-    ) -> lance_io::object_store::Result<PutResult> {
+    ) -> lance_io::storage::Result<PutResult> {
         self.inner.put_opts(path, payload, options).await
     }
 
@@ -2541,8 +2540,7 @@ impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
         &self,
         path: &Path,
         options: PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.inner.put_multipart_opts(path, options).await
     }
 
@@ -2550,33 +2548,33 @@ impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
         &self,
         path: &Path,
         options: GetOptions,
-    ) -> lance_io::object_store::Result<GetResult> {
+    ) -> lance_io::storage::Result<GetResult> {
         self.inner.get_opts(path, options).await
     }
 
     fn delete_stream(
         &self,
-        paths: BoxStream<'static, lance_io::object_store::Result<Path>>,
-    ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
+        paths: BoxStream<'static, lance_io::storage::Result<Path>>,
+    ) -> BoxStream<'static, lance_io::storage::Result<Path>> {
         self.inner.delete_stream(paths)
     }
 
     fn list(
         &self,
         prefix: Option<&Path>,
-    ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
+    ) -> BoxStream<'static, lance_io::storage::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
-    ) -> lance_io::object_store::Result<ListResult> {
+    ) -> lance_io::storage::Result<ListResult> {
         let mut entries = self.inner.list_with_delimiter(prefix).await?;
         if prefix == Some(&self.marker) {
             // Fail promptly if cleanup requeues the marker instead of hanging.
             if self.listings.fetch_add(1, AtomicOrdering::SeqCst) > 0 {
-                return Err(lance_io::object_store::Error::Generic {
+                return Err(lance_io::storage::Error::Generic {
                     store: "DirectoryMarkerStore",
                     source: "shared directory was listed more than once".into(),
                 });
@@ -2592,7 +2590,7 @@ impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
         from: &Path,
         to: &Path,
         options: CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+    ) -> lance_io::storage::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -2600,10 +2598,8 @@ impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         let offset = offset.clone();
         futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
             self.list(prefix),
@@ -2615,8 +2611,8 @@ impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
         &self,
         from: &Path,
         to: &Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.rename_opts(from, to, opts).await
     }
 }
@@ -2669,7 +2665,7 @@ async fn test_delete_branch_with_shared_directory(
     let marker_store = has_directory_marker.then(|| {
         let mut store = dataset.storage.as_ref().clone();
         let marker_store = std::sync::OnceLock::new();
-        store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| {
                 let wrapped = Arc::new(DirectoryMarkerStore {
                     inner: backend,
@@ -2775,13 +2771,12 @@ async fn test_cleanup_with_backend_wrapper(
     .unwrap();
     let hidden_staging = tempdir.std_path().join("data/unfinished.lance#1");
     std::fs::write(&hidden_staging, b"unfinished").unwrap();
-    let wrapper: Arc<dyn WrappingObjectStore> =
-        Arc::new(TestWrappingObjectStore::new(|backend| backend));
+    let wrapper: Arc<dyn BackendWrapper> = Arc::new(TestBackendWrapper::new(|backend| backend));
     let dataset = if apply_late {
         latest.with_backend_wrappers([wrapper])
     } else {
         DatasetBuilder::from_uri(&uri)
-            .with_store_params(ObjectStoreParams {
+            .with_store_params(StorageParams {
                 backend_wrappers: vec![wrapper],
                 ..Default::default()
             })
@@ -2855,15 +2850,14 @@ async fn test_delete_branch_with_backend_wrapper(
             Ok(())
         }),
     );
-    let wrapper: Arc<dyn WrappingObjectStore> =
-        Arc::new(TestWrappingObjectStore::new(move |backend| {
-            Arc::new(ProxyBackend::new(backend, policy.clone()))
-        }));
+    let wrapper: Arc<dyn BackendWrapper> = Arc::new(TestBackendWrapper::new(move |backend| {
+        Arc::new(ProxyBackend::new(backend, policy.clone()))
+    }));
     let mut wrapped = if apply_late {
         root.with_backend_wrappers([wrapper])
     } else {
         DatasetBuilder::from_uri(&uri)
-            .with_store_params(ObjectStoreParams {
+            .with_store_params(StorageParams {
                 backend_wrappers: vec![wrapper],
                 ..Default::default()
             })
@@ -2931,14 +2925,14 @@ async fn test_delete_branch_preserves_case_aliased_shared_directories(
     case_child.append(id_rows(30, 1), None).await.unwrap();
     if cannot_resolve_local_paths {
         // A provider without native path resolution must preserve ambiguous subtrees.
-        let mut config = lance_io::object_store::BackendConfig::new(
-            lance_io::object_store::backend::native::from_object_store(Arc::new(
+        let mut config = lance_io::storage::BackendConfig::new(
+            lance_io::storage::backend::object_store::from_object_store(Arc::new(
                 object_store::local::LocalFileSystem::new(),
             )),
             "file",
         );
         config.is_local = true;
-        let store = lance_io::utils::testing::TestObjectStoreProvider(config)
+        let store = lance_io::utils::testing::TestStorageProvider(config)
             .build(url::Url::parse("file:///").unwrap(), &Default::default());
         assert!(!store.has_direct_local_paths());
         let store = Arc::new(store);
@@ -3017,8 +3011,7 @@ async fn test_delete_branch_preserves_aliased_parent_data(
     create_branch_before_name_check(&root, "a/data/x").await;
 
     if with_wrapper {
-        let wrapper: Arc<dyn WrappingObjectStore> =
-            Arc::new(TestWrappingObjectStore::new(|backend| backend));
+        let wrapper: Arc<dyn BackendWrapper> = Arc::new(TestBackendWrapper::new(|backend| backend));
         root = root.with_backend_wrappers([wrapper]);
         assert!(
             root.storage
@@ -3323,7 +3316,7 @@ async fn test_delete_branch_preserves_aliased_main_dataset(
 
 #[derive(Debug)]
 struct GateSpelledRefsStore {
-    inner: Arc<dyn lance_io::object_store::StorageBackend>,
+    inner: Arc<dyn lance_io::storage::StorageBackend>,
     root: Path,
     spelling: &'static str,
 }
@@ -3335,14 +3328,14 @@ impl std::fmt::Display for GateSpelledRefsStore {
 }
 
 #[async_trait::async_trait]
-impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
+impl lance_io::storage::StorageBackend for GateSpelledRefsStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -3351,7 +3344,7 @@ impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
         &self,
         path: &Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         self.inner.get_ranges(path, ranges).await
     }
 
@@ -3360,7 +3353,7 @@ impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
         path: &Path,
         payload: PutPayload,
         options: PutOptions,
-    ) -> lance_io::object_store::Result<PutResult> {
+    ) -> lance_io::storage::Result<PutResult> {
         self.inner.put_opts(path, payload, options).await
     }
 
@@ -3368,8 +3361,7 @@ impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
         &self,
         path: &Path,
         options: PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.inner.put_multipart_opts(path, options).await
     }
 
@@ -3377,28 +3369,28 @@ impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
         &self,
         path: &Path,
         options: GetOptions,
-    ) -> lance_io::object_store::Result<GetResult> {
+    ) -> lance_io::storage::Result<GetResult> {
         self.inner.get_opts(path, options).await
     }
 
     fn delete_stream(
         &self,
-        paths: BoxStream<'static, lance_io::object_store::Result<Path>>,
-    ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
+        paths: BoxStream<'static, lance_io::storage::Result<Path>>,
+    ) -> BoxStream<'static, lance_io::storage::Result<Path>> {
         self.inner.delete_stream(paths)
     }
 
     fn list(
         &self,
         prefix: Option<&Path>,
-    ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
+    ) -> BoxStream<'static, lance_io::storage::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
-    ) -> lance_io::object_store::Result<ListResult> {
+    ) -> lance_io::storage::Result<ListResult> {
         let mut entries = self.inner.list_with_delimiter(prefix).await?;
         if prefix == Some(&self.root) {
             for directory in &mut entries.common_prefixes {
@@ -3415,7 +3407,7 @@ impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
         from: &Path,
         to: &Path,
         options: CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+    ) -> lance_io::storage::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -3423,10 +3415,8 @@ impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         let offset = offset.clone();
         futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
             self.list(prefix),
@@ -3438,8 +3428,8 @@ impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
         &self,
         from: &Path,
         to: &Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.rename_opts(from, to, opts).await
     }
 }
@@ -3565,7 +3555,7 @@ async fn test_gatekeeper_case_spelled_shared_refs(
     );
 
     let mut store = root.storage.as_ref().clone();
-    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+    store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
         |backend| {
             Arc::new(GateSpelledRefsStore {
                 inner: backend,

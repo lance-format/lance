@@ -52,7 +52,7 @@ use lance_table::transaction::{
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
 
-use super::ObjectStore;
+use super::Storage;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
@@ -158,7 +158,7 @@ pub(crate) fn maybe_timeout<T>(
 
 /// Read the raw protobuf transaction from a transaction file.
 async fn read_transaction_file_pb(
-    storage: &ObjectStore,
+    storage: &Storage,
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<pb::Transaction> {
@@ -174,7 +174,7 @@ async fn read_transaction_file_pb(
 /// Read the transaction data from a transaction file.
 #[cfg(test)]
 pub(crate) async fn read_transaction_file(
-    storage: &ObjectStore,
+    storage: &Storage,
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
@@ -193,7 +193,7 @@ pub(crate) async fn read_transaction_file(
 /// have NOT landed (see [`verify_commit_outcome`]): a landed manifest
 /// references its transaction file by path, so deleting it would corrupt the
 /// version.
-async fn cleanup_transaction_file(storage: &ObjectStore, base_path: &Path, transaction_file: &str) {
+async fn cleanup_transaction_file(storage: &Storage, base_path: &Path, transaction_file: &str) {
     if transaction_file.is_empty() {
         return;
     }
@@ -224,7 +224,7 @@ async fn cleanup_transaction_file(storage: &ObjectStore, base_path: &Path, trans
 /// its commit conclusively failed (the relocated FRI entry's spilled
 /// `details.binpb`). Never called when the commit outcome is unknown: the
 /// clone may have landed and still need them.
-async fn cleanup_spilled_clone_files(storage: &ObjectStore, spilled_files: &[Path]) {
+async fn cleanup_spilled_clone_files(storage: &Storage, spilled_files: &[Path]) {
     for path in spilled_files {
         if let Err(e) = storage.delete(path).await {
             log::warn!("Failed to clean up staged clone file '{}': {}", path, e);
@@ -271,7 +271,7 @@ const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
 async fn verify_commit_outcome(
-    storage: &ObjectStore,
+    storage: &Storage,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     version: u64,
@@ -347,7 +347,7 @@ async fn verify_commit_outcome(
 }
 
 async fn read_manifest_transaction(
-    storage: &ObjectStore,
+    storage: &Storage,
     base_path: &Path,
     manifest: &Manifest,
     location: &ManifestLocation,
@@ -375,7 +375,7 @@ async fn read_manifest_transaction(
 /// Read the manifest at `version`, distinguishing "no such version"
 /// (`Ok(None)`) from transient read failures (`Err`).
 async fn try_read_manifest_at(
-    storage: &ObjectStore,
+    storage: &Storage,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     version: u64,
@@ -397,7 +397,7 @@ async fn try_read_manifest_at(
 
 /// Write a transaction to a file and return the relative path.
 pub(crate) async fn write_transaction_file(
-    storage: &ObjectStore,
+    storage: &Storage,
     base_path: &Path,
     transaction: &pb::Transaction,
 ) -> Result<String> {
@@ -423,8 +423,8 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
-    storage: &ObjectStore,
-    source_store: Option<&ObjectStore>,
+    storage: &Storage,
+    source_store: Option<&Storage>,
     commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
     uri: &str,
@@ -463,7 +463,7 @@ async fn do_commit_new_dataset(
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(storage);
         let source_base_path =
-            ObjectStore::extract_path_from_uri(session.store_registry(), ref_path.as_str())?;
+            Storage::extract_path_from_uri(session.store_registry(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, source_store)
             .await?;
@@ -600,7 +600,7 @@ async fn do_commit_new_dataset(
                 let source_store = source_store.unwrap_or(storage);
                 let source = Dataset::checkout_manifest(
                     Arc::new(source_store.clone()),
-                    ObjectStore::extract_path_from_uri(session.store_registry(), ref_path)?,
+                    Storage::extract_path_from_uri(session.store_registry(), ref_path)?,
                     ref_path.clone(),
                     Arc::new(source_manifest.clone()),
                     source_manifest_location.clone(),
@@ -774,8 +774,8 @@ async fn record_new_dataset_commit(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_new_dataset(
-    storage: &ObjectStore,
-    source_store: Option<&ObjectStore>,
+    storage: &Storage,
+    source_store: Option<&Storage>,
     commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
     uri: &str,
@@ -1302,7 +1302,7 @@ pub(crate) fn detect_overlapping_fragments(
 
 pub(crate) async fn do_commit_detached_transaction(
     dataset: &Dataset,
-    storage: &ObjectStore,
+    storage: &Storage,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
@@ -1581,7 +1581,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
 pub(crate) async fn commit_detached_transaction(
     dataset: &Dataset,
-    storage: &ObjectStore,
+    storage: &Storage,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
@@ -1763,7 +1763,7 @@ async fn record_successful_commit(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
-    storage: &ObjectStore,
+    storage: &Storage,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
@@ -2923,7 +2923,7 @@ mod tests {
             manifest: &mut Manifest,
             indices: Option<Vec<IndexMetadata>>,
             base_path: &Path,
-            storage: &ObjectStore,
+            storage: &Storage,
             manifest_writer: ManifestWriter,
             naming_scheme: ManifestNamingScheme,
             transaction: Option<lance_table::format::Transaction>,
@@ -3104,7 +3104,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roundtrip_transaction_file() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("test");
         let transaction = Transaction::new(
             42,
@@ -3881,7 +3881,7 @@ mod tests {
             _manifest: &mut Manifest,
             _indices: Option<Vec<IndexMetadata>>,
             _base_path: &Path,
-            _storage: &ObjectStore,
+            _storage: &Storage,
             _manifest_writer: ManifestWriter,
             _naming_scheme: ManifestNamingScheme,
             _transaction: Option<lance_table::format::Transaction>,

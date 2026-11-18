@@ -29,7 +29,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::{
     reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
 };
-use lance_io::{object_store::ObjectStore, utils::read_message};
+use lance_io::{storage::Storage, utils::read_message};
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2, dot::DotPrepared, l2::L2Prepared};
 use lance_linalg::simd::dist_table::{
     filter_4bit_dist_table_transposed, sum_4bit_dist_table_transposed,
@@ -426,7 +426,7 @@ impl ProductQuantizationStorage {
     ///
     /// Parameters
     /// ----------
-    /// storage: &ObjectStore
+    /// storage: &Storage
     ///   The object store to load the storage from.
     /// path: &Path
     ///  The path to the storage.
@@ -438,7 +438,7 @@ impl ProductQuantizationStorage {
     /// Currently it loads everything in memory.
     /// TODO: support lazy loading later.
     pub async fn load(
-        storage: &ObjectStore,
+        storage: &Storage,
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     async fn write_partitioned_pq_file(storage: &ProductQuantizationStorage) -> FileReader {
-        let file_storage = ObjectStore::memory();
+        let file_storage = Storage::memory();
         let path = Path::from("partitioned-pq.lance");
         let schema =
             lance_core::datatypes::Schema::try_from(storage.batch.schema().as_ref()).unwrap();

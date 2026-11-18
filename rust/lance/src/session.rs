@@ -13,8 +13,8 @@ use lance_core::cache::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
-use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::spill::{LocalSpillStore, SpillStore};
+use lance_io::storage::StorageRegistry;
 
 pub use lance_index::vector::storage::{OriginLatencyClass, ResidentColumnsSetting};
 
@@ -108,7 +108,7 @@ pub struct Session {
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
-    store_registry: Arc<ObjectStoreRegistry>,
+    store_registry: Arc<StorageRegistry>,
 
     unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
 
@@ -186,7 +186,7 @@ impl Session {
     pub fn new(
         index_cache_size: usize,
         metadata_cache_size: usize,
-        store_registry: Arc<ObjectStoreRegistry>,
+        store_registry: Arc<StorageRegistry>,
     ) -> Self {
         Self {
             index_cache: GlobalIndexCache(Self::build_automatic_quick_cache(
@@ -217,7 +217,7 @@ impl Session {
     pub fn with_index_cache_backend(
         index_cache_backend: Arc<dyn CacheBackend>,
         metadata_cache_size: usize,
-        store_registry: Arc<ObjectStoreRegistry>,
+        store_registry: Arc<StorageRegistry>,
     ) -> Self {
         Self {
             index_cache: GlobalIndexCache(LanceCache::with_backend_and_metrics_kind(
@@ -437,7 +437,7 @@ impl Session {
     pub fn with_cache_backends(
         index_cache: CacheSpec,
         metadata_cache: CacheSpec,
-        store_registry: Arc<ObjectStoreRegistry>,
+        store_registry: Arc<StorageRegistry>,
     ) -> Self {
         let index_cache = Self::build_cache(
             index_cache,
@@ -559,7 +559,7 @@ impl Session {
     }
 
     /// Get the object store registry.
-    pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
+    pub fn store_registry(&self) -> Arc<StorageRegistry> {
         self.store_registry.clone()
     }
 
@@ -639,7 +639,7 @@ impl Default for Session {
         Self::new(
             DEFAULT_INDEX_CACHE_SIZE,
             DEFAULT_METADATA_CACHE_SIZE,
-            Arc::new(ObjectStoreRegistry::default()),
+            Arc::new(StorageRegistry::default()),
         )
     }
 }

@@ -293,7 +293,7 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
     use lance_index_core::scalar::IndexReader;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
 
     thread_local! {
         /// Lookahead steps [`contiguous_run_end`] has taken on this thread
@@ -382,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn sparse_batch_reads_only_touched_blocks_without_cache() {
         let directory = TempDir::default();
-        let (storage, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+        let (storage, path) = Storage::from_uri(directory.obj_path().as_ref())
             .await
             .unwrap();
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
@@ -463,7 +463,7 @@ mod tests {
         const ROWS: u64 = BLOCKS as u64 * BLOCK_ROWS;
         const DELETED: u32 = 5;
         let directory = TempDir::default();
-        let (storage, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+        let (storage, path) = Storage::from_uri(directory.obj_path().as_ref())
             .await
             .unwrap();
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
@@ -550,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn mapping_single_and_batch_translation_are_lazy() {
         let directory = TempDir::default();
-        let (storage, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+        let (storage, path) = Storage::from_uri(directory.obj_path().as_ref())
             .await
             .unwrap();
         let store = Arc::new(LanceIndexStore::new(

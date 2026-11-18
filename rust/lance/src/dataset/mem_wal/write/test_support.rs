@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::storage::path::Path;
 use lance_core::{Result, datatypes::Schema};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -23,10 +23,10 @@ use crate::blob::{BlobArrayBuilder, BlobFieldOptions, blob_field_with_options};
 use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 
-pub(super) async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
+pub(super) async fn create_local_store() -> (Arc<Storage>, Path, String, TempDir) {
     let temp_dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", temp_dir.path().display());
-    let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
+    let (store, path) = Storage::from_uri(&uri).await.unwrap();
     (store, path, uri, temp_dir)
 }
 
@@ -84,7 +84,7 @@ pub(super) enum BlobTestValue {
     Null,
 }
 
-pub(super) async fn blob_sidecars(store: &ObjectStore, data_dir: &Path) -> Vec<Path> {
+pub(super) async fn blob_sidecars(store: &Storage, data_dir: &Path) -> Vec<Path> {
     use futures::TryStreamExt;
 
     let mut paths = store
@@ -313,7 +313,7 @@ pub(super) fn schema_with_pk() -> Arc<ArrowSchema> {
 
 /// Rows in SSTables after a fresh writer replays the WAL and closes.
 pub(super) async fn rows_after_reopen(
-    store: &Arc<ObjectStore>,
+    store: &Arc<Storage>,
     base_path: &Path,
     shard_id: Uuid,
     schema: &Arc<ArrowSchema>,

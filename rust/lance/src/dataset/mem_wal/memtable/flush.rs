@@ -14,7 +14,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::{ShardManifest, SsTable};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::storage::{Storage, StorageParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
@@ -66,7 +66,7 @@ fn compute_dedup_deletions(batches: &[RecordBatch], pk_indices: &[usize]) -> Roa
 }
 
 pub struct MemTableFlusher {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: Path,
     base_uri: String,
     /// The MemWAL's `dir_id`; generations are written under its directory.
@@ -79,7 +79,7 @@ pub struct MemTableFlusher {
     /// Store params the base dataset was opened with, reused for the flusher's
     /// own opens + writes. Used verbatim only for the base's own URI; generation
     /// URIs resolve their own storage through the registry. `None` opens by URI alone.
-    store_params: Option<ObjectStoreParams>,
+    store_params: Option<StorageParams>,
     /// Session for those opens, sharing the base's store registry. `None` opens
     /// with a fresh session.
     session: Option<Arc<Session>>,
@@ -139,7 +139,7 @@ const TRAINING_BATCH_SIZE: usize = 8192;
 impl MemTableFlusher {
     /// Create a flusher writing `shard_id`'s generations under the MemWAL `dir_id`.
     pub fn new(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         base_uri: impl Into<String>,
         dir_id: impl Into<String>,
@@ -169,7 +169,7 @@ impl MemTableFlusher {
     /// `mem_wal_writer` from the base `Dataset`.
     pub fn with_storage_context(
         mut self,
-        store_params: Option<ObjectStoreParams>,
+        store_params: Option<StorageParams>,
         session: Option<Arc<Session>>,
     ) -> Self {
         self.store_params = store_params;
@@ -185,11 +185,7 @@ impl MemTableFlusher {
 
     /// Open `uri` with the injected session, or by URI alone when nothing was
     /// injected.
-    async fn open_uri(
-        &self,
-        uri: &str,
-        store_params: Option<ObjectStoreParams>,
-    ) -> Result<Dataset> {
+    async fn open_uri(&self, uri: &str, store_params: Option<StorageParams>) -> Result<Dataset> {
         let mut builder = DatasetBuilder::from_uri(uri);
         if let Some(params) = store_params {
             builder = builder.with_store_params(params);
@@ -267,7 +263,7 @@ impl MemTableFlusher {
         ))
     }
 
-    /// ObjectStore file version of the shard's base dataset. SSTables
+    /// Storage file version of the shard's base dataset. SSTables
     /// (data fragments and index files) are written at this same version so the
     /// whole shard stays on one format (e.g. a 2.2 base => 2.2 SSTables).
     ///
@@ -938,10 +934,10 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
+    async fn create_local_store() -> (Arc<Storage>, Path, String, TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = format!("file://{}", temp_dir.path().display());
-        let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
+        let (store, path) = Storage::from_uri(&uri).await.unwrap();
         (store, path, uri, temp_dir)
     }
 

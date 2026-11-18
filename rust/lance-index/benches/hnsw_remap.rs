@@ -61,7 +61,7 @@ use lance_index::vector::sq::{
 };
 use lance_index::vector::storage::{StorageBuilder, VectorStore};
 use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
 use rand::rngs::StdRng;
@@ -545,7 +545,7 @@ fn main() {
             if percent == deleted_percents[deleted_percents.len() - 1] {
                 // The remapped graph goes through the same writer as the index file.
                 let written = rt.block_on(async {
-                    let store = ObjectStore::memory();
+                    let store = Storage::memory();
                     let path = Path::from("hnsw_remap_graph.lance");
                     let schema =
                         lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref()).unwrap();

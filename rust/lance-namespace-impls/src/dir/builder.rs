@@ -8,7 +8,7 @@ use lance::session::Session;
 use lance_core::Result;
 use lance_core::storage::path::Path;
 use lance_core::utils::parse::str_to_bool;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::storage::{Storage, StorageParams, StorageRegistry};
 use lance_namespace::error::NamespaceError;
 use tokio::sync::OnceCell;
 
@@ -611,12 +611,12 @@ impl DirectoryNamespaceBuilder {
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: &Option<Arc<Session>>,
-    ) -> Result<(Arc<ObjectStore>, Path)> {
-        // Build ObjectStoreParams from storage options
+    ) -> Result<(Arc<Storage>, Path)> {
+        // Build StorageParams from storage options
         let accessor = storage_options.clone().map(|opts| {
-            Arc::new(lance_io::object_store::StorageOptionsAccessor::with_static_options(opts))
+            Arc::new(lance_io::storage::StorageOptionsAccessor::with_static_options(opts))
         });
-        let params = ObjectStoreParams {
+        let params = StorageParams {
             storage_options_accessor: accessor,
             ..Default::default()
         };
@@ -625,11 +625,11 @@ impl DirectoryNamespaceBuilder {
         let registry = if let Some(session) = session {
             session.store_registry()
         } else {
-            Arc::new(ObjectStoreRegistry::default())
+            Arc::new(StorageRegistry::default())
         };
 
         // Use Lance's object store factory to create from URI
-        let (storage, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
+        let (storage, base_path) = Storage::from_uri_and_params(registry, root, &params)
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {

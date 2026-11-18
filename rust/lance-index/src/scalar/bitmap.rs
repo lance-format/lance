@@ -36,7 +36,7 @@ use lance_core::{
     error::LanceOptionExt,
     utils::tokio::get_num_compute_intensive_cpus,
 };
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_io::stream::RecordBatchStream;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -1717,7 +1717,7 @@ async fn drain_same_key_bitmaps(
 }
 
 async fn list_bitmap_shard_files(
-    storage: &ObjectStore,
+    storage: &Storage,
     index_dir: &Path,
     progress: &dyn IndexBuildProgress,
 ) -> Result<Vec<String>> {
@@ -2128,7 +2128,7 @@ impl BitmapIndexPlugin {
 }
 
 pub async fn merge_index_files(
-    storage: &ObjectStore,
+    storage: &Storage,
     index_dir: &Path,
     store: Arc<dyn IndexStore>,
     progress: Arc<dyn IndexBuildProgress>,
@@ -2813,7 +2813,7 @@ pub(crate) mod test_util {
     use datafusion_common::ScalarValue;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_select::RowAddrTreeMap;
 
     use crate::scalar::IndexStore;
@@ -2824,7 +2824,7 @@ pub(crate) mod test_util {
     pub fn index_store() -> (TempObjDir, Arc<dyn IndexStore>) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2913,7 +2913,7 @@ mod tests {
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_select::RowSetOps;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
@@ -2928,7 +2928,7 @@ mod tests {
         use arrow_array::UInt32Array;
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3109,7 +3109,7 @@ mod tests {
         // Create a temporary directory for the index
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3249,7 +3249,7 @@ mod tests {
     async fn test_bitmap_absent_value_records_no_cache_activity() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3339,7 +3339,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3421,7 +3421,7 @@ mod tests {
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::LanceCache;
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
         use lance_select::RowAddrTreeMap;
         use std::sync::Arc;
 
@@ -3436,7 +3436,7 @@ mod tests {
         // Create a temporary store.
         let tmpdir = TempObjDir::default();
         let test_store = LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         );
@@ -3558,7 +3558,7 @@ mod tests {
         // Create a temporary directory for the index
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3701,7 +3701,7 @@ mod tests {
         // Create a temporary store.
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4024,7 +4024,7 @@ mod tests {
     async fn train_lookup_bitmap() -> (TempObjDir, Arc<LanceIndexStore>) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4134,7 +4134,7 @@ mod tests {
     async fn test_bitmap_lookup_bounds_batches() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4182,7 +4182,7 @@ mod tests {
         // Test that bitmap index correctly returns null_list for queries
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4894,7 +4894,7 @@ mod tests {
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(cache.clone()),
         ));
@@ -5047,10 +5047,7 @@ mod tests {
     async fn test_bitmap_segment_merge_reads_sources_sequentially() {
         const KEYS: u64 = 2_000;
 
-        async fn build(
-            storage: &Arc<ObjectStore>,
-            first_row: u64,
-        ) -> (TempObjDir, Arc<BitmapIndex>) {
+        async fn build(storage: &Arc<Storage>, first_row: u64) -> (TempObjDir, Arc<BitmapIndex>) {
             let tmpdir = TempObjDir::default();
             let store = Arc::new(LanceIndexStore::new(
                 storage.clone(),
@@ -5068,7 +5065,7 @@ mod tests {
             (tmpdir, index)
         }
 
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let (_left_dir, left) = build(&storage, 0).await;
         let (_right_dir, right) = build(&storage, KEYS).await;
 
@@ -5375,7 +5372,7 @@ mod tests {
     async fn test_load_with_remapping_rejects_corrupt_null_bitmap() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));

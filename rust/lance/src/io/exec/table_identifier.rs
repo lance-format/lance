@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use lance_core::Result;
 use lance_datafusion::pb;
-use lance_io::object_store::StorageOptions;
+use lance_io::storage::StorageOptions;
 use prost::Message;
 
 use crate::Dataset;

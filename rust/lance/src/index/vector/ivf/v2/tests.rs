@@ -87,8 +87,8 @@ use lance_index::{
     metrics::{LocalMetricsCollector, NoOpMetricsCollector},
 };
 use lance_io::{
-    object_store::{ObjectStore, ObjectStoreParams},
     scheduler::{ScanScheduler, SchedulerConfig},
+    storage::{Storage, StorageParams},
     utils::CachedFileSize,
 };
 use lance_linalg::distance::DistanceType;
@@ -818,7 +818,7 @@ async fn get_sq_metadata(
 }
 
 async fn assert_rq_rotation_type(dataset: &Dataset, expected: RQRotationType) {
-    let obj_store = Arc::new(ObjectStore::local());
+    let obj_store = Arc::new(Storage::local());
     let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
     let indices = dataset.load_indices().await.unwrap();
     assert!(!indices.is_empty(), "Expected at least one vector index");
@@ -1167,7 +1167,7 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         Some(WriteParams {
             // Keep this tiny fixture out of the whole-file read cache so
             // the source-I/O assertion also exercises PQ4 preparation.
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 block_size: Some(64),
                 ..Default::default()
             }),
@@ -3780,13 +3780,13 @@ async fn test_raw_index_commit_reads_cloned_segment_through_its_base() {
     let base_tracker = Arc::new(lance_io::utils::tracking_store::IOTracker::default());
     let own_tracker = Arc::new(lance_io::utils::tracking_store::IOTracker::default());
     let mut cloned = crate::DatasetBuilder::from_uri(&clone_uri)
-        .with_store_params(ObjectStoreParams {
+        .with_store_params(StorageParams {
             backend_wrappers: vec![own_tracker.clone()],
             ..Default::default()
         })
         .with_base_store_params(
             &base.path,
-            ObjectStoreParams {
+            StorageParams {
                 backend_wrappers: vec![base_tracker.clone()],
                 ..Default::default()
             },
@@ -5515,7 +5515,7 @@ async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_searches(
 
     let indices = dataset.load_indices().await.unwrap();
     assert_eq!(indices.len(), 1);
-    let obj_store = Arc::new(ObjectStore::local());
+    let obj_store = Arc::new(Storage::local());
     let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
     let index_uuid = indices[0].uuid.to_string();
     let rq_meta = get_rq_metadata(&dataset, scheduler.clone(), &index_uuid).await;
@@ -5967,7 +5967,7 @@ const HNSW_NEIGHBORS_COL: &str = "__neighbors";
 /// overlap, so a delay is what makes concurrency observable at all.
 #[derive(Debug)]
 struct ConcurrencyProbeStore {
-    target: Arc<dyn lance_io::object_store::StorageBackend>,
+    target: Arc<dyn lance_io::storage::StorageBackend>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: Arc<AtomicUsize>,
 }
@@ -5988,14 +5988,14 @@ impl ConcurrencyProbeStore {
 }
 
 #[async_trait::async_trait]
-impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
+impl lance_io::storage::StorageBackend for ConcurrencyProbeStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -6003,26 +6003,25 @@ impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
     async fn put_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        payload: lance_io::object_store::PutPayload,
-        opts: lance_io::object_store::PutOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
+        payload: lance_io::storage::PutPayload,
+        opts: lance_io::storage::PutOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PutResult> {
         self.target.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+        opts: lance_io::storage::PutMultipartOptions,
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        options: lance_io::object_store::GetOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
+        options: lance_io::storage::GetOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::GetResult> {
         self.enter().await;
         self.target.get_opts(location, options).await
     }
@@ -6031,7 +6030,7 @@ impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
         &self,
         location: &lance_core::storage::path::Path,
         ranges: &[Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         self.enter().await;
         self.target.get_ranges(location, ranges).await
     }
@@ -6040,11 +6039,11 @@ impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
         &self,
         locations: futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_core::storage::path::Path>,
+            lance_io::storage::Result<lance_core::storage::path::Path>,
         >,
     ) -> futures::stream::BoxStream<
         'static,
-        lance_io::object_store::Result<lance_core::storage::path::Path>,
+        lance_io::storage::Result<lance_core::storage::path::Path>,
     > {
         self.target.delete_stream(locations)
     }
@@ -6052,17 +6051,15 @@ impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
     fn list(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.target.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
+    ) -> lance_io::storage::Result<lance_io::storage::ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
 
@@ -6070,8 +6067,8 @@ impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::CopyOptions,
+    ) -> lance_io::storage::Result<()> {
         self.target.copy_opts(from, to, opts).await
     }
 
@@ -6079,10 +6076,8 @@ impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
         offset: &lance_core::storage::path::Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         let offset = offset.clone();
         futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
             self.list(prefix),
@@ -6094,8 +6089,8 @@ impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.target.rename_opts(from, to, opts).await
     }
 }
@@ -6122,7 +6117,7 @@ async fn test_storage_open_fetches_ivf_and_quantizer_buffers_together() {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let mut probed = dataset.storage.as_ref().clone();
-    probed.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+    probed.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
         |backend| {
             Arc::new(ConcurrencyProbeStore {
                 target: backend,
@@ -7190,7 +7185,7 @@ async fn test_recall<T: ArrowPrimitiveType>(
 async fn rewrite_pq_storage(dataset: &mut Dataset, old_meta: &IndexMetadata) -> Result<()> {
     use crate::dataset::transaction::{Operation, Transaction};
 
-    let obj_store = Arc::new(ObjectStore::local());
+    let obj_store = Arc::new(Storage::local());
     let old_dir = dataset.indices_dir().join(old_meta.uuid.to_string());
     let new_uuid = uuid::Uuid::new_v4();
     let new_dir = dataset.indices_dir().join(new_uuid.to_string());
@@ -7328,7 +7323,7 @@ async fn test_pq_storage_backwards_compat() {
         .unwrap();
     assert_eq!(search_result.num_rows(), 5);
 
-    let obj_store = Arc::new(ObjectStore::local());
+    let obj_store = Arc::new(Storage::local());
     let scheduler = ScanScheduler::new(obj_store.clone(), SchedulerConfig::default_for_testing());
 
     async fn get_pq_metadata(
@@ -8617,7 +8612,7 @@ async fn test_prewarm_and_query_with_serializing_backend(
     let session = Arc::new(crate::session::Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = crate::DatasetBuilder::from_uri(test_uri)
         .with_session(session)
@@ -8657,7 +8652,7 @@ async fn test_prewarm_and_query_with_serializing_backend(
     let session = Arc::new(crate::session::Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = crate::DatasetBuilder::from_uri(test_uri)
         .with_session(session)

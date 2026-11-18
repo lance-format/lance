@@ -189,7 +189,7 @@ fn posting_entries(posting: &PostingList) -> Vec<(u64, u32)> {
 async fn test_modern_posting_validation_is_cached_per_token() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -250,7 +250,7 @@ async fn test_modern_posting_validation_is_cached_per_token() {
 async fn test_posting_list_synthetic_grouping_reads_group_boundaries() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -303,7 +303,7 @@ async fn test_posting_list_synthetic_grouping_reads_group_boundaries() {
 async fn test_prewarm_group_keys_match_read_path() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -373,7 +373,7 @@ async fn test_prewarm_group_keys_match_read_path() {
 async fn test_empty_partition_has_no_synthetic_groups() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -398,7 +398,7 @@ async fn test_empty_partition_has_no_synthetic_groups() {
 async fn test_large_posting_reads_inside_synthetic_group() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -454,7 +454,7 @@ async fn test_large_posting_reads_inside_synthetic_group() {
 async fn test_prewarm_synthetic_grouping_populates_group_entries() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -520,7 +520,7 @@ async fn test_prewarm_synthetic_grouping_populates_group_entries() {
 async fn test_grouped_bm25_search_correct_and_cache_stable() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

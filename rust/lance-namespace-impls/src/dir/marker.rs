@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_io::object_store::ObjectStore;
-use lance_io::object_store::path::Path;
-use lance_io::object_store::{Error as StorageError, PutMode, PutOptions};
+use lance_io::storage::Storage;
+use lance_io::storage::path::Path;
+use lance_io::storage::{Error as StorageError, PutMode, PutOptions};
 
 /// Error from [`put_marker_file_atomic`].
 #[derive(Debug)]
@@ -46,7 +46,7 @@ impl std::fmt::Display for MarkerFileError {
 /// cannot await object-store I/O, so RAII is not used here. Each call uses a
 /// unique staging UUID, so concurrent callers never contend on the same cleanup.
 pub async fn put_marker_file_atomic(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
     file_description: &str,
 ) -> std::result::Result<(), MarkerFileError> {
@@ -113,7 +113,7 @@ pub async fn put_marker_file_atomic(
 /// Best-effort delete of a per-call staging marker, with short retries for
 /// transient store errors. `NotFound` is treated as success (delete may have
 /// succeeded despite an earlier ambiguous failure).
-async fn delete_staging_marker_best_effort(storage: &ObjectStore, staging_path: &Path) {
+async fn delete_staging_marker_best_effort(storage: &Storage, staging_path: &Path) {
     const MAX_ATTEMPTS: u32 = 3;
     const BACKOFF_MS: [u64; 2] = [20, 50];
 
@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use futures::{StreamExt, TryStreamExt};
     use lance_io::testing::MockStorageBackend;
-    use lance_io::utils::testing::TestWrappingObjectStore;
+    use lance_io::utils::testing::TestBackendWrapper;
     use std::sync::{Arc, Mutex};
 
     #[rstest::rstest]
@@ -167,7 +167,7 @@ mod tests {
         let destination = target.clone();
         let pending_failures = std::sync::atomic::AtomicUsize::new(cleanup_failures);
         let before = Arc::new(
-            move |op: &str, path: &Path| -> lance_io::object_store::Result<()> {
+            move |op: &str, path: &Path| -> lance_io::storage::Result<()> {
                 calls.lock().unwrap().push(op.to_string());
                 if op == "delete"
                     && pending_failures
@@ -178,7 +178,7 @@ mod tests {
                         )
                         .is_ok()
                 {
-                    return Err(lance_io::object_store::Error::Generic {
+                    return Err(lance_io::storage::Error::Generic {
                         store: "test",
                         source: "transient cleanup failure".into(),
                     });
@@ -190,7 +190,7 @@ mod tests {
                     _ => false,
                 };
                 if unavailable {
-                    Err(lance_io::object_store::Error::NotSupported {
+                    Err(lance_io::storage::Error::NotSupported {
                         source: format!("{op} unavailable").into(),
                     })
                 } else {
@@ -198,8 +198,8 @@ mod tests {
                 }
             },
         );
-        let mut store = ObjectStore::memory();
-        store.apply_wrapper(&TestWrappingObjectStore::new(|backend| {
+        let mut store = Storage::memory();
+        store.apply_wrapper(&TestBackendWrapper::new(|backend| {
             let mut mock = MockStorageBackend::new();
             // Mockall's async expectations return values synchronously; these
             // delegated in-memory operations complete without suspending.

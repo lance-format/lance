@@ -21,7 +21,7 @@ use crate::dataset::optimize::commit::commit_compaction;
 use crate::index::frag_reuse::frag_reuse_entry_appending;
 use crate::index::frag_reuse_reader::tests::prepare_partition;
 use crate::index::vector::IndexFileVersion;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1473,12 +1473,12 @@ struct FailingReadWrapper {
     failing: Arc<AtomicBool>,
 }
 
-impl lance_io::object_store::WrappingObjectStore for FailingReadWrapper {
+impl lance_io::storage::BackendWrapper for FailingReadWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(FailingReadStore {
             inner: original,
             suffix: self.suffix.clone(),
@@ -1489,7 +1489,7 @@ impl lance_io::object_store::WrappingObjectStore for FailingReadWrapper {
 
 #[derive(Debug)]
 struct FailingReadStore {
-    inner: Arc<dyn lance_io::object_store::StorageBackend>,
+    inner: Arc<dyn lance_io::storage::StorageBackend>,
     suffix: String,
     failing: Arc<AtomicBool>,
 }
@@ -1502,8 +1502,8 @@ impl FailingReadStore {
     /// A generic error, deliberately NOT `NotFound`: the point is that a fault
     /// that says nothing about the object's existence must not be read as a
     /// format verdict.
-    fn injected_error() -> lance_io::object_store::Error {
-        lance_io::object_store::Error::Generic {
+    fn injected_error() -> lance_io::storage::Error {
+        lance_io::storage::Error::Generic {
             store: "failing-read-test-store",
             source: "injected transient read failure".to_string().into(),
         }
@@ -1517,14 +1517,14 @@ impl std::fmt::Display for FailingReadStore {
 }
 
 #[async_trait::async_trait]
-impl lance_io::object_store::StorageBackend for FailingReadStore {
+impl lance_io::storage::StorageBackend for FailingReadStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -1532,26 +1532,25 @@ impl lance_io::object_store::StorageBackend for FailingReadStore {
     async fn put_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        payload: lance_io::object_store::PutPayload,
-        opts: lance_io::object_store::PutOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
+        payload: lance_io::storage::PutPayload,
+        opts: lance_io::storage::PutOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PutResult> {
         self.inner.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+        opts: lance_io::storage::PutMultipartOptions,
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        options: lance_io::object_store::GetOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
+        options: lance_io::storage::GetOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::GetResult> {
         if self.fails(location) {
             return Err(Self::injected_error());
         }
@@ -1562,7 +1561,7 @@ impl lance_io::object_store::StorageBackend for FailingReadStore {
         &self,
         location: &lance_core::storage::path::Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         if self.fails(location) {
             return Err(Self::injected_error());
         }
@@ -1573,11 +1572,11 @@ impl lance_io::object_store::StorageBackend for FailingReadStore {
         &self,
         locations: futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_core::storage::path::Path>,
+            lance_io::storage::Result<lance_core::storage::path::Path>,
         >,
     ) -> futures::stream::BoxStream<
         'static,
-        lance_io::object_store::Result<lance_core::storage::path::Path>,
+        lance_io::storage::Result<lance_core::storage::path::Path>,
     > {
         self.inner.delete_stream(locations)
     }
@@ -1585,10 +1584,8 @@ impl lance_io::object_store::StorageBackend for FailingReadStore {
     fn list(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.inner.list(prefix)
     }
 
@@ -1596,17 +1593,15 @@ impl lance_io::object_store::StorageBackend for FailingReadStore {
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
         offset: &lance_core::storage::path::Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
+    ) -> lance_io::storage::Result<lance_io::storage::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -1614,8 +1609,8 @@ impl lance_io::object_store::StorageBackend for FailingReadStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::CopyOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.copy_opts(from, to, opts).await
     }
 
@@ -1623,8 +1618,8 @@ impl lance_io::object_store::StorageBackend for FailingReadStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.rename_opts(from, to, opts).await
     }
 }
@@ -1670,7 +1665,7 @@ async fn tagged_with_fts_index(path: &str) -> Dataset {
 async fn open_with_failing_reads(path: &str, suffix: String) -> (Dataset, Arc<AtomicBool>) {
     let failing = Arc::new(AtomicBool::new(false));
     let dataset = DatasetBuilder::from_uri(path)
-        .with_store_params(ObjectStoreParams {
+        .with_store_params(StorageParams {
             backend_wrappers: vec![Arc::new(FailingReadWrapper {
                 suffix,
                 failing: failing.clone(),
@@ -2188,7 +2183,7 @@ async fn open_with_budgeted_failing_reads(
 ) -> (Dataset, Arc<AtomicUsize>) {
     let remaining = Arc::new(AtomicUsize::new(budget));
     let dataset = DatasetBuilder::from_uri(path)
-        .with_store_params(ObjectStoreParams {
+        .with_store_params(StorageParams {
             backend_wrappers: vec![Arc::new(BudgetedFailingReadWrapper {
                 suffix,
                 remaining: remaining.clone(),
@@ -2207,12 +2202,12 @@ struct BudgetedFailingReadWrapper {
     remaining: Arc<AtomicUsize>,
 }
 
-impl lance_io::object_store::WrappingObjectStore for BudgetedFailingReadWrapper {
+impl lance_io::storage::BackendWrapper for BudgetedFailingReadWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(BudgetedFailingReadStore {
             inner: original,
             suffix: self.suffix.clone(),
@@ -2223,7 +2218,7 @@ impl lance_io::object_store::WrappingObjectStore for BudgetedFailingReadWrapper 
 
 #[derive(Debug)]
 struct BudgetedFailingReadStore {
-    inner: Arc<dyn lance_io::object_store::StorageBackend>,
+    inner: Arc<dyn lance_io::storage::StorageBackend>,
     suffix: String,
     remaining: Arc<AtomicUsize>,
 }
@@ -2249,14 +2244,14 @@ impl std::fmt::Display for BudgetedFailingReadStore {
 }
 
 #[async_trait::async_trait]
-impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
+impl lance_io::storage::StorageBackend for BudgetedFailingReadStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -2264,26 +2259,25 @@ impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
     async fn put_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        payload: lance_io::object_store::PutPayload,
-        opts: lance_io::object_store::PutOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
+        payload: lance_io::storage::PutPayload,
+        opts: lance_io::storage::PutOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PutResult> {
         self.inner.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+        opts: lance_io::storage::PutMultipartOptions,
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        options: lance_io::object_store::GetOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
+        options: lance_io::storage::GetOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::GetResult> {
         if self.fails(location) {
             return Err(FailingReadStore::injected_error());
         }
@@ -2294,7 +2288,7 @@ impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
         &self,
         location: &lance_core::storage::path::Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         if self.fails(location) {
             return Err(FailingReadStore::injected_error());
         }
@@ -2305,11 +2299,11 @@ impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
         &self,
         locations: futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_core::storage::path::Path>,
+            lance_io::storage::Result<lance_core::storage::path::Path>,
         >,
     ) -> futures::stream::BoxStream<
         'static,
-        lance_io::object_store::Result<lance_core::storage::path::Path>,
+        lance_io::storage::Result<lance_core::storage::path::Path>,
     > {
         self.inner.delete_stream(locations)
     }
@@ -2317,10 +2311,8 @@ impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
     fn list(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.inner.list(prefix)
     }
 
@@ -2328,17 +2320,15 @@ impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
         offset: &lance_core::storage::path::Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
+    ) -> lance_io::storage::Result<lance_io::storage::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -2346,8 +2336,8 @@ impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::CopyOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.copy_opts(from, to, opts).await
     }
 
@@ -2355,8 +2345,8 @@ impl lance_io::object_store::StorageBackend for BudgetedFailingReadStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.rename_opts(from, to, opts).await
     }
 }
@@ -3715,12 +3705,12 @@ struct PhasedFailingReadWrapper {
     start: usize,
 }
 
-impl lance_io::object_store::WrappingObjectStore for PhasedFailingReadWrapper {
+impl lance_io::storage::BackendWrapper for PhasedFailingReadWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(PhasedFailingReadStore {
             inner: original,
             suffix: self.suffix.clone(),
@@ -3732,7 +3722,7 @@ impl lance_io::object_store::WrappingObjectStore for PhasedFailingReadWrapper {
 
 #[derive(Debug)]
 struct PhasedFailingReadStore {
-    inner: Arc<dyn lance_io::object_store::StorageBackend>,
+    inner: Arc<dyn lance_io::storage::StorageBackend>,
     suffix: String,
     attempts: Arc<AtomicUsize>,
     start: usize,
@@ -3757,14 +3747,14 @@ impl std::fmt::Display for PhasedFailingReadStore {
 }
 
 #[async_trait::async_trait]
-impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
+impl lance_io::storage::StorageBackend for PhasedFailingReadStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -3772,26 +3762,25 @@ impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
     async fn put_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        payload: lance_io::object_store::PutPayload,
-        opts: lance_io::object_store::PutOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
+        payload: lance_io::storage::PutPayload,
+        opts: lance_io::storage::PutOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PutResult> {
         self.inner.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+        opts: lance_io::storage::PutMultipartOptions,
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        options: lance_io::object_store::GetOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
+        options: lance_io::storage::GetOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::GetResult> {
         if self.fails(location) {
             return Err(FailingReadStore::injected_error());
         }
@@ -3802,7 +3791,7 @@ impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
         &self,
         location: &lance_core::storage::path::Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         if self.fails(location) {
             return Err(FailingReadStore::injected_error());
         }
@@ -3813,11 +3802,11 @@ impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
         &self,
         locations: futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_core::storage::path::Path>,
+            lance_io::storage::Result<lance_core::storage::path::Path>,
         >,
     ) -> futures::stream::BoxStream<
         'static,
-        lance_io::object_store::Result<lance_core::storage::path::Path>,
+        lance_io::storage::Result<lance_core::storage::path::Path>,
     > {
         self.inner.delete_stream(locations)
     }
@@ -3825,10 +3814,8 @@ impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
     fn list(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.inner.list(prefix)
     }
 
@@ -3836,17 +3823,15 @@ impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
         offset: &lance_core::storage::path::Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
+    ) -> lance_io::storage::Result<lance_io::storage::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -3854,8 +3839,8 @@ impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::CopyOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.copy_opts(from, to, opts).await
     }
 
@@ -3863,8 +3848,8 @@ impl lance_io::object_store::StorageBackend for PhasedFailingReadStore {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.inner.rename_opts(from, to, opts).await
     }
 }
@@ -4068,7 +4053,7 @@ async fn assert_partial_coverage_remap_is_exact(start: usize, no_cache: bool) {
         lance_index::scalar::inverted::METADATA_FILE
     );
     let attempts = Arc::new(AtomicUsize::new(0));
-    let mut builder = DatasetBuilder::from_uri(&path).with_store_params(ObjectStoreParams {
+    let mut builder = DatasetBuilder::from_uri(&path).with_store_params(StorageParams {
         backend_wrappers: vec![Arc::new(PhasedFailingReadWrapper {
             suffix,
             attempts: attempts.clone(),

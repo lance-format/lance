@@ -12,7 +12,7 @@ use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
 use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
-use lance::io::ObjectStore;
+use lance::io::Storage;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
 use lance_index::vector::{
@@ -507,7 +507,7 @@ async fn do_shuffle_transformed_vectors(
     ivf_centroids: FixedSizeListArray,
     shuffle_output_root_filename: &str,
 ) -> PyResult<Vec<String>> {
-    let (obj_store, path) = ObjectStore::from_uri(dir_path).await.infer_error()?;
+    let (obj_store, path) = Storage::from_uri(dir_path).await.infer_error()?;
     if !obj_store.is_local() {
         return Err(PyValueError::new_err(
             "shuffle_vectors input and output path is currently required to be local",

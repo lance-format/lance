@@ -204,7 +204,7 @@ fn ivf_centroids_from_proto(ivf: &pb::Ivf) -> Result<Option<FixedSizeListArray>>
 }
 
 async fn open_sibling_index_reader(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     sched: &Arc<ScanScheduler>,
     idx_path: &lance_core::storage::path::Path,
 ) -> Result<Option<V2Reader>> {
@@ -251,7 +251,7 @@ fn init_writer_for_storage(
 
 /// Create and initialize a unified writer for FLAT storage.
 pub async fn init_writer_for_flat(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     aux_out: &lance_core::storage::path::Path,
     d0: usize,
     item_type: &DataType,
@@ -286,7 +286,7 @@ pub async fn init_writer_for_flat(
 /// This always writes the codebook into the unified file and resets
 /// `buffer_index` in the metadata to point at the new location.
 pub async fn init_writer_for_pq(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     aux_out: &lance_core::storage::path::Path,
     dt: DistanceType,
     pm: &ProductQuantizationMetadata,
@@ -331,7 +331,7 @@ pub async fn init_writer_for_pq(
 
 /// Create and initialize a unified writer for SQ storage.
 pub async fn init_writer_for_sq(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     aux_out: &lance_core::storage::path::Path,
     dt: DistanceType,
     sq_meta: &ScalarQuantizationMetadata,
@@ -363,7 +363,7 @@ pub async fn init_writer_for_sq(
 
 /// Create and initialize a unified writer for RQ storage.
 pub async fn init_writer_for_rq(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     aux_out: &lance_core::storage::path::Path,
     dt: DistanceType,
     rq_meta: &RabitQuantizationMetadata,
@@ -830,7 +830,7 @@ fn filter_batch_to_owned_rows(
 /// segments share the same quantizer/codebook and distance type; it reuses the
 /// first encountered metadata.
 pub async fn merge_partial_vector_auxiliary_files(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     aux_paths: &[lance_core::storage::path::Path],
     target_dir: &lance_core::storage::path::Path,
     progress: Arc<dyn IndexBuildProgress>,
@@ -840,7 +840,7 @@ pub async fn merge_partial_vector_auxiliary_files(
 
 /// Merge auxiliary files while retaining only rows owned by each source segment.
 pub async fn merge_partial_vector_auxiliary_files_with_row_filters(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     aux_paths: &[lance_core::storage::path::Path],
     target_dir: &lance_core::storage::path::Path,
     row_filters: &[OldIndexDataFilter],
@@ -864,7 +864,7 @@ pub async fn merge_partial_vector_auxiliary_files_with_row_filters(
 }
 
 async fn merge_partial_vector_auxiliary_files_inner(
-    storage: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::storage::Storage,
     aux_paths: &[lance_core::storage::path::Path],
     target_dir: &lance_core::storage::path::Path,
     row_filters: Option<&[OldIndexDataFilter]>,
@@ -1745,8 +1745,8 @@ mod tests {
     use lance_core::ROW_ID_FIELD;
     use lance_core::storage::path::Path;
     use lance_file::writer::FileWriterOptions as V2WriterOptions;
-    use lance_io::object_store::ObjectStore;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::storage::Storage;
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::DistanceType;
     use prost::Message;
@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     async fn write_flat_partial_aux(
-        store: &ObjectStore,
+        store: &Storage,
         aux_path: &Path,
         dim: i32,
         lengths: &[u32],
@@ -1858,7 +1858,7 @@ mod tests {
     }
 
     async fn write_flat_partial_aux_f64(
-        store: &ObjectStore,
+        store: &Storage,
         aux_path: &Path,
         dim: i32,
         lengths: &[u32],
@@ -1924,7 +1924,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_flat_success_basic() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2110,7 +2110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_flat_filters_each_source_by_ownership() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid");
         let aux0 = index_dir
             .clone()
@@ -2204,7 +2204,7 @@ mod tests {
     async fn test_merge_streams_partitions_longer_than_a_read_batch(
         #[values(false, true)] filtered: bool,
     ) {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid");
         let aux = index_dir
             .clone()
@@ -2297,7 +2297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_distance_type_mismatch() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2355,7 +2355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_flat_preserves_float64_schema() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/float64_uuid");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2413,7 +2413,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     async fn write_pq_partial_aux(
-        store: &ObjectStore,
+        store: &Storage,
         aux_path: &Path,
         nbits: u32,
         num_sub_vectors: usize,
@@ -2517,7 +2517,7 @@ mod tests {
     }
 
     async fn write_rq_partial_aux(
-        store: &ObjectStore,
+        store: &Storage,
         aux_path: &Path,
         metadata: &RabitQuantizationMetadata,
         lengths: &[u32],
@@ -2638,7 +2638,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_pq_success() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid_pq");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2770,7 +2770,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_pq_rejects_transposed_source_shard() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid_pq_transposed");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2830,7 +2830,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_rq_success() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid_rq");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2959,7 +2959,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_rq_rejects_packed_source_shard() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid_rq_packed");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -3010,7 +3010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_rq_multi_bit_preserves_split_columns() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid_rq_multi_bit");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -3120,7 +3120,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_pq_codebook_mismatch() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid_pq_mismatch");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -3205,7 +3205,7 @@ mod tests {
         // Two partial directories that map to the same (min_fragment_id, dataset_version)
         // but differ in their parent directory name. This exercises the third
         // lexicographic tie-breaker component of the sort key.
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let index_dir = Path::from("index/uuid_tie");
 
         let partial_a = index_dir.clone().join("partial_1_10");

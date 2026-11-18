@@ -85,8 +85,8 @@ use lance_datafusion_exec::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_io::object_store::Error as ObjectStoreError;
 use lance_io::scheduler::SchedulerConfig;
+use lance_io::storage::Error as ObjectStoreError;
 use lance_io::stream::RecordBatchStream;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use log::{debug, warn};
@@ -4509,7 +4509,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion_exec::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_select::{RowAddrTreeMap, RowSetOps};
 
     use crate::Index;
@@ -4579,7 +4579,7 @@ mod tests {
     async fn test_btree_load_rejects_zero_batch_size_metadata() {
         let tmpdir = TempObjDir::default();
         let store = LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.as_ref().clone(),
             Arc::new(LanceCache::no_cache()),
         );
@@ -4614,7 +4614,7 @@ mod tests {
             .into_df_stream(RowCount::from(3), BatchCount::from(1));
         let tmpdir = TempObjDir::default();
         let store = LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.as_ref().clone(),
             Arc::new(LanceCache::no_cache()),
         );
@@ -4678,7 +4678,7 @@ mod tests {
     async fn test_null_ids() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4704,7 +4704,7 @@ mod tests {
 
         let remap_dir = TempObjDir::default();
         let remap_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             remap_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4743,7 +4743,7 @@ mod tests {
     async fn test_nan_ordering() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4796,7 +4796,7 @@ mod tests {
     async fn test_contains_keys_matches_search() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4898,7 +4898,7 @@ mod tests {
     ) -> (TempObjDir, Arc<LanceIndexStore>) {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5196,7 +5196,7 @@ mod tests {
     async fn test_lookup_rejects_mismatched_key_type() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5228,7 +5228,7 @@ mod tests {
         // single-page read, not a batched one.
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5279,7 +5279,7 @@ mod tests {
     async fn test_page_cache() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5318,7 +5318,7 @@ mod tests {
     async fn test_page_cache_hit_miss_counts() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5364,7 +5364,7 @@ mod tests {
     #[tokio::test]
     async fn test_range_query_coalesces_page_reads() {
         let tmpdir = TempObjDir::default();
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let test_store = Arc::new(LanceIndexStore::new(
             storage.clone(),
             tmpdir.clone(),
@@ -5426,7 +5426,7 @@ mod tests {
     #[tokio::test]
     async fn test_wide_range_query_prefetches_in_bounded_chunks() {
         let tmpdir = TempObjDir::default();
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let test_store = Arc::new(LanceIndexStore::new(
             storage.clone(),
             tmpdir.clone(),
@@ -5521,7 +5521,7 @@ mod tests {
         // own and a wide search costs *more* I/O than reading pages one at a
         // time would.
         let tmpdir = TempObjDir::default();
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let test_store = Arc::new(LanceIndexStore::new(
             storage.clone(),
             tmpdir.clone(),
@@ -5601,7 +5601,7 @@ mod tests {
     async fn test_batched_page_read_matches_individual_reads() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5650,7 +5650,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5784,7 +5784,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5845,14 +5845,14 @@ mod tests {
         // Setup stores for both indexes
         let full_tmpdir = TempObjDir::default();
         let full_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             full_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
         let fragment_tmpdir = TempObjDir::default();
         let fragment_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             fragment_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -6063,14 +6063,14 @@ mod tests {
         // Setup stores for both indexes
         let full_tmpdir = TempObjDir::default();
         let full_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             full_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
         let fragment_tmpdir = TempObjDir::default();
         let fragment_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             fragment_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -6514,7 +6514,7 @@ mod tests {
         // Create a test store
         let tmpdir = TempObjDir::default();
         let test_store: Arc<dyn crate::scalar::IndexStore> = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -6580,7 +6580,7 @@ mod tests {
     #[tokio::test]
     async fn test_btree_null_handling_in_queries() {
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::memory()),
+            Arc::new(Storage::memory()),
             Path::default(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -6694,14 +6694,14 @@ mod tests {
         // Setup stores for both indexes
         let full_tmpdir = TempObjDir::default();
         let full_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             full_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
         let range_tmpdir = TempObjDir::default();
         let range_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             range_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -6991,7 +6991,7 @@ mod tests {
 
         let remap_dir = TempObjDir::default();
         let remap_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             remap_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -7040,14 +7040,14 @@ mod tests {
         // Setup stores for both indexes
         let old_tmpdir = TempObjDir::default();
         let old_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             old_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
         let new_tmpdir = TempObjDir::default();
         let new_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -7191,14 +7191,14 @@ mod tests {
     async fn test_update_with_exact_row_id_filter() {
         let old_tmpdir = TempObjDir::default();
         let old_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             old_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
         let new_tmpdir = TempObjDir::default();
         let new_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -7281,7 +7281,7 @@ mod tests {
     async fn test_btree_remap_big_deletions() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -7323,7 +7323,7 @@ mod tests {
 
         let remap_dir = TempObjDir::default();
         let remap_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             remap_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -7394,7 +7394,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -7503,7 +7503,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_without_null_tracking_on_mixed_page() {
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::memory()),
+            Arc::new(Storage::memory()),
             Path::default(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -7607,7 +7607,7 @@ mod tests {
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
 
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::memory()),
+            Arc::new(Storage::memory()),
             Path::default(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -8632,7 +8632,7 @@ mod tests {
     async fn test_btree_index_state_reconstruct_and_plugin_cache() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -8706,7 +8706,7 @@ mod tests {
     async fn test_load_index_derives_domain_from_passed_in_version() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -8813,7 +8813,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -8884,7 +8884,7 @@ mod tests {
         // `ranges_to_files = Some` path end-to-end through serialize/deserialize/reconstruct.
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -9043,7 +9043,7 @@ mod tests {
         // Plain index: 8 pages, last one short.
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -9055,7 +9055,7 @@ mod tests {
         // the short pages in the middle (page 2) and at the end (page 4).
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -9110,7 +9110,7 @@ mod tests {
     async fn test_whole_index_reads_are_sequential() {
         let page_size = 64u64;
         let num_pages = 50u64;
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             storage.clone(),
@@ -9293,7 +9293,7 @@ mod tests {
 
     fn local_store(dir: &TempObjDir) -> Arc<LanceIndexStore> {
         Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             dir.as_ref().clone(),
             Arc::new(LanceCache::no_cache()),
         ))
@@ -9351,7 +9351,7 @@ mod tests {
         .await
         .unwrap();
 
-        let share = super::merge_io_buffer_size(ObjectStore::local().io_parallelism(), 2);
+        let share = super::merge_io_buffer_size(Storage::local().io_parallelism(), 2);
         assert_eq!(
             [
                 recorders[0].seen(),

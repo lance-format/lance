@@ -45,7 +45,7 @@ use lance_core::{
     utils::blob::blob_path,
 };
 use lance_io::{
-    object_store::ObjectStore,
+    storage::Storage,
     traits::{Reader, WriteExt, Writer},
 };
 use tokio::io::AsyncWriteExt;
@@ -975,7 +975,7 @@ pub(crate) struct BlobObjectWriter {
 }
 
 impl BlobObjectWriter {
-    pub(crate) async fn try_new(storage: ObjectStore, path: Path) -> Result<Self> {
+    pub(crate) async fn try_new(storage: Storage, path: Path) -> Result<Self> {
         let writer = storage.create(&path).await?;
         Ok(Self {
             path,
@@ -1099,7 +1099,7 @@ pub struct PackedBlobWriter {
 
 impl PackedBlobWriter {
     /// Create a packed blob writer for `data_file_path` and `blob_id`.
-    pub async fn try_new(storage: ObjectStore, data_file_path: Path, blob_id: u32) -> Result<Self> {
+    pub async fn try_new(storage: Storage, data_file_path: Path, blob_id: u32) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
         Ok(Self {
             upload: BlobObjectWriter::try_new(storage, path).await?,
@@ -1206,14 +1206,14 @@ impl ManagedBlobWriter {
     /// # use arrow_schema::Schema;
     /// # use lance::{BlobDescriptorArrayBuilder, Dataset, ManagedBlobWriter, Result};
     /// # use lance::dataset::{WriteParams, optimize::compact_files};
-    /// # use lance::io::ObjectStore;
+    /// # use lance::io::Storage;
     /// # use lance_file::version::LanceFileVersion;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// # let dir = tempfile::tempdir()?;
     /// # let location = dir.path().to_string_lossy();
     /// # let uri = location.as_ref();
-    /// let (store, root) = ObjectStore::from_uri(uri).await?;
+    /// let (store, root) = Storage::from_uri(uri).await?;
     /// let mut writer = ManagedBlobWriter::try_new((*store).clone(), root, None).await?;
     /// writer.write_blob(b"shared payload").await?;
     /// let references = writer.finish().await?;
@@ -1239,11 +1239,7 @@ impl ManagedBlobWriter {
     /// assert!(rows.iter().all(|row| row.data.as_deref() == Some(b"shared payload")));
     /// # Ok(()) }
     /// ```
-    pub async fn try_new(
-        storage: ObjectStore,
-        base_path: Path,
-        base_id: Option<u32>,
-    ) -> Result<Self> {
+    pub async fn try_new(storage: Storage, base_path: Path, base_id: Option<u32>) -> Result<Self> {
         let location = ManagedBlobLocation::new(base_id);
         let path = location.path(&base_path);
         Ok(Self {
@@ -1305,7 +1301,7 @@ pub struct DedicatedBlobWriter {
 
 impl DedicatedBlobWriter {
     /// Create a dedicated blob writer for `data_file_path` and `blob_id`.
-    pub async fn try_new(storage: ObjectStore, data_file_path: Path, blob_id: u32) -> Result<Self> {
+    pub async fn try_new(storage: Storage, data_file_path: Path, blob_id: u32) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
         Ok(Self {
             upload: BlobObjectWriter::try_new(storage, path).await?,
@@ -2000,7 +1996,7 @@ mod tests {
         let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
         let data_file_key = "data-file".to_string();
         let data_file_path = data_dir.clone().join(format!("{data_file_key}.lance"));
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
 
         let packed_id = 7;
         let packed_path = blob_path(&data_dir, &data_file_key, packed_id);
@@ -2065,7 +2061,7 @@ mod tests {
         let temp_dir = TempDir::default();
         let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
         let data_file_path = data_dir.join("data-file.lance");
-        let mut writer = PackedBlobWriter::try_new(ObjectStore::local(), data_file_path, 7)
+        let mut writer = PackedBlobWriter::try_new(Storage::local(), data_file_path, 7)
             .await
             .unwrap();
 

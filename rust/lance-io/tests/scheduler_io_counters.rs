@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::storage::Storage;
 use lance_io::traits::{Reader, Writer};
 use lance_io::{bytes_read_counter, iops_counter};
 use tokio::io::AsyncWriteExt;
@@ -32,7 +32,7 @@ async fn both_schedulers_publish_the_io_counters() {
 }
 
 async fn assert_counters_for(use_lite_scheduler: bool) {
-    let store = Arc::new(ObjectStore::memory());
+    let store = Arc::new(Storage::memory());
     let path = Path::from("data.bin");
     let mut writer = store.create(&path).await.unwrap();
     writer.write_all(&vec![7u8; 1024]).await.unwrap();

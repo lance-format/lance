@@ -367,7 +367,7 @@ async fn test_mem_wal_maintained_fts_v1_flush_preserves_format() {
         .expect("Failed to write MemWAL batch");
     writer.close().await.expect("Failed to close writer");
 
-    let (store, base_path) = lance_io::object_store::ObjectStore::from_uri(&uri)
+    let (store, base_path) = lance_io::storage::Storage::from_uri(&uri)
         .await
         .expect("Failed to open store");
     let dir_id = dataset
@@ -1045,7 +1045,7 @@ async fn test_shard_writer_e2e_correctness() {
     );
 
     // Read and verify manifest
-    let (store, base_path) = lance_io::object_store::ObjectStore::from_uri(&uri)
+    let (store, base_path) = lance_io::storage::Storage::from_uri(&uri)
         .await
         .expect("Failed to open store");
     let dir_id = dataset
@@ -1146,7 +1146,7 @@ async fn test_shard_writer_e2e_correctness() {
 async fn test_flush_and_read_with_storage_params() {
     use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
     use futures::TryStreamExt;
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
     use tempfile::TempDir;
 
     let vector_dim = 8;
@@ -1166,7 +1166,7 @@ async fn test_flush_and_read_with_storage_params() {
         .expect("Failed to initialize MemWAL");
 
     // Derived generation URIs inherit options, while the registry resolves their paths.
-    let store_params = ObjectStoreParams {
+    let store_params = StorageParams {
         block_size: Some(4096),
         ..Default::default()
     };
@@ -1294,7 +1294,7 @@ async fn test_store_params_reach_generation_write_and_read() {
     // the generation folder alone would pass vacuously: sidecars like
     // `{gen}/bloom_filter.bin` are written through the *base* dataset's
     // store, which is observable no matter what the params do. And the
-    // fragments can't be used either — `ObjectStore::create` writes local
+    // fragments can't be used either — `Storage::create` writes local
     // files through `tokio::fs`, bypassing the object store entirely, so
     // `{gen}/data/` never reaches a wrapper under `file://`. The manifest
     // goes through `put_opts`, and only the flusher's `Dataset::write` /
@@ -1344,7 +1344,7 @@ async fn test_store_params_reach_generation_write_and_read() {
 async fn test_fresh_tier_scan_with_storage_params() {
     use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
     use futures::TryStreamExt;
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
     use tempfile::TempDir;
 
     let vector_dim = 8;
@@ -1384,7 +1384,7 @@ async fn test_fresh_tier_scan_with_storage_params() {
         .with_sstable(sstable.generation, sstable.path.clone());
 
     // Derived generation URIs inherit options, while the registry resolves their paths.
-    let store_params = ObjectStoreParams {
+    let store_params = StorageParams {
         block_size: Some(4096),
         ..Default::default()
     };

@@ -37,7 +37,7 @@ use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::ReadBatchParams;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_io::traits::Writer;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_linalg::kernels::normalize_fsl;
@@ -345,7 +345,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
     }
 
-    let storage = ObjectStore::local();
+    let storage = Storage::local();
     // Partitions are staged in this scratch dir, then merged into the final index.
     // Share the guard with every task via `Arc` so its `Drop` removes the dir only
     // after the last task finishes -- never while one is still writing.
@@ -699,7 +699,7 @@ mod tests {
         let flat_row_id = UInt64Array::from_iter_values([13]);
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut writer = storage.create(&path).await.unwrap();
         write_pq_partition_payload(
             writer.as_mut(),

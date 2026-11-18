@@ -50,7 +50,7 @@ use futures::stream::FuturesUnordered;
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{ShardManifest, ShardStatus};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_table::format::pb;
 use log::{info, warn};
 use prost::Message;
@@ -79,7 +79,7 @@ struct VersionHint {
 /// and PUT-IF-NOT-EXISTS atomicity.
 #[derive(Debug)]
 pub struct ShardManifestStore {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     shard_id: Uuid,
     manifest_dir: Path,
     manifest_scan_batch_size: usize,
@@ -111,12 +111,12 @@ impl ShardManifestStore {
     /// # Arguments
     ///
     /// * `storage` - Object store for reading/writing manifests
-    /// * `base_path` - Base path within the object store (from ObjectStore::from_uri)
+    /// * `base_path` - Base path within the object store (from Storage::from_uri)
     /// * `dir_id` - The MemWAL's `dir_id` (empty for the legacy `_mem_wal`)
     /// * `shard_id` - Shard UUID
     /// * `manifest_scan_batch_size` - Batch size for parallel HEAD requests when scanning versions
     pub fn new(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: &Path,
         dir_id: &str,
         shard_id: Uuid,
@@ -347,8 +347,8 @@ impl ShardManifestStore {
             .map_err(|error| {
                 if matches!(
                     error,
-                    lance_io::object_store::Error::AlreadyExists { .. }
-                        | lance_io::object_store::Error::Precondition { .. }
+                    lance_io::storage::Error::AlreadyExists { .. }
+                        | lance_io::storage::Error::Precondition { .. }
                 ) {
                     self.version_taken(version)
                 } else {
@@ -424,7 +424,7 @@ impl ShardManifestStore {
 
         match self.storage.stat(&path).await {
             Ok(_) => Ok(true),
-            Err(lance_io::object_store::Error::NotFound { .. }) => Ok(false),
+            Err(lance_io::storage::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(Error::io(format!(
                 "HEAD request failed for version {}: {}",
                 version, e
@@ -440,7 +440,7 @@ impl ShardManifestStore {
         let read = async { self.storage.read_object(&path).await?.bytes().await };
         let bytes = match read.await {
             Ok(bytes) => bytes,
-            Err(lance_io::object_store::Error::NotFound { .. }) => return None,
+            Err(lance_io::storage::Error::NotFound { .. }) => return None,
             Err(e) => {
                 warn!(
                     "Failed to read version hint for shard {}: {}",
@@ -828,10 +828,10 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    async fn create_local_store() -> (Arc<ObjectStore>, Path, TempDir) {
+    async fn create_local_store() -> (Arc<Storage>, Path, TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = format!("file://{}", temp_dir.path().display());
-        let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
+        let (store, path) = Storage::from_uri(&uri).await.unwrap();
         (store, path, temp_dir)
     }
 
@@ -1363,7 +1363,7 @@ mod tests {
         shard_manifest_path(base_path, "", shard_id).join("version_hint.json")
     }
 
-    async fn write_hint(store: &ObjectStore, base_path: &Path, shard_id: &Uuid, version: u64) {
+    async fn write_hint(store: &Storage, base_path: &Path, shard_id: &Uuid, version: u64) {
         let hint = serde_json::to_vec(&VersionHint { version }).unwrap();
         store
             .put_payload(&hint_path(base_path, shard_id), Bytes::from(hint).into())
@@ -1373,16 +1373,16 @@ mod tests {
 
     /// `store`, with every `method` call on a path `fails` matches refused.
     fn failing_store(
-        store: &ObjectStore,
+        store: &Storage,
         method: &'static str,
         fails: impl Fn(&Path) -> bool + Send + Sync + 'static,
-    ) -> Arc<ObjectStore> {
+    ) -> Arc<Storage> {
         let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
         policy.lock().unwrap().set_before_policy(
             method,
             Arc::new(move |called: &str, path: &Path| {
                 if called == method && fails(path) {
-                    return Err(lance_io::object_store::Error::Generic {
+                    return Err(lance_io::storage::Error::Generic {
                         store: "test",
                         source: format!("{method} refused").into(),
                     }
@@ -1392,7 +1392,7 @@ mod tests {
             }),
         );
         let mut proxied = store.clone();
-        proxied.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        proxied.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
         ));
         Arc::new(proxied)
@@ -1602,7 +1602,7 @@ mod tests {
             "503",
             Arc::new(move |method: &str, path: &Path| {
                 if method == "get_opts" && path.as_ref().ends_with(v3_file.as_str()) {
-                    return Err(lance_io::object_store::Error::Generic {
+                    return Err(lance_io::storage::Error::Generic {
                         store: "test",
                         source: "503 slow down".into(),
                     }
@@ -1612,7 +1612,7 @@ mod tests {
             }),
         );
         let mut proxied = (*store).clone();
-        proxied.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        proxied.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
         ));
         let ours = ShardManifestStore::new(Arc::new(proxied), &base_path, "", shard_id, 2);

@@ -50,7 +50,7 @@ use lance_index::IndexType;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_linalg::distance::{DistanceType, MetricType};
 use uuid::Uuid;
 
@@ -399,7 +399,7 @@ async fn measure_flush(
         ),
         None => format!("file://{}", temp_path.display()),
     };
-    let (store, base_path) = ObjectStore::from_uri(&uri).await?;
+    let (store, base_path) = Storage::from_uri(&uri).await?;
     let shard_id = Uuid::new_v4();
     let manifest_store = Arc::new(ShardManifestStore::new(
         store.clone(),

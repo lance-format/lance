@@ -27,8 +27,8 @@ use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::object_reader::stream_local_range;
-use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::object_writer::WriteResult;
+use crate::storage::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::traits::{ByteStream, Reader, Writer};
 use crate::utils::tracking_store::IOTracker;
 
@@ -225,13 +225,13 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
 /// caller's metrics recording for exactly the failure worth counting.
 pub(crate) async fn join_local_io<T>(
     handle: tokio::task::JoinHandle<std::io::Result<T>>,
-) -> crate::object_store::Result<T> {
+) -> crate::storage::Result<T> {
     match handle.await {
-        Ok(result) => result.map_err(|err| crate::object_store::Error::Generic {
+        Ok(result) => result.map_err(|err| crate::storage::Error::Generic {
             store: "LocalFileSystem",
             source: err.into(),
         }),
-        Err(err) => Err(crate::object_store::Error::Generic {
+        Err(err) => Err(crate::storage::Error::Generic {
             store: "local",
             source: Box::new(err),
         }),
@@ -330,7 +330,7 @@ impl Reader for LocalObjectReader {
     }
 
     /// Returns the file size.
-    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::storage::Result<usize>> {
         Box::pin(async move {
             let file = self.file.clone();
             self.size
@@ -350,10 +350,7 @@ impl Reader for LocalObjectReader {
 
     /// Reads a range of data.
     #[instrument(level = "debug", skip(self))]
-    fn get_range(
-        &self,
-        range: Range<usize>,
-    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, crate::storage::Result<Bytes>> {
         let file = self.file.clone();
         let io_tracker = self.io_tracker.clone();
         let path = self.path.clone();
@@ -387,7 +384,7 @@ impl Reader for LocalObjectReader {
 
     /// Reads the entire file.
     #[instrument(level = "debug", skip(self))]
-    fn get_all(&self) -> BoxFuture<'_, crate::object_store::Result<Bytes>> {
+    fn get_all(&self) -> BoxFuture<'_, crate::storage::Result<Bytes>> {
         Box::pin(async move {
             let mut file = self.file.clone();
             let io_tracker = self.io_tracker.clone();
@@ -411,7 +408,7 @@ impl Reader for LocalObjectReader {
         })
     }
 
-    fn get_stream(&self) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
+    fn get_stream(&self) -> BoxFuture<'_, crate::storage::Result<ByteStream>> {
         Box::pin(async move {
             let size = self.size().await?;
             Ok(stream_local_range(
@@ -427,7 +424,7 @@ impl Reader for LocalObjectReader {
     fn get_range_stream(
         &self,
         range: Range<usize>,
-    ) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
+    ) -> BoxFuture<'_, crate::storage::Result<ByteStream>> {
         let file = self.file.clone();
         let path = self.path.clone();
         let io_tracker = self.io_tracker.clone();

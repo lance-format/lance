@@ -64,7 +64,7 @@ use lance_core::storage::path::Path;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 use lance_file::version::{ConcreteFileVersion, warn_if_legacy_storage_version};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -206,7 +206,7 @@ impl Transaction {
     }
 
     pub async fn restore_old_manifest(
-        storage: &ObjectStore,
+        storage: &Storage,
         commit_handler: &dyn CommitHandler,
         base_path: &Path,
         version: u64,
@@ -7871,10 +7871,10 @@ mod tests {
     async fn write_manifest_message(manifest: &mut Manifest) -> Vec<u8> {
         use lance_core::storage::path::Path;
         use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
         use lance_io::traits::{WriteExt, Writer};
 
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("manifest");
         let mut writer = store.create(&path).await.unwrap();
         let pos = crate::io::manifest::write_manifest(writer.as_mut(), manifest, None, None)

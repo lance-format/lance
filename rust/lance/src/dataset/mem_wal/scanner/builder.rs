@@ -34,7 +34,7 @@ use super::vector_search::ProbeBounds;
 use crate::dataset::Dataset;
 use crate::dataset::utils::SchemaAdapter;
 use crate::session::Session;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 
 /// Vector (KNN) search state, set by [`LsmScanner::nearest`] and friends. Mirrors
 /// the subset of `lance::dataset::scanner::Query` the LSM vector planner honors.
@@ -230,7 +230,7 @@ pub struct LsmScanner {
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's
     /// store. Defaults to the base table's params.
-    store_params: Option<ObjectStoreParams>,
+    store_params: Option<StorageParams>,
     /// Cache of opened SSTable datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
     sstable_cache: Option<Arc<dyn DatasetCache>>,
@@ -403,7 +403,7 @@ impl LsmScanner {
     /// adapted for generation URIs: a path-bound `storage` binding would
     /// redirect every generation open at the base table itself, so it is dropped
     /// while storage options, wrapper, and credentials carry over.
-    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+    pub fn with_store_params(mut self, store_params: StorageParams) -> Self {
         self.store_params = Some(store_params);
         self
     }

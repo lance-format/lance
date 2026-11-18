@@ -8,7 +8,7 @@
 //! written, and the number of disjoint periods where at least one IO is in-flight.
 //!
 //! This modules provides [`IOTracker`] which can be used to wrap any object store.
-use crate::object_store::backend::MultipartUpload;
+use crate::storage::backend::MultipartUpload;
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
 #[cfg(feature = "test-util")]
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "metrics")]
 use std::time::Instant;
 
-use crate::object_store::{
+use crate::storage::{
     CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
     PutPayload, PutResult, RenameOptions, Result as OSResult, UploadPart,
 };
@@ -28,8 +28,8 @@ use futures::stream::BoxStream;
 use lance_core::storage::path::Path;
 
 #[cfg(feature = "metrics")]
-use crate::object_store::metrics::{InFlightGuard, record_outcome};
-use crate::object_store::{StorageBackend, WrappingObjectStore};
+use crate::storage::metrics::{InFlightGuard, record_outcome};
+use crate::storage::{BackendWrapper, StorageBackend};
 
 #[derive(Debug, Default, Clone)]
 pub struct IOTracker {
@@ -185,12 +185,12 @@ impl IoMetricsGuard {
     }
 }
 
-impl WrappingObjectStore for IOTracker {
+impl BackendWrapper for IOTracker {
     fn wrap(
         &self,
         _store_prefix: &str,
-        target: Arc<dyn crate::object_store::StorageBackend>,
-    ) -> Arc<dyn crate::object_store::StorageBackend> {
+        target: Arc<dyn crate::storage::StorageBackend>,
+    ) -> Arc<dyn crate::storage::StorageBackend> {
         Arc::new(IoTrackingStore::new(target, self.stats.clone()))
     }
 }
@@ -398,14 +398,11 @@ impl StorageBackend for IoTrackingStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: crate::object_store::PaginatedListOptions,
-    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        options: crate::storage::PaginatedListOptions,
+    ) -> crate::storage::Result<crate::storage::PaginatedListResult> {
         let _guard = self.stage_guard();
         let result = self.target.list_paginated(prefix, options).await;
-        if !matches!(
-            &result,
-            Err(crate::object_store::Error::NotSupported { .. })
-        ) {
+        if !matches!(&result, Err(crate::storage::Error::NotSupported { .. })) {
             self.record_read(
                 "list_paginated",
                 Path::from(prefix.unwrap_or_default()),

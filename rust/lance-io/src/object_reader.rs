@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::object_store::StorageBackend;
+use crate::storage::StorageBackend;
 use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
@@ -21,12 +21,12 @@ use futures::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, error::CloneableError};
 
-use crate::object_store::{GetOptions, GetResult, Result as OSResult, path::Path};
+use crate::storage::{GetOptions, GetResult, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::{
-    object_store::DEFAULT_CLOUD_IO_PARALLELISM,
+    storage::DEFAULT_CLOUD_IO_PARALLELISM,
     traits::{ByteStream, Reader},
 };
 
@@ -104,7 +104,7 @@ impl CloudObjectReader {
 
     /// Override the I/O parallelism this reader advertises.
     ///
-    /// `ObjectStore::open` / `open_with_size` pass their normalized effective
+    /// `Storage::open` / `open_with_size` pass their normalized effective
     /// parallelism (`LANCE_IO_THREADS` override applied, at least 1) so
     /// consumers that size concurrency windows off the reader honor the
     /// configured request limit instead of the hardcoded cloud default.
@@ -139,7 +139,7 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
 // However, this failure is pretty common (e.g. timeout) and we want to retry in these
 // situations.  In addition, we provide additional logging information in these
 // failures cases.
-async fn do_get_with_outer_retry<E: From<crate::object_store::Error> + From<Error>>(
+async fn do_get_with_outer_retry<E: From<crate::storage::Error> + From<Error>>(
     download_retry_count: usize,
     get_request: Arc<GetRequest>,
     expected_size: Option<usize>,
@@ -231,7 +231,7 @@ impl Reader for CloudObjectReader {
     }
 
     /// Object/File Size.
-    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::storage::Result<usize>> {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
@@ -263,7 +263,7 @@ impl Reader for CloudObjectReader {
         });
         let download_retry_count = self.download_retry_count;
         Box::pin(async move {
-            do_get_with_outer_retry::<crate::object_store::Error>(
+            do_get_with_outer_retry::<crate::storage::Error>(
                 download_retry_count,
                 get_request,
                 None,
@@ -281,7 +281,7 @@ impl Reader for CloudObjectReader {
             options: GetOptions::default(),
         });
         Box::pin(async move {
-            do_get_with_outer_retry::<crate::object_store::Error>(
+            do_get_with_outer_retry::<crate::storage::Error>(
                 self.download_retry_count,
                 get_request,
                 None,
@@ -466,14 +466,11 @@ impl Reader for SmallReader {
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let inner = self.inner.clone();
         Box::pin(async move {
-            let bytes = inner
-                .wait()
-                .await
-                .map_err(crate::object_store::Error::from)?;
+            let bytes = inner.wait().await.map_err(crate::storage::Error::from)?;
             let start = range.start;
             let end = range.end;
             if start >= bytes.len() || end > bytes.len() {
-                return Err(crate::object_store::Error::Generic {
+                return Err(crate::storage::Error::Generic {
                     store: "memory",
                     source: format!(
                         "Invalid range {}..{} for object '{}' of size {} bytes",
@@ -490,12 +487,7 @@ impl Reader for SmallReader {
     }
 
     fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
-        Box::pin(async move {
-            self.inner
-                .wait()
-                .await
-                .map_err(crate::object_store::Error::from)
-        })
+        Box::pin(async move { self.inner.wait().await.map_err(crate::storage::Error::from) })
     }
 }
 
@@ -562,7 +554,7 @@ impl DeepSizeOf for SmallReader {
 
 /// A [`Reader`] that keeps no file descriptor open between reads.
 ///
-/// Each read reopens the object through the [`ObjectStore`](crate::object_store::ObjectStore)
+/// Each read reopens the object through the [`Storage`](crate::storage::Storage)
 /// and closes it when the read completes. Use this for readers that are stored
 /// inside long-lived cache entries: a reader holding an open file pins the
 /// inode even after the file is deleted, so cached readers would otherwise
@@ -573,7 +565,7 @@ impl DeepSizeOf for SmallReader {
 /// data is actually re-read.
 #[derive(Debug)]
 pub struct LazyReader {
-    storage: Arc<crate::object_store::ObjectStore>,
+    storage: Arc<crate::storage::Storage>,
     path: Path,
     size: OnceCell<usize>,
     block_size: usize,
@@ -586,7 +578,7 @@ impl LazyReader {
     /// `known_size`, when given, saves the HEAD request that the first
     /// [`Reader::size`] call would otherwise make.
     pub fn new(
-        storage: Arc<crate::object_store::ObjectStore>,
+        storage: Arc<crate::storage::Storage>,
         path: Path,
         known_size: Option<usize>,
     ) -> Self {
@@ -632,7 +624,7 @@ impl Reader for LazyReader {
             let reader = storage
                 .open(&path)
                 .await
-                .map_err(crate::object_store::Error::from)?;
+                .map_err(crate::storage::Error::from)?;
             reader.get_range(range).await
         })
     }
@@ -644,7 +636,7 @@ impl Reader for LazyReader {
             let reader = storage
                 .open(&path)
                 .await
-                .map_err(crate::object_store::Error::from)?;
+                .map_err(crate::storage::Error::from)?;
             reader.get_all().await
         })
     }
@@ -662,7 +654,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::object_store::{
+    use crate::storage::{
         Attributes, CopyOptions, GetResult, GetResultPayload, ListResult, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, path::Path,
     };
@@ -710,14 +702,14 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::object_store::StorageBackend for PartialBodyStore {
+    impl crate::storage::StorageBackend for PartialBodyStore {
         async fn list_paginated(
             &self,
             prefix: Option<&str>,
-            options: crate::object_store::PaginatedListOptions,
-        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            options: crate::storage::PaginatedListOptions,
+        ) -> crate::storage::Result<crate::storage::PaginatedListResult> {
             let _ = (prefix, options);
-            Err(crate::object_store::Error::NotSupported {
+            Err(crate::storage::Error::NotSupported {
                 source: "native pagination is unavailable".into(),
             })
         }
@@ -734,7 +726,7 @@ mod tests {
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::storage::backend::MultipartUpload>> {
             unimplemented!("put_multipart_opts is not used by these tests")
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -752,7 +744,7 @@ mod tests {
                     .unwrap_or(0..self.metadata_size)
             });
             let chunks = if request < self.failed_downloads {
-                vec![Err(crate::object_store::Error::Generic {
+                vec![Err(crate::storage::Error::Generic {
                     store: "PartialBodyStore",
                     source: "connection reset".into(),
                 })]
@@ -807,23 +799,20 @@ mod tests {
         }
         async fn get_ranges(
             &self,
-            location: &crate::object_store::Path,
+            location: &crate::storage::Path,
             ranges: &[std::ops::Range<u64>],
-        ) -> crate::object_store::Result<Vec<bytes::Bytes>> {
+        ) -> crate::storage::Result<Vec<bytes::Bytes>> {
             futures::future::try_join_all(ranges.iter().map(|range| {
-                (self as &dyn crate::object_store::StorageBackend)
-                    .get_range(location, range.clone())
+                (self as &dyn crate::storage::StorageBackend).get_range(location, range.clone())
             }))
             .await
         }
         fn list_with_offset(
             &self,
-            prefix: Option<&crate::object_store::Path>,
-            offset: &crate::object_store::Path,
-        ) -> futures::stream::BoxStream<
-            'static,
-            crate::object_store::Result<crate::object_store::ObjectMeta>,
-        > {
+            prefix: Option<&crate::storage::Path>,
+            offset: &crate::storage::Path,
+        ) -> futures::stream::BoxStream<'static, crate::storage::Result<crate::storage::ObjectMeta>>
+        {
             let offset = offset.clone();
             Box::pin(futures::TryStreamExt::try_filter(
                 self.list(prefix),
@@ -832,28 +821,24 @@ mod tests {
         }
         async fn rename_opts(
             &self,
-            from: &crate::object_store::Path,
-            to: &crate::object_store::Path,
-            options: crate::object_store::RenameOptions,
-        ) -> crate::object_store::Result<()> {
+            from: &crate::storage::Path,
+            to: &crate::storage::Path,
+            options: crate::storage::RenameOptions,
+        ) -> crate::storage::Result<()> {
             let mode = match options.target_mode {
-                crate::object_store::RenameTargetMode::Create => {
-                    crate::object_store::CopyMode::Create
-                }
-                crate::object_store::RenameTargetMode::Overwrite => {
-                    crate::object_store::CopyMode::Overwrite
-                }
+                crate::storage::RenameTargetMode::Create => crate::storage::CopyMode::Create,
+                crate::storage::RenameTargetMode::Overwrite => crate::storage::CopyMode::Overwrite,
             };
             self.copy_opts(
                 from,
                 to,
-                crate::object_store::CopyOptions {
+                crate::storage::CopyOptions {
                     mode,
                     extensions: options.extensions,
                 },
             )
             .await?;
-            (self as &dyn crate::object_store::StorageBackend)
+            (self as &dyn crate::storage::StorageBackend)
                 .delete(from)
                 .await
         }
@@ -908,7 +893,7 @@ mod tests {
             }),
         );
         let store = ProxyBackend::new(
-            crate::object_store::backend::native::from_object_store(Arc::new(
+            crate::storage::backend::object_store::from_object_store(Arc::new(
                 object_store::memory::InMemory::new(),
             )),
             Arc::new(Mutex::new(policy)),
@@ -925,13 +910,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reader: Box<dyn Reader> = if lazy {
             Box::new(LazyReader::new(
-                Arc::new(crate::object_store::ObjectStore::local()),
+                Arc::new(crate::storage::Storage::local()),
                 Path::from_absolute_path(dir.path().join("missing")).unwrap(),
                 None,
             ))
         } else {
             Box::new(SmallReader::new(
-                crate::object_store::backend::native::from_object_store(Arc::new(
+                crate::storage::backend::object_store::from_object_store(Arc::new(
                     ::object_store::memory::InMemory::new(),
                 )),
                 Path::from("missing"),
@@ -944,7 +929,7 @@ mod tests {
             reader.get_range(0..1).await.unwrap_err(),
         ] {
             assert!(
-                matches!(error, crate::object_store::Error::Generic { .. }),
+                matches!(error, crate::storage::Error::Generic { .. }),
                 "{error:?}"
             );
             assert!(matches!(
@@ -970,8 +955,8 @@ mod tests {
             failed_downloads: 0,
             ..Default::default()
         });
-        let mut store = crate::object_store::ObjectStore::memory();
-        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+        let mut store = crate::storage::Storage::memory();
+        store.apply_wrapper(&crate::utils::testing::TestBackendWrapper::new(
             |_backend| inner.clone(),
         ));
         let reader = store
@@ -1065,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn small_reader_checks_replaced_object_on_first_read(#[case] size: usize) {
         let store =
-            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
+            crate::storage::backend::object_store::from_object_store(Arc::new(InMemory::new()));
         let path = Path::from("part");
         store
             .put(&path, Bytes::from_static(b"old!").into())
@@ -1095,7 +1080,7 @@ mod tests {
         #[case] extra: usize,
         #[case] expected_heads: usize,
     ) {
-        let mut store = crate::object_store::ObjectStore::memory();
+        let mut store = crate::storage::Storage::memory();
         let size = store.block_size() + extra;
         let inner = Arc::new(PartialBodyStore {
             metadata_size: size as u64,
@@ -1103,7 +1088,7 @@ mod tests {
             failed_downloads: 0,
             ..Default::default()
         });
-        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+        store.apply_wrapper(&crate::utils::testing::TestBackendWrapper::new(
             |_backend| inner.clone(),
         ));
         let reader = store

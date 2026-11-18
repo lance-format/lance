@@ -46,7 +46,7 @@ async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
 
     let mut dataset = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
@@ -71,7 +71,7 @@ async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
         let handle = tokio::task::spawn(async move {
             let dataset = DatasetBuilder::from_uri("memory://")
                 .with_read_params(ReadParams {
-                    store_options: Some(ObjectStoreParams {
+                    store_options: Some(StorageParams {
                         backend_wrappers: vec![throttled_ref.clone()],
                         ..Default::default()
                     }),
@@ -174,7 +174,7 @@ async fn test_merge_insert_large_concurrent() {
 
     let dataset = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
@@ -235,7 +235,7 @@ async fn test_merge_insert_large_concurrent() {
     );
     let dataset2 = DatasetBuilder::from_uri("memory://")
         .with_read_params(ReadParams {
-            store_options: Some(ObjectStoreParams {
+            store_options: Some(StorageParams {
                 backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
@@ -490,7 +490,7 @@ async fn test_upsert_concurrent_full_frag() {
 
     let mut dataset = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
@@ -1835,7 +1835,7 @@ async fn test_merge_insert_cleans_up_data_on_apply_deletions_failure() {
 
     let dataset = DatasetBuilder::from_uri(&routed_uri)
         .with_read_params(ReadParams {
-            store_options: Some(ObjectStoreParams {
+            store_options: Some(StorageParams {
                 backend_wrappers: vec![failing.clone()],
                 ..Default::default()
             }),

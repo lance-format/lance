@@ -52,7 +52,7 @@ use lance_index::{
     frag_reuse::FRAG_REUSE_INDEX_NAME,
 };
 use lance_io::{
-    assert_io_eq, assert_io_lt, object_store::WrappingObjectStore, utils::tracking_store::IoStats,
+    assert_io_eq, assert_io_lt, storage::BackendWrapper, utils::tracking_store::IoStats,
 };
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_testing::datagen::generate_random_array;

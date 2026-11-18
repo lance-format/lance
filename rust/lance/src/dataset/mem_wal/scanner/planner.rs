@@ -28,7 +28,7 @@ use super::projection::{
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 
 /// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
 /// dropped from a WAL-arm scan. Used only for sources whose schema carries the
@@ -56,7 +56,7 @@ pub struct LsmScanPlanner {
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
-    store_params: Option<ObjectStoreParams>,
+    store_params: Option<StorageParams>,
     /// Cache of opened SSTable datasets.
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
@@ -105,7 +105,7 @@ impl LsmScanPlanner {
     }
 
     /// Set the store params used to open SSTables.
-    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+    pub fn with_store_params(mut self, store_params: StorageParams) -> Self {
         self.store_params = Some(store_params);
         self
     }

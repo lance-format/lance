@@ -28,8 +28,8 @@ use lance_core::{
 };
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-use lance_io::object_store::ObjectStoreParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::storage::StorageParams;
 use lance_io::utils::testing::{DelayConfig, DelayedBackend, ProxyBackend, ProxyBackendPolicy};
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
@@ -180,7 +180,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
         "memory://",
         Some(WriteParams {
             data_storage_version: Some(LanceFileVersion::V2_2),
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 block_size: Some(block_size),
                 ..Default::default()
             }),
@@ -241,7 +241,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
     );
     let completed_policy = Arc::new(Mutex::new(completed_policy));
     Arc::make_mut(&mut dataset.storage).apply_wrapper(
-        &lance_io::utils::testing::TestWrappingObjectStore::new(|backend| {
+        &lance_io::utils::testing::TestBackendWrapper::new(|backend| {
             let delayed = Arc::new(DelayedBackend::new(
                 Arc::new(ProxyBackend::new(backend, completed_policy.clone())),
                 DelayConfig::default(),

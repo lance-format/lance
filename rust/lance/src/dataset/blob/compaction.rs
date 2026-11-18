@@ -11,7 +11,7 @@ use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::Field;
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 
 use super::locate::{BlobLocator, StoredBlob};
 use crate::Dataset;
@@ -19,7 +19,7 @@ use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange};
 
 #[derive(Clone)]
 pub(super) struct Source {
-    pub(super) store: Arc<ObjectStore>,
+    pub(super) store: Arc<Storage>,
     pub(super) path: Path,
 }
 
@@ -312,7 +312,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let data_paths = |objects: &[lance_io::object_store::ObjectMeta]| {
+        let data_paths = |objects: &[lance_io::storage::ObjectMeta]| {
             objects
                 .iter()
                 .filter(|o| o.location.extension() == Some("lance"))

@@ -44,7 +44,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig, WalTailer};
 use lance::dataset::{Dataset, WriteParams};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use uuid::Uuid;
 
 use arrow_array::RecordBatchIterator;
@@ -136,7 +136,7 @@ async fn setup_dataset(schema: &Arc<ArrowSchema>, name: &str, dataset_prefix: &s
     };
 
     // Best-effort delete in case a prior run left state behind.
-    if let Ok((storage, base)) = ObjectStore::from_uri(&dataset_uri).await {
+    if let Ok((storage, base)) = Storage::from_uri(&dataset_uri).await {
         let _ = storage.remove_dir_all(base).await;
     }
 
@@ -194,7 +194,7 @@ async fn populate_shard_wal(
 /// Bench: raw `WalTailer::read_entry` throughput. Measures how long it
 /// takes to walk N entries from position 0 to the tip, end-to-end.
 async fn run_tailer_replay(
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: lance_core::storage::path::Path,
     shard_id: Uuid,
     expected_entries: usize,
@@ -282,7 +282,7 @@ fn bench_replay(c: &mut Criterion) {
         batch_size,
     ));
 
-    let (storage, base_path) = rt.block_on(ObjectStore::from_uri(&dataset_uri)).unwrap();
+    let (storage, base_path) = rt.block_on(Storage::from_uri(&dataset_uri)).unwrap();
 
     let mut group = c.benchmark_group("MemWAL Replay");
     group.throughput(Throughput::Elements(num_entries as u64));

@@ -565,7 +565,7 @@ mod test {
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
     use lance_table::rowids::segment::U64Segment;
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -893,7 +893,7 @@ mod test {
         let failing = Arc::new(FailingProxyStore::new());
         let dataset = DatasetBuilder::from_uri(&uri)
             .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
+                store_options: Some(StorageParams {
                     backend_wrappers: vec![failing.clone()],
                     ..Default::default()
                 }),
@@ -954,7 +954,7 @@ mod test {
         );
         let dataset = DatasetBuilder::from_uri(&routed_uri)
             .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
+                store_options: Some(StorageParams {
                     backend_wrappers: vec![failing_store.clone()],
                     ..Default::default()
                 }),

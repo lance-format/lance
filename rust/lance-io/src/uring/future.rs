@@ -18,7 +18,7 @@ pub(super) struct UringReadFuture {
 }
 
 impl Future for UringReadFuture {
-    type Output = crate::object_store::Result<Bytes>;
+    type Output = crate::storage::Result<Bytes>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.request.state.lock().unwrap();
@@ -26,7 +26,7 @@ impl Future for UringReadFuture {
         if state.completed {
             // Operation completed - take the result
             match state.err.take() {
-                Some(err) => Poll::Ready(Err(crate::object_store::Error::Generic {
+                Some(err) => Poll::Ready(Err(crate::storage::Error::Generic {
                     store: "io_uring",
                     source: Box::new(err),
                 })),

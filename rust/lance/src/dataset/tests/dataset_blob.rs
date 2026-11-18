@@ -46,7 +46,7 @@ use lance_core::{
 };
 use lance_datagen::{BatchCount, RowCount, array};
 use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
-use lance_io::{object_store::ObjectStoreParams, stream::RecordBatchStream};
+use lance_io::{storage::StorageParams, stream::RecordBatchStream};
 use lance_table::feature_flags::{FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY};
 use lance_table::format::BasePath;
 use rstest::rstest;
@@ -1530,7 +1530,7 @@ async fn test_released_legacy_blob_reads_from_shallow_clone(
             DatasetBuilder::from_uri(uri)
                 .with_base_store_params(
                     &source_base,
-                    ObjectStoreParams {
+                    StorageParams {
                         block_size: Some(512),
                         ..Default::default()
                     },

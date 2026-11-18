@@ -85,7 +85,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_io::object_store::uri_to_url;
+use lance_io::storage::uri_to_url;
 use lance_namespace::models::Identity;
 
 /// Default credential duration: 1 hour (3600000 milliseconds)

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 
 use crate::dataset::{Dataset, DatasetBuilder};
 use crate::session::Session;
@@ -47,7 +47,7 @@ use crate::session::Session;
 /// `StorageOptionsAccessor` and re-resolves per request, so a cached handle
 /// never carries expired credentials. What this does assume is that a given
 /// path is only ever served under one store configuration. Serving one table
-/// through a single cache under two different `ObjectStoreParams` would hand
+/// through a single cache under two different `StorageParams` would hand
 /// every caller the store the first one opened with.
 pub struct SsTableCache {
     // `moka`'s async cache gives a bounded size plus single-flight
@@ -83,7 +83,7 @@ impl SsTableCache {
         &self,
         path: &str,
         session: Option<Arc<Session>>,
-        store_params: Option<ObjectStoreParams>,
+        store_params: Option<StorageParams>,
     ) -> Result<Arc<Dataset>> {
         self.inner
             .try_get_with(path.to_string(), async move {
@@ -140,7 +140,7 @@ pub trait DatasetCache: Send + Sync + std::fmt::Debug {
         &self,
         path: &str,
         session: Option<Arc<Session>>,
-        store_params: Option<ObjectStoreParams>,
+        store_params: Option<StorageParams>,
     ) -> Result<Arc<Dataset>>;
 
     /// Drop cached entries whose path is not in `live_paths`. Async so an
@@ -156,7 +156,7 @@ impl DatasetCache for SsTableCache {
         &self,
         path: &str,
         session: Option<Arc<Session>>,
-        store_params: Option<ObjectStoreParams>,
+        store_params: Option<StorageParams>,
     ) -> Result<Arc<Dataset>> {
         Self::get_or_open(self, path, session, store_params).await
     }
@@ -200,7 +200,7 @@ pub trait SsTableWarmer: Send + Sync + std::fmt::Debug {
 pub async fn open_sstable(
     path: &str,
     session: Option<&Arc<Session>>,
-    store_params: Option<&ObjectStoreParams>,
+    store_params: Option<&StorageParams>,
     cache: Option<&Arc<dyn DatasetCache>>,
     warmer: Option<&Arc<dyn SsTableWarmer>>,
 ) -> Result<Arc<Dataset>> {
@@ -279,7 +279,7 @@ impl DatasetCache for RunOnOpen {
         &self,
         path: &str,
         session: Option<Arc<Session>>,
-        store_params: Option<ObjectStoreParams>,
+        store_params: Option<StorageParams>,
     ) -> Result<Arc<Dataset>> {
         let open = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if open == self.run_on {

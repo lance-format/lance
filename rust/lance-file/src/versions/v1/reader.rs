@@ -28,7 +28,7 @@ use lance_core::{Error, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_io::traits::Reader;
 use lance_io::utils::{read_metadata_offset, read_struct, read_struct_from_buf};
-use lance_io::{ReadBatchParams, object_store::ObjectStore};
+use lance_io::{ReadBatchParams, storage::Storage};
 use std::borrow::Cow;
 
 use lance_core::storage::path::Path;
@@ -137,7 +137,7 @@ impl FileReader {
     /// is passed in, there will be no caching.
     #[instrument(level = "debug", skip(storage, schema, session))]
     pub async fn try_new_with_fragment_id(
-        storage: &ObjectStore,
+        storage: &Storage,
         path: &Path,
         schema: Schema,
         fragment_id: u32,
@@ -288,7 +288,7 @@ impl FileReader {
     }
 
     /// Open one Lance data file for read.
-    pub async fn try_new(storage: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
+    pub async fn try_new(storage: &Storage, path: &Path, schema: Schema) -> Result<Self> {
         // If just reading a lance data file we assume the schema is the schema of the data file
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_with_fragment_id(storage, path, schema, 0, 0, max_field_id, None).await
@@ -822,7 +822,7 @@ mod tests {
     };
     use arrow_array::{BooleanArray, Int32Array};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
 
     #[test]
     fn string_cache_key_discriminators_are_stable_and_type_scoped() {
@@ -866,7 +866,7 @@ mod tests {
         ]);
         let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/take_test");
 
         // Write 10 batches.
@@ -946,7 +946,7 @@ mod tests {
 
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/null_strings");
 
         let string_arr = Arc::new(StringArray::from_iter([Some("a"), Some(""), Some("b")]));
@@ -996,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_struct_of_list_arrays() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/null_strings");
 
         let arrow_schema = make_schema_of_list_array();
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_struct_of_list_arrays() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/null_strings");
 
         let arrow_schema = make_schema_of_list_array();
@@ -1160,7 +1160,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
 
         // write to a lance file
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/takes");
         let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
@@ -1276,7 +1276,7 @@ mod tests {
         .unwrap();
 
         // write to a lance file
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/take_list");
         let schema: Schema = (&arrow_schema).try_into().unwrap();
         let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
@@ -1333,7 +1333,7 @@ mod tests {
             ),
         ]);
 
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/lists");
 
         let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
@@ -1388,7 +1388,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
 
         // write to a lance file
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/read_range");
         let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
@@ -1412,7 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batches_stream() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/batch_stream");
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, true)]);
@@ -1458,10 +1458,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_boolean_beyond_chunk() {
-        let store = ObjectStore::from_uri_and_params(
+        let store = Storage::from_uri_and_params(
             Arc::new(Default::default()),
             "memory://",
-            &ObjectStoreParams {
+            &StorageParams {
                 block_size: Some(256),
                 ..Default::default()
             },
@@ -1508,7 +1508,7 @@ mod tests {
         // The dataset schema may be very large.  The file reader should support reading
         // a small projection of that schema (this just tests the field_offset / num_fields
         // parameters)
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/partial_read");
 
         // Create a large schema

@@ -47,7 +47,7 @@ use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{
     BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
 };
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -705,7 +705,7 @@ pub async fn merge_rtree_indices(
     ));
     let tmpdir = Arc::new(TempDir::default());
     let spill_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.obj_path(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -867,7 +867,7 @@ impl ScalarIndex for RTreeIndex {
         ));
         let tmpdir = Arc::new(TempDir::default());
         let spill_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1253,7 +1253,7 @@ impl BasicTrainer for RTreeIndexPlugin {
         let bbox_data = Self::convert_bbox_stream(data)?;
         let tmpdir = Arc::new(TempDir::default());
         let spill_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1501,7 +1501,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1710,7 +1710,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1817,7 +1817,7 @@ mod tests {
             .collect();
         let first_tmpdir = TempObjDir::default();
         let first_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             first_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1890,7 +1890,7 @@ mod tests {
             train_index(&second_builder.finish(), Some(8)).await;
         let merged_tmpdir = TempObjDir::default();
         let merged_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             merged_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1949,7 +1949,7 @@ mod tests {
 
         let old_tmpdir = TempObjDir::default();
         let old_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             old_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1983,7 +1983,7 @@ mod tests {
 
         let new_tmpdir = TempObjDir::default();
         let new_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2102,7 +2102,7 @@ mod tests {
         );
         let dest_tmpdir = TempObjDir::default();
         let dest_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             dest_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2212,7 +2212,7 @@ mod tests {
 
         let tmpdir = TempObjDir::default();
         let new_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));

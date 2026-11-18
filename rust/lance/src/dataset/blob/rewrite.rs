@@ -162,7 +162,7 @@ fn classify_rows(
 /// The URI of the object at `relative_path` under the base at `base_uri`, each
 /// path segment escaped so characters such as `#` and `?` stay in the name.
 fn external_blob_uri(base_uri: &str, relative_path: &str) -> Result<String> {
-    let mut url = lance_io::object_store::uri_to_url(base_uri)?;
+    let mut url = lance_io::storage::uri_to_url(base_uri)?;
     url.path_segments_mut()
         .map_err(|_| {
             Error::invalid_input(format!(

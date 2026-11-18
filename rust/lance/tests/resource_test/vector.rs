@@ -18,7 +18,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 use lance_linalg::distance::MetricType;
 
 #[tokio::test]
@@ -116,7 +116,7 @@ async fn test_ivf_split_reshuffle_memory_stays_bounded() {
     )]));
     // Cloud stores report a 64 KiB block size; the re-read must not size its
     // batches from it.
-    let store_params = ObjectStoreParams {
+    let store_params = StorageParams {
         block_size: Some(64 * 1024),
         ..Default::default()
     };

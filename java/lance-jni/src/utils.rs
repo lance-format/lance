@@ -11,7 +11,7 @@ use jni::sys::{jboolean, jfloat, jlong};
 use lance::dataset::optimize::{CompactionMode, CompactionOptions, SourceBudgetMode};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
-use lance::io::ObjectStoreParams;
+use lance::io::StorageParams;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_index::IndexParams;
@@ -42,7 +42,7 @@ pub fn extract_storage_options(
 pub fn extract_base_store_params(
     env: &mut JNIEnv,
     base_store_params_obj: &JObject,
-) -> Result<HashMap<String, ObjectStoreParams>> {
+) -> Result<HashMap<String, StorageParams>> {
     if base_store_params_obj.is_null() {
         return Ok(HashMap::new());
     }
@@ -64,7 +64,7 @@ pub fn extract_base_store_params(
             let storage_options = extract_storage_options(env, &value)?;
             base_store_params.insert(
                 base_path,
-                ObjectStoreParams {
+                StorageParams {
                     storage_options_accessor: Some(Arc::new(
                         lance::io::StorageOptionsAccessor::with_static_options(storage_options),
                     )),
@@ -189,7 +189,7 @@ pub fn extract_write_params(
         ))
     };
 
-    write_params.store_params = Some(ObjectStoreParams {
+    write_params.store_params = Some(StorageParams {
         storage_options_accessor: accessor,
         ..Default::default()
     });

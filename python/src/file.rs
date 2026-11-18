@@ -20,7 +20,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
-use lance::io::{ObjectStore, RecordBatchStream};
+use lance::io::{RecordBatchStream, Storage};
 use lance_arrow::json::convert_json_columns;
 use lance_core::cache::LanceCache;
 use lance_core::storage::path::Path;
@@ -31,7 +31,7 @@ use lance_file::reader::{
 };
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_file::{LanceEncodingsIo, version::LanceFileVersion, versions as file_versions};
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, ObjectStoreParams};
+use lance_io::storage::{LanceNamespaceStorageOptionsProvider, StorageParams};
 use lance_io::{
     ReadBatchParams,
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -263,7 +263,7 @@ impl LanceFileWriter {
         data_cache_bytes: Option<u64>,
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        storage_options_provider: Option<Arc<dyn lance_io::storage::StorageOptionsProvider>>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
@@ -286,7 +286,7 @@ impl LanceFileWriter {
     }
 
     async fn open_with_store(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         path: Path,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
@@ -342,7 +342,7 @@ impl LanceFileWriter {
                 ns_client,
                 tid.clone(),
             ))
-                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
+                as Arc<dyn lance_io::storage::StorageOptionsProvider>)
         } else {
             None
         };
@@ -416,23 +416,23 @@ impl Drop for LanceFileWriter {
 
 pub async fn storage_from_uri_or_path_no_options(
     uri_or_path: impl AsRef<str>,
-) -> PyResult<(Arc<ObjectStore>, Path)> {
+) -> PyResult<(Arc<Storage>, Path)> {
     storage_from_uri_or_path(uri_or_path, None).await
 }
 
 pub async fn storage_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
-) -> PyResult<(Arc<ObjectStore>, Path)> {
+) -> PyResult<(Arc<Storage>, Path)> {
     storage_from_uri_or_path_with_provider(uri_or_path, storage_options, None).await
 }
 
 pub async fn storage_from_uri_or_path_with_provider(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
-    storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
-) -> PyResult<(Arc<ObjectStore>, Path)> {
-    let storage_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
+    storage_options_provider: Option<Arc<dyn lance_io::storage::StorageOptionsProvider>>,
+) -> PyResult<(Arc<Storage>, Path)> {
+    let storage_registry = Arc::new(lance::io::StorageRegistry::default());
 
     let accessor = match (storage_options, storage_options_provider) {
         (Some(opts), Some(provider)) => Some(Arc::new(
@@ -447,13 +447,13 @@ pub async fn storage_from_uri_or_path_with_provider(
         (None, None) => None,
     };
 
-    let storage_params = ObjectStoreParams {
+    let storage_params = StorageParams {
         storage_options_accessor: accessor,
         ..Default::default()
     };
 
     let (storage, path) =
-        ObjectStore::from_uri_and_params(storage_registry, uri_or_path.as_ref(), &storage_params)
+        Storage::from_uri_and_params(storage_registry, uri_or_path.as_ref(), &storage_params)
             .await
             .infer_error()?;
 
@@ -462,7 +462,7 @@ pub async fn storage_from_uri_or_path_with_provider(
 
 #[pyclass]
 pub struct LanceFileSession {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: Path,
 }
 
@@ -470,7 +470,7 @@ impl LanceFileSession {
     pub async fn try_new(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        storage_options_provider: Option<Arc<dyn lance_io::storage::StorageOptionsProvider>>,
     ) -> PyResult<Self> {
         let (storage, base_path) = storage_from_uri_or_path_with_provider(
             uri_or_path,
@@ -499,7 +499,7 @@ impl LanceFileSession {
                 ns_client,
                 tid.clone(),
             ))
-                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
+                as Arc<dyn lance_io::storage::StorageOptionsProvider>)
         } else {
             None
         };
@@ -827,7 +827,7 @@ impl LanceFileReader {
     async fn open(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        storage_options_provider: Option<Arc<dyn lance_io::storage::StorageOptionsProvider>>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let (storage, path) = storage_from_uri_or_path_with_provider(
@@ -840,7 +840,7 @@ impl LanceFileReader {
     }
 
     async fn open_with_store(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         path: Path,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
@@ -940,7 +940,7 @@ impl LanceFileReader {
                 ns_client,
                 tid.clone(),
             ))
-                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
+                as Arc<dyn lance_io::storage::StorageOptionsProvider>)
         } else {
             None
         };

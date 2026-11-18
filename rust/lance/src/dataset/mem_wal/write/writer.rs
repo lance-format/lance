@@ -14,7 +14,7 @@ use lance_core::datatypes::Schema;
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use log::{debug, info, warn};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -332,7 +332,7 @@ struct SharedWriterState {
     memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
     config: ShardWriterConfig,
     epoch: u64,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: Path,
     shard_id: Uuid,
     max_memtable_batches: usize,
@@ -352,7 +352,7 @@ impl SharedWriterState {
         memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
         config: ShardWriterConfig,
         epoch: u64,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         shard_id: Uuid,
         stop_flush_retries: CancellationToken,
@@ -890,7 +890,7 @@ pub struct ShardWriter {
 impl ShardWriter {
     /// Open or create a ShardWriter.
     ///
-    /// The `base_path` should come from `ObjectStore::from_uri()` to ensure
+    /// The `base_path` should come from `Storage::from_uri()` to ensure
     /// WAL files are written inside the dataset directory.
     ///
     /// `schema` should carry each field's id under `lance:field_id` in its
@@ -898,7 +898,7 @@ impl ShardWriter {
     /// a rename loses.
     #[instrument(name = "sw_open", level = "info", skip_all, fields(shard_id = %config.shard_id, index_count = index_specs.len()))]
     pub async fn open(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         base_uri: impl Into<String>,
         config: ShardWriterConfig,
@@ -918,7 +918,7 @@ impl ShardWriter {
 
     /// Body of [`Self::open`].
     async fn open_inner(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         base_uri: String,
         config: ShardWriterConfig,
@@ -1135,7 +1135,7 @@ impl ShardWriter {
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
         wal_flush_rx: mpsc::UnboundedReceiver<TriggerWalFlush>,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         base_uri: String,
         shard_id: Uuid,

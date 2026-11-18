@@ -1007,7 +1007,7 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
     use lance_io::utils::testing::DelayConfig;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -1539,7 +1539,7 @@ mod tests {
 
         let mut dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
-                store_params: Some(ObjectStoreParams {
+                store_params: Some(StorageParams {
                     backend_wrappers: vec![throttled.clone()],
                     ..Default::default()
                 }),
@@ -1560,7 +1560,7 @@ mod tests {
             let handle = tokio::task::spawn(async move {
                 let dataset = DatasetBuilder::from_uri("memory://")
                     .with_read_params(ReadParams {
-                        store_options: Some(ObjectStoreParams {
+                        store_options: Some(StorageParams {
                             backend_wrappers: vec![throttled_ref.clone()],
                             ..Default::default()
                         }),
@@ -1633,7 +1633,7 @@ mod tests {
 
         let mut dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
-                store_params: Some(ObjectStoreParams {
+                store_params: Some(StorageParams {
                     backend_wrappers: vec![throttled.clone()],
                     ..Default::default()
                 }),
@@ -1654,7 +1654,7 @@ mod tests {
             let handle = tokio::task::spawn(async move {
                 let dataset = DatasetBuilder::from_uri("memory://")
                     .with_read_params(ReadParams {
-                        store_options: Some(ObjectStoreParams {
+                        store_options: Some(StorageParams {
                             backend_wrappers: vec![throttled_ref.clone()],
                             ..Default::default()
                         }),
@@ -2489,7 +2489,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_cleans_up_data_on_apply_deletions_failure() {
         use crate::utils::test::FailingProxyStore;
-        use lance_io::object_store::ObjectStoreParams;
+        use lance_io::storage::StorageParams;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -2535,7 +2535,7 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(&routed_uri)
             .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
+                store_options: Some(StorageParams {
                     backend_wrappers: vec![failing.clone()],
                     ..Default::default()
                 }),
@@ -2640,7 +2640,7 @@ mod tests {
         failing.fail_when("put_multipart", "/data/", "injected data write failure");
         let dataset = DatasetBuilder::from_uri(&routed_uri)
             .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
+                store_options: Some(StorageParams {
                     backend_wrappers: vec![failing],
                     ..Default::default()
                 }),

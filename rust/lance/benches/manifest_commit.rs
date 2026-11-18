@@ -9,7 +9,7 @@
 //! - Load time (manifest read from storage, using checkout_latest)
 //!
 //! Key optimizations:
-//! - Uses shared ObjectStoreRegistry to reuse TCP/TLS connections
+//! - Uses shared StorageRegistry to reuse TCP/TLS connections
 //! - Disables auto-cleanup to avoid background cleanup overhead
 //! - Separates fragment writing from commit measurement
 //!
@@ -50,7 +50,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::session::Session;
 use lance_core::utils::parse::str_is_truthy;
-use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::storage::StorageRegistry;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -216,7 +216,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     // Create a shared session for both commit and load operations
     // When cache is disabled, use zero cache size to measure actual storage read latency
     // When cache is enabled, use default cache sizes (6GB index, 1GB metadata)
-    let shared_store_registry = Arc::new(ObjectStoreRegistry::default());
+    let shared_store_registry = Arc::new(StorageRegistry::default());
     let session = if enable_cache {
         Arc::new(Session::default())
     } else {

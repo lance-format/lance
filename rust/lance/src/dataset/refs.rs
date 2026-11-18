@@ -6,8 +6,8 @@ use std::ops::Range;
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_io::object_store::ObjectStore;
-use lance_io::object_store::{
+use lance_io::storage::Storage;
+use lance_io::storage::{
     Error as ObjectStoreError,
     path::{Path, PathPart},
 };
@@ -93,14 +93,14 @@ impl fmt::Display for Ref {
 
 #[derive(Debug, Clone)]
 pub struct Refs {
-    pub(crate) storage: Arc<ObjectStore>,
+    pub(crate) storage: Arc<Storage>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
     pub(crate) base_location: BranchLocation,
 }
 
 impl Refs {
     pub fn new(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         commit_handler: Arc<dyn CommitHandler>,
         base_location: BranchLocation,
     ) -> Self {
@@ -141,19 +141,19 @@ pub struct Branches<'a> {
 }
 
 impl Tags<'_> {
-    fn storage(&self) -> &ObjectStore {
+    fn storage(&self) -> &Storage {
         &self.refs.storage
     }
 }
 
 impl Branches<'_> {
-    fn storage(&self) -> &ObjectStore {
+    fn storage(&self) -> &Storage {
         &self.refs.storage
     }
 }
 
 async fn put_ref_if_absent(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
     contents: Vec<u8>,
     conflict_message: String,
@@ -1376,7 +1376,7 @@ pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
     }
 }
 
-async fn from_path<T>(path: &Path, storage: &ObjectStore) -> Result<T>
+async fn from_path<T>(path: &Path, storage: &Storage) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -1393,13 +1393,13 @@ where
 }
 
 impl TagContents {
-    pub async fn from_path(path: &Path, storage: &ObjectStore) -> Result<Self> {
+    pub async fn from_path(path: &Path, storage: &Storage) -> Result<Self> {
         from_path(path, storage).await
     }
 }
 
 impl BranchContents {
-    pub async fn from_path(path: &Path, storage: &ObjectStore, branch_name: &str) -> Result<Self> {
+    pub async fn from_path(path: &Path, storage: &Storage, branch_name: &str) -> Result<Self> {
         let mut contents: Self = from_path(path, storage).await?;
         if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
             // Legacy branch files do not store an identifier. Derive a deterministic fallback
@@ -1849,7 +1849,7 @@ mod tests {
     #[tokio::test]
     async fn test_branch_synthetic_uuid_is_stable() {
         let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let base_path = Path::from("dataset");
         let first_path = branch_contents_path(&base_path, "legacy_branch");
         store

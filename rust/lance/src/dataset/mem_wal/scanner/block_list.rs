@@ -38,7 +38,7 @@ use crate::dataset::mem_wal::index::encode_pk_tuple;
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::util::PK_INDEX_DIR;
 use crate::session::Session;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 
 /// Use the dataset registry when opening the standalone primary-key BTree.
 static PK_BTREE_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
@@ -158,7 +158,7 @@ type ShardGenSets = HashMap<Uuid, Vec<(LsmGeneration, GenMembership)>>;
 pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
-    store_params: Option<&ObjectStoreParams>,
+    store_params: Option<&StorageParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
@@ -242,7 +242,7 @@ pub async fn compute_source_block_lists(
 pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
-    store_params: Option<&ObjectStoreParams>,
+    store_params: Option<&StorageParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<GenMembership>> {
@@ -397,7 +397,7 @@ fn path_cache_uuid(path: &str) -> Uuid {
 async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
-    store_params: Option<&ObjectStoreParams>,
+    store_params: Option<&StorageParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let dataset = open_sstable(path, session, store_params, sstable_cache, None).await?;
@@ -453,7 +453,7 @@ pub async fn write_pk_sidecar(
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use lance_core::cache::LanceCache;
     use lance_index::scalar::btree::train_btree_index;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
 
     use crate::dataset::mem_wal::util::pk_index_path;
 
@@ -475,7 +475,7 @@ pub async fn write_pk_sidecar(
         return Ok(());
     }
     let schema = training[0].schema();
-    let (storage, base_path) = ObjectStore::from_uri(uri).await?;
+    let (storage, base_path) = Storage::from_uri(uri).await?;
     let store = LanceIndexStore::new(
         storage,
         pk_index_path(&base_path),
@@ -806,7 +806,7 @@ mod tests {
         use lance_core::cache::LanceCache;
         use lance_index::scalar::btree::train_btree_index;
         use lance_index::scalar::lance_format::LanceIndexStore;
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(
@@ -828,7 +828,7 @@ mod tests {
         index.insert(&batch, 0).unwrap();
         index.insert(&batch, 0).unwrap();
         let training = index.pk_training_batches(8192).unwrap();
-        let (storage, base_path) = ObjectStore::from_uri(&path).await.unwrap();
+        let (storage, base_path) = Storage::from_uri(&path).await.unwrap();
         let store = LanceIndexStore::new(
             storage,
             pk_index_path(&base_path),

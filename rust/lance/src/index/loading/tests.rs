@@ -18,7 +18,7 @@ use lance_index::IndexType;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
+use lance_io::storage::{Storage, StorageOptionsAccessor, StorageParams};
 use lance_linalg::distance::DistanceType;
 use rstest::rstest;
 
@@ -466,7 +466,7 @@ async fn test_vector_cache_uses_current_storage(#[case] index_version: IndexFile
     let session = Arc::new(crate::session::Session::with_index_cache_backend(
         cache_backend.clone(),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = crate::DatasetBuilder::from_uri(test_uri)
         .with_session(session)
@@ -474,7 +474,7 @@ async fn test_vector_cache_uses_current_storage(#[case] index_version: IndexFile
         .await
         .unwrap();
 
-    let store_params_a = ObjectStoreParams {
+    let store_params_a = StorageParams {
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             HashMap::from([(
                 "credential_generation".to_owned(),
@@ -483,7 +483,7 @@ async fn test_vector_cache_uses_current_storage(#[case] index_version: IndexFile
         ))),
         ..Default::default()
     };
-    let (store_a, _) = ObjectStore::from_uri_and_params(
+    let (store_a, _) = Storage::from_uri_and_params(
         dataset.session().store_registry(),
         dataset.uri(),
         &store_params_a,
@@ -492,7 +492,7 @@ async fn test_vector_cache_uses_current_storage(#[case] index_version: IndexFile
     .unwrap();
     let dataset_a = dataset.with_storage(store_a.clone(), Some(store_params_a));
 
-    let store_params_b = ObjectStoreParams {
+    let store_params_b = StorageParams {
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             HashMap::from([(
                 "credential_generation".to_owned(),
@@ -501,7 +501,7 @@ async fn test_vector_cache_uses_current_storage(#[case] index_version: IndexFile
         ))),
         ..Default::default()
     };
-    let (store_b, _) = ObjectStore::from_uri_and_params(
+    let (store_b, _) = Storage::from_uri_and_params(
         dataset.session().store_registry(),
         dataset.uri(),
         &store_params_b,

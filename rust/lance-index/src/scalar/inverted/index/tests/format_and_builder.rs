@@ -582,7 +582,7 @@ impl IndexStore for MetadataAccessDeniedStore {
 async fn params_legacy_fallback_probes_tokens_after_metadata_access_denied() {
     let tmpdir = TempObjDir::default();
     let inner: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -609,7 +609,7 @@ async fn params_legacy_fallback_probes_tokens_after_metadata_access_denied() {
 async fn params_legacy_probe_preserves_metadata_error_when_tokens_are_missing() {
     let tmpdir = TempObjDir::default();
     let inner: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -624,7 +624,7 @@ async fn params_legacy_probe_preserves_metadata_error_when_tokens_are_missing() 
 async fn params_metadata_ignores_unknown_fields() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -826,7 +826,7 @@ fn test_posting_builder_without_impact_column_roundtrips_without_impacts() {
 async fn test_build_search_uses_configured_posting_block_size() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -917,7 +917,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
 
     let source_dir = TempObjDir::default();
     let source_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         source_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -979,7 +979,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
     // conversion and that impact data can be regenerated from every posting.
     let dest_dir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dest_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1023,7 +1023,7 @@ async fn test_v1_position_merge_reads_are_bounded_and_ordered() {
 
     let source_dir = TempObjDir::default();
     let source_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         source_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1189,7 +1189,7 @@ async fn test_chunk_posting_mode_controls_buffer_sharing() {
 
     let source_dir = TempObjDir::default();
     let source_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         source_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1844,7 +1844,7 @@ fn test_posting_list_batch_matches_docset_scoring() {
 async fn test_remap_to_empty_posting_list() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2010,7 +2010,7 @@ fn test_token_dictionary_writes_same_batch_as_token_set(#[case] format: TokenSet
 async fn test_token_dictionary_keeps_loaded_token_ids(#[case] format: TokenSetFormat) {
     let tmpdir = TempObjDir::default();
     let store = LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     );

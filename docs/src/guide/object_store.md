@@ -1,5 +1,44 @@
 # Object Store Configuration
 
+Lance's Rust I/O API is `lance_io::storage`. `Storage` holds the configured
+backend and its policies; callers use its read, write, metadata, listing, and
+conditional-publication methods. Its backend is private. `StorageBackend` and
+`BackendWrapper` are the extension points for providers and middleware.
+
+Create handles with `Storage::from_uri` or `Storage::from_uri_and_params`.
+Custom integrations register a `StorageProvider` in a `StorageRegistry` and supply
+that registry through the session. The provider's `new_backend` returns a
+`BackendConfig`: the backend, read sizing, concurrency, listing and upload
+capabilities. The registry constructs `Storage`, validates
+caller options, and installs tracing, metrics, user wrappers, and IO tracking.
+Providers do not construct or instrument a `Storage` themselves. Local and
+in-memory convenience handles use the same synchronous assembly function.
+
+Pagination is part of `StorageBackend`, so pages pass through the same wrappers,
+tracing, metrics, and IO tracking as other requests. Backends and wrappers without
+pagination return `NotSupported`; `Storage` then pages their ordinary listing.
+Other errors propagate without fallback. Registry-configured wrappers run inside
+IO tracking. Wrappers added after construction run outside the existing tracker;
+requests they serve without accessing the inner backend are not counted there.
+External Blob views preserve this ordering without adding another tracker.
+The synchronous `Storage::local()` and `Storage::memory()` constructors do not
+install tracing, metrics, or IO tracking.
+
+Providers declare local directory semantics, cloud IO policies, and single-copy limits in
+`BackendConfig`. Local directory semantics require conservative cleanup when path
+aliases cannot be resolved; they do not grant native access. Native local file
+access is reserved for the built-in file provider. Wrappers disable direct
+file IO. Native directory maintenance keeps using the provider's local root
+mapping, independently of backend wrappers. URI aliases do not grant local access.
+
+Paths, request options, metadata, payloads, and errors are Lance-owned types
+exported from `lance_io::storage`. Native `object_store` implementations are
+converted by `storage::backend::object_store::from_object_store`; callers do not
+convert a configured `Storage` back into an upstream object store. The adapter
+preserves object keys, conditional operations, streaming bodies, and error
+categories. Unsupported atomic operations return an error rather than falling
+back to a check followed by an unconditional write.
+
 Lance supports object stores such as AWS S3 (and compatible stores), Azure Blob Store,
 and Google Cloud Storage. Which object store to use is determined by the URI scheme of
 the dataset path. For example, `s3://bucket/path` will use S3, `az://bucket/path`
@@ -119,13 +158,13 @@ before they return:
     use std::collections::HashMap;
     use std::sync::Arc;
     use lance::dataset::{WriteMode, WriteParams};
-    use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+    use lance::io::{StorageParams, StorageOptionsAccessor};
     use lance::Dataset;
 
     let storage_options = HashMap::from([("local_fsync".to_string(), "true".to_string())]);
     let write_params = WriteParams {
         mode: WriteMode::Overwrite,
-        store_params: Some(ObjectStoreParams {
+        store_params: Some(StorageParams {
             storage_options_accessor: Some(Arc::new(
                 StorageOptionsAccessor::with_static_options(storage_options),
             )),
@@ -744,19 +783,18 @@ versioned manifests.
       a default feature of `lance-io`:
       `lance-io = { version = "*", features = ["goosefs"] }`.
 
-    Open the underlying `lance_io::object_store::ObjectStore` directly (mirrors
+    Open the underlying `lance_io::storage::Storage` directly (mirrors
     the integration test in `rust/lance-io/tests/goosefs_integration.rs`):
 
     ```rust
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
 
     let uri = "goosefs://10.0.0.1:9200/lance-test/lance-io";
-    let (store, path) = ObjectStore::from_uri(uri).await?;
+    let (store, path) = Storage::from_uri(uri).await?;
 
-    // Read / write through the underlying `object_store::ObjectStore` API
-    store.inner.put(&path, (&b"hello"[..]).into()).await?;
-    let result = store.inner.get(&path).await?;
-    let bytes = result.bytes().await?;
+    // Read and write through the Lance Storage API
+    store.put(&path, b"hello").await?;
+    let bytes = store.read_one_all(&path).await?;
     ```
 
     Open a Lance dataset with custom storage options:

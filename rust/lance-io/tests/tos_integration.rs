@@ -6,14 +6,14 @@
 
 use futures::TryStreamExt;
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use tokio::io::AsyncWriteExt;
 
 fn tos_bucket() -> String {
     std::env::var("TOS_BUCKET").expect("TOS_BUCKET must be set")
 }
 
-async fn delete_prefix(store: &ObjectStore, prefix: &str) {
+async fn delete_prefix(store: &Storage, prefix: &str) {
     let prefix_path = Path::from(prefix);
     let locations = store
         .list(Some(prefix_path))
@@ -32,7 +32,7 @@ async fn delete_prefix(store: &ObjectStore, prefix: &str) {
 async fn test_tos_write_read_list_delete() {
     let prefix = format!("lance-tos-{}-{}", std::process::id(), rand::random::<u64>());
     let bucket = tos_bucket();
-    let (store, base_path) = ObjectStore::from_uri(&format!("tos://{bucket}/{prefix}"))
+    let (store, base_path) = Storage::from_uri(&format!("tos://{bucket}/{prefix}"))
         .await
         .unwrap();
     assert_eq!(base_path, Path::from(prefix.as_str()));

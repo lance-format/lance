@@ -17,9 +17,7 @@ use lance_index::IndexType;
 use lance_index::metrics::LocalMetricsCollector;
 use lance_index::scalar::registry::ScalarIndexCacheKey;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, inverted::InvertedIndex};
-use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
-};
+use lance_io::storage::{BackendWrapper, Storage, StorageOptionsAccessor, StorageParams};
 use rstest::rstest;
 
 use crate::dataset::WriteParams;
@@ -48,7 +46,7 @@ async fn test_scalar_cache_uses_current_storage(#[case] request_wrappers: bool) 
         ids
     }
 
-    // Rotated credentials require distinct ObjectStore instances to read the same data.
+    // Rotated credentials require distinct Storage instances to read the same data.
     // `memory://` creates an isolated in-memory backend for each instance, so this test needs
     // a filesystem-backed URI.
     let test_dir = TempStrDir::default();
@@ -121,9 +119,9 @@ async fn test_scalar_cache_uses_current_storage(#[case] request_wrappers: bool) 
     let mut requests = Vec::with_capacity(2);
     for (generation, wrapper) in [("a", &wrapper_a), ("b", &wrapper_b)] {
         let request = if request_wrappers {
-            dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>])
+            dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn BackendWrapper>])
         } else {
-            let store_params = ObjectStoreParams {
+            let store_params = StorageParams {
                 storage_options_accessor: Some(Arc::new(
                     StorageOptionsAccessor::with_static_options(HashMap::from([(
                         "credential_generation".to_owned(),
@@ -133,7 +131,7 @@ async fn test_scalar_cache_uses_current_storage(#[case] request_wrappers: bool) 
                 backend_wrappers: vec![wrapper.clone()],
                 ..Default::default()
             };
-            let (store, _) = ObjectStore::from_uri_and_params(
+            let (store, _) = Storage::from_uri_and_params(
                 dataset.session().store_registry(),
                 dataset.uri(),
                 &store_params,
@@ -289,8 +287,7 @@ async fn test_request_wrappers_reload_legacy_fts_fixture() {
 
     for _ in 0..2 {
         let wrapper = Arc::new(RequestIndexStoreWrapper::new(format!("_indices/{uuid}")));
-        let request =
-            dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+        let request = dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn BackendWrapper>]);
         let metrics = LocalMetricsCollector::default();
         let index = request
             .open_scalar_index("text", &uuid, &metrics)

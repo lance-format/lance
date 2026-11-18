@@ -15,7 +15,7 @@ use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
 use lance_core::Result;
-use lance_io::object_store::uri_to_url;
+use lance_io::storage::uri_to_url;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::Identity;
 use log::{debug, info, warn};

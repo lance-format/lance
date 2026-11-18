@@ -24,10 +24,10 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 2,
-            store_params: Some(ObjectStoreParams {
-                backend_wrappers: vec![Arc::new(MockWrappingObjectStore {
+            store_params: Some(StorageParams {
+                backend_wrappers: vec![Arc::new(MockBackendWrapper {
                     delete_latency,
-                    ..MockWrappingObjectStore::new()
+                    ..MockBackendWrapper::new()
                 })],
                 ..Default::default()
             }),

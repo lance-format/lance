@@ -80,7 +80,7 @@ impl CacheBackend for RejectPositionsCacheBackend {
 async fn test_prewarm_with_positions_populates_separate_position_cache() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -146,7 +146,7 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
         .unwrap();
 
     let rebound_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -223,7 +223,7 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
 async fn test_best_effort_prewarm_reports_missing_requested_positions() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -285,7 +285,7 @@ async fn test_best_effort_prewarm_reports_missing_requested_positions() {
 async fn test_prewarm_with_v2_positions_preserves_shared_stream_codec() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

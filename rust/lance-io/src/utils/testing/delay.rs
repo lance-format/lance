@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::object_store::{
+use crate::storage::{
     CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
     PutPayload, PutResult, RenameOptions, Result, UploadPart, path::Path,
 };
@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream::BoxStream};
 
-use crate::object_store::backend::{MultipartUpload, StorageBackend};
+use crate::storage::backend::{MultipartUpload, StorageBackend};
 
 /// Per-operation delays for exercising concurrent IO paths with [`DelayedBackend`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,10 +37,10 @@ pub struct DelayConfig {
 ///
 /// ```
 /// use std::{sync::Arc, time::Duration};
-/// use lance_io::object_store::ObjectStore;
+/// use lance_io::storage::Storage;
 /// use lance_io::utils::testing::{DelayConfig, DelayedBackend};
 ///
-/// let backend = DelayedBackend::new(lance_io::object_store::backend::native::from_object_store(Arc::new(object_store::memory::InMemory::new())), DelayConfig {
+/// let backend = DelayedBackend::new(lance_io::storage::backend::object_store::from_object_store(Arc::new(object_store::memory::InMemory::new())), DelayConfig {
 ///     wait_get_per_call: Duration::from_millis(10),
 ///     ..Default::default()
 /// });
@@ -83,8 +83,8 @@ impl StorageBackend for DelayedBackend {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: crate::object_store::PaginatedListOptions,
-    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        options: crate::storage::PaginatedListOptions,
+    ) -> crate::storage::Result<crate::storage::PaginatedListResult> {
         let delay = self.config.lock().unwrap().wait_list_per_call;
         tokio::time::sleep(delay).await;
         self.inner.list_paginated(prefix, options).await
@@ -218,8 +218,8 @@ impl MultipartUpload for DelayedUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::GetResultPayload;
-    use crate::object_store::backend::native::from_object_store;
+    use crate::storage::GetResultPayload;
+    use crate::storage::backend::object_store::from_object_store;
     use ::object_store::local::LocalFileSystem;
     use futures::TryStreamExt;
     use tokio::time::Instant;
@@ -258,7 +258,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn multipart_lifecycle_and_list_delays() {
         let backend = DelayedBackend::new(
-            crate::object_store::backend::native::from_object_store(Arc::new(
+            crate::storage::backend::object_store::from_object_store(Arc::new(
                 object_store::memory::InMemory::new(),
             )),
             DelayConfig {
@@ -296,7 +296,7 @@ mod tests {
         aborted.abort().await.unwrap();
         assert!(matches!(
             backend.head(&"b".into()).await,
-            Err(crate::object_store::Error::NotFound { .. })
+            Err(crate::storage::Error::NotFound { .. })
         ));
 
         let start = Instant::now();

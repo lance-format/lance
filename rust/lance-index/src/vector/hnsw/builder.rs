@@ -1945,7 +1945,7 @@ mod tests {
         reader::FileReader as V1FileReader,
         writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     };
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_linalg::distance::DistanceType;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
     use lance_table::format::SelfDescribingFileReader;
@@ -2022,7 +2022,7 @@ mod tests {
         )
         .unwrap();
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let path = Path::from("test_builder_write_load");
         let writer = storage.create(&path).await.unwrap();
         let schema = Schema::new(vec![
@@ -2084,7 +2084,7 @@ mod tests {
             .await
             .unwrap();
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let path = Path::from("test_builder_write_load_binary_hamming");
         let writer = storage.create(&path).await.unwrap();
         let schema = Schema::new(vec![

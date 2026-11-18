@@ -21,7 +21,7 @@ use lance_index::{
     IndexType,
     scalar::{FullTextSearchQuery, ScalarIndexParams},
 };
-use lance_io::{object_store::ObjectStoreParams, utils::tracking_store::IOTracker};
+use lance_io::{storage::StorageParams, utils::tracking_store::IOTracker};
 use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
@@ -219,7 +219,7 @@ fn bench_hybrid_scalar_prefilter(c: &mut Criterion) {
                     let uri = fixture.dataset.uri().to_owned();
                     let open = || {
                         lance::dataset::builder::DatasetBuilder::from_uri(&uri)
-                            .with_store_params(ObjectStoreParams {
+                            .with_store_params(StorageParams {
                                 backend_wrappers: vec![tracker.clone()],
                                 ..Default::default()
                             })
