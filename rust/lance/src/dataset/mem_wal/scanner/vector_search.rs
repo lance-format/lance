@@ -78,20 +78,26 @@ impl ProbeBounds {
 ///           ProjectionExec (null_columns _rowid)
 ///             PkBlockFilterExec: block-list                   (SSTable)
 ///               ProjectionExec (_distance rescaled, unrefined only)
-///                 KNNExec: SSTable gen N, fetch=ceil(k*overfetch) (fast_search)[.refine()?]
+///                 KNNExec: SSTable gen N, fetch=ceil(k*overfetch) (fast_search|flat)[.refine()?]
 ///         … one per SSTable gen …
 ///         ProjectionExec (canonical output schema)
 ///           PkBlockFilterExec: block-list                     (base)
-///             KNNExec: base table, k (fast_search)[.refine()?]
+///             ProjectionExec (_distance rescaled, flat unrefined only;
+///                             never under a block-list, which refines)
+///               KNNExec: base table, k (fast_search|flat)[.refine()?]
 /// ```
 ///
 /// # Index-Only Search (fast_search)
 ///
-/// For base table and SSTables we use `fast_search()` to only
-/// search indexed data. This is correct because:
-/// - Each SSTable has its own vector index built during flush.
-/// - The active memtable covers any unindexed data.
-/// - Searching unindexed data in base/SSTable would be redundant.
+/// The base table is searched with `fast_search()` — index-only — when its
+/// vector index is usable for the query (matching column and metric) and covers
+/// every fragment of the base; otherwise the arm forces the scanner's flat KNN,
+/// which reports exact distances, rescaled to the plan's scale. Each SSTable is
+/// searched without `fast_search()`, so its scanner plans the indexed fragments
+/// and the flat fallback together. `fast_search()` over a source without a
+/// usable, covering index returns nothing for the rows it cannot see, so gating
+/// it is what keeps an unindexed base or generation visible instead of silently
+/// dropping its rows.
 pub struct LsmVectorSearchPlanner {
     /// Data source collector.
     collector: LsmDataSourceCollector,
@@ -165,24 +171,52 @@ fn sstable_distance_scale(distance_type: lance_linalg::distance::DistanceType) -
     }
 }
 
-/// Whether `dataset` holds an index the scanner would answer a `distance_type`
-/// search on `column` with. Mirrors the scanner's own choice: keyed on the
-/// column, a known type, and a compatible metric. A generation without one is
-/// searched flat, which reports exact rather than index-scaled distances.
-async fn has_usable_vector_index(
+/// Name of the index the scanner would answer a `distance_type` search on
+/// `column` with, judged from segment metadata alone. Mirrors the scanner's own
+/// choice: keyed on the column, a known type, and a compatible metric (a legacy
+/// segment without details keeps the index, as it always has). `None` means the
+/// scanner has nothing to select and searches flat, which reports exact rather
+/// than index-scaled distances.
+async fn usable_vector_index(
     dataset: &Dataset,
     column: &str,
     distance_type: lance_linalg::distance::DistanceType,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     use crate::index::DatasetIndexExt;
 
     let column_id = dataset.schema().field_id(column)?;
-    Ok(dataset.load_indices().await?.iter().any(|index| {
-        index.fields.first() == Some(&column_id)
-            && crate::index::index_type_is_known(index)
+    Ok(dataset.load_indices().await?.iter().find_map(|index| {
+        (index.fields.first() == Some(&column_id)
+            && crate::index::segment::index_type_is_known(index)
             && crate::index::vector::details::metric_type_from_index_metadata(index)
-                .is_none_or(|metric| metric == distance_type)
+                .is_none_or(|metric| metric == distance_type))
+        .then(|| index.name.clone())
     }))
+}
+
+/// Whether the segments of index `name` cover every fragment of `dataset`.
+///
+/// Coverage, not the mere existence of an index on the column, is what
+/// `fast_search` needs: it searches indexed data only, so a segment that covers
+/// no fragment — a `train(false)` build, or a quantizer that could not train
+/// yet — makes the scanner reject the index outright, and a fragment appended
+/// after the build sits outside every segment. Either way `fast_search` returns
+/// nothing for those rows. A pre-0.8 segment carries no coverage bitmap, and the
+/// scanner reads unknown coverage as full coverage; this does the same, so those
+/// writers keep the index they always got.
+async fn index_covers_all_fragments(dataset: &Dataset, name: &str) -> Result<bool> {
+    use crate::index::DatasetIndexExt;
+    use crate::index::loading::DatasetIndexInternalExt;
+
+    let unknown_coverage = dataset
+        .load_indices_by_name(name)
+        .await?
+        .iter()
+        .any(|segment| segment.fragment_bitmap.is_none());
+    if unknown_coverage {
+        return Ok(true);
+    }
+    Ok(dataset.unindexed_fragments(name).await?.is_empty())
 }
 
 impl LsmVectorSearchPlanner {
@@ -639,7 +673,28 @@ impl LsmVectorSearchPlanner {
                 }
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
-                scanner.distance_range(self.distance_range.0, self.distance_range.1);
+                // The base may have no vector index on the column, one whose
+                // metric differs from the query's, or one that misses part of the
+                // base: `fast_search` returns nothing for the rows it cannot see,
+                // so search the base flat instead. An indexed base already
+                // reports on the plan's scale (see `with_distance_scale`); a flat
+                // one reports exact distances.
+                let indexed =
+                    match usable_vector_index(dataset, &self.vector_column, self.distance_type)
+                        .await?
+                    {
+                        Some(name) => index_covers_all_fragments(dataset, &name).await?,
+                        None => false,
+                    };
+                let scale = if indexed {
+                    1.0
+                } else {
+                    self.arm_scale(refine_factor, 1.0)
+                };
+                scanner.distance_range(
+                    self.distance_range.0.map(|lower| lower / scale),
+                    self.distance_range.1.map(|upper| upper / scale),
+                );
                 if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
                     scanner.minimum_nprobes(minimum_nprobes);
                 }
@@ -650,12 +705,19 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = indexed_arm_ef(self.ef, requested_k, k, refine_factor) {
                     scanner.ef(ef);
                 }
-                // Memtables cover unindexed rows; only search indexed data here.
-                scanner.fast_search();
-                if let Some(refine_factor) = refine_factor {
-                    scanner.refine(refine_factor);
+                if indexed {
+                    scanner.fast_search();
+                    if let Some(refine_factor) = refine_factor {
+                        scanner.refine(refine_factor);
+                    }
+                } else {
+                    // `nearest` would still pick that index and leave the gap to
+                    // the scanner's own flat fallback, so the arm's exact-distance
+                    // contract (and the scale it reports on) would depend on what
+                    // the scanner happens to reconcile.
+                    scanner.use_index(false);
                 }
-                scanner.create_plan().await
+                scale_distance(scanner.create_plan().await?, scale)
             }
             LsmDataSource::SsTable { path, .. } => {
                 let dataset = open_sstable(
@@ -729,8 +791,9 @@ impl LsmVectorSearchPlanner {
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 // A generation flushed while the column was not maintained has
                 // no index on it, so the scanner searches it flat.
-                let indexed =
-                    has_usable_vector_index(&dataset, &vector_column, self.distance_type).await?;
+                let indexed = usable_vector_index(&dataset, &vector_column, self.distance_type)
+                    .await?
+                    .is_some();
                 let native_scale = if indexed {
                     sstable_distance_scale(self.distance_type)
                 } else {
@@ -1174,8 +1237,9 @@ mod tests {
     /// whatever the caller asked for.
     #[tokio::test]
     async fn with_ef_reaches_the_memtable_arm() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1273,8 +1337,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_base_plus_active_returns_distance() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -1390,8 +1455,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_active_tombstone_masks_base_hit() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -1469,16 +1535,18 @@ mod tests {
     /// brute-force arm, which masks rows before the top-k cut.
     #[tokio::test]
     async fn test_vector_search_prefilter_restricts_to_matching_rows() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::{SessionContext, col, lit};
         use futures::TryStreamExt;
 
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
-        // Base rows are far from the query and unindexed, so `fast_search`
-        // contributes nothing; the test isolates the memtable prefilter.
+        // Base rows are far from the query and unindexed, so they are
+        // searched flat; they pass `id >= 2` and rank behind every memtable
+        // row, which still isolates the memtable prefilter for the top slots.
         let base_dataset = Arc::new(
             create_dataset(&base_uri, vec![create_test_batch(&schema, &[100, 200])]).await,
         );
@@ -1558,8 +1626,9 @@ mod tests {
         sorted.sort();
         assert_eq!(
             sorted,
-            vec![2, 3],
-            "prefilter must drop id=0 and id=1 (nearer but failing `id >= 2`)"
+            vec![2, 3, 100, 200],
+            "prefilter must drop id=0 and id=1 (nearer but failing `id >= 2`); \
+             the unindexed base rows pass the filter and are searched flat"
         );
     }
 
@@ -1577,16 +1646,18 @@ mod tests {
     /// that routing guard.
     #[tokio::test]
     async fn test_vector_search_distance_range_bounds_the_search() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
-        // Base rows are far and unindexed, so `fast_search` contributes nothing;
-        // the test isolates the memtable arms.
+        // Base rows are unindexed, so they are searched flat. They are far from
+        // the query, so they rank behind the memtable rows at k=2 and fail the
+        // upper bound, which isolates the memtable arms.
         let base_dataset = Arc::new(
             create_dataset(&base_uri, vec![create_test_batch(&schema, &[100, 200])]).await,
         );
@@ -1676,8 +1747,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_filtered_active_without_pk_keeps_all_matching_rows() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::{SessionContext, col, lit};
         use futures::TryStreamExt;
 
@@ -1911,8 +1983,9 @@ mod tests {
     /// is evaluated against the newest version of each PK.
     #[tokio::test]
     async fn test_vector_search_prefilter_excludes_pk_whose_newest_version_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use arrow_array::StringArray;
         use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
         use arrow_schema::{DataType, Field};
@@ -1955,9 +2028,10 @@ mod tests {
             .unwrap()
         };
 
-        // Base is unindexed, so `fast_search` contributes nothing; the test
-        // isolates the active-memtable dedup-before-filter behavior. Use a
-        // non-conflicting id to avoid any PK confusion.
+        // The base holds a single far 'active' row: the unindexed base is
+        // searched flat, making it the filter's only legitimate match, so a
+        // leaked pk=5 would show up as a second row. (Use a non-conflicting
+        // id to avoid any PK confusion.)
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
         let mut fb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
@@ -2025,11 +2099,14 @@ mod tests {
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
-        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let rows = collect_id_dist(&batches);
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
         assert_eq!(
-            total, 0,
+            ids,
+            vec![999],
             "pk=5's current version is 'archived' and must be excluded; a stale \
-             'active' older version must not leak (filter evaluated on newest)"
+             'active' older version must not leak (filter evaluated on newest). \
+             Only the base's own far 'active' row may match."
         );
     }
 
@@ -2038,8 +2115,9 @@ mod tests {
     /// newer active copy is `archived`; pk=5 must be absent from the result.
     #[tokio::test]
     async fn test_vector_search_prefilter_blocks_base_when_active_newest_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use arrow_array::StringArray;
@@ -2177,8 +2255,9 @@ mod tests {
         // delete/update phantom: the cluster constantly freezes memtables
         // (flush_interval ~250ms), so an insert and its later delete/update split
         // across in-memory generations.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2291,8 +2370,9 @@ mod tests {
         // Regression for: active arm previously did NOT call `build_projection_for_knn`,
         // so when the caller passed `projection=Some([...])`, the active arm's output
         // dropped the PK column (and the staleness/dedup pipeline lost its hash input).
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2371,8 +2451,9 @@ mod tests {
         // Regression: `_distance` / `_rowid` in projection must not break
         // the plan. `_distance` honored at requested position (no
         // duplication); `_rowid` honored as nullable.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2485,8 +2566,9 @@ mod tests {
         // (2) Active-memtable rows must reach the output — the UnionExec puts
         //     them in non-zero partitions, and any downstream node that only
         //     reads partition 0 would silently drop them.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2618,9 +2700,10 @@ mod tests {
         // under {base_uri}/_mem_wal/{shard}/gen_1 and pointing the
         // collector at it. Real flush would reverse-write, but for this
         // test we only have one row in the SSTable gen so order is moot.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2721,9 +2804,10 @@ mod tests {
         //   2. SSTable arm runs without erroring
         //   3. `_rowaddr` symmetry with `_rowid` (same code path, both are
         //      surfaced when requested and NULL'd outside the base arm)
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -3014,8 +3098,9 @@ mod tests {
         // Regression: same PK inserted twice into one active memtable with
         // *different* vectors. The exact active search must consider only the
         // newest version of each PK before top-k. The newer insert must win.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -3131,8 +3216,9 @@ mod tests {
         // (distance ~0), then updated to a FAR vector. Exact brute force must
         // compute newest-per-PK over the whole memtable before top-k, so the
         // stale near row is dropped even though the fresh row is far away.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -3242,8 +3328,9 @@ mod tests {
         //     to the query than fresh pk=1. With k=1 the active arm surfaces
         //     pk=2 and drops fresh pk=1, so without the block-list the stale
         //     base copy of pk=1 wins top-1.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -3450,8 +3537,9 @@ mod tests {
     async fn test_vector_search_overfetch_backfills_when_top_k_all_stale() {
         // A source whose entire top-k is stale must still yield k live results
         // from its next-nearest rows: the over-fetch backfills the dropped rows.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -3553,9 +3641,10 @@ mod tests {
     /// reports it exactly; both must land on the requested scale.
     #[tokio::test]
     async fn test_vector_search_cosine_arms_share_one_scale() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
         use lance_linalg::distance::DistanceType;
@@ -3765,6 +3854,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vector_search_base_without_vector_index_is_searched_flat() {
+        // A base with no vector index usable for the query (none on the
+        // column, or one with another metric): `fast_search` over it returned
+        // an EmptyExec and its rows silently vanished from every vector search.
+        use crate::index::DatasetIndexExt;
+        use crate::index::loading::DatasetIndexInternalExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::DistanceType;
+
+        let at = |cos_distance: f32, norm: f32| {
+            let cos = 1.0 - cos_distance;
+            [norm * cos, norm * (1.0 - cos * cos).sqrt(), 0.0, 0.0]
+        };
+        let query = {
+            use arrow_array::builder::Float32Builder;
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+            builder.values().append_slice(&[1.0, 0.0, 0.0, 0.0]);
+            builder.append(true);
+            builder.finish()
+        };
+        let expected = [(1, 0.05), (2, 0.4)];
+        let cosine_index = VectorIndexParams::ivf_flat(1, DistanceType::Cosine);
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let mut rows = vec![(1, at(0.05, 3.0)), (2, at(0.4, 2.0))];
+        rows.extend((10..=20).map(|id| (id, at(1.9, 1.0))));
+        let mut base_dataset = create_dataset(&base_uri, vec![batch_rows(&schema, &rows)]).await;
+
+        let search =
+            |base_dataset: &Dataset, scale: f32, refine: Option<u32>, upper: Option<f32>| {
+                let planner = LsmVectorSearchPlanner::new(
+                    LsmDataSourceCollector::new(Arc::new(base_dataset.clone()), vec![]),
+                    vec!["id".to_string()],
+                    schema.clone(),
+                    "vector".to_string(),
+                    DistanceType::Cosine,
+                )
+                .with_distance_scale(scale)
+                .with_refine_factor(refine)
+                .with_distance_range(None, upper);
+                let query = query.clone();
+                async move {
+                    let plan = planner
+                        .plan_search(&query, 2, 1, None, false, 1.0)
+                        .await
+                        .unwrap();
+                    let batches: Vec<RecordBatch> = plan
+                        .execute(0, SessionContext::new().task_ctx())
+                        .unwrap()
+                        .try_collect()
+                        .await
+                        .unwrap();
+                    collect_id_dist(&batches)
+                }
+            };
+        // Exact top-k the searched base must return, and the ids an upper bound
+        // of 0.5 on the 2x scale (exact distance 0.25) leaves at k=2.
+        let check = async |what: &str,
+                           base_dataset: &Dataset,
+                           expected: [(i32, f32); 2],
+                           bound_ids: Vec<i32>| {
+            // Flat distances are exact, rescaled to the plan's scale; a refined
+            // plan reports exact distances.
+            for (scale, refine, reported) in
+                [(1.0, None, 1.0), (2.0, None, 2.0), (2.0, Some(1), 1.0)]
+            {
+                let rows = search(base_dataset, scale, refine, None).await;
+                let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+                let want: Vec<i32> = expected.iter().map(|(id, _)| *id).collect();
+                assert_eq!(
+                    ids, want,
+                    "{what}, scale={scale} refine={refine:?}: got {rows:?}"
+                );
+                for ((id, distance), (_, exact)) in rows.iter().zip(expected) {
+                    assert!(
+                        (distance - exact * reported).abs() < 1e-4,
+                        "{what}, scale={scale} refine={refine:?}: id={id} reported \
+                             {distance}, expected {}",
+                        exact * reported
+                    );
+                }
+            }
+            // The range is given on the plan's scale, so an upper bound is
+            // divided by the same factor as the distances are multiplied by.
+            let rows = search(base_dataset, 2.0, None, Some(0.5)).await;
+            let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+            assert_eq!(
+                ids, bound_ids,
+                "{what}, bounded on the 2x scale: got {rows:?}"
+            );
+        };
+
+        check("unindexed base", &base_dataset, expected, vec![1]).await;
+
+        // An index whose metric differs from the query's is not usable either;
+        // the arm must fall back to flat instead of returning nothing.
+        let l2_index = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &l2_index, true)
+            .await
+            .unwrap();
+        check(
+            "metric-mismatched base index",
+            &base_dataset,
+            expected,
+            vec![1],
+        )
+        .await;
+
+        // A built index that covered no rows — a `train(false)` build, or a
+        // quantizer that could not train yet — declares the column, a known type
+        // and a matching metric, so metadata alone calls it usable. `fast_search`
+        // over it still returns nothing: the scanner rejects a segment covering no
+        // fragment, and the base's rows vanished.
+        let definition_only_uri = format!("{}/definition_only", temp_dir.path().to_str().unwrap());
+        let mut definition_only =
+            create_dataset(&definition_only_uri, vec![batch_rows(&schema, &rows)]).await;
+        definition_only
+            .create_index_builder(&["vector"], IndexType::Vector, &cosine_index)
+            .name("vector_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        assert!(
+            definition_only
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()[0]
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "a `train(false)` build must cover no rows"
+        );
+        check(
+            "definition-only matching index",
+            &definition_only,
+            expected,
+            vec![1],
+        )
+        .await;
+
+        // An index that covers only the fragments it was built over. The row
+        // appended afterwards is nearer than every indexed row, so a search that
+        // skips it lands on the wrong top-k.
+        let appended_uri = format!("{}/appended", temp_dir.path().to_str().unwrap());
+        let mut appended = create_dataset(&appended_uri, vec![batch_rows(&schema, &rows)]).await;
+        appended
+            .create_index(&["vector"], IndexType::Vector, None, &cosine_index, true)
+            .await
+            .unwrap();
+        let appended_batch = batch_rows(&schema, &[(3, at(0.01, 1.0))]);
+        let appended_schema = appended_batch.schema();
+        appended
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended_batch)], appended_schema),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            appended
+                .unindexed_fragments("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the appended fragment must be outside the index's coverage"
+        );
+        check(
+            "base with an uncovered appended fragment",
+            &appended,
+            [(3, 0.01), (1, 0.05)],
+            vec![3, 1],
+        )
+        .await;
+
+        // A usable index already reports on the plan's scale, so an indexed
+        // base is never rescaled.
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &cosine_index, true)
+            .await
+            .unwrap();
+        let native = search(&base_dataset, 1.0, None, None).await;
+        let on_2x_scale = search(&base_dataset, 2.0, None, None).await;
+        assert_eq!(native.len(), 2, "indexed base: got {native:?}");
+        assert_eq!(
+            on_2x_scale, native,
+            "an indexed base must report the index's distances unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn test_vector_search_sstable_superseded_by_newer_sstable() {
         // An older SSTable's stale row must be suppressed by a newer
         // SSTable (cross-SSTable blocking, no base/active involved).
@@ -3961,8 +4248,9 @@ mod tests {
     async fn test_vector_search_stale_read_with_composite_pk() {
         // The block-list must key on the full composite PK: a base row updated in
         // the active memtable (matched on (id1,id2)) must be suppressed.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -4074,8 +4362,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_prefilter_excludes_composite_pk_newest_version() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use arrow_array::StringArray;
         use arrow_array::builder::Float32Builder;
         use datafusion::prelude::{SessionContext, col, lit};
@@ -4205,8 +4494,9 @@ mod tests {
         // the newer far copy and exclude the stale near one — unlike
         // `test_vector_search_dedup_within_active_memtable`, which keeps the newer
         // copy only because it is also the closer one (a weaker check).
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -4303,10 +4593,11 @@ mod tests {
     /// being planned must not be returned alongside the older copy it replaces.
     #[tokio::test]
     async fn test_vector_search_write_during_planning_returns_key_once() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
         use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;

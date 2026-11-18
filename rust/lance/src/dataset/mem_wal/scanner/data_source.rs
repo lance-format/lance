@@ -9,7 +9,8 @@ use arrow_schema::SchemaRef;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 /// A watermark marking how far into one shard's fresh tier a prior scan
 /// observed, so membership can be evaluated as of that point (see

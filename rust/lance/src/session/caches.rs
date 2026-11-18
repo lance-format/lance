@@ -22,7 +22,7 @@ use lance_table::{
     format::{
         DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
     },
-    rowids::{RowIdIndex, RowIdSequence},
+    rowids::RowIdSequence,
 };
 use object_store::path::Path;
 
@@ -215,52 +215,6 @@ impl CacheKey for RowAddrMaskKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct RowIdIndexKey<'a> {
-    pub version: u64,
-    /// Whether the index knows the deleted rows (it then maps them to `None`).
-    /// An index built without deletion vectors reads no deletion file.
-    pub with_deletions: bool,
-    /// A dataset dropped and recreated at the same URI restarts its version
-    /// history at 1, so a long-lived session's cache can otherwise return the
-    /// previous incarnation's index for a version number the new incarnation
-    /// now also holds. The e-tag disambiguates generations the same way
-    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
-    /// cached index at all (see `get_row_id_index`).
-    pub e_tag: Option<&'a str>,
-}
-
-impl CacheKey for RowIdIndexKey<'_> {
-    type ValueType = RowIdIndex;
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "row_id_index/{}/{}/{}",
-            self.version,
-            self.with_deletions,
-            self.e_tag.unwrap_or("")
-        ))
-    }
-    fn type_name() -> &'static str {
-        "RowIdIndex"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
-        builder.write_u64(self.with_deletions as u64);
-        match self.e_tag {
-            Some(e_tag) => {
-                builder.write_some();
-                builder.write_str(e_tag);
-            }
-            None => builder.write_none(),
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct RowIdSequenceKey<'a> {
     pub fragment_id: u64,
     /// Where the sequence is stored. A fragment id alone is not enough: this
@@ -388,6 +342,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         };
         cache
             .insert_with_key(
@@ -437,31 +392,6 @@ mod tests {
                     fragment_id: 0,
                     row_id_meta: &second_generation,
                     lineage_file: None,
-                })
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn row_id_index_key_separates_manifest_generations() {
-        let cache = LanceCache::with_capacity(4096);
-        let key = RowIdIndexKey {
-            version: 5,
-            with_deletions: true,
-            e_tag: Some("first-etag"),
-        };
-        cache
-            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
-            .await;
-        assert!(cache.get_with_key(&key).await.is_some());
-
-        assert!(
-            cache
-                .get_with_key(&RowIdIndexKey {
-                    version: 5,
-                    with_deletions: true,
-                    e_tag: Some("second-etag"),
                 })
                 .await
                 .is_none()

@@ -110,12 +110,13 @@ public class Index {
   }
 
   /**
-   * Fields whose values this index carries but is not keyed on. Always a suffix of {@link
-   * #fields()}, and never all of it, so the first entry of {@code fields()} is always a column the
-   * index is keyed on. Empty for an index that carries no extra columns.
+   * Fields whose values this index carries. Empty for an index that carries no extra columns.
    *
-   * <p>These ids also appear in {@link #fields()} — that is deliberate, so that every consumer
-   * reading {@code fields()} as the index's dependency set also covers them with no change.
+   * <p>When these ids are a shorter trailing slice of {@link #fields()}, those trailing entries of
+   * {@code fields()} are carried, not keyed on, and the first entry of {@code fields()} is a column
+   * the index is keyed on. Otherwise every entry of {@code fields()} is a key, and this list may
+   * repeat entries of {@code fields()}. A consumer reading the index's dependency set reads both
+   * lists.
    *
    * @return the covering field IDs
    */
@@ -141,10 +142,25 @@ public class Index {
     return datasetVersion;
   }
 
+  /**
+   * Fragment IDs recorded in this index segment's manifest bitmap.
+   *
+   * <p>This reflects the raw fragment bitmap stored for the segment and may still include fragment
+   * IDs that have since been removed by deletes or compactions until index maintenance rewrites the
+   * segment.
+   *
+   * @return the recorded fragment IDs, or empty if no fragment bitmap is present
+   */
   public Optional<List<Integer>> fragments() {
     return Optional.ofNullable(fragments);
   }
 
+  /**
+   * Raw protobuf-encoded {@code google.protobuf.Any} index details stored in the manifest, or empty
+   * when the segment was committed without index details.
+   *
+   * @return the encoded index details bytes, or empty if absent
+   */
   public Optional<byte[]> indexDetails() {
     return Optional.ofNullable(indexDetails);
   }
@@ -189,6 +205,9 @@ public class Index {
 
   /**
    * Get the type of the index (e.g., BTREE, BITMAP, VECTOR).
+   *
+   * <p>Resolved from {@link #indexDetails()} when present, or inferred from the index metadata and
+   * dataset files when {@code index_details} was not persisted in the manifest.
    *
    * @return the index type, or null if unknown
    */

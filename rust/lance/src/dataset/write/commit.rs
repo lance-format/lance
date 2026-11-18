@@ -62,6 +62,8 @@ pub struct CommitBuilder<'a> {
     /// The complete desired clustering definitions list for an `UpdateConfig`
     /// commit; see [`ManifestBuildConfig::clustering_definitions`].
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    /// Whether the caller has opted in to committing a [`CompositeOperation`].
+    allow_composite_operations: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -90,11 +92,13 @@ impl<'a> CommitBuilder<'a> {
             deep_clone_files_copied: false,
             inherited_field_ids: false,
             clustering_definitions: None,
+            allow_composite_operations: false,
         }
     }
 
-    /// Whether to use stable row ids. This makes the `_rowid` column stable
-    /// after compaction, but not updates.
+    /// Whether to use stable row ids. A row then keeps the same `_rowid` for
+    /// its lifetime, even when compaction, an update or a merge insert
+    /// rewrites it.
     ///
     /// This is only used for new datasets. Existing datasets will use their
     /// existing setting.
@@ -162,28 +166,37 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Commit, together with an `UpdateConfig` transaction, the COMPLETE list of
-    /// clustering definitions the next manifest must hold: the target list.
-    /// A current definition the list keeps is unchanged, one it omits is
-    /// removed, and the new ones continue `max_clustering_id` in order; the
-    /// watermark never moves backwards. A definition can be removed only while
-    /// no fragment or index segment in the manifest the commit lands on
-    /// references it; otherwise the whole commit is refused. Applied against
-    /// that landing manifest, so a list built from a stale snapshot is a
-    /// non-retryable commit conflict (reload, rebuild the list, resubmit); a
-    /// list identical to the current one is a no-op. The transaction file
-    /// stays a plain `UpdateConfig`; the manifest is the durable record of the
-    /// definitions. Any other operation refuses this input, and so does a
-    /// detached commit.
+    /// Commit the complete list of clustering definitions this writer wants
+    /// the table to hold, planned against the manifest it read. Only an
+    /// `UpdateConfig` may carry it: the list rides alongside the metadata it
+    /// publishes and the commit stays a plain `UpdateConfig`; the manifest is
+    /// the durable record of the definitions. Any other operation refuses this
+    /// input, and so does a detached commit.
+    ///
+    /// The list is applied against the landing manifest on every attempt: a
+    /// definition allocated or removed underneath it, or one whose identity
+    /// changed, refuses the commit so the writer plans again. Every definition
+    /// the list allocates (each id above the read manifest's allocation mark,
+    /// not only the highest) is checked against the landing schema from the
+    /// schema the writer read: every key field must still be the same typed
+    /// field by id (same logical type along its path and in its subtree, a
+    /// timestamp's unit and timezone included). A same-id rename keeps a key;
+    /// a retype, a drop or a cast under a new id refuses the commit, and with
+    /// it every other allocation in the list. Retained definitions are not
+    /// checked.
     ///
     /// Definitions key on schema field ids, so allocating the first one on a
     /// table with reusable field ids activates non-reusable field ids in the
     /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
     /// dropped key field's id is never handed to a later column, and an
-    /// overwrite assigns ids above the mark. Activation is permanent: clearing
-    /// the definitions does not undo it, and under that contract the versions
-    /// from before the activating commit can no longer be restored (they stay
-    /// readable). A table already under the contract is unaffected.
+    /// overwrite assigns ids above the mark. Until that activation lands, a
+    /// stricter fence in the conflict resolver refuses concurrent schema
+    /// replacements that could reassign a key's id; it compares names too and
+    /// is deliberately separate from the typed check above. Activation is
+    /// permanent: clearing the definitions does not undo it, and under that
+    /// contract the versions from before the activating commit can no longer
+    /// be restored (they stay readable). A table already under the contract is
+    /// unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
         self
@@ -339,7 +352,56 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Opt in to committing an action-based transaction.
+    ///
+    /// Transaction V2 -- a [`Transaction`] whose operation is a
+    /// [`CompositeOperation`](lance_table::transaction::action::CompositeOperation)
+    /// -- is experimental for now: this API may change, and not every
+    /// operation can be expressed as actions yet.
+    /// The format it writes is not experimental.
+    ///
+    /// Without this opt-in, [`Self::execute`] rejects such a transaction with
+    /// [`Error::NotSupported`]. The opt-in has no effect on any other operation.
+    ///
+    /// # Compatibility
+    ///
+    /// Any reader can open and scan a dataset version committed this way: the
+    /// inline transaction lives in a manifest field older readers ignore
+    /// ([#9482]). Lance before v14.0.0 fails only when it decodes the
+    /// transaction itself, to read the transaction history or to check a
+    /// concurrent commit for conflicts. For conflict checking, that failure
+    /// aborts the older writer's commit, which is the safe outcome.
+    ///
+    /// [#9482]: https://github.com/lance-format/lance/pull/9482
+    ///
+    /// ```
+    /// # use lance::dataset::CommitBuilder;
+    /// # use lance::{Dataset, Result};
+    /// # use lance_table::transaction::Transaction;
+    /// # use std::sync::Arc;
+    /// # async fn commit(dataset: Arc<Dataset>, transaction: Transaction) -> Result<Dataset> {
+    /// CommitBuilder::new(dataset)
+    ///     .with_experimental_composite_operations(true)
+    ///     .execute(transaction)
+    ///     .await
+    /// # }
+    /// ```
+    pub fn with_experimental_composite_operations(mut self, allow: bool) -> Self {
+        self.allow_composite_operations = allow;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        if matches!(transaction.operation, Operation::CompositeOperation(_))
+            && !self.allow_composite_operations
+        {
+            return Err(Error::not_supported_source(
+                "Transaction V2 is experimental; a CompositeOperation can only be \
+                 committed after opting in with \
+                 CommitBuilder::with_experimental_composite_operations"
+                    .into(),
+            ));
+        }
         let timeout = self.timeout;
         if let Some(t) = timeout
             && t.is_zero()
@@ -462,6 +524,12 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
+        // A clone creates a new dataset. The destination may have appeared
+        // after the caller's preflight; never rebase a clone onto its winner.
+        if dest.dataset().is_some() && matches!(transaction.operation, Operation::Clone { .. }) {
+            return Err(Error::dataset_already_exists(dest.uri()));
+        }
+
         if dest.dataset().is_none()
             && !matches!(
                 transaction.operation,
@@ -537,6 +605,7 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
+                    None,
                 )
                 .await?
             }
@@ -600,6 +669,16 @@ impl<'a> CommitBuilder<'a> {
                         branch: manifest.branch.clone(),
                     },
                 );
+                let branch_identifier = if let Some(dataset) = dest.dataset() {
+                    dataset.ensure_branch_exists().await?;
+                    dataset.branch_identifier.clone()
+                } else {
+                    Arc::new(
+                        refs.branches()
+                            .get_identifier(manifest.branch.as_deref())
+                            .await?,
+                    )
+                };
 
                 Ok(Dataset {
                     object_store,
@@ -610,6 +689,7 @@ impl<'a> CommitBuilder<'a> {
                     session,
                     commit_handler,
                     refs,
+                    branch_identifier,
                     index_cache,
                     fragment_bitmap,
                     metadata_cache,
@@ -1448,6 +1528,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,

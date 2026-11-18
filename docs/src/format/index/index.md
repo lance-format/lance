@@ -117,7 +117,7 @@ in-place update or overlay that writes one of them invalidates the covered fragm
 rows into or out of the predicate. A writer that derives a segment from an existing one, for example by
 remapping, merging, or adding a delta segment, must carry the predicate forward unchanged.
 
-Writers must set `FLAG_INDEX_PREDICATES` (`1 << 19`) in both `reader_feature_flags` and
+Writers must set `FLAG_INDEX_PREDICATES` (`1 << 21`) in both `reader_feature_flags` and
 `writer_feature_flags` whenever any index in the manifest has a predicate, and clear it once none does.
 A reader that ignored the predicate would answer queries as if the segment held every row, and a writer
 that ignored it would drop the predicate from the next manifest it commits.

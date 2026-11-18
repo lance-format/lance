@@ -822,10 +822,14 @@ pub(crate) fn transform_fts_document_stream(
             .column_by_name(&resolved.root_column)
             .or_else(|| batch.column_by_name(VALUE_COLUMN_NAME))
             .expect("FTS document input schema was validated");
-        let documents = resolved
+        let mut documents = resolved
             .documents_from_array(source, batch.num_rows())
             .map_err(DataFusionError::from)?;
         let input_row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        // The row-ID validity bitmap can carry the scan's selection vector.
+        if input_row_ids.null_count() > 0 {
+            documents.retain(|document| input_row_ids.is_valid(document.row_index));
+        }
         let texts =
             StringArray::from_iter_values(documents.iter().map(|document| document.text.as_str()));
         let row_ids = UInt64Array::from_iter_values(
@@ -1033,7 +1037,7 @@ pub(crate) async fn merge_segments(
                 segment.uuid
             ))
         })?;
-        if segment.fields != segments[0].fields {
+        if !segment.declares_same_fields(&segments[0]) {
             return Err(Error::invalid_input(format!(
                 "FTS index {} has inconsistent fields across segments",
                 segments[0].name
@@ -1124,9 +1128,8 @@ pub async fn load_segments(
         return Ok(None);
     }
 
-    let expected_fields = indices[0].fields.clone();
     for meta in &indices {
-        if meta.fields != expected_fields {
+        if !meta.declares_same_fields(&indices[0]) {
             return Err(Error::invalid_input(format!(
                 "FTS index {} has inconsistent fields across segments",
                 index_meta.name

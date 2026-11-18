@@ -165,7 +165,7 @@ message Manifest {
    *   derived snapshots, including clone and restore, because data files may
    *   retain version 1 seeds. Legacy seeds may coexist and must be decoded
    *   with their original semantics.
-   * * 1 << 19: some index has a predicate (see IndexPredicate). Both feature
+   * * 1 << 21: some index has a predicate (see IndexPredicate). Both feature
    *   words must carry the bit while any index in the manifest has one. A
    *   reader or writer that ignores it would treat a partial index as covering
    *   every row.
@@ -466,7 +466,7 @@ message IndexMetadata {
 
   /* Restricts the index to rows where this predicate is TRUE. Absent means
    * the index covers every live row of the fragments in fragment_bitmap.
-   * Requires feature flag 1 << 19 in both reader_feature_flags and
+   * Requires feature flag 1 << 21 in both reader_feature_flags and
    * writer_feature_flags while any index in the manifest sets this field.
    */
   optional IndexPredicate predicate = 14;
@@ -672,6 +672,20 @@ message ShardManifest {
    * (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
    */
   ShardStatus status = 15;
+
+  /* The operation holding the seal; set with status SEALED, cleared on
+   * unseal. Identifies the holder and when it sealed.
+   */
+  optional SealedBy sealed_by = 16;
+}
+
+// The holder of a shard's seal.
+message SealedBy {
+  // Caller-chosen id of the operation that sealed the shard.
+  string txn = 1;
+
+  // When the seal was taken (Unix timestamp in milliseconds).
+  int64 sealed_at_millis = 2;
 }
 
 // A shard field value stored as raw Arrow scalar bytes.
@@ -694,7 +708,8 @@ message SsTable {
   string path = 2;
 
   /* Payload size of the rows, as the writer's MemTable accounted for them: the
-     sum over its buffers of the window each one holds.
+     sum over its buffers of the window each one holds, plus the payload of the
+     blob values the generation keeps in packed and dedicated sidecar files.
 
      An estimate of the payload, not a bound on what reading the SSTable costs.
      It excludes the per-array structure a reader materializes, so a consumer
@@ -842,6 +857,16 @@ message MemWalIndexDetails {
    * (which is not persisted).
    */
   map<string, string> writer_config_defaults = 11;
+
+  /* Names this MemWAL's storage directory, `_{dir_id}_mem_wal/` under the
+   * table's base path; empty means the legacy `_mem_wal/`. Minted at
+   * initialization and kept across rewrites of this index, so a
+   * re-initialized MemWAL shares no storage with an earlier one.
+   *
+   * Commits that change MemWAL state name their dir_id and are rejected when
+   * the index they build on carries another one, or none.
+   */
+  string dir_id = 13;
 }
 
 // Sharding spec definition.

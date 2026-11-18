@@ -11,7 +11,7 @@ pub mod pb {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.file.rs"));
+    include!("pb/lance.file.rs");
 }
 
 /// Protobuf definitions for Lance Format v2
@@ -24,7 +24,7 @@ pub mod pbfile {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.file.v2.rs"));
+    include!("pb/lance.file.v2.rs");
 }
 
 /// These version/magic values are written at the end of Lance files (e.g. versions/1.version)

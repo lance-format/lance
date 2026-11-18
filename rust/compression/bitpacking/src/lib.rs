@@ -13,10 +13,14 @@
 // The original code is licensed under the Apache Software License:
 // https://github.com/spiraldb/fastlanes/blob/8e0ff374f815d919d0c0ebdccf5ffd9e6dc7d663/LICENSE
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use arrayref::{array_mut_ref, array_ref};
 use core::mem::{MaybeUninit, size_of};
 
 mod bitpacker_internal;
+#[cfg(target_arch = "x86_64")]
+mod simd_x86;
 
 pub use bitpacker_internal::{BitPacker, BitPacker4x, BitPacker8x};
 
@@ -198,6 +202,15 @@ pub trait BitPacking: FastLanes {
     /// is the packed width. The output slice must be of exactly length 1024.
     /// These lengths are checked only with `debug_assert` (i.e., not checked on release builds).
     unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]);
+
+    /// Unpacks a single element at `index` (`0..1024`) from `W`-bit FastLanes-packed `input`
+    /// in `O(1)` time without unpacking the rest of the 1024-element block.
+    ///
+    /// # Safety
+    /// - `width <= Self::T`
+    /// - `index < 1024`
+    /// - `input.len() >= 1024 * width / Self::T`
+    unsafe fn unchecked_unpack_single(width: usize, input: &[Self], index: usize) -> Self;
 }
 
 /// Bitpacking kernels that can initialize previously uninitialized output storage.
@@ -225,25 +238,82 @@ macro_rules! impl_bitpacking_compat {
     ($ty:ty) => {
         impl BitPacking for $ty {
             unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+                // SAFETY: `MaybeUninit<Self>` has the layout of `Self`, and the new slice takes
+                // over the exclusive borrow of `output`. The kernels only write initialized
+                // values, so `output` stays valid even if one of them panics.
                 let output = unsafe {
                     core::slice::from_raw_parts_mut(
                         output.as_mut_ptr().cast::<MaybeUninit<Self>>(),
                         output.len(),
                     )
                 };
+                // SAFETY: `unchecked_pack_uninit` has the same length contract as this function,
+                // and the caller upholds it.
                 unsafe { <Self as BitPackingUninit>::unchecked_pack_uninit(width, input, output) };
             }
 
             unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+                // SAFETY: `MaybeUninit<Self>` has the layout of `Self`, and the new slice takes
+                // over the exclusive borrow of `output`. The kernels only write initialized
+                // values, so `output` stays valid even if one of them panics.
                 let output = unsafe {
                     core::slice::from_raw_parts_mut(
                         output.as_mut_ptr().cast::<MaybeUninit<Self>>(),
                         output.len(),
                     )
                 };
+                // SAFETY: `unchecked_unpack_uninit` has the same length contract as this function,
+                // and the caller upholds it.
                 unsafe {
                     <Self as BitPackingUninit>::unchecked_unpack_uninit(width, input, output)
                 };
+            }
+
+            #[inline]
+            unsafe fn unchecked_unpack_single(width: usize, input: &[Self], index: usize) -> Self {
+                const BITS: usize = <$ty as FastLanes>::T;
+                const LANES: usize = <$ty as FastLanes>::LANES;
+
+                debug_assert!(index < 1024, "Index must be less than 1024");
+                debug_assert!(width <= BITS, "Width must be <= {BITS}");
+                debug_assert!(
+                    input.len() >= 1024 * width / BITS,
+                    "Input buffer too small for width {width}"
+                );
+
+                if width == 0 {
+                    return 0;
+                }
+
+                // Inverse of FastLanes index(row, lane) = FL_ORDER[row / 8] * 16 + (row % 8) * 128 + lane.
+                // Because FL_ORDER = [0, 4, 2, 6, 1, 5, 3, 7] is an involution (FL_ORDER[FL_ORDER[x]] == x)
+                // and LANES = 1024 / BITS is a power of two in 16..=128, lane, FL_ORDER[o] * 16, and s * 128
+                // occupy disjoint bit ranges of `index`.
+                let lane = index & (LANES - 1);
+                let fl_o = (index & 127 & !(LANES - 1)) >> 4;
+                // SAFETY: `fl_o` masks `index` with `127` and shifts right by `4`, so `fl_o < 8 == FL_ORDER.len()`.
+                let o = unsafe { *FL_ORDER.get_unchecked(fl_o) };
+                let row = (o << 3) | (index >> 7);
+
+                if width == BITS {
+                    // SAFETY: `index < 1024` gives `row < 64` and `lane < LANES`, so `LANES * row + lane < 1024 <= input.len()`.
+                    return unsafe { *input.get_unchecked(LANES * row + lane) };
+                }
+
+                let mask: Self = (1 << width) - 1;
+                let bit_pos = row * width;
+                let curr_word = bit_pos / BITS;
+                let shift = bit_pos % BITS;
+                // SAFETY: `row < 1024 / LANES` and `width < BITS`, so `LANES * curr_word + lane < 1024 * width / BITS <= input.len()`.
+                let src0 = unsafe { *input.get_unchecked(LANES * curr_word + lane) };
+                if shift + width <= BITS {
+                    (src0 >> shift) & mask
+                } else {
+                    // SAFETY: When `shift + width > BITS`, the value spans into `curr_word + 1 < 1024 * width / BITS`,
+                    // so `LANES * (curr_word + 1) + lane < input.len()`.
+                    let src1 = unsafe { *input.get_unchecked(LANES * (curr_word + 1) + lane) };
+                    ((src0 >> shift) | (src1 << (BITS - shift))) & mask
+                }
             }
         }
     };
@@ -272,6 +342,22 @@ impl BitPackingUninit for u8 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::pack_u8(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::pack_u8(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -331,6 +417,22 @@ impl BitPackingUninit for u8 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::unpack_u8(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::unpack_u8(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -393,6 +495,22 @@ impl BitPackingUninit for u16 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::pack_u16(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::pack_u16(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -485,6 +603,22 @@ impl BitPackingUninit for u16 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::unpack_u16(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::unpack_u16(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -579,6 +713,22 @@ impl BitPackingUninit for u32 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::pack_u32(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::pack_u32(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -737,6 +887,22 @@ impl BitPackingUninit for u32 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::unpack_u32(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::unpack_u32(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -897,6 +1063,22 @@ impl BitPackingUninit for u64 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::pack_u64(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::pack_u64(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -1186,6 +1368,22 @@ impl BitPackingUninit for u64 {
             "Width must be less than or equal to {}",
             Self::T
         );
+
+        #[cfg(target_arch = "x86_64")]
+        match simd_x86::detect_level() {
+            simd_x86::SimdLevel::Avx512 => {
+                // SAFETY: `detect_level` verified `avx512f`, `avx512bw`, and `avx512vl` support,
+                // and caller upholds the slice length invariants checked above.
+                unsafe { simd_x86::avx512::unpack_u64(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Avx2 => {
+                // SAFETY: `detect_level` verified `avx2` support, and caller upholds slice lengths.
+                unsafe { simd_x86::avx2::unpack_u64(width, input, output) };
+                return;
+            }
+            simd_x86::SimdLevel::Scalar => {}
+        }
 
         match width {
             0 => {
@@ -1941,7 +2139,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u8>` has the layout of `u8`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len()) };
 
@@ -1970,7 +2169,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u16>` has the layout of `u16`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u16>(), packed.len()) };
 
@@ -1999,7 +2199,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u32>` has the layout of `u32`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u32>(), packed.len()) };
 
@@ -2034,7 +2235,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u64>` has the layout of `u64`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u64>(), packed.len()) };
 
@@ -2187,10 +2389,12 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u8;
         }
         let mut packed = vec![0; 1024 * bit_width / 8];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2202,10 +2406,12 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u16;
         }
         let mut packed = vec![0; 1024 * bit_width / u16::T];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2217,10 +2423,12 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u32;
         }
         let mut packed = vec![0; 1024 * bit_width / u32::T];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2238,10 +2446,12 @@ mod test {
             }
         }
         let mut packed = vec![0; 1024 * bit_width / u64::T];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2250,8 +2460,10 @@ mod test {
     fn test_unchecked_pack() {
         let input = array::from_fn(|i| i as u32);
         let mut packed = [0; 320];
+        // SAFETY: `input` holds 1024 values and `packed` holds 1024 * 10 / 32 = 320.
         unsafe { BitPacking::unchecked_pack(10, &input, &mut packed) };
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds 320 values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(10, &packed, &mut output) };
         assert_eq!(input, output);
 
@@ -2378,5 +2590,450 @@ mod test {
         unchecked_pack_unpack_u64(62);
         unchecked_pack_unpack_u64(63);
         unchecked_pack_unpack_u64(64);
+    }
+
+    #[test]
+    fn test_unchecked_unpack_single_exhaustive() {
+        let mut rng = XorShift::new(0x9E37_79B9);
+
+        for width in 0..=8 {
+            let mut values = [0u8; 1024];
+            if width > 0 {
+                let mask = if width == 8 {
+                    u8::MAX
+                } else {
+                    (1u8 << width) - 1
+                };
+                for v in &mut values {
+                    *v = (rng.next() as u8) & mask;
+                }
+            }
+            let mut packed = vec![0u8; 1024 * width / u8::T];
+            // SAFETY: `values` has 1024 elements, `width <= 8`, and `packed` has exact length `1024 * width / 8`.
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 8`, and `packed` holds `1024 * width / 8` words.
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u8 mismatch at width={width}, idx={idx}");
+            }
+        }
+
+        for width in 0..=16 {
+            let mut values = [0u16; 1024];
+            if width > 0 {
+                let mask = if width == 16 {
+                    u16::MAX
+                } else {
+                    (1u16 << width) - 1
+                };
+                for v in &mut values {
+                    *v = (rng.next() as u16) & mask;
+                }
+            }
+            let mut packed = vec![0u16; 1024 * width / u16::T];
+            // SAFETY: `values` has 1024 elements, `width <= 16`, and `packed` has exact length `1024 * width / 16`.
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 16`, and `packed` holds `1024 * width / 16` words.
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u16 mismatch at width={width}, idx={idx}");
+            }
+        }
+
+        for width in 0..=32 {
+            let mut values = [0u32; 1024];
+            if width > 0 {
+                let mask = if width == 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << width) - 1
+                };
+                for v in &mut values {
+                    *v = (rng.next() as u32) & mask;
+                }
+            }
+            let mut packed = vec![0u32; 1024 * width / u32::T];
+            // SAFETY: `values` has 1024 elements, `width <= 32`, and `packed` has exact length `1024 * width / 32`.
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 32`, and `packed` holds `1024 * width / 32` words.
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u32 mismatch at width={width}, idx={idx}");
+            }
+        }
+
+        for width in 0..=64 {
+            let mut values = [0u64; 1024];
+            if width > 0 {
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                for v in &mut values {
+                    *v = rng.next() & mask;
+                }
+            }
+            let mut packed = vec![0u64; 1024 * width / u64::T];
+            // SAFETY: `values` has 1024 elements, `width <= 64`, and `packed` has exact length `1024 * width / 64`.
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 64`, and `packed` holds `1024 * width / 64` words.
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u64 mismatch at width={width}, idx={idx}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[allow(clippy::identity_op)]
+    fn test_x86_simd_backends_match_scalar_unaligned_and_dirty_upper_bits() {
+        let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let has_avx512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+
+        let mut rng = XorShift::new(0xDEAD_BEEF_CAFE_BABEu64);
+
+        // u8: widths 0..=8 with unaligned (+1 element) slices and dirty upper bits
+        for w in 0..=8usize {
+            let mask: u8 = if w == 0 {
+                0
+            } else if w == 8 {
+                u8::MAX
+            } else {
+                (1u8 << w) - 1
+            };
+            let mut dirty_in = vec![0u8; 1025];
+            let mut expected_clean = [0u8; 1024];
+            for i in 0..1024 {
+                let r = rng.next() as u8;
+                dirty_in[i + 1] = r;
+                expected_clean[i] = r & mask;
+            }
+            let packed_len = 128 * w;
+            let mut scalar_packed = vec![MaybeUninit::<u8>::uninit(); packed_len];
+            seq_macro::seq!(BW in 1..=8 {
+                match w {
+                    0 => {}
+                    #(BW => super::pack_8_~BW(
+                        array_ref![dirty_in, 1, 1024],
+                        array_mut_ref![scalar_packed, 0, 128 * BW],
+                    ),)*
+                    _ => unreachable!(),
+                }
+            });
+            // SAFETY: every element of `scalar_packed` was initialized above.
+            let expected_packed = unsafe {
+                core::slice::from_raw_parts(scalar_packed.as_ptr().cast::<u8>(), packed_len)
+            };
+
+            if has_avx2 {
+                let mut packed_buf = vec![MaybeUninit::<u8>::new(0xAA); packed_len + 1];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::pack_u8(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u8>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx2 u8 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u8>::new(0x55); 1025];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::unpack_u8(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u8>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx2 u8 unpack mismatch at w={w}"
+                );
+            }
+
+            if has_avx512 {
+                let mut packed_buf = vec![MaybeUninit::<u8>::new(0xAA); packed_len + 1];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::pack_u8(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u8>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx512 u8 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u8>::new(0x55); 1025];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::unpack_u8(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u8>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx512 u8 unpack mismatch at w={w}"
+                );
+            }
+        }
+
+        // u16: widths 0..=16
+        for w in 0..=16usize {
+            let mask: u16 = match w {
+                0 => 0,
+                16 => u16::MAX,
+                _ => (1u16 << w) - 1,
+            };
+            let mut dirty_in = vec![0u16; 1025];
+            let mut expected_clean = [0u16; 1024];
+            for i in 0..1024 {
+                let r = rng.next() as u16;
+                dirty_in[i + 1] = r;
+                expected_clean[i] = r & mask;
+            }
+            let packed_len = 64 * w;
+            let mut scalar_packed = vec![MaybeUninit::<u16>::uninit(); packed_len];
+            seq_macro::seq!(BW in 1..=16 {
+                match w {
+                    0 => {}
+                    #(BW => super::pack_16_~BW(
+                        array_ref![dirty_in, 1, 1024],
+                        array_mut_ref![scalar_packed, 0, 64 * BW],
+                    ),)*
+                    _ => unreachable!(),
+                }
+            });
+            // SAFETY: `scalar_packed` was initialized above.
+            let expected_packed = unsafe {
+                core::slice::from_raw_parts(scalar_packed.as_ptr().cast::<u16>(), packed_len)
+            };
+
+            if has_avx2 {
+                let mut packed_buf = vec![MaybeUninit::<u16>::new(0xAAAA); packed_len + 1];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::pack_u16(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u16>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx2 u16 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u16>::new(0x5555); 1025];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::unpack_u16(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u16>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx2 u16 unpack mismatch at w={w}"
+                );
+            }
+
+            if has_avx512 {
+                let mut packed_buf = vec![MaybeUninit::<u16>::new(0xAAAA); packed_len + 1];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::pack_u16(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u16>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx512 u16 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u16>::new(0x5555); 1025];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::unpack_u16(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u16>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx512 u16 unpack mismatch at w={w}"
+                );
+            }
+        }
+
+        // u32: widths 0..=32
+        for w in 0..=32usize {
+            let mask: u32 = match w {
+                0 => 0,
+                32 => u32::MAX,
+                _ => (1u32 << w) - 1,
+            };
+            let mut dirty_in = vec![0u32; 1025];
+            let mut expected_clean = [0u32; 1024];
+            for i in 0..1024 {
+                let r = rng.next() as u32;
+                dirty_in[i + 1] = r;
+                expected_clean[i] = r & mask;
+            }
+            let packed_len = 32 * w;
+            let mut scalar_packed = vec![MaybeUninit::<u32>::uninit(); packed_len];
+            seq_macro::seq!(BW in 1..=32 {
+                match w {
+                    0 => {}
+                    #(BW => super::pack_32_~BW(
+                        array_ref![dirty_in, 1, 1024],
+                        array_mut_ref![scalar_packed, 0, 32 * BW],
+                    ),)*
+                    _ => unreachable!(),
+                }
+            });
+            // SAFETY: `scalar_packed` was initialized above.
+            let expected_packed = unsafe {
+                core::slice::from_raw_parts(scalar_packed.as_ptr().cast::<u32>(), packed_len)
+            };
+
+            if has_avx2 {
+                let mut packed_buf = vec![MaybeUninit::<u32>::new(0xAAAA_AAAA); packed_len + 1];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::pack_u32(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u32>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx2 u32 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u32>::new(0x5555_5555); 1025];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::unpack_u32(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u32>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx2 u32 unpack mismatch at w={w}"
+                );
+            }
+
+            if has_avx512 {
+                let mut packed_buf = vec![MaybeUninit::<u32>::new(0xAAAA_AAAA); packed_len + 1];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::pack_u32(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u32>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx512 u32 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u32>::new(0x5555_5555); 1025];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::unpack_u32(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u32>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx512 u32 unpack mismatch at w={w}"
+                );
+            }
+        }
+
+        // u64: widths 0..=64
+        for w in 0..=64usize {
+            let mask: u64 = match w {
+                0 => 0,
+                64 => u64::MAX,
+                _ => (1u64 << w) - 1,
+            };
+            let mut dirty_in = vec![0u64; 1025];
+            let mut expected_clean = [0u64; 1024];
+            for i in 0..1024 {
+                let r = rng.next();
+                dirty_in[i + 1] = r;
+                expected_clean[i] = r & mask;
+            }
+            let packed_len = 16 * w;
+            let mut scalar_packed = vec![MaybeUninit::<u64>::uninit(); packed_len];
+            seq_macro::seq!(BW in 1..=64 {
+                match w {
+                    0 => {}
+                    #(BW => super::pack_64_~BW(
+                        array_ref![dirty_in, 1, 1024],
+                        array_mut_ref![scalar_packed, 0, 16 * BW],
+                    ),)*
+                    _ => unreachable!(),
+                }
+            });
+            // SAFETY: `scalar_packed` was initialized above.
+            let expected_packed = unsafe {
+                core::slice::from_raw_parts(scalar_packed.as_ptr().cast::<u64>(), packed_len)
+            };
+
+            if has_avx2 {
+                let mut packed_buf =
+                    vec![MaybeUninit::<u64>::new(0xAAAA_AAAA_AAAA_AAAA); packed_len + 1];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::pack_u64(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u64>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx2 u64 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u64>::new(0x5555_5555_5555_5555); 1025];
+                // SAFETY: `avx2` is detected and slice lengths match `w`.
+                unsafe { simd_x86::avx2::unpack_u64(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u64>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx2 u64 unpack mismatch at w={w}"
+                );
+            }
+
+            if has_avx512 {
+                let mut packed_buf =
+                    vec![MaybeUninit::<u64>::new(0xAAAA_AAAA_AAAA_AAAA); packed_len + 1];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::pack_u64(w, &dirty_in[1..], &mut packed_buf[1..]) };
+                // SAFETY: `packed_buf[1..]` was initialized.
+                let got_packed = unsafe {
+                    core::slice::from_raw_parts(packed_buf[1..].as_ptr().cast::<u64>(), packed_len)
+                };
+                assert_eq!(
+                    got_packed, expected_packed,
+                    "avx512 u64 pack mismatch at w={w}"
+                );
+
+                let mut out_buf = vec![MaybeUninit::<u64>::new(0x5555_5555_5555_5555); 1025];
+                // SAFETY: `avx512f/bw/vl` are detected and slice lengths match `w`.
+                unsafe { simd_x86::avx512::unpack_u64(w, got_packed, &mut out_buf[1..]) };
+                // SAFETY: `out_buf[1..]` was initialized.
+                let got_unpacked = unsafe {
+                    core::slice::from_raw_parts(out_buf[1..].as_ptr().cast::<u64>(), 1024)
+                };
+                assert_eq!(
+                    got_unpacked, &expected_clean,
+                    "avx512 u64 unpack mismatch at w={w}"
+                );
+            }
+        }
     }
 }

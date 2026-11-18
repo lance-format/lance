@@ -1265,13 +1265,14 @@ mod tests {
             ivf: ivf.clone(),
             aux_ivf: ivf,
             distance_type: DistanceType::L2,
-            sub_index_metadata: vec!["meta1".to_string()],
+            sub_index_metadata: vec!["meta1".to_string()].into(),
             metadata: lance_index::vector::flat::index::FlatMetadata { dim: 2 },
             sub_index_type: SubIndexType::Flat,
             quantization_type: QuantizationType::Flat,
             index_file_size: 1024,
             aux_file_size: 512,
             rq_search_cache: empty_rabit_search_cache_cell(),
+            quantizer: None,
         };
 
         let entry = IvfStateEntryBox(Arc::new(state));

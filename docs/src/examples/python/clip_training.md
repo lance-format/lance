@@ -12,13 +12,14 @@ Along with Lance, we will be needing [PyTorch](https://pytorch.org/get-started/l
 ```python
 import cv2
 import lance
+from lance.torch.data import get_safe_loader
 
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torchvision import transforms
 
 import timm
@@ -50,65 +51,85 @@ class Config:
     text_encoder_model = 'bert-base-cased'
 ```
 
-And also two utility functions that will help us load the images and texts from the lance dataset. 
+And also two utility functions that will help us decode each image payload and pick a caption. 
 Remember, our Lance dataset has images, image names and all the captions for a given image. We only need the images and one of those captions. 
 For simplicity, when loading captions, we will be choosing the one that is the longest (with the rather naive assumption that it has more information about the image).
 
 ```python
-def load_image(ds, idx):
-    # Utility function to load an image at an index and convert it from bytes format to img format
-    raw_img = ds.take([idx], columns=['image']).to_pydict()
-    raw_img = np.frombuffer(b''.join(raw_img['image']), dtype=np.uint8)
+def decode_image(raw_bytes):
+    # Convert raw image bytes into an OpenCV RGB image
+    raw_img = np.frombuffer(raw_bytes, dtype=np.uint8)
     img = cv2.imdecode(raw_img, cv2.IMREAD_COLOR)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     return img
 
-def load_caption(ds, idx):
-    # Utility function to load an image's caption. Currently we return the longest caption of all
-    captions = ds.take([idx], columns=['captions']).to_pydict()['captions'][0]
+def select_caption(captions):
+    # Return the longest caption for an image
     return max(captions, key=len)
 ```
 
-Since the images are stored as bytes in the lance dataset, the `load_image()` function will load the bytes corresponding to an image and then use numpy and opencv to convert it into an image.
+`decode_image()` converts the raw image bytes retrieved from Lance into an image array using NumPy and OpenCV.
 
 ## Dataset and Augmentations
 
-Since our CLIP model will expect images of same size and tokenized captions, we will define a custom PyTorch dataset that will take the lance dataset path along with any augmentation (for the image) and return a pre-processed image and a tokenized caption (as a dictionary).
+Since our CLIP model expects resized images and tokenized captions, we will define a custom PyTorch dataset that opens the Lance dataset lazily inside each worker process and implements `__getitems__` so an entire batch of images and captions is fetched in one batched operation instead of calling `ds.take([idx])` twice per sample.
 
 ```python
 class CLIPLanceDataset(Dataset):
     """Custom Dataset to load images and their corresponding captions"""
     def __init__(self, lance_path, max_len=18, tokenizer=None, transforms=None):
-        self.ds = lance.dataset(lance_path)
+        self.lance_path = lance_path
         self.max_len = max_len
         # Init a new tokenizer if not specified already
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-cased') if not tokenizer else tokenizer
         self.transforms = transforms
+        self._ds = None
+
+        ds = lance.dataset(lance_path)
+        self._len = ds.count_rows()
+        del ds
+
+    def _get_ds(self):
+        if self._ds is None:
+            self._ds = lance.dataset(self.lance_path)
+        return self._ds
 
     def __len__(self):
-        return self.ds.count_rows()
+        return self._len
 
     def __getitem__(self, idx):
-        # Load the image and caption
-        img = load_image(self.ds, idx)
-        caption = load_caption(self.ds, idx)
+        return self.__getitems__([idx])[0]
 
-        # Apply transformations to the images
-        if self.transforms:
-            img = self.transforms(img)
+    def __getitems__(self, indices):
+        ds = self._get_ds()
+        # Read a full batch of image payloads from the Blob v2 column and their captions.
+        # (If your dataset stores `image` as a plain binary column instead of a blob column,
+        # use `ds.take(indices, columns=["image", "captions"]).to_pydict()`.)
+        image_bytes = [
+            payload
+            for _, payload in ds.read_blobs(
+                "image", indices=indices, preserve_order=True
+            )
+        ]
+        caption_rows = ds.take(indices, columns=["captions"]).to_pydict()["captions"]
 
-        # Tokenize the caption
-        caption = self.tokenizer(
-            caption,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_len,
-            return_tensors='pt'
-        )
-        # Flatten each component of tokenized caption otherwise they will cause size mismatch errors during training
-        caption = {k: v.flatten() for k, v in caption.items()}
+        samples = []
+        for raw_bytes, captions in zip(image_bytes, caption_rows):
+            img = decode_image(raw_bytes)
+            if self.transforms:
+                img = self.transforms(img)
 
-        return img, caption
+            tokenized = self.tokenizer(
+                select_caption(captions),
+                truncation=True,
+                padding='max_length',
+                max_length=self.max_len,
+                return_tensors='pt',
+            )
+            tokenized = {k: v.flatten() for k, v in tokenized.items()}
+            samples.append((img, tokenized))
+
+        return samples
 ```
 
 Now that our custom dataset is ready, we also define some very basic augmentations for our images.
@@ -208,7 +229,7 @@ def loss_fn(img_embed, text_embed, temperature=0.2):
     text_loss = (-targets * nn.LogSoftmax(dim=-1)(logits)).sum(1)
     return (img_loss + text_loss) / 2.0
 
-def forward(img, caption):
+def forward(img, caption, img_encoder, img_head, text_encoder, text_head):
     # Transfer to device
     img = img.to('cuda')
     for k, v in caption.items():
@@ -221,77 +242,83 @@ def forward(img, caption):
     return img_embed, text_embed
 ```
 
-In order for us to train, we will define the models, tokenizer and the optimizer to be used in the next section
+In order for us to train, we will define a helper that initializes the models, tokenizer, and optimizer.
 
 ```python
-# Define image encoder, image head, text encoder, text head and a tokenizer for tokenizing the caption
-img_encoder = ImageEncoder(model_name=Config.img_encoder_model).to('cuda')
-img_head = Head(Config.img_embed_dim, Config.projection_dim).to('cuda')
+def init_training_components():
+    # Define image encoder, image head, text encoder, text head and a tokenizer for tokenizing the caption
+    img_encoder = ImageEncoder(model_name=Config.img_encoder_model).to('cuda')
+    img_head = Head(Config.img_embed_dim, Config.projection_dim).to('cuda')
 
-tokenizer = AutoTokenizer.from_pretrained(Config.text_encoder_model)
-text_encoder = TextEncoder(model_name=Config.text_encoder_model).to('cuda')
-text_head = Head(Config.text_embed_dim, Config.projection_dim).to('cuda')
+    tokenizer = AutoTokenizer.from_pretrained(Config.text_encoder_model)
+    text_encoder = TextEncoder(model_name=Config.text_encoder_model).to('cuda')
+    text_head = Head(Config.text_embed_dim, Config.projection_dim).to('cuda')
 
-# Since we are optimizing two different models together, we will define parameters manually
-parameters = [
-    {"params": img_encoder.parameters(), "lr": Config.img_enc_lr},
-    {"params": text_encoder.parameters(), "lr": Config.text_enc_lr},
-    {
-        "params": itertools.chain(
-            img_head.parameters(),
-            text_head.parameters(),
-        ),
-        "lr": Config.head_lr,
-    },
-]
+    # Since we are optimizing two different models together, we will define parameters manually
+    parameters = [
+        {"params": img_encoder.parameters(), "lr": Config.img_enc_lr},
+        {"params": text_encoder.parameters(), "lr": Config.text_enc_lr},
+        {
+            "params": itertools.chain(
+                img_head.parameters(),
+                text_head.parameters(),
+            ),
+            "lr": Config.head_lr,
+        },
+    ]
 
-optimizer = torch.optim.Adam(parameters)
+    optimizer = torch.optim.Adam(parameters)
+    return img_encoder, img_head, text_encoder, text_head, tokenizer, optimizer
 ```
 
 ## Training
 
-Before we actually train the model, one last step remains: which is to initialize our Lance dataset and a dataloader.
+Before we actually train the model, one last step remains: initializing our Lance dataset and a process-safe dataloader inside a `__main__` guard so spawned worker processes do not re-run model initialization.
 
 ```python
-# We assume the flickr8k.lance dataset is in the same directory
-dataset = CLIPLanceDataset(
-    lance_path="flickr8k.lance",
-    max_len=Config.max_len,
-    tokenizer=tokenizer,
-    transforms=train_augments
-)
+if __name__ == "__main__":
+    img_encoder, img_head, text_encoder, text_head, tokenizer, optimizer = (
+        init_training_components()
+    )
 
-dataloader = DataLoader(
-    dataset,
-    shuffle=False,
-    batch_size=Config.bs,
-    pin_memory=True
-)
-```
+    # We assume the flickr8k.lance dataset is in the same directory
+    dataset = CLIPLanceDataset(
+        lance_path="flickr8k.lance",
+        max_len=Config.max_len,
+        tokenizer=tokenizer,
+        transforms=train_augments,
+    )
 
-Now that our dataloader is initialized, let's train the model.
+    dataloader = get_safe_loader(
+        dataset,
+        shuffle=False,
+        batch_size=Config.bs,
+        num_workers=2,
+        pin_memory=True,
+    )
 
-```python
-img_encoder.train()
-img_head.train()
-text_encoder.train()
-text_head.train()
+    img_encoder.train()
+    img_head.train()
+    text_encoder.train()
+    text_head.train()
 
-for epoch in range(Config.num_epochs):
-    print(f"{'='*20} Epoch: {epoch+1} / {Config.num_epochs} {'='*20}")
+    for epoch in range(Config.num_epochs):
+        print(f"{'='*20} Epoch: {epoch+1} / {Config.num_epochs} {'='*20}")
 
-    prog_bar = tqdm(dataloader)
-    for img, caption in prog_bar:
-        optimizer.zero_grad(set_to_none=True)
+        prog_bar = tqdm(dataloader)
+        for img, caption in prog_bar:
+            optimizer.zero_grad(set_to_none=True)
 
-        img_embed, text_embed = forward(img, caption)
-        loss = loss_fn(img_embed, text_embed, temperature=Config.temperature).mean()
+            img_embed, text_embed = forward(
+                img, caption, img_encoder, img_head, text_encoder, text_head
+            )
+            loss = loss_fn(img_embed, text_embed, temperature=Config.temperature).mean()
 
-        loss.backward()
-        optimizer.step()
+            loss.backward()
+            optimizer.step()
 
-        prog_bar.set_description(f"loss: {loss.item():.4f}")
-    print()
+            prog_bar.set_description(f"loss: {loss.item():.4f}")
+        print()
 ```
 
 The training loop is quite self-explanatory. We set image encoder, image head, text encoder and text head models to training mode. 

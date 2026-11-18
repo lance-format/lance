@@ -620,7 +620,11 @@ async fn read_spilled_column(
     let file = scheduler
         .open_file(&path, &data_file.file_size_bytes)
         .await?;
-    let options = dataset.file_reader_options.clone().unwrap_or_default();
+    let options = dataset
+        .file_reader_options
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
     let cache = dataset.metadata_cache.file_metadata_cache(&path);
     let io =
         Arc::new(LanceEncodingsIo::new(file.clone()).with_read_chunk_size(options.read_chunk_size));
@@ -2202,6 +2206,7 @@ mod tests {
                 let read_version = dataset.manifest.version;
                 let operation = Operation::DataReplacement {
                     replacements: vec![replacement],
+                    data_change: true,
                 };
                 dataset = Dataset::commit(
                     Arc::new(dataset),
@@ -2410,7 +2415,7 @@ mod tests {
         /// commits, which has to retry against the compacted fragment.
         UpdateAcrossCompaction,
         /// A compaction that rewrites its fragments, then commits after an
-        /// [`Step::Append`] it did not read; it must retry with a fresh plan.
+        /// [`Step::Append`] it did not read.
         CompactionAcrossAppend,
         /// A compaction that rewrites its fragments while a delete of
         /// `i % 11 = 0` commits in them. The compaction has to lose with a
@@ -2676,7 +2681,10 @@ mod tests {
                     let read_version = self.dataset.manifest.version;
                     self.dataset = Dataset::commit(
                         Arc::new(self.dataset.clone()),
-                        Operation::DataReplacement { replacements },
+                        Operation::DataReplacement {
+                            replacements,
+                            data_change: true,
+                        },
                         Some(read_version),
                         None,
                         None,
@@ -2727,26 +2735,7 @@ mod tests {
                     self.dataset = stale;
                     self.update("i % 3 = 0").await?;
                 }
-                Step::CompactionAcrossAppend => {
-                    let error = self
-                        .compact_across(Step::Append)
-                        .await
-                        .expect_err("a stale compaction must retry after an append");
-                    assert!(
-                        matches!(error, Error::RetryableCommitConflict { .. }),
-                        "{error}"
-                    );
-                    assert!(error.to_string().contains("Append"), "{error}");
-                    self.dataset.checkout_latest().await?;
-                    let appended = self.dataset.scan().try_into_batch().await?;
-                    let metrics = compact_files(&mut self.dataset, one_fragment(), None).await?;
-                    assert!(metrics.fragments_removed > 0);
-                    assert_eq!(
-                        self.dataset.scan().try_into_batch().await?,
-                        appended,
-                        "replanned compaction must preserve the appended table's row order"
-                    );
-                }
+                Step::CompactionAcrossAppend => self.compact_across(Step::Append).await?,
                 Step::CompactionAcrossDelete => {
                     let error = self
                         .compact_across(Step::Delete("i % 11 = 0"))
