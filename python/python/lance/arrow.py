@@ -584,9 +584,17 @@ def cast(
         list_size = list_type.list_size
         values = arr.values.slice(arr.offset * list_size, len(arr) * list_size)
         values = cast(values, list_type.value_type)
-        mask = arr.is_null() if arr.null_count > 0 else None
-        return pa.FixedSizeListArray.from_arrays(
-            values=values, list_size=list_size, mask=mask
+        if arr.null_count == 0:
+            return pa.FixedSizeListArray.from_arrays(values=values, list_size=list_size)
+        # ``from_arrays(mask=...)`` needs PyArrow 15; build from buffers so the
+        # validity bitmap is kept on every supported PyArrow version.
+        validity = pc.is_valid(arr).buffers()[1]
+        return pa.Array.from_buffers(
+            pa.list_(values.type, list_size),
+            len(arr),
+            [validity],
+            null_count=arr.null_count,
+            children=[values],
         )
 
     # Fallback to normal cast.
