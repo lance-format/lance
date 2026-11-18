@@ -281,7 +281,7 @@ impl ExecutionPlan for PrefilterUnionExec {
                             .load()
                             .await
                     }
-                    None => Ok(RowAddrMask::allow_nothing()),
+                    None => Ok(Arc::new(RowAddrMask::allow_nothing())),
                 }
             };
             // Start column and row-ID metadata I/O before cached scalar work,
@@ -294,9 +294,9 @@ impl ExecutionPlan for PrefilterUnionExec {
                     RowAddrMask::from_allowed(rows)
                 }
                 // A complement needs the scope's allow-list to become a finite selection.
-                RowAddrMask::BlockList(_) => scalar & selection.as_ref().clone(),
+                RowAddrMask::BlockList(_) => scalar.intersect_with(&selection),
             };
-            IndexExprResult::exact(scalar | missing)
+            IndexExprResult::exact(scalar | Arc::unwrap_or_clone(missing))
                 .serialize(&coverage, format)
                 .map_err(DataFusionError::from)
         };

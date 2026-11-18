@@ -2485,9 +2485,6 @@ source = { editable = "." }
 default-groups = ["dev", "tests"]
 dependencies = [
     { name = "lance-namespace" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pyarrow" },
 ]
 
@@ -2503,6 +2500,11 @@ geo = [
     { name = "geoarrow-rust-core" },
     { name = "geoarrow-rust-io" },
 ]
+numpy = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
 otel = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
@@ -2513,6 +2515,9 @@ tests = [
     { name = "datasets" },
     { name = "duckdb" },
     { name = "ml-dtypes" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
     { name = "pillow" },
     { name = "polars", extra = ["pandas", "pyarrow"] },
@@ -2540,6 +2545,9 @@ tests = [
     { name = "datasets" },
     { name = "duckdb" },
     { name = "ml-dtypes" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "opentelemetry-sdk" },
     { name = "pandas" },
     { name = "pillow" },
@@ -2560,7 +2568,8 @@ requires-dist = [
     { name = "geoarrow-rust-io", marker = "extra == 'geo'" },
     { name = "lance-namespace", specifier = ">=0.13.0,<0.14" },
     { name = "ml-dtypes", marker = "extra == 'tests'" },
-    { name = "numpy", specifier = ">=1.22" },
+    { name = "numpy", marker = "extra == 'numpy'", specifier = ">=1.22" },
+    { name = "numpy", marker = "extra == 'tests'", specifier = ">=1.22" },
     { name = "opentelemetry-api", marker = "extra == 'otel'" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'" },
     { name = "pandas", marker = "extra == 'tests'" },
@@ -2576,7 +2585,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.0" },
     { name = "tqdm", marker = "extra == 'tests'" },
 ]
-provides-extras = ["benchmarks", "dev", "geo", "otel", "tests", "torch"]
+provides-extras = ["benchmarks", "dev", "geo", "numpy", "otel", "tests", "torch"]
 
 [package.metadata.requires-dev]
 benchmarks = [{ name = "pytest-benchmark", specifier = "==5.1.0" }]
@@ -2591,6 +2600,7 @@ tests = [
     { name = "datasets", specifier = "==4.4.0" },
     { name = "duckdb", specifier = ">=1.5.0,<1.6.0" },
     { name = "ml-dtypes", specifier = "==0.5.3" },
+    { name = "numpy", specifier = ">=1.22" },
     { name = "opentelemetry-sdk", specifier = "==1.30.0" },
     { name = "pandas", specifier = "==2.3.3" },
     { name = "pillow", specifier = "==11.3.0" },

@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Generator, List, Type, Union, _GenericAl
 import pyarrow as pa
 import pydantic
 
+from .dependencies import _check_for_numpy
 from .dependencies import numpy as np
 
 _PYDANTIC_V2 = hasattr(pydantic, "GetCoreSchemaHandler")
@@ -99,7 +100,10 @@ def Vector(
         # For pydantic v1
         @classmethod
         def validate(cls, v):
-            if not isinstance(v, (list, range, np.ndarray)) or len(v) != dim:
+            ok = isinstance(v, (list, range)) or (
+                _check_for_numpy(v) and isinstance(v, np.ndarray)
+            )
+            if not ok or len(v) != dim:
                 raise TypeError("A list of numbers or numpy.ndarray is needed")
             return cls(v)
 
@@ -177,7 +181,10 @@ def MultiVector(
             if not isinstance(v, (list, range)):
                 raise TypeError("A list of vectors is needed")
             for vec in v:
-                if not isinstance(vec, (list, range, np.ndarray)) or len(vec) != dim:
+                ok = isinstance(vec, (list, range)) or (
+                    _check_for_numpy(vec) and isinstance(vec, np.ndarray)
+                )
+                if not ok or len(vec) != dim:
                     raise TypeError(f"Each vector must be a list of {dim} numbers")
             return cls(v)
 

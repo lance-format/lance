@@ -3185,6 +3185,7 @@ async fn test_quantized_refinement_cache_snapshot_identity(#[case] change: fn(&m
         query_parallelism: 0,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Normal,
+        rq_graph_scoring: Default::default(),
     };
     let options = QuantizedRefinementOptions {
         result_count: 10,
