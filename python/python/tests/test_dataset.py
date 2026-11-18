@@ -17,7 +17,7 @@ import textwrap
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -684,6 +684,32 @@ def test_asof_checkout(tmp_path: Path):
 
     # An explicit version takes precedence over the timestamp cutoff.
     assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
+
+
+class _NoOffsetTzInfo(tzinfo):
+    """A tzinfo without a UTC offset; Python treats such datetimes as naive."""
+
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return None
+
+
+def test_asof_cutoff_without_utc_offset_is_naive(tmp_path: Path):
+    lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+    version_ts = lance.dataset(tmp_path).versions()[0]["timestamp"]
+    cutoff = (version_ts + timedelta(days=1)).replace(tzinfo=_NoOffsetTzInfo())
+    assert cutoff.tzinfo is not None
+    assert cutoff.utcoffset() is None
+
+    # Python compares this as a naive local time, so it keeps the pre-existing
+    # behavior for naive cutoffs instead of treating it as an aware instant.
+    assert lance.dataset(tmp_path, asof=cutoff).version == 1
+    assert lance.dataset(tmp_path, asof=cutoff.replace(tzinfo=None)).version == 1
 
 
 @pytest.mark.parametrize("cleanup", ["explicit", "branch", "tag", "all_older"])

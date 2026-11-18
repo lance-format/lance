@@ -336,7 +336,9 @@ def dataset(
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
-        is_aware = ts_cutoff.tzinfo is not None
+        # A tzinfo whose utcoffset() is None does not make the cutoff aware:
+        # Python still compares such datetimes as naive local times.
+        is_aware = ts_cutoff.utcoffset() is not None
         ver_cutoff = max(
             [
                 v["version"]
