@@ -124,7 +124,8 @@ use lance_io::{
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata};
+use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata, Manifest};
+use lance_table::transaction::action::Action;
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive};
 use object_store::path::Path;
@@ -616,7 +617,7 @@ impl std::fmt::Display for VectorQueryContract {
     }
 }
 
-/// Refuses a `CreateIndex` that would leave the segments of one index name
+/// Refuses an index addition that would leave the segments of one index name
 /// keyed on different columns, or its vector segments under different query
 /// contracts. The index APIs compare the contracts of opened segments with
 /// [`validate_vector_query_compatibility`]; a raw transaction reaches the
@@ -636,15 +637,32 @@ impl std::fmt::Display for VectorQueryContract {
 pub(crate) async fn validate_committed_vector_segments(
     dataset: &Dataset,
     operation: &Operation,
+    proposed_manifest: &Manifest,
     proposed_indices: &[TableIndexMetadata],
 ) -> Result<()> {
-    let Operation::CreateIndex { new_indices, .. } = operation else {
-        return Ok(());
+    let mut segments_by_name: BTreeMap<&str, Vec<&TableIndexMetadata>> = match operation {
+        Operation::CreateIndex { new_indices, .. } => new_indices
+            .iter()
+            .map(|index| (index.name.as_str(), Vec::new()))
+            .collect(),
+        Operation::CompositeOperation(composite) => composite
+            .iter_actions()
+            .filter_map(|action| match action {
+                Action::AddIndexSegment(segment) => Some((segment.name.as_str(), Vec::new())),
+                _ => None,
+            })
+            .collect(),
+        _ => return Ok(()),
     };
-    let mut segments_by_name: BTreeMap<&str, Vec<&TableIndexMetadata>> = new_indices
-        .iter()
-        .map(|index| (index.name.as_str(), Vec::new()))
-        .collect();
+    if segments_by_name.is_empty() {
+        return Ok(());
+    }
+    // Actions can introduce fields and base paths in the same commit, so
+    // resolve their final segments through the manifest being published.
+    let proposed_dataset = matches!(operation, Operation::CompositeOperation(_))
+        .then(|| dataset.with_manifest_view(Arc::new(proposed_manifest.clone())));
+    let dataset = proposed_dataset.as_ref().unwrap_or(dataset);
+    let operation = operation.name();
     for segment in proposed_indices {
         if let Some(segments) = segments_by_name.get_mut(segment.name.as_str()) {
             segments.push(segment);
@@ -683,7 +701,7 @@ pub(crate) async fn validate_committed_vector_segments(
                     .join(", ")
             };
             return Err(Error::invalid_input(format!(
-                "CreateIndex: segments {} (on {}) and {} (on {}) would both remain in index \
+                "{operation}: segments {} (on {}) and {} (on {}) would both remain in index \
                  '{name}'; a search reads every segment of an index as keyed on the queried \
                  column, so all of them must be keyed on the same columns",
                 first.uuid,
@@ -704,7 +722,7 @@ pub(crate) async fn validate_committed_vector_segments(
                             .await
                             .map_err(|error| {
                                 Error::io(format!(
-                                    "CreateIndex: cannot read vector segment {} to check that \
+                                    "{operation}: cannot read vector segment {} to check that \
                                      index '{}' keeps one metric and index type: {error}",
                                     segment.uuid, segment.name
                                 ))
@@ -726,7 +744,7 @@ pub(crate) async fn validate_committed_vector_segments(
                     None => reference = Some((segment, contract)),
                     Some((first, expected)) if *expected != contract => {
                         return Err(Error::invalid_input(format!(
-                            "CreateIndex: vector segments {} ({expected}) and {} ({contract}) \
+                            "{operation}: vector segments {} ({expected}) and {} ({contract}) \
                              would both remain in index '{name}'; a search ranks every segment \
                              of an index by one metric and index type, so replace all of its \
                              segments in one commit",
@@ -738,7 +756,7 @@ pub(crate) async fn validate_committed_vector_segments(
             }
             if let (Some((first, expected)), Some(other)) = (&reference, without_index_file) {
                 return Err(Error::invalid_input(format!(
-                    "CreateIndex: vector segment {} ({expected}) and segment {}, which has no \
+                    "{operation}: vector segment {} ({expected}) and segment {}, which has no \
                      vector index file, would both remain in index '{name}'; a search opens \
                      every segment of an index as a vector segment",
                     first.uuid, other.uuid,
