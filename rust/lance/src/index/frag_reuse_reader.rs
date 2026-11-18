@@ -503,7 +503,7 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
             .join(index.uuid.to_string())
             .join(file.path.as_str());
         dataset
-            .object_store_for_index(index)
+            .storage_for_index(index)
             .await?
             .open(&path)
             .await?
@@ -703,7 +703,7 @@ pub mod tests {
         }
         let id = Uuid::new_v4();
         let store = LanceIndexStore::with_format_version(
-            dataset.object_store.clone(),
+            dataset.storage.clone(),
             dataset.base.clone().join("_fri").join(id.to_string()),
             Arc::new(LanceCache::with_capacity(1024 * 1024)),
             lance_file::version::ConcreteFileVersion::V2_1,
@@ -758,7 +758,7 @@ pub mod tests {
                 .indices_dir()
                 .join(uuid.to_string())
                 .join("details.binpb");
-            let mut writer = dataset.object_store.create(&path).await.unwrap();
+            let mut writer = dataset.storage.create(&path).await.unwrap();
             writer.write_all(&content).await.unwrap();
             writer.shutdown().await.unwrap();
             field(
@@ -806,7 +806,7 @@ pub mod tests {
         );
         let key = IndexMetadataKey {
             version: dataset.manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
+            store_identity: dataset.storage.store_prefix(),
             e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
@@ -825,7 +825,7 @@ pub mod tests {
         manifest.transaction_file = None;
         manifest.transaction_section = None;
         let location = crate::dataset::write_manifest_file(
-            &dataset.object_store,
+            &dataset.storage,
             dataset.commit_handler.as_ref(),
             &dataset.base,
             &mut manifest,
@@ -967,7 +967,7 @@ pub mod tests {
         for mut target in [legacy, tagged] {
             let fragments = target.manifest.fragments.clone();
             let expected_indices = lance_table::io::manifest::read_manifest_indexes(
-                &target.object_store,
+                &target.storage,
                 &target.manifest_location,
                 &target.manifest,
             )
@@ -978,7 +978,7 @@ pub mod tests {
             assert_eq!(target.manifest.version, latest);
             assert_eq!(target.manifest.fragments, fragments);
             let restored_indices = lance_table::io::manifest::read_manifest_indexes(
-                &target.object_store,
+                &target.storage,
                 &target.manifest_location,
                 &target.manifest,
             )
@@ -1033,7 +1033,7 @@ pub mod tests {
         manifest.reader_feature_flags &= !flag;
         manifest.writer_feature_flags &= !flag;
         let error = crate::dataset::write_manifest_file(
-            &dataset.object_store,
+            &dataset.storage,
             dataset.commit_handler.as_ref(),
             &dataset.base,
             &mut manifest,
@@ -1337,7 +1337,7 @@ pub mod tests {
         let fri = install(&mut dataset, content, destinations, false).await;
         let first = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
         let mut rebound = dataset.clone();
-        rebound.object_store = Arc::new(dataset.object_store.as_ref().clone());
+        rebound.storage = Arc::new(dataset.storage.as_ref().clone());
         let second = FragmentReuseIndex::open(&rebound, &fri).await.unwrap();
         assert!(Arc::ptr_eq(&first.ledger, &second.ledger));
         assert!(!Arc::ptr_eq(&first.readers[0], &second.readers[0]));
@@ -1986,7 +1986,7 @@ pub mod tests {
             .join(uuid.to_string())
             .join("details.binpb");
         let details = if external {
-            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
+            let mut writer = dataset.storage.create(&details_path).await.unwrap();
             writer.write_all(&content).await.unwrap();
             writer.shutdown().await.unwrap();
             field(
@@ -2090,7 +2090,7 @@ pub mod tests {
         assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
 
         let indices = lance_table::io::manifest::read_manifest_indexes(
-            &dataset.object_store,
+            &dataset.storage,
             &dataset.manifest_location,
             &dataset.manifest,
         )
@@ -2099,7 +2099,7 @@ pub mod tests {
         assert_eq!(indices.iter().find(|index| index.uuid == uuid), Some(&fri));
         if external {
             let bytes = dataset
-                .object_store
+                .storage
                 .open(&details_path)
                 .await
                 .unwrap()

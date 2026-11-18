@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use lance::session::Session;
 use lance_core::Result;
+use lance_core::storage::path::Path;
 use lance_core::utils::parse::str_to_bool;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_namespace::error::NamespaceError;
-use object_store::path::Path;
 use tokio::sync::OnceCell;
 
 use super::{DirectoryNamespace, OpsMetrics, manifest, manifest_feature_flags};
@@ -529,15 +529,15 @@ impl DirectoryNamespaceBuilder {
     /// - Connection to the storage backend fails
     /// - Storage options are invalid
     pub async fn build(self) -> Result<DirectoryNamespace> {
-        let (object_store, base_path) =
-            Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
+        let (storage, base_path) =
+            Self::initialize_storage(&self.root, &self.storage_options, &self.session).await?;
 
         let manifest_ns = if self.manifest_enabled {
             match manifest::ManifestNamespace::open_from_directory(
                 self.root.clone(),
                 self.storage_options.clone(),
                 self.session.clone(),
-                object_store.clone(),
+                storage.clone(),
                 base_path.clone(),
                 self.dir_listing_enabled,
                 self.inline_optimization_enabled,
@@ -586,7 +586,7 @@ impl DirectoryNamespaceBuilder {
             root: self.root,
             storage_options: self.storage_options,
             session: self.session,
-            object_store,
+            storage,
             base_path,
             manifest_ns: manifest_cell,
             write_manifest_ns: OnceCell::new(),
@@ -606,8 +606,8 @@ impl DirectoryNamespaceBuilder {
         })
     }
 
-    /// Initialize the Lance ObjectStore based on the configuration
-    async fn initialize_object_store(
+    /// Initialize the Lance Storage based on the configuration
+    async fn initialize_storage(
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: &Option<Arc<Session>>,
@@ -629,7 +629,7 @@ impl DirectoryNamespaceBuilder {
         };
 
         // Use Lance's object store factory to create from URI
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
+        let (storage, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
@@ -637,6 +637,6 @@ impl DirectoryNamespaceBuilder {
                 })
             })?;
 
-        Ok((object_store, base_path))
+        Ok((storage, base_path))
     }
 }

@@ -1134,7 +1134,7 @@ async fn test_physical_slice_read_preserves_deleted_positions() {
 
 async fn count_files(dataset: &Dataset) -> usize {
     dataset
-        .object_store
+        .storage
         .read_dir_all(&dataset.data_dir(), None)
         .try_fold(0usize, |count, _| async move { Ok(count + 1) })
         .await

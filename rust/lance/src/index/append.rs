@@ -192,7 +192,7 @@ pub async fn build_old_data_filter(
                         Ok::<_, Error>((fragment_id, deleted))
                     }
                 })
-                .buffer_unordered(dataset.object_store.io_parallelism());
+                .buffer_unordered(dataset.storage.io_parallelism());
             let mut deleted_rows = RowAddrTreeMap::new();
             while let Some((fragment_id, deleted)) = deletions.try_next().await? {
                 if let Some(deleted) = deleted
@@ -597,7 +597,7 @@ impl<'a> SeedHarvester<'a> {
         if let Some(scheduler) = self.schedulers.lock().unwrap().get(&base_id) {
             return Ok(scheduler.clone());
         }
-        let store = self.dataset.object_store(base_id).await?;
+        let store = self.dataset.storage(base_id).await?;
         let config = SchedulerConfig::max_bandwidth(&store);
         let scheduler = ScanScheduler::new(store, config);
         Ok(self
@@ -1319,8 +1319,8 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
         .clone()
         .join(index.uuid.to_string())
         .join(INDEX_FILE_NAME);
-    let object_store = dataset.object_store_for_index(index).await?;
-    object_store.exists(&index_file).await
+    let storage = dataset.storage_for_index(index).await?;
+    storage.exists(&index_file).await
 }
 
 /// Whether a rebuild of `params` should expect the definition alone, because
@@ -3232,8 +3232,8 @@ mod tests {
 
         let version_before = dataset.version().version;
         let segments_before = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-        let object_store = dataset.object_store.clone();
-        let directories_before = object_store
+        let storage = dataset.storage.clone();
+        let directories_before = storage
             .read_dir(dataset.indices_dir())
             .await
             .unwrap()
@@ -3267,7 +3267,7 @@ mod tests {
             segments_after, segments_before,
             "incompatible logical segments must remain unchanged"
         );
-        let directories_after = object_store
+        let directories_after = storage
             .read_dir(latest.indices_dir())
             .await
             .unwrap()
@@ -3451,8 +3451,8 @@ mod tests {
         );
 
         // There should be two indices directories existed.
-        let object_store = dataset.object_store.as_ref();
-        let index_dirs = object_store.read_dir(dataset.indices_dir()).await.unwrap();
+        let storage = dataset.storage.as_ref();
+        let index_dirs = storage.read_dir(dataset.indices_dir()).await.unwrap();
         assert_eq!(index_dirs.len(), 2);
 
         let mut scanner = dataset.scan();
@@ -3660,8 +3660,8 @@ mod tests {
             .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let version_before = dataset.version().version;
-        let object_store = dataset.object_store.as_ref();
-        let dirs_before = object_store
+        let storage = dataset.storage.as_ref();
+        let dirs_before = storage
             .read_dir(dataset.indices_dir())
             .await
             .unwrap()
@@ -3676,7 +3676,7 @@ mod tests {
             .await
             .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        let dirs_after = object_store
+        let dirs_after = storage
             .read_dir(dataset.indices_dir())
             .await
             .unwrap()
@@ -6313,7 +6313,7 @@ mod tests {
             if let Some(deletion_file) = fragment.metadata().deletion_file.clone() {
                 let path =
                     deletion_file_path(&dataset.base, fragment.metadata().id, &deletion_file);
-                dataset.object_store.delete(&path).await.unwrap();
+                dataset.storage.delete(&path).await.unwrap();
                 removed += 1;
             }
         }
@@ -6716,7 +6716,7 @@ mod tests {
             !files.is_empty(),
             "the index must cover at least one fragment with data"
         );
-        dataset.object_store.as_ref().io_stats_incremental(); // Reset
+        dataset.storage.as_ref().io_stats_incremental(); // Reset
         files
     }
 
@@ -6730,7 +6730,7 @@ mod tests {
         indexed_files: &[String],
     ) {
         let rescanned = dataset
-            .object_store
+            .storage
             .as_ref()
             .io_stats_incremental()
             .requests

@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::{
     encoding::populate_schema_dictionaries, reader::FileReader as V1FileReader,
 };
 use lance_io::traits::{ProtoStruct, Reader};
-use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
 use std::collections::{BTreeMap, HashMap};
@@ -1303,14 +1303,14 @@ pub trait SelfDescribingFileReader {
     /// When loading files from a dataset it is preferable to use
     /// the fragment reader to avoid this overhead.
     async fn try_new_self_described(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         path: &Path,
         cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized,
     {
-        let reader = object_store.open(path).await?;
+        let reader = storage.open(path).await?;
         Self::try_new_self_described_from_reader(reader.into(), cache).await
     }
 

@@ -213,7 +213,7 @@ pub(super) async fn build_index_metadata_from_segments(
                 .await?;
         }
         let index_dir = dataset.indices_dir().join(uuid.to_string());
-        let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        let mut files = list_index_files_with_sizes(&dataset.storage, &index_dir).await?;
         if is_inverted_index {
             retain_committed_inverted_files(&mut files);
         }
@@ -233,7 +233,7 @@ pub(super) async fn build_index_metadata_from_segments(
             metadata,
         })
     }))
-    .buffered(dataset.object_store.io_parallelism())
+    .buffered(dataset.storage.io_parallelism())
     .try_collect::<Vec<_>>()
     .await?;
 
@@ -632,7 +632,7 @@ impl DatasetIndexExt for Dataset {
         // caches its derived output.
         let derived_key = DerivedIndexListingKey {
             version: self.manifest.version,
-            store_identity: &self.object_store.store_prefix,
+            store_identity: self.storage.store_prefix(),
             e_tag: self.manifest_location.e_tag.as_deref(),
         };
         if let Some(cached) = self.index_cache.get_with_key(&derived_key).await {

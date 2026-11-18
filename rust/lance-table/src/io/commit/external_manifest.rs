@@ -8,18 +8,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
 };
 use lance_core::{Error, Result};
+use lance_io::object_store::ObjectMeta;
 use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{Error as ObjectStoreError, path::Path};
 use log::warn;
-use object_store::ObjectMeta;
-use object_store::ObjectStoreExt;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::info;
 
 use super::{
@@ -41,14 +39,13 @@ pub async fn finalize_staged<S: ExternalManifestStore + ?Sized>(
     version: u64,
     staging_path: &Path,
     size: u64,
-    object_store: &dyn OSObjectStore,
+    storage: &ObjectStore,
     naming_scheme: ManifestNamingScheme,
 ) -> Result<ManifestLocation> {
     // Step 2: Copy staging to final path
     let final_path = naming_scheme.manifest_path(base_path, version);
     let final_e_tag =
-        copy_or_verify_final_manifest(object_store, staging_path, &final_path, version, size)
-            .await?;
+        copy_or_verify_final_manifest(storage, staging_path, &final_path, version, size).await?;
 
     let location = ManifestLocation {
         version,
@@ -83,9 +80,9 @@ pub async fn finalize_staged<S: ExternalManifestStore + ?Sized>(
     }
 
     // Step 4: Delete staging manifest
-    match object_store.delete(staging_path).await {
+    match storage.delete(staging_path).await {
         Ok(_) => {}
-        Err(ObjectStoreError::NotFound { .. }) => {}
+        Err(error) if error.is_not_found() => {}
         Err(error) => {
             // Staging is no longer authoritative after the canonical
             // object and final index entry exist. Its deletion is garbage
@@ -232,7 +229,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         staging_path: &Path,
         size: u64,
         _e_tag: Option<String>,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
         // Default implementation: staging-based workflow
@@ -257,7 +254,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             version,
             staging_path,
             size,
-            object_store,
+            storage,
             naming_scheme,
         )
         .await
@@ -271,7 +268,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
         staging_path: &Path,
         size: u64,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
         finalize_staged(
@@ -280,7 +277,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             version,
             staging_path,
             size,
-            object_store,
+            storage,
             naming_scheme,
         )
         .await
@@ -384,56 +381,6 @@ pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNami
         })
 }
 
-/// The most conservative server-side-copy size limit across the object
-/// stores we support. This is not S3-specific: S3's `CopyObject` and GCS's
-/// single-shot `Objects: copy` both reject sources above ~5 GiB, so we use
-/// 5 GiB as a backend-agnostic threshold. Above it we stream the source
-/// through the client and re-upload via multipart instead of relying on a
-/// server-side copy. Stores that have no such cap (e.g. local filesystem)
-/// also take the fallback above this size — correctness is preserved; only
-/// the rare >5 GiB copy is slower than a native copy would be.
-const MAX_SERVER_SIDE_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-
-/// Part size for the read+rewrite fallback. Multipart-capable stores
-/// (S3, GCS) require every part except the last to be ≥5 MB and allow up to
-/// 10,000 parts. 100 MB sits comfortably inside both bounds and keeps the
-/// part count low (~140 parts for a 14 GB manifest) without large per-part
-/// RAM.
-const COPY_REWRITE_PART_SIZE: usize = 100 * 1024 * 1024;
-
-/// Copy `from` to `to`, falling back to a multipart-equivalent read+rewrite
-/// when the source exceeds the server-side-copy size limit
-/// (`MAX_SERVER_SIDE_COPY_BYTES`).
-///
-/// For sources below the limit, this is the same fast server-side
-/// `store.copy()` as before. For larger sources, the source is streamed
-/// through the client and re-uploaded as a multipart upload at `to`. This
-/// doubles bytes-on-the-wire for the rare large case while preserving the
-/// cheap fast path for the common small case.
-///
-/// `size` is the known source size. It is required: the only caller already
-/// has it, and the alternative (an extra `head(from)` round-trip) is work
-/// the caller can avoid by passing what it already knows.
-///
-/// `NotFound` errors on `from` propagate unchanged so callers can keep
-/// existing `Err(NotFound { .. })` arms.
-///
-/// This is a workaround for the missing `UploadPartCopy` primitive in the
-/// upstream `object_store` crate. Once that lands, this helper can be
-/// deleted and the call sites can go back to plain `store.copy()`.
-async fn copy_size_aware(
-    store: &dyn OSObjectStore,
-    from: &Path,
-    to: &Path,
-    size: u64,
-) -> std::result::Result<(), ObjectStoreError> {
-    if size < MAX_SERVER_SIDE_COPY_BYTES {
-        store.copy(from, to).await
-    } else {
-        copy_via_read_rewrite(store, from, to).await
-    }
-}
-
 /// Copy the selected staging manifest to its canonical path.
 ///
 /// A successful copy is the object store's acknowledgement that the known
@@ -450,16 +397,19 @@ async fn copy_size_aware(
 /// manifest. Any ETag returned by that required HEAD is merely the current
 /// object's opaque generation metadata.
 async fn copy_or_verify_final_manifest(
-    object_store: &dyn OSObjectStore,
+    storage: &ObjectStore,
     staging_path: &Path,
     final_path: &Path,
     version: u64,
     selected_size: u64,
 ) -> Result<Option<String>> {
-    match copy_size_aware(object_store, staging_path, final_path, selected_size).await {
+    match storage
+        .copy_with_size(staging_path, final_path, selected_size)
+        .await
+    {
         Ok(()) => {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
-            let final_meta = object_store.head(final_path).await?;
+            let final_meta = storage.stat(final_path).await?;
             if final_meta.size != selected_size {
                 return Err(Error::corrupt_file(
                     final_path.clone(),
@@ -471,7 +421,7 @@ async fn copy_or_verify_final_manifest(
             }
             Ok(final_meta.e_tag)
         }
-        Err(ObjectStoreError::NotFound { .. }) => match object_store.head(final_path).await {
+        Err(ObjectStoreError::NotFound { .. }) => match storage.stat(final_path).await {
             Ok(final_meta) if final_meta.size == selected_size => Ok(final_meta.e_tag),
             Ok(final_meta) => Err(Error::corrupt_file(
                 final_path.clone(),
@@ -484,79 +434,6 @@ async fn copy_or_verify_final_manifest(
         },
         Err(error) => Err(error.into()),
     }
-}
-
-// NOTE: parts are uploaded sequentially. This could be parallelized (a
-// bounded JoinSet, like lance-io/src/object_writer.rs's
-// LANCE_UPLOAD_CONCURRENCY) or sidestepped entirely by switching to
-// `object_store::WriteMultipart` (which also handles abort-on-drop). Left
-// sequential here: this is a cold path (only >5 GiB manifests) and the
-// helper is itself a stopgap until `object_store` exposes UploadPartCopy.
-async fn copy_via_read_rewrite(
-    store: &dyn OSObjectStore,
-    from: &Path,
-    to: &Path,
-) -> std::result::Result<(), ObjectStoreError> {
-    // NotFound here propagates upward unchanged.
-    let mut stream = store.get(from).await?.into_stream();
-
-    // From here on, errors must `abort()` the upload to avoid leaving an
-    // orphan multipart upload on stores that support them (e.g. S3, GCS),
-    // which would otherwise incur storage charges until the bucket's
-    // lifecycle policy cleans it up.
-    //
-    // Note: this does NOT cover task cancellation — `MultipartUpload`'s
-    // upstream Drop is documented as a no-op for S3/GCS. Callers that
-    // need cancellation cleanliness should run this with a guard or
-    // switch to `object_store::WriteMultipart` (planned follow-up).
-    let mut upload = store.put_multipart(to).await?;
-    let mut part_buf: Vec<u8> = Vec::with_capacity(COPY_REWRITE_PART_SIZE);
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = upload.abort().await;
-                return Err(e);
-            }
-        };
-        // Append the chunk in COPY_REWRITE_PART_SIZE-bounded slices so a
-        // single oversized chunk (e.g., LocalFileSystem returning a whole
-        // file) cannot push part_buf past the backend's per-part size limit
-        // (5 GiB on S3/GCS). COPY_REWRITE_PART_SIZE is well under every
-        // backend's cap, so each flushed part is always valid.
-        let mut offset = 0;
-        while offset < chunk.len() {
-            let want = COPY_REWRITE_PART_SIZE - part_buf.len();
-            let take = want.min(chunk.len() - offset);
-            part_buf.extend_from_slice(&chunk[offset..offset + take]);
-            offset += take;
-
-            if part_buf.len() >= COPY_REWRITE_PART_SIZE {
-                let payload =
-                    std::mem::replace(&mut part_buf, Vec::with_capacity(COPY_REWRITE_PART_SIZE));
-                if let Err(e) = upload.put_part(Bytes::from(payload).into()).await {
-                    let _ = upload.abort().await;
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    // Flush the final (possibly-short) part. The last part of a multipart
-    // upload is exempt from the per-part minimum on S3/GCS.
-    if !part_buf.is_empty()
-        && let Err(e) = upload.put_part(Bytes::from(part_buf).into()).await
-    {
-        let _ = upload.abort().await;
-        return Err(e);
-    }
-
-    if let Err(e) = upload.complete().await {
-        let _ = upload.abort().await;
-        return Err(e);
-    }
-    Ok(())
 }
 
 /// External manifest commit handler
@@ -572,9 +449,9 @@ impl ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         location: ManifestLocation,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
     ) -> std::result::Result<ManifestLocation, Error> {
-        match object_store.head(&location.path).await {
+        match storage.stat(&location.path).await {
             Ok(ObjectMeta { size, e_tag, .. }) => {
                 let ManifestLocation {
                     version,
@@ -619,7 +496,7 @@ impl ExternalManifestCommitHandler {
             Err(ObjectStoreError::NotFound { .. }) => {
                 // The external store may hold a stale finalized V2 path while
                 // the object store still has the manifest at the V1 location.
-                default_resolve_version(base_path, location.version, object_store).await
+                default_resolve_version(base_path, location.version, storage).await
             }
             Err(e) => Err(e.into()),
         }
@@ -639,7 +516,7 @@ impl ExternalManifestCommitHandler {
         staging_manifest_path: &Path,
         version: u64,
         size: u64,
-        store: &dyn OSObjectStore,
+        store: &ObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<ManifestLocation, Error> {
         // step 1: copy the manifest to the final location
@@ -695,7 +572,7 @@ impl ExternalManifestCommitHandler {
         // step 3: delete the staging manifest
         match store.delete(staging_manifest_path).await {
             Ok(_) => {}
-            Err(ObjectStoreError::NotFound { .. }) => {}
+            Err(error) if error.is_not_found() => {}
             Err(error) => {
                 warn!(
                     "Failed to delete finalized staging manifest '{}': {}",
@@ -716,7 +593,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         version: u64,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<bool> {
         match self
@@ -727,7 +604,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Ok(_) => Ok(true),
             Err(Error::NotFound { .. }) => {
                 let path = naming_scheme.manifest_path(base_path, version);
-                match object_store.head(&path).await {
+                match storage.stat(&path).await {
                     Ok(_) => Ok(true),
                     Err(ObjectStoreError::NotFound { .. }) => Ok(false),
                     Err(e) => Err(e.into()),
@@ -742,7 +619,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         base_path: &Path,
         version: u64,
         path: &Path,
-        _object_store: &dyn OSObjectStore,
+        _storage: &ObjectStore,
     ) -> Result<bool> {
         match self
             .external_manifest_store
@@ -758,7 +635,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
     ) -> std::result::Result<ManifestLocation, Error> {
         let location = self
             .external_manifest_store
@@ -768,15 +645,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
         match location {
             Some(location) => {
                 if location.identity.is_some() {
-                    return recorded_as_final(location, object_store.inner.as_ref()).await;
+                    return recorded_as_final(location, storage).await;
                 }
                 if location.path.extension() == Some(MANIFEST_EXTENSION) {
                     return self
-                        .verify_finalized_manifest_location(
-                            base_path,
-                            location,
-                            object_store.inner.as_ref(),
-                        )
+                        .verify_finalized_manifest_location(base_path, location, storage)
                         .await;
                 }
 
@@ -793,7 +666,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 let size = if let Some(size) = size {
                     size
                 } else {
-                    match object_store.stat(&path).await {
+                    match storage.stat(&path).await {
                         Ok(meta) => meta.size,
                         Err(ObjectStoreError::NotFound { .. }) => {
                             // there may be other threads that have finished executing finalize_manifest.
@@ -808,21 +681,14 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 };
 
                 let mut final_location = self
-                    .finalize_manifest(
-                        base_path,
-                        &path,
-                        version,
-                        size,
-                        &object_store.inner,
-                        naming_scheme,
-                    )
+                    .finalize_manifest(base_path, &path, version, size, storage, naming_scheme)
                     .await?;
                 final_location.identity = identity;
                 Ok(final_location)
             }
             // Dataset not found in the external store, this could be because the dataset did not
             // use external store for commit before. In this case, we search for the latest manifest
-            None => current_manifest_path(object_store, base_path).await,
+            None => current_manifest_path(storage, base_path).await,
         }
     }
 
@@ -830,7 +696,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         version: u64,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
     ) -> std::result::Result<ManifestLocation, Error> {
         let location_res = self
             .external_manifest_store
@@ -841,11 +707,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Ok(p) => p,
             // not board external manifest yet, direct to object store
             Err(Error::NotFound { .. }) => {
-                let path = default_resolve_version(base_path, version, object_store)
+                let path = default_resolve_version(base_path, version, storage)
                     .await
                     .map_err(|_| Error::not_found(format!("{}@{}", base_path, version)))?
                     .path;
-                match object_store.head(&path).await {
+                match storage.stat(&path).await {
                     Ok(ObjectMeta { size, e_tag, .. }) => {
                         let res = self
                             .external_manifest_store
@@ -885,11 +751,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
         };
 
         if location.identity.is_some() {
-            return recorded_as_final(location, object_store).await;
+            return recorded_as_final(location, storage).await;
         }
         if location.path.extension() == Some(MANIFEST_EXTENSION) {
             return self
-                .verify_finalized_manifest_location(base_path, location, object_store)
+                .verify_finalized_manifest_location(base_path, location, storage)
                 .await;
         }
 
@@ -899,7 +765,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         let size = if let Some(size) = location.size {
             size
         } else {
-            let meta = object_store.head(&location.path).await?;
+            let meta = storage.stat(&location.path).await?;
             meta.size
         };
 
@@ -909,7 +775,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 &location.path,
                 version,
                 size,
-                object_store,
+                storage,
                 naming_scheme,
             )
             .await?;
@@ -920,7 +786,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_identity(
         &self,
         base_path: &Path,
-        _object_store: &ObjectStore,
+        _storage: &ObjectStore,
         version: u64,
     ) -> Result<Option<PredecessorIdentity>> {
         Ok(self
@@ -933,7 +799,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     fn list_manifest_locations<'a>(
         &self,
         base_path: &Path,
-        object_store: &'a ObjectStore,
+        storage: &'a ObjectStore,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         let store = self.external_manifest_store.clone();
@@ -948,7 +814,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 }
                 None => Ok(default_list_manifest_locations(
                     &base_path,
-                    object_store,
+                    storage,
                     sorted_descending,
                 )),
             }
@@ -960,7 +826,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     fn list_manifest_locations_since<'a>(
         &self,
         base_path: &Path,
-        object_store: &'a ObjectStore,
+        storage: &'a ObjectStore,
         since_version: u64,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         let store = self.external_manifest_store.clone();
@@ -977,7 +843,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 }
                 None => Ok(default_list_manifest_locations_since(
                     &base_path,
-                    object_store,
+                    storage,
                     since_version,
                 )),
             }
@@ -991,7 +857,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: super::ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1003,7 +869,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let staging_path = make_staging_manifest_path(&path)?;
         let write_res =
-            manifest_writer(object_store, manifest, indices, &staging_path, transaction).await?;
+            manifest_writer(storage, manifest, indices, &staging_path, transaction).await?;
 
         // step 2 & 3: Put the manifest to external store
         let result = self
@@ -1014,24 +880,18 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 &staging_path,
                 write_res.size as u64,
                 write_res.e_tag,
-                &object_store.inner,
+                storage,
                 naming_scheme,
             )
             .await;
 
         match result {
             Ok(location) => {
-                write_version_hint(object_store, base_path, manifest.version).await;
+                write_version_hint(storage, base_path, manifest.version).await;
                 Ok(location)
             }
             Err(error) => Err(self
-                .lose_or_retain(
-                    base_path,
-                    manifest.version,
-                    &staging_path,
-                    object_store,
-                    error,
-                )
+                .lose_or_retain(base_path, manifest.version, &staging_path, storage, error)
                 .await),
         }
     }
@@ -1056,7 +916,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_latest_identity(
         &self,
         base_path: &Path,
-        _object_store: &ObjectStore,
+        _storage: &ObjectStore,
     ) -> Result<Option<PredecessorIdentity>> {
         let Some((version, _)) = self
             .external_manifest_store
@@ -1077,7 +937,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: super::ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1088,8 +948,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         // recreated dataset would share is never written.
         let path =
             make_staging_manifest_path(&naming_scheme.manifest_path(base_path, manifest.version))?;
-        let write_res =
-            manifest_writer(object_store, manifest, indices, &path, transaction).await?;
+        let write_res = manifest_writer(storage, manifest, indices, &path, transaction).await?;
         let size = write_res.size as u64;
 
         let reserved = self
@@ -1104,7 +963,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .await;
         match reserved {
             Ok(Reservation::Reserved { identity }) => {
-                write_version_hint(object_store, base_path, manifest.version).await;
+                write_version_hint(storage, base_path, manifest.version).await;
                 Ok(ManifestLocation {
                     version: manifest.version,
                     path,
@@ -1117,7 +976,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             }
             Ok(Reservation::PredecessorChanged) => {
                 // Nothing was recorded, so the object is ours to drop.
-                delete_staging(object_store, &path, "refused").await;
+                delete_staging(storage, &path, "refused").await;
                 Err(CommitError::OtherError(
                     lance_core::error::PrerequisiteFailedSnafu {
                         message: format!(
@@ -1133,7 +992,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     base_path,
                     manifest.version,
                     &path,
-                    object_store,
+                    storage,
                     Error::commit_conflict_source(
                         manifest.version,
                         "manifest already exists".into(),
@@ -1141,7 +1000,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 )
                 .await),
             Err(error) => Err(self
-                .lose_or_retain(base_path, manifest.version, &path, object_store, error)
+                .lose_or_retain(base_path, manifest.version, &path, storage, error)
                 .await),
         }
     }
@@ -1155,7 +1014,7 @@ impl ExternalManifestCommitHandler {
         base_path: &Path,
         version: u64,
         staging_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         error: Error,
     ) -> CommitError {
         let recorded_location = self
@@ -1163,7 +1022,7 @@ impl ExternalManifestCommitHandler {
             .get_manifest_location(base_path.as_ref(), version)
             .await;
         if matches!(&recorded_location, Ok(location) if location.path != *staging_path) {
-            delete_staging(object_store, staging_path, "losing").await;
+            delete_staging(storage, staging_path, "losing").await;
             return CommitError::CommitConflict;
         }
         warn!(
@@ -1179,20 +1038,20 @@ impl ExternalManifestCommitHandler {
 /// never repaired onto the canonical path.
 async fn recorded_as_final(
     mut location: ManifestLocation,
-    object_store: &dyn OSObjectStore,
+    storage: &ObjectStore,
 ) -> Result<ManifestLocation> {
     if location.size.is_none() {
-        location.size = Some(object_store.head(&location.path).await?.size);
+        location.size = Some(storage.stat(&location.path).await?.size);
     }
     Ok(location)
 }
 
-async fn delete_staging(object_store: &ObjectStore, staging_path: &Path, why: &str) {
-    match object_store.inner.delete(staging_path).await {
+async fn delete_staging(storage: &ObjectStore, staging_path: &Path, why: &str) {
+    match storage.delete(staging_path).await {
         Ok(()) => {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
         }
-        Err(ObjectStoreError::NotFound { .. }) => {}
+        Err(error) if error.is_not_found() => {}
         Err(delete_error) => {
             warn!(
                 "Failed to delete {} staging manifest '{}': {}",
@@ -1204,14 +1063,15 @@ async fn delete_staging(object_store: &ObjectStore, staging_path: &Path, why: &s
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
-    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_file::version::LanceFileVersion;
+    use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
     use tokio::sync::Notify;
 
     use super::*;
@@ -1390,18 +1250,18 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
-        object_store
+        storage
             .put_payload(
                 &final_path,
-                object_store::PutPayload::from_static(b"manifest"),
+                lance_io::object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.stat(&final_path).await.unwrap();
+        let final_meta = storage.stat(&final_path).await.unwrap();
 
         external_store
             .put_if_not_exists(
@@ -1415,7 +1275,7 @@ mod tests {
             .unwrap();
 
         let resolved = handler
-            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, 1, &storage)
             .await
             .expect("a legacy external-store ETag must not override object storage");
         assert_eq!(resolved.path, final_path);
@@ -1429,18 +1289,18 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
-        object_store
+        storage
             .put_payload(
                 &final_path,
-                object_store::PutPayload::from_static(b"manifest"),
+                lance_io::object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.stat(&final_path).await.unwrap();
+        let final_meta = storage.stat(&final_path).await.unwrap();
         external_store
             .put_if_not_exists(
                 base_path.as_ref(),
@@ -1453,7 +1313,7 @@ mod tests {
             .unwrap();
 
         let resolved = handler
-            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, 1, &storage)
             .await
             .expect("an absent external-store ETag must opt out of comparison");
         assert_eq!(resolved.path, final_path);
@@ -1467,7 +1327,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
 
@@ -1476,14 +1336,14 @@ mod tests {
                 &mut manifest,
                 None,
                 &base_path,
-                &object_store,
+                &storage,
                 write_manifest_file_to_path,
                 ManifestNamingScheme::V2,
                 None,
             )
             .await
             .expect("the default store should finalize the selected manifest");
-        let original = object_store.stat(&committed.path).await.unwrap();
+        let original = storage.stat(&committed.path).await.unwrap();
         assert_eq!(committed.e_tag, original.e_tag);
 
         let indexed = external_store
@@ -1492,19 +1352,19 @@ mod tests {
             .unwrap();
         assert_eq!(indexed.e_tag, None);
 
-        object_store
+        storage
             .put_payload(
                 &committed.path,
-                object_store::PutPayload::from(vec![0_u8; original.size as usize]),
+                lance_io::object_store::PutPayload::from(vec![0_u8; original.size as usize]),
             )
             .await
             .unwrap();
 
-        let replacement = object_store.stat(&committed.path).await.unwrap();
+        let replacement = storage.stat(&committed.path).await.unwrap();
         assert_ne!(replacement.e_tag, original.e_tag);
 
         let resolved = handler
-            .resolve_version_location(&base_path, committed.version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, committed.version, &storage)
             .await
             .expect("the external index must not reject a new physical generation");
         assert_eq!(resolved.e_tag, replacement.e_tag);
@@ -1516,18 +1376,18 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let version = 1;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
         let staging_path = make_staging_manifest_path(&final_path).unwrap();
         let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
 
-        object_store
+        storage
             .put_payload(&staging_path, manifest_bytes.clone().into())
             .await
             .unwrap();
-        let staging_meta = object_store.stat(&staging_path).await.unwrap();
+        let staging_meta = storage.stat(&staging_path).await.unwrap();
         external_store
             .put_if_not_exists(
                 base_path.as_ref(),
@@ -1540,10 +1400,10 @@ mod tests {
             .unwrap();
 
         let finalized = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .expect("a reader should finalize the selected staging manifest");
-        let final_meta = object_store.stat(&final_path).await.unwrap();
+        let final_meta = storage.stat(&final_path).await.unwrap();
         assert_eq!(finalized.e_tag, final_meta.e_tag);
 
         let indexed = external_store
@@ -1559,22 +1419,22 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let version = 1;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
 
-        object_store
+        storage
             .put_payload(
                 &final_path,
-                object_store::PutPayload::from_static(b"manifest"),
+                lance_io::object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.stat(&final_path).await.unwrap();
+        let final_meta = storage.stat(&final_path).await.unwrap();
 
         let resolved = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .expect("an existing manifest should be indexed during onboarding");
         assert_eq!(resolved.e_tag, final_meta.e_tag);
@@ -1592,18 +1452,18 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
-        object_store
+        storage
             .put_payload(
                 &final_path,
-                object_store::PutPayload::from_static(b"manifest"),
+                lance_io::object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.stat(&final_path).await.unwrap();
+        let final_meta = storage.stat(&final_path).await.unwrap();
         external_store
             .put_if_not_exists(
                 base_path.as_ref(),
@@ -1616,7 +1476,7 @@ mod tests {
             .unwrap();
 
         let error = handler
-            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, 1, &storage)
             .await
             .expect_err("copies of the selected staging object must preserve its size");
         assert!(matches!(error, Error::CorruptFile { .. }));
@@ -1629,7 +1489,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
         let version = manifest.version;
@@ -1640,7 +1500,7 @@ mod tests {
                 &mut manifest,
                 None,
                 &base_path,
-                &object_store,
+                &storage,
                 write_manifest_file_to_path,
                 ManifestNamingScheme::V2,
                 None,
@@ -1652,7 +1512,7 @@ mod tests {
             committed.e_tag.is_some(),
             "the caller must retain the canonical generation even when index repair fails"
         );
-        object_store
+        storage
             .stat(&final_path)
             .await
             .expect("the canonical manifest is the durable commit point");
@@ -1662,13 +1522,13 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(pending.path, final_path);
-        object_store
+        storage
             .stat(&pending.path)
             .await
             .expect("staging must remain until the external index is repaired");
 
         let repaired = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .expect("a reader must be able to repair the pending external index");
         assert_eq!(repaired.path, final_path);
@@ -1686,7 +1546,7 @@ mod tests {
             indexed.e_tag, None,
             "the repaired index must not retain a physical object generation"
         );
-        let staging_error = object_store
+        let staging_error = storage
             .stat(&pending.path)
             .await
             .expect_err("repair should garbage-collect the retained staging object");
@@ -1699,20 +1559,20 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let version = 1;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
         let staging_path = make_staging_manifest_path(&final_path).unwrap();
         let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
 
-        object_store
+        storage
             .put_payload(&staging_path, manifest_bytes.clone().into())
             .await
             .unwrap();
-        let staging_meta = object_store.stat(&staging_path).await.unwrap();
+        let staging_meta = storage.stat(&staging_path).await.unwrap();
 
-        let writer_store = object_store.inner.clone();
+        let writer_store = storage.clone();
         let writer_external_store = external_store.clone();
         let writer_base_path = base_path.clone();
         let writer_staging_path = staging_path.clone();
@@ -1725,7 +1585,7 @@ mod tests {
                     &writer_staging_path,
                     staging_meta.size,
                     writer_e_tag,
-                    writer_store.as_ref(),
+                    &writer_store,
                     ManifestNamingScheme::V2,
                 )
                 .await
@@ -1738,7 +1598,7 @@ mod tests {
         .await
         .expect("the direct finalizer should pause after COPY");
 
-        let first_generation = object_store.stat(&final_path).await.unwrap();
+        let first_generation = storage.stat(&final_path).await.unwrap();
         let reservation = external_store
             .get_manifest_location(base_path.as_ref(), version)
             .await
@@ -1754,14 +1614,14 @@ mod tests {
         // index. Both copies have exactly the same bytes; only their physical
         // object generations differ.
         let reader_location = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .unwrap();
 
         external_store.release_first_final_publish.notify_one();
         let writer_location = writer.await.unwrap().unwrap();
-        let final_meta = object_store.stat(&final_path).await.unwrap();
-        let final_bytes = object_store
+        let final_meta = storage.stat(&final_path).await.unwrap();
+        let final_bytes = storage
             .read_object(&final_path)
             .await
             .unwrap()
@@ -1788,7 +1648,7 @@ mod tests {
         );
 
         let resolved = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .expect("the finalized manifest must remain readable after the race");
         assert_eq!(resolved.e_tag, final_meta.e_tag);
@@ -1800,7 +1660,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
 
@@ -1809,7 +1669,7 @@ mod tests {
                 &mut manifest,
                 None,
                 &base_path,
-                &object_store,
+                &storage,
                 write_manifest_file_to_path,
                 ManifestNamingScheme::V2,
                 None,
@@ -1819,17 +1679,17 @@ mod tests {
         assert!(matches!(commit_error, CommitError::CommitConflict));
 
         let staging_path = Path::from(external_store.get("dataset", 1).await.unwrap());
-        object_store.stat(&staging_path).await.unwrap();
+        storage.stat(&staging_path).await.unwrap();
 
         let resolved = handler
-            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, 1, &storage)
             .await
             .expect("the retained staging manifest must allow finalization");
         assert_eq!(
             resolved.path,
             ManifestNamingScheme::V2.manifest_path(&base_path, 1)
         );
-        object_store.stat(&resolved.path).await.unwrap();
+        storage.stat(&resolved.path).await.unwrap();
     }
 
     #[tokio::test]
@@ -1838,7 +1698,7 @@ mod tests {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
         let version = manifest.version;
@@ -1849,7 +1709,7 @@ mod tests {
                 &mut manifest,
                 None,
                 &base_path,
-                &object_store,
+                &storage,
                 write_manifest_file_to_path,
                 ManifestNamingScheme::V2,
                 None,
@@ -1857,7 +1717,7 @@ mod tests {
             .await
             .expect("the generic workflow should commit the canonical manifest");
         assert_eq!(committed.path, final_path);
-        let final_meta = object_store.stat(&final_path).await.unwrap();
+        let final_meta = storage.stat(&final_path).await.unwrap();
         assert_eq!(
             committed.e_tag, final_meta.e_tag,
             "the freshly committed Dataset needs the observed generation for cache separation"
@@ -1876,18 +1736,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_staging_verifies_existing_final_manifest() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let staging_path = Path::from("dataset/_versions/1.manifest-missing");
         let final_path = Path::from("dataset/_versions/1.manifest");
         let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
-        object_store
+        storage
             .put_payload(&final_path, manifest_bytes.clone().into())
             .await
             .unwrap();
-        let final_meta = object_store.stat(&final_path).await.unwrap();
+        let final_meta = storage.stat(&final_path).await.unwrap();
 
         let recovered_e_tag = copy_or_verify_final_manifest(
-            object_store.inner.as_ref(),
+            &storage,
             &staging_path,
             &final_path,
             1,
@@ -1901,19 +1761,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_staging_rejects_missing_final_manifest() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let staging_path = Path::from("dataset/_versions/1.manifest-missing");
         let final_path = Path::from("dataset/_versions/1.manifest");
 
-        let error = copy_or_verify_final_manifest(
-            object_store.inner.as_ref(),
-            &staging_path,
-            &final_path,
-            1,
-            42,
-        )
-        .await
-        .expect_err("missing staging and canonical objects cannot establish a commit");
+        let error = copy_or_verify_final_manifest(&storage, &staging_path, &final_path, 1, 42)
+            .await
+            .expect_err("missing staging and canonical objects cannot establish a commit");
 
         assert!(matches!(error, Error::NotFound { .. }), "{error:?}");
         assert!(error.to_string().contains(final_path.as_ref()), "{error}");
@@ -1921,23 +1775,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_staging_rejects_wrong_final_size() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let staging_path = Path::from("dataset/_versions/1.manifest-missing");
         let final_path = Path::from("dataset/_versions/1.manifest");
-        object_store
+        storage
             .put_payload(&final_path, Bytes::from_static(b"wrong size").into())
             .await
             .unwrap();
 
-        let error = copy_or_verify_final_manifest(
-            object_store.inner.as_ref(),
-            &staging_path,
-            &final_path,
-            1,
-            42,
-        )
-        .await
-        .expect_err("a same-path object with the wrong size is not the selected manifest");
+        let error = copy_or_verify_final_manifest(&storage, &staging_path, &final_path, 1, 42)
+            .await
+            .expect_err("a same-path object with the wrong size is not the selected manifest");
 
         assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
         assert!(
@@ -1953,10 +1801,10 @@ mod tests {
             external_manifest_store: external_store.clone(),
         };
 
-        let mut object_store = ObjectStore::memory();
+        let mut storage = ObjectStore::memory();
         let fail_next_copy = Arc::new(AtomicBool::new(true));
         let failed_copy_source = Arc::new(Mutex::new(None));
-        let mut policy = ProxyObjectStorePolicy::new();
+        let mut policy = ProxyBackendPolicy::new();
         let policy_fail_next_copy = fail_next_copy.clone();
         let policy_failed_copy_source = failed_copy_source.clone();
         policy.set_before_policy(
@@ -1970,9 +1818,8 @@ mod tests {
             }),
         );
         let policy = Arc::new(Mutex::new(policy));
-        object_store.inner = Arc::new(ProxyObjectStore::new(
-            object_store.inner.clone(),
-            policy.clone(),
+        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
         ));
 
         let base_path = Path::from("dataset");
@@ -1985,7 +1832,7 @@ mod tests {
                 &mut manifest,
                 None,
                 &base_path,
-                &object_store,
+                &storage,
                 write_manifest_file_to_path,
                 ManifestNamingScheme::V2,
                 None,
@@ -2008,12 +1855,12 @@ mod tests {
             .clone()
             .expect("the failure must be injected at copy(staging, canonical)");
         assert_eq!(recorded_location.path, staging_path);
-        object_store
+        storage
             .stat(&staging_path)
             .await
             .expect("the winning staging manifest must be retained");
 
-        let canonical_error = object_store
+        let canonical_error = storage
             .stat(&canonical_path)
             .await
             .expect_err("copy failed before creating the canonical manifest");
@@ -2024,7 +1871,7 @@ mod tests {
 
         policy.lock().unwrap().clear_before_policy("fail-copy-once");
         let resolved = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .expect("the retained staging manifest must allow finalization");
         assert_eq!(resolved.path, canonical_path);
@@ -2034,12 +1881,12 @@ mod tests {
             .await
             .expect("the external store must publish the canonical location");
         assert_eq!(finalized_location.path, canonical_path);
-        object_store
+        storage
             .stat(&canonical_path)
             .await
             .expect("the canonical manifest must exist after finalization");
 
-        let staging_error = object_store
+        let staging_error = storage
             .stat(&staging_path)
             .await
             .expect_err("successful finalization must clean up the staging manifest");
@@ -2276,14 +2123,14 @@ mod tests {
         PredecessorIdentity,
     ) {
         let handler = store.handler();
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("dataset");
         handler
             .commit(
                 &mut test_manifest(),
                 None,
                 &base_path,
-                &object_store,
+                &storage,
                 write_manifest_file_to_path,
                 ManifestNamingScheme::V2,
                 None,
@@ -2291,17 +2138,17 @@ mod tests {
             .await
             .unwrap();
         let predecessor = handler
-            .resolve_latest_identity(&base_path, &object_store)
+            .resolve_latest_identity(&base_path, &storage)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(predecessor.version, 1);
-        (handler, object_store, base_path, predecessor)
+        (handler, storage, base_path, predecessor)
     }
 
     async fn commit_after_v2(
         handler: &ExternalManifestCommitHandler,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         base_path: &Path,
         predecessor: &PredecessorIdentity,
     ) -> std::result::Result<ManifestLocation, CommitError> {
@@ -2312,7 +2159,7 @@ mod tests {
                 &mut manifest,
                 None,
                 base_path,
-                object_store,
+                storage,
                 write_manifest_file_to_path,
                 ManifestNamingScheme::V2,
                 None,
@@ -2321,9 +2168,9 @@ mod tests {
             .await
     }
 
-    async fn versions_dir_files(object_store: &ObjectStore, base_path: &Path) -> Vec<String> {
-        let mut files: Vec<String> = object_store
-            .list_objects(Some(&base_path.clone().join(VERSIONS_DIR)))
+    async fn versions_dir_files(storage: &ObjectStore, base_path: &Path) -> Vec<String> {
+        let mut files: Vec<String> = storage
+            .list(Some(base_path.clone().join(VERSIONS_DIR)))
             .map_ok(|meta| meta.location.filename().unwrap().to_string())
             .try_collect()
             .await
@@ -2335,8 +2182,8 @@ mod tests {
     #[tokio::test]
     async fn test_a_conditioned_commit_lands_under_its_minted_identity() {
         let store = Arc::new(IdentifiedStore::default());
-        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
-        let location = commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+        let (handler, storage, base_path, predecessor) = identified_fixture(&store).await;
+        let location = commit_after_v2(&handler, &storage, &base_path, &predecessor)
             .await
             .unwrap();
         // Published at a staging name: invisible to object-store listing,
@@ -2348,35 +2195,35 @@ mod tests {
         assert!(location.identity.is_some());
         assert_eq!(location.identity, store.identity_of(2));
         let resolved = handler
-            .resolve_latest_location(&base_path, &object_store)
+            .resolve_latest_location(&base_path, &storage)
             .await
             .unwrap();
         assert_eq!(resolved.path, location.path);
         assert_eq!(resolved.identity, location.identity);
         // The store, not the object store, is the history.
         assert_eq!(
-            listed_versions(&handler, &object_store, &base_path).await,
+            listed_versions(&handler, &storage, &base_path).await,
             vec![2, 1]
         );
         let since: Vec<u64> = handler
-            .list_manifest_locations_since(&base_path, &object_store, 1)
+            .list_manifest_locations_since(&base_path, &storage, 1)
             .map_ok(|l| l.version)
             .try_collect()
             .await
             .unwrap();
         assert_eq!(since, vec![2]);
-        assert_eq!(versions_dir_files(&object_store, &base_path).await.len(), 2);
+        assert_eq!(versions_dir_files(&storage, &base_path).await.len(), 2);
     }
 
     #[tokio::test]
     async fn test_a_changed_predecessor_is_refused_without_publishing() {
         let store = Arc::new(IdentifiedStore::default());
-        let (handler, object_store, base_path, _) = identified_fixture(&store).await;
+        let (handler, storage, base_path, _) = identified_fixture(&store).await;
         let stale = PredecessorIdentity {
             version: 1,
             identity: "identity-from-a-dropped-dataset".to_string(),
         };
-        let err = commit_after_v2(&handler, &object_store, &base_path, &stale)
+        let err = commit_after_v2(&handler, &storage, &base_path, &stale)
             .await
             .unwrap_err();
         assert!(
@@ -2388,7 +2235,7 @@ mod tests {
         );
         assert!(store.identity_of(2).is_none());
         assert_eq!(
-            versions_dir_files(&object_store, &base_path).await,
+            versions_dir_files(&storage, &base_path).await,
             v2_names(&[1])
         );
     }
@@ -2396,17 +2243,17 @@ mod tests {
     #[tokio::test]
     async fn test_a_taken_version_is_a_conflict() {
         let store = Arc::new(IdentifiedStore::default());
-        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        let (handler, storage, base_path, predecessor) = identified_fixture(&store).await;
         store
             .put_if_not_exists("dataset", 2, &v2_path(2), 1, None)
             .await
             .unwrap();
-        let err = commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+        let err = commit_after_v2(&handler, &storage, &base_path, &predecessor)
             .await
             .unwrap_err();
         assert!(matches!(err, CommitError::CommitConflict), "{err:?}");
         assert_eq!(
-            versions_dir_files(&object_store, &base_path).await,
+            versions_dir_files(&storage, &base_path).await,
             v2_names(&[1])
         );
     }
@@ -2416,9 +2263,9 @@ mod tests {
     #[tokio::test]
     async fn test_a_recreation_before_publication_is_refused() {
         let store = Arc::new(IdentifiedStore::default());
-        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        let (handler, storage, base_path, predecessor) = identified_fixture(&store).await;
         store.recreate();
-        let err = commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+        let err = commit_after_v2(&handler, &storage, &base_path, &predecessor)
             .await
             .unwrap_err();
         assert!(
@@ -2429,17 +2276,17 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(
-            versions_dir_files(&object_store, &base_path).await,
+            versions_dir_files(&storage, &base_path).await,
             v2_names(&[1])
         );
     }
     async fn listed_versions(
         handler: &ExternalManifestCommitHandler,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         base_path: &Path,
     ) -> Vec<u64> {
         handler
-            .list_manifest_locations(base_path, object_store, true)
+            .list_manifest_locations(base_path, storage, true)
             .map_ok(|l| l.version)
             .try_collect()
             .await
@@ -2451,13 +2298,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_cancelled_reservation_publishes_nothing() {
         let store = Arc::new(IdentifiedStore::default());
-        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        let (handler, storage, base_path, predecessor) = identified_fixture(&store).await;
         store.hold_next_reservation.store(true, Ordering::SeqCst);
         let task = {
-            let (handler, object_store, base_path) =
-                (store.handler(), object_store.clone(), base_path.clone());
+            let (handler, storage, base_path) =
+                (store.handler(), storage.clone(), base_path.clone());
             tokio::spawn(async move {
-                commit_after_v2(&handler, &object_store, &base_path, &predecessor).await
+                commit_after_v2(&handler, &storage, &base_path, &predecessor).await
             })
         };
         tokio::time::timeout(
@@ -2471,12 +2318,12 @@ mod tests {
 
         assert!(store.identity_of(2).is_none());
         assert_eq!(
-            listed_versions(&handler, &object_store, &base_path).await,
+            listed_versions(&handler, &storage, &base_path).await,
             vec![1]
         );
         // The orphaned object is on the object store, but not as a version.
-        assert_eq!(versions_dir_files(&object_store, &base_path).await.len(), 2);
-        let raw: Vec<u64> = default_list_manifest_locations(&base_path, &object_store, true)
+        assert_eq!(versions_dir_files(&storage, &base_path).await.len(), 2);
+        let raw: Vec<u64> = default_list_manifest_locations(&base_path, &storage, true)
             .map_ok(|l| l.version)
             .try_collect()
             .await
@@ -2488,8 +2335,8 @@ mod tests {
     #[tokio::test]
     async fn test_forgetting_a_version_retires_only_that_record() {
         let store = Arc::new(IdentifiedStore::default());
-        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
-        commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+        let (handler, storage, base_path, predecessor) = identified_fixture(&store).await;
+        commit_after_v2(&handler, &storage, &base_path, &predecessor)
             .await
             .unwrap();
         handler
@@ -2497,7 +2344,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            listed_versions(&handler, &object_store, &base_path).await,
+            listed_versions(&handler, &storage, &base_path).await,
             vec![2, 1]
         );
         let identity = store.identity_of(1).unwrap();
@@ -2510,7 +2357,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            listed_versions(&handler, &object_store, &base_path).await,
+            listed_versions(&handler, &storage, &base_path).await,
             vec![2]
         );
     }

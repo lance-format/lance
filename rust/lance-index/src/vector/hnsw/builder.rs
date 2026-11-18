@@ -1939,6 +1939,7 @@ mod tests {
     use arrow_schema::{Schema, SchemaRef};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::storage::path::Path;
     use lance_core::{Error, Result, deepsize::DeepSizeOf};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader,
@@ -1950,7 +1951,6 @@ mod tests {
     use lance_table::format::SelfDescribingFileReader;
     use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
-    use object_store::path::Path;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
@@ -2022,9 +2022,9 @@ mod tests {
         )
         .unwrap();
 
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let path = Path::from("test_builder_write_load");
-        let writer = object_store.create(&path).await.unwrap();
+        let writer = storage.create(&path).await.unwrap();
         let schema = Schema::new(vec![
             VECTOR_ID_FIELD.clone(),
             NEIGHBORS_FIELD.clone(),
@@ -2042,7 +2042,7 @@ mod tests {
         writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&storage, &path, None)
             .await
             .unwrap();
         let batch = reader
@@ -2084,9 +2084,9 @@ mod tests {
             .await
             .unwrap();
 
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let path = Path::from("test_builder_write_load_binary_hamming");
-        let writer = object_store.create(&path).await.unwrap();
+        let writer = storage.create(&path).await.unwrap();
         let schema = Schema::new(vec![
             VECTOR_ID_FIELD.clone(),
             NEIGHBORS_FIELD.clone(),
@@ -2104,7 +2104,7 @@ mod tests {
         writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&storage, &path, None)
             .await
             .unwrap();
         let batch = reader

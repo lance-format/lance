@@ -214,6 +214,7 @@ mod tests {
 
     use async_trait::async_trait;
     use lance_core::Error;
+    use lance_core::storage::path::Path as ObjectPath;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use lance_table::format::{IndexMetadata, Manifest, Transaction as ManifestTransaction};
@@ -221,7 +222,6 @@ mod tests {
         CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
         RenameCommitHandler,
     };
-    use object_store::path::Path as ObjectPath;
     use rstest::rstest;
 
     use super::*;
@@ -251,7 +251,7 @@ mod tests {
             manifest: &mut Manifest,
             indices: Option<Vec<IndexMetadata>>,
             base_path: &ObjectPath,
-            object_store: &ObjectStore,
+            storage: &ObjectStore,
             manifest_writer: ManifestWriter,
             naming_scheme: ManifestNamingScheme,
             transaction: Option<ManifestTransaction>,
@@ -276,7 +276,7 @@ mod tests {
                     manifest,
                     indices,
                     base_path,
-                    object_store,
+                    storage,
                     manifest_writer,
                     naming_scheme,
                     transaction,

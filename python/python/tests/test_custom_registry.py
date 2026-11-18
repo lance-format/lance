@@ -3,7 +3,7 @@
 
 """Smoke test for the runtime object-store scheme registration hook.
 
-Exercises the pyo3 additions in ``python/src/object_store.rs`` and the new
+Exercises the pyo3 additions in ``python/src/storage.rs`` and the new
 ``store_registry=`` parameter on ``Session(...)``. Registers the built-in
 ``MemoryStoreProvider`` under a made-up scheme (``test-mem``) and proves that
 ``lance.write_dataset(...)`` and ``lance.dataset(...)`` route reads and writes
@@ -12,7 +12,7 @@ resolver.
 
 The full Python-to-Rust ``ObjectStoreProvider`` callable bridge is not exercised
 here — that is a follow-up. See the module docstring in
-``python/src/object_store.rs``.
+``python/src/storage.rs``.
 """
 
 import lance
@@ -40,7 +40,7 @@ def test_custom_scheme_registration_roundtrip():
     """Register ``test-mem`` and round-trip a small table through it.
 
     Note on lifetimes: ``ObjectStoreRegistry`` caches active stores under
-    ``Weak<ObjectStore>``. Every call to ``MemoryStoreProvider::new_store``
+    ``Weak<Storage>``. Every call to ``MemoryStoreProvider::new_backend``
     allocates a fresh ``InMemory`` backend, so the writer's dataset handle
     must stay alive across the read to keep the same in-memory store visible
     from the reader.
@@ -56,7 +56,7 @@ def test_custom_scheme_registration_roundtrip():
     uri = "test-mem://cache/dataset.lance"
 
     # Keep the write-side dataset alive across the read so the shared
-    # ObjectStore held by the registry's Weak cache remains upgradeable.
+    # Storage held by the registry's Weak cache remains upgradeable.
     written = lance.write_dataset(table, uri, session=session)
     assert written.count_rows() == 5
 

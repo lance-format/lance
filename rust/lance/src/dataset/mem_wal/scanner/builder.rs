@@ -32,7 +32,6 @@ use super::projection::validate_projection_names;
 use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use super::vector_search::ProbeBounds;
 use crate::dataset::Dataset;
-use crate::dataset::mem_wal::util::derived_store_params;
 use crate::dataset::utils::SchemaAdapter;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
@@ -266,7 +265,7 @@ impl LsmScanner {
         // The scanner only ever opens SSTables with these — the base
         // table is already open and handed in — so they must not carry a
         // path-bound store binding.
-        let store_params = base_table.store_params().map(derived_store_params);
+        let store_params = base_table.store_params().cloned();
         Self {
             identity_schema: Arc::new(crate::dataset::mem_wal::arrow_schema_with_field_ids(
                 base_table.schema(),
@@ -401,11 +400,11 @@ impl LsmScanner {
     /// base table's; set explicitly on a fresh-tier-only scanner (no base table).
     ///
     /// Pass the params the *base* was opened with. As in [`Self::new`], they are
-    /// adapted for generation URIs: a path-bound `object_store` binding would
+    /// adapted for generation URIs: a path-bound `storage` binding would
     /// redirect every generation open at the base table itself, so it is dropped
     /// while storage options, wrapper, and credentials carry over.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
-        self.store_params = Some(derived_store_params(&store_params));
+        self.store_params = Some(store_params);
         self
     }
 

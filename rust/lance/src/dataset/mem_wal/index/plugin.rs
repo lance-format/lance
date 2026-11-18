@@ -18,6 +18,7 @@ use datafusion::common::ScalarValue;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexType;
@@ -26,7 +27,6 @@ use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
-use object_store::path::Path;
 use uuid::Uuid;
 
 use super::RowPosition;
@@ -245,7 +245,7 @@ pub struct GenerationWrite<'a> {
     /// Directory holding the generation's files.
     pub path: &'a Path,
     /// Store to write through.
-    pub object_store: &'a Arc<ObjectStore>,
+    pub storage: &'a Arc<ObjectStore>,
     /// The generation as committed.
     pub dataset: &'a Dataset,
     /// How many rows the generation holds.

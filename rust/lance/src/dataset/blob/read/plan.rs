@@ -162,7 +162,7 @@ impl BlobReadBatchFootprint {
             let source_ranges = self.sources.entry(planned.source_key.clone()).or_default();
             let insertion = source_ranges.plan_insertion(
                 &planned.read.physical_range,
-                planned.source.object_store.block_size() as u64,
+                planned.source.storage.block_size() as u64,
             )?;
             let Some(insertion) = insertion else {
                 return Ok(true);
@@ -349,8 +349,8 @@ mod tests {
     use bytes::Bytes;
     use futures::TryStreamExt;
     use lance_core::datatypes::BlobKind;
+    use lance_core::storage::path::Path;
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
     use std::sync::Arc;
 
     fn recording_range_store_with_block_size(

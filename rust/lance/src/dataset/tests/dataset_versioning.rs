@@ -12,6 +12,7 @@ use std::vec;
 
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     AutoCleanupParams, MergeInsertBuilder, NewColumnTransform, UpdateBuilder, WhenNotMatched,
@@ -23,6 +24,7 @@ use lance_table::io::commit::{
 };
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
+use crate::session::Session;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::cast::AsArray;
@@ -30,11 +32,10 @@ use arrow_array::types::UInt64Type;
 use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
-use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_io::local::to_local_path;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreProvider};
+use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy, TestWrappingObjectStore};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
@@ -44,14 +45,12 @@ use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure, copy_test_dat
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use lance_core::Error;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, path::Path,
+use lance_io::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStoreParams,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, WrappingObjectStore, path::Path,
 };
 use rstest::rstest;
 use std::cmp::Ordering;
-use url::Url;
 
 fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNamingScheme) {
     let entries_names = test_dir
@@ -1402,7 +1401,7 @@ async fn test_deleted_branch_cannot_checkout_retained_manifests() {
     root.tags().create("snapshot", ("exp", 1)).await.unwrap();
     // Model an interrupted cleanup or an in-flight writer leaving manifests.
     let metadata = branch_contents_path(&root.base, "exp");
-    root.object_store.delete(&metadata).await.unwrap();
+    root.storage.delete(&metadata).await.unwrap();
 
     for version in [None, Some(1)] {
         let error = root.checkout_version(("exp", version)).await.unwrap_err();
@@ -1442,7 +1441,7 @@ impl CommitHandler for DeleteBranchOnCommit {
         manifest: &mut lance_table::format::Manifest,
         indices: Option<Vec<lance_table::format::IndexMetadata>>,
         base_path: &Path,
-        object_store: &lance_io::object_store::ObjectStore,
+        storage: &lance_io::object_store::ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<lance_table::format::Transaction>,
@@ -1460,7 +1459,7 @@ impl CommitHandler for DeleteBranchOnCommit {
                 manifest,
                 indices,
                 base_path,
-                object_store,
+                storage,
                 manifest_writer,
                 naming_scheme,
                 transaction,
@@ -1527,14 +1526,18 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
     root.append(id_rows(2, 1), None).await.unwrap();
     let mut deleted = root.create_branch("a", 2, None).await.unwrap();
     root.create_branch("a/b", 1, None).await.unwrap();
-    let mut store = root.object_store.as_ref().clone();
-    store.inner = Arc::new(DirectoryMarkerStore {
-        inner: store.inner.clone(),
-        marker: deleted.base.clone(),
-        // Force the shared-directory traversal to fail before removing files.
-        listings: AtomicUsize::new(1),
-    });
-    root.refs.object_store = Arc::new(store);
+    let mut store = root.storage.as_ref().clone();
+    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        |backend| {
+            Arc::new(DirectoryMarkerStore {
+                inner: backend,
+                marker: deleted.base.clone(),
+                // Force the shared-directory traversal to fail before removing files.
+                listings: AtomicUsize::new(1),
+            })
+        },
+    ));
+    root.refs.storage = Arc::new(store);
 
     let error = root.delete_branch("a").await.unwrap_err();
     assert!(matches!(error, Error::IO { .. }), "{error}");
@@ -1546,7 +1549,7 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
     );
     assert!(
         deleted
-            .object_store
+            .storage
             .exists(&deleted.manifest_location.path)
             .await
             .unwrap()
@@ -1562,7 +1565,7 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
     assert_eq!(child.count_rows(None).await.unwrap(), 2);
 
     // Finish the failed cleanup before reusing the name for a different history.
-    root.refs.object_store = root.object_store.clone();
+    root.refs.storage = root.storage.clone();
     root.force_delete_branch("a").await.unwrap();
     let recreated = root.create_branch("a", 1, None).await.unwrap();
     assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
@@ -1851,7 +1854,7 @@ async fn test_create_branch_rejects_orphaned_versions(
     dataset.branches().create("exp", 1, None).await.unwrap();
     // Choose the branch's naming scheme independently of create_branch's default.
     let mut orphan = CommitBuilder::new(branch_location.uri.as_str())
-        .with_object_store(dataset.object_store.clone())
+        .with_storage(dataset.storage.clone())
         .with_commit_handler(dataset.commit_handler.clone())
         .enable_v2_manifest_paths(enable_v2_manifest_paths)
         .execute(Transaction::new(
@@ -1872,12 +1875,12 @@ async fn test_create_branch_rejects_orphaned_versions(
     // Leave the same storage state as a write racing branch deletion, without
     // depending on whether writes through deleted handles are permitted.
     dataset
-        .object_store
+        .storage
         .delete(&branch_contents_path(&dataset.base, "exp"))
         .await
         .unwrap();
     if remove_first_manifest {
-        dataset.object_store.delete(&first_manifest).await.unwrap();
+        dataset.storage.delete(&first_manifest).await.unwrap();
     }
     dataset.append(id_rows(10, 2), None).await.unwrap();
     let source_version = if remove_first_manifest { 1 } else { 2 };
@@ -1901,13 +1904,13 @@ async fn test_create_branch_rejects_orphaned_versions(
         assert!(dataset.list_branches().await.unwrap().is_empty());
         assert!(
             dataset
-                .object_store
+                .storage
                 .exists(&orphan.manifest_location.path)
                 .await
                 .unwrap()
         );
         assert_eq!(
-            dataset.object_store.exists(&first_manifest).await.unwrap(),
+            dataset.storage.exists(&first_manifest).await.unwrap(),
             !remove_first_manifest
         );
     }
@@ -1960,7 +1963,7 @@ async fn test_create_branch_name_storage_limits(
         assert!(!std::path::Path::new(tempdir.as_str()).join("tree").exists());
         assert!(
             dataset
-                .object_store
+                .storage
                 .list(Some(base_branches_contents_path(&dataset.base)))
                 .try_collect::<Vec<_>>()
                 .await
@@ -1990,23 +1993,9 @@ async fn test_create_branch_name_storage_limits(
     }
 }
 
-#[derive(Debug)]
-struct FixedMemoryStoreProvider(Arc<ObjectStore>);
-
-#[async_trait::async_trait]
-impl ObjectStoreProvider for FixedMemoryStoreProvider {
-    async fn new_store(
-        &self,
-        _base_path: Url,
-        _params: &ObjectStoreParams,
-    ) -> lance_core::Result<ObjectStore> {
-        Ok(self.0.as_ref().clone())
-    }
-}
-
 #[rstest]
 #[case::released_local("é".repeat(22), false)]
-#[case::object_store("x".repeat(300), true)]
+#[case::storage("x".repeat(300), true)]
 #[tokio::test]
 async fn test_existing_branch_above_creation_limit(
     #[case] branch_name: String,
@@ -2015,21 +2004,29 @@ async fn test_existing_branch_above_creation_limit(
 ) {
     let test_dir = copy_test_data_to_tmp("v14.0.2/long_branch.lance").unwrap();
     let mut dataset = if in_memory {
+        let provider = lance_io::utils::testing::TestObjectStoreProvider(
+            lance_io::object_store::BackendConfig::new(
+                lance_io::object_store::backend::native::from_object_store(Arc::new(
+                    object_store::memory::InMemory::new(),
+                )),
+                "memory",
+            ),
+        );
+        let session = Arc::new(Session::default());
+        session
+            .store_registry()
+            .insert("memory", Arc::new(provider));
         let dataset = Dataset::write(
             id_rows(0, 2),
             "memory://",
             Some(WriteParams {
+                session: Some(session),
                 max_rows_per_file: 1,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-        // Reopening the clone and its source must resolve to the same memory backend.
-        dataset.session.store_registry().insert(
-            "memory",
-            Arc::new(FixedMemoryStoreProvider(dataset.object_store.clone())),
-        );
         create_branch_before_name_check(&dataset, &branch_name).await;
         dataset
     } else {
@@ -2089,7 +2086,7 @@ async fn test_existing_branch_above_creation_limit(
         .path;
     assert!(
         dataset
-            .object_store
+            .storage
             .list(Some(branch_path))
             .try_collect::<Vec<_>>()
             .await
@@ -2122,12 +2119,11 @@ async fn test_list_hierarchical_branches() {
     ))
     .unwrap();
     dataset
-        .object_store
-        .inner
+        .storage
         .copy(&encoded_path, &nested_path)
         .await
         .unwrap();
-    dataset.object_store.delete(&encoded_path).await.unwrap();
+    dataset.storage.delete(&encoded_path).await.unwrap();
 
     let branches = dataset.list_branches().await.unwrap();
     assert_eq!(branches.len(), 2);
@@ -2160,7 +2156,7 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
     dataset.create_branch("retained", 1, None).await.unwrap();
 
     let deleted_ref = branch_contents_path(&dataset.base, "deleted");
-    let mut policy = ProxyObjectStorePolicy::new();
+    let mut policy = ProxyBackendPolicy::new();
     let has_deleted_ref = AtomicBool::new(false);
     policy.set_before_policy(
         "ref_disappears_after_listing",
@@ -2171,7 +2167,7 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
                         std::fs::remove_file(to_local_path(path)).unwrap();
                     }
                 } else {
-                    return Err(object_store::Error::PermissionDenied {
+                    return Err(lance_io::object_store::Error::PermissionDenied {
                         path: path.to_string(),
                         source: "ref cannot be read".into(),
                     }
@@ -2181,12 +2177,12 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
             Ok(())
         }),
     );
-    let mut store = dataset.object_store.as_ref().clone();
-    store.inner = Arc::new(ProxyObjectStore::new(
-        store.inner.clone(),
-        Arc::new(Mutex::new(policy)),
+    let mut store = dataset.storage.as_ref().clone();
+    let policy = Arc::new(Mutex::new(policy));
+    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
     ));
-    dataset.refs.object_store = Arc::new(store);
+    dataset.refs.storage = Arc::new(store);
 
     if is_not_found {
         let branches = dataset.list_branches().await.unwrap();
@@ -2199,7 +2195,7 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
         assert!(dataset.list_branches().await.unwrap().is_empty());
         assert!(
             dataset
-                .object_store
+                .storage
                 .list(Some(dataset.base.clone().join("tree").join("retained")))
                 .try_collect::<Vec<_>>()
                 .await
@@ -2215,7 +2211,7 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
         assert!(error.to_string().contains("ref cannot be read"), "{error}");
         assert!(
             dataset
-                .object_store
+                .storage
                 .exists(&branch_contents_path(&dataset.base, "retained"))
                 .await
                 .unwrap()
@@ -2225,11 +2221,11 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
 
 #[rstest]
 #[case::local(false)]
-#[case::object_store(true)]
+#[case::storage(true)]
 #[tokio::test]
-async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_store: bool) {
+async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_file_backend: bool) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         let path_prefix = if cfg!(windows) { "/" } else { "" };
         format!("file-object-store://{path_prefix}{}", tempdir.path_str())
     } else {
@@ -2249,7 +2245,7 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
     let concurrent = dataset.create_branch("concurrent", 1, None).await.unwrap();
     let concurrent_ref = branch_contents_path(&dataset.base, "concurrent");
     let deleted_ref = branch_contents_path(&dataset.base, "deleted");
-    let mut policy = ProxyObjectStorePolicy::new();
+    let mut policy = ProxyBackendPolicy::new();
     let has_deleted_ref = Arc::new(AtomicBool::new(false));
     let has_deleted_ref_for_directory_policy = has_deleted_ref.clone();
     let has_deleted_ref_for_ref_policy = has_deleted_ref.clone();
@@ -2279,9 +2275,9 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
             {
                 let reads =
                     concurrent_ref_reads_for_policy.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-                // Local file reads bypass the proxy. Object-store refs are read once
-                // during the cleanup list before the existence recheck.
-                let recheck_read = if use_object_store { 2 } else { 1 };
+                // Cleanup listing reads metadata and the body through the wrapper.
+                // Remove the ref on the subsequent existence recheck.
+                let recheck_read = 3;
                 if reads == recheck_read {
                     std::fs::remove_file(to_local_path(&concurrent_ref_for_policy)).unwrap();
                     has_removed_concurrent_ref_for_policy.store(true, AtomicOrdering::SeqCst);
@@ -2290,23 +2286,23 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
             Ok(())
         }),
     );
-    let mut store = dataset.object_store.as_ref().clone();
-    store.inner = Arc::new(ProxyObjectStore::new(
-        store.inner.clone(),
-        Arc::new(Mutex::new(policy)),
+    let mut store = dataset.storage.as_ref().clone();
+    let policy = Arc::new(Mutex::new(policy));
+    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
     ));
-    dataset.refs.object_store = Arc::new(store);
+    dataset.refs.storage = Arc::new(store);
 
     assert!(
         dataset
-            .object_store
+            .storage
             .exists(&branch.manifest_location.path)
             .await
             .unwrap()
     );
     assert!(
         !dataset
-            .object_store
+            .storage
             .list(Some(branch.base.clone()))
             .try_collect::<Vec<_>>()
             .await
@@ -2316,18 +2312,19 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
     dataset.delete_branch("deleted").await.unwrap();
     assert!(has_deleted_ref.load(AtomicOrdering::SeqCst));
     assert!(has_removed_concurrent_ref.load(AtomicOrdering::SeqCst));
+    assert_eq!(concurrent_ref_reads.load(AtomicOrdering::SeqCst), 3);
     assert!(
         !dataset
-            .object_store
+            .storage
             .exists(&branch.manifest_location.path)
             .await
             .unwrap()
     );
-    assert!(!dataset.object_store.exists(&concurrent_ref).await.unwrap());
+    assert!(!dataset.storage.exists(&concurrent_ref).await.unwrap());
     assert!(dataset.list_branches().await.unwrap().is_empty());
     assert!(
         dataset
-            .object_store
+            .storage
             .list(Some(branch.base.clone()))
             .try_collect::<Vec<_>>()
             .await
@@ -2336,7 +2333,7 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
     );
     assert!(
         dataset
-            .object_store
+            .storage
             .list(Some(concurrent.base.clone()))
             .try_collect::<Vec<_>>()
             .await
@@ -2347,11 +2344,11 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
 
 #[rstest]
 #[case::local(false)]
-#[case::object_store(true)]
+#[case::storage(true)]
 #[tokio::test]
-async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_object_store: bool) {
+async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_file_backend: bool) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         let path_prefix = if cfg!(windows) { "/" } else { "" };
         format!("file-object-store://{path_prefix}{}", tempdir.path_str())
     } else {
@@ -2392,7 +2389,7 @@ async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_obj
     let target = branch_contents_path(&dataset.base, "a");
     let done_rx = Mutex::new(done_rx);
     let has_created_child = AtomicBool::new(false);
-    let mut policy = ProxyObjectStorePolicy::new();
+    let mut policy = ProxyBackendPolicy::new();
     policy.set_before_policy(
         "create_before_ref_removal",
         Arc::new(move |method, path| {
@@ -2410,12 +2407,12 @@ async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_obj
             Ok(())
         }),
     );
-    let mut store = dataset.object_store.as_ref().clone();
-    store.inner = Arc::new(ProxyObjectStore::new(
-        store.inner.clone(),
-        Arc::new(Mutex::new(policy)),
+    let mut store = dataset.storage.as_ref().clone();
+    let policy = Arc::new(Mutex::new(policy));
+    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
     ));
-    dataset.refs.object_store = Arc::new(store);
+    dataset.refs.storage = Arc::new(store);
 
     dataset.delete_branch("a").await.unwrap();
     creator_thread.join().unwrap();
@@ -2432,11 +2429,11 @@ async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_obj
 
 #[rstest]
 #[case::local(false)]
-#[case::object_store(true)]
+#[case::storage(true)]
 #[tokio::test]
-async fn test_concurrent_branch_deletes_and_listing(#[case] use_object_store: bool) {
+async fn test_concurrent_branch_deletes_and_listing(#[case] use_file_backend: bool) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         let path_prefix = if cfg!(windows) { "/" } else { "" };
         format!("file-object-store://{path_prefix}{}", tempdir.path_str())
     } else {
@@ -2482,7 +2479,7 @@ async fn test_concurrent_branch_deletes_and_listing(#[case] use_object_store: bo
     tokio::join!(futures::future::join_all(deletes), list);
     assert!(dataset.list_branches().await.unwrap().is_empty());
     let files = dataset
-        .object_store
+        .storage
         .list(Some(dataset.base.clone().join("tree")))
         .try_collect::<Vec<_>>()
         .await
@@ -2499,7 +2496,7 @@ async fn test_concurrent_branch_deletes_and_listing(#[case] use_object_store: bo
 
 #[derive(Debug)]
 struct DirectoryMarkerStore {
-    inner: Arc<dyn OSObjectStore>,
+    inner: Arc<dyn lance_io::object_store::StorageBackend>,
     marker: Path,
     listings: AtomicUsize,
 }
@@ -2511,13 +2508,32 @@ impl std::fmt::Display for DirectoryMarkerStore {
 }
 
 #[async_trait::async_trait]
-impl OSObjectStore for DirectoryMarkerStore {
+impl lance_io::object_store::StorageBackend for DirectoryMarkerStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
+    async fn get_ranges(
+        &self,
+        path: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(path, ranges).await
+    }
+
     async fn put_opts(
         &self,
         path: &Path,
         payload: PutPayload,
         options: PutOptions,
-    ) -> object_store::Result<PutResult> {
+    ) -> lance_io::object_store::Result<PutResult> {
         self.inner.put_opts(path, payload, options).await
     }
 
@@ -2525,31 +2541,42 @@ impl OSObjectStore for DirectoryMarkerStore {
         &self,
         path: &Path,
         options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+    {
         self.inner.put_multipart_opts(path, options).await
     }
 
-    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: GetOptions,
+    ) -> lance_io::object_store::Result<GetResult> {
         self.inner.get_opts(path, options).await
     }
 
     fn delete_stream(
         &self,
-        paths: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
+        paths: BoxStream<'static, lance_io::object_store::Result<Path>>,
+    ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
         self.inner.delete_stream(paths)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> lance_io::object_store::Result<ListResult> {
         let mut entries = self.inner.list_with_delimiter(prefix).await?;
         if prefix == Some(&self.marker) {
             // Fail promptly if cleanup requeues the marker instead of hanging.
             if self.listings.fetch_add(1, AtomicOrdering::SeqCst) > 0 {
-                return Err(object_store::Error::Generic {
+                return Err(lance_io::object_store::Error::Generic {
                     store: "DirectoryMarkerStore",
                     source: "shared directory was listed more than once".into(),
                 });
@@ -2565,8 +2592,32 @@ impl OSObjectStore for DirectoryMarkerStore {
         from: &Path,
         to: &Path,
         options: CopyOptions,
-    ) -> object_store::Result<()> {
+    ) -> lance_io::object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| std::future::ready(meta.location > offset),
+        ))
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
+        self.inner.rename_opts(from, to, opts).await
     }
 }
 
@@ -2581,11 +2632,11 @@ async fn test_delete_branch_with_shared_directory(
     #[case] remaining_branch: &str,
     #[case] force: bool,
     #[case] use_legacy_branch_creation: bool,
-    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] use_file_backend: bool,
     #[values(false, true)] has_directory_marker: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         let path_prefix = if cfg!(windows) { "/" } else { "" };
         format!("file-object-store://{path_prefix}{}", tempdir.path_str())
     } else {
@@ -2616,21 +2667,28 @@ async fn test_delete_branch_with_shared_directory(
     remaining.append(data(20), Some(params())).await.unwrap();
 
     let marker_store = has_directory_marker.then(|| {
-        let mut store = dataset.object_store.as_ref().clone();
-        let marker_store = Arc::new(DirectoryMarkerStore {
-            inner: store.inner.clone(),
-            marker: deleted.base.clone(),
-            listings: AtomicUsize::new(0),
-        });
-        store.inner = marker_store.clone();
+        let mut store = dataset.storage.as_ref().clone();
+        let marker_store = std::sync::OnceLock::new();
+        store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| {
+                let wrapped = Arc::new(DirectoryMarkerStore {
+                    inner: backend,
+                    marker: deleted.base.clone(),
+                    listings: AtomicUsize::new(0),
+                });
+                marker_store.set(wrapped.clone()).unwrap();
+                wrapped
+            },
+        ));
+        let marker_store = marker_store.into_inner().unwrap();
         let store = Arc::new(store);
-        dataset.object_store = store.clone();
-        dataset.refs.object_store = store;
+        dataset.storage = store.clone();
+        dataset.refs.storage = store;
         marker_store
     });
     if force {
         let metadata = branch_contents_path(&dataset.base, "a");
-        dataset.object_store.delete(&metadata).await.unwrap();
+        dataset.storage.delete(&metadata).await.unwrap();
         dataset.force_delete_branch("a").await.unwrap();
     } else {
         dataset.delete_branch("a").await.unwrap();
@@ -2650,7 +2708,7 @@ async fn test_delete_branch_with_shared_directory(
         assert!(error.to_string().contains("branch a"), "{error}");
     }
     let files = dataset
-        .object_store
+        .storage
         .list(Some(deleted.base.clone()))
         .try_collect::<Vec<_>>()
         .await
@@ -2676,16 +2734,180 @@ async fn test_delete_branch_with_shared_directory(
 }
 
 #[rstest]
-#[case::direct(false, false)]
-#[case::object_store(true, false)]
-#[case::rooted(false, true)]
 #[tokio::test]
-async fn test_delete_branch_preserves_case_aliased_shared_directories(
-    #[case] use_object_store: bool,
-    #[case] is_rooted_store: bool,
+async fn test_cleanup_with_backend_wrapper(
+    #[values("file", "file-object-store")] scheme: &str,
+    #[values(false, true)] apply_late: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = format!(
+        "{scheme}://{}{}",
+        if cfg!(windows) { "/" } else { "" },
+        tempdir.path_str()
+    );
+    let first = Dataset::write(
+        id_rows(0, 2),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let old_files = first
+        .manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| &fragment.files)
+        .map(|file| first.data_dir().join(file.path.as_str()))
+        .collect::<Vec<_>>();
+    let latest = Dataset::write(
+        id_rows(10, 2),
+        &uri,
+        Some(WriteParams {
+            mode: WriteMode::Overwrite,
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let hidden_staging = tempdir.std_path().join("data/unfinished.lance#1");
+    std::fs::write(&hidden_staging, b"unfinished").unwrap();
+    let wrapper: Arc<dyn WrappingObjectStore> =
+        Arc::new(TestWrappingObjectStore::new(|backend| backend));
+    let dataset = if apply_late {
+        latest.with_backend_wrappers([wrapper])
+    } else {
+        DatasetBuilder::from_uri(&uri)
+            .with_store_params(ObjectStoreParams {
+                backend_wrappers: vec![wrapper],
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap()
+    };
+    let policy = CleanupPolicyBuilder::default()
+        .versions(vec![1])
+        .unwrap()
+        .delete_unverified(true)
+        .build();
+    let removed = dataset.cleanup_with_policy(policy.clone()).await.unwrap();
+    assert_eq!(removed.old_versions, 1);
+    assert_eq!(
+        dataset
+            .version_refs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    for file in old_files {
+        assert!(!dataset.storage.exists(&file).await.unwrap());
+    }
+    assert!(!hidden_staging.exists());
+    let reopened = Dataset::open(&uri).await.unwrap();
+    assert_eq!(
+        reopened.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[10, 11]
+    );
+    assert_eq!(
+        dataset
+            .cleanup_with_policy(policy)
+            .await
+            .unwrap()
+            .old_versions,
+        0
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_delete_branch_with_backend_wrapper(
+    #[values("file", "file-object-store")] scheme: &str,
+    #[values(false, true)] apply_late: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = format!(
+        "{scheme}://{}{}",
+        if cfg!(windows) { "/" } else { "" },
+        tempdir.path_str()
+    );
+    let mut root = Dataset::write(id_rows(0, 2), &uri, None).await.unwrap();
+    let mut branch = root.create_branch("feature", 1, None).await.unwrap();
+    branch.append(id_rows(10, 2), None).await.unwrap();
+    let listings = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = listings.clone();
+    let policy = Arc::new(std::sync::Mutex::new(ProxyBackendPolicy::new()));
+    policy.lock().unwrap().set_before_policy(
+        "record recursive listings",
+        Arc::new(move |operation, path| {
+            if operation == "list" {
+                observed.lock().unwrap().push(path.clone());
+            }
+            Ok(())
+        }),
+    );
+    let wrapper: Arc<dyn WrappingObjectStore> =
+        Arc::new(TestWrappingObjectStore::new(move |backend| {
+            Arc::new(ProxyBackend::new(backend, policy.clone()))
+        }));
+    let mut wrapped = if apply_late {
+        root.with_backend_wrappers([wrapper])
+    } else {
+        DatasetBuilder::from_uri(&uri)
+            .with_store_params(ObjectStoreParams {
+                backend_wrappers: vec![wrapper],
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap()
+    };
+    listings.lock().unwrap().clear();
+    wrapped.delete_branch("feature").await.unwrap();
+    // Only the file backend scans the deleted subtree before removing it.
+    let deleted_prefix = root.base.clone().join("tree").join("feature");
+    assert_eq!(
+        listings.lock().unwrap().contains(&deleted_prefix),
+        scheme == "file-object-store"
+    );
+    let reopened = Dataset::open(&uri).await.unwrap();
+    assert!(
+        !reopened
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature")
+    );
+    assert!(!tempdir.std_path().join("tree/feature").exists());
+    assert_eq!(
+        reopened.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 1]
+    );
+}
+
+#[rstest]
+#[case::direct(false, false)]
+#[case::storage(true, false)]
+#[case::unresolved_local(false, true)]
+#[tokio::test]
+async fn test_delete_branch_preserves_case_aliased_shared_directories(
+    #[case] use_file_backend: bool,
+    #[case] cannot_resolve_local_paths: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_file_backend {
         let path_prefix = if cfg!(windows) { "/" } else { "" };
         format!("file-object-store://{path_prefix}{}", tempdir.path_str())
     } else {
@@ -2707,14 +2929,21 @@ async fn test_delete_branch_preserves_case_aliased_shared_directories(
     lower_child.append(id_rows(20, 1), None).await.unwrap();
     let mut case_child = root.create_branch("A/c", 1, None).await.unwrap();
     case_child.append(id_rows(30, 1), None).await.unwrap();
-    if is_rooted_store {
+    if cannot_resolve_local_paths {
         // A provider without native path resolution must preserve ambiguous subtrees.
-        let mut store = root.object_store.as_ref().clone();
-        store.store_prefix = "file$rooted-test".to_owned();
+        let mut config = lance_io::object_store::BackendConfig::new(
+            lance_io::object_store::backend::native::from_object_store(Arc::new(
+                object_store::local::LocalFileSystem::new(),
+            )),
+            "file",
+        );
+        config.is_local = true;
+        let store = lance_io::utils::testing::TestObjectStoreProvider(config)
+            .build(url::Url::parse("file:///").unwrap(), &Default::default());
         assert!(!store.has_direct_local_paths());
         let store = Arc::new(store);
-        root.object_store = store.clone();
-        root.refs.object_store = store;
+        root.storage = store.clone();
+        root.refs.storage = store;
     }
 
     root.delete_branch("a").await.unwrap();
@@ -2754,16 +2983,19 @@ async fn test_delete_branch_preserves_case_aliased_shared_directories(
 }
 
 #[rstest]
-#[case::same_name(false, false)]
-#[case::alias(true, false)]
-#[case::alias_object_store(true, true)]
+#[case::same_name(false, false, false)]
+#[case::alias(true, false, false)]
+#[case::alias_storage(true, true, false)]
+#[case::wrapped(false, false, true)]
+#[case::wrapped_storage(false, true, true)]
 #[tokio::test]
 async fn test_delete_branch_preserves_aliased_parent_data(
     #[case] has_alias: bool,
-    #[case] use_object_store: bool,
+    #[case] use_file_backend: bool,
+    #[case] with_wrapper: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         let path_prefix = if cfg!(windows) { "/" } else { "" };
         format!("file-object-store://{path_prefix}{}", tempdir.path_str())
     } else {
@@ -2784,14 +3016,24 @@ async fn test_delete_branch_preserves_aliased_parent_data(
     create_branch_before_name_check(&parent, "a/data").await;
     create_branch_before_name_check(&root, "a/data/x").await;
 
+    if with_wrapper {
+        let wrapper: Arc<dyn WrappingObjectStore> =
+            Arc::new(TestWrappingObjectStore::new(|backend| backend));
+        root = root.with_backend_wrappers([wrapper]);
+        assert!(
+            root.storage
+                .local_directory_path(&root.base)
+                .unwrap()
+                .is_some()
+        );
+    }
     root.delete_branch("a/data").await.unwrap();
 
-    let mut parent = Dataset::open(&uri)
-        .await
-        .unwrap()
-        .checkout_branch(parent_branch)
-        .await
-        .unwrap();
+    let reopened = Dataset::open(&uri).await.unwrap();
+    let branches = reopened.list_branches().await.unwrap();
+    assert!(!branches.contains_key("a/data"));
+    assert!(branches.contains_key("a/data/x"));
+    let mut parent = reopened.checkout_branch(parent_branch).await.unwrap();
     let batch = parent.scan().try_into_batch().await.unwrap();
     assert_eq!(
         batch["id"].as_primitive::<Int32Type>().values().as_ref(),
@@ -2799,7 +3041,6 @@ async fn test_delete_branch_preserves_aliased_parent_data(
     );
     parent.append(id_rows(20, 1), None).await.unwrap();
     assert_eq!(parent.count_rows(None).await.unwrap(), 3);
-    assert!(root.list_branches().await.unwrap().contains_key("a/data/x"));
 }
 
 #[cfg(unix)]
@@ -2857,12 +3098,12 @@ async fn test_delete_branch_preserves_unicode_aliased_parent_data() {
 async fn test_delete_branch_preserves_relocated_parent_data(
     #[case] dataset_dir: &str,
     #[case] alias: &str,
-    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] use_file_backend: bool,
     #[values(false, true)] has_child: bool,
     #[values(false, true)] has_sibling: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         format!("file-object-store://{}", tempdir.path_str())
     } else {
         tempdir.path_str()
@@ -2942,18 +3183,18 @@ async fn test_delete_branch_preserves_relocated_parent_data(
 #[cfg(unix)]
 #[rstest]
 #[case::direct_nested(false, true)]
-#[case::object_store_nested(true, true)]
+#[case::storage_nested(true, true)]
 #[case::direct_alias(false, false)]
-#[case::object_store_alias(true, false)]
+#[case::storage_alias(true, false)]
 #[tokio::test]
 async fn test_delete_branch_preserves_nested_dataset_data(
-    #[case] use_object_store: bool,
+    #[case] use_file_backend: bool,
     #[case] relocate_into_deleted: bool,
     #[values(false, true)] deep_alias: bool,
     #[values(false, true)] has_child: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         format!("file-object-store://{}", tempdir.path_str())
     } else {
         tempdir.path_str()
@@ -3027,11 +3268,11 @@ async fn test_delete_branch_preserves_nested_dataset_data(
 #[tokio::test]
 async fn test_delete_branch_preserves_aliased_main_dataset(
     #[case] dataset_dir: &str,
-    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] use_file_backend: bool,
     #[values(false, true)] has_child: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         format!("file-object-store://{}", tempdir.path_str())
     } else {
         tempdir.path_str()
@@ -3082,7 +3323,7 @@ async fn test_delete_branch_preserves_aliased_main_dataset(
 
 #[derive(Debug)]
 struct GateSpelledRefsStore {
-    inner: Arc<dyn OSObjectStore>,
+    inner: Arc<dyn lance_io::object_store::StorageBackend>,
     root: Path,
     spelling: &'static str,
 }
@@ -3094,13 +3335,32 @@ impl std::fmt::Display for GateSpelledRefsStore {
 }
 
 #[async_trait::async_trait]
-impl OSObjectStore for GateSpelledRefsStore {
+impl lance_io::object_store::StorageBackend for GateSpelledRefsStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
+    async fn get_ranges(
+        &self,
+        path: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(path, ranges).await
+    }
+
     async fn put_opts(
         &self,
         path: &Path,
         payload: PutPayload,
         options: PutOptions,
-    ) -> object_store::Result<PutResult> {
+    ) -> lance_io::object_store::Result<PutResult> {
         self.inner.put_opts(path, payload, options).await
     }
 
@@ -3108,26 +3368,37 @@ impl OSObjectStore for GateSpelledRefsStore {
         &self,
         path: &Path,
         options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+    {
         self.inner.put_multipart_opts(path, options).await
     }
 
-    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: GetOptions,
+    ) -> lance_io::object_store::Result<GetResult> {
         self.inner.get_opts(path, options).await
     }
 
     fn delete_stream(
         &self,
-        paths: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
+        paths: BoxStream<'static, lance_io::object_store::Result<Path>>,
+    ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
         self.inner.delete_stream(paths)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> lance_io::object_store::Result<ListResult> {
         let mut entries = self.inner.list_with_delimiter(prefix).await?;
         if prefix == Some(&self.root) {
             for directory in &mut entries.common_prefixes {
@@ -3144,8 +3415,32 @@ impl OSObjectStore for GateSpelledRefsStore {
         from: &Path,
         to: &Path,
         options: CopyOptions,
-    ) -> object_store::Result<()> {
+    ) -> lance_io::object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| std::future::ready(meta.location > offset),
+        ))
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
+        self.inner.rename_opts(from, to, opts).await
     }
 }
 
@@ -3153,12 +3448,12 @@ impl OSObjectStore for GateSpelledRefsStore {
 #[rstest]
 #[tokio::test]
 async fn test_delete_branch_preserves_shared_refs(
-    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] use_file_backend: bool,
     #[values(false, true)] deep_alias: bool,
     #[values(false, true)] has_child: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         format!("file-object-store://{}", tempdir.path_str())
     } else {
         tempdir.path_str()
@@ -3230,10 +3525,10 @@ async fn test_delete_branch_preserves_shared_refs(
 #[tokio::test]
 async fn test_gatekeeper_case_spelled_shared_refs(
     #[case] spelling: &'static str,
-    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] use_file_backend: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         format!("file-object-store://{}", tempdir.path_str())
     } else {
         tempdir.path_str()
@@ -3269,15 +3564,19 @@ async fn test_gatekeeper_case_spelled_shared_refs(
         &[0, 10],
     );
 
-    let mut store = root.object_store.as_ref().clone();
-    store.inner = Arc::new(GateSpelledRefsStore {
-        inner: store.inner.clone(),
-        root: root.refs.root().unwrap().path,
-        spelling,
-    });
+    let mut store = root.storage.as_ref().clone();
+    store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        |backend| {
+            Arc::new(GateSpelledRefsStore {
+                inner: backend,
+                root: root.refs.root().unwrap().path,
+                spelling,
+            })
+        },
+    ));
     let store = Arc::new(store);
-    root.object_store = store.clone();
-    root.refs.object_store = store;
+    root.storage = store.clone();
+    root.refs.storage = store;
     assert!(root.list_branches().await.unwrap().contains_key("retained"));
     root.delete_branch("a").await.unwrap();
 
@@ -3300,13 +3599,13 @@ async fn test_gatekeeper_case_spelled_shared_refs(
 #[rstest]
 #[tokio::test]
 async fn test_delete_branch_preserves_nested_blob_target(
-    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] use_file_backend: bool,
     #[values(false, true)] relocate_owned_child: bool,
     #[values(false, true)] is_file_alias: bool,
     #[values(false, true)] has_child: bool,
 ) {
     let tempdir = TempDir::default();
-    let uri = if use_object_store {
+    let uri = if use_file_backend {
         format!("file-object-store://{}", tempdir.path_str())
     } else {
         tempdir.path_str()
@@ -3585,9 +3884,9 @@ async fn test_branch() {
     let (branch1_rows, _) = collect_rows(&updated_branch1).await;
     assert_eq!(branch1_rows, 80); // batch1+batch2
     assert_eq!(updated_branch1.version().version, 2);
-    let _ = updated_branch1.object_store.as_ref().io_stats_incremental();
+    let _ = updated_branch1.storage.as_ref().io_stats_incremental();
     let branch1_versions = updated_branch1.version_refs().await.unwrap();
-    let io_stats = updated_branch1.object_store.as_ref().io_stats_incremental();
+    let io_stats = updated_branch1.storage.as_ref().io_stats_incremental();
     assert_eq!(io_stats.read_bytes, 0);
     assert_eq!(
         branch1_versions
@@ -3811,8 +4110,7 @@ async fn test_branch() {
     ))
     .unwrap();
     main_dataset
-        .object_store
-        .inner
+        .storage
         .copy(&staged_manifest, &staged_copy)
         .await
         .unwrap();
@@ -3828,12 +4126,12 @@ async fn test_branch() {
         err
     );
     main_dataset
-        .object_store
+        .storage
         .remove_dir_all(Path::parse(format!("{}/tree/ghost", test_uri)).unwrap())
         .await
         .unwrap();
     main_dataset
-        .object_store
+        .storage
         .delete(&branch_contents_path(&main_dataset.base, "ghost"))
         .await
         .unwrap();
@@ -3847,7 +4145,7 @@ async fn test_branch() {
     // Test deleting zombie branch
     let root_location = dataset.refs.root().unwrap();
     let branch_file = branch_contents_path(&root_location.path, "feature/nathan/branch3");
-    dataset.object_store.delete(&branch_file).await.unwrap();
+    dataset.storage.delete(&branch_file).await.unwrap();
     // Now "feature/nathan/branch3" is a zombie branch
     // Use delete_branch to verify if the directory is cleaned up
     dataset
@@ -3855,7 +4153,7 @@ async fn test_branch() {
         .await
         .unwrap();
     let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
-    assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
+    assert!(!dataset.storage.exists(&cleaned_path).await.unwrap());
 
     dataset.tags().delete("tag1").await.unwrap();
     dataset.tags().delete("tag_branch1_v1").await.unwrap();
@@ -3869,7 +4167,7 @@ async fn test_branch() {
     // Verify branch directories are all deleted cleanly
     let test_path = tempdir.obj_path();
     let branches = dataset
-        .object_store
+        .storage
         .read_dir(test_path.clone().join("tree"))
         .await
         .unwrap();
@@ -3905,7 +4203,7 @@ async fn create_branch_before_name_check(source: &Dataset, branch: &str) {
         .unwrap();
     CommitBuilder::new(location.uri.as_str())
         .with_store_params(source.store_params.as_deref().cloned().unwrap_or_default())
-        .with_object_store(Arc::new(source.object_store.as_ref().clone()))
+        .with_storage(Arc::new(source.storage.as_ref().clone()))
         .with_commit_handler(source.commit_handler.clone())
         .with_exact_storage_format(source.manifest.data_storage_format.lance_file_format())
         .execute(Transaction::new(version, clone, None))

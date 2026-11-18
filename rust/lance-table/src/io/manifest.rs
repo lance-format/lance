@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Buf, Bytes};
 use futures::TryStreamExt;
+use lance_core::storage::path::Path;
 use lance_file::{
     version::ConcreteFileVersion,
     versions::v1::{
         encoding::write_schema_dictionaries, writer::ManifestProvider as V1ManifestProvider,
     },
 };
-use object_store::path::Path;
 use prost::Message;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ use super::commit::ManifestLocation;
 /// use lance_io::object_store::ObjectStore;
 /// use lance_table::format::pb;
 /// use lance_table::io::manifest::read_manifest_proto;
-/// use object_store::path::Path;
+/// use lance_core::storage::path::Path;
 ///
 /// let object_store = ObjectStore::local();
 /// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
@@ -54,29 +54,29 @@ use super::commit::ManifestLocation;
 /// # Ok(())
 /// # }
 /// ```
-#[instrument(level = "debug", skip(object_store))]
+#[instrument(level = "debug", skip(storage))]
 pub async fn read_manifest_proto(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<pb::Manifest> {
-    let (proto, _) = read_manifest_proto_with_length(object_store, path, known_size).await?;
+    let (proto, _) = read_manifest_proto_with_length(storage, path, known_size).await?;
     Ok(proto)
 }
 
 async fn read_manifest_proto_with_length(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<(pb::Manifest, usize)> {
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
-        object_store.stat(path).await?.size
+        storage.stat(path).await?.size
     };
     if file_size < 16 {
         if known_size.is_some() {
-            return Box::pin(read_manifest_proto_with_length(object_store, path, None)).await;
+            return Box::pin(read_manifest_proto_with_length(storage, path, None)).await;
         }
         return Err(Error::corrupt_file(
             path.clone(),
@@ -89,12 +89,12 @@ async fn read_manifest_proto_with_length(
         start: initial_start,
         end: file_size,
     };
-    let buf = object_store.read_range(path, range).await?;
+    let buf = storage.read_range(path, range).await?;
 
     // In case of corruption, the known_size might be wrong. We can retry without
     // the size to be more robust.
     if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
-        return Box::pin(read_manifest_proto_with_length(object_store, path, None)).await;
+        return Box::pin(read_manifest_proto_with_length(storage, path, None)).await;
     }
 
     if buf.len() < 16 {
@@ -120,9 +120,7 @@ async fn read_manifest_proto_with_length(
         // as concurrent chunked range requests: a single GET is limited to one
         // connection's throughput, which dominates load time for manifests of
         // datasets with many fragments.
-        let reader = object_store
-            .open_with_size(path, file_size as usize)
-            .await?;
+        let reader = storage.open_with_size(path, file_size as usize).await?;
         let mut chunks = read_range_in_chunks(
             reader.as_ref(),
             manifest_pos..(file_size - PREFETCH_SIZE) as usize,
@@ -178,7 +176,7 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<(pb::Manifes
 /// use lance_io::object_store::ObjectStore;
 /// use lance_table::format::Manifest;
 /// use lance_table::io::manifest::read_manifest;
-/// use object_store::path::Path;
+/// use lance_core::storage::path::Path;
 ///
 /// let object_store = ObjectStore::local();
 /// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
@@ -187,27 +185,27 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<(pb::Manifes
 /// # Ok(())
 /// # }
 /// ```
-#[instrument(level = "debug", skip(object_store))]
+#[instrument(level = "debug", skip(storage))]
 pub async fn read_manifest(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<Manifest> {
     let (proto, recorded_length) =
-        read_manifest_proto_with_length(object_store, path, known_size).await?;
+        read_manifest_proto_with_length(storage, path, known_size).await?;
     let mut manifest = Manifest::try_from(proto)?;
     manifest.detach_sparse_inline_row_ids(recorded_length);
     Ok(manifest)
 }
 
-#[instrument(level = "debug", skip(object_store, manifest))]
+#[instrument(level = "debug", skip(storage, manifest))]
 pub async fn read_manifest_indexes(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     location: &ManifestLocation,
     manifest: &Manifest,
 ) -> Result<Vec<IndexMetadata>> {
     if let Some(pos) = manifest.index_section.as_ref() {
-        let result = read_index_section(object_store, &location.path, location.size, *pos).await;
+        let result = read_index_section(storage, &location.path, location.size, *pos).await;
         // A stale cached size makes the index offset fall outside the sized view,
         // so the read fails as "file size is too small". Retry once with the true
         // size; surface any other error unchanged.
@@ -215,7 +213,7 @@ pub async fn read_manifest_indexes(
             Err(e)
                 if location.size.is_some() && e.to_string().contains("file size is too small") =>
             {
-                read_index_section(object_store, &location.path, None, *pos).await?
+                read_index_section(storage, &location.path, None, *pos).await?
             }
             other => other?,
         };
@@ -234,15 +232,15 @@ pub async fn read_manifest_indexes(
 /// Read the index section message at `pos`, opening the manifest with a known
 /// size when one is provided.
 async fn read_index_section(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
     size: Option<u64>,
     pos: usize,
 ) -> Result<pb::IndexSection> {
     let reader = if let Some(size) = size {
-        object_store.open_with_size(path, size as usize).await?
+        storage.open_with_size(path, size as usize).await?
     } else {
-        object_store.open(path).await?
+        storage.open(path).await?
     };
     read_message(reader.as_ref(), pos).await
 }

@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::dataset::refs::Branches;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
-use object_store::path::Path;
 
 pub const BRANCH_DIR: &str = "tree";
 
@@ -168,8 +168,8 @@ impl BranchLocation {
 #[cfg(test)]
 mod tests {
     use crate::dataset::branch_location::BranchLocation;
+    use lance_core::storage::path::Path;
     use lance_core::utils::tempfile::TempStdDir;
-    use object_store::path::Path;
     use rstest::rstest;
     use std::fs;
     use std::path::PathBuf;

@@ -3,22 +3,21 @@
 
 //! Testing utilities
 
-use crate::Result;
+use crate::object_store::backend::{MultipartUpload, StorageBackend};
+use crate::object_store::{
+    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result as OSResult,
-};
+use lance_core::Result;
+use lance_core::storage::path::Path;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
 use std::ops::Range;
-use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -55,7 +54,7 @@ type ObjectMetaPolicyFn = Arc<dyn ObjectMetaPolicyFnT>;
 /// Currently, for simplicity, we only proxy calls that involve some kind of path.  Calls
 /// to copy functions, which have a src and dst, will provide the source to the policy
 #[derive(Debug, Default)]
-pub struct ProxyObjectStorePolicy {
+pub struct ProxyBackendPolicy {
     /// Policies which run before a method is invoked.  If the policy returns
     /// an error then the target method will not be invoked and the error will
     /// be returned instead.
@@ -65,7 +64,7 @@ pub struct ProxyObjectStorePolicy {
     object_meta_policies: HashMap<String, ObjectMetaPolicyFn>,
 }
 
-impl ProxyObjectStorePolicy {
+impl ProxyBackendPolicy {
     pub fn new() -> Self {
         Default::default()
     }
@@ -92,13 +91,13 @@ impl ProxyObjectStorePolicy {
 /// made to the underlying store.  This can be used to simulate failures or, perhaps
 /// in the future, to mock out results or provide other fine-grained control.
 #[derive(Debug)]
-pub struct ProxyObjectStore {
-    target: Arc<dyn ObjectStore>,
-    policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+pub struct ProxyBackend {
+    target: Arc<dyn StorageBackend>,
+    policy: Arc<Mutex<ProxyBackendPolicy>>,
 }
 
-impl ProxyObjectStore {
-    pub fn new(target: Arc<dyn ObjectStore>, policy: Arc<Mutex<ProxyObjectStorePolicy>>) -> Self {
+impl ProxyBackend {
+    pub fn new(target: Arc<dyn StorageBackend>, policy: Arc<Mutex<ProxyBackendPolicy>>) -> Self {
         Self { target, policy }
     }
 
@@ -108,6 +107,33 @@ impl ProxyObjectStore {
             policy(method, location).map_err(OSError::from)?;
         }
         Ok(())
+    }
+
+    fn list_with_policy(
+        &self,
+        prefix: Option<&Path>,
+        offset: Option<&Path>,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        if let Err(error) = self.before_method("list", prefix.unwrap_or(&Path::default())) {
+            return futures::stream::once(future::ready(Err(error))).boxed();
+        }
+        let stream = match offset {
+            Some(offset) => self.target.list_with_offset(prefix, offset),
+            None => self.target.list(prefix),
+        };
+        let policy = Arc::clone(&self.policy);
+        stream
+            .and_then(move |meta| {
+                let policy = policy.lock().unwrap();
+                let transformed = policy
+                    .object_meta_policies
+                    .values()
+                    .try_fold(meta, |meta, policy| {
+                        policy("list", meta).map_err(OSError::from)
+                    });
+                future::ready(transformed)
+            })
+            .boxed()
     }
 
     fn transform_meta(&self, method: &str, meta: ObjectMeta) -> OSResult<ObjectMeta> {
@@ -120,24 +146,24 @@ impl ProxyObjectStore {
     }
 }
 
-impl std::fmt::Display for ProxyObjectStore {
+impl std::fmt::Display for ProxyBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ProxyObjectStore({})", self.target)
+        write!(f, "ProxyBackend({})", self.target)
     }
 }
 
 /// An object store wrapper that counts listing operations.
 ///
-/// This increments the shared counter for both `list` and `list_with_delimiter`
+/// This increments the shared counter for `list`, `list_with_offset`, and `list_with_delimiter`
 /// so tests can observe all listing-based directory and version discovery calls.
 #[derive(Debug)]
-pub struct CountingObjectStore {
-    target: Arc<dyn ObjectStore>,
+pub struct CountingBackend {
+    target: Arc<dyn StorageBackend>,
     listing_count: Arc<AtomicUsize>,
 }
 
-impl CountingObjectStore {
-    pub fn new(target: Arc<dyn ObjectStore>, listing_count: Arc<AtomicUsize>) -> Self {
+impl CountingBackend {
+    pub fn new(target: Arc<dyn StorageBackend>, listing_count: Arc<AtomicUsize>) -> Self {
         Self {
             target,
             listing_count,
@@ -147,23 +173,27 @@ impl CountingObjectStore {
     fn record_listing(&self) {
         self.listing_count.fetch_add(1, Ordering::SeqCst);
     }
-
-    fn delegate_list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> Pin<Box<dyn futures::Stream<Item = OSResult<ObjectMeta>> + Send>> {
-        self.target.list(prefix)
-    }
 }
 
-impl std::fmt::Display for CountingObjectStore {
+impl std::fmt::Display for CountingBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CountingObjectStore({})", self.target)
+        write!(f, "CountingBackend({})", self.target)
     }
 }
 
 #[async_trait]
-impl ObjectStore for ProxyObjectStore {
+impl StorageBackend for ProxyBackend {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(crate::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -219,23 +249,15 @@ impl ObjectStore for ProxyObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        if let Err(error) = self.before_method("list", prefix.unwrap_or(&Path::default())) {
-            return futures::stream::once(future::ready(Err(error))).boxed();
-        }
-        let target = self.target.clone();
-        let policy = Arc::clone(&self.policy);
+        self.list_with_policy(prefix, None)
+    }
 
-        target
-            .list(prefix)
-            .and_then(move |meta| {
-                let policy = policy.lock().unwrap();
-                let mut meta = meta;
-                for p in policy.object_meta_policies.values() {
-                    meta = p("list", meta).map_err(OSError::from).unwrap();
-                }
-                future::ready(Ok(meta))
-            })
-            .boxed()
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.list_with_policy(prefix, Some(offset))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
@@ -254,7 +276,16 @@ impl ObjectStore for ProxyObjectStore {
 }
 
 #[async_trait]
-impl ObjectStore for CountingObjectStore {
+impl StorageBackend for CountingBackend {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        self.listing_count.fetch_add(1, Ordering::SeqCst);
+        self.target.list_paginated(prefix, options).await
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -289,7 +320,16 @@ impl ObjectStore for CountingObjectStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         self.record_listing();
-        self.delegate_list(prefix).boxed()
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.record_listing();
+        self.target.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
@@ -299,5 +339,147 @@ impl ObjectStore for CountingObjectStore {
 
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         self.target.copy_opts(from, to, opts).await
+    }
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+mod delay;
+pub use delay::{DelayConfig, DelayedBackend};
+
+/// Install a test backend transformation through Storage's wrapper policy.
+///
+pub struct TestWrappingObjectStore<F> {
+    transform: F,
+}
+
+impl<F> TestWrappingObjectStore<F>
+where
+    F: Fn(
+            Arc<dyn crate::object_store::backend::StorageBackend>,
+        ) -> Arc<dyn crate::object_store::backend::StorageBackend>
+        + Send
+        + Sync,
+{
+    pub fn new(transform: F) -> Self {
+        Self { transform }
+    }
+}
+
+impl<F> Debug for TestWrappingObjectStore<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestWrappingObjectStore")
+    }
+}
+
+impl<F> crate::object_store::WrappingObjectStore for TestWrappingObjectStore<F>
+where
+    F: Fn(
+            Arc<dyn crate::object_store::backend::StorageBackend>,
+        ) -> Arc<dyn crate::object_store::backend::StorageBackend>
+        + Send
+        + Sync,
+{
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        backend: Arc<dyn crate::object_store::backend::StorageBackend>,
+    ) -> Arc<dyn crate::object_store::backend::StorageBackend> {
+        (self.transform)(backend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn offset_precedes_metadata_policy_and_policy_errors_propagate() {
+        let backend = crate::object_store::backend::native::from_object_store(Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        for name in ["a", "b", "c"] {
+            backend
+                .put(&name.into(), Bytes::from_static(b"value").into())
+                .await
+                .unwrap();
+        }
+        let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
+        policy.lock().unwrap().set_obj_meta_policy(
+            "rewrite",
+            Arc::new(|_, mut meta| {
+                meta.location = Path::from(format!("0/{}", meta.location));
+                Ok(meta)
+            }),
+        );
+        let proxy = ProxyBackend::new(backend, policy.clone());
+        let objects = proxy
+            .list_with_offset(None, &"b".into())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].location, Path::from("0/c"));
+
+        policy.lock().unwrap().set_obj_meta_policy(
+            "rewrite",
+            Arc::new(|_, _| Err(lance_core::Error::invalid_input("rejected metadata"))),
+        );
+        for stream in [proxy.list(None), proxy.list_with_offset(None, &"b".into())] {
+            let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+            assert!(error.to_string().contains("rejected metadata"));
+        }
+    }
+}
+
+/// Supplies an already-created test backend through the production registry path.
+#[derive(Debug, Clone)]
+pub struct TestObjectStoreProvider(pub crate::object_store::BackendConfig);
+
+#[async_trait]
+impl crate::object_store::ObjectStoreProvider for TestObjectStoreProvider {
+    async fn new_backend(
+        &self,
+        _url: url::Url,
+        _params: &crate::object_store::ObjectStoreParams,
+    ) -> Result<crate::object_store::BackendConfig> {
+        Ok(self.0.clone())
+    }
+
+    fn calculate_storage_prefix(
+        &self,
+        url: &url::Url,
+        options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        match crate::object_store::ObjectStoreRegistry::default().get_provider(url.scheme()) {
+            Some(provider) => provider.calculate_storage_prefix(url, options),
+            None => Ok(format!("{}${}", url.scheme(), url.authority())),
+        }
+    }
+}
+
+impl TestObjectStoreProvider {
+    /// Register the fixture under its scheme in an isolated registry.
+    pub fn registry(&self) -> Arc<crate::object_store::ObjectStoreRegistry> {
+        let registry = Arc::new(crate::object_store::ObjectStoreRegistry::default());
+        registry.insert(&self.0.scheme, Arc::new(self.clone()));
+        registry
+    }
+
+    /// Build a fresh fixture with production parameter validation and wrappers.
+    pub fn build(
+        &self,
+        url: url::Url,
+        params: &crate::object_store::ObjectStoreParams,
+    ) -> crate::object_store::ObjectStore {
+        use futures::FutureExt;
+        self.registry()
+            .new_store(url, params)
+            .now_or_never()
+            .expect("static test provider is synchronous")
+            .expect("valid test storage configuration")
+            .as_ref()
+            .clone()
     }
 }

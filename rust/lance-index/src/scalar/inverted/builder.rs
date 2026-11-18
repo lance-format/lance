@@ -24,6 +24,7 @@ use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
+use lance_core::storage::path::Path;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
@@ -31,7 +32,6 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowSetOps;
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -2627,13 +2627,13 @@ impl BudgetLease {
 /// metadata, then clear staging. See [`merge_index_files_with_options`] for
 /// the final file list.
 pub async fn merge_index_files(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     index_dir: &Path,
     store: Arc<dyn IndexStore>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     merge_index_files_with_options(
-        object_store,
+        storage,
         index_dir,
         store,
         FinalizeOptions::default(),
@@ -2651,15 +2651,15 @@ pub async fn merge_index_files(
 /// listed final files are returned, so a retry after a lost reply still gets
 /// the real file list.
 pub async fn merge_index_files_with_options(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     index_dir: &Path,
     store: Arc<dyn IndexStore>,
     options: FinalizeOptions,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
-    let index_files = list_index_files(object_store, index_dir).await?;
+    let index_files = list_index_files(storage, index_dir).await?;
     let metadata_path = index_dir.clone().join(METADATA_FILE);
-    if object_store.exists(&metadata_path).await? {
+    if storage.exists(&metadata_path).await? {
         let (staged, finalized): (Vec<_>, Vec<_>) = index_files
             .into_iter()
             .partition(|file| is_staged_path(&file.path));
@@ -2680,7 +2680,7 @@ pub async fn merge_index_files_with_options(
     }
 
     finalize_staged_partitions(
-        object_store,
+        storage,
         store,
         &index_files,
         &part_metadata_files,
@@ -2695,9 +2695,9 @@ pub fn is_staged_path(path: &str) -> bool {
     path.starts_with(&format!("{STAGED_PARTITION_DIR}/"))
 }
 
-async fn list_index_files(object_store: &ObjectStore, index_dir: &Path) -> Result<Vec<IndexFile>> {
+async fn list_index_files(storage: &ObjectStore, index_dir: &Path) -> Result<Vec<IndexFile>> {
     let mut index_files = Vec::new();
-    let mut list_stream = object_store.read_dir_all(index_dir, None);
+    let mut list_stream = storage.read_dir_all(index_dir, None);
 
     while let Some(item) = list_stream.next().await {
         match item {
@@ -2733,8 +2733,8 @@ fn metadata_files(index_files: &[IndexFile]) -> Vec<String> {
 }
 
 #[cfg(test)]
-async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Result<Vec<String>> {
-    let index_files = list_index_files(object_store, index_dir).await?;
+async fn list_metadata_files(storage: &ObjectStore, index_dir: &Path) -> Result<Vec<String>> {
+    let index_files = list_index_files(storage, index_dir).await?;
     let part_metadata_files = metadata_files(&index_files);
     if part_metadata_files.is_empty() {
         return Err(Error::invalid_input_source(
@@ -2881,7 +2881,7 @@ fn staged_partitions(
 }
 
 async fn finalize_staged_partitions(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     store: Arc<dyn IndexStore>,
     index_files: &[IndexFile],
     part_metadata_files: &[String],
@@ -2912,8 +2912,8 @@ async fn finalize_staged_partitions(
         .unwrap_or(0);
     // A streaming copy double-buffers its reads and keeps the multipart
     // upload's in-flight parts: that is the whole per-copy footprint.
-    let per_copy_bytes = object_store.max_iop_size().saturating_mul(2)
-        + object_store.upload_memory_bound_bytes(max_copied_file_bytes);
+    let per_copy_bytes = storage.max_iop_size().saturating_mul(2)
+        + storage.upload_memory_bound_bytes(max_copied_file_bytes);
     let budget = Arc::new(FinalizeBudget::new(total_budget_bytes, per_copy_bytes));
     tracing::info!(
         staged_partitions = partitions.len(),
@@ -3190,12 +3190,12 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
-    use object_store::memory::InMemory;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-        Result as OSResult,
+
+    use lance_io::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result as OSResult,
     };
+    use object_store::memory::InMemory;
     use std::any::Any;
     use std::fmt::{Display, Formatter};
     use std::ops::Range;
@@ -3225,13 +3225,15 @@ mod tests {
     }
 
     struct FailingListObjectStore {
-        inner: InMemory,
+        inner: Arc<dyn lance_io::object_store::StorageBackend>,
     }
 
     impl Default for FailingListObjectStore {
         fn default() -> Self {
             Self {
-                inner: InMemory::new(),
+                inner: lance_io::object_store::backend::native::from_object_store(Arc::new(
+                    InMemory::new(),
+                )),
             }
         }
     }
@@ -3249,7 +3251,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl OSObjectStore for FailingListObjectStore {
+    impl lance_io::object_store::StorageBackend for FailingListObjectStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: lance_io::object_store::PaginatedListOptions,
+        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(lance_io::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -3263,7 +3276,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -3283,7 +3296,7 @@ mod tests {
         }
 
         fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-            stream::iter(vec![Err(object_store::Error::Generic {
+            stream::iter(vec![Err(lance_io::object_store::Error::Generic {
                 store: "failing-list",
                 source: "boom listing metadata".into(),
             })])
@@ -3305,11 +3318,38 @@ mod tests {
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
         }
+        async fn rename_opts(
+            &self,
+            from: &lance_io::object_store::Path,
+            to: &lance_io::object_store::Path,
+            options: lance_io::object_store::RenameOptions,
+        ) -> lance_io::object_store::Result<()> {
+            let mode = match options.target_mode {
+                lance_io::object_store::RenameTargetMode::Create => {
+                    lance_io::object_store::CopyMode::Create
+                }
+                lance_io::object_store::RenameTargetMode::Overwrite => {
+                    lance_io::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                lance_io::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn lance_io::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     #[derive(Debug)]
     struct CopyFailingObjectStore {
-        inner: InMemory,
+        inner: Arc<dyn lance_io::object_store::StorageBackend>,
         copy_count: Arc<AtomicUsize>,
     }
 
@@ -3320,7 +3360,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl OSObjectStore for CopyFailingObjectStore {
+    impl lance_io::object_store::StorageBackend for CopyFailingObjectStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: lance_io::object_store::PaginatedListOptions,
+        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(lance_io::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -3334,7 +3385,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -3371,19 +3422,48 @@ mod tests {
 
         async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
             self.copy_count.fetch_add(1, Ordering::SeqCst);
-            Err(object_store::Error::Generic {
+            Err(lance_io::object_store::Error::Generic {
                 store: "CopyFailingObjectStore",
                 source: "native copy disabled in test".into(),
             })
+        }
+        async fn rename_opts(
+            &self,
+            from: &lance_io::object_store::Path,
+            to: &lance_io::object_store::Path,
+            options: lance_io::object_store::RenameOptions,
+        ) -> lance_io::object_store::Result<()> {
+            let mode = match options.target_mode {
+                lance_io::object_store::RenameTargetMode::Create => {
+                    lance_io::object_store::CopyMode::Create
+                }
+                lance_io::object_store::RenameTargetMode::Overwrite => {
+                    lance_io::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                lance_io::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn lance_io::object_store::StorageBackend)
+                .delete(from)
+                .await
         }
     }
 
     #[tokio::test]
     async fn test_list_metadata_files_propagates_list_error() -> Result<()> {
-        let mut object_store = ObjectStore::memory();
-        object_store.inner = Arc::new(FailingListObjectStore::default());
+        let mut storage = ObjectStore::memory();
+        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |_backend| Arc::new(FailingListObjectStore::default()),
+        ));
 
-        let err = list_metadata_files(&object_store, &Path::from("index"))
+        let err = list_metadata_files(&storage, &Path::from("index"))
             .await
             .unwrap_err();
 
@@ -3396,9 +3476,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_metadata_files_empty_directory_returns_no_files_error() -> Result<()> {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
 
-        let err = list_metadata_files(&object_store, &Path::from("empty-index"))
+        let err = list_metadata_files(&storage, &Path::from("empty-index"))
             .await
             .unwrap_err();
 
@@ -3865,9 +3945,9 @@ mod tests {
     #[tokio::test]
     async fn test_merge_index_files_remaps_staged_partitions_without_rename() -> Result<()> {
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3895,7 +3975,7 @@ mod tests {
         }
 
         merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_dir.obj_path(),
             store,
             FinalizeOptions::copy_only(),
@@ -3946,15 +4026,21 @@ mod tests {
     #[tokio::test]
     async fn test_fts_remap_streams_files_when_native_copy_fails() -> Result<()> {
         let copy_count = Arc::new(AtomicUsize::new(0));
-        let mut object_store = ObjectStore::memory();
-        object_store.inner = Arc::new(CopyFailingObjectStore {
-            inner: InMemory::new(),
-            copy_count: copy_count.clone(),
-        });
-        let object_store = Arc::new(object_store);
+        let mut storage = ObjectStore::memory();
+        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(CopyFailingObjectStore {
+                    inner: lance_io::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    copy_count: copy_count.clone(),
+                })
+            },
+        ));
+        let storage = Arc::new(storage);
         let index_path = Path::from("index");
         let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_path.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4010,7 +4096,7 @@ mod tests {
 
         let progress = Arc::new(RecordingProgress::default());
         merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_path,
             store,
             FinalizeOptions::copy_only(),
@@ -4046,9 +4132,9 @@ mod tests {
     #[tokio::test]
     async fn test_merge_index_files_rewrites_partial_final_files_from_staging() -> Result<()> {
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4083,7 +4169,7 @@ mod tests {
         }
 
         merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_dir.obj_path(),
             store.clone(),
             FinalizeOptions::copy_only(),
@@ -4105,16 +4191,16 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_from_existing_copies_existing_partitions_to_staging_and_finalizes()
     -> Result<()> {
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let source_dir = TempDir::default();
         let dest_dir = TempDir::default();
         let source_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             source_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
         let dest_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             dest_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4164,7 +4250,7 @@ mod tests {
         }
 
         merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &dest_dir.obj_path(),
             merge_store,
             FinalizeOptions::copy_only(),
@@ -4193,9 +4279,9 @@ mod tests {
     #[tokio::test]
     async fn test_merge_index_files_keeps_staging_when_final_metadata_write_fails() -> Result<()> {
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4223,7 +4309,7 @@ mod tests {
         }
 
         let err = merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_dir.obj_path(),
             failing_store,
             FinalizeOptions::copy_only(),
@@ -4255,9 +4341,9 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_build_writes_partition_data_to_staging() -> Result<()> {
         let index_dir = TempDir::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let store = Arc::new(LanceIndexStore::new(
-            object_store.into(),
+            storage.into(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4314,9 +4400,9 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_empty_build_does_not_finalize_shared_directory() -> Result<()> {
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4367,12 +4453,11 @@ mod tests {
             .update(Box::pin(stream), store.as_ref(), None)
             .await?;
 
-        let staged_metadata =
-            list_metadata_files(object_store.as_ref(), &index_dir.obj_path()).await?;
+        let staged_metadata = list_metadata_files(storage.as_ref(), &index_dir.obj_path()).await?;
         assert_eq!(staged_metadata.len(), 2);
 
         merge_index_files(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_dir.obj_path(),
             store.clone(),
             noop_progress(),
@@ -4388,9 +4473,9 @@ mod tests {
     #[tokio::test]
     async fn test_merge_index_files_is_noop_when_metadata_exists() -> Result<()> {
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -4407,7 +4492,7 @@ mod tests {
             .await?;
 
         merge_index_files(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_dir.obj_path(),
             store,
             noop_progress(),
@@ -5074,9 +5159,9 @@ mod tests {
     async fn test_merge_index_files_reports_progress_stages() -> Result<()> {
         let index_dir = TempDir::default();
         let index_path = index_dir.obj_path();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone().into(),
+            storage.clone().into(),
             index_path.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5099,7 +5184,7 @@ mod tests {
 
         let progress = Arc::new(RecordingProgress::default());
         merge_index_files_with_options(
-            &object_store,
+            &storage,
             &index_path,
             store.clone(),
             FinalizeOptions::copy_only(),
@@ -6146,9 +6231,9 @@ mod tests {
     #[tokio::test]
     async fn test_staged_metadata_carries_build_memory_config() -> Result<()> {
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -6162,7 +6247,7 @@ mod tests {
             .update(Box::pin(stream), store.as_ref(), None)
             .await?;
 
-        let index_files = list_index_files(object_store.as_ref(), &index_dir.obj_path()).await?;
+        let index_files = list_index_files(storage.as_ref(), &index_dir.obj_path()).await?;
         let store_dyn: Arc<dyn IndexStore> = store.clone();
         let staged =
             read_staged_metadata(&store_dyn, &metadata_files(&index_files), &noop_progress())
@@ -6471,20 +6556,19 @@ mod tests {
 
         let corpus = consolidation_corpus(6, 40);
         let staged_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let staged_store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             staged_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
         stage_consolidation_corpus(&staged_store, &corpus).await?;
-        let staged_metadata =
-            list_metadata_files(object_store.as_ref(), &staged_dir.obj_path()).await?;
+        let staged_metadata = list_metadata_files(storage.as_ref(), &staged_dir.obj_path()).await?;
         assert_eq!(staged_metadata.len(), 6);
 
         let progress = Arc::new(RecordingProgress::default());
         let files = merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &staged_dir.obj_path(),
             staged_store.clone(),
             FinalizeOptions::default(),
@@ -6550,7 +6634,7 @@ mod tests {
         // Reference: the same documents built in one shot.
         let reference_dir = TempDir::default();
         let reference_store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             reference_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -6599,15 +6683,15 @@ mod tests {
     -> Result<()> {
         let corpus = consolidation_corpus(2, 5);
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
         stage_consolidation_corpus(&store, &corpus).await?;
         let first = merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_dir.obj_path(),
             store.clone(),
             FinalizeOptions::default(),
@@ -6620,7 +6704,7 @@ mod tests {
         let leftover = staged_partition_file_path(99, TOKENS_FILE);
         write_partition_file_marker(store.as_ref(), &leftover, 99).await?;
         let retry = merge_index_files_with_options(
-            object_store.as_ref(),
+            storage.as_ref(),
             &index_dir.obj_path(),
             store.clone(),
             FinalizeOptions::default(),
@@ -6650,14 +6734,14 @@ mod tests {
     async fn test_consolidate_group_splits_on_decoded_memory_guard() -> Result<()> {
         let corpus = consolidation_corpus(3, 5);
         let index_dir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             index_dir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
         stage_consolidation_corpus(&store, &corpus).await?;
-        let index_files = list_index_files(object_store.as_ref(), &index_dir.obj_path()).await?;
+        let index_files = list_index_files(storage.as_ref(), &index_dir.obj_path()).await?;
         let store_dyn: Arc<dyn IndexStore> = store.clone();
         let staged =
             read_staged_metadata(&store_dyn, &metadata_files(&index_files), &noop_progress())

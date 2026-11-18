@@ -228,7 +228,7 @@ impl Scanner {
         get_default_batch_size().unwrap_or_else(|| {
             self.batch_size.unwrap_or_else(|| {
                 std::cmp::max(
-                    self.dataset.object_store.as_ref().block_size() / 4,
+                    self.dataset.storage.as_ref().block_size() / 4,
                     BATCH_SIZE_FALLBACK,
                 )
             })

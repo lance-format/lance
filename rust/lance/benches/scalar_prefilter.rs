@@ -220,7 +220,7 @@ fn bench_hybrid_scalar_prefilter(c: &mut Criterion) {
                     let open = || {
                         lance::dataset::builder::DatasetBuilder::from_uri(&uri)
                             .with_store_params(ObjectStoreParams {
-                                object_store_wrapper: Some(tracker.clone()),
+                                backend_wrappers: vec![tracker.clone()],
                                 ..Default::default()
                             })
                             .load()

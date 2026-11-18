@@ -222,7 +222,7 @@ impl LanceStream {
         } else {
             projection.clone()
         };
-        let io_parallelism = dataset.object_store.io_parallelism();
+        let io_parallelism = dataset.storage.io_parallelism();
         // First, use the value specified by the user in the call
         // Second, use the default from the environment variable, if specified
         // Finally, use a default based on the io_parallelism
@@ -298,7 +298,7 @@ impl LanceStream {
         }
 
         let scan_scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
+            dataset.storage.clone(),
             SchedulerConfig::new(config.io_buffer_size),
         );
         // Shared for this scan so every base file reuses one scheduler per base

@@ -330,7 +330,7 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     };
     assert_eq!(dataset.manifest.fragments.len(), 2);
     let before = dataset
-        .object_store
+        .storage
         .read_dir_all(&dataset.base, None)
         .try_collect::<Vec<_>>()
         .await
@@ -368,7 +368,7 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     .await
     .unwrap();
     let after = dataset
-        .object_store
+        .storage
         .read_dir_all(&dataset.base, None)
         .try_collect::<Vec<_>>()
         .await
@@ -1558,7 +1558,7 @@ async fn test_released_legacy_blob_reads_from_shallow_clone(
             .await
             .unwrap();
         let base_id = dataset.get_fragments()[0].metadata().files[0].base_id;
-        let store = dataset.object_store(base_id).await.unwrap();
+        let store = dataset.storage(base_id).await.unwrap();
         if base_id.is_some() {
             assert_eq!(store.block_size(), 512);
         }
@@ -1973,7 +1973,7 @@ async fn test_read_legacy_and_v2_blob_layouts_from_one_file() {
     .unwrap();
     let data_file_name = format!("{}.lance", Uuid::new_v4());
     let object_writer = dataset
-        .object_store
+        .storage
         .create(&dataset.data_dir().join(data_file_name.as_str()))
         .await
         .unwrap();
@@ -2141,7 +2141,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     let packed_path = blob_path(&dataset.data_dir(), &file_id, blob_id);
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.storage.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2165,7 +2165,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     )
     .unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset.storage.create(&data_file_path).await.unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(append_schema.as_ref()).unwrap(),
@@ -2315,7 +2315,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let blob_id = 1;
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.storage.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2346,7 +2346,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset.storage.create(&data_file_path).await.unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -2450,7 +2450,7 @@ async fn test_create_data_file_skips_blob_orphans_with_top_level_name_collision(
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset.storage.create(&data_file_path).await.unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -2972,7 +2972,7 @@ async fn test_blob_v2_external_mapped_to_registered_base(
         "objects/mapped.bin"
     );
 
-    let external_store = dataset.object_store(Some(1)).await.unwrap();
+    let external_store = dataset.storage(Some(1)).await.unwrap();
     let _ = external_store.io_stats_incremental();
     let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
     assert_eq!(blobs.len(), 1);

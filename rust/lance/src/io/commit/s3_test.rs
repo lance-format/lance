@@ -227,7 +227,7 @@ async fn test_concurrent_writers() {
 
     // Create a table
     let store_params = ObjectStoreParams {
-        object_store_wrapper: Some(io_tracker.clone()),
+        backend_wrappers: vec![io_tracker.clone()],
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             CONFIG
                 .iter()
@@ -259,7 +259,7 @@ async fn test_concurrent_writers() {
         .await
         .unwrap();
     // Commit: 2 IOPs. 1 for transaction file, 1 for manifest file
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 2);
     let dataset = Arc::new(dataset);
     let old_version = dataset.manifest().version;
@@ -311,7 +311,7 @@ async fn test_ddb_open_iops() {
 
     // Create a table
     let store_params = ObjectStoreParams {
-        object_store_wrapper: Some(io_tracker.clone()),
+        backend_wrappers: vec![io_tracker.clone()],
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             CONFIG
                 .iter()
@@ -351,7 +351,7 @@ async fn test_ddb_open_iops() {
     // that ETag, but the freshly committed Dataset needs the observed physical
     // generation so downstream caches cannot reuse an older Dataset at the
     // same URI and version.
-    let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
+    let io_stats = committed_ds.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
     assert_io_eq!(io_stats, read_iops, 2);
     assert!(committed_ds.manifest_location().e_tag.is_some());
@@ -378,7 +378,7 @@ async fn test_ddb_open_iops() {
         dataset.manifest_location().e_tag.as_deref(),
         Some("legacy-stale-etag")
     );
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     // Open dataset can be read with 2 IOPs: HEAD verifies that the
     // finalized path returned by DynamoDB still exists, then the manifest
     // itself is read. Looking up the latest manifest is handled in DynamoDB.
@@ -394,7 +394,7 @@ async fn test_ddb_open_iops() {
         .execute(vec![data.clone()])
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
     // Append reads once to list versions and once to observe the canonical
@@ -407,7 +407,7 @@ async fn test_ddb_open_iops() {
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     // Checkout: 1 read IOP. Version resolution HEAD-checks the finalized path,
     // while the manifest body is served from the Session metadata cache.
     assert_io_eq!(io_stats, read_iops, 1);

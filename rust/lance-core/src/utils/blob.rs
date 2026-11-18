@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use object_store::path::Path;
+use crate::storage::path::Path;
 
 use crate::{Error, Result};
 

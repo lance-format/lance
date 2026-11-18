@@ -172,7 +172,7 @@ impl CacheKey for FragReuseIndexKey<'_> {
 #[derive(Debug)]
 pub struct FragReuseDetailsKey<'a> {
     pub store_identity: &'a str,
-    pub path: &'a object_store::path::Path,
+    pub path: &'a lance_core::storage::path::Path,
     pub offset: u64,
     pub size: u64,
 }
@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn index_metadata_key_isolates_object_store_identity() {
+    fn index_metadata_key_isolates_storage_identity() {
         let first = IndexMetadataKey {
             version: 7,
             store_identity: "s3$first-options",

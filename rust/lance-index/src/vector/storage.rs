@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Vector Storage, holding (quantized) vectors and providing distance calculation.
+//! Vector ObjectStore, holding (quantized) vectors and providing distance calculation.
 
 mod prewarm;
 
@@ -598,7 +598,7 @@ impl DeepSizeOf for QueryScratchPool {
     }
 }
 
-/// Vector Storage is the abstraction to store the vectors.
+/// Vector ObjectStore is the abstraction to store the vectors.
 ///
 /// It can be in-memory or on-disk, raw vector or quantized vectors.
 ///
@@ -637,7 +637,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     fn row_ids(&self) -> impl Iterator<Item = &u64>;
 
-    /// Append Raw [RecordBatch] into the Storage.
+    /// Append Raw [RecordBatch] into the ObjectStore.
     /// The storage implement will perform quantization if necessary.
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
 
@@ -885,8 +885,8 @@ pub enum OriginLatencyClass {
 
 impl OriginLatencyClass {
     /// The class `auto` resolves to for an index read from `object_store`.
-    pub fn of_store(object_store: &ObjectStore) -> Self {
-        if object_store.is_cloud() {
+    pub fn of_store(storage: &ObjectStore) -> Self {
+        if storage.is_cloud() {
             Self::High
         } else {
             Self::Low
@@ -896,8 +896,8 @@ impl OriginLatencyClass {
     /// The class of an index read from `object_store` under `setting`, the
     /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, when no session
     /// declares one.
-    pub fn resolve(setting: Option<Self>, object_store: &ObjectStore) -> Self {
-        Self::resolve_with_hint(setting, None, object_store)
+    pub fn resolve(setting: Option<Self>, storage: &ObjectStore) -> Self {
+        Self::resolve_with_hint(setting, None, storage)
     }
 
     /// The class of an index read from `object_store` under `setting`, the
@@ -910,11 +910,9 @@ impl OriginLatencyClass {
     pub fn resolve_with_hint(
         setting: Option<Self>,
         hint: Option<Self>,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
     ) -> Self {
-        setting
-            .or(hint)
-            .unwrap_or_else(|| Self::of_store(object_store))
+        setting.or(hint).unwrap_or_else(|| Self::of_store(storage))
     }
 
     /// The knob's spelling of the class: `low` or `high`.

@@ -5,9 +5,8 @@
 #![cfg(feature = "tos-test")]
 
 use futures::TryStreamExt;
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
-use object_store::ObjectStoreExt;
-use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 fn tos_bucket() -> String {
@@ -17,15 +16,14 @@ fn tos_bucket() -> String {
 async fn delete_prefix(store: &ObjectStore, prefix: &str) {
     let prefix_path = Path::from(prefix);
     let locations = store
-        .inner
-        .list(Some(&prefix_path))
+        .list(Some(prefix_path))
         .map_ok(|meta| meta.location)
         .try_collect::<Vec<_>>()
         .await
         .unwrap_or_default();
 
     for location in locations {
-        let _ = store.inner.delete(&location).await;
+        let _ = store.delete(&location).await;
     }
 }
 
@@ -48,26 +46,25 @@ async fn test_tos_write_read_list_delete() {
         writer.write_all(b" tos").await?;
         writer.shutdown().await?;
 
-        let meta = store.inner.head(&path).await?;
+        let meta = store.stat(&path).await?;
         if meta.size != 9 {
             return Err(format!("expected object size 9, got {}", meta.size).into());
         }
 
-        let data = store.inner.get(&path).await?.bytes().await?;
+        let data = store.read_object(&path).await?.bytes().await?;
         if data.as_ref() != b"hello tos" {
             return Err("downloaded TOS object content did not match".into());
         }
 
         let listed = store
-            .inner
-            .list(Some(&Path::from(prefix.as_str())))
+            .list(Some(Path::from(prefix.as_str())))
             .try_collect::<Vec<_>>()
             .await?;
         if !listed.iter().any(|meta| meta.location == path) {
             return Err("uploaded TOS object was not returned by list".into());
         }
 
-        store.inner.delete(&path).await?;
+        store.delete(&path).await?;
         if store.exists(&path).await? {
             return Err("deleted TOS object still exists".into());
         }

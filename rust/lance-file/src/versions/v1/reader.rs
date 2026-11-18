@@ -31,7 +31,7 @@ use lance_io::utils::{read_metadata_offset, read_struct, read_struct_from_buf};
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use std::borrow::Cow;
 
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use tracing::instrument;
 
 use crate::versions::v1::encoding::{dictionary::DictionaryDecoder, read_fixed_stride_array};
@@ -135,9 +135,9 @@ impl FileReader {
     ///
     /// The session passed in is used to cache metadata about the file. If no session
     /// is passed in, there will be no caching.
-    #[instrument(level = "debug", skip(object_store, schema, session))]
+    #[instrument(level = "debug", skip(storage, schema, session))]
     pub async fn try_new_with_fragment_id(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         path: &Path,
         schema: Schema,
         fragment_id: u32,
@@ -145,7 +145,7 @@ impl FileReader {
         max_field_id: i32,
         session: Option<&LanceCache>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(path).await?;
+        let object_reader = storage.open(path).await?;
 
         let metadata = Self::read_metadata(object_reader.as_ref(), session).await?;
 
@@ -288,10 +288,10 @@ impl FileReader {
     }
 
     /// Open one Lance data file for read.
-    pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
+    pub async fn try_new(storage: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         // If just reading a lance data file we assume the schema is the schema of the data file
         let max_field_id = schema.max_field_id().unwrap_or_default();
-        Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, max_field_id, None).await
+        Self::try_new_with_fragment_id(storage, path, schema, 0, 0, max_field_id, None).await
     }
 
     fn io_parallelism(&self) -> usize {

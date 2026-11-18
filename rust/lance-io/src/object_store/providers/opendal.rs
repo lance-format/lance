@@ -66,7 +66,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
-    use object_store::ObjectStoreExt as _;
     use opendal::raw::oio;
     use opendal::raw::{
         OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
@@ -269,8 +268,8 @@ mod tests {
             3,
         ));
 
-        store
-            .head(&object_store::path::Path::from("file"))
+        (&store as &dyn crate::object_store::StorageBackend)
+            .head(&crate::object_store::Path::from("file"))
             .await
             .expect("head should succeed after retries");
         assert_eq!(service.stat_attempts(), 3);

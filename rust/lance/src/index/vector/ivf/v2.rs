@@ -40,6 +40,7 @@ use lance_core::cache::{
     CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
@@ -91,7 +92,6 @@ use lance_io::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrTreeMap;
-use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use std::time::Instant;
@@ -891,7 +891,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
 
     fn reconstruct<'a>(
         &'a self,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<ResolvedRemapping>,
@@ -1068,7 +1068,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
 
     fn reconstruct<'a>(
         &'a self,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<ResolvedRemapping>,
@@ -1079,7 +1079,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                 SubIndexType::Flat => {
                     reconstruct_typed::<FlatIndex, Q>(
                         self,
-                        object_store,
+                        storage,
                         file_metadata_cache,
                         index_cache,
                         frag_reuse_index,
@@ -1090,7 +1090,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                 SubIndexType::Hnsw => {
                     reconstruct_typed::<HNSW, Q>(
                         self,
-                        object_store,
+                        storage,
                         file_metadata_cache,
                         index_cache,
                         frag_reuse_index,
@@ -1343,19 +1343,15 @@ pub(crate) struct IvfOpenContext {
 }
 
 /// The key of the auxiliary (storage) file of index `uuid` in `index_dir`
-/// on `object_store`, which IVF_RQ runtime handles, the resident store and
+/// on `storage`, which IVF_RQ runtime handles, the resident store and
 /// the lazy scan's far gather pools, are shared by.
-pub(crate) fn aux_file_key(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-    uuid: &Uuid,
-) -> IndexFileKey {
+pub(crate) fn aux_file_key(storage: &ObjectStore, index_dir: &Path, uuid: &Uuid) -> IndexFileKey {
     let uuid = uuid.to_string();
     let aux_path = index_dir
         .clone()
         .join(uuid.as_str())
         .join(INDEX_AUXILIARY_FILE_NAME);
-    IndexFileKey::new(&uuid, &object_store.store_prefix, aux_path.as_ref())
+    IndexFileKey::new(&uuid, storage.store_prefix(), aux_path.as_ref())
 }
 
 /// Warn, once per process, that `LANCE_RQ_RESIDENT_COLUMNS=on` keeps a
@@ -1782,7 +1778,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// Create a new IVF index.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         index_dir: Path,
         uuid: Uuid,
         frag_reuse_index: Option<ResolvedRemapping>,
@@ -1791,30 +1787,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_sizes: HashMap<String, u64>,
         context: IvfOpenContext,
     ) -> Result<Self> {
-        let io_parallelism = object_store.io_parallelism();
-        let origin_latency =
-            Self::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
+        let io_parallelism = storage.io_parallelism();
+        let origin_latency = Self::origin_latency_at_open(&storage, context.origin_latency_hint)?;
         let uuid_str = uuid.to_string();
         let aux_path = index_dir
             .clone()
             .join(uuid_str.as_str())
             .join(INDEX_AUXILIARY_FILE_NAME);
-        let index_file = aux_file_key(&object_store, &index_dir, &uuid);
+        let index_file = aux_file_key(&storage, &index_dir, &uuid);
         let raw_cache = WeakLanceCache::from(
             &context
                 .file_cache
                 .as_ref()
                 .unwrap_or(&index_cache)
-                .with_key_prefix(&object_store.store_prefix)
+                .with_key_prefix(storage.store_prefix())
                 .with_key_prefix(aux_path.as_ref()),
         );
         let row_address_cache = WeakLanceCache::from(
             &index_cache
-                .with_key_prefix(&object_store.store_prefix)
+                .with_key_prefix(storage.store_prefix())
                 .with_key_prefix(aux_path.as_ref()),
         );
-        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+        let scheduler = ScanScheduler::new(storage, scheduler_config);
 
         let uri = index_dir
             .clone()
@@ -2015,22 +2010,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         })
     }
 
-    /// The origin latency class of an index opened on `object_store` by a
+    /// The origin latency class of an index opened on `storage` by a
     /// session that declares `hint`. Only IVF_RQ indexes read (and validate)
     /// `LANCE_RQ_ORIGIN_LATENCY` and take the hint, the setting first (see
     /// [`OriginLatencyClass::resolve_with_hint`]); any other index takes the
     /// class of its store, since no reader policy of theirs depends on it.
     fn origin_latency_at_open(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         hint: Option<OriginLatencyClass>,
     ) -> Result<OriginLatencyClass> {
         if Q::quantization_type() != QuantizationType::Rabit {
-            return Ok(OriginLatencyClass::of_store(object_store));
+            return Ok(OriginLatencyClass::of_store(storage));
         }
         Ok(OriginLatencyClass::resolve_with_hint(
             origin_latency_setting()?,
             hint,
-            object_store,
+            storage,
         ))
     }
 
@@ -3540,15 +3535,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PartitionSearchSource 
 
 async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     state: &IvfIndexState<Q>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
     frag_reuse_index: Option<ResolvedRemapping>,
     context: IvfOpenContext,
 ) -> Result<Arc<dyn VectorIndex>> {
-    let io_parallelism = object_store.io_parallelism();
+    let io_parallelism = storage.io_parallelism();
     let origin_latency =
-        IVFIndex::<S, Q>::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
+        IVFIndex::<S, Q>::origin_latency_at_open(&storage, context.origin_latency_hint)?;
 
     let index_path = Path::parse(&state.index_file_path)
         .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
@@ -3558,27 +3553,27 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     parts.pop();
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-    let index_file = IndexFileKey::new(&state.uuid, &object_store.store_prefix, aux_path.as_ref());
+    let index_file = IndexFileKey::new(&state.uuid, storage.store_prefix(), aux_path.as_ref());
     let raw_cache = WeakLanceCache::from(
         &context
             .file_cache
             .as_ref()
             .unwrap_or(&index_cache)
-            .with_key_prefix(&object_store.store_prefix)
+            .with_key_prefix(storage.store_prefix())
             .with_key_prefix(aux_path.as_ref()),
     );
 
     let row_address_cache = WeakLanceCache::from(
         &index_cache
-            .with_key_prefix(&object_store.store_prefix)
+            .with_key_prefix(storage.store_prefix())
             .with_key_prefix(aux_path.as_ref()),
     );
 
     // Readers carry a scheduler bound to an object store, so they cannot be
     // shared across dataset opens. Reuse only portable file metadata and bind
     // fresh readers to the object store supplied for this reconstruction.
-    let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+    let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+    let scheduler = ScanScheduler::new(storage, scheduler_config);
     let index_reader = open_reader_cached(
         &scheduler,
         &index_path,

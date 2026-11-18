@@ -12,8 +12,6 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-thiserror.workspace = true
-percent-encoding.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-data.workspace = true
@@ -32,7 +30,8 @@ moka.workspace = true
 metrics = { workspace = true, optional = true }
 quick_cache = "0.6"
 num_cpus = "1.0"
-object_store = { workspace = true }
+percent-encoding.workspace = true
+thiserror.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 rand.workspace = true

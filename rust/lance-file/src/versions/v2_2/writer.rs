@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::{BufMut, Bytes};
+use lance_core::storage::path::Path;
 use lance_core::{Result, datatypes::Schema};
 use lance_encoding::{
     compression_config::CompressionParams,
     encoder::{BatchEncoder, EncodedBatch},
 };
 use lance_io::{object_store::ObjectStore, traits::Writer as ObjectWriter};
-use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
@@ -93,8 +93,8 @@ impl Writer {
     }
 
     /// Spill page metadata to a sidecar file instead of retaining it in memory.
-    pub fn with_page_metadata_spill(mut self, object_store: Arc<ObjectStore>, path: Path) -> Self {
-        self.sink.with_page_metadata_spill(object_store, path);
+    pub fn with_page_metadata_spill(mut self, storage: Arc<ObjectStore>, path: Path) -> Self {
+        self.sink.with_page_metadata_spill(storage, path);
         self
     }
 

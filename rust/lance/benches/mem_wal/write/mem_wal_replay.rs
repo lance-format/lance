@@ -136,8 +136,8 @@ async fn setup_dataset(schema: &Arc<ArrowSchema>, name: &str, dataset_prefix: &s
     };
 
     // Best-effort delete in case a prior run left state behind.
-    if let Ok((object_store, base)) = ObjectStore::from_uri(&dataset_uri).await {
-        let _ = object_store.remove_dir_all(base).await;
+    if let Ok((storage, base)) = ObjectStore::from_uri(&dataset_uri).await {
+        let _ = storage.remove_dir_all(base).await;
     }
 
     // Seed an empty Lance dataset (one tiny batch). Keeps `Dataset::open`
@@ -194,12 +194,12 @@ async fn populate_shard_wal(
 /// Bench: raw `WalTailer::read_entry` throughput. Measures how long it
 /// takes to walk N entries from position 0 to the tip, end-to-end.
 async fn run_tailer_replay(
-    object_store: Arc<ObjectStore>,
-    base_path: object_store::path::Path,
+    storage: Arc<ObjectStore>,
+    base_path: lance_core::storage::path::Path,
     shard_id: Uuid,
     expected_entries: usize,
 ) -> usize {
-    let tailer = WalTailer::new(object_store, base_path, "", shard_id);
+    let tailer = WalTailer::new(storage, base_path, "", shard_id);
     let mut count = 0usize;
     let mut pos = 0u64;
     loop {
@@ -282,7 +282,7 @@ fn bench_replay(c: &mut Criterion) {
         batch_size,
     ));
 
-    let (object_store, base_path) = rt.block_on(ObjectStore::from_uri(&dataset_uri)).unwrap();
+    let (storage, base_path) = rt.block_on(ObjectStore::from_uri(&dataset_uri)).unwrap();
 
     let mut group = c.benchmark_group("MemWAL Replay");
     group.throughput(Throughput::Elements(num_entries as u64));
@@ -296,17 +296,17 @@ fn bench_replay(c: &mut Criterion) {
         BenchmarkId::new("WalTailer::read_entry", &label_tailer),
         &num_entries,
         |b, &expected| {
-            let object_store = object_store.clone();
+            let storage = storage.clone();
             let base_path = base_path.clone();
             b.to_async(&rt).iter_custom(|iters| {
-                let object_store = object_store.clone();
+                let storage = storage.clone();
                 let base_path = base_path.clone();
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         let start = Instant::now();
                         let _count = run_tailer_replay(
-                            object_store.clone(),
+                            storage.clone(),
                             base_path.clone(),
                             tailer_shard_id,
                             expected,

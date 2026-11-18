@@ -382,11 +382,11 @@ mod tests {
     #[tokio::test]
     async fn sparse_batch_reads_only_touched_blocks_without_cache() {
         let directory = TempDir::default();
-        let (object_store, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+        let (storage, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
             .await
             .unwrap();
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store,
+            storage,
             path,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -463,11 +463,11 @@ mod tests {
         const ROWS: u64 = BLOCKS as u64 * BLOCK_ROWS;
         const DELETED: u32 = 5;
         let directory = TempDir::default();
-        let (object_store, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+        let (storage, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
             .await
             .unwrap();
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            object_store,
+            storage,
             path,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -550,11 +550,11 @@ mod tests {
     #[tokio::test]
     async fn mapping_single_and_batch_translation_are_lazy() {
         let directory = TempDir::default();
-        let (object_store, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+        let (storage, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
             .await
             .unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            object_store,
+            storage,
             path,
             Arc::new(LanceCache::with_capacity(1024 * 1024)),
         ));

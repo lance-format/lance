@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
@@ -24,7 +25,6 @@ use lance_io::utils::CachedFileSize;
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::format::list_index_files_with_sizes;
-use object_store::path::Path;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -70,7 +70,7 @@ impl CacheKey for IndexFileMetadataKey<'_> {
 /// each collection in a file in the lance format.
 #[derive(Debug, Clone)]
 pub struct LanceIndexStore {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
@@ -90,7 +90,7 @@ impl DeepSizeOf for LanceIndexStore {
         // `Session::deep_size_of_children`): it is not this store's own footprint, and
         // sizing it here makes every opened index that holds a store report the whole
         // cache as its own bytes — inflating and N-times double-counting it.
-        self.object_store.deep_size_of_children(context)
+        self.storage.deep_size_of_children(context)
             + self.index_dir.as_ref().deep_size_of_children(context)
     }
 }
@@ -98,12 +98,12 @@ impl DeepSizeOf for LanceIndexStore {
 impl LanceIndexStore {
     /// Create a new index store at the given directory
     pub fn new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
     ) -> Self {
         Self::with_format_version(
-            object_store,
+            storage,
             index_dir,
             metadata_cache,
             ConcreteFileVersion::V2_0,
@@ -112,17 +112,15 @@ impl LanceIndexStore {
 
     /// Create a new index store at the given directory with a specific format version
     pub fn with_format_version(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
         format_version: ConcreteFileVersion,
     ) -> Self {
-        let scheduler = ScanScheduler::new(
-            object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
-        );
+        let scheduler =
+            ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(&storage));
         Self {
-            object_store,
+            storage,
             index_dir,
             metadata_cache,
             scheduler,
@@ -548,13 +546,12 @@ impl IndexStore for LanceIndexStore {
 
     fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
         other.as_any().downcast_ref::<Self>().is_some_and(|other| {
-            Arc::ptr_eq(&self.object_store, &other.object_store)
-                && self.index_dir == other.index_dir
+            Arc::ptr_eq(&self.storage, &other.storage) && self.index_dir == other.index_dir
         })
     }
 
     fn io_parallelism(&self) -> usize {
-        self.object_store.io_parallelism()
+        self.storage.io_parallelism()
     }
 
     async fn new_index_file(
@@ -564,7 +561,7 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_file_path(name)?;
         let schema = schema.as_ref().try_into()?;
-        let writer = self.object_store.create(&path).await?;
+        let writer = self.storage.create(&path).await?;
         let writer = versions::create_writer(
             self.format_version,
             writer,
@@ -591,10 +588,10 @@ impl IndexStore for LanceIndexStore {
         // scheduler. The object store underneath is still shared.
         Arc::new(Self {
             scheduler: ScanScheduler::new(
-                self.object_store.clone(),
+                self.storage.clone(),
                 SchedulerConfig {
                     io_buffer_size_bytes: bytes,
-                    ..SchedulerConfig::max_bandwidth(&self.object_store)
+                    ..SchedulerConfig::max_bandwidth(&self.storage)
                 },
             ),
             ..self.clone()
@@ -648,7 +645,7 @@ impl IndexStore for LanceIndexStore {
                 // Legacy files are not cached; they are opened through the v1
                 // reader which has its own (manifest-based) metadata handling.
                 let reader = V1FileReader::try_new_self_described(
-                    &self.object_store,
+                    &self.storage,
                     &path,
                     Some(&self.metadata_cache),
                 )
@@ -680,8 +677,8 @@ impl IndexStore for LanceIndexStore {
             Some(dest_store) => {
                 let dest_path = dest_store.index_file_path(new_name)?;
                 let result = self
-                    .object_store
-                    .copy_bulk(&path, &dest_store.object_store, &dest_path)
+                    .storage
+                    .copy_bulk(&path, &dest_store.storage, &dest_path)
                     .await?;
                 Ok(IndexFile {
                     path: new_name.to_string(),
@@ -708,10 +705,10 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_file_path(name)?;
         let new_path = self.index_file_path(new_name)?;
         let result = self
-            .object_store
-            .copy_bulk(&path, &self.object_store, &new_path)
+            .storage
+            .copy_bulk(&path, &self.storage, &new_path)
             .await?;
-        self.object_store.delete(&path).await?;
+        self.storage.delete(&path).await?;
         Ok(IndexFile {
             path: new_name.to_string(),
             size_bytes: result.size as u64,
@@ -720,11 +717,11 @@ impl IndexStore for LanceIndexStore {
 
     async fn delete_index_file(&self, name: &str) -> Result<()> {
         let path = self.index_file_path(name)?;
-        self.object_store.delete(&path).await
+        self.storage.delete(&path).await
     }
 
     async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
-        let files = list_index_files_with_sizes(&self.object_store, &self.index_dir).await?;
+        let files = list_index_files_with_sizes(&self.storage, &self.index_dir).await?;
         Ok(files
             .into_iter()
             .map(|f| IndexFile {
@@ -773,14 +770,14 @@ mod tests {
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();
-        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();
         let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
             128 * 1024 * 1024,
         ));
-        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+        Arc::new(LanceIndexStore::new(storage, test_path, cache))
     }
 
     #[tokio::test]
@@ -809,14 +806,14 @@ mod tests {
 
         let index_dir = TempDir::default();
         let test_path = index_dir.obj_path();
-        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();
         let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
             128 * 1024 * 1024,
         ));
-        let store = LanceIndexStore::new(object_store, test_path, cache.clone());
+        let store = LanceIndexStore::new(storage, test_path, cache.clone());
 
         let before = store.deep_size_of();
         cache
@@ -836,15 +833,15 @@ mod tests {
     /// IO counters and the store's scheduler.
     fn concrete_test_store(tempdir: &TempDir) -> (Arc<ObjectStore>, LanceIndexStore) {
         let test_path = tempdir.obj_path();
-        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();
         let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
             128 * 1024 * 1024,
         ));
-        let store = LanceIndexStore::new(object_store.clone(), test_path, cache);
-        (object_store, store)
+        let store = LanceIndexStore::new(storage.clone(), test_path, cache);
+        (storage, store)
     }
 
     async fn write_int_index_file(store: &dyn IndexStore, name: &str) -> RecordBatch {
@@ -868,7 +865,7 @@ mod tests {
     async fn test_open_index_file_reuses_cached_metadata() {
         const FILE_NAME: &str = "pages.lance";
         let tempdir = TempDir::default();
-        let (object_store, store) = concrete_test_store(&tempdir);
+        let (storage, store) = concrete_test_store(&tempdir);
         let expected = write_int_index_file(&store, FILE_NAME).await;
 
         // Provide the file size (as the manifest does in production) so that no
@@ -883,10 +880,10 @@ mod tests {
         let store = store.with_file_sizes(file_sizes);
 
         // Cold open: the footer/schema/column metadata must be read from storage.
-        let _ = object_store.io_stats_incremental();
+        let _ = storage.io_stats_incremental();
         let sched_before = store.scheduler.stats();
         let first = store.open_index_file(FILE_NAME).await.unwrap();
-        let cold_stats = object_store.io_stats_incremental();
+        let cold_stats = storage.io_stats_incremental();
         let sched_after = store.scheduler.stats();
         assert!(
             cold_stats.read_iops > 0,
@@ -900,7 +897,7 @@ mod tests {
         // and no bytes fetched at all.
         let sched_before = store.scheduler.stats();
         let second = store.open_index_file(FILE_NAME).await.unwrap();
-        let warm_stats = object_store.io_stats_incremental();
+        let warm_stats = storage.io_stats_incremental();
         let sched_after = store.scheduler.stats();
         assert_eq!(
             warm_stats.read_iops, 0,
@@ -928,9 +925,9 @@ mod tests {
         // Priority views are cheap clones sharing the same cache, so they must
         // also open without I/O.
         let prioritized = store.with_io_priority(7);
-        let _ = object_store.io_stats_incremental();
+        let _ = storage.io_stats_incremental();
         let third = prioritized.open_index_file(FILE_NAME).await.unwrap();
-        let prio_stats = object_store.io_stats_incremental();
+        let prio_stats = storage.io_stats_incremental();
         assert_eq!(
             prio_stats.read_iops, 0,
             "priority clone must share the metadata cache, got {:?}",
@@ -940,10 +937,10 @@ mod tests {
 
         // A store with a fresh cache over the same directory has to read the
         // metadata again, proving the savings come from the cache.
-        let (object_store2, store2) = concrete_test_store(&tempdir);
-        let _ = object_store2.io_stats_incremental();
+        let (storage2, store2) = concrete_test_store(&tempdir);
+        let _ = storage2.io_stats_incremental();
         let fresh = store2.open_index_file(FILE_NAME).await.unwrap();
-        let fresh_stats = object_store2.io_stats_incremental();
+        let fresh_stats = storage2.io_stats_incremental();
         assert!(fresh_stats.read_iops > 0, "got {:?}", fresh_stats);
         assert_eq!(fresh.num_rows(), 1000);
     }
@@ -952,7 +949,7 @@ mod tests {
     async fn test_index_file_metadata_cache_is_keyed_by_full_path() {
         // Two different files in the same store must not share cached metadata.
         let tempdir = TempDir::default();
-        let (object_store, store) = concrete_test_store(&tempdir);
+        let (storage, store) = concrete_test_store(&tempdir);
         let _small = write_int_index_file(&store, "a.lance").await;
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -982,18 +979,18 @@ mod tests {
         // Warm the cache with a.lance, then open b.lance: it must be read from
         // storage and describe b's schema, not a's.
         store.open_index_file("a.lance").await.unwrap();
-        let _ = object_store.io_stats_incremental();
+        let _ = storage.io_stats_incremental();
         let b = store.open_index_file("b.lance").await.unwrap();
-        let stats = object_store.io_stats_incremental();
+        let stats = storage.io_stats_incremental();
         assert!(stats.read_iops > 0, "got {:?}", stats);
         assert_eq!(b.num_rows(), 5);
         assert_eq!(&ArrowSchema::from(b.schema()), big.schema().as_ref());
         assert_eq!(b.read_range(0..5, None).await.unwrap(), big);
 
         // And now b is cached too.
-        let _ = object_store.io_stats_incremental();
+        let _ = storage.io_stats_incremental();
         let b2 = store.open_index_file("b.lance").await.unwrap();
-        let stats = object_store.io_stats_incremental();
+        let stats = storage.io_stats_incremental();
         assert_eq!(stats.read_iops, 0, "got {:?}", stats);
         assert_eq!(b2.read_range(0..5, None).await.unwrap(), big);
     }

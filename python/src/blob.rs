@@ -313,14 +313,13 @@ pub struct PyPackedBlobWriter {
 
 impl PyPackedBlobWriter {
     pub(crate) async fn try_new(
-        object_store: Arc<lance_io::object_store::ObjectStore>,
-        data_file_path: object_store::path::Path,
+        storage: Arc<lance_io::object_store::ObjectStore>,
+        data_file_path: lance_core::storage::path::Path,
         blob_id: u32,
     ) -> PyResult<Self> {
-        let inner =
-            PackedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
-                .await
-                .infer_error()?;
+        let inner = PackedBlobWriter::try_new(storage.as_ref().clone(), data_file_path, blob_id)
+            .await
+            .infer_error()?;
         Ok(Self {
             field: None,
             inner: Mutex::new(Some(inner)),
@@ -479,11 +478,11 @@ pub struct PyManagedBlobWriter {
 
 impl PyManagedBlobWriter {
     pub(crate) async fn try_new(
-        object_store: Arc<lance_io::object_store::ObjectStore>,
-        base_path: object_store::path::Path,
+        storage: Arc<lance_io::object_store::ObjectStore>,
+        base_path: lance_core::storage::path::Path,
         base_id: Option<u32>,
     ) -> PyResult<Self> {
-        let inner = ManagedBlobWriter::try_new(object_store.as_ref().clone(), base_path, base_id)
+        let inner = ManagedBlobWriter::try_new(storage.as_ref().clone(), base_path, base_id)
             .await
             .infer_error()?;
         Ok(Self {
@@ -585,14 +584,13 @@ pub struct PyDedicatedBlobWriter {
 
 impl PyDedicatedBlobWriter {
     pub(crate) async fn try_new(
-        object_store: Arc<lance_io::object_store::ObjectStore>,
-        data_file_path: object_store::path::Path,
+        storage: Arc<lance_io::object_store::ObjectStore>,
+        data_file_path: lance_core::storage::path::Path,
         blob_id: u32,
     ) -> PyResult<Self> {
-        let inner =
-            DedicatedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
-                .await
-                .infer_error()?;
+        let inner = DedicatedBlobWriter::try_new(storage.as_ref().clone(), data_file_path, blob_id)
+            .await
+            .infer_error()?;
         Ok(Self {
             inner: Mutex::new(Some(inner)),
         })

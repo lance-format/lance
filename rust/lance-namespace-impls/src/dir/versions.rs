@@ -5,11 +5,11 @@ use std::collections::HashMap;
 
 use futures::TryStreamExt;
 use lance_core::Result;
+use lance_core::storage::path::Path;
+use lance_io::object_store::{Error as StorageError, ObjectMeta, PutMode, PutOptions};
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{CreateTableVersionResponse, TableVersion};
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
-use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStoreExt, PutMode, PutOptions};
 
 use super::DirectoryNamespace;
 
@@ -78,7 +78,7 @@ impl DirectoryNamespace {
             return Ok(false);
         }
 
-        let staging_bytes = match self.object_store.read_object(staging_path).await {
+        let staging_bytes = match self.storage.read_object(staging_path).await {
             Ok(r) => r.bytes().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
@@ -87,7 +87,7 @@ impl DirectoryNamespace {
                     ),
                 })
             })?,
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(false),
+            Err(StorageError::NotFound { .. }) => return Ok(false),
             Err(e) => {
                 return Err(lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
@@ -99,7 +99,7 @@ impl DirectoryNamespace {
         };
 
         let final_bytes = self
-            .object_store
+            .storage
             .read_object(final_path)
             .await
             .map_err(|e| {
@@ -139,7 +139,7 @@ impl DirectoryNamespace {
             .await?
         {
             // Best-effort cleanup of a retry's staging blob.
-            if let Err(e) = self.object_store.inner.delete(args.staging_path).await {
+            if let Err(e) = self.storage.delete(args.staging_path).await {
                 log::warn!(
                     "Failed to delete staging manifest at '{}': {:?}",
                     args.staging_path,
@@ -220,35 +220,33 @@ impl DirectoryNamespace {
         Ok(())
     }
 
-    /// Materialize staging → final with Create semantics only (never overwrite).
     pub(super) async fn materialize_version_manifest_create(
         &self,
         staging_path: &Path,
         final_path: &Path,
         staging_manifest_path: &str,
-    ) -> std::result::Result<(), ObjectStoreError> {
+    ) -> std::result::Result<(), StorageError> {
         match self
-            .object_store
+            .storage
             .copy_if_not_exists(staging_path, final_path)
             .await
         {
             Ok(()) => Ok(()),
-            Err(ObjectStoreError::NotImplemented { .. })
-            | Err(ObjectStoreError::NotSupported { .. }) => {
+            Err(StorageError::NotSupported { .. }) => {
                 let manifest_data = self
-                    .object_store
+                    .storage
                     .read_object(staging_path)
                     .await?
                     .bytes()
                     .await
-                    .map_err(|e| ObjectStoreError::Generic {
+                    .map_err(|e| StorageError::Generic {
                         store: "DirectoryNamespace",
                         source: Box::new(std::io::Error::other(format!(
                             "Failed to read staging manifest bytes at '{}': {}",
                             staging_manifest_path, e
                         ))),
                     })?;
-                self.object_store
+                self.storage
                     .put_payload_opts(
                         final_path,
                         manifest_data.into(),
@@ -270,7 +268,7 @@ impl DirectoryNamespace {
         descending: bool,
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
-        let table_path = self.object_store_path_from_uri(table_uri)?;
+        let table_path = self.storage_path_from_uri(table_uri)?;
         self.list_versions_under(&table_path, descending, limit)
             .await
     }
@@ -285,7 +283,7 @@ impl DirectoryNamespace {
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
         let versions_dir = table_path.clone().join(VERSIONS_DIR);
-        let mut stream = self.object_store.read_dir_all(&versions_dir, None);
+        let mut stream = self.storage.read_dir_all(&versions_dir, None);
         let list_err = |e: lance_core::Error| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!(
@@ -340,7 +338,7 @@ impl DirectoryNamespace {
         // arrives newest-first; when that matches the requested order, stop
         // after `limit` manifests instead of paginating the whole directory
         // (the `get_latest_version` hot path: descending, limit 1).
-        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+        let list_is_ordered = self.storage.list_is_lexically_ordered();
         let stream_matches_request = list_is_ordered
             && if is_v2_naming {
                 descending
@@ -395,12 +393,12 @@ impl DirectoryNamespace {
                 Some(b) => self.resolve_branch_location(&table_uri, b).await?,
                 None => table_uri,
             };
-            let table_path = self.object_store_path_from_uri(&table_uri)?;
+            let table_path = self.storage_path_from_uri(&table_uri)?;
             let versions_dir_path = table_path.clone().join(VERSIONS_DIR);
 
             // Match listed files, not constructed names (`{version}.manifest` misses V2).
             let manifest_metas: Vec<_> = self
-                .object_store
+                .storage
                 .read_dir_all(&versions_dir_path, None)
                 .try_collect()
                 .await
@@ -425,11 +423,11 @@ impl DirectoryNamespace {
                 if !te.ranges.iter().any(|&(s, e)| vi >= s && (e < 0 || vi < e)) {
                     continue;
                 }
-                match self.object_store.inner.delete(version_path).await {
+                match self.storage.delete(version_path).await {
                     Ok(_) => {
                         deleted_count += 1;
                     }
-                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) if error.is_not_found() => {}
                     Err(e) => {
                         return Err(NamespaceError::Internal {
                             message: format!(

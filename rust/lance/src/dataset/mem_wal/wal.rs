@@ -21,9 +21,9 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::StreamExt;
+use lance_core::storage::path::Path;
 use lance_core::{Error, FenceReason, Result};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use tracing::instrument;
@@ -1034,9 +1034,9 @@ impl WalEntryData {
     ///
     /// The parsed WAL entry data, or an error if reading/parsing fails.
     #[instrument(name = "wal_entry_read", level = "debug", skip_all, fields(path = %path))]
-    pub async fn read(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+    pub async fn read(storage: &ObjectStore, path: &Path) -> Result<Self> {
         // Read the file
-        let data = object_store
+        let data = storage
             .read_object(path)
             .await
             .map_err(|e| Error::io(format!("Failed to read WAL file: {}", e)))?
@@ -1152,7 +1152,7 @@ pub struct WalReadEntry {
 /// retries with the next position. Checks fencing on conflict or PUT failure.
 #[derive(Debug)]
 pub struct WalAppender {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     shard_id: Uuid,
@@ -1170,14 +1170,14 @@ pub struct WalAppender {
 impl WalAppender {
     /// Open a WAL appender and claim a new writer epoch.
     pub async fn open(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         dir_id: &str,
         shard_id: Uuid,
         shard_spec_id: u32,
     ) -> Result<Self> {
         let manifest_store = Arc::new(ShardManifestStore::new(
-            object_store.clone(),
+            storage.clone(),
             &base_path,
             dir_id,
             shard_id,
@@ -1189,7 +1189,7 @@ impl WalAppender {
             .max(manifest.replay_after_wal_entry_position)
             .saturating_add(1);
         Ok(Self::with_claimed_epoch(
-            object_store,
+            storage,
             base_path,
             dir_id,
             shard_id,
@@ -1213,7 +1213,7 @@ impl WalAppender {
     /// first append.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_claimed_epoch(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         dir_id: &str,
         shard_id: Uuid,
@@ -1223,7 +1223,7 @@ impl WalAppender {
         retry: WalRetryConfig,
     ) -> Self {
         Self {
-            object_store,
+            storage,
             wal_dir: shard_wal_path(&base_path, dir_id, &shard_id),
             manifest_store,
             shard_id,
@@ -1311,7 +1311,7 @@ impl WalAppender {
                 ))
             })?;
             match atomic_put(
-                self.object_store.as_ref(),
+                self.storage.as_ref(),
                 &self.wal_dir,
                 &wal_entry_filename(pos),
                 wal_data.clone(),
@@ -1401,7 +1401,7 @@ impl WalAppender {
         let mut conflicts = 0;
         loop {
             match atomic_put(
-                self.object_store.as_ref(),
+                self.storage.as_ref(),
                 &self.wal_dir,
                 &wal_entry_filename(pos),
                 sentinel.clone(),
@@ -1440,18 +1440,14 @@ impl WalAppender {
             let hint = manifest
                 .wal_entry_position_last_seen
                 .max(manifest.replay_after_wal_entry_position);
-            if let Some(tip) = probe_forward_from(
-                self.object_store.as_ref(),
-                &self.wal_dir,
-                self.shard_id,
-                hint,
-            )
-            .await?
+            if let Some(tip) =
+                probe_forward_from(self.storage.as_ref(), &self.wal_dir, self.shard_id, hint)
+                    .await?
             {
                 return Ok(tip);
             }
         }
-        scan_next_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
+        scan_next_position(self.storage.as_ref(), &self.wal_dir, self.shard_id).await
     }
 }
 
@@ -1461,21 +1457,21 @@ impl WalAppender {
 ///
 /// The caller must already have raised the manifest epoch to `writer_epoch`.
 pub async fn fence_shard(
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_path: &Path,
     dir_id: &str,
     shard_id: Uuid,
     writer_epoch: u64,
 ) -> Result<u64> {
     let manifest_store = Arc::new(ShardManifestStore::new(
-        object_store.clone(),
+        storage.clone(),
         base_path,
         dir_id,
         shard_id,
         2,
     ));
     WalAppender::with_claimed_epoch(
-        object_store,
+        storage,
         base_path.clone(),
         dir_id,
         shard_id,
@@ -1499,7 +1495,7 @@ pub async fn fence_shard(
 /// the epoch holder's job — a tailer holds no claim and writes no manifests.
 #[derive(Debug, Clone)]
 pub struct WalTailer {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     shard_id: Uuid,
@@ -1510,21 +1506,16 @@ pub struct WalTailer {
 
 impl WalTailer {
     /// Create a WAL tailer for a shard.
-    pub fn new(
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        dir_id: &str,
-        shard_id: Uuid,
-    ) -> Self {
+    pub fn new(storage: Arc<ObjectStore>, base_path: Path, dir_id: &str, shard_id: Uuid) -> Self {
         let manifest_store = Arc::new(ShardManifestStore::new(
-            object_store.clone(),
+            storage.clone(),
             &base_path,
             dir_id,
             shard_id,
             2,
         ));
         Self {
-            object_store,
+            storage,
             wal_dir: shard_wal_path(&base_path, dir_id, &shard_id),
             manifest_store,
             shard_id,
@@ -1539,9 +1530,9 @@ impl WalTailer {
             .wal_dir
             .clone()
             .join(wal_entry_filename(entry_position));
-        let data = match self.object_store.read_object(&path).await {
+        let data = match self.storage.read_object(&path).await {
             Ok(data) => data,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(lance_io::object_store::Error::NotFound { .. }) => return Ok(None),
             Err(e) => {
                 return Err(Error::io(format!(
                     "failed to read WAL entry {} for shard {}: {}",
@@ -1582,12 +1573,12 @@ impl WalTailer {
         {
             return Ok(tip);
         }
-        scan_next_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
+        scan_next_position(self.storage.as_ref(), &self.wal_dir, self.shard_id).await
     }
 
     /// Find the earliest listed WAL position.
     pub async fn first_position(&self) -> Result<u64> {
-        scan_first_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
+        scan_first_position(self.storage.as_ref(), &self.wal_dir, self.shard_id).await
     }
 
     /// Where to start probing for the WAL tip: what this tailer has already
@@ -1603,13 +1594,7 @@ impl WalTailer {
     }
 
     async fn probe_forward(&self, hint: u64) -> Result<Option<u64>> {
-        probe_forward_from(
-            self.object_store.as_ref(),
-            &self.wal_dir,
-            self.shard_id,
-            hint,
-        )
-        .await
+        probe_forward_from(self.storage.as_ref(), &self.wal_dir, self.shard_id, hint).await
     }
 }
 
@@ -1830,18 +1815,19 @@ enum AtomicPutError {
 }
 
 async fn atomic_put(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     dir: &Path,
     filename: &str,
     bytes: Bytes,
 ) -> std::result::Result<(), AtomicPutError> {
     let path = dir.clone().join(filename);
-    object_store
+    storage
         .put_if_absent(&path, bytes.into())
         .await
+        .map(|_| ())
         .map_err(|error| match error {
-            object_store::Error::AlreadyExists { .. }
-            | object_store::Error::Precondition { .. } => AtomicPutError::AlreadyExists,
+            lance_io::object_store::Error::AlreadyExists { .. }
+            | lance_io::object_store::Error::Precondition { .. } => AtomicPutError::AlreadyExists,
             _ => AtomicPutError::Other(Error::io(format!(
                 "failed to create {} atomically: {}",
                 path, error
@@ -1852,15 +1838,15 @@ async fn atomic_put(
 /// Probe forward from a hint position to find the next unwritten position.
 /// Returns `None` if the hint position itself doesn't exist (stale hint).
 async fn probe_forward_from(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     wal_dir: &Path,
     shard_id: Uuid,
     hint: u64,
 ) -> Result<Option<u64>> {
     let path = wal_dir.clone().join(wal_entry_filename(hint));
-    match object_store.stat(&path).await {
+    match storage.stat(&path).await {
         Ok(_) => {}
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(lance_io::object_store::Error::NotFound { .. }) => return Ok(None),
         Err(e) => {
             return Err(Error::io(format!(
                 "failed to check WAL entry {} for shard {}: {}",
@@ -1871,9 +1857,9 @@ async fn probe_forward_from(
     let mut pos = hint + 1;
     while pos - hint <= MAX_CURSOR_PROBE {
         let p = wal_dir.clone().join(wal_entry_filename(pos));
-        match object_store.stat(&p).await {
+        match storage.stat(&p).await {
             Ok(_) => pos += 1,
-            Err(object_store::Error::NotFound { .. }) => return Ok(Some(pos)),
+            Err(lance_io::object_store::Error::NotFound { .. }) => return Ok(Some(pos)),
             Err(e) => {
                 return Err(Error::io(format!(
                     "failed to check WAL entry {} for shard {}: {}",
@@ -1885,13 +1871,9 @@ async fn probe_forward_from(
     Ok(None)
 }
 
-async fn scan_next_position(
-    object_store: &ObjectStore,
-    wal_dir: &Path,
-    shard_id: Uuid,
-) -> Result<u64> {
+async fn scan_next_position(storage: &ObjectStore, wal_dir: &Path, shard_id: Uuid) -> Result<u64> {
     let mut max_position = None::<u64>;
-    let mut stream = object_store.list_objects(Some(wal_dir));
+    let mut stream = storage.list_objects(Some(wal_dir));
     while let Some(item) = stream.next().await {
         let meta = item.map_err(|e| {
             Error::io(format!(
@@ -1913,13 +1895,9 @@ async fn scan_next_position(
     }
 }
 
-async fn scan_first_position(
-    object_store: &ObjectStore,
-    wal_dir: &Path,
-    shard_id: Uuid,
-) -> Result<u64> {
+async fn scan_first_position(storage: &ObjectStore, wal_dir: &Path, shard_id: Uuid) -> Result<u64> {
     let mut min_position = None::<u64>;
-    let mut stream = object_store.list_objects(Some(wal_dir));
+    let mut stream = storage.list_objects(Some(wal_dir));
     while let Some(item) = stream.next().await {
         let meta = item.map_err(|e| {
             Error::io(format!(
@@ -2647,6 +2625,14 @@ mod tests {
         let zero = RecordBatch::new_empty(schema);
         let err = appender.append(vec![zero]).await.unwrap_err();
         assert!(err.to_string().contains("empty batch"));
+    }
+
+    #[tokio::test]
+    async fn test_wal_tailer_missing_entry_uses_one_request() {
+        let (store, base, controls) = failing_memory_store().await;
+        let tailer = WalTailer::new(store, base, "", Uuid::new_v4());
+        assert!(tailer.read_entry(1).await.unwrap().is_none());
+        assert_eq!(controls.read_count(), 1);
     }
 
     #[tokio::test]

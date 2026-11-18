@@ -240,7 +240,7 @@ async fn assert_index_matches_scan_with(
 }
 
 fn io(dataset: &Dataset) -> IoStats {
-    dataset.object_store.io_stats_incremental()
+    dataset.storage.io_stats_incremental()
 }
 
 async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
@@ -249,8 +249,8 @@ async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
         .unwrap()
         .join(file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     let file_scheduler = scheduler
         .open_file(&path, &CachedFileSize::unknown())
@@ -1638,7 +1638,7 @@ impl Drop for ReadGuard<'_> {
 
 #[derive(Debug)]
 struct SlowReads {
-    target: Arc<dyn object_store::ObjectStore>,
+    target: Arc<dyn lance_io::object_store::StorageBackend>,
     watch: Arc<ReadWatch>,
 }
 
@@ -1649,38 +1649,50 @@ impl std::fmt::Display for SlowReads {
 }
 
 #[async_trait::async_trait]
-impl object_store::ObjectStore for SlowReads {
+impl lance_io::object_store::StorageBackend for SlowReads {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
-        location: &object_store::path::Path,
-        bytes: object_store::PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
+        location: &lance_core::storage::path::Path,
+        bytes: lance_io::object_store::PutPayload,
+        opts: lance_io::object_store::PutOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
         self.target.put_opts(location, bytes, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
-        location: &object_store::path::Path,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        location: &lance_core::storage::path::Path,
+        opts: lance_io::object_store::PutMultipartOptions,
+    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+    {
         self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
         &self,
-        location: &object_store::path::Path,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
+        location: &lance_core::storage::path::Path,
+        options: lance_io::object_store::GetOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
         let _read = self.watch.enter().await;
         self.target.get_opts(location, options).await
     }
 
     async fn get_ranges(
         &self,
-        location: &object_store::path::Path,
+        location: &lance_core::storage::path::Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
         let _read = self.watch.enter().await;
         self.target.get_ranges(location, ranges).await
     }
@@ -1689,42 +1701,63 @@ impl object_store::ObjectStore for SlowReads {
         &self,
         locations: futures::stream::BoxStream<
             'static,
-            object_store::Result<object_store::path::Path>,
+            lance_io::object_store::Result<lance_core::storage::path::Path>,
         >,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_core::storage::path::Path>,
+    > {
         self.target.delete_stream(locations)
     }
 
     fn list(
         &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        prefix: Option<&lance_core::storage::path::Path>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
         self.target.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> object_store::Result<object_store::ListResult> {
+        prefix: Option<&lance_core::storage::path::Path>,
+    ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(
         &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-        opts: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
+        from: &lance_core::storage::path::Path,
+        to: &lance_core::storage::path::Path,
+        opts: lance_io::object_store::CopyOptions,
+    ) -> lance_io::object_store::Result<()> {
         self.target.copy_opts(from, to, opts).await
     }
 
     async fn rename_opts(
         &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-        opts: object_store::RenameOptions,
-    ) -> object_store::Result<()> {
+        from: &lance_core::storage::path::Path,
+        to: &lance_core::storage::path::Path,
+        opts: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
         self.target.rename_opts(from, to, opts).await
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&lance_core::storage::path::Path>,
+        offset: &lance_core::storage::path::Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| std::future::ready(meta.location > offset),
+        ))
     }
 }
 
@@ -1735,20 +1768,12 @@ impl lance_io::object_store::WrappingObjectStore for SlowReadsWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        target: Arc<dyn object_store::ObjectStore>,
-    ) -> Arc<dyn object_store::ObjectStore> {
+        target: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
         Arc::new(SlowReads {
             target,
             watch: self.0.clone(),
         })
-    }
-
-    fn wrap_paginated(
-        &self,
-        _store_prefix: &str,
-        original: Arc<dyn object_store::list::PaginatedListStore>,
-    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
-        Some(original)
     }
 }
 
@@ -1761,12 +1786,11 @@ impl lance_io::object_store::WrappingObjectStore for SlowReadsWrapper {
 async fn test_harvest_reads_are_bounded_and_concurrent() {
     let watch = Arc::new(ReadWatch::default());
     let store_params = lance_io::object_store::ObjectStoreParams {
-        object_store_wrapper: Some(Arc::new(SlowReadsWrapper(watch.clone()))),
+        backend_wrappers: vec![Arc::new(SlowReadsWrapper(watch.clone()))],
         ..Default::default()
     };
-    // An in-memory store, so data-file reads go through the `object_store`
-    // layer the wrapper counts (local files are read directly), and a
-    // session without a metadata cache, so every harvest reads its footer.
+    // Use an in-memory backend and disable metadata caching so every harvest
+    // reads its footer through the observation wrapper.
     let session = Arc::new(crate::session::Session::new(
         0,
         0,
@@ -1817,7 +1841,7 @@ async fn test_harvest_reads_are_bounded_and_concurrent() {
         "{} concurrent harvests for a concurrency of {concurrency}",
         report.max_concurrent_harvests
     );
-    // Storage-level concurrency is reported separately: one harvest can
+    // ObjectStore-level concurrency is reported separately: one harvest can
     // issue several reads, so only the overlap itself is asserted.
     let max_reads_in_flight = watch.max_in_flight.load(Ordering::SeqCst);
     assert!(

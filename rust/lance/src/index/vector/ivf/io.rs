@@ -20,6 +20,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
+use lance_core::storage::path::Path;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::JoinHandle;
@@ -42,7 +43,6 @@ use lance_linalg::distance::{DistanceType, MetricType};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
-use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
@@ -345,7 +345,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
     }
 
-    let object_store = ObjectStore::local();
+    let storage = ObjectStore::local();
     // Partitions are staged in this scratch dir, then merged into the final index.
     // Share the guard with every task via `Arc` so its `Drop` removes the dir only
     // after the last task finishes -- never while one is still writing.
@@ -407,7 +407,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
             let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
             let part_writer = V1FileWriter::<ManifestDescribing>::try_new(
-                &object_store,
+                &storage,
                 part_file,
                 Schema::try_from(writer.schema())?,
                 &Default::default(),
@@ -417,7 +417,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             let aux_part_writer = match auxiliary_writer.as_ref() {
                 Some(writer) => Some(
                     V1FileWriter::<ManifestDescribing>::try_new(
-                        &object_store,
+                        &storage,
                         aux_part_file,
                         Schema::try_from(writer.schema())?,
                         &Default::default(),
@@ -478,7 +478,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
             let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
             let part_reader =
-                V1FileReader::try_new_self_described(&object_store, part_file, None).await?;
+                V1FileReader::try_new_self_described(&storage, part_file, None).await?;
 
             let batches = futures::stream::iter(0..part_reader.num_batches())
                 .map(|batch_id| {
@@ -488,7 +488,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                         part_reader.schema(),
                     )
                 })
-                .buffered(object_store.io_parallelism())
+                .buffered(storage.io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await?;
             writer.write(&batches).await?;
@@ -498,12 +498,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 part_reader.schema().metadata[HNSW::metadata_key()].as_str(),
             )?);
             std::mem::drop(part_reader);
-            object_store.delete(part_file).await?;
+            storage.delete(part_file).await?;
 
             if let Some(aux_writer) = auxiliary_writer.as_mut() {
                 let aux_part_reader =
-                    V1FileReader::try_new_self_described(&object_store, aux_part_file, None)
-                        .await?;
+                    V1FileReader::try_new_self_described(&storage, aux_part_file, None).await?;
 
                 let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                     .map(|batch_id| {
@@ -513,11 +512,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                             aux_part_reader.schema(),
                         )
                     })
-                    .buffered(object_store.io_parallelism())
+                    .buffered(storage.io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
                 std::mem::drop(aux_part_reader);
-                object_store.delete(aux_part_file).await?;
+                storage.delete(aux_part_file).await?;
 
                 aux_writer.write(&batches).await?;
                 aux_ivf.add_partition(num_rows as u32);
@@ -700,8 +699,8 @@ mod tests {
         let flat_row_id = UInt64Array::from_iter_values([13]);
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let mut writer = object_store.create(&path).await.unwrap();
+        let storage = ObjectStore::local();
+        let mut writer = storage.create(&path).await.unwrap();
         write_pq_partition_payload(
             writer.as_mut(),
             &[&codes as &dyn Array, &flat_codes as &dyn Array],
@@ -711,7 +710,7 @@ mod tests {
         .unwrap();
         Writer::shutdown(&mut writer).await.unwrap();
 
-        let reader = object_store.open(&path).await.unwrap();
+        let reader = storage.open(&path).await.unwrap();
         let bytes = reader.get_range(0..30).await.unwrap();
         let mut expected = vec![2, 3, 4, 5, 7, 8];
         expected.extend_from_slice(&11_u64.to_le_bytes());

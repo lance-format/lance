@@ -23,6 +23,7 @@ use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_arrow::json::convert_json_columns;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_core::utils::path::LancePathExt;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{
@@ -37,7 +38,6 @@ use lance_io::{
     traits::Writer,
     utils::CachedFileSize,
 };
-use object_store::{ObjectStoreExt, path::Path};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
     exceptions::{PyIOError, PyRuntimeError},
@@ -267,14 +267,14 @@ impl LanceFileWriter {
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        let (object_store, path) = object_store_from_uri_or_path_with_provider(
+        let (storage, path) = storage_from_uri_or_path_with_provider(
             uri_or_path,
             storage_options,
             storage_options_provider,
         )
         .await?;
         Self::open_with_store(
-            object_store,
+            storage,
             path,
             schema,
             data_cache_bytes,
@@ -286,7 +286,7 @@ impl LanceFileWriter {
     }
 
     async fn open_with_store(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         path: Path,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
@@ -294,7 +294,7 @@ impl LanceFileWriter {
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        let object_writer = object_store.create(&path).await.infer_error()?;
+        let object_writer = storage.create(&path).await.infer_error()?;
         let version = version
             .map(|value| value.parse::<LanceFileVersion>())
             .transpose()
@@ -414,25 +414,25 @@ impl Drop for LanceFileWriter {
     }
 }
 
-pub async fn object_store_from_uri_or_path_no_options(
+pub async fn storage_from_uri_or_path_no_options(
     uri_or_path: impl AsRef<str>,
 ) -> PyResult<(Arc<ObjectStore>, Path)> {
-    object_store_from_uri_or_path(uri_or_path, None).await
+    storage_from_uri_or_path(uri_or_path, None).await
 }
 
-pub async fn object_store_from_uri_or_path(
+pub async fn storage_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<(Arc<ObjectStore>, Path)> {
-    object_store_from_uri_or_path_with_provider(uri_or_path, storage_options, None).await
+    storage_from_uri_or_path_with_provider(uri_or_path, storage_options, None).await
 }
 
-pub async fn object_store_from_uri_or_path_with_provider(
+pub async fn storage_from_uri_or_path_with_provider(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
     storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
 ) -> PyResult<(Arc<ObjectStore>, Path)> {
-    let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
+    let storage_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
 
     let accessor = match (storage_options, storage_options_provider) {
         (Some(opts), Some(provider)) => Some(Arc::new(
@@ -447,25 +447,22 @@ pub async fn object_store_from_uri_or_path_with_provider(
         (None, None) => None,
     };
 
-    let object_store_params = ObjectStoreParams {
+    let storage_params = ObjectStoreParams {
         storage_options_accessor: accessor,
         ..Default::default()
     };
 
-    let (object_store, path) = ObjectStore::from_uri_and_params(
-        object_store_registry,
-        uri_or_path.as_ref(),
-        &object_store_params,
-    )
-    .await
-    .infer_error()?;
+    let (storage, path) =
+        ObjectStore::from_uri_and_params(storage_registry, uri_or_path.as_ref(), &storage_params)
+            .await
+            .infer_error()?;
 
-    Ok((object_store, path))
+    Ok((storage, path))
 }
 
 #[pyclass]
 pub struct LanceFileSession {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_path: Path,
 }
 
@@ -475,16 +472,13 @@ impl LanceFileSession {
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
     ) -> PyResult<Self> {
-        let (object_store, base_path) = object_store_from_uri_or_path_with_provider(
+        let (storage, base_path) = storage_from_uri_or_path_with_provider(
             uri_or_path,
             storage_options,
             storage_options_provider,
         )
         .await?;
-        Ok(Self {
-            object_store,
-            base_path,
-        })
+        Ok(Self { storage, base_path })
     }
 }
 
@@ -521,7 +515,7 @@ impl LanceFileSession {
         let path = self.base_path.child_path(&Path::from(path));
         rt().block_on(
             None,
-            LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+            LanceFileReader::open_with_store(self.storage.clone(), path, columns),
         )?
     }
 
@@ -546,7 +540,7 @@ impl LanceFileSession {
         rt().block_on(
             None,
             LanceFileWriter::open_with_store(
-                self.object_store.clone(),
+                self.storage.clone(),
                 path,
                 schema,
                 data_cache_bytes,
@@ -569,11 +563,7 @@ impl LanceFileSession {
     pub fn open_managed_blob_writer(&self, base_id: Option<u32>) -> PyResult<PyManagedBlobWriter> {
         rt().block_on(
             None,
-            PyManagedBlobWriter::try_new(
-                self.object_store.clone(),
-                self.base_path.clone(),
-                base_id,
-            ),
+            PyManagedBlobWriter::try_new(self.storage.clone(), self.base_path.clone(), base_id),
         )?
     }
 
@@ -585,7 +575,7 @@ impl LanceFileSession {
         let path = self.base_path.child_path(&Path::from(path));
         rt().block_on(
             None,
-            PyPackedBlobWriter::try_new(self.object_store.clone(), path, blob_id),
+            PyPackedBlobWriter::try_new(self.storage.clone(), path, blob_id),
         )?
     }
 
@@ -597,14 +587,14 @@ impl LanceFileSession {
         let path = self.base_path.child_path(&Path::from(path));
         rt().block_on(
             None,
-            PyDedicatedBlobWriter::try_new(self.object_store.clone(), path, blob_id),
+            PyDedicatedBlobWriter::try_new(self.storage.clone(), path, blob_id),
         )?
     }
 
     pub fn contains(&self, path: String) -> PyResult<bool> {
         let full_path = self.base_path.child_path(&Path::from(path));
         rt().block_on(None, async {
-            self.object_store
+            self.storage
                 .exists(&full_path)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
@@ -623,7 +613,7 @@ impl LanceFileSession {
             };
 
             // List all files under the specified path
-            let stream = self.object_store.list(Some(list_path));
+            let stream = self.storage.list(Some(list_path));
             let results: Vec<_> = stream.collect().await;
 
             let mut paths: Vec<String> = Vec::new();
@@ -670,7 +660,7 @@ impl LanceFileSession {
             };
 
             let result = self
-                .object_store
+                .storage
                 .list_with_delimiter(Some(&list_path))
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
@@ -719,7 +709,7 @@ impl LanceFileSession {
             let full_path = self.base_path.child_path(&Path::from(remote_path));
 
             let mut writer =
-                self.object_store.create(&full_path).await.map_err(|e| {
+                self.storage.create(&full_path).await.map_err(|e| {
                     PyIOError::new_err(format!("Failed to create remote file: {}", e))
                 })?;
 
@@ -747,8 +737,7 @@ impl LanceFileSession {
     pub fn delete_file(&self, path: String) -> PyResult<()> {
         rt().block_on(None, async {
             let full_path = self.base_path.child_path(&Path::from(path));
-            self.object_store
-                .inner
+            self.storage
                 .delete(&full_path)
                 .await
                 .map_err(|e| PyIOError::new_err(format!("Failed to delete remote file: {}", e)))?;
@@ -779,7 +768,7 @@ impl LanceFileSession {
         rt().block_on(None, async {
             let full_path = self.base_path.child_path(&Path::from(path));
             let bytes = self
-                .object_store
+                .storage
                 .read_one_range(&full_path, offset..offset + length)
                 .await
                 .map_err(|e| {
@@ -801,9 +790,8 @@ impl LanceFileSession {
         rt().block_on(None, async {
             let full_path = self.base_path.child_path(&Path::from(remote_path));
             let get_result = self
-                .object_store
-                .inner
-                .get(&full_path)
+                .storage
+                .read_object(&full_path)
                 .await
                 .map_err(|e| PyIOError::new_err(format!("Failed to get remote file: {}", e)))?;
 
@@ -842,22 +830,21 @@ impl LanceFileReader {
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let (object_store, path) = object_store_from_uri_or_path_with_provider(
+        let (storage, path) = storage_from_uri_or_path_with_provider(
             uri_or_path,
             storage_options,
             storage_options_provider,
         )
         .await?;
-        Self::open_with_store(object_store, path, columns).await
+        Self::open_with_store(storage, path, columns).await
     }
 
     async fn open_with_store(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         path: Path,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let scheduler =
-            ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
+        let scheduler = ScanScheduler::new(storage, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
         let file = scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await

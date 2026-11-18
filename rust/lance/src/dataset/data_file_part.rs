@@ -4,10 +4,10 @@
 use std::{collections::HashSet, num::NonZeroU64, ops::Range};
 
 use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::storage::path::PathPart;
 use lance_core::{Error, Result};
 use lance_file::concat::{DataFilePart as OpenedDataFilePart, EncodedFileInput};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use object_store::path::PathPart;
 use serde::{Deserialize, Serialize};
 
 use super::{DataFileTarget, Dataset};
@@ -103,7 +103,7 @@ impl DataFilePart {
                 )));
             }
         }
-        let store = dataset.object_store(target.base_id).await?;
+        let store = dataset.storage(target.base_id).await?;
         let dir = target.parts_dir(&dataset.data_file_dir_for_base(target.base_id)?);
         let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
         let concurrency = store.io_parallelism().min(MAX_CONCURRENT_PART_OPENS);

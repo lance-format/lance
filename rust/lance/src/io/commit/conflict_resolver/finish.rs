@@ -101,7 +101,7 @@ impl<'a> TransactionRebase<'a> {
                         .await
                         .map(|dv| (fragment_id, dv))
                     })
-                    .buffered(dataset.object_store.as_ref().io_parallelism())
+                    .buffered(dataset.storage.as_ref().io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -157,7 +157,7 @@ impl<'a> TransactionRebase<'a> {
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
-                        dataset.object_store.as_ref(),
+                        dataset.storage.as_ref(),
                         dataset.inline_deletions_max_bytes()?,
                     )
                     .await?;

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store::ObjectStore as OSObjectStore;
-use object_store::path::Path;
+use crate::object_store::StorageBackend;
+use lance_core::storage::path::Path;
 use opendal::{Operator, services::Huggingface};
 use url::Url;
 
@@ -13,8 +14,8 @@ use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::parse_hf_repo_id;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, ObjectStoreParams, ObjectStoreProvider,
+    StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -197,7 +198,11 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for HuggingfaceStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig> {
         let ParsedHfUrl {
             repo_type, repo_id, ..
         } = parse_hf_url(&base_path)?;
@@ -205,7 +210,6 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let storage_options =
             StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
-        let download_retry_count = storage_options.download_retry_count();
 
         let mut base_options = build_hf_base_options(&repo_type, &repo_id, &storage_options);
         if !base_options.contains_key("hf_token") && !base_options.contains_key("token") {
@@ -217,7 +221,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         }
 
         let accessor = params.get_accessor();
-        let inner: Arc<dyn OSObjectStore> =
+        let inner: Arc<dyn StorageBackend> =
             if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
                 Arc::new(
                     DynamicOpenDalStore::new(
@@ -233,26 +237,22 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
                 Arc::new(build_hf_store(normalize_hf_config(&base_options)?)?)
             };
 
-        Ok(ObjectStore {
+        Ok(BackendConfig {
+            store_prefix: None,
             scheme: "hf".to_string(),
-            inner,
-            external_blob_inner: None,
-            direct_local_io: false,
-            _external_blob_origin: None,
+            backend: inner,
             local_dir_operations: None,
             local_fsync: false,
+            direct_local_io: false,
+            local_io: crate::object_store::LocalIo::Backend,
+            is_local: false,
+            is_remote: true,
+            max_single_copy_size: None,
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count,
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.
-            paginated_lister: None,
         })
     }
 
@@ -263,7 +263,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         })
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
@@ -308,12 +308,12 @@ mod tests {
             ))),
             ..Default::default()
         };
-        // new_store should accept without creating operator; test precedence via builder config
+        // new_backend should accept without creating operator; test precedence via builder config
         let ParsedHfUrl {
             repo_type, repo_id, ..
         } = parse_hf_url(&url).unwrap();
 
-        // Build config map the same way new_store would to assert precedence logic.
+        // Build config map the same way new_backend would to assert precedence logic.
         let mut config_map: HashMap<String, String> = HashMap::new();
         config_map.insert("repo_type".to_string(), repo_type);
         config_map.insert("repo".to_string(), repo_id);
@@ -420,7 +420,7 @@ mod tests {
             ))),
             ..Default::default()
         };
-        let err = HuggingfaceStoreProvider
+        let err = crate::object_store::ObjectStoreRegistry::default()
             .new_store(
                 Url::parse("hf://datasets/acme/repo/table.lance").unwrap(),
                 &params,
@@ -511,7 +511,7 @@ mod tests {
     fn calculate_prefix_uses_repo_id() {
         let provider = HuggingfaceStoreProvider;
         let url = Url::parse("hf://datasets/acme/repo/path").unwrap();
-        let prefix = provider.calculate_object_store_prefix(&url, None).unwrap();
+        let prefix = provider.calculate_storage_prefix(&url, None).unwrap();
         assert_eq!(prefix, "hf$datasets@acme/repo");
     }
 

@@ -43,7 +43,7 @@ pub struct CommitBuilder<'a> {
     storage_format: Option<ConcreteFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
-    object_store: Option<Arc<ObjectStore>>,
+    storage: Option<Arc<ObjectStore>>,
     source_store: Option<Arc<ObjectStore>>,
     session: Option<Arc<Session>>,
     detached: bool,
@@ -76,7 +76,7 @@ impl<'a> CommitBuilder<'a> {
             storage_format: None,
             commit_handler: None,
             store_params: None,
-            object_store: None,
+            storage: None,
             source_store: None,
             session: None,
             detached: false,
@@ -128,8 +128,8 @@ impl<'a> CommitBuilder<'a> {
     }
 
     /// Pass an object store to use.
-    pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
-        self.object_store = Some(object_store);
+    pub fn with_storage(mut self, storage: Arc<ObjectStore>) -> Self {
+        self.storage = Some(storage);
         self
     }
 
@@ -150,7 +150,7 @@ impl<'a> CommitBuilder<'a> {
     /// The source dataset's commit handler is not used.
     #[deprecated(since = "12.0.0-beta.12", note = "use with_source_store instead")]
     pub fn with_source_dataset(self, source: &Dataset) -> Self {
-        self.with_source_store(source.object_store.clone())
+        self.with_source_store(source.storage.clone())
     }
 
     /// Pass a commit handler to use for the dataset.
@@ -409,9 +409,9 @@ impl<'a> CommitBuilder<'a> {
         // Store used to read the source manifest for a clone (see with_source_store).
         let source_store = self.source_store.clone();
 
-        let (object_store, base_path, commit_handler) = match &self.dest {
+        let (storage, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
-                dataset.object_store.clone(),
+                dataset.storage.clone(),
                 dataset.base.clone(),
                 self.commit_handler
                     .clone()
@@ -419,14 +419,14 @@ impl<'a> CommitBuilder<'a> {
             ),
             WriteDestination::Uri(uri) => {
                 let commit_handler = if let (Some(_), Some(commit_handler)) =
-                    (&self.object_store, &self.commit_handler)
+                    (&self.storage, &self.commit_handler)
                 {
                     commit_handler.clone()
                 } else {
                     resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
                         .await?
                 };
-                let (object_store, base_path) = if let Some(passed_store) = self.object_store {
+                let (storage, base_path) = if let Some(passed_store) = self.storage {
                     (
                         passed_store,
                         ObjectStore::extract_path_from_uri(session.store_registry(), uri)?,
@@ -439,7 +439,7 @@ impl<'a> CommitBuilder<'a> {
                     )
                     .await?
                 };
-                (object_store, base_path, commit_handler)
+                (storage, base_path, commit_handler)
             }
         };
 
@@ -528,7 +528,7 @@ impl<'a> CommitBuilder<'a> {
                 }
                 commit_detached_transaction(
                     dataset,
-                    object_store.as_ref(),
+                    storage.as_ref(),
                     commit_handler.as_ref(),
                     &transaction,
                     &manifest_config,
@@ -539,7 +539,7 @@ impl<'a> CommitBuilder<'a> {
             } else {
                 commit_transaction(
                     dataset,
-                    object_store.as_ref(),
+                    storage.as_ref(),
                     commit_handler.as_ref(),
                     &transaction,
                     &manifest_config,
@@ -558,7 +558,7 @@ impl<'a> CommitBuilder<'a> {
             ));
         } else {
             commit_new_dataset(
-                object_store.as_ref(),
+                storage.as_ref(),
                 source_store.as_deref(),
                 &commit_handler,
                 &base_path,
@@ -587,8 +587,8 @@ impl<'a> CommitBuilder<'a> {
 
         match &self.dest {
             WriteDestination::Dataset(dataset) => {
-                let base_object_stores = if manifest.base_paths == dataset.manifest.base_paths {
-                    dataset.base_object_stores.clone()
+                let base_storage_cache = if manifest.base_paths == dataset.manifest.base_paths {
+                    dataset.base_storage_cache.clone()
                 } else {
                     Default::default()
                 };
@@ -597,13 +597,13 @@ impl<'a> CommitBuilder<'a> {
                     manifest_location,
                     session,
                     fragment_bitmap,
-                    base_object_stores,
+                    base_storage_cache,
                     ..dataset.as_ref().clone()
                 })
             }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
-                    object_store.clone(),
+                    storage.clone(),
                     commit_handler.clone(),
                     BranchLocation {
                         path: base_path.clone(),
@@ -623,7 +623,7 @@ impl<'a> CommitBuilder<'a> {
                 };
 
                 Ok(Dataset {
-                    object_store,
+                    storage,
                     base: base_path,
                     uri: uri.to_string(),
                     manifest: Arc::new(manifest),
@@ -638,7 +638,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
-                    base_object_stores: Default::default(),
+                    base_storage_cache: Default::default(),
                 })
             }
         }
@@ -712,9 +712,9 @@ mod tests {
     use lance_table::transaction::resolve_arrow_field_ids;
     use std::time::Duration;
 
-    use object_store::throttle::ThrottleConfig;
+    use lance_io::utils::testing::DelayConfig;
 
-    use crate::utils::test::ThrottledStoreWrapper;
+    use crate::utils::test::DelayedStoreWrapper;
 
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
 
@@ -852,8 +852,8 @@ mod tests {
             &self,
             _manifest: &mut Manifest,
             _indices: Option<Vec<IndexMetadata>>,
-            _base_path: &object_store::path::Path,
-            _object_store: &ObjectStore,
+            _base_path: &lance_core::storage::path::Path,
+            _storage: &ObjectStore,
             _manifest_writer: ManifestWriter,
             _naming_scheme: ManifestNamingScheme,
             _transaction: Option<TableTransaction>,
@@ -889,7 +889,7 @@ mod tests {
             .unwrap();
         let dataset = Arc::new(dataset);
 
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
         assert_io_gt!(io_stats, write_iops, 0);
 
@@ -905,7 +905,7 @@ mod tests {
             // we shouldn't need to read anything from disk. Except we do need
             // to check for the latest version to see if we need to do conflict
             // resolution.
-            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+            let io_stats = dataset.storage.as_ref().io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 1, "check latest version, i = {} ", i);
             // Should see 2 IOPs:
             // 1. Write the transaction files
@@ -926,7 +926,7 @@ mod tests {
         // The read version's manifest body is served from the session cache (it
         // was cached when v1 was first created), so the checkout only pays the
         // version-resolution head, not a manifest read.
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 3, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
 
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 10);
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
     }
@@ -971,7 +971,7 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store.as_ref().io_stats_incremental(); // Reset the stats
+        dataset.storage.as_ref().io_stats_incremental(); // Reset the stats
         let read_version = dataset.manifest().version;
         let new_ds = CommitBuilder::new(Arc::new(dataset))
             .execute(sample_transaction(read_version))
@@ -979,7 +979,7 @@ mod tests {
             .unwrap();
 
         // Assert io requests
-        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        let io_stats = new_ds.storage.as_ref().io_stats_incremental();
         // This could be zero, if we decided to be optimistic. However, that
         // would mean wasted write requests (txn + manifest) if there was
         // a conflict. We choose to be pessimistic for more consistent performance.
@@ -997,8 +997,8 @@ mod tests {
         let session = Arc::new(Session::new(0, cache_size, Default::default()));
         // We need throttled to correctly count num hops. Otherwise, memory store
         // returns synchronously, and each request is 1 hop.
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_list_per_call: Duration::from_millis(5),
                 wait_get_per_call: Duration::from_millis(5),
                 wait_put_per_call: Duration::from_millis(5),
@@ -1007,7 +1007,7 @@ mod tests {
         });
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled),
+                backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -1037,14 +1037,14 @@ mod tests {
                 .await
                 .unwrap();
         }
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset.storage.as_ref().io_stats_incremental();
 
         let new_ds = CommitBuilder::new(original_dataset.clone())
             .execute(sample_transaction(original_dataset.manifest().version))
             .await
             .unwrap();
 
-        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        let io_stats = new_ds.storage.as_ref().io_stats_incremental();
 
         // If there is a conflict with two transaction, the retry should require io requests:
         // * 1 list version
@@ -1172,15 +1172,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_triggers() {
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_put_per_call: Duration::from_secs(5),
                 ..Default::default()
             },
         });
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled),
+                backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
             ..Default::default()
@@ -1211,15 +1211,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_applies_to_execute_batch() {
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_put_per_call: Duration::from_secs(5),
                 ..Default::default()
             },
         });
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled),
+                backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
             ..Default::default()
@@ -1255,15 +1255,15 @@ mod tests {
     /// 50ms timeout in `test_commit_timeout_triggers` would have fired.
     #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_none_disables() {
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_put_per_call: Duration::from_millis(200),
                 ..Default::default()
             },
         });
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled),
+                backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
             ..Default::default()
@@ -1342,8 +1342,8 @@ mod tests {
             &self,
             manifest: &mut Manifest,
             indices: Option<Vec<IndexMetadata>>,
-            base_path: &object_store::path::Path,
-            object_store: &ObjectStore,
+            base_path: &lance_core::storage::path::Path,
+            storage: &ObjectStore,
             manifest_writer: ManifestWriter,
             naming_scheme: ManifestNamingScheme,
             transaction: Option<TableTransaction>,
@@ -1359,7 +1359,7 @@ mod tests {
                     manifest,
                     indices,
                     base_path,
-                    object_store,
+                    storage,
                     manifest_writer,
                     naming_scheme,
                     transaction,
@@ -1376,15 +1376,15 @@ mod tests {
     async fn test_commit_retry_timeout_excludes_initial_catch_up() {
         let catch_up_latency = Duration::from_millis(400);
         let retry_timeout = Duration::from_millis(300);
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_list_per_call: catch_up_latency,
                 ..Default::default()
             },
         });
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled),
+                backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
             ..Default::default()
@@ -1513,8 +1513,8 @@ mod tests {
     async fn test_commit_uses_version_hint_on_non_lexical_store() {
         // Make `list` artificially slow per entry so a full listing would be
         // obvious; HEAD/GET/PUT stay fast.
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_list_per_entry: Duration::from_millis(50),
                 wait_get_per_call: Duration::from_millis(1),
                 wait_put_per_call: Duration::from_millis(1),
@@ -1524,7 +1524,7 @@ mod tests {
         let session = Arc::new(Session::default());
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled),
+                backend_wrappers: vec![throttled],
                 list_is_lexically_ordered: Some(false),
                 ..Default::default()
             }),
@@ -1562,7 +1562,7 @@ mod tests {
         }
         assert_eq!(dataset.manifest().version, 51);
 
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset.storage.as_ref().io_stats_incremental();
 
         let start = std::time::Instant::now();
         let new_ds = CommitBuilder::new(dataset.clone())
@@ -1577,7 +1577,7 @@ mod tests {
             "commit took {elapsed:?}; the version hint path was likely not used"
         );
 
-        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        let io_stats = new_ds.storage.as_ref().io_stats_incremental();
         assert!(
             io_stats.read_iops < 10,
             "read_iops = {}; a full listing was likely used",

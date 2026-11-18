@@ -9,23 +9,23 @@ mod test {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use ::object_store::local::LocalFileSystem;
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use futures::{StreamExt, TryStreamExt, future::join_all};
     use lance_core::{Error, Result};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::object_store::backend::MultipartUpload;
+    use lance_io::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult, path::Path,
+    };
+    use lance_io::object_store::{ObjectStore, StorageBackend};
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
     };
     use lance_table::io::commit::{CommitHandler, ManifestLocation, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::memory::InMemory;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        ObjectStore as OSObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
-        PutResult, RenameOptions, Result as OSResult, local::LocalFileSystem, path::Path,
-    };
     use tokio::sync::{Barrier, Mutex};
 
     use crate::dataset::builder::DatasetBuilder;
@@ -143,7 +143,7 @@ mod test {
     #[derive(Debug)]
     struct StaticExternalManifestStore {
         location: ManifestLocation,
-        verify_store: Option<Arc<dyn OSObjectStore>>,
+        verify_store: Option<ObjectStore>,
     }
 
     #[async_trait]
@@ -202,7 +202,7 @@ mod test {
             e_tag: Option<String>,
         ) -> Result<()> {
             if let Some(store) = &self.verify_store {
-                let final_meta = store.head(&Path::from(path)).await?;
+                let final_meta = store.stat(&Path::from(path)).await?;
                 assert_eq!(size, final_meta.size);
                 assert_eq!(
                     e_tag, None,
@@ -234,13 +234,13 @@ mod test {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 7;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
         let body = b"manifest body";
 
-        object_store
+        storage
             .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
@@ -250,7 +250,7 @@ mod test {
             .insert((base_path.to_string(), version), final_path.to_string());
 
         let location = handler
-            .resolve_latest_location(&base_path, &object_store)
+            .resolve_latest_location(&base_path, &storage)
             .await
             .expect("resolve latest finalized manifest");
 
@@ -266,13 +266,13 @@ mod test {
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
         };
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 7;
         let missing_v2_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
         let v1_path = ManifestNamingScheme::V1.manifest_path(&base_path, version);
 
-        object_store
+        storage
             .put_payload(&v1_path, PutPayload::from_static(b"v1 manifest body"))
             .await
             .expect("seed V1 manifest");
@@ -282,14 +282,14 @@ mod test {
         );
 
         let latest_location = handler
-            .resolve_latest_location(&base_path, &object_store)
+            .resolve_latest_location(&base_path, &storage)
             .await
             .expect("resolve latest should fall back to V1");
         assert_eq!(latest_location.path, v1_path);
         assert_eq!(latest_location.naming_scheme, ManifestNamingScheme::V1);
 
         let version_location = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .expect("resolve version should fall back to V1");
         assert_eq!(version_location.path, v1_path);
@@ -298,13 +298,13 @@ mod test {
 
     #[tokio::test]
     async fn finalized_external_manifest_location_rejects_size_mismatch() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 7;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
         let body = b"manifest body";
 
-        object_store
+        storage
             .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
@@ -324,7 +324,7 @@ mod test {
         };
 
         let err = handler
-            .resolve_latest_location(&base_path, &object_store)
+            .resolve_latest_location(&base_path, &storage)
             .await
             .expect_err("stale external manifest size should be rejected");
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
@@ -333,13 +333,13 @@ mod test {
 
     #[tokio::test]
     async fn finalized_external_manifest_location_without_stored_etag_uses_current_etag() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 7;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
         let body = b"manifest body";
 
-        object_store
+        storage
             .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
@@ -359,10 +359,10 @@ mod test {
         };
 
         let resolved = handler
-            .resolve_latest_location(&base_path, &object_store)
+            .resolve_latest_location(&base_path, &storage)
             .await
             .expect("the canonical manifest should resolve from object storage");
-        let current_meta = object_store
+        let current_meta = storage
             .stat(&resolved.path)
             .await
             .expect("read current object-store metadata");
@@ -371,15 +371,15 @@ mod test {
 
     #[tokio::test]
     async fn external_manifest_store_put_returns_destination_etag() {
-        let object_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let storage = ObjectStore::memory();
         let base_path = Path::from("repro");
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
-        object_store
-            .put(&staging_path, PutPayload::from_static(b"manifest body"))
+        storage
+            .put(&staging_path, b"manifest body")
             .await
             .expect("seed staging manifest");
-        let staging_meta = object_store
-            .head(&staging_path)
+        let staging_meta = storage
+            .stat(&staging_path)
             .await
             .expect("read staging metadata");
 
@@ -393,7 +393,7 @@ mod test {
                 identity: None,
                 last_modified: None,
             },
-            verify_store: Some(object_store.clone()),
+            verify_store: Some(storage.clone()),
         };
         let location = external_store
             .put(
@@ -402,13 +402,13 @@ mod test {
                 &staging_path,
                 staging_meta.size,
                 staging_meta.e_tag.clone(),
-                object_store.as_ref(),
+                &storage,
                 ManifestNamingScheme::V2,
             )
             .await
             .expect("finalize manifest");
-        let final_meta = object_store
-            .head(&location.path)
+        let final_meta = storage
+            .stat(&location.path)
             .await
             .expect("read finalized metadata");
 
@@ -425,15 +425,15 @@ mod test {
 
     #[tokio::test]
     async fn external_manifest_handler_finalize_returns_destination_etag() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 1;
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
-        object_store
+        storage
             .put_payload(&staging_path, PutPayload::from_static(b"manifest body"))
             .await
             .expect("seed staging manifest");
-        let staging_meta = object_store
+        let staging_meta = storage
             .stat(&staging_path)
             .await
             .expect("read staging metadata");
@@ -449,15 +449,15 @@ mod test {
                     identity: None,
                     last_modified: None,
                 },
-                verify_store: Some(object_store.inner.clone()),
+                verify_store: Some(storage.clone()),
             }),
         };
 
         let location = handler
-            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .resolve_version_location(&base_path, version, &storage)
             .await
             .expect("finalize manifest");
-        let final_meta = object_store
+        let final_meta = storage
             .stat(&location.path)
             .await
             .expect("read finalized metadata");
@@ -712,7 +712,9 @@ mod test {
         }
 
         // manually simulate last version is out of sync
-        let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
+        let localfs = lance_io::object_store::backend::native::from_object_store(Arc::new(
+            LocalFileSystem::new(),
+        ));
         // Move version 6 to a temporary location, put that in the store.
         let base_path = Path::parse(ds_uri).unwrap();
         let version_six_staging_location = base_path
@@ -772,7 +774,7 @@ mod test {
                 .version_exists(
                     &ds.base,
                     6,
-                    ds.object_store.inner.as_ref(),
+                    &ds.storage,
                     ds.manifest_location().naming_scheme,
                 )
                 .await
@@ -783,7 +785,7 @@ mod test {
                 .version_exists(
                     &ds.base,
                     7,
-                    ds.object_store.inner.as_ref(),
+                    &ds.storage,
                     ds.manifest_location().naming_scheme,
                 )
                 .await
@@ -848,12 +850,12 @@ mod test {
         let orphan_staging_manifest =
             Path::parse(format!("{}-{}", canonical_manifest, uuid::Uuid::new_v4())).unwrap();
         dataset
-            .object_store
+            .storage
             .copy(&canonical_manifest, &authoritative_staging_manifest)
             .await
             .unwrap();
         dataset
-            .object_store
+            .storage
             .copy(&canonical_manifest, &orphan_staging_manifest)
             .await
             .unwrap();
@@ -874,7 +876,7 @@ mod test {
 
         assert!(
             dataset
-                .object_store
+                .storage
                 .exists(&authoritative_staging_manifest)
                 .await
                 .unwrap(),
@@ -882,7 +884,7 @@ mod test {
         );
         assert!(
             !dataset
-                .object_store
+                .storage
                 .exists(&orphan_staging_manifest)
                 .await
                 .unwrap(),
@@ -906,11 +908,11 @@ mod test {
 
     #[derive(Debug)]
     struct CopyCapStore {
-        inner: Arc<dyn OSObjectStore>,
+        inner: Arc<dyn StorageBackend>,
         /// path → fake size returned by head(); overrides the inner store.
         head_size_overrides: Arc<Mutex<HashMap<String, u64>>>,
         /// Counts calls to `copy_opts` (the fast path). Tests use this to
-        /// assert which branch of `copy_size_aware` was taken — succeeding
+        /// assert which branch of `ObjectStore::copy_with_size` was taken — succeeding
         /// alone is not enough, since the slow path can also succeed for
         /// small files.
         copy_calls: AtomicUsize,
@@ -919,7 +921,7 @@ mod test {
     }
 
     impl CopyCapStore {
-        fn new(inner: Arc<dyn OSObjectStore>) -> Self {
+        fn new(inner: Arc<dyn StorageBackend>) -> Self {
             Self {
                 inner,
                 head_size_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -960,7 +962,18 @@ mod test {
     }
 
     #[async_trait]
-    impl OSObjectStore for CopyCapStore {
+    impl StorageBackend for CopyCapStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: lance_io::object_store::PaginatedListOptions,
+        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(lance_io::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -980,7 +993,7 @@ mod test {
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-            // `head()` is a default method on `ObjectStore` that delegates to
+            // `head()` on `dyn StorageBackend` delegates to
             // `get_opts(location, GetOptions { head: true, .. })`. To make a
             // staging file *appear* to be 14 GB without holding 14 GB in
             // memory, we override the size in the returned ObjectMeta here.
@@ -994,10 +1007,6 @@ mod test {
             self.inner.get_ranges(location, ranges).await
         }
 
-        // `head` and `delete` are default methods on `ObjectStore`, derived
-        // from `get_opts`/`delete_stream`. We override `head` indirectly by
-        // overriding `get_opts` below — it returns size based on the
-        // overrides table for the chosen path.
         fn delete_stream(
             &self,
             locations: BoxStream<'static, OSResult<Path>>,
@@ -1024,9 +1033,9 @@ mod test {
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             // Mimic S3's CopyObject 5 GB hard cap: read the (possibly-overridden)
             // size of the source via head() and reject if it crosses the cap.
-            let meta = self.head(from).await?;
+            let meta = (self as &dyn StorageBackend).head(from).await?;
             if meta.size >= S3_COPY_OBJECT_CAP_BYTES {
-                return Err(object_store::Error::Generic {
+                return Err(lance_io::object_store::Error::Generic {
                     store: "S3",
                     source: format!(
                         "EntityTooLarge: ProposedSize {} exceeds CopyObject 5GB cap",
@@ -1052,20 +1061,26 @@ mod test {
     /// our `CopyCapStore` wrapper rejects with the same `EntityTooLarge`
     /// error S3 returns in production.
     ///
-    /// The regression verifies that `copy_size_aware` falls back to the
+    /// The regression verifies that `ObjectStore::copy_with_size` falls back to the
     /// multipart-equivalent read+rewrite path instead of calling CopyObject.
     #[tokio::test]
     async fn manifest_commit_succeeds_when_staging_exceeds_5gb_copy_cap() {
-        let inner: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let inner = lance_io::object_store::backend::native::from_object_store(Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
         let capped = Arc::new(CopyCapStore::new(inner));
+        let mut lance_store = ObjectStore::memory();
+        lance_store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |_| capped.clone(),
+        ));
 
         // Write a small staging file, then lie about its size so the
         // CopyObject cap fires without holding 14 GB in memory.
         let base_path = Path::from("repro");
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
         let body = b"fake manifest body";
-        capped
-            .put(&staging_path, PutPayload::from_static(body))
+        lance_store
+            .put_payload(&staging_path, PutPayload::from_static(body))
             .await
             .expect("seed staging file");
         capped
@@ -1075,7 +1090,7 @@ mod test {
         // Spin up an ExternalManifestStore and drive `put` (the same code
         // path the failing CTAS hits via ExternalManifestCommitHandler).
         let external = TestExternalManifestStore::new();
-        let head_meta = capped.head(&staging_path).await.unwrap();
+        let head_meta = lance_store.stat(&staging_path).await.unwrap();
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
         // The fixture stores only a tiny body, so its source-size override must
         // also apply to the destination metadata. This keeps the fake object
@@ -1090,7 +1105,7 @@ mod test {
                 &staging_path,
                 head_meta.size,
                 head_meta.e_tag,
-                capped.as_ref(),
+                &lance_store,
                 ManifestNamingScheme::V2,
             )
             .await
@@ -1122,7 +1137,10 @@ mod test {
         assert_eq!(final_get.as_ref(), body);
         let staging_after = capped.inner.head(&staging_path).await;
         assert!(
-            matches!(staging_after, Err(object_store::Error::NotFound { .. })),
+            matches!(
+                staging_after,
+                Err(lance_io::object_store::Error::NotFound { .. })
+            ),
             "staging file must be cleaned up after commit, got: {:?}",
             staging_after
         );
@@ -1134,24 +1152,30 @@ mod test {
     /// regressed every commit to read+rewrite.
     #[tokio::test]
     async fn manifest_commit_uses_fast_copy_for_small_staging() {
-        let inner: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let inner = lance_io::object_store::backend::native::from_object_store(Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
         let capped = Arc::new(CopyCapStore::new(inner));
+        let mut lance_store = ObjectStore::memory();
+        lance_store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |_| capped.clone(),
+        ));
 
         let base_path = Path::from("repro");
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
-        capped
-            .put(
+        lance_store
+            .put_payload(
                 &staging_path,
                 PutPayload::from_static(b"small manifest body"),
             )
             .await
             .expect("seed staging file");
         // No size override — the staging file's real size is ~20 bytes,
-        // well below the 5 GB cap, so copy_size_aware must take the fast
+        // well below the 5 GB cap, so copy_with_size must take the fast
         // path.
 
         let external = TestExternalManifestStore::new();
-        let head_meta = capped.head(&staging_path).await.unwrap();
+        let head_meta = lance_store.stat(&staging_path).await.unwrap();
 
         external
             .put(
@@ -1160,7 +1184,7 @@ mod test {
                 &staging_path,
                 head_meta.size,
                 head_meta.e_tag,
-                capped.as_ref(),
+                &lance_store,
                 ManifestNamingScheme::V2,
             )
             .await

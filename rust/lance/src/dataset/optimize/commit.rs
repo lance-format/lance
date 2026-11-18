@@ -51,7 +51,7 @@ pub(super) async fn reserve_fragment_ids(
 
     let (manifest, _) = commit_transaction(
         dataset,
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),

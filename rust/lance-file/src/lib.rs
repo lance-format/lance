@@ -17,9 +17,9 @@ mod compatibility_tests;
 pub use io::LanceEncodingsIo;
 
 use format::MAGIC;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use version::ConcreteFileVersion;
 
 pub async fn determine_file_version(

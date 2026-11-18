@@ -1,7 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Extend [object_store::ObjectStore] functionalities
+//! Lance's runtime I/O boundary.
+//!
+//! ObjectStore integrations resolve authorized locations, credentials, and access
+//! policies through [`ObjectStoreProvider`], [`StorageOptionsProvider`], and
+//! [`WrappingObjectStore`]. Dataset and commit code use [`ObjectStore`] and
+//! Lance readers and writers instead of the provider's underlying store.
+//! Providers supply a [`StorageBackend`]. Wrappers intercept that same interface,
+//! including multipart uploads, conditional publication, and bulk operations.
+//! [`backend::native`] adapts existing `object_store` implementations at the edge.
+//! Paths, requests, metadata, payloads, and errors are Lance-owned values. The
+//! adapter converts them without exposing the native backend to consumers.
+//!
+//! Backend operations and conditional publication return [`Result`] so callers
+//! can distinguish conflicts, missing objects, and unsupported atomic operations.
+//! Reader/writer and directory conveniences return [`lance_core::Result`], mapping
+//! missing objects to core NotFound and other backend failures to core IO errors.
+//! Unsupported capabilities use [`Error::NotSupported`];
+//! authorization and other failures never trigger an unwrapped fallback.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -15,35 +32,31 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+use ::object_store::{ClientOptions, HeaderMap, HeaderValue};
 use ::tracing::{Span, field::Empty, instrument};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{FutureExt, Stream};
+use futures::Stream;
 use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::{parse_env_as_bool, str_is_truthy};
 use list_retry::ListRetryStream;
-use object_store::DynObjectStore;
-use object_store::ObjectStoreExt as OSObjectStoreExt;
-#[cfg(feature = "aws")]
-use object_store::aws::AwsCredentialProvider;
-use object_store::list::PaginatedListStore;
-#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{
-    ListResult, ObjectMeta, ObjectStore as OSObjectStore, PutMode, PutOptions, PutPayload,
-    path::Path,
-};
-use providers::local::FileStoreProvider;
-use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
 #[cfg(target_os = "linux")]
 use crate::uring::{UringCurrentThreadReader, UringReader};
+pub use lance_core::storage::{Error, Path, Result, path};
+mod types;
+pub use types::*;
+
+pub mod backend;
+pub use backend::StorageBackend;
+mod copy;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
@@ -70,13 +83,15 @@ pub mod storage_options;
 pub(crate) mod test_utils;
 pub mod throttle;
 mod tracing;
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub mod transport;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
 use crate::scheduler::{SCHEDULER_ERROR_MODE_STORAGE_OPTION, SchedulerErrorMode};
 use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
-use lance_core::{Error, Result};
+use lance_core::{Error as LanceError, Result as LanceResult};
 
 // Local disks tend to do fine with a few threads
 // Note: the number of threads here also impacts the number of files
@@ -109,9 +124,9 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
-/// Storage option that sets the registry-wide minimum prune threshold of the
-/// object store cache; see [`StorageOptions::object_store_cache_prune_threshold`].
-pub const OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION: &str = "object_store_cache_prune_threshold";
+/// ObjectStore option that sets the registry-wide minimum prune threshold of the
+/// object store cache; see [`StorageOptions::storage_cache_prune_threshold`].
+pub const STORAGE_CACHE_PRUNE_THRESHOLD_OPTION: &str = "object_store_cache_prune_threshold";
 
 #[derive(Debug)]
 struct StreamCopyError {
@@ -142,8 +157,8 @@ fn stream_copy_error(
     source_path: &Path,
     destination_path: &Path,
     source: impl std::error::Error + Send + Sync + 'static,
-) -> Error {
-    Error::io_source(Box::new(StreamCopyError {
+) -> LanceError {
+    LanceError::io_source(Box::new(StreamCopyError {
         stage,
         source_path: source_path.to_string(),
         destination_path: destination_path.to_string(),
@@ -151,7 +166,7 @@ fn stream_copy_error(
     }))
 }
 
-pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use providers::{BackendConfig, ObjectStoreProvider, ObjectStoreRegistry};
 pub use read_dir::ReadDirOptions;
 pub use storage_options::{
     BASE_SCOPED_OPTION_PREFIX, BaseScopedStorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
@@ -161,30 +176,15 @@ pub use storage_options::{
 };
 
 #[async_trait]
-pub trait ObjectStoreExt {
-    /// Returns true if the file exists.
-    async fn exists(&self, path: &Path) -> Result<bool>;
-
-    /// Read all files (start from base directory) recursively
-    ///
-    /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    fn read_dir_all<'a, 'b>(
-        &'a self,
-        dir_path: impl Into<&'b Path> + Send,
-        unmodified_since: Option<DateTime<Utc>>,
-    ) -> BoxStream<'a, Result<ObjectMeta>>;
-}
-
-#[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
-    fn directory_to_filesystem(&self, path: &Path) -> Result<PathBuf>;
-    async fn remove_dir_all(&self, path: &Path) -> Result<()>;
-    async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
+    fn directory_to_filesystem(&self, path: &Path) -> LanceResult<PathBuf>;
+    async fn remove_dir_all(&self, path: &Path) -> LanceResult<()>;
+    async fn canonicalize(&self, path: &Path) -> LanceResult<Option<PathBuf>>;
 }
 
 pub(crate) fn canonicalize_local_io_result(
     result: std::io::Result<PathBuf>,
-) -> Result<Option<PathBuf>> {
+) -> LanceResult<Option<PathBuf>> {
     match result {
         Ok(path) => Ok(Some(path)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -192,39 +192,22 @@ pub(crate) fn canonicalize_local_io_result(
     }
 }
 
-#[async_trait]
-impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
-    fn read_dir_all<'a, 'b>(
-        &'a self,
-        dir_path: impl Into<&'b Path> + Send,
-        unmodified_since: Option<DateTime<Utc>>,
-    ) -> BoxStream<'a, Result<ObjectMeta>> {
-        let output = self.list(Some(dir_path.into())).map_err(|e| e.into());
-        if let Some(unmodified_since_val) = unmodified_since {
-            output
-                .try_filter(move |file| future::ready(file.last_modified <= unmodified_since_val))
-                .boxed()
-        } else {
-            output.boxed()
-        }
-    }
-
-    async fn exists(&self, path: &Path) -> Result<bool> {
-        match self.head(path).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { path: _, source: _ }) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
+/// Native file IO is granted only by the built-in local provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum LocalIo {
+    #[default]
+    Backend,
+    Standard,
+    Uring,
 }
 
 struct ExternalBlobStore {
-    inner: Arc<dyn OSObjectStore>,
+    inner: Arc<dyn StorageBackend>,
     view: std::sync::Mutex<std::sync::Weak<ObjectStore>>,
 }
 
 impl ExternalBlobStore {
-    fn new(inner: Arc<dyn OSObjectStore>) -> Self {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
         Self {
             inner,
             view: Default::default(),
@@ -239,29 +222,39 @@ impl Clone for ExternalBlobStore {
     }
 }
 
-/// Wraps [ObjectStore](object_store::ObjectStore)
+/// A configured Lance I/O handle, including its provider and wrapper policies.
+///
+/// Keep this handle when accessing a resolved storage integration: reconstructing
+/// a store from its URI alone can discard credentials, scope, and cache identity.
 #[derive(Clone)]
 pub struct ObjectStore {
-    // Inner object store
-    pub inner: Arc<dyn OSObjectStore>,
+    /// Backend used by Lance readers, writers, and object operations.
+    /// Install policies through [`Self::apply_wrapper`] to also wrap external views and listing.
+    inner: Arc<dyn StorageBackend>,
+    has_wrappers: bool,
     // The same physical store with external-blob wrapping rules.
     external_blob_inner: Option<ExternalBlobStore>,
     // Keep the registry's weak binding alive while only an external view is held.
     _external_blob_origin: Option<Arc<Self>>,
-    direct_local_io: bool,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     // Whether local writes sync file data and directory entries before returning.
     local_fsync: bool,
+    // Enabled only by the built-in file provider, never by a URI alone.
+    direct_local_io: bool,
+    local_io: LocalIo,
+    is_local: bool,
+    is_remote: bool,
+    max_single_copy_size: Option<u64>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
     /// Whether to use constant size upload parts for multipart uploads. This
     /// is only necessary for Cloudflare R2.
-    pub use_constant_size_upload_parts: bool,
+    use_constant_size_upload_parts: bool,
     /// Whether we can assume that the list of files is lexically ordered. This
     /// is true for object stores, but not for local filesystems.
-    pub list_is_lexically_ordered: bool,
+    list_is_lexically_ordered: bool,
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
@@ -272,13 +265,10 @@ pub struct ObjectStore {
     /// The datastore prefix that uniquely identifies this object store. It encodes information
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
-    pub store_prefix: String,
-    /// The backend's paginated listing API, when it has one. `None` means
-    /// [`Self::read_dir_page`] has to list a directory in full to page through it.
-    pub(crate) paginated_lister: Option<Arc<dyn PaginatedListStore>>,
+    store_prefix: String,
 }
 
-// Hand-written because `PaginatedListStore` is not `Debug`.
+// Keep debug output focused on the configured binding.
 impl std::fmt::Debug for ObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectStore")
@@ -296,7 +286,6 @@ impl std::fmt::Debug for ObjectStore {
             .field("download_retry_count", &self.download_retry_count)
             .field("io_tracker", &self.io_tracker)
             .field("store_prefix", &self.store_prefix)
-            .field("paginated_lister", &self.paginated_lister.is_some())
             .finish()
     }
 }
@@ -317,12 +306,23 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
+/// Apply authorization, observation, or caching to Lance backend operations.
+///
+/// Wrappers operate on already-configured handles and must retain provider identity.
+/// Installing one disables direct local file reads and writes. Native directory
+/// maintenance retains the provider's path mapping and runs outside this wrapper.
+/// Pagination is part of the wrapped backend and must obey the same policy.
+/// Implement middleware directly against [`StorageBackend`].
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// Wrap an object store with additional functionality
     ///
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
-    fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+    fn wrap(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn StorageBackend>,
+    ) -> Arc<dyn StorageBackend>;
 
     /// Wrap a store used to read mutable, externally owned blob payloads.
     ///
@@ -334,105 +334,10 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap_external_blob(
         &self,
         _store_prefix: &str,
-        _original: Arc<dyn OSObjectStore>,
-        wrapped: Arc<dyn OSObjectStore>,
-    ) -> Arc<dyn OSObjectStore> {
+        _original: Arc<dyn StorageBackend>,
+        wrapped: Arc<dyn StorageBackend>,
+    ) -> Arc<dyn StorageBackend> {
         wrapped
-    }
-
-    /// Apply a wrapper to the regular and external views of one physical store.
-    /// Shared inputs are wrapped once. Chains preserve each component's policy.
-    #[doc(hidden)]
-    fn wrap_with_external_blobs(
-        &self,
-        store_prefix: &str,
-        original: Arc<dyn OSObjectStore>,
-        external: Arc<dyn OSObjectStore>,
-    ) -> (Arc<dyn OSObjectStore>, Arc<dyn OSObjectStore>) {
-        let wrapped = self.wrap(store_prefix, original.clone());
-        let external_wrapped = if Arc::ptr_eq(&original, &external) {
-            wrapped.clone()
-        } else {
-            self.wrap(store_prefix, external.clone())
-        };
-        let external = self.wrap_external_blob(store_prefix, external, external_wrapped);
-        (wrapped, external)
-    }
-
-    /// Wrap the paginated listing API that goes with the store, if it has one.
-    ///
-    /// [`ObjectStore::read_dir_page`] pushes the page size and the resume position into
-    /// [`PaginatedListStore`], which is a separate trait from [`OSObjectStore`] and so cannot
-    /// be reached through the store [`Self::wrap`] returns. A listing that is pushed down
-    /// therefore does not pass through [`Self::wrap`], and this is where a wrapper says what
-    /// should happen instead:
-    ///
-    /// - `Some(lister)` keeps the pushdown, wrapping the lister or handing back the one
-    ///   given. Right for a wrapper that observes rather than intercepts — metering, caching,
-    ///   mirroring writes.
-    /// - `None` gives up the pushdown, so listings go through [`Self::wrap`] as a full
-    ///   directory read. Right for a wrapper that hides, rewrites or fails paths, which a
-    ///   pushed-down listing would otherwise walk straight past.
-    ///
-    /// A wrapper that keeps the pushdown must leave the listing itself alone: setting
-    /// [`offset`](object_store::list::PaginatedListOptions::offset) or changing the delimiter
-    /// breaks paging, since `read_dir_page` reads one directory level and resumes by the token
-    /// it got back.
-    ///
-    /// There is deliberately no default: getting this wrong is either a silent loss of speed
-    /// or a silent loss of the wrapper, and neither announces itself.
-    fn wrap_paginated(
-        &self,
-        store_prefix: &str,
-        original: Arc<dyn PaginatedListStore>,
-    ) -> Option<Arc<dyn PaginatedListStore>>;
-}
-
-#[derive(Debug, Clone)]
-pub struct ChainedWrappingObjectStore {
-    wrappers: Vec<Arc<dyn WrappingObjectStore>>,
-}
-
-impl ChainedWrappingObjectStore {
-    pub fn new(wrappers: Vec<Arc<dyn WrappingObjectStore>>) -> Self {
-        Self { wrappers }
-    }
-
-    pub fn add_wrapper(&mut self, wrapper: Arc<dyn WrappingObjectStore>) {
-        self.wrappers.push(wrapper);
-    }
-}
-
-impl WrappingObjectStore for ChainedWrappingObjectStore {
-    fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
-        self.wrappers
-            .iter()
-            .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
-    }
-
-    fn wrap_with_external_blobs(
-        &self,
-        store_prefix: &str,
-        original: Arc<dyn OSObjectStore>,
-        external: Arc<dyn OSObjectStore>,
-    ) -> (Arc<dyn OSObjectStore>, Arc<dyn OSObjectStore>) {
-        self.wrappers
-            .iter()
-            .fold((original, external), |(original, external), wrapper| {
-                wrapper.wrap_with_external_blobs(store_prefix, original, external)
-            })
-    }
-
-    // One wrapper giving up the pushdown gives it up for the chain: the listing has to go
-    // through `wrap`, which is every wrapper in the chain at once.
-    fn wrap_paginated(
-        &self,
-        store_prefix: &str,
-        original: Arc<dyn PaginatedListStore>,
-    ) -> Option<Arc<dyn PaginatedListStore>> {
-        self.wrappers.iter().try_fold(original, |acc, wrapper| {
-            wrapper.wrap_paginated(store_prefix, acc)
-        })
     }
 }
 
@@ -441,31 +346,44 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
 #[derive(Debug, Clone)]
 pub struct ObjectStoreParams {
     pub block_size: Option<usize>,
-    #[deprecated(note = "Implement an ObjectStoreProvider instead")]
-    pub object_store: Option<(Arc<DynObjectStore>, Url)>,
-    /// Refresh offset for AWS credentials when using the legacy AWS credentials path.
+    /// Refresh offset for AWS credentials when using the built-in AWS SDK credential chain.
     /// For StorageOptionsAccessor, use `refresh_offset_millis` storage option instead.
     pub s3_credentials_refresh_offset: Duration,
-    #[cfg(feature = "aws")]
-    pub aws_credentials: Option<AwsCredentialProvider>,
-    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
-    /// The connector that native S3, GCS and Azure stores open their HTTP clients with.
+    /// Backend policies applied in order, before per-binding IO tracking.
+    pub backend_wrappers: Vec<Arc<dyn WrappingObjectStore>>,
+    /// Wrap or replace the configured HTTP client used by native S3, GCS and Azure.
     ///
-    /// Lance's own HTTP layers (the AIMD throttle and the metrics) wrap it, so it sees every
-    /// attempt object_store's retry loop makes, and the [`ClientOptions`] lance resolved from
-    /// the storage options. `None` is object_store's `ReqwestConnector`.
+    /// The supplied client already has the resolved timeout, proxy and TLS settings.
+    /// The wrapper sees every HTTP attempt, including retries. Lance's AIMD and
+    /// metrics layers remain outside it. `None` uses the configured default client.
     ///
-    /// object_store also opens its credential clients (IMDS, STS web identity, GCP metadata) with
-    /// it, while S3 bucket-region lookup and the GCS external-account token exchange open their
-    /// own clients and bypass it. Stores and AIMD state are shared only between params that hold
-    /// the same `Arc`, so reuse one connector for one bucket.
+    /// This also covers credential clients opened by these stores (IMDS, STS web
+    /// identity and GCP metadata). AWS SDK credential resolution, S3 region lookup
+    /// and GCS external-account token exchange open their own clients.
+    ///
+    /// Stores and AIMD state are shared only for the same wrapper allocation.
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-    pub http_connector: Option<Arc<dyn object_store::client::HttpConnector>>,
+    pub http_client_wrapper: Option<Arc<dyn transport::HttpClientWrapper>>,
     /// Unified storage options accessor with caching and automatic refresh
     ///
     /// Provides storage options and optionally a dynamic provider for automatic
     /// credential refresh. Use `StorageOptionsAccessor::with_static_options()` for static
     /// options or `StorageOptionsAccessor::with_initial_and_provider()` for dynamic refresh.
+    /// AWS providers return `aws_access_key_id`, `aws_secret_access_key`, and optionally
+    /// `aws_session_token`. Set `expires_at_millis` for expiring credentials and
+    /// `refresh_offset_millis` to control early refresh. The provider ID must distinguish
+    /// credential scopes: equal IDs share cached stores.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_io::object_store::{StorageOptionsAccessor, StorageOptionsProvider, ObjectStoreParams};
+    /// fn params(provider: Arc<dyn StorageOptionsProvider>) -> ObjectStoreParams {
+    ///     ObjectStoreParams {
+    ///         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_provider(provider))),
+    ///         ..Default::default()
+    ///     }
+    /// }
+    /// ```
     pub storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
     /// Use constant size upload parts for multipart uploads. Only necessary
     /// for Cloudflare R2, which doesn't support variable size parts. When this
@@ -477,16 +395,12 @@ pub struct ObjectStoreParams {
 
 impl Default for ObjectStoreParams {
     fn default() -> Self {
-        #[allow(deprecated)]
         Self {
-            object_store: None,
             block_size: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
-            #[cfg(feature = "aws")]
-            aws_credentials: None,
-            object_store_wrapper: None,
+            backend_wrappers: Vec::new(),
             #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-            http_connector: None,
+            http_client_wrapper: None,
             storage_options_accessor: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
@@ -511,7 +425,7 @@ impl ObjectStoreParams {
 
     /// The block size to use: the explicit `block_size` parameter, else the
     /// `block_size` storage option, else `None` for the store's default.
-    pub fn resolved_block_size(&self) -> Result<Option<usize>> {
+    pub fn resolved_block_size(&self) -> LanceResult<Option<usize>> {
         if self.block_size.is_some() {
             return Ok(self.block_size);
         }
@@ -521,13 +435,13 @@ impl ObjectStoreParams {
         }
     }
 
-    pub(crate) fn scheduler_error_mode(&self) -> Result<SchedulerErrorMode> {
+    pub(crate) fn scheduler_error_mode(&self) -> LanceResult<SchedulerErrorMode> {
         parse_scheduler_error_mode(self.storage_options())
     }
 
     /// Resolve these params for a single base path scope.
     ///
-    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// ObjectStore options may carry base-scoped entries (`base_<id>.<key>`) that
     /// apply only to one registered base path; see
     /// [`StorageOptionsAccessor::scoped_to_base`]. Returns the params unchanged
     /// when the storage options contain no base-scoped entries.
@@ -549,7 +463,7 @@ impl ObjectStoreParams {
 
 fn parse_scheduler_error_mode(
     storage_options: Option<&HashMap<String, String>>,
-) -> Result<SchedulerErrorMode> {
+) -> LanceResult<SchedulerErrorMode> {
     let value = storage_options.and_then(|options| {
         options
             .get(SCHEDULER_ERROR_MODE_STORAGE_OPTION)
@@ -571,25 +485,17 @@ fn allocation_ptr<T: ?Sized>(arc: &Arc<T>) -> *const () {
 
 // We implement hash for caching
 impl std::hash::Hash for ObjectStoreParams {
-    #[allow(deprecated)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // For hashing, we use pointer values for ObjectStore, S3 credentials, wrapper
+        // For hashing, we use pointer values for wrappers
         self.block_size.hash(state);
-        if let Some((store, url)) = &self.object_store {
-            Arc::as_ptr(store).hash(state);
-            url.hash(state);
-        }
         self.s3_credentials_refresh_offset.hash(state);
-        #[cfg(feature = "aws")]
-        if let Some(aws_credentials) = &self.aws_credentials {
-            Arc::as_ptr(aws_credentials).hash(state);
-        }
-        if let Some(wrapper) = &self.object_store_wrapper {
+        self.backend_wrappers.len().hash(state);
+        for wrapper in &self.backend_wrappers {
             allocation_ptr(wrapper).hash(state);
         }
         #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-        if let Some(connector) = &self.http_connector {
-            allocation_ptr(connector).hash(state);
+        if let Some(wrapper) = &self.http_client_wrapper {
+            allocation_ptr(wrapper).hash(state);
         }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
@@ -602,33 +508,23 @@ impl std::hash::Hash for ObjectStoreParams {
 // We implement eq for caching
 impl Eq for ObjectStoreParams {}
 impl PartialEq for ObjectStoreParams {
-    #[allow(deprecated)]
     fn eq(&self, other: &Self) -> bool {
-        #[cfg(feature = "aws")]
-        if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
-            return false;
-        }
         #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-        if self.http_connector.as_ref().map(allocation_ptr)
-            != other.http_connector.as_ref().map(allocation_ptr)
+        if self.http_client_wrapper.as_ref().map(allocation_ptr)
+            != other.http_client_wrapper.as_ref().map(allocation_ptr)
         {
             return false;
         }
 
-        // For equality, we use pointer comparison for ObjectStore, S3 credentials, wrapper
+        // For equality, we use pointer comparison for wrappers
         // For accessor, we use accessor_id() for semantic equality
         self.block_size == other.block_size
-            && self
-                .object_store
-                .as_ref()
-                .map(|(store, url)| (Arc::as_ptr(store), url))
-                == other
-                    .object_store
-                    .as_ref()
-                    .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.object_store_wrapper.as_ref().map(allocation_ptr)
-                == other.object_store_wrapper.as_ref().map(allocation_ptr)
+            && self
+                .backend_wrappers
+                .iter()
+                .map(allocation_ptr)
+                .eq(other.backend_wrappers.iter().map(allocation_ptr))
             && self
                 .storage_options_accessor
                 .as_ref()
@@ -662,7 +558,7 @@ impl PartialEq for ObjectStoreParams {
 /// # #[cfg(unix)]
 /// assert_eq!(url.scheme(), "file");
 /// ```
-pub fn uri_to_url(uri: &str) -> Result<Url> {
+pub fn uri_to_url(uri: &str) -> LanceResult<Url> {
     match Url::parse(uri) {
         Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
             // On Windows, the drive is parsed as a scheme
@@ -673,13 +569,13 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
     }
 }
 
-fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
+fn expand_path(str_path: impl AsRef<str>) -> LanceResult<std::path::PathBuf> {
     let str_path = str_path.as_ref();
     let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
         .map_err(|err| {
-            Error::invalid_input(format!(
+            LanceError::invalid_input(format!(
                 "Invalid table location: '{str_path}' could not be resolved to an absolute path: {err}"
             ))
         })?
@@ -711,16 +607,16 @@ fn expand_tilde_path(path: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-fn local_path_to_url(str_path: &str) -> Result<Url> {
+fn local_path_to_url(str_path: &str) -> LanceResult<Url> {
     let expanded_path = expand_path(str_path)?;
 
     Url::from_directory_path(expanded_path).map_err(|_| {
-        Error::invalid_input_source(format!("Invalid table location: '{}'", str_path).into())
+        LanceError::invalid_input_source(format!("Invalid table location: '{}'", str_path).into())
     })
 }
 
 #[cfg(feature = "huggingface")]
-fn parse_hf_repo_id(url: &Url) -> Result<String> {
+fn parse_hf_repo_id(url: &Url) -> LanceResult<String> {
     // Accept forms with repo type prefix (models/datasets/spaces) or legacy without.
     let mut segments: Vec<String> = Vec::new();
     if let Some(host) = url.host_str() {
@@ -734,7 +630,7 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
     );
 
     if segments.len() < 2 {
-        return Err(Error::invalid_input(
+        return Err(LanceError::invalid_input(
             "Huggingface URL must contain at least owner and repo",
         ));
     }
@@ -742,7 +638,7 @@ fn parse_hf_repo_id(url: &Url) -> Result<String> {
     let repo_type_candidates = ["models", "datasets", "spaces"];
     let (owner, repo_with_rev) = if repo_type_candidates.contains(&segments[0].as_str()) {
         if segments.len() < 3 {
-            return Err(Error::invalid_input(
+            return Err(LanceError::invalid_input(
                 "Huggingface URL missing owner/repo after repo type",
             ));
         }
@@ -766,7 +662,7 @@ impl ObjectStore {
     /// This uses the default [ObjectStoreRegistry] to find the object store. To
     /// allow for potential re-use of object store instances, it's recommended to
     /// create a shared [ObjectStoreRegistry] and pass that to [Self::from_uri_and_params].
-    pub async fn from_uri(uri: &str) -> Result<(Arc<Self>, Path)> {
+    pub async fn from_uri(uri: &str) -> LanceResult<(Arc<Self>, Path)> {
         let registry = Arc::new(ObjectStoreRegistry::default());
 
         Self::from_uri_and_params(registry, uri, &ObjectStoreParams::default()).await
@@ -779,7 +675,7 @@ impl ObjectStore {
         registry: Arc<ObjectStoreRegistry>,
         uri: &str,
         params: &ObjectStoreParams,
-    ) -> Result<(Arc<Self>, Path)> {
+    ) -> LanceResult<(Arc<Self>, Path)> {
         Self::from_uri_and_params_impl(registry, uri, params, true).await
     }
 
@@ -792,7 +688,7 @@ impl ObjectStore {
         registry: Arc<ObjectStoreRegistry>,
         uri: &str,
         params: &ObjectStoreParams,
-    ) -> Result<(Arc<Self>, Path)> {
+    ) -> LanceResult<(Arc<Self>, Path)> {
         Self::from_uri_and_params_impl(registry, uri, params, false).await
     }
 
@@ -801,55 +697,7 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
         use_registry_cache: bool,
-    ) -> Result<(Arc<Self>, Path)> {
-        #[allow(deprecated)]
-        if let Some((store, path)) = params.object_store.as_ref() {
-            let mut inner = store.clone();
-            let store_prefix =
-                registry.calculate_object_store_prefix(uri, params.storage_options())?;
-
-            let mut io_tracker = IOTracker::default();
-            meter_store(
-                &mut inner,
-                &mut io_tracker,
-                &metrics_base(&store_prefix, path),
-            );
-
-            let external_blob_inner = if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                let (wrapped, external) =
-                    wrapper.wrap_with_external_blobs(&store_prefix, inner.clone(), inner);
-                inner = wrapped;
-                Some(ExternalBlobStore::new(io_tracker.wrap("", external)))
-            } else {
-                None
-            };
-
-            // Always wrap with IO tracking
-            let tracked_store = io_tracker.wrap("", inner);
-
-            let store = Self {
-                inner: tracked_store,
-                external_blob_inner,
-                _external_blob_origin: None,
-                direct_local_io: false,
-                local_dir_operations: None,
-                local_fsync: false,
-                scheme: path.scheme().to_string(),
-                block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
-                max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-                use_constant_size_upload_parts: params.use_constant_size_upload_parts,
-                list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-                scheduler_error_mode: params.scheduler_error_mode()?,
-                io_tracker,
-                store_prefix,
-                // Type-erased on the way in, so there is no telling if it can paginate.
-                paginated_lister: None,
-            };
-            let path = Path::parse(path.path())?;
-            return Ok((Arc::new(store), path));
-        }
+    ) -> LanceResult<(Arc<Self>, Path)> {
         let url = uri_to_url(uri)?;
 
         let store = if use_registry_cache {
@@ -877,64 +725,52 @@ impl ObjectStore {
     /// # Returns
     ///
     /// The extracted path component
-    pub fn extract_path_from_uri(registry: Arc<ObjectStoreRegistry>, uri: &str) -> Result<Path> {
+    pub fn extract_path_from_uri(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+    ) -> LanceResult<Path> {
         let url = uri_to_url(uri)?;
-        let provider = registry
-            .get_provider(url.scheme())
-            .ok_or_else(|| Error::invalid_input(format!("Unknown scheme: {}", url.scheme())))?;
+        let provider = registry.get_provider(url.scheme()).ok_or_else(|| {
+            LanceError::invalid_input(format!("Unknown scheme: {}", url.scheme()))
+        })?;
         provider.extract_path(&url)
     }
 
-    #[deprecated(note = "Use `from_uri` instead")]
-    pub fn from_path(str_path: &str) -> Result<(Arc<Self>, Path)> {
-        Self::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
-            str_path,
-            &Default::default(),
-        )
-        .now_or_never()
-        .unwrap()
-    }
-
-    /// Local object store.
+    /// Build a fresh local handle using the registry's synchronous built-in assembly.
     pub fn local() -> Self {
-        let provider = FileStoreProvider;
-        provider
-            .new_store(Url::parse("file:///").unwrap(), &Default::default())
-            .now_or_never()
-            .unwrap()
-            .unwrap()
+        ObjectStoreRegistry::local()
     }
 
-    /// Create a in-memory object store directly for testing.
+    /// Build a fresh in-memory handle using the registry's synchronous built-in assembly.
     pub fn memory() -> Self {
-        let provider = MemoryStoreProvider;
-        provider
-            .new_store(Url::parse("memory:///").unwrap(), &Default::default())
-            .now_or_never()
-            .unwrap()
-            .unwrap()
+        ObjectStoreRegistry::memory()
     }
 
-    /// Returns true if the object store pointed to a local file system.
+    /// Whether the provider declares local directory and path-alias semantics.
+    /// This does not imply that native filesystem access is available.
     pub fn is_local(&self) -> bool {
-        self.scheme == "file" || self.scheme == "file+uring"
+        self.is_local
     }
 
-    /// Returns true when object paths directly encode absolute local filesystem paths.
+    /// Returns true when direct native access is allowed and paths encode absolute local filesystem paths.
     ///
     /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
-    /// their inner object-store implementation instead of direct filesystem access.
+    /// their backend implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
-        self.has_absolute_local_mapping() && self.is_local() && !self.has_wrapper()
+        self.direct_local_io && self.local_io != LocalIo::Backend && !self.has_io_wrapper()
     }
 
-    fn has_absolute_local_mapping(&self) -> bool {
-        self.direct_local_io && self.store_prefix == self.scheme
+    // Policy wrappers only intercept backend calls. Native file operations must
+    // not escape them, including external views whose wrapper state lives in
+    // the origin binding.
+    fn has_io_wrapper(&self) -> bool {
+        self.has_wrappers
     }
 
-    fn has_wrapper(&self) -> bool {
-        self.external_blob_inner.is_some() || self._external_blob_origin.is_some()
+    /// Whether local directory cleanup must enumerate backend entries before
+    /// removing subtrees. This is a provider choice, unaffected by wrappers.
+    pub fn uses_backend_directory_listing(&self) -> bool {
+        self.direct_local_io && matches!(self.local_io, LocalIo::Backend)
     }
 
     /// Canonicalize a local object path, resolving rooted and UNC stores through
@@ -946,19 +782,19 @@ impl ObjectStore {
     ///
     /// ```
     /// # use lance_core::Result;
-    /// # use lance_io::object_store::ObjectStore;
-    /// # use object_store::path::Path;
-    /// # async fn same_directory(store: &ObjectStore, a: &Path, b: &Path) -> Result<bool> {
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// #
+    /// # async fn same_directory(store: &ObjectStore, a: &Path, b: &Path) -> lance_core::Result<bool> {
     /// let a = store.canonicalize_local_path(a).await?;
     /// let b = store.canonicalize_local_path(b).await?;
     /// # Ok(a.is_some() && a == b)
     /// # }
     /// ```
-    pub async fn canonicalize_local_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+    pub async fn canonicalize_local_path(&self, path: &Path) -> LanceResult<Option<PathBuf>> {
         if let Some(local_dir_operations) = &self.local_dir_operations {
             return local_dir_operations.canonicalize(path).await;
         }
-        if self.has_absolute_local_mapping() {
+        if self.direct_local_io {
             return canonicalize_local_io_result(
                 tokio::fs::canonicalize(super::local::to_local_path(path)).await,
             );
@@ -967,10 +803,7 @@ impl ObjectStore {
     }
 
     pub fn is_cloud(&self) -> bool {
-        if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
-            return false;
-        }
-        true
+        self.is_remote
     }
 
     /// Whether this object store prefers the lite scheduler.
@@ -978,11 +811,40 @@ impl ObjectStore {
     /// The lite scheduler is designed for backends like io_uring where
     /// tasks should only be polled when the consumer polls them.
     pub fn prefers_lite_scheduler(&self) -> bool {
-        self.scheme == "file+uring" && self.has_direct_local_paths()
+        self.local_io == LocalIo::Uring
     }
 
     pub fn scheme(&self) -> &str {
         &self.scheme
+    }
+
+    /// Stable identity for cache keys; assigned by the provider and registry.
+    pub fn store_prefix(&self) -> &str {
+        &self.store_prefix
+    }
+
+    /// Whether multipart uploads require equally sized non-final parts.
+    pub fn use_constant_size_upload_parts(&self) -> bool {
+        self.use_constant_size_upload_parts
+    }
+
+    /// Whether backend listings are ordered lexically by path.
+    pub fn list_is_lexically_ordered(&self) -> bool {
+        self.list_is_lexically_ordered
+    }
+
+    /// Resolve a directory through the provider's local root mapping.
+    /// Returns None when the provider has no native directory mapping. Native
+    /// directory maintenance is independent of backend wrappers; this mapping
+    /// does not enable direct file reads or writes through a wrapper.
+    pub fn local_directory_path(&self, path: &Path) -> LanceResult<Option<PathBuf>> {
+        if !self.direct_local_io && self.local_dir_operations.is_none() {
+            return Ok(None);
+        }
+        match &self.local_dir_operations {
+            Some(operations) => operations.directory_to_filesystem(path).map(Some),
+            None => Ok(Some(super::local::to_local_path(path).into())),
+        }
     }
 
     pub fn block_size(&self) -> usize {
@@ -1015,6 +877,25 @@ impl ObjectStore {
             .max(1)
     }
 
+    /// Set the default I/O concurrency while retaining the configured backend and policies.
+    ///
+    /// Zero is rejected; the process-wide `LANCE_IO_THREADS` override still takes precedence.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// let storage = ObjectStore::memory().with_io_parallelism(4).unwrap();
+    /// assert!(ObjectStore::memory().with_io_parallelism(0).is_err());
+    /// ```
+    pub fn with_io_parallelism(mut self, parallelism: usize) -> LanceResult<Self> {
+        if parallelism == 0 {
+            return Err(LanceError::invalid_input(
+                "I/O parallelism must be greater than zero, got 0",
+            ));
+        }
+        self.io_parallelism = parallelism;
+        Ok(self)
+    }
+
     pub(crate) fn scheduler_error_mode(&self) -> SchedulerErrorMode {
         self.scheduler_error_mode
     }
@@ -1036,7 +917,7 @@ impl ObjectStore {
     /// # Examples
     ///
     /// ```
-    /// # use lance_io::object_store::ObjectStore;
+    /// # use lance_io::object_store::{ObjectStore, Path};
     /// # fn example(store: &ObjectStore) {
     /// let counter = store.counter("lance_example_items_total");
     /// counter.increment(1);
@@ -1074,11 +955,8 @@ impl ObjectStore {
         self.io_tracker.incremental_stats()
     }
 
-    /// Apply a [`WrappingObjectStore`] to both `inner` and `paginated_lister` together.
-    ///
-    /// Keeps both halves in sync: a wrapper returning `None` from
-    /// [`WrappingObjectStore::wrap_paginated`] clears the lister so that
-    /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
+    /// Add a policy to ordinary and external-blob operations, including pagination.
+    /// Existing wrappers and instrumentation retain their position in the chain.
     pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
         let external = self
             .external_blob_inner
@@ -1086,14 +964,26 @@ impl ObjectStore {
             .map(|external| &external.inner)
             .unwrap_or(&self.inner)
             .clone();
-        let (inner, external) =
-            wrapper.wrap_with_external_blobs(&self.store_prefix, self.inner.clone(), external);
+        let inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        let external_wrapped = if Arc::ptr_eq(&self.inner, &external) {
+            inner.clone()
+        } else {
+            wrapper.wrap(&self.store_prefix, external.clone())
+        };
+        let external = wrapper.wrap_external_blob(&self.store_prefix, external, external_wrapped);
         self.inner = inner;
+        self.has_wrappers = true;
         self.external_blob_inner = Some(ExternalBlobStore::new(external));
-        self.paginated_lister = self
-            .paginated_lister
-            .take()
-            .and_then(|lister| wrapper.wrap_paginated(&self.store_prefix, lister));
+    }
+
+    // Registry-created bindings track both views once, before any late wrappers.
+    fn track_io(&mut self) {
+        if let Some(external) = &mut self.external_blob_inner {
+            external.inner = self
+                .io_tracker
+                .wrap(&self.store_prefix, external.inner.clone());
+        }
+        self.inner = self.io_tracker.wrap(&self.store_prefix, self.inner.clone());
     }
 
     /// Derive an external-blob read view without reopening the provider.
@@ -1106,10 +996,10 @@ impl ObjectStore {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use lance_io::object_store::ObjectStore;
+    /// # use lance_io::object_store::{ObjectStore, Path};
     /// let store = Arc::new(ObjectStore::memory());
     /// let external = store.for_external_blobs();
-    /// assert_eq!(external.store_prefix, store.store_prefix);
+    /// assert_eq!(external.store_prefix(), store.store_prefix());
     /// ```
     pub fn for_external_blobs(self: &Arc<Self>) -> Arc<Self> {
         let Some(external) = self.external_blob_inner.as_ref() else {
@@ -1124,7 +1014,6 @@ impl ObjectStore {
         }
         let mut store = self.as_ref().clone();
         store.inner = external.inner.clone();
-        store.paginated_lister = None;
         store.external_blob_inner = None;
         store._external_blob_origin = Some(self.clone());
         let store = Arc::new(store);
@@ -1136,9 +1025,9 @@ impl ObjectStore {
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
-    pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
-        match self.scheme.as_str() {
-            "file" if self.has_direct_local_paths() => {
+    pub async fn open(&self, path: &Path) -> LanceResult<Box<dyn Reader>> {
+        match self.local_io {
+            LocalIo::Standard if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -1148,7 +1037,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" if self.has_direct_local_paths() => {
+            LocalIo::Uring if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1190,7 +1079,11 @@ impl ObjectStore {
     /// This size may either have been retrieved from a list operation or
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
-    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+    pub async fn open_with_size(
+        &self,
+        path: &Path,
+        known_size: usize,
+    ) -> LanceResult<Box<dyn Reader>> {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
@@ -1202,8 +1095,8 @@ impl ObjectStore {
             )));
         }
 
-        match self.scheme.as_str() {
-            "file" if self.has_direct_local_paths() => {
+        match self.local_io {
+            LocalIo::Standard if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -1213,7 +1106,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" if self.has_direct_local_paths() => {
+            LocalIo::Uring if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1257,8 +1150,8 @@ impl ObjectStore {
     /// This does not pin a version of a mutable large file across later reads.
     ///
     /// ```
-    /// # use lance_io::object_store::ObjectStore;
-    /// # use object_store::path::Path;
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// #
     /// # async fn example(store: &ObjectStore, path: &Path) -> lance_core::Result<()> {
     /// let reader = store.open_with_expected_size(path, 1024).await?;
     /// let bytes = reader.get_range(0..16).await?;
@@ -1269,7 +1162,7 @@ impl ObjectStore {
         &self,
         path: &Path,
         expected_size: u64,
-    ) -> Result<Box<dyn Reader>> {
+    ) -> LanceResult<Box<dyn Reader>> {
         if expected_size <= self.block_size as u64 {
             let reader = SmallReader::open_with_expected_size(
                 self.inner.clone(),
@@ -1282,12 +1175,12 @@ impl ObjectStore {
         }
         let actual_size = self.size(path).await?;
         if actual_size != expected_size {
-            return Err(Error::invalid_input(format!(
+            return Err(LanceError::invalid_input(format!(
                 "object at '{path}' has {actual_size} bytes, checkpoint expects {expected_size}"
             )));
         }
         let size = usize::try_from(actual_size).map_err(|_| {
-            Error::invalid_input(format!(
+            LanceError::invalid_input(format!(
                 "object at '{path}' is too large for this platform: {actual_size} bytes"
             ))
         })?;
@@ -1295,25 +1188,25 @@ impl ObjectStore {
     }
 
     /// Create an [ObjectWriter] from local [std::path::Path]
-    pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
-        let object_store = Self::local();
+    pub async fn create_local_writer(path: &std::path::Path) -> LanceResult<ObjectWriter> {
+        let storage = Self::local();
         let absolute_path = expand_path(path.to_string_lossy())?;
         let os_path = Path::from_absolute_path(absolute_path)?;
-        ObjectWriter::new(&object_store, &os_path).await
+        ObjectWriter::new(&storage, &os_path).await
     }
 
     /// Open an [Reader] from local [std::path::Path]
-    pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
-        let object_store = Self::local();
+    pub async fn open_local(path: &std::path::Path) -> LanceResult<Box<dyn Reader>> {
+        let storage = Self::local();
         let absolute_path = expand_path(path.to_string_lossy())?;
         let os_path = Path::from_absolute_path(absolute_path)?;
-        object_store.open(&os_path).await
+        storage.open(&os_path).await
     }
 
     /// Create a new file.
-    pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
-        match self.scheme.as_str() {
-            "file" if self.has_direct_local_paths() => {
+    pub async fn create(&self, path: &Path) -> LanceResult<Box<dyn Writer>> {
+        match self.local_io {
+            LocalIo::Standard if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
                 let parent = local_path
@@ -1338,7 +1231,7 @@ impl ObjectStore {
                     tempfile::NamedTempFile::new_in(parent)
                 })
                 .await
-                .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
+                .map_err(|e| LanceError::io(format!("spawn_blocking failed: {}", e)))??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
                 Ok(Box::new(
@@ -1355,28 +1248,74 @@ impl ObjectStore {
         }
     }
 
-    /// Read an object directly, preserving request and body errors separately.
-    pub async fn read_object(&self, path: &Path) -> object_store::Result<object_store::GetResult> {
+    /// Read an object with its metadata and a streaming body.
+    ///
+    /// The returned body may be consumed as bytes or as a stream. Requests pass
+    /// through the configured backend wrappers, including external blob policies.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path, Result};
+    /// # async fn example(storage: &ObjectStore, path: &Path) -> Result<()> {
+    /// let response = storage.read_object(path).await?;
+    /// let metadata = response.meta.clone();
+    /// let body = response.into_stream();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_object(
+        &self,
+        path: &Path,
+    ) -> crate::object_store::Result<crate::object_store::GetResult> {
         self.inner.get(path).await
     }
 
-    /// Publish a payload without buffering it through a Lance writer.
+    /// Begin a multipart upload through the configured backend policies.
+    ///
+    /// Completion publishes the object; callers must abort an unfinished upload.
+    pub async fn start_upload(
+        &self,
+        path: &Path,
+        options: PutMultipartOptions,
+    ) -> Result<Box<dyn backend::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    /// Publish a payload through the configured backend without collecting its chunks.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, PutPayload, Result};
+    /// # async fn example(storage: &ObjectStore) -> Result<()> {
+    /// let written = storage.put_payload(&"data".into(), PutPayload::from_static(b"data")).await?;
+    /// assert_eq!(written.size, 4);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn put_payload(
         &self,
         path: &Path,
         payload: PutPayload,
-    ) -> object_store::Result<WriteResult> {
-        self.put_payload_opts(path, payload, Default::default())
+    ) -> crate::object_store::Result<WriteResult> {
+        self.put_payload_opts(path, payload, PutOptions::default())
             .await
     }
 
-    /// Publish a payload with the caller's preconditions.
+    /// Publish a payload with backend preconditions, without adding staging or
+    /// fallback requests. Unsupported conditions are returned to the caller.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, PutMode, PutOptions, Result};
+    /// # async fn example(storage: &ObjectStore) -> Result<()> {
+    /// storage.put_payload_opts(&"manifest".into(), b"data".to_vec().into(),
+    ///     PutOptions { mode: PutMode::Create, ..Default::default() }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn put_payload_opts(
         &self,
         path: &Path,
         payload: PutPayload,
-        options: object_store::PutOptions,
-    ) -> object_store::Result<WriteResult> {
+        options: PutOptions,
+    ) -> crate::object_store::Result<WriteResult> {
         let size = payload.content_length();
         let result = self.inner.put_opts(path, payload, options).await?;
         Ok(WriteResult {
@@ -1385,41 +1324,8 @@ impl ObjectStore {
         })
     }
 
-    /// List objects with a single backend stream.
-    pub fn list_objects(
-        &self,
-        prefix: Option<&Path>,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    /// Read one byte range in a single backend request.
-    pub async fn read_range(&self, path: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
-        self.inner.get_range(path, range).await
-    }
-
-    /// Read metadata without fetching the object body.
-    pub async fn stat(&self, path: &Path) -> object_store::Result<ObjectMeta> {
-        self.inner.head(path).await
-    }
-
-    /// Rename an object using the provider's replacement semantics.
-    pub async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.rename(from, to).await
-    }
-
-    /// Publish by rename only if the destination is absent.
-    pub async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.rename_if_not_exists(from, to).await
-    }
-
-    /// Copy only if the destination is absent.
-    pub async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
     /// A helper function to create a file and write content to it.
-    pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
+    pub async fn put(&self, path: &Path, content: &[u8]) -> LanceResult<WriteResult> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
         Writer::shutdown(writer.as_mut()).await
@@ -1427,28 +1333,40 @@ impl ObjectStore {
 
     /// Atomically creates an object without replacing an existing object.
     ///
-    /// Local stores publish a uniquely named staging object with a conditional
-    /// rename. Other stores use their conditional create operation. Tencent COS
+    /// Native file access publishes a staging object with a conditional rename.
+    /// Object-backend access uses its conditional create operation. Tencent COS
     /// is rejected because it can silently ignore conditional create requests.
     ///
-    /// Returns [`object_store::Error::NotSupported`] without writing when the
-    /// backend cannot reliably provide put-if-absent semantics.
+    /// Returns [`crate::object_store::Error::NotSupported`] when the backend cannot
+    /// provide conditional publication. Staging cleanup is best effort.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// let written = store.put_if_absent(&"manifest".into(), b"data".to_vec().into()).await?;
+    /// assert_eq!(written.size, 4);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn put_if_absent(
         &self,
         path: &Path,
         content: PutPayload,
-    ) -> object_store::Result<()> {
+    ) -> crate::object_store::Result<WriteResult> {
         if self.scheme == "cos" {
-            return Err(object_store::Error::NotSupported {
-                source: "Tencent COS does not reliably enforce put-if-absent after bucket \
-                         versioning has ever been enabled"
-                    .into(),
+            return Err(crate::object_store::Error::NotSupported {
+                source: "Tencent COS cannot guarantee put-if-not-exists".into(),
             });
         }
-
-        if self.is_local() {
-            let name = format!("lance-io.staging.{}", uuid::Uuid::new_v4().simple());
-            let staging_path = path.parent().unwrap_or_default().join(name.as_str());
+        let size = content.content_length();
+        if !matches!(self.local_io, LocalIo::Backend) || self.local_dir_operations.is_some() {
+            // Preserve the parent's encoding and keep dotfile names out of the
+            // staging basename, which some local backends reserve.
+            let staging_name = format!("lance-io.staging.{}", uuid::Uuid::new_v4().simple());
+            let staging_path = path
+                .parent()
+                .unwrap_or_default()
+                .join(staging_name.as_str());
             self.inner.put(&staging_path, content).await?;
             let result = self.inner.rename_if_not_exists(&staging_path, path).await;
             if result.is_err()
@@ -1460,35 +1378,103 @@ impl ObjectStore {
                     error
                 );
             }
-            result
+            result.map(|()| WriteResult { size, e_tag: None })
         } else {
-            self.inner
-                .put_opts(
-                    path,
-                    content,
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map(|_| ())
+            self.put_payload_opts(
+                path,
+                content,
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
         }
+    }
+
+    /// Read object metadata through the configured provider and wrappers.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// let metadata = store.stat(&"data.lance".into()).await?;
+    /// assert_eq!(metadata.location.as_ref(), "data.lance");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn stat(&self, path: &Path) -> crate::object_store::Result<ObjectMeta> {
+        self.inner.head(path).await
+    }
+
+    /// Move an object, replacing the destination if it exists.
+    ///
+    /// Atomicity follows the backend; use [`Self::rename_if_not_exists`] when
+    /// publishing a new manifest without replacing a concurrent writer's object.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// store.rename(&"old".into(), &"new".into()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn rename(&self, from: &Path, to: &Path) -> crate::object_store::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    /// Publish `from` at `to` only if `to` does not exist.
+    ///
+    /// The backend must enforce the condition atomically or report that the
+    /// operation is unsupported. No existence check is used to emulate it.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// store.rename_if_not_exists(&"staging".into(), &"manifest".into()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn rename_if_not_exists(
+        &self,
+        from: &Path,
+        to: &Path,
+    ) -> crate::object_store::Result<()> {
+        self.inner.rename_if_not_exists(from, to).await
+    }
+
+    /// Copy without replacing an existing destination.
+    ///
+    /// The backend must enforce the condition atomically or return
+    /// [`Error::NotSupported`]. The caller owns any publication fallback.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// store.copy_if_not_exists(&"staging".into(), &"manifest".into()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn copy_if_not_exists(
+        &self,
+        from: &Path,
+        to: &Path,
+    ) -> crate::object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
     }
 
     /// Delete an object, including a local staging file hidden from normal listings.
     ///
     /// See [`Self::read_local_staging_files`] for an example of finding and removing
     /// old staging files after an interrupted write.
-    pub async fn delete(&self, path: &Path) -> Result<()> {
+    pub async fn delete(&self, path: &Path) -> LanceResult<()> {
         if let Some(local_path) = self.local_staging_path(path)? {
             // LocalFileSystem rejects its reserved staging names, even for deletion.
             let metrics = self.io_tracker.begin_io("delete");
             let result = tokio::fs::remove_file(&local_path).await.map_err(|error| {
                 if error.kind() == ErrorKind::NotFound {
-                    Error::not_found(path.to_string())
+                    LanceError::not_found(path.to_string())
                 } else {
-                    Error::io(format!(
+                    LanceError::io(format!(
                         "Failed to remove local staging file {}: {error}",
                         local_path.display()
                     ))
@@ -1501,24 +1487,33 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// AWS S3 and GCS reject a single-shot server-side copy whose source is
-    /// larger than this; such sources are streamed through a multipart write.
-    const MAX_SINGLE_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
-
-    pub async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        // S3 and GCS cap single-shot server-side copies at 5 GiB and object_store
-        // does not fall back to a multipart copy for larger sources
-        // (https://github.com/apache/arrow-rs-object-store/issues/563). Azure and
-        // other blob stores don't have this limit, so we only pay for the fallback
-        // (an extra size lookup) on S3 and GCS.
-        let multipart_copy_fallback = matches!(self.scheme.as_str(), "s3" | "s3+ddb" | "gs");
-        self.copy_impl(
-            from,
-            to,
-            multipart_copy_fallback,
-            Self::MAX_SINGLE_COPY_BYTES,
-        )
-        .await
+    /// Copy an object, streaming through multipart upload when it exceeds the
+    /// provider's single-request copy limit.
+    pub async fn copy(&self, from: &Path, to: &Path) -> LanceResult<()> {
+        if self.has_direct_local_paths() {
+            // Native filesystem copies bypass the writer's file and directory syncs.
+            if self.local_fsync {
+                self.copy_via_stream(from, self, to).await?;
+                return Ok(());
+            }
+            // Use std::fs::copy for local filesystem to support cross-filesystem copies
+            let metrics = self.io_tracker.begin_io("copy");
+            let result = super::local::copy_file(from, to);
+            metrics.record(&result, 0);
+            return result;
+        }
+        if let Some(max_single_copy) = self.max_single_copy_size {
+            // Reuse the reader for both the size lookup (a single cached HEAD)
+            // and the streamed copy, avoiding a separate HEAD request.
+            let reader = self.open(from).await?;
+            if reader.size().await? as u64 > max_single_copy {
+                let mut writer = self.create(to).await?;
+                writer.copy_from_reader(reader.as_ref()).await?;
+                Writer::shutdown(writer.as_mut()).await?;
+                return Ok(());
+            }
+        }
+        Ok(self.inner.copy(from, to).await?)
     }
 
     /// Copy an object using the policy for bulk file movement.
@@ -1531,9 +1526,9 @@ impl ObjectStore {
     ///
     /// ```no_run
     /// # use lance_core::Result;
-    /// # use lance_io::object_store::ObjectStore;
-    /// # use object_store::path::Path;
-    /// # async fn copy(source: &ObjectStore, destination: &ObjectStore) -> Result<()> {
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// #
+    /// # async fn copy(source: &ObjectStore, destination: &ObjectStore) -> lance_core::Result<()> {
     /// source
     ///     .copy_bulk(
     ///         &Path::from("staging/index.lance"),
@@ -1549,7 +1544,7 @@ impl ObjectStore {
         source_path: &Path,
         destination_store: &Self,
         destination_path: &Path,
-    ) -> Result<WriteResult> {
+    ) -> LanceResult<WriteResult> {
         self.copy_bulk_with_server_side_copy(
             source_path,
             destination_store,
@@ -1570,7 +1565,7 @@ impl ObjectStore {
         destination_store: &Self,
         destination_path: &Path,
         server_side_copy_enabled: bool,
-    ) -> Result<WriteResult> {
+    ) -> LanceResult<WriteResult> {
         if !server_side_copy_enabled || !self.can_server_side_copy_to(destination_store) {
             return self
                 .copy_via_stream(source_path, destination_store, destination_path)
@@ -1579,7 +1574,7 @@ impl ObjectStore {
 
         let source_size = self.size(source_path).await?;
         let result_size = usize::try_from(source_size).map_err(|source| {
-            Error::io(format!(
+            LanceError::io(format!(
                 "server-side copy source size conversion failed from {source_path} to \
                  {destination_path}: source_size={source_size}, error={source}"
             ))
@@ -1589,7 +1584,7 @@ impl ObjectStore {
             .await?;
         let destination_size = destination_store.size(destination_path).await?;
         if destination_size != source_size {
-            return Err(Error::io(format!(
+            return Err(LanceError::io(format!(
                 "server-side copy destination size mismatch from {source_path} to \
                  {destination_path}: source_size={source_size}, \
                  destination_size={destination_size}"
@@ -1621,9 +1616,9 @@ impl ObjectStore {
     ///
     /// ```no_run
     /// # use lance_core::Result;
-    /// # use lance_io::object_store::ObjectStore;
-    /// # use object_store::path::Path;
-    /// # async fn copy(source: &ObjectStore, destination: &ObjectStore) -> Result<()> {
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// #
+    /// # async fn copy(source: &ObjectStore, destination: &ObjectStore) -> lance_core::Result<()> {
     /// source
     ///     .copy_via_stream(
     ///         &Path::from("staging/index.lance"),
@@ -1658,7 +1653,7 @@ impl ObjectStore {
         source_path: &Path,
         destination_store: &Self,
         destination_path: &Path,
-    ) -> Result<WriteResult> {
+    ) -> LanceResult<WriteResult> {
         self.copy_via_stream_inner(source_path, destination_store, destination_path)
             .await
     }
@@ -1667,11 +1662,22 @@ impl ObjectStore {
     ///
     /// This uses the provider's native conditional copy. An existing destination
     /// with the same size is treated as a successful retry.
+    /// This only validates size; callers must ensure the destination belongs to
+    /// the same immutable file publication. Metadata commits requiring content
+    /// equality must use [`Self::copy_if_not_exists`] and verify conflicts.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// store.copy_if_not_exists_or_same_size(&"staging/data".into(), &"data".into()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn copy_if_not_exists_or_same_size(
         &self,
         source_path: &Path,
         destination_path: &Path,
-    ) -> Result<WriteResult> {
+    ) -> LanceResult<WriteResult> {
         let source_size = self.size(source_path).await?;
         match self
             .inner
@@ -1680,23 +1686,23 @@ impl ObjectStore {
         {
             Ok(()) => {}
             Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
+                crate::object_store::Error::AlreadyExists { .. }
+                | crate::object_store::Error::Precondition { .. },
             ) => {
                 let destination_size = self.size(destination_path).await?;
                 if source_size != destination_size {
-                    return Err(Error::io(format!(
+                    return Err(LanceError::io(format!(
                         "destination {destination_path} already exists with size \
                          {destination_size}, but source {source_path} has size {source_size}"
                     )));
                 }
             }
-            Err(error) => return Err(Error::io(error.to_string())),
+            Err(error) => return Err(LanceError::io(error.to_string())),
         }
 
         Ok(WriteResult {
             size: usize::try_from(source_size).map_err(|_| {
-                Error::io(format!(
+                LanceError::io(format!(
                     "source {source_path} size {source_size} does not fit in usize"
                 ))
             })?,
@@ -1709,7 +1715,7 @@ impl ObjectStore {
         source_path: &Path,
         destination_store: &Self,
         destination_path: &Path,
-    ) -> Result<WriteResult> {
+    ) -> LanceResult<WriteResult> {
         let started_at = Instant::now();
         if self.has_direct_local_paths()
             && destination_store.has_direct_local_paths()
@@ -1718,9 +1724,9 @@ impl ObjectStore {
             let source_size = std::fs::metadata(super::local::to_local_path(source_path))
                 .map_err(|source| {
                     let source = if source.kind() == std::io::ErrorKind::NotFound {
-                        Error::not_found(source_path.to_string())
+                        LanceError::not_found(source_path.to_string())
                     } else {
-                        Error::from(source)
+                        LanceError::from(source)
                     };
                     stream_copy_error("source metadata", source_path, destination_path, source)
                 })?
@@ -1763,7 +1769,7 @@ impl ObjectStore {
             Span::current().record("destination_size", destination_size);
             if destination_size != source_size as u64 {
                 Span::current().record("validation", "failed");
-                return Err(Error::io(format!(
+                return Err(LanceError::io(format!(
                     "multipart_stream_copy destination size mismatch from {source_path} to \
                      {destination_path}: source_size={source_size}, \
                      destination_size={destination_size}"
@@ -1813,7 +1819,7 @@ impl ObjectStore {
                 let expected_bytes = current_range.len();
                 if current_bytes.len() != expected_bytes {
                     Span::current().record("validation", "failed");
-                    return Err(Error::io(format!(
+                    return Err(LanceError::io(format!(
                         "multipart_stream_copy source range size mismatch from {source_path} to \
                          {destination_path}: range={current_range:?}, \
                          expected_bytes={expected_bytes}, actual_bytes={}",
@@ -1823,7 +1829,7 @@ impl ObjectStore {
                 bytes_transferred = bytes_transferred
                     .checked_add(current_bytes.len())
                     .ok_or_else(|| {
-                        Error::io(format!(
+                        LanceError::io(format!(
                             "multipart_stream_copy byte count overflow from {source_path} to \
                              {destination_path}"
                         ))
@@ -1870,7 +1876,7 @@ impl ObjectStore {
         })?;
         if write_result.size != source_size {
             Span::current().record("validation", "failed");
-            return Err(Error::io(format!(
+            return Err(LanceError::io(format!(
                 "multipart_stream_copy writer size mismatch from {source_path} to \
                  {destination_path}: source_size={source_size}, \
                  writer_size={}",
@@ -1893,7 +1899,7 @@ impl ObjectStore {
         Span::current().record("destination_size", destination_size);
         if destination_size != source_size as u64 {
             Span::current().record("validation", "failed");
-            return Err(Error::io(format!(
+            return Err(LanceError::io(format!(
                 "multipart_stream_copy destination size mismatch from {source_path} to \
                  {destination_path}: source_size={source_size}, \
                  destination_size={destination_size}"
@@ -1905,49 +1911,11 @@ impl ObjectStore {
         Ok(write_result)
     }
 
-    /// Copy `from` to `to`. When `multipart_copy_fallback` is set, a source
-    /// larger than `max_single_copy` is streamed through a multipart write
-    /// instead of a single-shot server-side copy. Both are parameters so tests
-    /// can drive the streaming path without a multi-gigabyte fixture or an S3
-    /// endpoint.
-    async fn copy_impl(
-        &self,
-        from: &Path,
-        to: &Path,
-        multipart_copy_fallback: bool,
-        max_single_copy: u64,
-    ) -> Result<()> {
-        if self.has_direct_local_paths() {
-            // Native filesystem copies bypass the writer's file and directory syncs.
-            if self.local_fsync {
-                self.copy_via_stream(from, self, to).await?;
-                return Ok(());
-            }
-            // Use std::fs::copy for local filesystem to support cross-filesystem copies
-            let metrics = self.io_tracker.begin_io("copy");
-            let result = super::local::copy_file(from, to);
-            metrics.record(&result, 0);
-            return result;
-        }
-        if multipart_copy_fallback {
-            // Reuse the reader for both the size lookup (a single cached HEAD)
-            // and the streamed copy, avoiding a separate HEAD request.
-            let reader = self.open(from).await?;
-            if reader.size().await? as u64 > max_single_copy {
-                let mut writer = self.create(to).await?;
-                writer.copy_from_reader(reader.as_ref()).await?;
-                Writer::shutdown(writer.as_mut()).await?;
-                return Ok(());
-            }
-        }
-        Ok(self.inner.copy(from, to).await?)
-    }
-
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
     ///
     /// This enumerates the whole prefix before it returns, however many children it holds.
     /// Use [`Self::read_dir_page`] to page through a directory instead.
-    pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
+    pub async fn read_dir(&self, dir_path: impl Into<Path>) -> LanceResult<Vec<String>> {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
         let output = self.inner.list_with_delimiter(Some(&path)).await?;
@@ -1965,8 +1933,27 @@ impl ObjectStore {
     /// only the immediate children of `prefix`: the child "directories" as
     /// [`ListResult::common_prefixes`] and the direct child files as
     /// [`ListResult::objects`].
-    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> LanceResult<ListResult> {
         Ok(self.inner.list_with_delimiter(prefix).await?)
+    }
+
+    /// List objects through the backend without adding retries or resuming a
+    /// failed stream. Provider-level retries still apply.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Result};
+    /// # use futures::TryStreamExt;
+    /// # async fn example(storage: &ObjectStore) -> Result<()> {
+    /// let objects = storage.list_objects(Some(&"versions".into()))
+    ///     .try_collect::<Vec<_>>().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn list_objects(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, crate::object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
     }
 
     /// List objects recursively. On unordered stores, a retryable failure after
@@ -1975,12 +1962,38 @@ impl ObjectStore {
     pub fn list(
         &self,
         path: Option<Path>,
-    ) -> Pin<Box<dyn Stream<Item = Result<ObjectMeta>> + Send>> {
+    ) -> Pin<Box<dyn Stream<Item = LanceResult<ObjectMeta>> + Send>> {
         Box::pin(
             ListRetryStream::new(self.inner.clone(), path, 5)
                 .with_lexical_ordering(self.list_is_lexically_ordered)
                 .map(|m| m.map_err(|e| e.into())),
         )
+    }
+
+    /// List objects lexically after `offset`, preserving the provider's native
+    /// start-after optimization when available.
+    ///
+    /// This filters keys, not continuation tokens. It makes no ordering
+    /// guarantee beyond [`Self::list_is_lexically_ordered`].
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # use futures::TryStreamExt;
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// let objects = store.list_with_offset(Some(&"versions".into()), &"versions/d".into())
+    ///     .try_collect::<Vec<_>>().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'_, LanceResult<ObjectMeta>> {
+        self.inner
+            .list_with_offset(prefix, offset)
+            .map_err(LanceError::from)
+            .boxed()
     }
 
     /// Read all files (start from base directory) recursively
@@ -1990,12 +2003,25 @@ impl ObjectStore {
         &'a self,
         dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> BoxStream<'a, Result<ObjectMeta>> {
-        self.inner.read_dir_all(dir_path, unmodified_since)
+    ) -> BoxStream<'a, LanceResult<ObjectMeta>> {
+        let output = self
+            .inner
+            .list(Some(dir_path.into()))
+            .map_err(LanceError::from);
+        if let Some(cutoff) = unmodified_since {
+            output
+                .try_filter(move |file| future::ready(file.last_modified <= cutoff))
+                .boxed()
+        } else {
+            output.boxed()
+        }
     }
 
     /// Remove a directory recursively.
-    pub async fn remove_dir_all(&self, dir_path: impl Into<Path>) -> Result<()> {
+    ///
+    /// Native local stores also remove materialized directories through the
+    /// provider's path mapping, independently of backend wrappers.
+    pub async fn remove_dir_all(&self, dir_path: impl Into<Path>) -> LanceResult<()> {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
@@ -2005,7 +2031,7 @@ impl ObjectStore {
             metrics.record(&result, 0);
             return result;
         }
-        if self.has_absolute_local_mapping() && self.is_local() {
+        if self.direct_local_io && self.local_io != LocalIo::Backend {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
@@ -2040,7 +2066,7 @@ impl ObjectStore {
         for location in deferred {
             self.inner.delete(&location).await?;
         }
-        if self.has_absolute_local_mapping() && self.scheme == "file-object-store" {
+        if self.direct_local_io {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
             return super::local::remove_dir_all(&path);
@@ -2060,8 +2086,8 @@ impl ObjectStore {
     /// # use std::collections::HashSet;
     /// # use chrono::Utc;
     /// # use lance_core::Result;
-    /// # use lance_io::object_store::ObjectStore;
-    /// # async fn remove_stale_index_dirs(store: &ObjectStore) -> Result<()> {
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn remove_stale_index_dirs(store: &ObjectStore) -> lance_core::Result<()> {
     /// store
     ///     .remove_empty_dirs(
     ///         "dataset/_indices",
@@ -2079,8 +2105,8 @@ impl ObjectStore {
         retained_dirs: HashSet<Path>,
         verified_dirs: HashSet<Path>,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        if !self.has_absolute_local_mapping() {
+    ) -> LanceResult<()> {
+        if !self.direct_local_io {
             return Ok(());
         }
 
@@ -2090,7 +2116,7 @@ impl ObjectStore {
             super::local::remove_empty_dirs(&path, &retained_dirs, &verified_dirs, unmodified_since)
         })
         .await
-        .map_err(|error| Error::io(format!("empty-directory cleanup task failed: {error}")))?;
+        .map_err(|error| LanceError::io(format!("empty-directory cleanup task failed: {error}")))?;
         metrics.record(&result, 0);
         result
     }
@@ -2101,7 +2127,7 @@ impl ObjectStore {
     /// which is days for a table with millions of unreferenced files.
     ///
     /// `ObjectStore::delete_stream` would also batch (S3: 1000 keys per request) but
-    /// needs a `'static` stream of `object_store::Result`; callers pass a borrowed
+    /// needs a `'static` stream of `crate::object_store::Result`; callers pass a borrowed
     /// stream of `lance_core::Result`. Using it means changing this signature.
     ///
     /// Order is not preserved; no caller may depend on it.
@@ -2111,8 +2137,8 @@ impl ObjectStore {
     /// between; failing there would abandon an entire sweep over one absent object.
     pub fn remove_stream<'a>(
         &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
+        locations: BoxStream<'a, LanceResult<Path>>,
+    ) -> BoxStream<'a, LanceResult<Path>> {
         let store = Arc::clone(&self.inner);
         locations
             .map(move |location| {
@@ -2121,7 +2147,7 @@ impl ObjectStore {
                     let location = location?;
                     match store.delete(&location).await {
                         Ok(()) => Ok(location),
-                        Err(object_store::Error::NotFound { .. }) => Ok(location),
+                        Err(crate::object_store::Error::NotFound { .. }) => Ok(location),
                         Err(error) => Err(error.into()),
                     }
                 }
@@ -2131,52 +2157,50 @@ impl ObjectStore {
     }
 
     /// Check a file exists.
-    pub async fn exists(&self, path: &Path) -> Result<bool> {
+    pub async fn exists(&self, path: &Path) -> LanceResult<bool> {
         match self.inner.head(path).await {
             Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { path: _, source: _ }) => Ok(false),
+            Err(crate::object_store::Error::NotFound { path: _, source: _ }) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
 
     /// Get file size.
-    pub async fn size(&self, path: &Path) -> Result<u64> {
+    pub async fn size(&self, path: &Path) -> LanceResult<u64> {
         Ok(self.inner.head(path).await?.size)
     }
 
     /// Convenience function to open a reader and read all the bytes
-    pub async fn read_one_all(&self, path: &Path) -> Result<Bytes> {
+    pub async fn read_one_all(&self, path: &Path) -> LanceResult<Bytes> {
         let reader = self.open(path).await?;
         Ok(reader.get_all().await?)
+    }
+
+    /// Read a byte range directly from the configured store.
+    ///
+    /// This preserves the backend's range response, including a shorter body
+    /// when an object has shrunk since its size was observed. Manifest readers
+    /// use that response to detect stale size hints and retry their metadata
+    /// lookup. The range uses 64-bit object offsets without opening a Reader.
+    ///
+    /// ```
+    /// # use lance_io::object_store::{ObjectStore, Path};
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// let header = store.read_range(&"manifest".into(), 0..16).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_range(&self, path: &Path, range: Range<u64>) -> LanceResult<Bytes> {
+        Ok(self.inner.get_range(path, range).await?)
     }
 
     /// Convenience function open a reader and make a single request
     ///
     /// If you will be making multiple requests to the path it is more efficient to call [`Self::open`]
     /// and then call [`Reader::get_range`] multiple times.
-    pub async fn read_one_range(&self, path: &Path, range: Range<usize>) -> Result<Bytes> {
+    pub async fn read_one_range(&self, path: &Path, range: Range<usize>) -> LanceResult<Bytes> {
         let reader = self.open(path).await?;
         Ok(reader.get_range(range).await?)
-    }
-}
-
-/// Options that can be set for multiple object stores
-#[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
-pub enum LanceConfigKey {
-    /// Number of times to retry a download that fails
-    DownloadRetryCount,
-}
-
-impl FromStr for LanceConfigKey {
-    type Err = Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "download_retry_count" => Ok(Self::DownloadRetryCount),
-            _ => Err(Error::invalid_input_source(
-                format!("Invalid LanceConfigKey: {}", s).into(),
-            )),
-        }
     }
 }
 
@@ -2272,7 +2296,7 @@ impl StorageOptions {
 
     /// Byte gap below which the I/O scheduler merges two reads of one file
     /// into a single request, overriding the store's default.
-    pub fn block_size(&self) -> Result<Option<usize>> {
+    pub fn block_size(&self) -> LanceResult<Option<usize>> {
         let Some((_, value)) = self
             .0
             .iter()
@@ -2281,7 +2305,7 @@ impl StorageOptions {
             return Ok(None);
         };
         let block_size = value.trim().parse::<usize>().map_err(|err| {
-            Error::invalid_input(format!(
+            LanceError::invalid_input(format!(
                 "storage option block_size must be a number of bytes, got `{value}`: {err}"
             ))
         })?;
@@ -2291,17 +2315,17 @@ impl StorageOptions {
     /// Minimum cache size at which the session's object store registry sweeps
     /// out entries whose store is no longer in use; `0` disables the sweep.
     /// See [`ObjectStoreRegistry::get_store()`].
-    pub fn object_store_cache_prune_threshold(&self) -> Result<Option<usize>> {
+    pub fn storage_cache_prune_threshold(&self) -> LanceResult<Option<usize>> {
         let Some((_, value)) = self
             .0
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION))
+            .find(|(key, _)| key.eq_ignore_ascii_case(STORAGE_CACHE_PRUNE_THRESHOLD_OPTION))
         else {
             return Ok(None);
         };
         let threshold = value.trim().parse::<usize>().map_err(|err| {
-            Error::invalid_input(format!(
-                "storage option {OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION} must be a \
+            LanceError::invalid_input(format!(
+                "storage option {STORAGE_CACHE_PRUNE_THRESHOLD_OPTION} must be a \
                  non-negative integer, got `{value}`: {err}"
             ))
         })?;
@@ -2309,7 +2333,7 @@ impl StorageOptions {
     }
 
     /// Whether local writes must sync files and directory entries before returning.
-    pub(crate) fn local_fsync(&self) -> Result<bool> {
+    pub(crate) fn local_fsync(&self) -> LanceResult<bool> {
         let Some((_, value)) = self
             .0
             .iter()
@@ -2320,7 +2344,7 @@ impl StorageOptions {
         match value.trim().to_ascii_lowercase().as_str() {
             "true" => Ok(true),
             "false" => Ok(false),
-            _ => Err(Error::invalid_input(format!(
+            _ => Err(LanceError::invalid_input(format!(
                 "storage option local_fsync must be `true` or `false`, got `{value}`"
             ))),
         }
@@ -2365,17 +2389,21 @@ impl StorageOptions {
     ///
     /// Returns an error if any `headers.*` key has an invalid header name or value.
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-    pub fn client_options(&self) -> Result<ClientOptions> {
+    fn client_options(&self) -> LanceResult<ClientOptions> {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.0 {
             if let Some(header_name) = key.strip_prefix("headers.") {
                 let name = header_name
                     .parse::<http::header::HeaderName>()
                     .map_err(|e| {
-                        Error::invalid_input(format!("invalid header name '{header_name}': {e}"))
+                        LanceError::invalid_input(format!(
+                            "invalid header name '{header_name}': {e}"
+                        ))
                     })?;
                 let val = HeaderValue::from_str(value).map_err(|e| {
-                    Error::invalid_input(format!("invalid header value for '{header_name}': {e}"))
+                    LanceError::invalid_input(format!(
+                        "invalid header value for '{header_name}': {e}"
+                    ))
                 })?;
                 headers.insert(name, val);
             }
@@ -2398,193 +2426,6 @@ impl StorageOptions {
 impl From<HashMap<String, String>> for StorageOptions {
     fn from(value: HashMap<String, String>) -> Self {
         Self::new(value)
-    }
-}
-
-static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
-    std::sync::LazyLock::new(ObjectStoreRegistry::default);
-
-impl ObjectStore {
-    /// Wrap an object store implementation with Lance I/O behavior.
-    ///
-    /// `storage_options` may contain `scheduler_error_mode`. Valid values are
-    /// `best_effort` and `fail_fast`. Because this legacy constructor is
-    /// infallible, an invalid value is logged and falls back to `best_effort`.
-    /// Use [`Self::try_new`] when invalid storage options must be rejected.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        store: Arc<DynObjectStore>,
-        location: Url,
-        block_size: Option<usize>,
-        wrapper: Option<Arc<dyn WrappingObjectStore>>,
-        use_constant_size_upload_parts: bool,
-        list_is_lexically_ordered: bool,
-        io_parallelism: usize,
-        download_retry_count: usize,
-        storage_options: Option<&HashMap<String, String>>,
-    ) -> Self {
-        let scheduler_error_mode = match parse_scheduler_error_mode(storage_options) {
-            Ok(mode) => mode,
-            Err(error) => {
-                log::warn!(
-                    "{error}; ObjectStore::new is falling back to best_effort. Use ObjectStore::try_new to reject invalid storage options"
-                );
-                SchedulerErrorMode::BestEffort
-            }
-        };
-        let store_prefix = Self::direct_store_prefix(&location, storage_options).unwrap();
-        Self::new_with_scheduler_error_mode(
-            store,
-            location,
-            block_size,
-            wrapper,
-            use_constant_size_upload_parts,
-            list_is_lexically_ordered,
-            io_parallelism,
-            download_retry_count,
-            scheduler_error_mode,
-            store_prefix,
-        )
-    }
-
-    /// Wrap an object store implementation and validate Lance storage options.
-    ///
-    /// This is the fallible counterpart to [`Self::new`]. Custom object-store
-    /// providers may use it to reject an invalid `scheduler_error_mode` before
-    /// returning a store. A store returned through [`ObjectStoreRegistry`] is
-    /// validated by the registry independently of which constructor its provider
-    /// uses.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::{collections::HashMap, sync::Arc};
-    ///
-    /// use lance_io::object_store::ObjectStore;
-    /// use object_store::memory::InMemory;
-    /// use url::Url;
-    ///
-    /// # fn build_store() -> lance_core::Result<()> {
-    /// let storage_options = HashMap::from([(
-    ///     "scheduler_error_mode".to_string(),
-    ///     "fail_fast".to_string(),
-    /// )]);
-    /// let _store = ObjectStore::try_new(
-    ///     Arc::new(InMemory::new()),
-    ///     Url::parse("memory:///").expect("valid memory URL"),
-    ///     None,
-    ///     None,
-    ///     false,
-    ///     true,
-    ///     64,
-    ///     3,
-    ///     Some(&storage_options),
-    /// )?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        store: Arc<DynObjectStore>,
-        location: Url,
-        block_size: Option<usize>,
-        wrapper: Option<Arc<dyn WrappingObjectStore>>,
-        use_constant_size_upload_parts: bool,
-        list_is_lexically_ordered: bool,
-        io_parallelism: usize,
-        download_retry_count: usize,
-        storage_options: Option<&HashMap<String, String>>,
-    ) -> Result<Self> {
-        let scheduler_error_mode = parse_scheduler_error_mode(storage_options)?;
-        let store_prefix = Self::direct_store_prefix(&location, storage_options)?;
-        Ok(Self::new_with_scheduler_error_mode(
-            store,
-            location,
-            block_size,
-            wrapper,
-            use_constant_size_upload_parts,
-            list_is_lexically_ordered,
-            io_parallelism,
-            download_retry_count,
-            scheduler_error_mode,
-            store_prefix,
-        ))
-    }
-
-    fn direct_store_prefix(
-        location: &Url,
-        storage_options: Option<&HashMap<String, String>>,
-    ) -> Result<String> {
-        match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(location.scheme()) {
-            Some(provider) => provider.calculate_object_store_prefix(location, storage_options),
-            None => {
-                let store_prefix = format!("{}${}", location.scheme(), location.authority());
-                log::warn!(
-                    "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
-                    store_prefix
-                );
-                Ok(store_prefix)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_scheduler_error_mode(
-        mut store: Arc<DynObjectStore>,
-        location: Url,
-        block_size: Option<usize>,
-        wrapper: Option<Arc<dyn WrappingObjectStore>>,
-        use_constant_size_upload_parts: bool,
-        list_is_lexically_ordered: bool,
-        io_parallelism: usize,
-        download_retry_count: usize,
-        scheduler_error_mode: SchedulerErrorMode,
-        store_prefix: String,
-    ) -> Self {
-        let scheme = location.scheme();
-        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
-        let mut io_tracker = IOTracker::default();
-        meter_store(
-            &mut store,
-            &mut io_tracker,
-            &metrics_base(&store_prefix, &location),
-        );
-
-        let (store, external_blob_inner) = match wrapper {
-            Some(wrapper) => {
-                let (store, external) =
-                    wrapper.wrap_with_external_blobs(&store_prefix, store.clone(), store);
-                (
-                    store,
-                    Some(ExternalBlobStore::new(io_tracker.wrap("", external))),
-                )
-            }
-            None => (store, None),
-        };
-
-        // Always wrap with IO tracking
-        let tracked_store = io_tracker.wrap("", store);
-
-        Self {
-            inner: tracked_store,
-            external_blob_inner,
-            _external_blob_origin: None,
-            direct_local_io: false,
-            local_dir_operations: None,
-            local_fsync: false,
-            scheme: scheme.into(),
-            block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-            use_constant_size_upload_parts,
-            list_is_lexically_ordered,
-            io_parallelism,
-            download_retry_count,
-            scheduler_error_mode,
-            io_tracker,
-            store_prefix,
-            // Type-erased on the way in, so there is no telling if it can paginate.
-            paginated_lister: None,
-        }
     }
 }
 
@@ -2623,14 +2464,14 @@ impl StoreCounter {
 /// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
 /// through here, or through nothing at all.
 #[cfg(feature = "metrics")]
-fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, base: &str) {
-    use crate::object_store::metrics::ObjectStoreMetricsExt;
+fn meter_store(inner: &mut Arc<dyn StorageBackend>, io_tracker: &mut IOTracker, base: &str) {
+    use crate::object_store::metrics::StorageBackendMetricsExt;
     io_tracker.set_metrics_base(base);
     *inner = inner.clone().metered(base.to_owned());
 }
 
 #[cfg(not(feature = "metrics"))]
-fn meter_store(_inner: &mut Arc<dyn OSObjectStore>, _io_tracker: &mut IOTracker, _base: &str) {}
+fn meter_store(_inner: &mut Arc<dyn StorageBackend>, _io_tracker: &mut IOTracker, _base: &str) {}
 
 /// The `base` metrics label for a store opened at `location`; see
 /// [`metrics::metrics_base`]. Without the `metrics` feature the label is unused
@@ -2645,31 +2486,23 @@ pub(crate) fn metrics_base(store_prefix: &str, _location: &Url) -> String {
     store_prefix.to_owned()
 }
 
-fn infer_block_size(scheme: &str) -> usize {
-    // Block size: On local file systems, we use 4KB block size. On cloud
-    // object stores, we use 64KB block size. This is generally the largest
-    // block size where we don't see a latency penalty.
-    match scheme {
-        "file" => 4 * 1024,
-        _ => 64 * 1024,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::object_store::Result as OSResult;
+    use futures::FutureExt;
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     #[test]
-    fn test_params_with_different_http_connectors_are_not_shared() {
-        use crate::object_store::test_utils::RecordingConnector;
+    fn test_params_with_different_http_client_wrappers_are_not_shared() {
+        use crate::object_store::test_utils::RecordingHttpClientWrapper;
         use std::hash::{BuildHasher, RandomState};
 
-        let one: Arc<dyn object_store::client::HttpConnector> =
-            Arc::new(RecordingConnector::default());
-        let other: Arc<dyn object_store::client::HttpConnector> =
-            Arc::new(RecordingConnector::default());
-        let with = |connector: &Arc<dyn object_store::client::HttpConnector>| ObjectStoreParams {
-            http_connector: Some(connector.clone()),
+        let one: Arc<dyn transport::HttpClientWrapper> =
+            Arc::new(RecordingHttpClientWrapper::default());
+        let other: Arc<dyn transport::HttpClientWrapper> =
+            Arc::new(RecordingHttpClientWrapper::default());
+        let with = |wrapper: &Arc<dyn transport::HttpClientWrapper>| ObjectStoreParams {
+            http_client_wrapper: Some(wrapper.clone()),
             ..Default::default()
         };
         let hasher = RandomState::new();
@@ -2679,14 +2512,11 @@ mod tests {
         assert_ne!(with(&one), ObjectStoreParams::default());
     }
     use super::*;
+    use crate::object_store::backend::MultipartUpload;
     use async_trait::async_trait;
     use bytes::Bytes;
     use lance_core::utils::tempfile::{TempStdDir, TempStdFile, TempStrDir};
     use object_store::memory::InMemory;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
-    };
     use rstest::rstest;
     use serial_test::serial;
     use std::env::set_current_dir;
@@ -2694,7 +2524,7 @@ mod tests {
     use std::fs::{create_dir_all, write};
     use std::ops::Range;
     use std::path::Path as StdPath;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_canonicalize_local_io_result() {
@@ -2713,7 +2543,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
         )))
         .unwrap_err();
-        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(matches!(error, LanceError::IO { .. }), "{error:?}");
     }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -2774,7 +2604,7 @@ mod tests {
         write(path, contents)
     }
 
-    async fn read_from_store(store: &ObjectStore, path: &Path) -> Result<String> {
+    async fn read_from_store(store: &ObjectStore, path: &Path) -> LanceResult<String> {
         let test_file_store = store.open(path).await.unwrap();
         let size = test_file_store.size().await.unwrap();
         let bytes = test_file_store.get_range(0..size).await.unwrap();
@@ -2782,29 +2612,51 @@ mod tests {
         Ok(contents)
     }
 
+    #[rstest]
+    #[case::memory("memory")]
+    #[case::local("file")]
+    #[case::local_storage("file-object-store")]
     #[tokio::test]
-    async fn test_put_if_absent() {
-        let temp_dir = TempStrDir::default();
-        let parent = Path::from(temp_dir.as_str()).join("目录");
-        let basename = format!(".{}", "x".repeat(240));
-        let path = parent.join(basename.as_str());
-        let store = ObjectStore::local();
-        store
+    async fn test_put_if_absent(#[case] scheme: &str) {
+        let directory = TempStdDir::default();
+        let (store, base) = if scheme == "memory" {
+            (Arc::new(ObjectStore::memory()), Path::from("dataset"))
+        } else {
+            let file_url = Url::from_directory_path(&directory).unwrap();
+            let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+            url.set_path(file_url.path());
+            ObjectStore::from_uri(url.as_ref()).await.unwrap()
+        };
+        let path = base.clone().join("目录/.lance-reserved");
+        let result = store
             .put_if_absent(&path, Bytes::from_static(b"first").into())
             .await
             .unwrap();
+        assert_eq!(result.size, 5);
+        if scheme == "memory" {
+            assert!(result.e_tag.is_some());
+            assert_eq!(result.e_tag, store.stat(&path).await.unwrap().e_tag);
+        }
         let error = store
             .put_if_absent(&path, Bytes::from_static(b"second").into())
             .await
             .unwrap_err();
         assert!(matches!(
             error,
-            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
+            crate::object_store::Error::AlreadyExists { .. }
+                | crate::object_store::Error::Precondition { .. }
         ));
         assert_eq!(
             store.read_one_all(&path).await.unwrap(),
             b"first".as_slice()
         );
+        let remaining = store
+            .list(Some(base))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1, "staging objects must be cleaned up");
+        assert_eq!(remaining[0].location, path);
     }
 
     #[rstest]
@@ -2851,51 +2703,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(matches!(error, LanceError::InvalidInput { .. }));
         assert!(error.to_string().contains(
             "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
         ));
-    }
-
-    #[test]
-    fn test_try_new_rejects_invalid_scheduler_error_mode() {
-        let storage_options = HashMap::from([(
-            SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
-            "invalid".to_string(),
-        )]);
-
-        let error = ObjectStore::try_new(
-            Arc::new(InMemory::new()),
-            Url::parse("memory:///").unwrap(),
-            None,
-            None,
-            false,
-            true,
-            DEFAULT_CLOUD_IO_PARALLELISM,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            Some(&storage_options),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains(
-            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_put_if_absent_rejects_cos() {
-        let mut store = ObjectStore::memory();
-        store.scheme = "cos".to_string();
-        let path = Path::from("atomic-create");
-
-        let error = store
-            .put_if_absent(&path, Bytes::from_static(b"value").into())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, object_store::Error::NotSupported { .. }));
-        assert!(!store.exists(&path).await.unwrap());
     }
 
     #[rstest]
@@ -3139,9 +2950,9 @@ mod tests {
         // removed with the temp dir, so put it back as soon as the call that
         // needs it returns.
         let original_dir = std::env::current_dir().unwrap();
-        set_current_dir(StdPath::new(tmp_path.as_ref())).expect("Error changing current dir");
+        set_current_dir(StdPath::new(tmp_path.as_ref())).expect("LanceError changing current dir");
         let opened = ObjectStore::from_uri("./bar/foo.lance").await;
-        set_current_dir(&original_dir).expect("Error restoring current dir");
+        set_current_dir(&original_dir).expect("LanceError restoring current dir");
         let (store, path) = opened.unwrap();
 
         let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
@@ -3198,7 +3009,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl OSObjectStore for BatchedDeleteStore {
+    impl crate::object_store::StorageBackend for BatchedDeleteStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(&self, _: &Path, _: PutPayload, _: PutOptions) -> OSResult<PutResult> {
             unreachable!()
         }
@@ -3207,7 +3029,7 @@ mod tests {
             &self,
             _: &Path,
             _: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             unreachable!()
         }
 
@@ -3266,7 +3088,7 @@ mod tests {
                             assert_eq!(deleted.load(Ordering::SeqCst), 20_000);
                             deferred.lock().await.extend(chunk.iter().cloned());
                         }
-                        Ok::<_, object_store::Error>(futures::stream::iter(
+                        Ok::<_, crate::object_store::Error>(futures::stream::iter(
                             chunk.into_iter().map(Ok),
                         ))
                     }
@@ -3283,13 +3105,67 @@ mod tests {
         async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> OSResult<()> {
             unreachable!()
         }
+        async fn get_ranges(
+            &self,
+            location: &crate::object_store::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> crate::object_store::Result<Vec<bytes::Bytes>> {
+            futures::future::try_join_all(ranges.iter().map(|range| {
+                (self as &dyn crate::object_store::StorageBackend)
+                    .get_range(location, range.clone())
+            }))
+            .await
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&crate::object_store::Path>,
+            offset: &crate::object_store::Path,
+        ) -> futures::stream::BoxStream<
+            'static,
+            crate::object_store::Result<crate::object_store::ObjectMeta>,
+        > {
+            let offset = offset.clone();
+            Box::pin(futures::TryStreamExt::try_filter(
+                self.list(prefix),
+                move |meta| futures::future::ready(meta.location > offset),
+            ))
+        }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     #[tokio::test]
     async fn test_remove_dir_all_preserves_batch_concurrency() {
         let backend = Arc::new(BatchedDeleteStore::default());
         let mut store = ObjectStore::memory();
-        store.inner = backend.clone();
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(|_| {
+            backend.clone()
+        }));
         store.remove_dir_all("dataset").await.unwrap();
         assert_eq!(backend.deleted.load(Ordering::SeqCst), 20_000);
         assert_eq!(backend.peak.load(Ordering::SeqCst), 20);
@@ -3309,7 +3185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_directory_file_object_store() {
+    async fn test_delete_directory_file_storage() {
         test_delete_directory("file-object-store").await;
     }
 
@@ -3423,13 +3299,169 @@ mod tests {
         assert!(!path.join("verified").exists());
     }
 
+    #[derive(Debug)]
+    struct TestWrapper {
+        calls: std::sync::atomic::AtomicUsize,
+
+        return_value: Arc<dyn StorageBackend>,
+    }
+
+    impl WrappingObjectStore for TestWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn StorageBackend>,
+        ) -> Arc<dyn StorageBackend> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.return_value.clone()
+        }
+    }
+
+    impl TestWrapper {
+        fn called(&self) -> bool {
+            self.calls.load(Ordering::Relaxed) > 0
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_short_circuit_wrapper_preserves_tracking_position(
+        #[values(false, true)] apply_late: bool,
+    ) {
+        let cached = backend::native::from_object_store(Arc::new(InMemory::new()));
+        let path = Path::from("cached");
+        cached
+            .put(&path, Bytes::from_static(b"cached value").into())
+            .await
+            .unwrap();
+        let wrapper = Arc::new(TestWrapper {
+            calls: Default::default(),
+            return_value: cached,
+        });
+        let params = ObjectStoreParams {
+            backend_wrappers: if apply_late {
+                vec![]
+            } else {
+                vec![wrapper.clone()]
+            },
+            ..Default::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap();
+        let mut store = store.as_ref().clone();
+        if apply_late {
+            store.apply_wrapper(wrapper.as_ref());
+        }
+        let store = Arc::new(store);
+        for view in [store.clone(), store.for_external_blobs()] {
+            store.io_stats_incremental();
+            assert_eq!(
+                view.read_object(&path)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                b"cached value".as_slice()
+            );
+            let stats = store.io_stats_snapshot();
+            assert_eq!(stats.read_iops, if apply_late { 0 } else { 1 });
+            assert_eq!(stats.read_bytes, if apply_late { 0 } else { 12 });
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_builtin_constructors_do_not_install_tracking(#[values(false, true)] local: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = if local {
+            ObjectStore::local()
+        } else {
+            ObjectStore::memory()
+        };
+        let path = if local {
+            Path::from_absolute_path(dir.path().join("data")).unwrap()
+        } else {
+            Path::from("data")
+        };
+        store
+            .put_payload(&path, Bytes::from_static(b"value").into())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .read_object(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            b"value".as_slice()
+        );
+        assert_eq!(store.io_stats_snapshot().read_iops, 0);
+        assert_eq!(store.io_stats_snapshot().write_iops, 0);
+        #[cfg(feature = "metrics")]
+        assert!(store.io_tracker.metrics_base().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cos_restriction_only_applies_to_put_if_absent() {
+        let backend = backend::native::from_object_store(Arc::new(InMemory::new()));
+        let store =
+            crate::utils::testing::TestObjectStoreProvider(BackendConfig::new(backend, "cos"))
+                .build(
+                    Url::parse("cos://bucket/").unwrap(),
+                    &ObjectStoreParams::default(),
+                );
+        let source = Path::from("source");
+        let target = Path::from("target");
+        let renamed = Path::from("renamed");
+        assert!(matches!(
+            store
+                .put_if_absent(&source, Bytes::from_static(b"data").into())
+                .await,
+            Err(crate::object_store::Error::NotSupported { .. })
+        ));
+        assert!(matches!(
+            store.stat(&source).await,
+            Err(crate::object_store::Error::NotFound { .. })
+        ));
+        store
+            .put_payload_opts(
+                &source,
+                Bytes::from_static(b"data").into(),
+                PutMode::Create.into(),
+            )
+            .await
+            .unwrap();
+        store.copy_if_not_exists(&source, &target).await.unwrap();
+        store.rename_if_not_exists(&target, &renamed).await.unwrap();
+        assert_eq!(
+            store
+                .read_object(&renamed)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            b"data".as_slice()
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_external_view_counts_reads_once(#[values(false, true)] apply_late: bool) {
         let wrapper = Arc::new(IOTracker::default());
         let params = ObjectStoreParams {
-            object_store_wrapper: (!apply_late)
-                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            backend_wrappers: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>)
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let (store, _) = ObjectStore::from_uri_and_params(
@@ -3450,7 +3482,7 @@ mod tests {
             store.io_stats_incremental();
             wrapper.incremental_stats();
             assert_eq!(
-                view.inner.get_range(&path, 0..4).await.unwrap(),
+                view.read_range(&path, 0..4).await.unwrap(),
                 b"blob".as_slice()
             );
             let stats = store.io_stats_snapshot();
@@ -3474,14 +3506,16 @@ mod tests {
         let file_url = Url::from_directory_path(&directory).unwrap();
         let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
         url.set_path(file_url.path());
-        let replacement = Arc::new(InMemory::new());
+        let replacement = backend::native::from_object_store(Arc::new(InMemory::new()));
         let wrapper = Arc::new(TestWrapper {
-            called: AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
             return_value: replacement.clone(),
         });
         let params = ObjectStoreParams {
-            object_store_wrapper: (!apply_late)
-                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            backend_wrappers: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>)
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let (store, base) = ObjectStore::from_uri_and_params(
@@ -3558,163 +3592,178 @@ mod tests {
         assert!(wrapper.called());
     }
 
-    #[derive(Debug)]
-    struct TestWrapper {
-        called: AtomicBool,
-
-        return_value: Arc<dyn OSObjectStore>,
-    }
-
-    impl WrappingObjectStore for TestWrapper {
-        fn wrap(
-            &self,
-            _store_prefix: &str,
-            _original: Arc<dyn OSObjectStore>,
-        ) -> Arc<dyn OSObjectStore> {
-            self.called.store(true, Ordering::Relaxed);
-
-            // return a mocked value so we can check if the final store is the one we expect
-            self.return_value.clone()
-        }
-
-        // This one swaps the store out entirely, so a listing that went around it would be
-        // listing something else.
-        fn wrap_paginated(
-            &self,
-            _store_prefix: &str,
-            _original: Arc<dyn PaginatedListStore>,
-        ) -> Option<Arc<dyn PaginatedListStore>> {
-            None
-        }
-    }
-
-    impl TestWrapper {
-        fn called(&self) -> bool {
-            self.called.load(Ordering::Relaxed)
-        }
-    }
-
-    /// A lister that exists only to be wrapped.
-    #[derive(Debug)]
-    struct StubLister;
-
-    #[async_trait]
-    impl PaginatedListStore for StubLister {
-        async fn list_paginated(
-            &self,
-            _prefix: Option<&str>,
-            _opts: object_store::list::PaginatedListOptions,
-        ) -> object_store::Result<object_store::list::PaginatedListResult> {
-            unimplemented!("this lister exists to be wrapped, not to list")
-        }
-    }
-
-    /// Records the listers it was handed, and leaves the store alone.
-    #[derive(Debug)]
-    struct PaginatedTestWrapper {
-        name: &'static str,
-        log: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl WrappingObjectStore for PaginatedTestWrapper {
-        fn wrap(
-            &self,
-            _store_prefix: &str,
-            original: Arc<dyn OSObjectStore>,
-        ) -> Arc<dyn OSObjectStore> {
-            original
-        }
-
-        fn wrap_paginated(
-            &self,
-            store_prefix: &str,
-            original: Arc<dyn PaginatedListStore>,
-        ) -> Option<Arc<dyn PaginatedListStore>> {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{}@{store_prefix}", self.name));
-            Some(original)
-        }
-    }
-
-    /// A chain hands the lister to each of its wrappers in turn. One wrapper giving up the
-    /// pushdown gives it up for the chain, and the wrappers after it are never asked: the
-    /// listing is going through `wrap` either way, which is every wrapper at once.
     #[rstest]
-    #[case::every_wrapper_keeps_it(false, vec!["first@memory", "second@memory"])]
-    #[case::one_wrapper_gives_it_up(true, vec!["first@memory"])]
-    fn test_a_chain_wraps_the_lister_until_one_gives_it_up(
-        #[case] gives_up: bool,
-        #[case] expected_log: Vec<&str>,
+    #[case::file("file")]
+    #[case::storage("file-object-store")]
+    #[cfg_attr(target_os = "linux", case::uring("file+uring"))]
+    #[tokio::test]
+    async fn test_custom_backend_does_not_inherit_native_file_access(
+        #[case] scheme: &str,
+        #[values(false, true)] is_local: bool,
     ) {
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> =
-            vec![Arc::new(PaginatedTestWrapper {
-                name: "first",
-                log: log.clone(),
-            })];
-        if gives_up {
-            wrappers.push(Arc::new(TestWrapper {
-                called: AtomicBool::new(false),
-                return_value: Arc::new(InMemory::new()),
-            }));
-        }
-        wrappers.push(Arc::new(PaginatedTestWrapper {
-            name: "second",
-            log: log.clone(),
-        }));
-
-        let wrapped = ChainedWrappingObjectStore::new(wrappers)
-            .wrap_paginated("memory", Arc::new(StubLister));
-
-        assert_eq!(wrapped.is_none(), gives_up);
-        assert_eq!(*log.lock().unwrap(), expected_log);
+        let directory = TempStdDir::default();
+        std::fs::write(directory.join("source"), b"disk").unwrap();
+        std::fs::write(directory.join("unfinished#1"), b"staging").unwrap();
+        let source = Path::from_absolute_path(directory.join("source")).unwrap();
+        let base = Path::from_absolute_path(&directory).unwrap();
+        let tracker = IOTracker::default();
+        // This backend implements only Lance's trait, with no native ObjectStore impl.
+        let backend = tracker.wrap(
+            "custom",
+            crate::object_store::backend::native::from_object_store(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+        );
+        let store = {
+            let url = Url::parse(&format!("{scheme}:///")).unwrap();
+            let mut config = crate::object_store::BackendConfig::new(backend, url.scheme());
+            config.io_parallelism = 1;
+            config.is_local = is_local;
+            crate::utils::testing::TestObjectStoreProvider(config).build(url, &Default::default())
+        };
+        assert_eq!(store.is_local(), is_local);
+        assert!(!store.has_direct_local_paths());
+        assert!(store.local_directory_path(&base).unwrap().is_none());
+        store.put(&source, b"backend").await.unwrap();
+        assert_eq!(
+            store.open(&source).await.unwrap().get_all().await.unwrap(),
+            b"backend".as_slice()
+        );
+        assert_eq!(
+            store
+                .open_with_size(&source, 7)
+                .await
+                .unwrap()
+                .get_all()
+                .await
+                .unwrap(),
+            b"backend".as_slice()
+        );
+        store
+            .copy(&source, &base.clone().join("copy"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .open(&base.clone().join("copy"))
+                .await
+                .unwrap()
+                .get_all()
+                .await
+                .unwrap(),
+            b"backend".as_slice()
+        );
+        assert!(
+            store
+                .canonicalize_local_path(&base)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_local_staging_files(&base)
+                .try_next()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .local_staging_path(&Path::parse(format!("{base}/unfinished#1")).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        store
+            .remove_empty_dirs(base.clone(), HashSet::new(), HashSet::new(), None)
+            .await
+            .unwrap();
+        store.remove_dir_all(base).await.unwrap();
+        assert!(!store.exists(&source).await.unwrap());
+        assert_eq!(std::fs::read(directory.join("source")).unwrap(), b"disk");
+        assert_eq!(
+            std::fs::read(directory.join("unfinished#1")).unwrap(),
+            b"staging"
+        );
+        assert!(!directory.join("copy").exists());
     }
 
-    /// `apply_wrapper` keeps both halves of the store in sync. A wrapper that gives up the
-    /// pushdown has to clear the lister too, or `read_dir_page` would keep talking to the
-    /// backend behind the wrapper's back.
     #[rstest]
-    #[case::gives_up_the_pushdown(true)]
-    #[case::keeps_the_pushdown(false)]
-    fn test_apply_wrapper_keeps_inner_and_the_lister_in_sync(#[case] gives_up: bool) {
-        let replacement = Arc::new(InMemory::new());
-        let giving_up = TestWrapper {
-            called: AtomicBool::new(false),
-            return_value: replacement.clone(),
-        };
-        let keeping = PaginatedTestWrapper {
-            name: "passthrough",
-            log: Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
-        let wrapper: &dyn WrappingObjectStore = match gives_up {
-            true => &giving_up,
-            false => &keeping,
-        };
-
-        let mut store = ObjectStore::memory();
-        store.paginated_lister = Some(Arc::new(StubLister) as Arc<dyn PaginatedListStore>);
-        store.apply_wrapper(wrapper);
-
-        assert_eq!(
-            store.paginated_lister.is_some(),
-            !gives_up,
-            "the lister has to follow what the wrapper said"
+    #[case::file("file")]
+    #[case::storage("file-object-store")]
+    #[cfg_attr(target_os = "linux", case::uring("file+uring"))]
+    #[tokio::test]
+    async fn test_wrappers_preserve_native_directory_maintenance(
+        #[case] scheme: &str,
+        #[values(false, true)] apply_late: bool,
+    ) {
+        let directory = TempStdDir::default();
+        create_dir_all(directory.join("empty")).unwrap();
+        std::fs::write(directory.join("part#1"), b"staging").unwrap();
+        let file_url = Url::from_directory_path(&directory).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let wrapper: Arc<dyn WrappingObjectStore> = Arc::new(
+            crate::utils::testing::TestWrappingObjectStore::new(|backend| backend),
         );
-        // The wrapper that gives up the pushdown is also the one that swaps the store out, so
-        // whether `inner` was replaced says that `wrap` ran on the same wrapper.
+        let (store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            url.as_ref(),
+            &ObjectStoreParams {
+                backend_wrappers: if apply_late {
+                    vec![]
+                } else {
+                    vec![wrapper.clone()]
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut store = store.as_ref().clone();
+        if apply_late {
+            store.apply_wrapper(wrapper.as_ref());
+        }
+        store.apply_wrapper(&IOTracker::default());
+        assert!(!store.has_direct_local_paths());
+        let store = Arc::new(store);
+        let view = store.for_external_blobs();
         assert_eq!(
-            Arc::ptr_eq(&store.inner, &(replacement as Arc<dyn OSObjectStore>)),
-            gives_up
+            view.canonicalize_local_path(&base).await.unwrap(),
+            Some(std::fs::canonicalize(&directory).unwrap())
         );
+        assert_eq!(
+            view.local_directory_path(&base).unwrap(),
+            Some(directory.to_path_buf())
+        );
+        let files = view
+            .read_local_staging_files(&base)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].location,
+            Path::parse(format!("{base}/part#1")).unwrap()
+        );
+        view.delete(&files[0].location).await.unwrap();
+        assert!(!directory.join("part#1").exists());
+        store
+            .remove_empty_dirs(base.clone(), HashSet::new(), HashSet::new(), None)
+            .await
+            .unwrap();
+        assert!(!directory.join("empty").exists());
+        create_dir_all(directory.join("remove/child")).unwrap();
+        std::fs::write(directory.join("remove/child/data"), b"data").unwrap();
+        store.remove_dir_all(base.join("remove")).await.unwrap();
+        assert!(!directory.join("remove").exists());
     }
 
     #[tokio::test]
     async fn test_external_view_retains_the_registry_binding() {
         let registry = Arc::new(ObjectStoreRegistry::default());
         let params = ObjectStoreParams {
-            object_store_wrapper: Some(Arc::new(IOTracker::default())),
+            backend_wrappers: vec![Arc::new(IOTracker::default())],
             ..Default::default()
         };
         let (store, path) =
@@ -3756,16 +3805,18 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_identity_is_stable_across_tasks() {
         let wrapper = Arc::new(TestWrapper {
-            called: AtomicBool::new(false),
-            return_value: Arc::new(InMemory::new()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            return_value: crate::object_store::backend::native::from_object_store(Arc::new(
+                InMemory::new(),
+            )),
         });
         let initial_params = ObjectStoreParams {
-            object_store_wrapper: Some(wrapper.clone()),
+            backend_wrappers: vec![wrapper.clone()],
             ..ObjectStoreParams::default()
         };
         let task_params = tokio::spawn(async move {
             ObjectStoreParams {
-                object_store_wrapper: Some(wrapper),
+                backend_wrappers: vec![wrapper],
                 ..ObjectStoreParams::default()
             }
         })
@@ -3786,29 +3837,30 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_wrapping_object_store_option_is_used(
-        #[values(false, true)] is_custom_store: bool,
-    ) {
+    async fn test_wrapping_storage_option_is_used(#[values(false, true)] is_custom_store: bool) {
         // Make a store for the inner store first
-        let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let mock_inner_store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let registry = Arc::new(ObjectStoreRegistry::default());
 
         assert_eq!(Arc::strong_count(&mock_inner_store), 1);
 
         let wrapper = Arc::new(TestWrapper {
-            called: AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
             return_value: mock_inner_store.clone(),
         });
 
-        #[allow(deprecated)]
+        let registry = if is_custom_store {
+            crate::utils::testing::TestObjectStoreProvider(BackendConfig::new(
+                backend::native::from_object_store(Arc::new(InMemory::new())),
+                "memory",
+            ))
+            .registry()
+        } else {
+            registry
+        };
         let params = ObjectStoreParams {
-            object_store_wrapper: Some(wrapper.clone()),
-            object_store: is_custom_store.then(|| {
-                (
-                    Arc::new(InMemory::new()) as Arc<dyn OSObjectStore>,
-                    Url::parse("memory:///").unwrap(),
-                )
-            }),
+            backend_wrappers: vec![wrapper.clone()],
             ..ObjectStoreParams::default()
         };
 
@@ -3820,7 +3872,7 @@ mod tests {
             .unwrap();
 
         // called after construction
-        assert!(wrapper.called());
+        assert_eq!(wrapper.calls.load(Ordering::Relaxed), 1);
 
         // hard to compare two trait pointers as the point to vtables
         // using the ref count as a proxy to make sure that the store is correctly kept
@@ -3869,7 +3921,8 @@ mod tests {
         writer.write_all(b"LOCAL").await.unwrap();
         Writer::shutdown(&mut writer).await.unwrap();
 
-        let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
+        let file_path_os =
+            lance_core::storage::path::Path::parse(file_path.to_str().unwrap()).unwrap();
         let obj_store = ObjectStore::local();
         let buf = obj_store.read_one_all(&file_path_os).await.unwrap();
         assert_eq!(buf.as_ref(), b"LOCAL");
@@ -3940,10 +3993,10 @@ mod tests {
         // Create paths relative to the ObjectStore base
         let from_path = base_path.clone().join(source_file_name);
 
-        // Use object_store::Path::parse for the destination
+        // Use crate::object_store::Path::parse for the destination
         let dest_file = dest_dir.join("copied_file.txt");
         let dest_str = dest_file.to_str().unwrap();
-        let to_path = object_store::path::Path::parse(dest_str).unwrap();
+        let to_path = lance_core::storage::path::Path::parse(dest_str).unwrap();
 
         // Perform the copy operation
         store.copy(&from_path, &to_path).await.unwrap();
@@ -4028,7 +4081,7 @@ mod tests {
     /// for an oversized source rather than issuing a single `CopyObject`.
     #[derive(Debug)]
     struct CopyFailingStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
     }
 
     impl Display for CopyFailingStore {
@@ -4070,7 +4123,7 @@ mod tests {
             self.observations.part_count.fetch_add(1, Ordering::SeqCst);
             if self.fail_parts {
                 return Box::pin(async {
-                    Err(object_store::Error::Generic {
+                    Err(crate::object_store::Error::Generic {
                         store: "ObservedMultipartStore",
                         source: "injected multipart part failure".into(),
                     })
@@ -4091,7 +4144,7 @@ mod tests {
 
     #[derive(Debug)]
     struct ObservedMultipartStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
         observations: Arc<MultipartObservations>,
         fail_parts: bool,
         destination_size_adjustment: u64,
@@ -4104,7 +4157,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl OSObjectStore for ObservedMultipartStore {
+    impl crate::object_store::StorageBackend for ObservedMultipartStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -4118,7 +4182,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             let inner = self.inner.put_multipart_opts(location, opts).await?;
             Ok(Box::new(ObservedMultipartUpload {
                 inner,
@@ -4194,10 +4258,48 @@ mod tests {
                 .fetch_add(1, Ordering::SeqCst);
             self.inner.copy_opts(from, to, opts).await
         }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     #[async_trait]
-    impl OSObjectStore for CopyFailingStore {
+    impl crate::object_store::StorageBackend for CopyFailingStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -4210,7 +4312,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -4239,54 +4341,82 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
         async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
-            Err(object_store::Error::Generic {
-                store: "CopyFailingStore",
+            Err(crate::object_store::Error::NotSupported {
                 source: "single-shot copy disabled in test".into(),
             })
         }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
+    #[rstest]
+    #[case::exceeds_limit(8, true)]
+    #[case::within_limit(u64::MAX, false)]
     #[tokio::test]
-    async fn test_copy_streams_objects_larger_than_threshold() {
-        // memory:// is non-local but isn't an S3/GCS scheme, so copy() wouldn't
-        // enable the fallback on its own. Drive copy_impl directly with
-        // multipart_copy_fallback = true to exercise the streaming path. The
-        // inner store rejects any single-shot copy, so a successful copy can only
-        // have gone through the streaming branch.
-        let mut store = ObjectStore::memory();
-        store.inner = Arc::new(CopyFailingStore {
-            inner: InMemory::new(),
+    async fn test_copy_obeys_provider_size_limit(#[case] limit: u64, #[case] streams: bool) {
+        // This backend rejects native copy. Only a declared limit can route the
+        // public copy operation through multipart streaming.
+        let backend = Arc::new(CopyFailingStore {
+            inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                InMemory::new(),
+            )),
         });
-
+        let mut config = BackendConfig::new(backend, "memory");
+        config.is_remote = false;
+        config.max_single_copy_size = Some(limit);
+        let store = crate::utils::testing::TestObjectStoreProvider(config)
+            .build(Url::parse("memory:///").unwrap(), &Default::default());
         let from = Path::from("source.bin");
+        let to = Path::from("copy.bin");
         let contents = b"streaming multipart copy payload well past the tiny threshold";
         store.put(&from, contents).await.unwrap();
-
-        // Source size (61 bytes) exceeds the threshold -> must stream via a
-        // multipart write rather than a single-shot server-side copy.
-        let streamed = Path::from("streamed.bin");
-        store.copy_impl(&from, &streamed, true, 8).await.unwrap();
-        let copied = store.read_one_all(&streamed).await.unwrap();
-        assert_eq!(copied.as_ref(), contents.as_slice());
-
-        // Source size below the threshold -> single-shot copy, which the inner
-        // store rejects, confirming that the streaming branch (not native copy)
-        // is what made the first copy succeed.
-        let native = Path::from("native.bin");
-        assert!(
-            store
-                .copy_impl(&from, &native, true, u64::MAX)
-                .await
-                .is_err()
-        );
+        let result = store.copy(&from, &to).await;
+        if streams {
+            result.unwrap();
+            assert_eq!(store.read_one_all(&to).await.unwrap().as_ref(), contents);
+        } else {
+            assert!(result.is_err());
+            assert!(!store.exists(&to).await.unwrap());
+        }
     }
 
     #[tokio::test]
     async fn test_copy_via_stream_never_uses_native_copy() {
         let mut store = ObjectStore::memory();
-        store.inner = Arc::new(CopyFailingStore {
-            inner: InMemory::new(),
-        });
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(CopyFailingStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
@@ -4306,7 +4436,224 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_if_not_exists_accepts_equal_size_local_retry() {
+    async fn test_direct_listing_does_not_retry() {
+        use crate::utils::testing::{ProxyBackend, ProxyBackendPolicy, TestWrappingObjectStore};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let policy = Arc::new(std::sync::Mutex::new(ProxyBackendPolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "list failure",
+            Arc::new(move |op, _| {
+                if op == "list" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(LanceError::io("temporary list failure"));
+                }
+                Ok(())
+            }),
+        );
+        let mut storage = ObjectStore::memory();
+        storage.apply_wrapper(&TestWrappingObjectStore::new(|backend| {
+            Arc::new(ProxyBackend::new(backend, policy.clone()))
+        }));
+        let error = storage
+            .list_objects(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Generic { .. }));
+        assert!(error.to_string().contains("temporary list failure"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[case::file("file", true)]
+    #[case::backend("file-object-store", false)]
+    #[cfg_attr(target_os = "linux", case::uring("file+uring", true))]
+    #[tokio::test]
+    async fn test_conditional_create_keeps_provider_strategy(
+        #[case] scheme: &str,
+        #[case] staged: bool,
+    ) {
+        use crate::utils::testing::{ProxyBackend, ProxyBackendPolicy, TestWrappingObjectStore};
+        let temp = tempfile::tempdir().unwrap();
+        let uri = format!(
+            "{scheme}://{}{}",
+            if cfg!(windows) { "/" } else { "" },
+            temp.path().display()
+        );
+        let (store, base) = ObjectStore::from_uri(&uri).await.unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let policy = Arc::new(std::sync::Mutex::new(ProxyBackendPolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "failure",
+            Arc::new(move |op, _| {
+                observed.lock().unwrap().push(op.to_string());
+                match op {
+                    "rename" => Err(LanceError::not_supported("conditional rename unavailable")),
+                    "delete" => Err(LanceError::io("cleanup unavailable")),
+                    _ => Ok(()),
+                }
+            }),
+        );
+        let mut store = (*store).clone();
+        store.apply_wrapper(&TestWrappingObjectStore::new(|backend| {
+            Arc::new(ProxyBackend::new(backend, policy.clone()))
+        }));
+        let path = base.join(".manifest");
+        let result = store.put_if_absent(&path, b"data".to_vec().into()).await;
+        if staged {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::Generic { .. }));
+            assert!(error.to_string().contains("conditional rename unavailable"));
+            assert_eq!(*calls.lock().unwrap(), ["put", "rename", "delete"]);
+            assert!(!temp.path().join(".manifest").exists());
+        } else {
+            result.unwrap();
+            assert_eq!(*calls.lock().unwrap(), ["put"]);
+            assert_eq!(
+                std::fs::read(temp.path().join(".manifest")).unwrap(),
+                b"data"
+            );
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_conditional_copy_preserves_backend_result(
+        #[values(false, true)] unsupported: bool,
+    ) {
+        let mut store = ObjectStore::memory();
+        if unsupported {
+            store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+                |_backend| {
+                    Arc::new(CopyFailingStore {
+                        inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                            InMemory::new(),
+                        )),
+                    })
+                },
+            ));
+        }
+        let source = Path::from("source");
+        let destination = Path::from("destination");
+        store.put(&source, b"new").await.unwrap();
+        store.put(&destination, b"old").await.unwrap();
+        let error = store
+            .copy_if_not_exists(&source, &destination)
+            .await
+            .unwrap_err();
+        if unsupported {
+            assert!(matches!(
+                error,
+                crate::object_store::Error::NotSupported { .. }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                crate::object_store::Error::AlreadyExists { .. }
+                    | crate::object_store::Error::Precondition { .. }
+            ));
+        }
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            b"old"
+        );
+        store.delete(&destination).await.unwrap();
+        let result = store.copy_if_not_exists(&source, &destination).await;
+        if unsupported {
+            assert!(matches!(
+                result,
+                Err(crate::object_store::Error::NotSupported { .. })
+            ));
+            assert!(matches!(
+                store.stat(&destination).await,
+                Err(crate::object_store::Error::NotFound { .. })
+            ));
+            return;
+        }
+        result.unwrap();
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            b"new"
+        );
+        let error = store
+            .copy_if_not_exists(&"missing".into(), &"other".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::object_store::Error::NotFound { .. }));
+    }
+
+    #[rstest]
+    #[case::native(3, false)]
+    #[case::streamed(5 * 1024 * 1024 * 1024, false)]
+    #[case::upload_failure(5 * 1024 * 1024 * 1024, true)]
+    #[tokio::test]
+    async fn test_copy_with_known_size(#[case] size: u64, #[case] fail_parts: bool) {
+        let observations = Arc::new(MultipartObservations::default());
+        let mut store = ObjectStore::memory();
+        let backend = ObservedMultipartStore {
+            inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                InMemory::new(),
+            )),
+            observations: observations.clone(),
+            fail_parts,
+            destination_size_adjustment: 0,
+        };
+        // Report a large known size without allocating a multi-gigabyte fixture.
+        backend
+            .inner
+            .put(&"source".into(), Bytes::from_static(b"new").into())
+            .await
+            .unwrap();
+        let backend = Arc::new(backend);
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(|_| {
+            backend.clone()
+        }));
+        let result = store
+            .copy_with_size(&"source".into(), &"destination".into(), size)
+            .await;
+        if fail_parts {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected multipart part failure")
+            );
+            assert_eq!(observations.abort_count.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                store.stat(&"destination".into()).await,
+                Err(crate::object_store::Error::NotFound { .. })
+            ));
+        } else {
+            result.unwrap();
+            assert_eq!(
+                store
+                    .read_one_all(&"destination".into())
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"new"
+            );
+        }
+        assert_eq!(
+            observations.native_copy_count.load(Ordering::SeqCst),
+            usize::from(size == 3)
+        );
+        assert_eq!(
+            observations.part_count.load(Ordering::SeqCst),
+            usize::from(size != 3)
+        );
+        assert!(matches!(
+            store
+                .copy_with_size(&"missing".into(), &"other".into(), size)
+                .await,
+            Err(crate::object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_or_same_size_accepts_equal_size_local_retry() {
         let directory = TempStdDir::default();
         let (store, base_path) = ObjectStore::from_uri(directory.to_str().unwrap())
             .await
@@ -4332,12 +4679,18 @@ mod tests {
     async fn test_copy_if_not_exists_uses_native_copy() {
         let observations = Arc::new(MultipartObservations::default());
         let mut store = ObjectStore::memory();
-        store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
@@ -4414,12 +4767,18 @@ mod tests {
         // exactly when that regression happens.
         let observations = Arc::new(MultipartObservations::default());
         let mut store = ObjectStore::memory();
-        store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
 
         let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
         for path in &paths {
@@ -4444,12 +4803,18 @@ mod tests {
     async fn test_bulk_copy_streams_when_server_side_copy_is_disabled() {
         let observations = Arc::new(MultipartObservations::default());
         let mut store = ObjectStore::memory();
-        store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
@@ -4469,12 +4834,22 @@ mod tests {
         );
     }
 
+    fn remote_memory_store() -> ObjectStore {
+        let config = BackendConfig::new(
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new())),
+            "test-cloud",
+        );
+        crate::utils::testing::TestObjectStoreProvider(config).build(
+            Url::parse("test-cloud://bucket").unwrap(),
+            &ObjectStoreParams::default(),
+        )
+    }
+
     #[test]
     #[serial(server_side_copy_env)]
     fn test_server_side_copy_environment_policy() {
         let previous_value = std::env::var_os(SERVER_SIDE_COPY_ENABLED_ENV);
-        let mut store = ObjectStore::memory();
-        store.scheme = "test-cloud".to_string();
+        let store = remote_memory_store();
         let destination_store = store.clone();
 
         // SAFETY: this serialized test is the only test that mutates this task-specific
@@ -4498,14 +4873,19 @@ mod tests {
     #[tokio::test]
     async fn test_bulk_copy_uses_server_side_copy_when_enabled_for_same_store() {
         let observations = Arc::new(MultipartObservations::default());
-        let mut source_store = ObjectStore::memory();
-        source_store.scheme = "test-cloud".to_string();
-        source_store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        let mut source_store = remote_memory_store();
+        source_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
         let destination_store = source_store.clone();
 
         let source = Path::from("source.bin");
@@ -4532,27 +4912,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_bulk_copy_streams_for_distinct_clients_with_same_prefix() {
-        let shared_inner = InMemory::new();
+        let shared_inner =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let source_observations = Arc::new(MultipartObservations::default());
-        let mut source_store = ObjectStore::memory();
-        source_store.scheme = "test-cloud".to_string();
-        source_store.store_prefix = "test-cloud$bucket".to_string();
-        source_store.inner = Arc::new(ObservedMultipartStore {
-            inner: shared_inner.clone(),
-            observations: source_observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        let mut source_store = remote_memory_store();
+        source_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: shared_inner.clone(),
+                    observations: source_observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
         let destination_observations = Arc::new(MultipartObservations::default());
-        let mut destination_store = ObjectStore::memory();
-        destination_store.scheme = "test-cloud".to_string();
-        destination_store.store_prefix = "test-cloud$bucket".to_string();
-        destination_store.inner = Arc::new(ObservedMultipartStore {
-            inner: shared_inner,
-            observations: destination_observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        let mut destination_store = remote_memory_store();
+        destination_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: shared_inner.clone(),
+                    observations: destination_observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
@@ -4588,14 +4973,19 @@ mod tests {
     #[tokio::test]
     async fn test_bulk_copy_rejects_server_side_destination_size_mismatch() {
         let observations = Arc::new(MultipartObservations::default());
-        let mut source_store = ObjectStore::memory();
-        source_store.scheme = "test-cloud".to_string();
-        source_store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 1,
-        });
+        let mut source_store = remote_memory_store();
+        source_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 1,
+                })
+            },
+        ));
         let destination_store = source_store.clone();
 
         let source = Path::from("source.bin");
@@ -4622,12 +5012,18 @@ mod tests {
         let source_store = ObjectStore::memory();
         let observations = Arc::new(MultipartObservations::default());
         let mut destination_store = ObjectStore::memory();
-        destination_store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        destination_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
@@ -4677,12 +5073,18 @@ mod tests {
         source_store.max_iop_size = 1024 * 1024;
         let observations = Arc::new(MultipartObservations::default());
         let mut destination_store = ObjectStore::memory();
-        destination_store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
+        destination_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: false,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
@@ -4714,12 +5116,18 @@ mod tests {
         let source_store = ObjectStore::memory();
         let observations = Arc::new(MultipartObservations::default());
         let mut destination_store = ObjectStore::memory();
-        destination_store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: true,
-            destination_size_adjustment: 0,
-        });
+        destination_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: observations.clone(),
+                    fail_parts: true,
+                    destination_size_adjustment: 0,
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
@@ -4760,12 +5168,18 @@ mod tests {
     async fn test_copy_via_stream_rejects_destination_size_mismatch() {
         let source_store = ObjectStore::memory();
         let mut destination_store = ObjectStore::memory();
-        destination_store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: Arc::new(MultipartObservations::default()),
-            fail_parts: false,
-            destination_size_adjustment: 1,
-        });
+        destination_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| {
+                Arc::new(ObservedMultipartStore {
+                    inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    observations: Arc::new(MultipartObservations::default()),
+                    fail_parts: false,
+                    destination_size_adjustment: 1,
+                })
+            },
+        ));
 
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");

@@ -28,6 +28,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
+use lance_core::storage::path::Path;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
@@ -44,7 +45,6 @@ use lance_table::format::{
 };
 use lance_table::rowids::version::write_dataset_versions;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
-use object_store::path::Path;
 
 use super::super::Dataset;
 use crate::dataset::fragment::write::generate_random_filename;
@@ -499,7 +499,7 @@ async fn write_lineage_file(
             .collect::<Vec<_>>(),
     ));
     let schema = Schema::try_from(arrow_schema.as_ref())?;
-    let object_writer = dataset.object_store.create(&full_path).await?;
+    let object_writer = dataset.storage.create(&full_path).await?;
     let mut writer = versions::create_writer(
         file_version,
         object_writer,
@@ -612,11 +612,8 @@ async fn read_spilled_column(
     let path: Path = dataset
         .data_file_dir(data_file)?
         .join(data_file.path.as_str());
-    let object_store = dataset.object_store_for_data_file(data_file).await?;
-    let scheduler = ScanScheduler::new(
-        object_store.clone(),
-        SchedulerConfig::max_bandwidth(&object_store),
-    );
+    let storage = dataset.storage_for_data_file(data_file).await?;
+    let scheduler = ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(&storage));
     let file = scheduler
         .open_file(&path, &data_file.file_size_bytes)
         .await?;

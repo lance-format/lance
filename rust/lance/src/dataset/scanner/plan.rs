@@ -384,7 +384,7 @@ impl Scanner {
                 }
 
                 let byte_width = field.data_type().byte_width_opt();
-                let is_cloud = self.dataset.object_store.as_ref().is_cloud();
+                let is_cloud = self.dataset.storage.as_ref().is_cloud();
                 if is_cloud {
                     byte_width.is_some_and(|bw| bw < 1000)
                 } else {
@@ -1903,7 +1903,7 @@ mod tests {
         let tracker = Arc::new(IOTracker::default());
         let dataset = crate::dataset::builder::DatasetBuilder::from_uri(data_dir.as_str())
             .with_store_params(ObjectStoreParams {
-                object_store_wrapper: Some(tracker.clone()),
+                backend_wrappers: vec![tracker.clone()],
                 ..Default::default()
             })
             .load()

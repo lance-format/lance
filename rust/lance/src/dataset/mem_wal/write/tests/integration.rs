@@ -1140,18 +1140,10 @@ async fn test_shard_writer_e2e_correctness() {
         .expect("Failed to close new writer");
 }
 
-/// Regression: a base opened with a *path-bound* store binding (the
-/// deprecated `ObjectStoreParams::object_store`) must still flush and read
-/// generations at their own paths.
-///
-/// The binding pins a store to one location, and both
-/// `ObjectStore::from_uri_and_params` and `DatasetBuilder::build_object_store`
-/// take the path from it while ignoring the URI they were handed. Reusing the
-/// base's params verbatim therefore aimed every generation write and open at
-/// the base table itself: the flush failed ("dataset already exists") and any
-/// derived open returned base rows as generation rows.
+/// Generation writes and reads must resolve their own paths while inheriting
+/// the base dataset's storage configuration.
 #[tokio::test]
-async fn test_flush_and_read_with_path_bound_object_store() {
+async fn test_flush_and_read_with_storage_params() {
     use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
     use futures::TryStreamExt;
     use lance_io::object_store::ObjectStoreParams;
@@ -1173,17 +1165,12 @@ async fn test_flush_and_read_with_path_bound_object_store() {
         .await
         .expect("Failed to initialize MemWAL");
 
-    // Re-bind the base to a store pinned at the base's own path — what
-    // `DatasetBuilder::with_object_store` leaves on an opened dataset.
-    #[allow(deprecated)]
+    // Derived generation URIs inherit options, while the registry resolves their paths.
     let store_params = ObjectStoreParams {
-        object_store: Some((
-            Arc::new(object_store::local::LocalFileSystem::new()),
-            url::Url::parse(&uri).unwrap(),
-        )),
+        block_size: Some(4096),
         ..Default::default()
     };
-    let dataset = dataset.with_object_store(dataset.object_store.clone(), Some(store_params));
+    let dataset = dataset.with_storage(dataset.storage.clone(), Some(store_params));
 
     let shard_id = Uuid::new_v4();
     let writer = dataset
@@ -1351,12 +1338,10 @@ async fn test_store_params_reach_generation_write_and_read() {
     writer.close().await.unwrap();
 }
 
-/// A fresh-tier-only scanner reaches its store params through
-/// `with_store_params`, not `new()`, so the setter must strip the path-bound
-/// store binding too. Left raw, it redirects the generation open at the base
-/// table and the scan silently returns base rows as WAL rows.
+/// A fresh-tier scanner configured through `with_store_params` must read
+/// generation rows using the generation URI, independently of the base table.
 #[tokio::test]
-async fn test_fresh_tier_scan_with_path_bound_object_store() {
+async fn test_fresh_tier_scan_with_storage_params() {
     use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
     use futures::TryStreamExt;
     use lance_io::object_store::ObjectStoreParams;
@@ -1398,14 +1383,9 @@ async fn test_fresh_tier_scan_with_path_bound_object_store() {
         .with_current_generation(manifest.current_generation)
         .with_sstable(sstable.generation, sstable.path.clone());
 
-    // What `DatasetBuilder::with_object_store` leaves on an opened dataset:
-    // a store pinned at the base's own path.
-    #[allow(deprecated)]
+    // Derived generation URIs inherit options, while the registry resolves their paths.
     let store_params = ObjectStoreParams {
-        object_store: Some((
-            Arc::new(object_store::local::LocalFileSystem::new()),
-            url::Url::parse(&uri).unwrap(),
-        )),
+        block_size: Some(4096),
         ..Default::default()
     };
 

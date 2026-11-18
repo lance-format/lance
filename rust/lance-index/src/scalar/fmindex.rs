@@ -2406,9 +2406,9 @@ mod tests {
     use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, UInt64Array};
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::storage::path::Path;
     use lance_core::{ROW_ADDR, cache::LanceCache};
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;

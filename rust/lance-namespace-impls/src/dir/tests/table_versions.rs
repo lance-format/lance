@@ -424,14 +424,13 @@ async fn test_create_table_version() {
         .await
         .unwrap();
 
-    // Use dataset's object_store to find and copy the manifest
+    // Use dataset's storage to find and copy the manifest
     let versions_path = dataset.versions_dir();
     let manifest_metas: Vec<_> = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .list(Some(&versions_path))
+        .list(Some(versions_path.clone()))
         .try_collect()
         .await
         .unwrap();
@@ -448,25 +447,23 @@ async fn test_create_table_version() {
 
     // Read the existing manifest data
     let manifest_data = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .get(&manifest_meta.location)
+        .read_object(&manifest_meta.location)
         .await
         .unwrap()
         .bytes()
         .await
         .unwrap();
 
-    // Write to a staging location using the dataset's object_store
+    // Write to a staging location using the dataset's storage
     let staging_path = dataset.versions_dir().join("staging_manifest");
     dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .put(&staging_path, manifest_data.into())
+        .put_payload(&staging_path, manifest_data.into())
         .await
         .unwrap();
 
@@ -490,11 +487,10 @@ async fn test_create_table_version() {
         .expect("response should contain version info");
     let version_2_path = Path::parse(&version_info.manifest_path).unwrap();
     let head_result = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .head(&version_2_path)
+        .stat(&version_2_path)
         .await;
     assert!(
         head_result.is_ok(),
@@ -504,11 +500,10 @@ async fn test_create_table_version() {
 
     // Verify the staging file has been deleted
     let staging_head_result = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .head(&staging_path)
+        .stat(&staging_path)
         .await;
     assert!(
         staging_head_result.is_err(),
@@ -554,11 +549,10 @@ async fn test_create_table_version_idempotent() {
 
     let versions_path = dataset.versions_dir();
     let manifest_metas: Vec<_> = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .list(Some(&versions_path))
+        .list(Some(versions_path.clone()))
         .try_collect()
         .await
         .unwrap();
@@ -574,11 +568,10 @@ async fn test_create_table_version_idempotent() {
         .expect("No manifest file found");
 
     let manifest_data = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .get(&manifest_meta.location)
+        .read_object(&manifest_meta.location)
         .await
         .unwrap()
         .bytes()
@@ -587,11 +580,10 @@ async fn test_create_table_version_idempotent() {
 
     let staging_path = dataset.versions_dir().join("staging_manifest");
     dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .put(&staging_path, manifest_data.clone().into())
+        .put_payload(&staging_path, manifest_data.clone().into())
         .await
         .unwrap();
 
@@ -606,11 +598,10 @@ async fn test_create_table_version_idempotent() {
     // Re-stage identical bytes (simulates Lance commit retry rewriting staging).
     let retry_staging = dataset.versions_dir().join("staging_manifest_retry");
     dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .put(&retry_staging, manifest_data.into())
+        .put_payload(&retry_staging, manifest_data.into())
         .await
         .unwrap();
 
@@ -669,14 +660,13 @@ async fn test_create_table_version_conflict() {
         .await
         .unwrap();
 
-    // Use dataset's object_store to find and copy the manifest
+    // Use dataset's storage to find and copy the manifest
     let versions_path = dataset.versions_dir();
     let manifest_metas: Vec<_> = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .list(Some(&versions_path))
+        .list(Some(versions_path.clone()))
         .try_collect()
         .await
         .unwrap();
@@ -693,25 +683,23 @@ async fn test_create_table_version_conflict() {
 
     // Read the existing manifest data
     let manifest_data = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .get(&manifest_meta.location)
+        .read_object(&manifest_meta.location)
         .await
         .unwrap()
         .bytes()
         .await
         .unwrap();
 
-    // Write to a staging location using the dataset's object_store
+    // Write to a staging location using the dataset's storage
     let staging_path = dataset.versions_dir().join("staging_manifest");
     dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .put(&staging_path, manifest_data.into())
+        .put_payload(&staging_path, manifest_data.into())
         .await
         .unwrap();
 
@@ -739,11 +727,10 @@ async fn test_create_table_version_conflict() {
     // Different content for the same version number must conflict.
     let conflict_staging = dataset.versions_dir().join("staging_manifest_conflict");
     dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .put(
+        .put_payload(
             &conflict_staging,
             bytes::Bytes::from_static(b"not-a-real-manifest").into(),
         )
@@ -765,13 +752,12 @@ async fn test_create_table_version_conflict() {
         "expected ConcurrentModification, got: {err}"
     );
 
-    // Verify version 2 still exists using the dataset's object_store
+    // Verify version 2 still exists using the dataset's storage
     let head_result = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .head(&version_2_path)
+        .stat(&version_2_path)
         .await;
     assert!(
         head_result.is_ok(),
@@ -817,11 +803,10 @@ async fn test_create_table_version_cas_rejects_gap() {
 
     let versions_path = dataset.versions_dir();
     let manifest_metas: Vec<_> = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .list(Some(&versions_path))
+        .list(Some(versions_path.clone()))
         .try_collect()
         .await
         .unwrap();
@@ -835,11 +820,10 @@ async fn test_create_table_version_cas_rejects_gap() {
         })
         .expect("No manifest file found");
     let manifest_data = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .get(&manifest_meta.location)
+        .read_object(&manifest_meta.location)
         .await
         .unwrap()
         .bytes()
@@ -848,11 +832,10 @@ async fn test_create_table_version_cas_rejects_gap() {
 
     let staging_path = dataset.versions_dir().join("staging_gap");
     dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .put(&staging_path, manifest_data.into())
+        .put_payload(&staging_path, manifest_data.into())
         .await
         .unwrap();
 
@@ -895,9 +878,9 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
 
     let branch_ds = Dataset::open(&branch_uri).await.unwrap();
     let versions_dir = branch_ds.versions_dir();
-    let store = branch_ds.object_store(None).await.unwrap();
+    let store = branch_ds.storage(None).await.unwrap();
     let manifests: Vec<_> = store
-        .list_objects(Some(&versions_dir))
+        .list(Some(versions_dir.clone()))
         .try_collect()
         .await
         .unwrap();
@@ -907,13 +890,13 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
             .filename()
             .is_some_and(|f| f.ends_with(".manifest"))
         {
-            store.inner.delete(&meta.location).await.unwrap();
+            store.delete(&meta.location).await.unwrap();
         }
     }
     // Confirm the branch object-store chain is empty (do not open the dataset:
     // with no manifests, Dataset::open would fail).
     let remaining_manifests = store
-        .list_objects(Some(&versions_dir))
+        .list(Some(versions_dir.clone()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -932,10 +915,9 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
     // Stage bytes from a main manifest.
     let main_ds = open_dataset(&namespace, "users").await;
     let main_versions = main_ds.versions_dir();
-    let main_store = main_ds.object_store(None).await.unwrap();
+    let main_store = main_ds.storage(None).await.unwrap();
     let source_meta = main_store
-        .inner
-        .list(Some(&main_versions))
+        .list(Some(main_versions.clone()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -947,8 +929,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
         })
         .expect("main should have a manifest");
     let source_bytes = main_store
-        .inner
-        .get(&source_meta.location)
+        .read_object(&source_meta.location)
         .await
         .unwrap()
         .bytes()

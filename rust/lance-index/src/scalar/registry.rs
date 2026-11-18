@@ -859,15 +859,15 @@ mod tests {
     }
 
     async fn empty_index_bindings() -> [(Arc<dyn IndexStore>, Arc<dyn ScalarIndex>); 2] {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
         let store_a: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            Arc::new(object_store.clone()),
+            Arc::new(storage.clone()),
             "index".into(),
             metadata_cache.clone(),
         ));
         let store_b: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-            Arc::new(object_store),
+            Arc::new(storage),
             "index".into(),
             metadata_cache,
         ));

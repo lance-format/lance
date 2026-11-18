@@ -688,14 +688,14 @@ mod tests {
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();
-        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();
         let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
             128 * 1024 * 1024,
         ));
-        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+        Arc::new(LanceIndexStore::new(storage, test_path, cache))
     }
 
     struct TestMap {

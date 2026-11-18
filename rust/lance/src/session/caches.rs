@@ -13,6 +13,7 @@
 use std::{borrow::Cow, ops::Deref};
 
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::storage::path::Path;
 use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
@@ -24,7 +25,6 @@ use lance_table::{
     },
     rowids::RowIdSequence,
 };
-use object_store::path::Path;
 
 use crate::dataset::transaction::Transaction;
 

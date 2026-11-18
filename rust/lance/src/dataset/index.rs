@@ -246,12 +246,7 @@ impl DatasetIndexRemapper {
 
         for remapped in &remapped_results {
             let intermediate_dir = self.dataset.indices_dir().join(remapped.new_id.to_string());
-            if let Err(error) = self
-                .dataset
-                .object_store
-                .remove_dir_all(intermediate_dir)
-                .await
-            {
+            if let Err(error) = self.dataset.storage.remove_dir_all(intermediate_dir).await {
                 log::warn!(
                     "Failed to remove intermediate remapped index {}: {}",
                     remapped.new_id,
@@ -400,7 +395,7 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         Ok(Self::with_format_version(
-            dataset.object_store.clone(),
+            dataset.storage.clone(),
             index_dir,
             Arc::new(cache),
             format_version,
@@ -413,9 +408,8 @@ impl LanceIndexStoreExt for LanceIndexStore {
             .join(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
-        let object_store = dataset.object_store_for_index(index).await?;
-        let store =
-            Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
+        let storage = dataset.storage_for_index(index).await?;
+        let store = Self::with_format_version(storage, index_dir, Arc::new(cache), format_version);
         Ok(store.with_file_sizes(index.file_size_map()))
     }
 }
@@ -586,7 +580,7 @@ mod tests {
         let second_segment_dir = dataset.indices_dir().join(second_segment_uuid.to_string());
         for file_name in ["index.idx", "auxiliary.idx"] {
             dataset
-                .object_store
+                .storage
                 .as_ref()
                 .copy(
                     &first_segment_dir.clone().join(file_name),
@@ -815,7 +809,7 @@ mod tests {
         index.covering_fields.push(999);
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
-            store_identity: &dataset.object_store.store_prefix,
+            store_identity: dataset.storage.store_prefix(),
             e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset

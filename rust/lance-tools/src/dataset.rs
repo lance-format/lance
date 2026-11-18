@@ -10,12 +10,12 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::write::CommitBuilder;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_file::version::ConcreteFileVersion;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use object_store::path::Path;
 
 use crate::cli::{
     LanceDatasetLocateArgs, LanceDatasetRepairArgs, LanceDatasetRestoreArgs,
@@ -58,7 +58,7 @@ pub(crate) async fn verify_data_files(
         .flat_map(|fragment| fragment.files.iter().map(move |file| (fragment, file)));
     // Limit concurrent metadata reads as well as requests: each scheduler has
     // its own memory budget, independent of the object's store concurrency.
-    let concurrency = dataset.object_store(None).await?.io_parallelism().min(16);
+    let concurrency = dataset.storage(None).await?.io_parallelism().min(16);
     let mut checks = stream::iter(files)
         .map(|(fragment, file)| {
             let dataset = &dataset;

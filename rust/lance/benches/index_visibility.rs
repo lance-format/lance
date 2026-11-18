@@ -156,9 +156,7 @@ fn bench_visibility(c: &mut Criterion) {
             ("segments", 1, true, false),
         ] {
             let fixture = runtime.block_on(Fixture::new(stable, changed, segmented, deleted));
-            let store = runtime
-                .block_on(fixture.dataset.object_store(None))
-                .unwrap();
+            let store = runtime.block_on(fixture.dataset.storage(None)).unwrap();
             let label = format!("{}/{name}", if stable { "stable" } else { "address" });
             runtime.block_on(async {
                 assert_eq!(fixture.scan().try_into_batch().await.unwrap().num_rows(), fixture.expected_rows);

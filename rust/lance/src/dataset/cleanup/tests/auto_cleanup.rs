@@ -37,11 +37,7 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     MockClock::set_system_time(TimeDelta::try_days(3).unwrap().to_std().unwrap());
     let dataset = fixture.open().await.unwrap();
     let orphan = dataset.data_dir().join(format!("{}.lance", Uuid::new_v4()));
-    dataset
-        .object_store
-        .put(&orphan, &[0u8; 1024])
-        .await
-        .unwrap();
+    dataset.storage.put(&orphan, &[0u8; 1024]).await.unwrap();
     drop(dataset);
 
     MockClock::set_system_time(TimeDelta::try_days(cleanup_day).unwrap().to_std().unwrap());
@@ -233,14 +229,10 @@ async fn dont_cleanup_recent_unverified_files() {
         assert!(fixture.append_some_data().await.is_err());
         let dataset = fixture.open().await.unwrap();
         let blob_path = dataset.base.clone().join("_blobs").join("orphan.blob");
-        dataset
-            .object_store
-            .put(&blob_path, b"orphan")
-            .await
-            .unwrap();
+        dataset.storage.put(&blob_path, b"orphan").await.unwrap();
 
         let staging_manifests = dataset
-            .object_store
+            .storage
             .read_dir_all(&dataset.versions_dir(), None)
             .try_filter_map(|meta| {
                 let relative_path = remove_prefix(&meta.location, &dataset.base);
@@ -279,7 +271,7 @@ async fn dont_cleanup_recent_unverified_files() {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(
-            dataset.object_store.exists(&blob_path).await.unwrap(),
+            dataset.storage.exists(&blob_path).await.unwrap(),
             !should_delete,
             "override={override_opt:?}, old_files={old_files}"
         );
@@ -295,7 +287,7 @@ async fn dont_cleanup_recent_unverified_files() {
             assert_eq!(removed.bytes_removed, 0);
         }
         assert_eq!(
-            dataset.object_store.exists(staging_manifest).await.unwrap(),
+            dataset.storage.exists(staging_manifest).await.unwrap(),
             !should_delete
         );
     }

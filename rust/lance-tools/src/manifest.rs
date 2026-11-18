@@ -4,6 +4,7 @@
 use crate::cli::LanceTableManifestArgs;
 use chrono::{DateTime, Utc};
 use lance_core::Result;
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_message;
 use lance_table::feature_flags::{
@@ -23,8 +24,6 @@ use lance_table::format::{
 };
 use lance_table::format::{pb, pb_actions};
 use lance_table::io::manifest::read_manifest_proto;
-use object_store::ObjectStoreExt;
-use object_store::path::Path;
 use prost::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -68,7 +67,7 @@ enum TransactionSource {
 }
 
 struct ManifestSource {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     manifest_path: Path,
     dataset_base: Option<Path>,
 }
@@ -77,18 +76,18 @@ impl LanceToolManifest {
     async fn open(args: &LanceTableManifestArgs) -> Result<Self> {
         let source = resolve_manifest_source(&args.source).await?;
         let raw_manifest =
-            read_manifest_proto(&source.object_store, &source.manifest_path, None).await?;
+            read_manifest_proto(&source.storage, &source.manifest_path, None).await?;
         let has_timestamp = raw_manifest.timestamp.is_some();
         let has_data_format = raw_manifest.data_format.is_some();
         let manifest = Manifest::try_from(raw_manifest)?;
         let indices = load_indices(
-            &source.object_store,
+            &source.storage,
             &source.manifest_path,
             manifest.index_section,
         )
         .await;
         let transaction = load_transaction(
-            &source.object_store,
+            &source.storage,
             &source.manifest_path,
             source.dataset_base.as_ref(),
             &manifest,
@@ -108,10 +107,10 @@ impl LanceToolManifest {
 }
 
 async fn resolve_manifest_source(source: &str) -> Result<ManifestSource> {
-    let (object_store, path) = crate::util::get_object_store_and_path(&source.to_string()).await?;
+    let (storage, path) = crate::util::get_storage_and_path(&source.to_string()).await?;
     let dataset_base = infer_dataset_base_from_manifest_path(&path);
     Ok(ManifestSource {
-        object_store,
+        storage,
         manifest_path: path,
         dataset_base,
     })
@@ -146,14 +145,14 @@ fn path_from_parts(parts: &[String]) -> Path {
 }
 
 async fn load_indices(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     manifest_path: &Path,
     index_section: Option<usize>,
 ) -> OptionalSection<Vec<IndexView>> {
     let Some(index_section) = index_section else {
         return OptionalSection::NotPresent;
     };
-    match read_section::<pb::IndexSection>(object_store, manifest_path, index_section).await {
+    match read_section::<pb::IndexSection>(storage, manifest_path, index_section).await {
         Ok(section) => OptionalSection::Loaded(
             section
                 .indices
@@ -169,13 +168,13 @@ async fn load_indices(
 }
 
 async fn load_transaction(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     manifest_path: &Path,
     dataset_base: Option<&Path>,
     manifest: &Manifest,
 ) -> OptionalSection<TransactionView> {
     if let Some(position) = manifest.transaction_section {
-        match read_section::<pb::Transaction>(object_store, manifest_path, position).await {
+        match read_section::<pb::Transaction>(storage, manifest_path, position).await {
             Ok(transaction) => OptionalSection::Loaded(TransactionView {
                 source: TransactionSource::Inline { position },
                 transaction,
@@ -193,7 +192,7 @@ async fn load_transaction(
             .clone()
             .join(TRANSACTIONS_DIR)
             .join(transaction_file.as_str());
-        match read_external_transaction(object_store, &path).await {
+        match read_external_transaction(storage, &path).await {
             Ok(transaction) => OptionalSection::Loaded(TransactionView {
                 source: TransactionSource::External { path },
                 transaction,
@@ -206,12 +205,11 @@ async fn load_transaction(
 }
 
 async fn read_external_transaction(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
 ) -> std::result::Result<pb::Transaction, String> {
-    let result = object_store
-        .inner
-        .get(path)
+    let result = storage
+        .read_object(path)
         .await
         .map_err(|error| format!("failed to read external transaction {path}: {error}"))?;
     let data = result.bytes().await.map_err(|error| {
@@ -222,11 +220,11 @@ async fn read_external_transaction(
 }
 
 async fn read_section<M: Message + Default>(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     manifest_path: &Path,
     position: usize,
 ) -> Result<M> {
-    let reader = object_store.open(manifest_path).await?;
+    let reader = storage.open(manifest_path).await?;
     read_message(reader.as_ref(), position).await
 }
 
@@ -1563,13 +1561,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_transaction_error_includes_path() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let mut manifest = empty_manifest();
         manifest.transaction_file = Some("1.txn".to_string());
         let manifest_path = Path::from("dataset/_versions/1.manifest");
 
         let transaction = load_transaction(
-            &object_store,
+            &storage,
             &manifest_path,
             Some(&Path::from("dataset")),
             &manifest,

@@ -12,8 +12,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use uuid::Uuid;
 
 use super::super::test_support::*;

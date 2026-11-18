@@ -3,9 +3,9 @@
 
 use std::{future::Future, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
+use crate::object_store::{ObjectMeta, path::Path};
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
-use object_store::{ObjectMeta, ObjectStore, path::Path};
 use rand::Rng;
 use tokio::time::Sleep;
 
@@ -17,8 +17,8 @@ const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// This is to handle request responses that ObjectStore doesn't handle, such as
 /// the error `error decoding response body` from queries to GCS.
 pub struct ListRetryStream {
-    object_store: Arc<dyn ObjectStore>,
-    current_stream: BoxStream<'static, object_store::Result<ObjectMeta>>,
+    storage: Arc<dyn super::StorageBackend>,
+    current_stream: BoxStream<'static, crate::object_store::Result<ObjectMeta>>,
     prefix: Option<Path>,
     last_successful_key: Option<Path>,
     is_lexically_ordered: bool,
@@ -32,13 +32,13 @@ pub struct ListRetryStream {
 
 impl ListRetryStream {
     pub fn new(
-        object_store: Arc<dyn ObjectStore>,
+        storage: Arc<dyn super::StorageBackend>,
         prefix: Option<Path>,
         max_retries: usize,
     ) -> Self {
-        let current_stream = object_store.list(prefix.as_ref());
+        let current_stream = storage.list(prefix.as_ref());
         Self {
-            object_store,
+            storage,
             current_stream,
             prefix,
             last_successful_key: None,
@@ -64,25 +64,24 @@ impl ListRetryStream {
 
     #[cfg(test)]
     fn new_with_backoff(
-        object_store: Arc<dyn ObjectStore>,
+        storage: Arc<dyn crate::object_store::StorageBackend>,
         prefix: Option<Path>,
         max_retries: usize,
         base_retry_delay: Duration,
         max_retry_delay: Duration,
     ) -> Self {
-        let mut stream = Self::new(object_store, prefix, max_retries);
+        let mut stream = Self::new(storage, prefix, max_retries);
         stream.base_retry_delay = base_retry_delay;
         stream.max_retry_delay = max_retry_delay;
         stream
     }
 
-    fn is_retryable(error: &object_store::Error) -> bool {
+    fn is_retryable(error: &crate::object_store::Error) -> bool {
         !matches!(
             error,
-            object_store::Error::NotFound { .. }
-                | object_store::Error::InvalidPath { .. }
-                | object_store::Error::NotSupported { .. }
-                | object_store::Error::NotImplemented { .. }
+            crate::object_store::Error::NotFound { .. }
+                | crate::object_store::Error::InvalidPath { .. }
+                | crate::object_store::Error::NotSupported { .. }
         )
     }
 
@@ -102,16 +101,15 @@ impl ListRetryStream {
 
     fn recreate_stream(&mut self) {
         self.current_stream = if let Some(offset) = self.last_successful_key.as_ref() {
-            self.object_store
-                .list_with_offset(self.prefix.as_ref(), offset)
+            self.storage.list_with_offset(self.prefix.as_ref(), offset)
         } else {
-            self.object_store.list(self.prefix.as_ref())
+            self.storage.list(self.prefix.as_ref())
         };
     }
 }
 
 impl Stream for ListRetryStream {
-    type Item = Result<ObjectMeta, object_store::Error>;
+    type Item = Result<ObjectMeta, crate::object_store::Error>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -176,14 +174,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
+    use crate::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult, Result as OSResult,
+    };
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::{TryStreamExt, stream};
     use object_store::memory::InMemory;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStoreExt,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
-    };
 
     fn assert_send<T: Send>() {}
 
@@ -203,22 +201,22 @@ mod tests {
         }
     }
 
-    fn retryable_error() -> object_store::Error {
-        object_store::Error::Generic {
+    fn retryable_error() -> crate::object_store::Error {
+        crate::object_store::Error::Generic {
             store: "scripted",
             source: "retryable list error".into(),
         }
     }
 
-    fn not_found_error() -> object_store::Error {
-        object_store::Error::NotFound {
+    fn not_found_error() -> crate::object_store::Error {
+        crate::object_store::Error::NotFound {
             path: "missing".to_string(),
             source: "missing".into(),
         }
     }
 
     struct ScriptedListStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
         list_streams: Mutex<VecDeque<Vec<OSResult<ObjectMeta>>>>,
         offset_streams: Mutex<VecDeque<Vec<OSResult<ObjectMeta>>>>,
         list_calls: AtomicUsize,
@@ -232,7 +230,9 @@ mod tests {
             offset_streams: Vec<Vec<OSResult<ObjectMeta>>>,
         ) -> Self {
             Self {
-                inner: InMemory::new(),
+                inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                    InMemory::new(),
+                )),
                 list_streams: Mutex::new(list_streams.into()),
                 offset_streams: Mutex::new(offset_streams.into()),
                 list_calls: AtomicUsize::new(0),
@@ -267,7 +267,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl ObjectStore for ScriptedListStore {
+    impl crate::object_store::StorageBackend for ScriptedListStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -281,7 +292,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -330,6 +341,33 @@ mod tests {
 
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
+        }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
         }
     }
 
@@ -406,7 +444,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(matches!(
             items.into_iter().next().unwrap(),
-            Err(object_store::Error::NotFound { .. })
+            Err(crate::object_store::Error::NotFound { .. })
         ));
         assert_eq!(store.list_calls(), 1);
         assert_eq!(store.offset_calls(), 0);
@@ -478,7 +516,7 @@ mod tests {
             let error = items.last().unwrap().as_ref().unwrap_err();
             assert!(matches!(
                 error,
-                object_store::Error::Generic {
+                crate::object_store::Error::Generic {
                     store: "scripted",
                     ..
                 }

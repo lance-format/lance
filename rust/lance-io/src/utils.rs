@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::traits::{ProtoStruct, Reader};
 use lance_core::{Error, Result};
 
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 pub mod tracking_store;
 
 /// Chunk size for splitting a large metadata read into concurrent range requests.
@@ -35,7 +37,7 @@ pub fn read_range_in_chunks(
     reader: &dyn Reader,
     range: Range<usize>,
     chunk_size: usize,
-) -> impl Stream<Item = object_store::Result<Bytes>> + '_ {
+) -> impl Stream<Item = crate::object_store::Result<Bytes>> + '_ {
     let end = range.end;
     let chunk_ranges = range
         .step_by(chunk_size)
@@ -211,7 +213,7 @@ pub async fn read_struct<
     T::try_from(msg)
 }
 
-pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
+pub async fn read_last_block(reader: &dyn Reader) -> crate::object_store::Result<Bytes> {
     let file_size = reader.size().await?;
     let block_size = reader.block_size();
     let begin = file_size.saturating_sub(block_size);
@@ -369,7 +371,7 @@ mod tests {
 
     use bytes::{Buf, Bytes, BytesMut};
     use futures::TryStreamExt;
-    use object_store::path::Path;
+    use lance_core::storage::path::Path;
     use prost::Message;
 
     use super::{ChunkedBuf, read_message};
@@ -421,10 +423,8 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader =
-            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
-                .unwrap();
-        let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
+        let object_reader = store.open(&path).await.unwrap();
+        let actual: BytesWrapper = read_struct(object_reader.as_ref(), pos).await.unwrap();
         assert_eq!(some_message, actual);
     }
 
@@ -451,14 +451,18 @@ mod tests {
     async fn test_read_range_in_chunks_zero_parallelism_reader() {
         // A reader advertising io_parallelism 0 (e.g. LANCE_URING_IO_PARALLELISM=0)
         // must not hang the chunked read: the window is clamped to at least 1.
-        let store = ObjectStore::memory();
+        let store = crate::object_store::backend::native::from_object_store(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
         let path = Path::from("/zero_parallelism");
         let data: Vec<u8> = (0..4096).map(|i| (i % 249) as u8).collect();
-        store.put(&path, &data).await.unwrap();
-        let reader =
-            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
-                .unwrap()
-                .with_io_parallelism(0);
+        store
+            .put(&path, Bytes::from(data.clone()).into())
+            .await
+            .unwrap();
+        let reader = CloudObjectReader::new(store, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+            .unwrap()
+            .with_io_parallelism(0);
 
         let assembled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut buf = BytesMut::new();
@@ -488,10 +492,8 @@ mod tests {
         let pos = object_writer.write_struct(&message).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
-        let object_reader =
-            CloudObjectReader::new(store.inner, path, 4096, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
-                .unwrap();
-        let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
+        let object_reader = store.open(&path).await.unwrap();
+        let actual: BytesWrapper = read_struct(object_reader.as_ref(), pos).await.unwrap();
         assert_eq!(message, actual);
     }
 

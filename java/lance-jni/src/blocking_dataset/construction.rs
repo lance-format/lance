@@ -61,20 +61,19 @@ impl BlockingDataset {
     pub fn drop(uri: &str, storage_options: HashMap<String, String>) -> Result<()> {
         block_on(async move {
             let registry = Arc::new(ObjectStoreRegistry::default());
-            let object_store_params = ObjectStoreParams {
+            let storage_params = ObjectStoreParams {
                 storage_options_accessor: Some(Arc::new(
                     lance::io::StorageOptionsAccessor::with_static_options(storage_options),
                 )),
                 ..Default::default()
             };
-            let (object_store, path) =
-                ObjectStore::from_uri_and_params(registry, uri, &object_store_params)
-                    .await
-                    .map_err(|e| Error::io_error(e.to_string()))?;
-            lance::dataset::validate_dataset_root_for_drop(&object_store, &path)
+            let (storage, path) = ObjectStore::from_uri_and_params(registry, uri, &storage_params)
+                .await
+                .map_err(|e| Error::io_error(e.to_string()))?;
+            lance::dataset::validate_dataset_root_for_drop(&storage, &path)
                 .await
                 .map_err(|e| Error::input_error(e.to_string()))?;
-            object_store
+            storage
                 .remove_dir_all(path)
                 .await
                 .map_err(|e| Error::io_error(e.to_string()))

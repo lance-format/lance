@@ -18,6 +18,7 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream::BoxStream};
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::storage::path::Path;
 use lance_encoding::{
     EncodingsIo,
     decoder::{
@@ -27,7 +28,6 @@ use lance_encoding::{
     encoder::EncodedBatch,
 };
 use log::debug;
-use object_store::path::Path;
 use prost::Message;
 
 use lance_core::{
@@ -2769,7 +2769,7 @@ mod tests {
             },
         )
         .await;
-        let raw = fs.object_store.read_one_all(&fs.tmp_path).await.unwrap();
+        let raw = fs.storage.read_one_all(&fs.tmp_path).await.unwrap();
         let payload_ranges = payloads
             .iter()
             .map(|payload| {
@@ -2780,10 +2780,10 @@ mod tests {
                 start as u64..(start + payload.len()) as u64
             })
             .collect::<Vec<_>>();
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let scheduler = fs
             .scheduler
-            .open_reader(fs.object_store.open(&fs.tmp_path).await.unwrap().into());
+            .open_reader(fs.storage.open(&fs.tmp_path).await.unwrap().into());
         let field_id = written.schema.field("images").unwrap().id;
         let cache = test_cache();
         let options = FileReaderOptions {
@@ -2823,7 +2823,7 @@ mod tests {
         for batch in batches {
             assert_eq!(batch.column(0).as_list::<i32>().value_length(0), 1);
         }
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert!(stats.read_iops > 0);
         for request in stats.requests {
             if let Some(range) = request.range {
@@ -2857,7 +2857,7 @@ mod tests {
             3
         );
         assert_eq!(
-            fs.object_store.io_stats_incremental().read_iops,
+            fs.storage.io_stats_incremental().read_iops,
             0,
             "repeated structural reads should reuse cached metadata without retaining payloads"
         );
@@ -2920,7 +2920,7 @@ mod tests {
             FileWriterOptions::default(),
         )
         .await;
-        let raw = fs.object_store.read_one_all(&fs.tmp_path).await.unwrap();
+        let raw = fs.storage.read_one_all(&fs.tmp_path).await.unwrap();
         let payload_ranges = [0, 1024, 2999].map(|index| {
             let start = raw
                 .windows(32)
@@ -2928,10 +2928,10 @@ mod tests {
                 .unwrap();
             start as u64..(start + 32) as u64
         });
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let scheduler = fs
             .scheduler
-            .open_reader(fs.object_store.open(&fs.tmp_path).await.unwrap().into());
+            .open_reader(fs.storage.open(&fs.tmp_path).await.unwrap().into());
         let options = FileReaderOptions {
             decoder_config: DecoderConfig {
                 list_structure: Arc::new(BTreeMap::from([(
@@ -3002,7 +3002,7 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert!(stats.read_iops > 0);
         for request in stats.requests {
             if let Some(range) = request.range {
@@ -3754,7 +3754,7 @@ mod tests {
         .await;
 
         let mut bytes = fs
-            .object_store
+            .storage
             .read_one_all(&fs.tmp_path)
             .await
             .unwrap()
@@ -3771,7 +3771,7 @@ mod tests {
         );
         let patch_start = matches[0] + patch_offset;
         bytes[patch_start..patch_start + patch.len()].copy_from_slice(patch);
-        fs.object_store.put(&fs.tmp_path, &bytes).await.unwrap();
+        fs.storage.put(&fs.tmp_path, &bytes).await.unwrap();
 
         let file_scheduler = fs
             .scheduler
@@ -3813,7 +3813,7 @@ mod tests {
         .await;
 
         let mut bytes = fs
-            .object_store
+            .storage
             .read_one_all(&fs.tmp_path)
             .await
             .unwrap()
@@ -3821,7 +3821,7 @@ mod tests {
         // V2.1 places this column's first mini-block metadata word at byte zero.
         // The issue's mutation makes its non-final item count exceed the page total.
         bytes[0] ^= 0xf7;
-        fs.object_store.put(&fs.tmp_path, &bytes).await.unwrap();
+        fs.storage.put(&fs.tmp_path, &bytes).await.unwrap();
 
         let file_scheduler = fs
             .scheduler
@@ -4031,7 +4031,7 @@ mod tests {
         use arrow_array::{Array, Float16Array, Int64Array, LargeListArray};
 
         let fs = FsFixture::default();
-        fs.object_store
+        fs.storage
             .put(
                 &fs.tmp_path,
                 include_bytes!("../../../test_data/v6.0.1/wrapped_bitpacked_levels.lance"),
@@ -4103,9 +4103,9 @@ mod tests {
 
         let WrittenFile { data, .. } = create_some_file(&fs, ConcreteFileVersion::V2_0).await;
 
-        let file_size = fs.object_store.size(&fs.tmp_path).await.unwrap() as usize;
+        let file_size = fs.storage.size(&fs.tmp_path).await.unwrap() as usize;
         let footer = fs
-            .object_store
+            .storage
             .open(&fs.tmp_path)
             .await
             .unwrap()
@@ -4114,7 +4114,7 @@ mod tests {
             .unwrap();
         assert_eq!(footer_version(&footer), (0, 3));
         assert_eq!(
-            crate::determine_file_version(&fs.object_store, &fs.tmp_path, Some(file_size))
+            crate::determine_file_version(&fs.storage, &fs.tmp_path, Some(file_size))
                 .await
                 .unwrap(),
             ConcreteFileVersion::V2_0
@@ -4508,11 +4508,11 @@ mod tests {
             .map(|(_, length)| *length)
             .sum::<u64>();
         assert!(
-            total_metadata_bytes > 8 * fs.object_store.block_size() as u64,
+            total_metadata_bytes > 8 * fs.storage.block_size() as u64,
             "test file metadata is too small to prove lazy loading: {total_metadata_bytes} bytes"
         );
 
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let tasks = lazy_reader
             .read_tasks(
                 lance_io::ReadBatchParams::Range(0..0),
@@ -4525,7 +4525,7 @@ mod tests {
         let batches = collect_read_tasks(tasks, 1).await;
         assert!(batches.is_empty());
 
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert!(
             stats.read_bytes < total_metadata_bytes / 2,
             "lazy read fetched too much metadata: read {} bytes, requested column metadata is {} bytes, total column metadata is {} bytes",
@@ -4534,7 +4534,7 @@ mod tests {
             total_metadata_bytes
         );
 
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let tasks = lazy_reader
             .read_tasks(
                 lance_io::ReadBatchParams::Range(0..0),
@@ -4547,7 +4547,7 @@ mod tests {
         let batches = collect_read_tasks(tasks, 1).await;
         assert!(batches.is_empty());
 
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert_eq!(
             stats.read_iops, 0,
             "cached column metadata should avoid repeat metadata I/O"
@@ -4586,7 +4586,7 @@ mod tests {
         .await
         .unwrap();
 
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let tasks = lazy_reader
             .read_tasks(
                 lance_io::ReadBatchParams::Range(0..0),
@@ -4599,7 +4599,7 @@ mod tests {
         let batches = collect_read_tasks(tasks, 1).await;
         assert!(batches.is_empty());
 
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert_eq!(
             stats.read_iops, 0,
             "column metadata already captured by the tail read must not be fetched again"
@@ -4677,7 +4677,7 @@ mod tests {
         )
         .await
         .unwrap();
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let tasks = lazy_reader
             .read_tasks(
                 lance_io::ReadBatchParams::Range(0..0),
@@ -4688,7 +4688,7 @@ mod tests {
             .await
             .unwrap();
         assert!(collect_read_tasks(tasks, 1).await.is_empty());
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert_eq!(
             stats.read_iops, 1,
             "only the column outside the tail window needs a request"
@@ -4766,7 +4766,7 @@ mod tests {
             .sum::<u64>();
         assert!(total_metadata_bytes > requested_metadata_bytes * 8);
 
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let tasks = lazy_reader
             .read_tasks(
                 lance_io::ReadBatchParams::Range(0..0),
@@ -4777,7 +4777,7 @@ mod tests {
             .await
             .unwrap();
         assert!(collect_read_tasks(tasks, 1).await.is_empty());
-        let metadata_stats = fs.object_store.io_stats_incremental();
+        let metadata_stats = fs.storage.io_stats_incremental();
         assert!(
             metadata_stats.read_bytes < total_metadata_bytes / 2,
             "lazy {shape} read fetched too much metadata: read {} bytes, requested column metadata is {} bytes, total column metadata is {} bytes",
@@ -5000,7 +5000,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = versions::v2_1::create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             FileWriterOptions::default(),
         )
@@ -5239,13 +5239,13 @@ mod tests {
         // The first read also initializes the page metadata; the cache keeps
         // it, so the second read is data I/O only.
         read_all().await;
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let batches = read_all().await;
         assert_eq!(
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             100_000
         );
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert_eq!(
             stats.read_iops, 1,
             "{num_pages} adjacent pages must be read together, not one request each"
@@ -5437,9 +5437,9 @@ mod tests {
         // The first take also initializes the page metadata; the cache keeps
         // it, so the second take is data I/O only.
         take(3).await;
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
         let batches = take(200).await;
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert_eq!(
             stats.read_iops, 1,
             "one row across 16 adjacent column pages must be one request, not one per column"
@@ -5674,7 +5674,7 @@ mod tests {
             .unwrap();
 
         let mut file_writer = versions::v2_1::create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema,
             FileWriterOptions::default(),
         )
@@ -5832,7 +5832,7 @@ mod tests {
         write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
 
         let mut file_bytes = fs
-            .object_store
+            .storage
             .read_one_all(&fs.tmp_path)
             .await
             .unwrap()
@@ -5848,10 +5848,7 @@ mod tests {
         };
         file_bytes[gbo_table_start..gbo_table_start + 8].copy_from_slice(&position.to_le_bytes());
         file_bytes[gbo_table_start + 8..gbo_table_start + 16].copy_from_slice(&size.to_le_bytes());
-        fs.object_store
-            .put(&fs.tmp_path, &file_bytes)
-            .await
-            .unwrap();
+        fs.storage.put(&fs.tmp_path, &file_bytes).await.unwrap();
 
         let scheduler = fs
             .scheduler
@@ -5886,7 +5883,7 @@ mod tests {
     async fn test_read_global_buffer(#[case] within_window: bool) {
         let fs = FsFixture::default();
 
-        let block_size = fs.object_store.block_size();
+        let block_size = fs.storage.block_size();
         let buffer = if within_window {
             Bytes::from_static(b"hello")
         } else {
@@ -5918,12 +5915,12 @@ mod tests {
         assert_eq!(retained.contains_key(&1), within_window);
 
         // Reset the IO counters so we only measure the read_global_buffer call.
-        fs.object_store.io_stats_incremental();
+        fs.storage.io_stats_incremental();
 
         let buf = file_reader.read_global_buffer(1).await.unwrap();
         assert_eq!(buf, buffer);
 
-        let stats = fs.object_store.io_stats_incremental();
+        let stats = fs.storage.io_stats_incremental();
         assert_eq!(stats.read_iops, expected_read_iops);
     }
 

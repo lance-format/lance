@@ -67,7 +67,7 @@ use super::scanner::exec::validate_pk_types;
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
 use super::schema_with_tombstone;
-use super::util::{derived_store_params, generate_mem_wal_dir_id, mem_wal_path, sstable_uri};
+use super::util::{generate_mem_wal_dir_id, mem_wal_path, sstable_uri};
 use super::write::ShardWriter;
 use super::{FreezeFence, ShardWriterConfig};
 
@@ -343,7 +343,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
 async fn mint_mem_wal_dir_id(dataset: &Dataset) -> Result<String> {
     use futures::StreamExt;
 
-    let store = dataset.object_store(None).await?;
+    let store = dataset.storage(None).await?;
     let base_path = dataset.branch_location().path;
     loop {
         let dir_id = generate_mem_wal_dir_id(dataset.uri());
@@ -778,9 +778,8 @@ impl DatasetMemWalExt for Dataset {
             return Ok(Vec::new());
         };
         let prefix = mem_wal_path(&self.branch_location().path, &details.dir_id);
-        let object_store = self.object_store(None).await?;
-        let list_result = object_store
-            .inner
+        let storage = self.storage(None).await?;
+        let list_result = storage
             .list_with_delimiter(Some(&prefix))
             .await
             .map_err(|e| {
@@ -808,7 +807,7 @@ impl DatasetMemWalExt for Dataset {
     ) -> Result<()> {
         let session = self.session();
         // Every open below targets a generation URI, never the base's own.
-        let store_params = self.store_params().map(derived_store_params);
+        let store_params = self.store_params().cloned();
         // Resolve SSTable paths exactly as the LSM collector does, so the
         // session/cache entries we warm key-match the paths later lookups open.
         let dir_id = self
@@ -862,7 +861,7 @@ impl DatasetMemWalExt for Dataset {
         // would discard the store params the dataset was opened with, signing WAL
         // writes with the ambient identity. Mirrors `list_mem_wal_latest_shard_ids`.
         let base_uri = self.uri();
-        let store = self.object_store(None).await?;
+        let store = self.storage(None).await?;
         let base_path = self.branch_location().path;
 
         // Create ShardWriter
@@ -1674,7 +1673,7 @@ mod tests {
             .unwrap()
             .dir_id;
 
-        let store = dataset.object_store(None).await.unwrap();
+        let store = dataset.storage(None).await.unwrap();
         let base_path = dataset.branch_location().path;
         let ours = Uuid::new_v4();
         for (dir, shard) in [
@@ -1684,9 +1683,7 @@ mod tests {
         ] {
             let path = super::super::util::shard_manifest_path(&base_path, dir, &shard)
                 .join("version_hint.json");
-            object_store::ObjectStoreExt::put(store.inner.as_ref(), &path, b"{}".to_vec().into())
-                .await
-                .unwrap();
+            store.put(&path, b"{}").await.unwrap();
         }
 
         assert_eq!(

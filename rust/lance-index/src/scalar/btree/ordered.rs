@@ -1656,10 +1656,10 @@ mod tests {
         // them never reaches the object store.
         const PAGE_SIZE: u64 = 4096;
         let rows: Vec<Row> = (0..8 * PAGE_SIZE).map(|i| (Some(i as i32), i)).collect();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1675,7 +1675,7 @@ mod tests {
         let index = BTreeIndex::load(store.clone(), None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
-        let take_reads = || object_store.io_stats_incremental().read_iops;
+        let take_reads = || storage.io_stats_incremental().read_iops;
         take_reads();
         let page_file = store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
         let open_reads = take_reads();

@@ -106,9 +106,9 @@ mod tests {
         let expected_sum: f64 = vals.iter().sum();
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let mut writer = create_v2_3_writer_with_compression(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema,
             FileWriterOptions::default(),
             CompressionParams::new(),
@@ -269,7 +269,7 @@ mod tests {
         let input = UInt64Array::new(ScalarBuffer::new(buffer, 0, 4096), None).slice(17, 32);
         let batch = RecordBatch::try_from_iter([("id", Arc::new(input) as ArrayRef)]).unwrap();
         let fs = FsFixture::default();
-        let sink = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let sink = fs.storage.create(&fs.tmp_path).await.unwrap();
         let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
         let mut writer = versions::create_writer(
             ConcreteFileVersion::V2_1,
@@ -460,7 +460,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             version,
             FileWriterOptions::default(),
@@ -572,7 +572,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             version,
             FileWriterOptions::default(),
@@ -753,7 +753,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             version,
             FileWriterOptions::default(),
@@ -865,7 +865,7 @@ mod tests {
         // A lazy-schema writer cannot infer the schema from a single column.
         let fs = FsFixture::default();
         let mut lazy_writer = versions::v2_1::create_lazy_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             FileWriterOptions::default(),
         );
         let err = lazy_writer
@@ -887,7 +887,7 @@ mod tests {
         // An out-of-bounds field index is rejected, naming the index and count.
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             ConcreteFileVersion::V2_1,
             FileWriterOptions::default(),
@@ -971,7 +971,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             file_schema,
             version,
             FileWriterOptions::default(),
@@ -1008,7 +1008,7 @@ mod tests {
             LanceSchema::try_from(&ArrowSchema::new(vec![json_field("j", true)])).unwrap();
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             file_schema,
             version,
             FileWriterOptions::default(),
@@ -1074,7 +1074,7 @@ mod tests {
         let fs = FsFixture::default();
         let result = async {
             let mut writer = create_writer(
-                fs.object_store.create(&fs.tmp_path).await?,
+                fs.storage.create(&fs.tmp_path).await?,
                 LanceSchema::try_from(schema.as_ref())?,
                 version,
                 FileWriterOptions::default(),
@@ -1126,7 +1126,7 @@ mod tests {
         let fs = FsFixture::default();
         let result = async {
             let mut writer = create_writer(
-                fs.object_store.create(&fs.tmp_path).await?,
+                fs.storage.create(&fs.tmp_path).await?,
                 LanceSchema::try_from(schema.as_ref())?,
                 version,
                 FileWriterOptions::default(),
@@ -1169,7 +1169,7 @@ mod tests {
         let fs = FsFixture::default();
         let result = async {
             let mut writer = create_writer(
-                fs.object_store.create(&fs.tmp_path).await?,
+                fs.storage.create(&fs.tmp_path).await?,
                 LanceSchema::try_from(schema.as_ref())?,
                 version,
                 FileWriterOptions::default(),
@@ -1231,7 +1231,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             ConcreteFileVersion::V2_0,
             FileWriterOptions::default(),
@@ -1320,7 +1320,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
             version,
             FileWriterOptions::default(),
@@ -1382,7 +1382,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             version,
             FileWriterOptions::default(),
@@ -1450,7 +1450,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
             version,
             FileWriterOptions::default(),
@@ -1517,7 +1517,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema,
             ConcreteFileVersion::V2_0,
             FileWriterOptions::default(),
@@ -1587,7 +1587,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema,
             ConcreteFileVersion::V2_0,
             FileWriterOptions::default(),
@@ -1754,7 +1754,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
             version,
             FileWriterOptions::default(),
@@ -1841,7 +1841,7 @@ mod tests {
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            fs.storage.create(&fs.tmp_path).await.unwrap(),
             lance_schema,
             ConcreteFileVersion::V2_1,
             FileWriterOptions::default(),
@@ -1895,9 +1895,9 @@ mod tests {
         };
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let mut writer = create_writer(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema,
             ConcreteFileVersion::V2_0,
             options,
@@ -1967,8 +1967,8 @@ mod tests {
     #[tokio::test]
     async fn test_zero_max_page_bytes_rejected(#[case] lazy: bool) {
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let object_writer = object_store.create(&path).await.unwrap();
+        let storage = ObjectStore::local();
+        let object_writer = storage.create(&path).await.unwrap();
         let options = FileWriterOptions {
             max_page_bytes: Some(0),
             ..Default::default()
@@ -1998,8 +1998,8 @@ mod tests {
     #[tokio::test]
     async fn test_v2_0_writer_rejects_zero_max_page_bytes() {
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let object_writer = object_store.create(&path).await.unwrap();
+        let storage = ObjectStore::local();
+        let object_writer = storage.create(&path).await.unwrap();
         let schema = LanceSchema::try_from(&Schema::new(vec![Field::new(
             "data",
             DataType::UInt64,
@@ -2020,8 +2020,8 @@ mod tests {
     #[tokio::test]
     async fn test_v2_1_lazy_writer_rejects_zero_max_page_bytes() {
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let object_writer = object_store.create(&path).await.unwrap();
+        let storage = ObjectStore::local();
+        let object_writer = storage.create(&path).await.unwrap();
         let options = FileWriterOptions {
             max_page_bytes: Some(0),
             ..Default::default()
@@ -2055,9 +2055,9 @@ mod tests {
         };
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let mut writer = create_writer(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema.clone(),
             ConcreteFileVersion::V2_1,
             options,
@@ -2187,10 +2187,10 @@ mod tests {
 
         // Write the file
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
 
         let mut writer = create_v2_1_writer_with_compression(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
             params,
@@ -2209,7 +2209,7 @@ mod tests {
         };
 
         let mut writer_no_compression = create_writer(
-            object_store.create(&path_no_compression).await.unwrap(),
+            storage.create(&path_no_compression).await.unwrap(),
             lance_schema.clone(),
             ConcreteFileVersion::V2_1,
             default_options,
@@ -2315,13 +2315,13 @@ mod tests {
         .unwrap();
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
 
         // Create encoding strategy that will read from field metadata
         let params = CompressionParams::new();
         let options = FileWriterOptions::default();
         let mut writer = create_v2_1_writer_with_compression(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
             params,
@@ -2405,13 +2405,13 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(status_array)]).unwrap();
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
 
         // Create encoding strategy that will read from field metadata
         let params = CompressionParams::new();
         let options = FileWriterOptions::default();
         let mut writer = create_v2_1_writer_with_compression(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
             params,
@@ -2482,9 +2482,9 @@ mod tests {
         .unwrap();
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let mut writer = create_v2_3_writer_with_compression(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema.clone(),
             FileWriterOptions::default(),
             CompressionParams::new(),
@@ -2590,9 +2590,9 @@ mod tests {
         .unwrap();
 
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let mut writer = create_v2_3_writer_with_compression(
-            object_store.create(&path).await.unwrap(),
+            storage.create(&path).await.unwrap(),
             lance_schema.clone(),
             FileWriterOptions::default(),
             CompressionParams::new(),
@@ -2716,7 +2716,7 @@ mod tests {
         let path = fs.tmp_path;
 
         let mut writer = create_writer(
-            fs.object_store.create(&path).await.unwrap(),
+            fs.storage.create(&path).await.unwrap(),
             lance_schema.clone(),
             ConcreteFileVersion::V2_1,
             options,
@@ -2728,7 +2728,7 @@ mod tests {
         assert_eq!(write_summary.num_rows, 2);
         assert_eq!(
             write_summary.size_bytes,
-            fs.object_store.size(&path).await.unwrap()
+            fs.storage.size(&path).await.unwrap()
         );
 
         // Read back with split configuration
@@ -2809,11 +2809,11 @@ mod tests {
 
     async fn write_and_read_batches(
         batches: &[RecordBatch],
-        spill: Option<(Arc<ObjectStore>, object_store::path::Path)>,
+        spill: Option<(Arc<ObjectStore>, lance_core::storage::path::Path)>,
     ) -> Vec<RecordBatch> {
         let fs = FsFixture::default();
         let lance_schema = LanceSchema::try_from(batches[0].schema().as_ref()).unwrap();
-        let writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let writer = fs.storage.create(&fs.tmp_path).await.unwrap();
         let mut file_writer = create_writer(
             writer,
             lance_schema,

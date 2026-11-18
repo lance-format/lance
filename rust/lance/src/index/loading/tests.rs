@@ -429,7 +429,7 @@ async fn test_resolve_index_column_nested_field() {
 #[case::v3(IndexFileVersion::V3)]
 #[case::legacy(IndexFileVersion::Legacy)]
 #[tokio::test]
-async fn test_vector_cache_uses_current_object_store(#[case] index_version: IndexFileVersion) {
+async fn test_vector_cache_uses_current_storage(#[case] index_version: IndexFileVersion) {
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
     let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
@@ -490,7 +490,7 @@ async fn test_vector_cache_uses_current_object_store(#[case] index_version: Inde
     )
     .await
     .unwrap();
-    let dataset_a = dataset.with_object_store(store_a.clone(), Some(store_params_a));
+    let dataset_a = dataset.with_storage(store_a.clone(), Some(store_params_a));
 
     let store_params_b = ObjectStoreParams {
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
@@ -509,7 +509,7 @@ async fn test_vector_cache_uses_current_object_store(#[case] index_version: Inde
     .await
     .unwrap();
     assert!(!Arc::ptr_eq(&store_a, &store_b));
-    let dataset_b = dataset.with_object_store(store_b.clone(), Some(store_params_b));
+    let dataset_b = dataset.with_storage(store_b.clone(), Some(store_params_b));
 
     let _ = store_a.io_stats_incremental();
     let _ = store_b.io_stats_incremental();

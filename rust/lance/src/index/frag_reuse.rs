@@ -11,6 +11,7 @@ use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
@@ -24,7 +25,6 @@ use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
 use lance_table::transaction::RewriteGroup;
-use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -837,7 +837,7 @@ pub async fn load_frag_reuse_index_details(
                 .index_cache
                 .get_or_insert_with_key(
                     FragReuseDetailsKey {
-                        store_identity: &store.store_prefix,
+                        store_identity: store.store_prefix(),
                         path: &path,
                         offset: external_file.offset,
                         size: external_file.size,
@@ -865,7 +865,7 @@ async fn fri_external_location(
         .indice_files_dir(index)?
         .join(index.uuid.to_string())
         .join(file.path.as_str());
-    Ok((dataset.object_store_for_index(index).await?, path))
+    Ok((dataset.storage_for_index(index).await?, path))
 }
 
 async fn read_fri_external_range(
@@ -970,7 +970,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
             .indices_dir()
             .join(index_id.to_string())
             .join(FRAG_REUSE_DETAILS_FILE_NAME);
-        let mut writer = dataset.object_store.create(&file_path).await?;
+        let mut writer = dataset.storage.create(&file_path).await?;
         writer
             .write_all(new_index_details_proto.encode_to_vec().as_slice())
             .await?;
@@ -1012,7 +1012,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
             .index_cache
             .insert_with_key(
                 &FragReuseDetailsKey {
-                    store_identity: &store.store_prefix,
+                    store_identity: store.store_prefix(),
                     path: &path,
                     offset: file.offset,
                     size: file.size,
@@ -1262,7 +1262,7 @@ async fn validate_folded_deletions(
                     .extract_path(dataset.session.store_registry())?,
             };
             let directory = base.join("_fri").join(reference.map_id.as_str());
-            let store = dataset.object_store(reference.base_id).await?;
+            let store = dataset.storage(reference.base_id).await?;
             let metadata_cache = dataset.metadata_cache.file_metadata_cache(&directory);
             let store =
                 LanceIndexStore::new(store, directory, Arc::new(metadata_cache)).with_file_sizes(
@@ -2239,7 +2239,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
 ) -> lance_core::Result<IndexMetadata> {
     let index_id = Uuid::new_v4();
     let details_value = encode_tagged_frag_reuse_details(
-        &dataset.object_store,
+        &dataset.storage,
         dataset.indices_dir(),
         index_id,
         content,
@@ -2272,7 +2272,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
 /// spilling to `<indices_dir>/<index_id>/details.binpb` above the inline
 /// threshold.
 async fn encode_tagged_frag_reuse_details(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     indices_dir: Path,
     index_id: Uuid,
     content: Vec<u8>,
@@ -2281,7 +2281,7 @@ async fn encode_tagged_frag_reuse_details(
         let file_path = indices_dir
             .join(index_id.to_string())
             .join(FRAG_REUSE_DETAILS_FILE_NAME);
-        let mut writer = object_store.create(&file_path).await?;
+        let mut writer = storage.create(&file_path).await?;
         writer.write_all(&content).await?;
         writer.shutdown().await?;
         let external_file = ExternalFile {
@@ -2704,7 +2704,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
             .join(FRAG_REUSE_DIR)
             .join(reference.map_id.as_str());
         let mut mapping_size = None;
-        let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
+        let mut stream = dataset.storage.read_dir_all(&map_dir, None);
         loop {
             match stream.try_next().await {
                 Ok(Some(meta)) => {
@@ -3338,7 +3338,7 @@ mod tests {
             .clone()
             .join(crate::dataset::TRANSACTIONS_DIR)
             .join(transaction_file);
-        assert!(dataset.object_store.exists(&path).await.unwrap());
+        assert!(dataset.storage.exists(&path).await.unwrap());
     }
 
     /// A 0 -> 1 lift reinterprets the committed v0 bytes without re-encoding
@@ -4533,7 +4533,7 @@ mod tests {
         pub(super) async fn list_fri_map_dirs(dataset: &Dataset) -> Vec<String> {
             let prefix = dataset.base.clone().join("_fri");
             let mut ids = HashSet::new();
-            let mut stream = dataset.object_store.read_dir_all(&prefix, None);
+            let mut stream = dataset.storage.read_dir_all(&prefix, None);
             loop {
                 match stream.try_next().await {
                     Ok(Some(meta)) => {
@@ -4637,14 +4637,12 @@ mod tests {
             async fn resolve_latest_location(
                 &self,
                 base_path: &Path,
-                object_store: &ObjectStore,
+                storage: &ObjectStore,
             ) -> lance_core::Result<ManifestLocation> {
                 if base_path.as_ref().ends_with(self.fail_suffix) {
                     return Err(Error::io("injected resolver outage"));
                 }
-                self.inner
-                    .resolve_latest_location(base_path, object_store)
-                    .await
+                self.inner.resolve_latest_location(base_path, storage).await
             }
 
             async fn commit(
@@ -4652,7 +4650,7 @@ mod tests {
                 manifest: &mut Manifest,
                 indices: Option<Vec<IndexMetadata>>,
                 base_path: &Path,
-                object_store: &ObjectStore,
+                storage: &ObjectStore,
                 manifest_writer: ManifestWriter,
                 naming_scheme: ManifestNamingScheme,
                 transaction: Option<lance_table::format::Transaction>,
@@ -4662,7 +4660,7 @@ mod tests {
                         manifest,
                         indices,
                         base_path,
-                        object_store,
+                        storage,
                         manifest_writer,
                         naming_scheme,
                         transaction,
@@ -5082,7 +5080,7 @@ mod tests {
         async fn list_index_dirs(dataset: &Dataset) -> Vec<String> {
             let prefix = dataset.base.clone().join(crate::dataset::INDICES_DIR);
             let mut ids = HashSet::new();
-            let mut stream = dataset.object_store.read_dir_all(&prefix, None);
+            let mut stream = dataset.storage.read_dir_all(&prefix, None);
             loop {
                 match stream.try_next().await {
                     Ok(Some(meta)) => {
@@ -5401,7 +5399,7 @@ mod tests {
                 None,
             );
             let error = crate::io::commit::commit_new_dataset(
-                &dataset.object_store,
+                &dataset.storage,
                 None,
                 &dataset.commit_handler,
                 &clone.base,
@@ -5461,11 +5459,11 @@ mod tests {
             // The directory still lists a file, so only the mapping file's
             // own presence can catch this.
             dataset
-                .object_store
+                .storage
                 .put(&map_dir.join("stray.bin"), b"x")
                 .await
                 .unwrap();
-            dataset.object_store.delete(&mapping).await.unwrap();
+            dataset.storage.delete(&mapping).await.unwrap();
 
             let version = dataset.manifest.version;
             let error = dataset
@@ -5489,7 +5487,7 @@ mod tests {
             let clone_uri = format!("{}/deep", clone_dir.as_str());
             let (mut dataset, _, mapping) = tagged_source(source_dir.as_str()).await;
             let bytes = dataset
-                .object_store
+                .storage
                 .open(&mapping)
                 .await
                 .unwrap()
@@ -5497,7 +5495,7 @@ mod tests {
                 .await
                 .unwrap();
             dataset
-                .object_store
+                .storage
                 .put(&mapping, &bytes[..bytes.len() - 1])
                 .await
                 .unwrap();
@@ -5725,7 +5723,7 @@ mod tests {
             // The persisted form (the manifest round-trip truncates
             // `created_at`), which is what byte-identical carry-over yields.
             let stored = lance_table::io::manifest::read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -6113,7 +6111,7 @@ mod tests {
             harness.destinations[destination].id,
             harness.read_version,
             &deletion_vector,
-            &harness.dataset.object_store,
+            &harness.dataset.storage,
             0,
         )
         .await
@@ -6313,7 +6311,7 @@ mod tests {
             0,
             dataset.manifest.version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.storage,
             0,
         )
         .await
@@ -6364,7 +6362,7 @@ mod tests {
             0,
             dataset.manifest.version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.storage,
             0,
         )
         .await
@@ -6391,7 +6389,7 @@ mod tests {
             destinations[1].id,
             read_version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.storage,
             0,
         )
         .await
@@ -6503,7 +6501,7 @@ mod tests {
             fragment.id,
             read_version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.storage,
             0,
         )
         .await
@@ -6653,7 +6651,7 @@ mod tests {
                 frag.id,
                 base_version,
                 &deletion_vector,
-                &dataset.object_store,
+                &dataset.storage,
                 0,
             )
             .await
@@ -6825,7 +6823,7 @@ mod tests {
             0,
             harness.read_version,
             &forged,
-            &harness.dataset.object_store,
+            &harness.dataset.storage,
             0,
         )
         .await

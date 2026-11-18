@@ -12,6 +12,7 @@ use lance_arrow::{
     BLOB_V2_EXT_NAME,
 };
 use lance_core::datatypes::{NullabilityComparison, OnMissing, OnTypeMismatch};
+use lance_core::storage::path::Path;
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };
@@ -36,7 +37,6 @@ use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
-use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -181,7 +181,7 @@ impl Dataset {
 
         let mut preprocessor = if has_blob || blob_ids.is_some() {
             let data_dir = self.data_file_dir_for_base(target.base_id)?;
-            let object_store = self.object_store(target.base_id).await?;
+            let storage = self.storage(target.base_id).await?;
             let external_base_resolver = blob_v2_external_base_resolver(
                 Some(self),
                 &WriteParams::default(),
@@ -190,7 +190,7 @@ impl Dataset {
             .await?;
             Some(
                 BlobPreprocessor::new(
-                    object_store.as_ref().clone(),
+                    storage.as_ref().clone(),
                     data_dir,
                     target.data_file_key().to_string(),
                     target.schema.as_ref(),
@@ -215,7 +215,7 @@ impl Dataset {
         let path = target
             .parts_dir(&self.data_file_dir_for_base(target.base_id)?)
             .join(file_name.as_str());
-        let store = self.object_store(target.base_id).await?;
+        let store = self.storage(target.base_id).await?;
         let mut writer = V2WriterAdapter::new(
             file_versions::create_writer(
                 target.version,
@@ -295,7 +295,7 @@ impl Dataset {
         let opened = DataFilePart::open_all(self, target, ordered_parts).await?;
         let data_dir = self.data_file_dir_for_base(target.base_id)?;
         let output_path = target.object_path(&data_dir);
-        let object_store = self.object_store(target.base_id).await?;
+        let storage = self.storage(target.base_id).await?;
         let mut concat_target = FileConcatTarget::new(target.version, target.schema.clone());
         if let Some(blob_target_id) = target.blob_target_id() {
             concat_target = concat_target.with_blob_target_id(blob_target_id);
@@ -304,9 +304,9 @@ impl Dataset {
             &concat_target,
             &opened,
             {
-                let object_store = object_store.clone();
+                let storage = storage.clone();
                 let output_path = output_path.clone();
-                move || async move { object_store.create(&output_path).await }
+                move || async move { storage.create(&output_path).await }
             },
             FileConcatOptions::default(),
         )
@@ -579,7 +579,7 @@ pub struct WriteParams {
 
     /// Default object store params for the write.
     ///
-    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// ObjectStore options may carry base-scoped entries (`base_<id>.<key>`) that
     /// apply only to the registered base path with that id, overriding the
     /// unscoped options that every base inherits.
     pub store_params: Option<ObjectStoreParams>,
@@ -603,8 +603,8 @@ pub struct WriteParams {
     /// If not set, the default will be based on the object store.  Generally this will
     /// be RenameCommitHandler unless the object store does not handle atomic renames (e.g. S3)
     ///
-    /// If a custom object store is provided (via store_params.object_store) then this
-    /// must also be provided.
+    /// Custom storage providers must supply a commit handler when the URI scheme
+    /// has no built-in commit protocol.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
 
     /// The format version to use when writing data.
@@ -937,7 +937,7 @@ fn balanced_row_counts(total_rows: usize, max_rows_per_file: usize) -> VecDeque<
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
     mut buffered_reader: futures::stream::BoxStream<'static, Result<Vec<RecordBatch>>>,
@@ -965,7 +965,7 @@ where
     };
     let cleanup_bases = target_bases_info.clone();
     let writer_generator = WriterGenerator::new(
-        object_store.clone(),
+        storage.clone(),
         base_dir,
         schema,
         open_writer,
@@ -1218,13 +1218,7 @@ where
         // Drop the writer so its in-progress file is cleaned up (LocalWriter
         // removes its temp file; ObjectWriter aborts the multipart upload).
         drop(writer.take());
-        cleanup_data_fragments(
-            &object_store,
-            base_dir,
-            cleanup_bases.as_deref(),
-            &fragments,
-        )
-        .await;
+        cleanup_data_fragments(&storage, base_dir, cleanup_bases.as_deref(), &fragments).await;
         return Err(e);
     }
 
@@ -1232,13 +1226,7 @@ where
     if let Some(mut writer) = writer.take() {
         if let Err(e) = seeds.flush(writer.as_mut()).await {
             drop(writer);
-            cleanup_data_fragments(
-                &object_store,
-                base_dir,
-                cleanup_bases.as_deref(),
-                &fragments,
-            )
-            .await;
+            cleanup_data_fragments(&storage, base_dir, cleanup_bases.as_deref(), &fragments).await;
             return Err(e);
         }
         match writer.finish().await {
@@ -1254,7 +1242,7 @@ where
                 // if the callback fails.
                 if let Err(e) = params.progress.complete(last_fragment).await {
                     cleanup_data_fragments(
-                        &object_store,
+                        &storage,
                         base_dir,
                         cleanup_bases.as_deref(),
                         &fragments,
@@ -1272,13 +1260,8 @@ where
             }
             Err(e) => {
                 drop(writer);
-                cleanup_data_fragments(
-                    &object_store,
-                    base_dir,
-                    cleanup_bases.as_deref(),
-                    &fragments,
-                )
-                .await;
+                cleanup_data_fragments(&storage, base_dir, cleanup_bases.as_deref(), &fragments)
+                    .await;
                 return Err(e);
             }
         }
@@ -1299,7 +1282,7 @@ where
 /// - Safe to call with an empty slice.
 /// - Must be called before the fragments are committed, otherwise live data may be deleted.
 pub(crate) async fn cleanup_data_fragments(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base_dir: &Path,
     target_bases: Option<&[TargetBaseInfo]>,
     fragments: &[Fragment],
@@ -1321,7 +1304,7 @@ pub(crate) async fn cleanup_data_fragments(
                         } else {
                             base_info.base_dir.clone()
                         };
-                        (base_info.object_store.as_ref(), dir)
+                        (base_info.storage.as_ref(), dir)
                     }
                     None => {
                         skipped_external += 1;
@@ -1329,7 +1312,7 @@ pub(crate) async fn cleanup_data_fragments(
                     }
                 }
             } else {
-                (object_store, data_dir.clone())
+                (storage, data_dir.clone())
             };
 
             let path = file_dir.clone().join(file.path.as_str());
@@ -1463,7 +1446,7 @@ pub async fn validate_and_resolve_target_bases(
             })?;
 
             let store_params = write_store_params_for_base(params, base_path);
-            let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
+            let (target_storage, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
                 &store_params,
@@ -1472,7 +1455,7 @@ pub async fn validate_and_resolve_target_bases(
 
             bases_info.push(TargetBaseInfo {
                 base_id: target_base_id,
-                object_store: target_object_store,
+                storage: target_storage,
                 base_dir: extracted_path,
                 is_dataset_root: base_path.is_dataset_root,
             });
@@ -1492,7 +1475,7 @@ pub async fn validate_and_resolve_target_bases(
 pub(crate) async fn validate_and_resolve_target_bases_with_primary(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
-    primary_object_store: &Arc<ObjectStore>,
+    primary_storage: &Arc<ObjectStore>,
     primary_base_dir: &Path,
     primary_uri: &str,
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
@@ -1601,7 +1584,7 @@ pub(crate) async fn validate_and_resolve_target_bases_with_primary(
         if is_primary {
             bases_info.push(TargetBaseInfo {
                 base_id: PRIMARY_BASE_ID,
-                object_store: primary_object_store.clone(),
+                storage: primary_storage.clone(),
                 base_dir: primary_base_dir.clone(),
                 is_dataset_root: true,
             });
@@ -1702,7 +1685,7 @@ async fn append_external_initial_bases(
             .await?;
             append_external_base_candidate(
                 base_path,
-                store.store_prefix.clone(),
+                store.store_prefix().to_owned(),
                 extracted_path,
                 store_params,
                 candidates,
@@ -1735,7 +1718,7 @@ async fn build_external_base_resolver(
             .await?;
             append_external_base_candidate(
                 base_path,
-                store.store_prefix.clone(),
+                store.store_prefix().to_owned(),
                 extracted_path,
                 store_params,
                 &mut candidates,
@@ -1798,7 +1781,7 @@ pub(super) async fn blob_v2_external_base_resolver(
 pub async fn write_fragments_internal(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
@@ -1808,7 +1791,7 @@ pub async fn write_fragments_internal(
     write_fragments_internal_with_file_row_counts(
         storage_version,
         dataset,
-        object_store,
+        storage,
         base_dir,
         schema,
         data,
@@ -1824,7 +1807,7 @@ pub async fn write_fragments_internal(
 pub(crate) async fn write_fragments_internal_with_file_row_counts(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
@@ -1835,7 +1818,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
     write_fragments_internal_impl(
         storage_version,
         dataset,
-        object_store,
+        storage,
         base_dir,
         schema,
         data,
@@ -1855,7 +1838,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
 pub(in crate::dataset) async fn write_fragments_internal_impl(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
@@ -1878,7 +1861,7 @@ pub(in crate::dataset) async fn write_fragments_internal_impl(
     versions::write_fragments(
         storage_version,
         dataset,
-        object_store,
+        storage,
         base_dir,
         normalized_schema,
         data,
@@ -2150,18 +2133,17 @@ pub(in crate::dataset) struct V2WriterAdapter {
 }
 
 pub(in crate::dataset) struct FilePromotion {
-    object_store: ObjectStore,
+    storage: ObjectStore,
     staging_path: Path,
     final_path: Path,
 }
 
 impl FilePromotion {
     async fn promote(&self) -> Result<()> {
-        self.object_store
+        self.storage
             .copy_if_not_exists_or_same_size(&self.staging_path, &self.final_path)
             .await?;
-        self.object_store
-            .inner
+        self.storage
             .delete(&self.staging_path)
             .await
             .map_err(|error| Error::io(error.to_string()))?;
@@ -2169,7 +2151,7 @@ impl FilePromotion {
     }
 
     async fn abort(&self) {
-        let _ = self.object_store.inner.delete(&self.staging_path).await;
+        let _ = self.storage.delete(&self.staging_path).await;
     }
 }
 
@@ -2357,7 +2339,7 @@ impl WriterOptions {
 }
 
 pub(crate) async fn open_v1_writer(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
@@ -2375,7 +2357,7 @@ pub(crate) async fn open_v1_writer(
     );
     Ok(Box::new(V1WriterAdapter {
         writer: V1FileWriter::<ManifestDescribing>::try_new(
-            object_store,
+            storage,
             &full_path,
             schema.clone(),
             &Default::default(),
@@ -2388,7 +2370,7 @@ pub(crate) async fn open_v1_writer(
 
 pub(in crate::dataset) async fn open_current_writer<F>(
     create_file_writer: F,
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
@@ -2416,9 +2398,9 @@ where
     );
     let (writer_path, promotion_target) =
         staged_writer_path(data_dir, final_path, preassigned_data_file_name.is_some());
-    let writer = object_store.create(&writer_path).await?;
+    let writer = storage.create(&writer_path).await?;
     let promotion = promotion_target.map(|final_path| FilePromotion {
-        object_store: object_store.clone(),
+        storage: storage.clone(),
         staging_path: writer_path,
         final_path,
     });
@@ -2440,7 +2422,7 @@ where
 pub(in crate::dataset) async fn open_current_blob_v2_writer<F>(
     version: ConcreteFileVersion,
     create_file_writer: F,
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
@@ -2478,9 +2460,9 @@ where
         final_path,
         preassigned_data_file_name.is_some(),
     );
-    let writer = object_store.create(&writer_path).await?;
+    let writer = storage.create(&writer_path).await?;
     let promotion = promotion_target.map(|final_path| FilePromotion {
-        object_store: object_store.clone(),
+        storage: storage.clone(),
         staging_path: writer_path,
         final_path,
     });
@@ -2492,7 +2474,7 @@ where
         file_writer_options,
     )?;
     let mut preprocessor = BlobPreprocessor::new(
-        object_store.clone(),
+        storage.clone(),
         data_dir,
         data_file_key,
         schema,
@@ -2564,7 +2546,7 @@ pub struct TargetBaseInfo {
     /// The registered base id, or [`PRIMARY_BASE_ID`] for the dataset's
     /// primary storage.
     pub base_id: u32,
-    pub object_store: Arc<ObjectStore>,
+    pub storage: Arc<ObjectStore>,
     /// The base directory path (without /data subdirectory)
     pub base_dir: Path,
     /// Whether this base path is a dataset root.
@@ -2575,7 +2557,7 @@ pub struct TargetBaseInfo {
 
 struct WriterGenerator<OpenWriter> {
     /// Default object store (used when no target bases specified)
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     /// Default base directory (used when no target bases specified)
     base_dir: Path,
     schema: Schema,
@@ -2596,7 +2578,7 @@ where
     OpenWriterFuture: Future<Output = Result<Box<dyn GenericWriter>>> + Send,
 {
     pub fn new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_dir: &Path,
         schema: &Schema,
         open_writer: OpenWriter,
@@ -2604,7 +2586,7 @@ where
         options: WriterOptions,
     ) -> Self {
         Self {
-            object_store,
+            storage,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             open_writer,
@@ -2640,7 +2622,7 @@ where
 
         let writer = if let Some(base_info) = self.select_target_base() {
             (self.open_writer)(
-                base_info.object_store.clone(),
+                base_info.storage.clone(),
                 self.schema.clone(),
                 base_info.base_dir.clone(),
                 WriterOptions {
@@ -2654,7 +2636,7 @@ where
             .await?
         } else {
             (self.open_writer)(
-                self.object_store.clone(),
+                self.storage.clone(),
                 self.schema.clone(),
                 self.base_dir.clone(),
                 WriterOptions {
@@ -2677,19 +2659,7 @@ async fn resolve_commit_handler(
     store_options: &Option<ObjectStoreParams>,
 ) -> Result<Arc<dyn CommitHandler>> {
     match commit_handler {
-        None => {
-            #[allow(deprecated)]
-            if store_options
-                .as_ref()
-                .map(|opts| opts.object_store.is_some())
-                .unwrap_or_default()
-            {
-                return Err(Error::invalid_input(
-                    "when creating a dataset with a custom object store the commit_handler must also be specified",
-                ));
-            }
-            commit_handler_from_url(uri, store_options).await
-        }
+        None => commit_handler_from_url(uri, store_options).await,
         Some(commit_handler) => {
             if uri.starts_with("s3+ddb") {
                 Err(Error::invalid_input(
@@ -2738,7 +2708,7 @@ mod tests {
     use rstest::rstest;
 
     async fn open_v2_1_test_writer(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         schema: Schema,
         base_dir: Path,
         options: WriterOptions,
@@ -2752,7 +2722,7 @@ mod tests {
                 data_file.base_id = base_id;
                 Ok((writer, data_file))
             },
-            &object_store,
+            &storage,
             &schema,
             &base_dir,
             options,
@@ -2944,11 +2914,11 @@ mod tests {
             async move {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-                let object_store = Arc::new(ObjectStore::memory());
+                let storage = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
                     write_params.storage_version_or_default(),
                     None,
-                    object_store,
+                    storage,
                     &Path::from("test"),
                     schema,
                     data_stream,
@@ -3022,12 +2992,12 @@ mod tests {
         let stream =
             RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let object_store = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(ObjectStore::memory());
 
         let (fragments, _) = write_fragments_internal_with_file_row_counts(
             ConcreteFileVersion::V2_0,
             None,
-            object_store,
+            storage,
             &Path::from("planned_byte_boundary"),
             schema,
             Box::pin(stream),
@@ -3078,12 +3048,12 @@ mod tests {
         let stream =
             RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let object_store = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(ObjectStore::memory());
 
         let (fragments, _) = write_fragments_internal_with_file_row_counts(
             ConcreteFileVersion::V2_0,
             None,
-            object_store,
+            storage,
             &Path::from("repeated_planned_byte_boundaries"),
             schema,
             Box::pin(stream),
@@ -3161,11 +3131,11 @@ mod tests {
             async move {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-                let object_store = Arc::new(ObjectStore::memory());
+                let storage = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
                     write_params.storage_version_or_default(),
                     None,
-                    object_store,
+                    storage,
                     &Path::from("test"),
                     schema,
                     data_stream,
@@ -3260,11 +3230,11 @@ mod tests {
             async move {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-                let object_store = Arc::new(ObjectStore::memory());
+                let storage = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
                     write_params.storage_version_or_default(),
                     None,
-                    object_store,
+                    storage,
                     &Path::from("test"),
                     schema,
                     data_stream,
@@ -3375,11 +3345,11 @@ mod tests {
 
             let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-            let object_store = Arc::new(ObjectStore::memory());
+            let storage = Arc::new(ObjectStore::memory());
             let (fragments, _) = write_fragments_internal(
                 version.resolve(),
                 None,
-                object_store,
+                storage,
                 &Path::from("test"),
                 schema,
                 data_stream,
@@ -3450,12 +3420,12 @@ mod tests {
             futures::stream::iter(std::iter::once(Ok(data.clone()))),
         ));
 
-        let object_store = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
         let (fragments, written_schema) = write_fragments_internal(
             ConcreteFileVersion::V1,
             None,
-            object_store.clone(),
+            storage.clone(),
             &base_path,
             schema.clone(),
             data_stream,
@@ -3482,7 +3452,7 @@ mod tests {
             .clone()
             .join(DATA_DIR)
             .join(fragment.files[0].path.as_str());
-        let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
+        let file_reader: Arc<dyn Reader> = storage.open(&path).await.unwrap().into();
         let reader = V1FileReader::try_new_from_reader(
             &path,
             file_reader,
@@ -3531,11 +3501,11 @@ mod tests {
 
         assert_eq!(target_bases.len(), 2);
         assert_eq!(
-            target_bases[0].object_store.store_prefix,
+            target_bases[0].storage.store_prefix(),
             "az$container@account-a"
         );
         assert_eq!(
-            target_bases[1].object_store.store_prefix,
+            target_bases[1].storage.store_prefix(),
             "az$container@account-b"
         );
     }
@@ -3596,11 +3566,11 @@ mod tests {
 
         assert_eq!(target_bases.len(), 2);
         assert_eq!(
-            target_bases[0].object_store.store_prefix,
+            target_bases[0].storage.store_prefix(),
             "az$container@account-a"
         );
         assert_eq!(
-            target_bases[1].object_store.store_prefix,
+            target_bases[1].storage.store_prefix(),
             "az$container@account-b"
         );
     }
@@ -3637,7 +3607,7 @@ mod tests {
 
         assert_eq!(target_bases.len(), 1);
         assert_eq!(
-            target_bases[0].object_store.store_prefix,
+            target_bases[0].storage.store_prefix(),
             "az$container@account-exact"
         );
     }
@@ -3657,18 +3627,18 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
         // Create in-memory object store
-        let object_store = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(ObjectStore::memory());
         let base_dir = Path::from("test/bucket2");
 
         // Test WriterGenerator with explicit data file bases configuration
         let target_bases = vec![TargetBaseInfo {
             base_id: 2,
-            object_store: object_store.clone(),
+            storage: storage.clone(),
             base_dir: base_dir.clone(),
             is_dataset_root: false, // Test uses direct data directory
         }];
         let writer_generator = WriterGenerator::new(
-            object_store.clone(),
+            storage.clone(),
             &base_dir,
             &schema,
             open_v2_1_test_writer,
@@ -3709,12 +3679,12 @@ mod tests {
         .unwrap();
 
         // Create in-memory object store and writer
-        let object_store = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(ObjectStore::memory());
         let base_dir = Path::from("test/bucket2");
 
         let mut inner_writer = versions::open_writer(
             LanceFileVersion::Stable.resolve(),
-            &object_store,
+            &storage,
             &schema,
             &base_dir,
             WriterOptions {
@@ -3762,19 +3732,19 @@ mod tests {
         let target_bases = vec![
             TargetBaseInfo {
                 base_id: 1,
-                object_store: store1.clone(),
+                storage: store1.clone(),
                 base_dir: Path::from("base1"),
                 is_dataset_root: false,
             },
             TargetBaseInfo {
                 base_id: 2,
-                object_store: store2.clone(),
+                storage: store2.clone(),
                 base_dir: Path::from("base2"),
                 is_dataset_root: false,
             },
             TargetBaseInfo {
                 base_id: 3,
-                object_store: store3.clone(),
+                storage: store3.clone(),
                 base_dir: Path::from("base3"),
                 is_dataset_root: false,
             },
@@ -4618,7 +4588,7 @@ mod tests {
             >()),
         ));
 
-        let object_store = Arc::new(ObjectStore::memory());
+        let storage = Arc::new(ObjectStore::memory());
         let write_params = WriteParams {
             mode: WriteMode::Create,
             ..Default::default()
@@ -4627,7 +4597,7 @@ mod tests {
         let result = write_fragments_internal(
             write_params.storage_version_or_default(),
             None,
-            object_store,
+            storage,
             &Path::from("test_empty"),
             schema,
             data_stream,
@@ -4717,9 +4687,9 @@ mod tests {
 
         use async_trait::async_trait;
         use futures::stream::BoxStream;
-        use object_store::{
-            CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-            PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        use lance_io::object_store::{
+            CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+            PutOptions, PutPayload, PutResult,
         };
 
         // Create a custom ObjectStore that simulates disk full error
@@ -4733,14 +4703,26 @@ mod tests {
         }
 
         #[async_trait]
-        impl object_store::ObjectStore for DiskFullObjectStore {
+        impl lance_io::object_store::StorageBackend for DiskFullObjectStore {
+            async fn list_paginated(
+                &self,
+                prefix: Option<&str>,
+                options: lance_io::object_store::PaginatedListOptions,
+            ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult>
+            {
+                let _ = (prefix, options);
+                Err(lance_io::object_store::Error::NotSupported {
+                    source: "native pagination is unavailable".into(),
+                })
+            }
+
             async fn put_opts(
                 &self,
-                _location: &object_store::path::Path,
+                _location: &lance_core::storage::path::Path,
                 _bytes: PutPayload,
                 _opts: PutOptions,
-            ) -> object_store::Result<PutResult> {
-                Err(object_store::Error::Generic {
+            ) -> lance_io::object_store::Result<PutResult> {
+                Err(lance_io::object_store::Error::Generic {
                     store: "DiskFullStore",
                     source: Box::new(io::Error::new(
                         ErrorKind::StorageFull,
@@ -4751,20 +4733,22 @@ mod tests {
 
             async fn put_multipart_opts(
                 &self,
-                _location: &object_store::path::Path,
+                _location: &lance_core::storage::path::Path,
                 _opts: PutMultipartOptions,
-            ) -> object_store::Result<Box<dyn MultipartUpload>> {
-                Err(object_store::Error::NotSupported {
+            ) -> lance_io::object_store::Result<
+                Box<dyn lance_io::object_store::backend::MultipartUpload>,
+            > {
+                Err(lance_io::object_store::Error::NotSupported {
                     source: "Multipart upload not supported".into(),
                 })
             }
 
             async fn get_opts(
                 &self,
-                _location: &object_store::path::Path,
+                _location: &lance_core::storage::path::Path,
                 _options: GetOptions,
-            ) -> object_store::Result<GetResult> {
-                Err(object_store::Error::NotFound {
+            ) -> lance_io::object_store::Result<GetResult> {
+                Err(lance_io::object_store::Error::NotFound {
                     path: "".into(),
                     source: "".into(),
                 })
@@ -4772,22 +4756,27 @@ mod tests {
 
             fn delete_stream(
                 &self,
-                locations: BoxStream<'static, object_store::Result<object_store::path::Path>>,
-            ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+                locations: BoxStream<
+                    'static,
+                    lance_io::object_store::Result<lance_core::storage::path::Path>,
+                >,
+            ) -> BoxStream<'static, lance_io::object_store::Result<lance_core::storage::path::Path>>
+            {
                 locations
             }
 
             fn list(
                 &self,
-                _prefix: Option<&object_store::path::Path>,
-            ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+                _prefix: Option<&lance_core::storage::path::Path>,
+            ) -> futures::stream::BoxStream<'static, lance_io::object_store::Result<ObjectMeta>>
+            {
                 Box::pin(futures::stream::empty())
             }
 
             async fn list_with_delimiter(
                 &self,
-                _prefix: Option<&object_store::path::Path>,
-            ) -> object_store::Result<ListResult> {
+                _prefix: Option<&lance_core::storage::path::Path>,
+            ) -> lance_io::object_store::Result<ListResult> {
                 Ok(ListResult {
                     common_prefixes: vec![],
                     objects: vec![],
@@ -4797,27 +4786,77 @@ mod tests {
 
             async fn copy_opts(
                 &self,
-                _from: &object_store::path::Path,
-                _to: &object_store::path::Path,
+                _from: &lance_core::storage::path::Path,
+                _to: &lance_core::storage::path::Path,
                 _options: CopyOptions,
-            ) -> object_store::Result<()> {
+            ) -> lance_io::object_store::Result<()> {
                 Ok(())
+            }
+            async fn get_ranges(
+                &self,
+                location: &lance_io::object_store::Path,
+                ranges: &[std::ops::Range<u64>],
+            ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+                futures::future::try_join_all(ranges.iter().map(|range| {
+                    (self as &dyn lance_io::object_store::StorageBackend)
+                        .get_range(location, range.clone())
+                }))
+                .await
+            }
+            fn list_with_offset(
+                &self,
+                prefix: Option<&lance_io::object_store::Path>,
+                offset: &lance_io::object_store::Path,
+            ) -> futures::stream::BoxStream<
+                'static,
+                lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+            > {
+                let offset = offset.clone();
+                Box::pin(futures::TryStreamExt::try_filter(
+                    self.list(prefix),
+                    move |meta| futures::future::ready(meta.location > offset),
+                ))
+            }
+            async fn rename_opts(
+                &self,
+                from: &lance_io::object_store::Path,
+                to: &lance_io::object_store::Path,
+                options: lance_io::object_store::RenameOptions,
+            ) -> lance_io::object_store::Result<()> {
+                let mode = match options.target_mode {
+                    lance_io::object_store::RenameTargetMode::Create => {
+                        lance_io::object_store::CopyMode::Create
+                    }
+                    lance_io::object_store::RenameTargetMode::Overwrite => {
+                        lance_io::object_store::CopyMode::Overwrite
+                    }
+                };
+                self.copy_opts(
+                    from,
+                    to,
+                    lance_io::object_store::CopyOptions {
+                        mode,
+                        extensions: options.extensions,
+                    },
+                )
+                .await?;
+                (self as &dyn lance_io::object_store::StorageBackend)
+                    .delete(from)
+                    .await
             }
         }
 
-        let object_store = Arc::new(lance_io::object_store::ObjectStore::new(
-            Arc::new(DiskFullObjectStore) as Arc<dyn object_store::ObjectStore>,
-            // Use a non-"file" scheme so writes go through ObjectWriter (which
-            // uses the DiskFullObjectStore) instead of the optimized LocalWriter.
-            url::Url::parse("mock:///test").unwrap(),
-            None,
-            None,
-            false,
-            true,
-            lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
-            lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let storage = Arc::new({
+            let url = url::Url::parse("mock:///test").unwrap();
+            let mut config = lance_io::object_store::BackendConfig::new(
+                Arc::new(DiskFullObjectStore),
+                url.scheme(),
+            );
+            config.io_parallelism = lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
+            config.list_is_lexically_ordered = true;
+            lance_io::utils::testing::TestObjectStoreProvider(config)
+                .build(url, &Default::default())
+        });
 
         // Create test data
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -4853,7 +4892,7 @@ mod tests {
         let result = write_fragments_internal(
             write_params.storage_version_or_default(),
             None,
-            object_store,
+            storage,
             &Path::from("test_disk_full"),
             schema,
             data_stream,
@@ -5012,7 +5051,7 @@ mod tests {
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let (object_store, base_dir) =
+        let (storage, base_dir) =
             ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
@@ -5036,7 +5075,7 @@ mod tests {
         let result = versions::write_fragments_direct(
             ConcreteFileVersion::V2_1,
             None,
-            object_store.clone(),
+            storage.clone(),
             &base_dir,
             &schema,
             stream,
@@ -5074,7 +5113,7 @@ mod tests {
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let (object_store, base_dir) =
+        let (storage, base_dir) =
             ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
@@ -5099,7 +5138,7 @@ mod tests {
         let result = versions::write_fragments_direct(
             ConcreteFileVersion::V2_1,
             None,
-            object_store.clone(),
+            storage.clone(),
             &base_dir,
             &schema,
             stream,
@@ -5198,7 +5237,7 @@ mod tests {
     ) -> Result<Vec<Fragment>> {
         let arrow_schema = id_batch(0).schema();
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let (object_store, base_dir) =
+        let (storage, base_dir) =
             ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
@@ -5210,7 +5249,7 @@ mod tests {
         versions::write_fragments_direct(
             ConcreteFileVersion::V2_1,
             None,
-            object_store,
+            storage,
             &base_dir,
             &schema,
             stream,
@@ -5337,7 +5376,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let (object_store, base_dir) =
+        let (storage, base_dir) =
             ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
@@ -5346,7 +5385,7 @@ mod tests {
         let data_dir = base_dir.clone().join(DATA_DIR);
         let local_filename = "local.lance";
         let local_path = data_dir.clone().join(local_filename);
-        object_store.put(&local_path, b"x").await.unwrap();
+        storage.put(&local_path, b"x").await.unwrap();
         // Sanity check: file is on disk.
         assert_eq!(count_data_files(test_uri), 1);
 
@@ -5367,7 +5406,7 @@ mod tests {
             metadata: Default::default(),
         }];
 
-        cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
+        cleanup_data_fragments(&storage, &base_dir, None, &fragments).await;
 
         // The local file should be removed; the external file is skipped without
         // erroring (its base store isn't known here).
@@ -5390,7 +5429,7 @@ mod tests {
         let base1_dir = TempStrDir::default();
         let base2_dir = TempStrDir::default();
 
-        let (object_store, base_dir) = ObjectStore::from_uri_and_params(
+        let (storage, base_dir) = ObjectStore::from_uri_and_params(
             Default::default(),
             primary_dir.as_str(),
             &Default::default(),
@@ -5453,19 +5492,19 @@ mod tests {
         let target_bases = vec![
             TargetBaseInfo {
                 base_id: 1,
-                object_store: base1_store,
+                storage: base1_store,
                 base_dir: base1_path,
                 is_dataset_root: true,
             },
             TargetBaseInfo {
                 base_id: 2,
-                object_store: base2_store,
+                storage: base2_store,
                 base_dir: base2_path,
                 is_dataset_root: false,
             },
         ];
 
-        cleanup_data_fragments(&object_store, &base_dir, Some(&target_bases), &fragments).await;
+        cleanup_data_fragments(&storage, &base_dir, Some(&target_bases), &fragments).await;
 
         assert_eq!(
             count_data_files(base1_dir.as_str()),
@@ -5499,7 +5538,7 @@ mod tests {
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let (object_store, base_dir) = ObjectStore::from_uri_and_params(
+        let (storage, base_dir) = ObjectStore::from_uri_and_params(
             Default::default(),
             primary_dir.as_str(),
             &Default::default(),
@@ -5536,7 +5575,7 @@ mod tests {
 
         let target_bases = vec![TargetBaseInfo {
             base_id: 1,
-            object_store: base1_store,
+            storage: base1_store,
             base_dir: base1_path,
             is_dataset_root: true,
         }];
@@ -5548,7 +5587,7 @@ mod tests {
         let result = versions::write_fragments_direct(
             ConcreteFileVersion::V2_1,
             None,
-            object_store.clone(),
+            storage.clone(),
             &base_dir,
             &schema,
             stream,
@@ -5946,8 +5985,8 @@ mod tests {
             .unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.storage.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.storage),
         );
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
@@ -6028,8 +6067,8 @@ mod tests {
         let data_file = new_fragment.files.first().unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.storage.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.storage),
         );
         let path = dataset
             .base

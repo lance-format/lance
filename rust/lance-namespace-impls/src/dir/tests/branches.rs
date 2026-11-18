@@ -191,9 +191,9 @@ async fn test_create_table_version_on_branch() {
     // Stage a manifest by copying one of the branch's existing manifests.
     let branch_ds = Dataset::open(&branch_uri).await.unwrap();
     let versions_dir = branch_ds.versions_dir();
-    let store = branch_ds.object_store(None).await.unwrap();
+    let store = branch_ds.storage(None).await.unwrap();
     let existing = store
-        .list_objects(Some(&versions_dir))
+        .list(Some(versions_dir.clone()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -322,10 +322,9 @@ async fn test_external_manifest_store_resolves_branch_from_base_path() {
     // Commit (put) with the branch base: the new version must land on the
     // branch chain. Stage a manifest by copying an existing branch manifest.
     let versions_dir = branch_ds.versions_dir();
-    let obj = branch_ds.object_store(None).await.unwrap();
+    let obj = branch_ds.storage(None).await.unwrap();
     let existing = obj
-        .inner
-        .list(Some(&versions_dir))
+        .list(Some(versions_dir.clone()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -338,8 +337,7 @@ async fn test_external_manifest_store_resolves_branch_from_base_path() {
         })
         .expect("a branch manifest");
     let bytes = obj
-        .inner
-        .get(&existing.location)
+        .read_object(&existing.location)
         .await
         .unwrap()
         .bytes()
@@ -347,7 +345,7 @@ async fn test_external_manifest_store_resolves_branch_from_base_path() {
         .unwrap();
     let size = bytes.len() as u64;
     let staging = versions_dir.clone().join("staging_manifest");
-    obj.inner.put(&staging, bytes.into()).await.unwrap();
+    obj.put_payload(&staging, bytes.into()).await.unwrap();
 
     let committed = store
         .put(
@@ -356,7 +354,7 @@ async fn test_external_manifest_store_resolves_branch_from_base_path() {
             &staging,
             size,
             None,
-            obj.inner.as_ref(),
+            &obj,
             ManifestNamingScheme::V2,
         )
         .await
@@ -565,9 +563,9 @@ async fn test_branch_ops_reject_zombie_branch() {
     create_scalar_table(&namespace, "users").await;
 
     let dataset = open_dataset(&namespace, "users").await;
-    let store = dataset.object_store(None).await.unwrap();
+    let store = dataset.storage(None).await.unwrap();
     let manifest = store
-        .list_objects(Some(&dataset.versions_dir()))
+        .list(Some(dataset.versions_dir().clone()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -1209,10 +1207,10 @@ async fn test_managed_branch_open_and_commit() {
     // The committed data files live under the branch chain, not main's data
     // dir, so unmanaged readers of the branch and main's cleanup see a
     // consistent layout.
-    let store = branch_ds.object_store(None).await.unwrap();
+    let store = branch_ds.storage(None).await.unwrap();
     let branch_data = branch_base.clone().join("data");
     let branch_files = store
-        .list_objects(Some(&branch_data))
+        .list(Some(branch_data.clone()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap();

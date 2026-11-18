@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,8 +10,8 @@ use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, ObjectStoreParams, ObjectStoreProvider,
+    StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -21,7 +22,11 @@ pub struct TencentStoreProvider;
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for TencentStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let storage_options =
             StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
@@ -93,25 +98,22 @@ impl ObjectStoreProvider for TencentStoreProvider {
             url.set_path(&format!("{}/", url.path()));
         }
 
-        Ok(ObjectStore {
+        Ok(BackendConfig {
+            store_prefix: None,
             scheme: "cos".to_string(),
-            inner: opendal_store,
-            external_blob_inner: None,
-            direct_local_io: false,
-            _external_blob_origin: None,
+            backend: opendal_store,
             local_dir_operations: None,
             local_fsync: false,
+            direct_local_io: false,
+            local_io: crate::object_store::LocalIo::Backend,
+            is_local: false,
+            is_remote: true,
+            max_single_copy_size: None,
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count: storage_options.download_retry_count(),
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.
-            paginated_lister: None,
         })
     }
 }

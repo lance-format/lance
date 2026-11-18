@@ -3,19 +3,19 @@
 
 //! Wrappers around object_store that apply tracing
 
+use crate::object_store::{StorageBackend, backend::MultipartUpload};
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, Result as OSResult, UploadPart,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use lance_core::storage::path::Path;
 use lance_core::utils::tracing::StreamTracingExt;
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
-    UploadPart,
-};
 use tracing::{Instrument, Span, instrument};
 
 #[derive(Debug)]
@@ -48,19 +48,28 @@ impl MultipartUpload for TracedMultipartUpload {
 }
 
 #[derive(Debug)]
-pub struct TracedObjectStore {
-    target: Arc<dyn object_store::ObjectStore>,
+pub struct TracedBackend {
+    target: Arc<dyn StorageBackend>,
 }
 
-impl std::fmt::Display for TracedObjectStore {
+impl std::fmt::Display for TracedBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("TracedObjectStore({})", self.target))
+        f.write_fmt(format_args!("TracedBackend({})", self.target))
     }
 }
 
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
-impl object_store::ObjectStore for TracedObjectStore {
+impl StorageBackend for TracedBackend {
+    #[instrument(level = "debug", skip(self, options), fields(max_keys = options.max_keys))]
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        self.target.list_paginated(prefix, options).await
+    }
+
     #[instrument(level = "debug", skip(self, bytes, location, opts), fields(path = location.as_ref(), size = bytes.content_length()))]
     async fn put_opts(
         &self,
@@ -76,7 +85,7 @@ impl object_store::ObjectStore for TracedObjectStore {
         &self,
         location: &Path,
         opts: PutMultipartOptions,
-    ) -> OSResult<Box<dyn object_store::MultipartUpload>> {
+    ) -> OSResult<Box<dyn MultipartUpload>> {
         let upload = self.target.put_multipart_opts(location, opts).await?;
         Ok(Box::new(TracedMultipartUpload {
             target: upload,
@@ -144,19 +153,19 @@ impl object_store::ObjectStore for TracedObjectStore {
     }
 }
 
-pub trait ObjectStoreTracingExt {
-    fn traced(self) -> Arc<dyn object_store::ObjectStore>;
+pub trait StorageBackendTracingExt {
+    fn traced(self) -> Arc<dyn StorageBackend>;
 }
 
-impl ObjectStoreTracingExt for Arc<dyn object_store::ObjectStore> {
-    fn traced(self) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(TracedObjectStore { target: self })
+impl StorageBackendTracingExt for Arc<dyn StorageBackend> {
+    fn traced(self) -> Arc<dyn StorageBackend> {
+        Arc::new(TracedBackend { target: self })
     }
 }
 
-impl<T: object_store::ObjectStore> ObjectStoreTracingExt for Arc<T> {
-    fn traced(self) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(TracedObjectStore { target: self })
+impl<T: StorageBackend> StorageBackendTracingExt for Arc<T> {
+    fn traced(self) -> Arc<dyn StorageBackend> {
+        Arc::new(TracedBackend { target: self })
     }
 }
 
@@ -164,18 +173,18 @@ impl<T: object_store::ObjectStore> ObjectStoreTracingExt for Arc<T> {
 mod tests {
     use super::*;
 
+    use crate::object_store::PutPayload;
     use bytes::Bytes;
+    use lance_core::storage::path::Path;
     use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::{ObjectStoreExt, PutPayload};
     use tracing_mock::{expect, subscriber};
 
     fn payload(data: &[u8]) -> PutPayload {
-        PutPayload::from_bytes(Bytes::copy_from_slice(data))
+        Bytes::copy_from_slice(data).into()
     }
 
-    fn make_store() -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(InMemory::new()).traced()
+    fn make_store() -> Arc<dyn crate::object_store::StorageBackend> {
+        crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new())).traced()
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,8 +15,8 @@ use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, ObjectStoreParams, ObjectStoreProvider,
+    StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -415,7 +416,11 @@ impl GooseFsStoreProvider {
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for GooseFsStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let storage_options =
             StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
@@ -486,26 +491,22 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         // Wrap as object_store::ObjectStore via OpendalStore bridge
         let opendal_store = Arc::new(OpendalStore::new(operator));
 
-        Ok(ObjectStore {
+        Ok(BackendConfig {
+            store_prefix: None,
             scheme: "goosefs".to_string(),
-            inner: opendal_store,
-            external_blob_inner: None,
-            direct_local_io: false,
-            _external_blob_origin: None,
+            backend: opendal_store,
             local_dir_operations: None,
             local_fsync: false,
+            direct_local_io: false,
+            local_io: crate::object_store::LocalIo::Backend,
+            is_local: false,
+            is_remote: true,
+            max_single_copy_size: None,
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(false),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count: storage_options.download_retry_count(),
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.
-            paginated_lister: None,
         })
     }
 
@@ -518,7 +519,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
     /// Calculate the object store prefix used as the registry cache key.
     ///
     /// Format: `goosefs$master_addr`. The address is derived through the same
-    /// chain that [`Self::new_store`] feeds to OpenDAL as `master_addr`
+    /// chain that [`Self::new_backend`] feeds to OpenDAL as `master_addr`
     /// (`goosefs_master_addr`, then `GOOSEFS_MASTER_ADDR`, then the URL
     /// authority), so the prefix always tracks the master the Operator
     /// actually uses — including when those options override the URL
@@ -531,7 +532,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
     /// URL path is disambiguated by [`Self::extract_path`] on each request.
     /// This is analogous to how two `s3://bucket/a` and `s3://bucket/b`
     /// URLs share one store.
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         storage_options: Option<&HashMap<String, String>>,
@@ -628,9 +629,9 @@ mod tests {
 
     #[test]
     fn test_goosefs_extract_path_percent_decoded() {
+        let provider = GooseFsStoreProvider;
         // The URL contains a percent-encoded space; extract_path must decode
         // it once so the ObjectStore layer does not double-encode later.
-        let provider = GooseFsStoreProvider;
         let url = Url::parse("goosefs://master:9200/dir/with%20space/f.lance").unwrap();
         let path = provider.extract_path(&url).unwrap();
         assert_eq!(path.to_string(), "dir/with space/f.lance");
@@ -646,12 +647,8 @@ mod tests {
         let url_a = Url::parse("goosefs://10.0.0.1:9200/repro/a.lance").unwrap();
         let url_b = Url::parse("goosefs://10.0.0.1:9200/repro/b.lance").unwrap();
 
-        let pa = provider
-            .calculate_object_store_prefix(&url_a, None)
-            .unwrap();
-        let pb = provider
-            .calculate_object_store_prefix(&url_b, None)
-            .unwrap();
+        let pa = provider.calculate_storage_prefix(&url_a, None).unwrap();
+        let pb = provider.calculate_storage_prefix(&url_b, None).unwrap();
         assert_eq!(pa, pb, "same master must share one cache prefix");
 
         // Extracted keys must differ so the shared Operator can route
@@ -670,8 +667,8 @@ mod tests {
         let u1 = Url::parse("goosefs://host-a:9200/x.lance").unwrap();
         let u2 = Url::parse("goosefs://host-b:9200/x.lance").unwrap();
         assert_ne!(
-            provider.calculate_object_store_prefix(&u1, None).unwrap(),
-            provider.calculate_object_store_prefix(&u2, None).unwrap(),
+            provider.calculate_storage_prefix(&u1, None).unwrap(),
+            provider.calculate_storage_prefix(&u2, None).unwrap(),
         );
     }
 
@@ -682,11 +679,11 @@ mod tests {
         let provider = GooseFsStoreProvider;
         let url = Url::parse("goosefs://host:9200/x.lance").unwrap();
 
-        let default_prefix = provider.calculate_object_store_prefix(&url, None).unwrap();
+        let default_prefix = provider.calculate_storage_prefix(&url, None).unwrap();
         let custom_opts: HashMap<String, String> =
             HashMap::from([("goosefs_root".to_string(), "/tenant-a".to_string())]);
         let custom_prefix = provider
-            .calculate_object_store_prefix(&url, Some(&custom_opts))
+            .calculate_storage_prefix(&url, Some(&custom_opts))
             .unwrap();
 
         assert_eq!(default_prefix, "goosefs$host:9200");
@@ -747,7 +744,7 @@ mod tests {
         "goosefs$10.0.0.2:9200"
     )]
     #[serial]
-    fn test_calculate_object_store_prefix(
+    fn test_calculate_storage_prefix(
         #[case] uri: &str,
         #[case] master_option: Option<&str>,
         #[case] expected: &str,
@@ -756,7 +753,7 @@ mod tests {
         let url = Url::parse(uri).unwrap();
         let opts = master_option_map(master_option);
         let prefix = GooseFsStoreProvider
-            .calculate_object_store_prefix(&url, opts.as_ref())
+            .calculate_storage_prefix(&url, opts.as_ref())
             .unwrap();
         assert_eq!(prefix, expected);
     }
@@ -779,9 +776,8 @@ mod tests {
         let _config_file = RestoreEnv::set("GOOSEFS_CONFIG_FILE", &site);
         let _clear_addr = RestoreEnv::unset("GOOSEFS_MASTER_ADDR");
 
-        let provider = GooseFsStoreProvider;
         let url = Url::parse("goosefs:///data/foo.lance").unwrap();
-        let store = provider
+        let store = crate::object_store::ObjectStoreRegistry::default()
             .new_store(url, &ObjectStoreParams::default())
             .await
             .unwrap();

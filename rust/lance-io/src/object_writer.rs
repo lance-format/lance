@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::backend::MultipartUpload;
 use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -8,13 +9,13 @@ use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::time::Instant;
 
-use crate::object_store::ObjectStore as LanceObjectStore;
+use crate::object_store::ObjectStore;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::{MultipartUpload, ObjectStoreExt};
-use object_store::{ObjectStore, path::Path};
+
+use lance_core::storage::path::Path;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 
@@ -149,11 +150,11 @@ impl UploadFailure {
     /// than a local copy of its mapping, and the error itself is kept as the
     /// source, so both callers matching on the kind and `Error::is_not_found`
     /// (which downcasts along the source chain) keep working.
-    fn new(context: String, source: object_store::Error) -> Self {
+    fn new(context: String, source: crate::object_store::Error) -> Self {
         let mapped = io::Error::from(source);
         let kind = mapped.kind();
         let source: Box<dyn std::error::Error + Send + Sync> =
-            match mapped.downcast::<object_store::Error>() {
+            match mapped.downcast::<crate::object_store::Error>() {
                 Ok(source) => Box::new(source),
                 Err(mapped) => Box::new(mapped),
             };
@@ -225,7 +226,7 @@ fn upload_settings() -> String {
 enum UploadState {
     /// The writer has been opened but no data has been written yet. Will be in
     /// this state until the buffer is full or the writer is shut down.
-    Started(Arc<dyn ObjectStore>),
+    Started(Arc<ObjectStore>),
     /// The writer is in the process of creating a multipart upload.
     CreatingUpload(BoxFuture<'static, UploadResult<Box<dyn MultipartUpload>>>),
     /// The writer is in the process of uploading parts.
@@ -254,16 +255,19 @@ impl UploadState {
                 let started_at = Instant::now();
                 let fut = async move {
                     let size = buffer.len();
-                    let res = store.put(&path, buffer.into()).await.map_err(|source| {
-                        UploadFailure::new(
-                            format!(
-                                "single PUT of {path} failed after {:?} ({size} bytes, {})",
-                                started_at.elapsed(),
-                                upload_settings()
-                            ),
-                            source,
-                        )
-                    })?;
+                    let res = store
+                        .put_payload(&path, buffer.into())
+                        .await
+                        .map_err(|source| {
+                            UploadFailure::new(
+                                format!(
+                                    "single PUT of {path} failed after {:?} ({size} bytes, {})",
+                                    started_at.elapsed(),
+                                    upload_settings()
+                                ),
+                                source,
+                            )
+                        })?;
                     Ok(WriteResult {
                         size,
                         e_tag: res.e_tag,
@@ -325,12 +329,12 @@ impl UploadState {
 impl ObjectWriter {
     /// Creates a writer, rejecting `LANCE_UPLOAD_CONCURRENCY=0` before allocating
     /// an upload buffer or issuing any requests.
-    pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
-        Self::with_upload_parallelism(object_store, path, max_upload_parallelism())
+    pub async fn new(storage: &ObjectStore, path: &Path) -> Result<Self> {
+        Self::with_upload_parallelism(storage, path, max_upload_parallelism())
     }
 
     fn with_upload_parallelism(
-        object_store: &LanceObjectStore,
+        storage: &ObjectStore,
         path: &Path,
         upload_parallelism: usize,
     ) -> Result<Self> {
@@ -340,12 +344,12 @@ impl ObjectWriter {
             ))
         })?;
         Ok(Self {
-            state: UploadState::Started(object_store.inner.clone()),
+            state: UploadState::Started(Arc::new(storage.clone())),
             cursor: 0,
             upload_parallelism,
             path: Arc::new(path.clone()),
             buffer: Vec::with_capacity(initial_upload_size()),
-            use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
+            use_constant_size_upload_parts: storage.use_constant_size_upload_parts(),
         })
     }
 
@@ -528,7 +532,7 @@ impl AsyncWrite for ObjectWriter {
                         let store = store.clone();
                         let started_at = Instant::now();
                         let fut = Box::pin(async move {
-                            store.put_multipart(path.as_ref()).await.map_err(|source| {
+                            store.start_upload(path.as_ref(), Default::default()).await.map_err(|source| {
                                     UploadFailure::new(
                                         format!(
                                             "failed to create multipart upload for {path} after {:?} ({})",
@@ -1036,12 +1040,12 @@ fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use futures::stream::BoxStream;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStoreExt,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
-        UploadPart,
+    use crate::object_store::backend::MultipartUpload;
+    use crate::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult, UploadPart,
     };
+    use futures::stream::BoxStream;
     use rstest::rstest;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1083,8 +1087,8 @@ mod tests {
         }
     }
 
-    fn rejected(stage: &'static str) -> object_store::Error {
-        object_store::Error::Generic {
+    fn rejected(stage: &'static str) -> crate::object_store::Error {
+        crate::object_store::Error::Generic {
             store: "FailingUploadStore",
             source: format!("{stage} rejected by test").into(),
         }
@@ -1182,7 +1186,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl ObjectStore for FailingUploadStore {
+    impl crate::object_store::StorageBackend for FailingUploadStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             _location: &Path,
@@ -1204,7 +1219,7 @@ mod tests {
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             if self.fail_at == FailAt::CreateMultipart {
                 Err(rejected("create multipart"))
             } else {
@@ -1256,6 +1271,17 @@ mod tests {
         ) -> OSResult<()> {
             unimplemented!()
         }
+        async fn get_ranges(
+            &self,
+            location: &crate::object_store::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> crate::object_store::Result<Vec<bytes::Bytes>> {
+            futures::future::try_join_all(ranges.iter().map(|range| {
+                (self as &dyn crate::object_store::StorageBackend)
+                    .get_range(location, range.clone())
+            }))
+            .await
+        }
     }
 
     const FAILING_UPLOAD_PATH: &str = "part_7_invert.lance";
@@ -1271,8 +1297,10 @@ mod tests {
     /// error. The failure can surface either from a write or from shutdown
     /// depending on when the rejected request is reaped, so both are checked.
     async fn failing_upload(fail_at: FailAt, num_bytes: usize) -> io::Error {
-        let mut store = LanceObjectStore::memory();
-        store.inner = Arc::new(FailingUploadStore::new(fail_at));
+        let mut store = ObjectStore::memory();
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| Arc::new(FailingUploadStore::new(fail_at)),
+        ));
 
         let mut writer = ObjectWriter::new(&store, &Path::from(FAILING_UPLOAD_PATH))
             .await
@@ -1376,7 +1404,9 @@ mod tests {
         let source = std::error::Error::source(failure)
             .expect("upload failure should expose the object store error");
         assert!(
-            source.downcast_ref::<object_store::Error>().is_some(),
+            source
+                .downcast_ref::<crate::object_store::Error>()
+                .is_some(),
             "source should still be the object store error, got: {source}"
         );
     }
@@ -1385,8 +1415,8 @@ mod tests {
     /// maps an error to, since that kind is observable to callers.
     #[test]
     fn test_upload_failure_preserves_error_kind() {
-        fn not_found() -> object_store::Error {
-            object_store::Error::NotFound {
+        fn not_found() -> crate::object_store::Error {
+            crate::object_store::Error::NotFound {
                 path: FAILING_UPLOAD_PATH.to_string(),
                 source: "not found".into(),
             }
@@ -1404,9 +1434,11 @@ mod tests {
     /// store error has to remain reachable through it, not be flattened into a
     /// message.
     #[tokio::test]
-    async fn test_writer_shutdown_preserves_object_store_source() {
-        let mut store = LanceObjectStore::memory();
-        store.inner = Arc::new(FailingUploadStore::new(FailAt::SinglePut));
+    async fn test_writer_shutdown_preserves_storage_source() {
+        let mut store = ObjectStore::memory();
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| Arc::new(FailingUploadStore::new(FailAt::SinglePut)),
+        ));
         let mut writer = ObjectWriter::new(&store, &Path::from(FAILING_UPLOAD_PATH))
             .await
             .unwrap();
@@ -1414,15 +1446,18 @@ mod tests {
         let err = Writer::shutdown(&mut writer).await.unwrap_err();
 
         let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&err);
-        let mut found_object_store = false;
+        let mut found_storage = false;
         while let Some(source) = current {
-            if source.downcast_ref::<object_store::Error>().is_some() {
-                found_object_store = true;
+            if source
+                .downcast_ref::<crate::object_store::Error>()
+                .is_some()
+            {
+                found_storage = true;
                 break;
             }
             current = source.source();
         }
-        assert!(found_object_store, "source chain was flattened: {err:?}");
+        assert!(found_storage, "source chain was flattened: {err:?}");
 
         assert!(
             err.to_string().contains(FAILING_UPLOAD_PATH),
@@ -1516,8 +1551,11 @@ mod tests {
     async fn test_flush_does_not_wait_for_in_flight_parts() {
         let (store, gate) = FailingUploadStore::gated(FailAt::Nothing);
         let observations = store.observations.clone();
-        let mut lance_store = LanceObjectStore::memory();
-        lance_store.inner = Arc::new(store);
+        let mut lance_store = ObjectStore::memory();
+        let upload_backend = Arc::new(store);
+        lance_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(|_| {
+            upload_backend.clone()
+        }));
 
         let mut writer = ObjectWriter::new(&lance_store, &Path::from("gated.lance"))
             .await
@@ -1557,8 +1595,11 @@ mod tests {
     async fn test_part_failure_after_flush_surfaces_at_shutdown() {
         let (store, gate) = FailingUploadStore::gated(FailAt::PutPart);
         let observations = store.observations.clone();
-        let mut lance_store = LanceObjectStore::memory();
-        lance_store.inner = Arc::new(store);
+        let mut lance_store = ObjectStore::memory();
+        let upload_backend = Arc::new(store);
+        lance_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(|_| {
+            upload_backend.clone()
+        }));
 
         let mut writer = ObjectWriter::new(&lance_store, &Path::from(FAILING_UPLOAD_PATH))
             .await
@@ -1586,7 +1627,7 @@ mod tests {
 
     #[test]
     fn test_zero_upload_parallelism_rejected() {
-        let store = LanceObjectStore::memory();
+        let store = ObjectStore::memory();
         let path = Path::from("zero-concurrency.lance");
         let error = ObjectWriter::with_upload_parallelism(&store, &path, 0)
             .err()
@@ -1609,7 +1650,7 @@ mod tests {
         #[case] tail: isize,
         #[values(Some(1), None)] upload_parallelism: Option<usize>,
     ) {
-        let store = LanceObjectStore::memory();
+        let store = ObjectStore::memory();
         let path = Path::from("round-trip.lance");
         let mut writer = match upload_parallelism {
             Some(upload_parallelism) => {
@@ -1629,7 +1670,13 @@ mod tests {
         .await
         .expect("valid concurrency must not stall writes or shutdown");
         assert_eq!(result.size, payload.len());
-        let persisted = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        let persisted = store
+            .read_object(&path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert_eq!(persisted.as_ref(), payload.as_slice());
     }
 
@@ -1637,8 +1684,11 @@ mod tests {
     async fn test_shutdown_waits_for_tail_at_concurrency_one() {
         let (store, gate) = FailingUploadStore::gated(FailAt::Nothing);
         let observations = store.observations.clone();
-        let mut lance_store = LanceObjectStore::memory();
-        lance_store.inner = Arc::new(store);
+        let mut lance_store = ObjectStore::memory();
+        let upload_backend = Arc::new(store);
+        lance_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(|_| {
+            upload_backend.clone()
+        }));
         let mut writer =
             ObjectWriter::with_upload_parallelism(&lance_store, &Path::from("gated-tail.lance"), 1)
                 .unwrap();
@@ -1667,7 +1717,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write() {
-        let store = LanceObjectStore::memory();
+        let store = ObjectStore::memory();
 
         let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
             .await
@@ -1707,13 +1757,15 @@ mod tests {
     async fn test_poll_write_progresses_after_uploads_drain() {
         let store = FailingUploadStore::new(FailAt::Nothing);
         let observations = store.observations.clone();
-        let mut lance_store = LanceObjectStore::memory();
-        lance_store.inner = Arc::new(store);
+        let mut lance_store = ObjectStore::memory();
+        let upload_backend = Arc::new(store);
+        lance_store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(|_| {
+            upload_backend.clone()
+        }));
         let path = Path::from("drained.lance");
         let mut writer = ObjectWriter::new(&lance_store, &path).await.unwrap();
         let upload = lance_store
-            .inner
-            .put_multipart_opts(&path, PutMultipartOptions::default())
+            .start_upload(&path, PutMultipartOptions::default())
             .await
             .unwrap();
 
@@ -1752,7 +1804,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_write_empty_input() {
-        let store = LanceObjectStore::memory();
+        let store = ObjectStore::memory();
         let path = Path::from("empty.lance");
         let mut writer = ObjectWriter::new(&store, &path).await.unwrap();
         let waker = futures::task::noop_waker();
@@ -1764,8 +1816,7 @@ mod tests {
         assert_eq!(writer.cursor, 0);
 
         let upload = store
-            .inner
-            .put_multipart_opts(&path, PutMultipartOptions::default())
+            .start_upload(&path, PutMultipartOptions::default())
             .await
             .unwrap();
         writer.state = UploadState::InProgress {
@@ -1787,7 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_abort_write() {
-        let store = LanceObjectStore::memory();
+        let store = ObjectStore::memory();
 
         let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
             .await

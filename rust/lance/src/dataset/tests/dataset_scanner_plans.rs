@@ -162,7 +162,7 @@ async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
 
     // Baseline: materializing the column costs at least its payload.
     let dataset = Dataset::open(&test_dir).await.unwrap();
-    dataset.object_store.io_stats_incremental();
+    dataset.storage.io_stats_incremental();
     let full = dataset
         .scan()
         .project(&["cells"])
@@ -171,7 +171,7 @@ async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
         .await
         .unwrap();
     assert_eq!(full.num_rows(), num_rows);
-    let full_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+    let full_bytes = dataset.storage.io_stats_incremental().read_bytes;
     assert!(full_bytes >= data_bytes, "{full_bytes} < {data_bytes}");
 
     for (filter, wants_null) in [("cells IS NULL", true), ("cells IS NOT NULL", false)] {
@@ -180,9 +180,9 @@ async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
         scan.project(&["id"]).unwrap().filter(filter).unwrap();
         let plan = scan.explain_plan(true).await.unwrap();
         assert!(plan.contains("projection=[id, cells.item.idx]"), "{plan}");
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
         let batch = scan.try_into_batch().await.unwrap();
-        let read_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+        let read_bytes = dataset.storage.io_stats_incremental().read_bytes;
         assert_eq!(batch.schema().fields().len(), 1, "{:?}", batch.schema());
         let mut ids = batch
             .column(0)
@@ -675,9 +675,9 @@ async fn test_late_materialization(
         .unwrap();
 
     // First run a full scan to get a baseline
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let _ = dataset.storage.as_ref().io_stats_incremental(); // reset
     dataset.scan().try_into_batch().await.unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     let full_scan_bytes = io_stats.read_bytes;
 
     // Next do a scan without pushdown, we should still see a benefit from late materialization
@@ -689,7 +689,7 @@ async fn test_late_materialization(
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
     let filtered_scan_bytes = io_stats.read_bytes;
 
@@ -703,7 +703,7 @@ async fn test_late_materialization(
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
     }
 
@@ -717,7 +717,7 @@ async fn test_late_materialization(
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
     let index_scan_bytes = io_stats.read_bytes;
 
@@ -730,7 +730,7 @@ async fn test_late_materialization(
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
 }
 
@@ -766,7 +766,7 @@ async fn test_blob_all_binary_late_materialization() {
     .unwrap();
 
     // Baseline: read the blob column as binary for the whole table.
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let _ = dataset.storage.as_ref().io_stats_incremental(); // reset
     dataset
         .scan()
         .project(&["blobs"])
@@ -775,11 +775,7 @@ async fn test_blob_all_binary_late_materialization() {
         .try_into_batch()
         .await
         .unwrap();
-    let full_scan_bytes = dataset
-        .object_store
-        .as_ref()
-        .io_stats_incremental()
-        .read_bytes;
+    let full_scan_bytes = dataset.storage.as_ref().io_stats_incremental().read_bytes;
 
     // A filter matching a single row out of 4000 should read far less than the whole
     // column: only the filter leaf plus the one materialized blob.
@@ -793,7 +789,7 @@ async fn test_blob_all_binary_late_materialization() {
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
 }
 
@@ -852,7 +848,7 @@ async fn test_nested_blob_all_binary_late_materialization() {
     .await
     .unwrap();
 
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let _ = dataset.storage.as_ref().io_stats_incremental(); // reset
     dataset
         .scan()
         .project(&["s"])
@@ -861,11 +857,7 @@ async fn test_nested_blob_all_binary_late_materialization() {
         .try_into_batch()
         .await
         .unwrap();
-    let full_scan_bytes = dataset
-        .object_store
-        .as_ref()
-        .io_stats_incremental()
-        .read_bytes;
+    let full_scan_bytes = dataset.storage.as_ref().io_stats_incremental().read_bytes;
 
     dataset
         .scan()
@@ -877,7 +869,7 @@ async fn test_nested_blob_all_binary_late_materialization() {
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
 }
 
@@ -2663,7 +2655,7 @@ pub async fn test_scan_planning_io(
         .unwrap();
 
     // First pass will need to perform some IOPs to determine what scalar indices are available
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_gt!(io_stats, read_iops, 0);
 
     // Second planning cycle should not perform any I/O
@@ -2676,7 +2668,7 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 
     dataset
@@ -2688,7 +2680,7 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 
     dataset
@@ -2701,7 +2693,7 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 
     dataset
@@ -2714,7 +2706,7 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 }
 

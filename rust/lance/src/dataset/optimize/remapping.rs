@@ -258,7 +258,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // index file is rebuilt and committed exactly once, rather than once per
     // version (the reuse index can accumulate many versions before remap runs).
     let curr_index_meta = read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )
@@ -884,7 +884,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     // Stored metadata: the segment's provenance bitmap and the entry, never
     // the query-rewritten listing `load_indices` produces on tagged tables.
     let stored = read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )
@@ -2209,7 +2209,7 @@ mod tests {
 
         async fn stored_index(dataset: &Dataset, name: &str) -> IndexMetadata {
             read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -2380,7 +2380,7 @@ mod tests {
             // history away.
             cleanup_frag_reuse_index(&mut dataset).await.unwrap();
             let remaining = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -2734,7 +2734,7 @@ mod tests {
             // are: the withdrawn sources' addresses are gone from them, the
             // compaction's rows were translated.
             let entries = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -2804,7 +2804,7 @@ mod tests {
                 .unwrap();
             assert_eq!(dataset.manifest.version, version, "nothing committed");
             let stored = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -3122,7 +3122,7 @@ mod tests {
             // The remapped segment claims only the destination it still
             // serves; the ceded one belongs to the sibling.
             let remapped: Vec<IndexMetadata> = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -3144,7 +3144,7 @@ mod tests {
                 .await
                 .unwrap();
             let segments = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -3560,7 +3560,7 @@ mod tests {
             dataset: &Dataset,
         ) -> Vec<lance_table::format::pb::fragment_reuse_index_details::Version> {
             let Some(entry) = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -3602,7 +3602,7 @@ mod tests {
         /// Every stored segment of `name`, in manifest order.
         async fn segments_named(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
             read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -4824,7 +4824,7 @@ mod tests {
             let mut faulted = DatasetBuilder::from_uri(&routed)
                 .with_read_params(ReadParams {
                     store_options: Some(ObjectStoreParams {
-                        object_store_wrapper: Some(failing),
+                        backend_wrappers: vec![failing],
                         ..Default::default()
                     }),
                     ..Default::default()

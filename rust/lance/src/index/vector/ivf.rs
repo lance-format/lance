@@ -53,6 +53,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
@@ -127,7 +128,6 @@ use lance_select::RowAddrTreeMap;
 use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata};
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive};
-use object_store::path::Path;
 use prost::Message;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -714,7 +714,7 @@ pub(crate) async fn validate_committed_vector_segments(
                 .boxed()
             })
             .collect::<Vec<_>>();
-        let mut contracts = stream::iter(contracts).buffered(dataset.object_store.io_parallelism());
+        let mut contracts = stream::iter(contracts).buffered(dataset.storage.io_parallelism());
         let mut reference: Option<(&TableIndexMetadata, VectorQueryContract)> = None;
         let mut without_index_file = None;
         while let Some((segment, contract)) = contracts.try_next().await? {
@@ -771,20 +771,15 @@ async fn vector_segment_contract(
     {
         return Ok(None);
     }
-    let object_store = dataset.object_store_for_index(segment).await?;
+    let storage = dataset.storage_for_index(segment).await?;
     let index_file = dataset
         .indice_files_dir(segment)?
         .join(segment.uuid.to_string())
         .join(INDEX_FILE_NAME);
     let file_sizes = segment.file_size_map();
     let version = async {
-        let reader = open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?;
+        let reader =
+            open_index_file(storage.as_ref(), &index_file, INDEX_FILE_NAME, &file_sizes).await?;
         read_version(&read_last_block(reader.as_ref()).await?)
     };
     let version = match version.await {
@@ -794,7 +789,7 @@ async fn vector_segment_contract(
     };
     if matches!(version, (0, 3) | (2, _)) {
         let metadata = dataset
-            .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
+            .read_vector_index_metadata(&storage, &index_file, &file_sizes)
             .await?;
         return VectorQueryContract::from_file_metadata(&metadata).map(Some);
     }
@@ -1034,12 +1029,12 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store.as_ref();
+    let storage = dataset.storage.as_ref();
     let index_file = dataset
         .indices_dir()
         .join(new_uuid.to_string())
         .join(INDEX_FILE_NAME);
-    let writer = object_store.create(&index_file).await?;
+    let writer = storage.create(&index_file).await?;
 
     let first_idx = existing_indices[0]
         .as_any()
@@ -1071,7 +1066,7 @@ pub(crate) async fn optimize_vector_indices(
                 .indices_dir()
                 .join(new_uuid.to_string())
                 .join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_writer = object_store.create(&aux_file).await?;
+            let aux_writer = storage.create(&aux_file).await?;
             optimize_ivf_hnsw_indices(
                 Arc::new(dataset),
                 first_idx,
@@ -2420,7 +2415,7 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     let file = write_ivf_pq_file(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         dataset.indices_dir(),
         column,
         index_name,
@@ -2713,7 +2708,7 @@ pub(crate) async fn remap_index_file(
     column: String,
     transforms: Vec<pb::Transform>,
 ) -> Result<IndexFile> {
-    let object_store = dataset.object_store.as_ref();
+    let storage = dataset.storage.as_ref();
     let old_path = dataset
         .indices_dir()
         .join(old_uuid.to_string())
@@ -2728,18 +2723,17 @@ pub(crate) async fn remap_index_file(
         .await?
         .map(|index| index.file_size_map())
         .unwrap_or_default();
-    let reader: Arc<dyn Reader> =
-        open_index_file(object_store, &old_path, INDEX_FILE_NAME, &file_sizes)
-            .await?
-            .into();
-    let mut writer = object_store.create(&new_path).await?;
+    let reader: Arc<dyn Reader> = open_index_file(storage, &old_path, INDEX_FILE_NAME, &file_sizes)
+        .await?
+        .into();
+    let mut writer = storage.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
     let mapping = Arc::new(mapping.clone());
 
     let mut task_stream = stream::iter(tasks)
         .map(|task| task.load_and_remap(reader.clone(), index, mapping.clone()))
-        .buffered(object_store.io_parallelism());
+        .buffered(storage.io_parallelism());
 
     let mut ivf = IvfModel {
         centroids: index.ivf.centroids.clone(),
@@ -2787,7 +2781,7 @@ pub(crate) async fn remap_index_file(
 ///
 #[allow(clippy::too_many_arguments)]
 async fn write_ivf_pq_file(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     index_dir: Path,
     column: &str,
     index_name: &str,
@@ -2806,7 +2800,7 @@ async fn write_ivf_pq_file(
         .clone()
         .join(uuid.to_string())
         .join(INDEX_FILE_NAME);
-    let mut writer = object_store.create(&path).await?;
+    let mut writer = storage.create(&path).await?;
 
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
@@ -2861,7 +2855,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
-    let obj_store = dataset.object_store.as_ref();
+    let obj_store = dataset.storage.as_ref();
     let path = dataset
         .indices_dir()
         .join(index_id.to_string())
@@ -2903,12 +2897,12 @@ async fn write_ivf_hnsw_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let object_store = dataset.object_store.as_ref();
+    let storage = dataset.storage.as_ref();
     let path = dataset
         .indices_dir()
         .join(uuid.to_string())
         .join(INDEX_FILE_NAME);
-    let writer = object_store.create(&path).await?;
+    let writer = storage.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
     let mut writer =
@@ -2927,7 +2921,7 @@ async fn write_ivf_hnsw_file(
         .indices_dir()
         .join(uuid.to_string())
         .join(INDEX_AUXILIARY_FILE_NAME);
-    let aux_writer = object_store.create(&aux_path).await?;
+    let aux_writer = storage.create(&aux_path).await?;
     let schema = Schema::new(vec![
         ROW_ID_FIELD.clone(),
         arrow_schema::Field::new(
@@ -3041,7 +3035,7 @@ pub(crate) async fn merge_segments(
         );
     }
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         &dataset.indices_dir(),
         segments,
         Some(row_filters),
@@ -3057,7 +3051,7 @@ pub(crate) async fn merge_remapped_segments(
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         &dataset.indices_dir(),
         segments,
         None,
@@ -3070,7 +3064,7 @@ pub(crate) async fn merge_remapped_segments(
 /// report progress through the provided callback.
 #[cfg(test)]
 pub(crate) async fn merge_segments_with_progress(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
@@ -3090,18 +3084,11 @@ pub(crate) async fn merge_segments_with_progress(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    merge_segments_inner(
-        object_store,
-        indices_dir,
-        segments,
-        Some(row_filters),
-        progress,
-    )
-    .await
+    merge_segments_inner(storage, indices_dir, segments, Some(row_filters), progress).await
 }
 
 async fn merge_segments_inner(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
     row_filters: Option<Vec<lance_index::scalar::OldIndexDataFilter>>,
@@ -3140,7 +3127,7 @@ async fn merge_segments_inner(
     let segment_uuid = Uuid::new_v4();
     let final_dir = indices_dir.clone().join(segment_uuid.to_string());
     let files = merge_segments_to_dir(
-        object_store,
+        storage,
         indices_dir,
         &final_dir,
         &segments,
@@ -3170,7 +3157,7 @@ async fn merge_segments_inner(
 /// those input segments directly from `indices/<segment_uuid>/` and writes the
 /// merged auxiliary/index files into `final_dir`.
 async fn merge_segments_to_dir(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
@@ -3178,7 +3165,7 @@ async fn merge_segments_to_dir(
     _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
-    reset_final_segment_dir(object_store, final_dir).await?;
+    reset_final_segment_dir(storage, final_dir).await?;
 
     debug_assert!(
         segments.len() > 1,
@@ -3205,7 +3192,7 @@ async fn merge_segments_to_dir(
         .collect::<Vec<_>>();
     let auxiliary_file = if let Some(row_filters) = row_filters {
         lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
-            object_store,
+            storage,
             &aux_paths,
             final_dir,
             row_filters,
@@ -3214,7 +3201,7 @@ async fn merge_segments_to_dir(
         .await?
     } else {
         lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
-            object_store,
+            storage,
             &aux_paths,
             final_dir,
             progress.clone(),
@@ -3222,7 +3209,7 @@ async fn merge_segments_to_dir(
         .await?
     };
     let index_file = write_root_vector_index_from_auxiliary(
-        object_store,
+        storage,
         final_dir,
         None,
         &source_index_paths,
@@ -3245,8 +3232,8 @@ fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
 }
 
 /// Best-effort reset of one target directory before rewriting it.
-async fn reset_final_segment_dir(object_store: &ObjectStore, final_dir: &Path) -> Result<()> {
-    match object_store.remove_dir_all(final_dir.clone()).await {
+async fn reset_final_segment_dir(storage: &ObjectStore, final_dir: &Path) -> Result<()> {
+    match storage.remove_dir_all(final_dir.clone()).await {
         Ok(()) => {}
         Err(Error::NotFound { .. }) => {}
         Err(err) => return Err(err),
@@ -3255,7 +3242,7 @@ async fn reset_final_segment_dir(object_store: &ObjectStore, final_dir: &Path) -
 }
 
 async fn write_root_vector_index_from_auxiliary(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     index_dir: &Path,
     requested_index_type: Option<IndexType>,
     centroid_source_index_paths: &[Path],
@@ -3263,8 +3250,8 @@ async fn write_root_vector_index_from_auxiliary(
 ) -> Result<IndexFile> {
     let aux_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
-        Arc::new(object_store.clone()),
-        SchedulerConfig::max_bandwidth(object_store),
+        Arc::new(storage.clone()),
+        SchedulerConfig::max_bandwidth(storage),
     );
     let fh = scheduler
         .open_file(&aux_path, &CachedFileSize::unknown())
@@ -3296,7 +3283,7 @@ async fn write_root_vector_index_from_auxiliary(
     // from one of the shard index files that fed this merge.
     if pb_ivf.centroids_tensor.is_none() {
         for partial_index_path in centroid_source_index_paths {
-            if !object_store.exists(partial_index_path).await? {
+            if !storage.exists(partial_index_path).await? {
                 continue;
             }
             let fh = scheduler
@@ -3351,7 +3338,7 @@ async fn write_root_vector_index_from_auxiliary(
             }
         };
     if let Some(source_hnsw_index_metadata) =
-        read_hnsw_index_metadata_from_sources(object_store, &scheduler, centroid_source_index_paths)
+        read_hnsw_index_metadata_from_sources(storage, &scheduler, centroid_source_index_paths)
             .await?
     {
         if idx_meta.index_type.starts_with("IVF_HNSW")
@@ -3367,7 +3354,7 @@ async fn write_root_vector_index_from_auxiliary(
 
     // Write root index.idx via V2 writer so downstream opens through v2 path.
     let index_path = index_dir.clone().join(INDEX_FILE_NAME);
-    let obj_writer = object_store.create(&index_path).await?;
+    let obj_writer = storage.create(&index_path).await?;
     progress
         .stage_start("write_root_index", Some(1), "files")
         .await?;
@@ -3391,12 +3378,9 @@ async fn write_root_vector_index_from_auxiliary(
     );
 
     if is_hnsw {
-        let hnsw_params = read_hnsw_build_params_from_sources(
-            object_store,
-            &scheduler,
-            centroid_source_index_paths,
-        )
-        .await?;
+        let hnsw_params =
+            read_hnsw_build_params_from_sources(storage, &scheduler, centroid_source_index_paths)
+                .await?;
         write_hnsw_root_index_from_auxiliary(
             &mut v2_writer,
             &aux_reader,
@@ -3437,14 +3421,14 @@ async fn write_root_vector_index_from_auxiliary(
 }
 
 async fn read_hnsw_index_metadata_from_sources(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     scheduler: &Arc<ScanScheduler>,
     source_index_paths: &[Path],
 ) -> Result<Option<IndexMetadata>> {
     let mut index_metadata: Option<IndexMetadata> = None;
 
     for source_index_path in source_index_paths {
-        if !object_store.exists(source_index_path).await? {
+        if !storage.exists(source_index_path).await? {
             continue;
         }
 
@@ -3493,14 +3477,14 @@ fn index_metadata_eq(left: &IndexMetadata, right: &IndexMetadata) -> bool {
 }
 
 async fn read_hnsw_build_params_from_sources(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     scheduler: &Arc<ScanScheduler>,
     source_index_paths: &[Path],
 ) -> Result<HnswBuildParams> {
     let mut build_params: Option<HnswBuildParams> = None;
 
     for source_index_path in source_index_paths {
-        if !object_store.exists(source_index_path).await? {
+        if !storage.exists(source_index_path).await? {
             continue;
         }
 
@@ -5850,7 +5834,7 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
         generate_fixed_training_ranges(
             selection_rows,
             selection_rows.min(requested_rows),
-            dataset.object_store.as_ref().block_size(),
+            dataset.storage.as_ref().block_size(),
             sampler.byte_width,
         )
     });
@@ -10688,11 +10672,11 @@ mod tests {
             .unwrap();
 
         // Reset IO stats after index creation
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset.storage.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all partitions into cache
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset.storage.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10709,7 +10693,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10719,7 +10703,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -10841,11 +10825,11 @@ mod tests {
             .clone();
 
         // Reset IO stats after migration and sampling.
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset.storage.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all index deltas into cache.
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset.storage.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10861,7 +10845,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10871,7 +10855,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached).
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -10987,7 +10971,7 @@ mod tests {
         let indices_dir = dataset.indices_dir().join(index.uuid.to_string());
         for file in files {
             let actual = dataset
-                .object_store
+                .storage
                 .size(&indices_dir.clone().join(file.path.as_str()))
                 .await
                 .unwrap();

@@ -308,42 +308,35 @@ impl BranchDatasetFixture {
         }
 
         let manifest_dir = branch_path.clone().join("_versions");
-        self.counts.num_manifest_files = count_dir(
-            &self.dataset.object_store,
-            &manifest_dir,
-            Some(&["manifest"]),
-        )
-        .await
-        .unwrap_or(0);
+        self.counts.num_manifest_files =
+            count_dir(&self.dataset.storage, &manifest_dir, Some(&["manifest"]))
+                .await
+                .unwrap_or(0);
 
         // Transactions: count files under _transactions (extension .txn)
         let txn_dir = branch_path.clone().join("_transactions");
-        self.counts.num_tx_files = count_dir(&self.dataset.object_store, &txn_dir, Some(&["txn"]))
+        self.counts.num_tx_files = count_dir(&self.dataset.storage, &txn_dir, Some(&["txn"]))
             .await
             .unwrap_or(0);
 
         // Indices: count files under _indices
         let idx_dir = branch_path.clone().join(crate::dataset::INDICES_DIR);
-        self.counts.num_index_files = count_dir(&self.dataset.object_store, &idx_dir, None)
+        self.counts.num_index_files = count_dir(&self.dataset.storage, &idx_dir, None)
             .await
             .unwrap_or(0);
 
         // Deletions: count files under _deletions (extensions .arrow / .bin)
         let del_dir = branch_path.clone().join("_deletions");
-        self.counts.num_delete_files = count_dir(
-            &self.dataset.object_store,
-            &del_dir,
-            Some(&["arrow", "bin"]),
-        )
-        .await
-        .unwrap_or(0);
+        self.counts.num_delete_files =
+            count_dir(&self.dataset.storage, &del_dir, Some(&["arrow", "bin"]))
+                .await
+                .unwrap_or(0);
 
         // Data files: count .lance files under data/
         let data_dir = branch_path.clone().join(crate::dataset::DATA_DIR);
-        self.counts.num_data_files =
-            count_dir(&self.dataset.object_store, &data_dir, Some(&["lance"]))
-                .await
-                .unwrap_or(0);
+        self.counts.num_data_files = count_dir(&self.dataset.storage, &data_dir, Some(&["lance"]))
+            .await
+            .unwrap_or(0);
 
         Ok(())
     }

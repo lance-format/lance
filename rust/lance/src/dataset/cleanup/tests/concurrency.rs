@@ -25,10 +25,10 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
         Some(WriteParams {
             max_rows_per_file: 2,
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(Arc::new(MockObjectStore {
+                backend_wrappers: vec![Arc::new(MockWrappingObjectStore {
                     delete_latency,
-                    ..MockObjectStore::new()
-                })),
+                    ..MockWrappingObjectStore::new()
+                })],
                 ..Default::default()
             }),
             ..Default::default()
@@ -50,17 +50,14 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
     .unwrap();
     let expected = dataset.scan().try_into_batch().await.unwrap();
     // A small store default exercises explicit windows both below and above it.
-    dataset.object_store = Arc::new(ObjectStore::new(
-        dataset.object_store.inner.clone(),
-        url::Url::parse("memory://").unwrap(),
-        None,
-        None,
-        false,
-        true,
-        2,
-        0,
-        None,
-    ));
+    dataset.storage = Arc::new(
+        dataset
+            .storage
+            .as_ref()
+            .clone()
+            .with_io_parallelism(2)
+            .unwrap(),
+    );
     tokio::time::pause();
     let policy = CleanupPolicy {
         // Keep the pre-existing exhaustive literal source-compatible.
@@ -108,7 +105,7 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
         }
     };
     let explanation = operation.explain().await.unwrap();
-    let window = concurrency.unwrap_or_else(|| dataset.object_store.io_parallelism());
+    let window = concurrency.unwrap_or_else(|| dataset.storage.io_parallelism());
     let candidate_count = explanation.candidate_files.len();
     if concurrency.is_some() {
         assert!(candidate_count >= window);

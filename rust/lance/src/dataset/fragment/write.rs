@@ -158,7 +158,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
         let schema = promote_legacy_blobs(version, schema)?;
 
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
@@ -173,7 +173,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         };
         let mut writer = crate::dataset::versions::open_writer(
             version,
-            &object_store,
+            &storage,
             &schema,
             &base_path,
             WriterOptions::from_params(&params, external_base_resolver),
@@ -230,7 +230,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let existing_base_paths = existing_dataset
             .as_ref()
             .map(|dataset| &dataset.manifest.base_paths);
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
@@ -240,7 +240,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             validate_and_resolve_target_bases_with_primary(
                 &mut params,
                 existing_base_paths,
-                &object_store,
+                &storage,
                 &base_path,
                 self.dataset_uri,
             )
@@ -251,7 +251,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         crate::dataset::versions::write_fragments_direct(
             version,
             existing_dataset.as_ref(),
-            object_store,
+            storage,
             &base_path,
             &schema,
             stream,
@@ -278,7 +278,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
@@ -288,7 +288,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let mut writer = V1FileWriter::<ManifestDescribing>::try_new(
-            &object_store,
+            &storage,
             &full_path,
             schema,
             &Default::default(),

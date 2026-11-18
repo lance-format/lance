@@ -11,6 +11,7 @@ use arrow_array::{FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_core::storage::path::Path;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::versions as file_versions;
@@ -23,7 +24,6 @@ use lance_index::vector::{ivf::storage::IvfModel, transform::Transformer};
 use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
-use object_store::path::Path;
 use tracing::instrument;
 
 use lance_core::{Error, ROW_ID, Result, traits::DatasetTakeRows};

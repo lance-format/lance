@@ -153,7 +153,7 @@ async fn scoped_count_reads_only_scoped_deletions(
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {
             store_options: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io.clone()),
+                backend_wrappers: vec![io.clone()],
                 ..Default::default()
             }),
             ..Default::default()

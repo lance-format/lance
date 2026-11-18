@@ -132,7 +132,7 @@ pub(super) async fn commit_overlay(
     // base we get e.g. tmp/lance-bench/data/foo.lance → /tmp/lance-bench/data/foo.lance.
     // For memory:// stores base is empty so the result is the same as before.
     let path = dataset.base.clone().join("data").join(filename.as_str());
-    let obj_writer = dataset.object_store.create(&path).await.unwrap();
+    let obj_writer = dataset.storage.create(&path).await.unwrap();
     let file_version = dataset.manifest.data_storage_format.lance_file_format();
     let mut writer = lance_file::versions::create_writer(
         file_version,
@@ -2605,13 +2605,9 @@ async fn test_remapping_merge_reads_only_overlaid_rows() {
         .expect("the writer records the data file size")
         .get();
     let appended_file = dataset.get_fragment(1).unwrap().metadata().files[0].clone();
-    dataset.object_store.as_ref().io_stats_incremental(); // Reset
+    dataset.storage.as_ref().io_stats_incremental(); // Reset
     optimize_into_one_segment(&mut dataset, "age_idx", &OptimizeOptions::merge(2), &[0, 1]).await;
-    let requests = dataset
-        .object_store
-        .as_ref()
-        .io_stats_incremental()
-        .requests;
+    let requests = dataset.storage.as_ref().io_stats_incremental().requests;
     let base_reads = requests
         .iter()
         .filter(|request| request.path.as_ref().ends_with(base_file.path.as_str()))

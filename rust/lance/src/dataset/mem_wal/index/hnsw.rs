@@ -18,6 +18,7 @@ use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::storage::path::Path;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY};
 use lance_file::versions as file_versions;
@@ -38,7 +39,6 @@ use lance_index::{
     IndexMetadata as IndexMetaSchema, IndexType, pb,
 };
 use lance_linalg::distance::DistanceType;
-use object_store::path::Path;
 use prost::Message;
 
 use super::super::hnsw::{ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams};
@@ -605,7 +605,7 @@ async fn write_sq_storage(
     let mut writer = file_versions::create_writer(
         generation.storage_version,
         generation
-            .object_store
+            .storage
             .create(&dir.clone().join(INDEX_AUXILIARY_FILE_NAME))
             .await?,
         (&schema).try_into()?,
@@ -669,7 +669,7 @@ async fn write_graph(
     let mut writer = file_versions::create_writer(
         generation.storage_version,
         generation
-            .object_store
+            .storage
             .create(&dir.clone().join(INDEX_FILE_NAME))
             .await?,
         (&schema).try_into()?,

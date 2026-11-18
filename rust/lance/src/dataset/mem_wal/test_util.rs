@@ -13,11 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result as OSResult,
+use lance_core::storage::path::Path;
+use lance_io::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, Result as OSResult,
 };
 use tokio::sync::Notify;
 
@@ -87,7 +86,7 @@ impl FailControls {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(object_store::Error::Generic {
+            return Err(lance_io::object_store::Error::Generic {
                 store: "failing-test-store",
                 source: "injected SSTable write failure".into(),
             });
@@ -144,6 +143,11 @@ impl FailControls {
             .any(|p| p.contains(needle))
     }
 
+    /// Number of backend reads, including failed requests.
+    pub fn read_count(&self) -> usize {
+        self.get_paths.lock().unwrap().len()
+    }
+
     /// Did any read land on a path containing `needle`? See [`Self::wrote_under`].
     pub fn read_under(&self, needle: &str) -> bool {
         self.get_paths
@@ -154,60 +158,66 @@ impl FailControls {
     }
 }
 
-/// Wraps the inner store with [`FailingObjectStore`] at construction.
+/// Wraps the inner store with [`FailingBackend`] at construction.
 #[derive(Debug)]
 struct FailingWrapper {
     controls: Arc<FailControls>,
 }
 
 impl WrappingObjectStore for FailingWrapper {
-    fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
-        Arc::new(FailingObjectStore {
+    fn wrap(
+        &self,
+        _prefix: &str,
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        Arc::new(FailingBackend {
             inner: original,
             controls: self.controls.clone(),
         })
-    }
-
-    // Injects behaviour into every request, so a listing must not go around it.
-    fn wrap_paginated(
-        &self,
-        _store_prefix: &str,
-        _original: Arc<dyn object_store::list::PaginatedListStore>,
-    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
-        None
     }
 }
 
 /// Delegates everything to `inner`, failing WAL-entry PUTs per [`FailControls`].
 #[derive(Debug)]
-struct FailingObjectStore {
-    inner: Arc<dyn OSObjectStore>,
+struct FailingBackend {
+    inner: Arc<dyn lance_io::object_store::StorageBackend>,
     controls: Arc<FailControls>,
 }
 
-impl FailingObjectStore {
+impl FailingBackend {
     /// WAL entries live under `.../wal/`; manifests (`.../manifest/`) are never
     /// failed so `ShardWriter::open`/`claim_epoch` still work.
     fn is_wal_entry(location: &Path) -> bool {
         location.as_ref().contains("/wal/")
     }
 
-    fn injected_error() -> object_store::Error {
-        object_store::Error::Generic {
+    fn injected_error() -> lance_io::object_store::Error {
+        lance_io::object_store::Error::Generic {
             store: "failing-test-store",
             source: "injected transient WAL put failure".to_string().into(),
         }
     }
 }
 
-impl Display for FailingObjectStore {
+impl Display for FailingBackend {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FailingObjectStore({})", self.inner)
+        write!(f, "FailingBackend({})", self.inner)
     }
 }
 
 #[async_trait::async_trait]
-impl OSObjectStore for FailingObjectStore {
+impl lance_io::object_store::StorageBackend for FailingBackend {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -259,7 +269,7 @@ impl OSObjectStore for FailingObjectStore {
         &self,
         location: &Path,
         opts: PutMultipartOptions,
-    ) -> OSResult<Box<dyn MultipartUpload>> {
+    ) -> OSResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
         // Data files (`*.lance`) are written multipart, not via `put_opts`.
         self.controls
             .put_paths
@@ -330,9 +340,9 @@ impl OSObjectStore for FailingObjectStore {
 pub fn observable_store_params() -> (ObjectStoreParams, Arc<FailControls>) {
     let controls = Arc::new(FailControls::default());
     let params = ObjectStoreParams {
-        object_store_wrapper: Some(Arc::new(FailingWrapper {
+        backend_wrappers: vec![Arc::new(FailingWrapper {
             controls: controls.clone(),
-        })),
+        })],
         ..Default::default()
     };
     (params, controls)

@@ -29,6 +29,7 @@ use futures::stream::repeat_with;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_core::utils::futures::StreamOnDropExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
@@ -47,7 +48,6 @@ use lance_io::utils::CachedFileSize;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
-use object_store::path::Path;
 
 use crate::vector::PART_ID_COLUMN;
 use crate::vector::ivf::IvfTransformer;
@@ -491,9 +491,9 @@ impl IvfShuffler {
         &mut self,
         data: impl Stream<Item = Result<RecordBatch>>,
     ) -> Result<()> {
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let path = self.output_dir.clone().join(UNSORTED_BUFFER);
-        let writer = object_store.create(&path).await?;
+        let writer = storage.create(&path).await?;
 
         let mut data = Box::pin(data.peekable());
         let schema = match data.as_mut().peek_mut().await {
@@ -544,16 +544,15 @@ impl IvfShuffler {
     async fn total_batches(&self) -> Result<Vec<usize>> {
         let mut total_batches = vec![];
         for buffer in &self.unsorted_buffers {
-            let object_store = ObjectStore::local();
+            let storage = ObjectStore::local();
             let path = self.output_dir.clone().join(buffer.as_str());
 
             if self.is_legacy {
-                let reader =
-                    V1FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader = V1FileReader::try_new_self_described(&storage, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
-                let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-                let scheduler = ScanScheduler::new(object_store.into(), scheduler_config);
+                let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+                let scheduler = ScanScheduler::new(storage.into(), scheduler_config);
                 let file = scheduler
                     .open_file(&path, &CachedFileSize::unknown())
                     .await?;
@@ -580,11 +579,11 @@ impl IvfShuffler {
     }
 
     async fn count_partition_size(&self, inputs: &[ShuffleInput]) -> Result<Vec<u64>> {
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         let mut partition_sizes = vec![0; self.num_partitions as usize];
         let scheduler = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
 
         for &ShuffleInput {
@@ -597,8 +596,7 @@ impl IvfShuffler {
             let path = self.output_dir.clone().join(file_name.as_str());
 
             if self.is_legacy {
-                let reader =
-                    V1FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader = V1FileReader::try_new_self_described(&storage, &path, None).await?;
                 let lance_schema = reader
                     .schema()
                     .project(&[PART_ID_COLUMN])
@@ -669,14 +667,14 @@ impl IvfShuffler {
             end,
         } in inputs
         {
-            let object_store = ObjectStore::local();
+            let storage = ObjectStore::local();
             let file_name = &self.unsorted_buffers[file_idx];
             let path = self.output_dir.clone().join(file_name.as_str());
             let mut _reader_handle = None;
 
             let mut stream = if self.is_legacy {
                 _reader_handle =
-                    Some(V1FileReader::try_new_self_described(&object_store, &path, None).await?);
+                    Some(V1FileReader::try_new_self_described(&storage, &path, None).await?);
 
                 stream::iter(start..end)
                     .map(|i| {
@@ -686,8 +684,8 @@ impl IvfShuffler {
                     .buffered(16)
                     .boxed()
             } else {
-                let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-                let scheduler = ScanScheduler::new(Arc::new(object_store), scheduler_config);
+                let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+                let scheduler = ScanScheduler::new(Arc::new(storage), scheduler_config);
                 let file = scheduler
                     .open_file(&path, &CachedFileSize::unknown())
                     .await?;
@@ -807,10 +805,10 @@ impl IvfShuffler {
                         .await?;
 
                     // finally, write the shuffled data to disk
-                    let object_store = ObjectStore::local();
+                    let storage = ObjectStore::local();
                     let output_file = format!("{}_{}.lance", this.shuffle_output_root_filename, i);
                     let path = this.output_dir.clone().join(output_file.clone());
-                    let writer = object_store.create(&path).await?;
+                    let writer = storage.create(&path).await?;
 
                     info!(
                         "Chunk loaded into memory and sorted, writing to disk at {}",
@@ -861,10 +859,10 @@ impl IvfShuffler {
         let mut streams = vec![];
 
         for file in files {
-            let object_store = Arc::new(ObjectStore::local());
+            let storage = Arc::new(ObjectStore::local());
             let path = basedir.clone().join(file);
-            let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-            let scan_scheduler = ScanScheduler::new(object_store, scheduler_config);
+            let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+            let scan_scheduler = ScanScheduler::new(storage, scheduler_config);
             let file_scheduler = scan_scheduler
                 .open_file(&path, &CachedFileSize::unknown())
                 .await?;

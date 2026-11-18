@@ -227,7 +227,7 @@ pub async fn plan_expire_versions(
 
     let locations: Vec<ManifestLocation> = dataset
         .commit_handler
-        .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+        .list_manifest_locations(&dataset.base, &dataset.storage, false)
         .try_collect()
         .await?;
 
@@ -380,7 +380,7 @@ pub async fn expire_versions(
         source.boxed()
     };
 
-    let store = &dataset.object_store;
+    let store = &dataset.storage;
     paced
         .map(|location| async move {
             let location = location?;
@@ -393,7 +393,7 @@ pub async fn expire_versions(
             };
             Ok::<_, Error>((location, outcome))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.storage.io_parallelism())
         .try_for_each(|(location, outcome)| {
             let mut stats = stats.lock().unwrap();
             match outcome {
@@ -444,16 +444,16 @@ pub async fn expire_versions(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use all_asserts::assert_gt;
     use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 
     use super::*;
     use crate::dataset::{CommitBuilder, DeleteBuilder, WriteParams};
+    use crate::utils::test::FailingProxyStore;
 
     /// A dataset at version `versions`, each version an overwrite.
     async fn dataset_with_versions(uri: &str, versions: u32) -> Dataset {
@@ -490,7 +490,7 @@ mod tests {
     async fn version_count(dataset: &Dataset) -> usize {
         dataset
             .commit_handler
-            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .list_manifest_locations(&dataset.base, &dataset.storage, false)
             .try_collect::<Vec<_>>()
             .await
             .unwrap()
@@ -544,22 +544,11 @@ mod tests {
         let uri = TempStrDir::default();
         let mut dataset = dataset_with_versions(&uri, 4).await;
         let before = version_count(&dataset).await;
-        lance_table::io::commit::write_version_hint(&dataset.object_store, &dataset.base, 3).await;
+        lance_table::io::commit::write_version_hint(&dataset.storage, &dataset.base, 3).await;
 
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
-        policy.lock().unwrap().set_before_policy(
-            "fail_hint_read",
-            Arc::new(|method, path| {
-                if method == "get_opts" && path.filename() == Some("latest_version_hint.json") {
-                    Err(Error::internal("hint unavailable".to_string()))
-                } else {
-                    Ok(())
-                }
-            }),
-        );
-        let original = dataset.object_store.inner.clone();
-        let object_store = Arc::make_mut(&mut dataset.object_store);
-        object_store.inner = Arc::new(ProxyObjectStore::new(original, policy));
+        let wrapper = FailingProxyStore::new();
+        wrapper.fail_when("get_opts", "latest_version_hint.json", "hint unavailable");
+        Arc::make_mut(&mut dataset.storage).apply_wrapper(&wrapper);
 
         let error = expire_versions(
             &dataset,
@@ -648,7 +637,7 @@ mod tests {
         assert_eq!(stats.versions_removed, 3);
         let surviving = dataset
             .commit_handler
-            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .list_manifest_locations(&dataset.base, &dataset.storage, false)
             .map_ok(|l| l.version)
             .try_collect::<HashSet<_>>()
             .await
@@ -686,26 +675,13 @@ mod tests {
         let mut dataset = dataset_with_versions(&uri, 4).await;
         let data_before = count_data_files(&dataset).await;
 
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
-        policy.lock().unwrap().set_before_policy(
-            "reject_manifest_reads",
-            Arc::new(|method, path| {
-                if method == "get_opts"
-                    && path
-                        .filename()
-                        .is_some_and(|filename| filename.ends_with(".manifest"))
-                {
-                    Err(Error::internal(format!(
-                        "expiry unexpectedly read manifest {path}"
-                    )))
-                } else {
-                    Ok(())
-                }
-            }),
+        let wrapper = FailingProxyStore::new();
+        wrapper.fail_when(
+            "get_opts",
+            ".manifest",
+            "expiry unexpectedly read a manifest",
         );
-        let original = dataset.object_store.inner.clone();
-        let object_store = Arc::make_mut(&mut dataset.object_store);
-        object_store.inner = Arc::new(ProxyObjectStore::new(original, policy));
+        Arc::make_mut(&mut dataset.storage).apply_wrapper(&wrapper);
 
         let stats = expire_versions(
             &dataset,
@@ -726,7 +702,7 @@ mod tests {
 
     async fn count_data_files(dataset: &Dataset) -> usize {
         dataset
-            .object_store
+            .storage
             .read_dir_all(&dataset.base.clone().join("data"), None)
             .try_collect::<Vec<_>>()
             .await
@@ -760,7 +736,7 @@ mod tests {
 
         // Pin the hint below the latest so the guard has something to protect that the
         // ordinary "never remove the latest" rule would not already cover.
-        lance_table::io::commit::write_version_hint(&dataset.object_store, &dataset.base, 3).await;
+        lance_table::io::commit::write_version_hint(&dataset.storage, &dataset.base, 3).await;
 
         let plan = explain_expire_versions(
             &dataset,

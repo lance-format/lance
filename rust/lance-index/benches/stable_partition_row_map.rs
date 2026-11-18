@@ -48,13 +48,13 @@ fn fixture() -> &'static Fixture {
         let tempdir = TempDir::default();
         // The store's IO scheduler spawns onto the ambient tokio runtime.
         let _guard = runtime.enter();
-        let (object_store, path) = runtime
+        let (storage, path) = runtime
             .block_on(ObjectStore::from_uri(tempdir.obj_path().as_ref()))
             .unwrap();
         // 2.1+ has the miniblock dictionary path; 2.0 stores the labels as
         // plain u16 and roughly triples the file.
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::with_format_version(
-            object_store,
+            storage,
             path,
             Arc::new(LanceCache::with_capacity(128 * 1024 * 1024)),
             lance_file::version::ConcreteFileVersion::V2_1,

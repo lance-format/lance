@@ -13,8 +13,8 @@ use std::{
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{FutureExt, future::try_join_all};
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_index::Index;
 use lance_index::scalar::inverted::{
     DocSet, FTS_FORMAT_VERSION_KEY, InvertedIndex, InvertedIndexParams, InvertedIndexPlugin,
@@ -25,7 +25,7 @@ use lance_index::scalar::inverted::{
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{IndexStore, registry::ScalarIndexPlugin};
 use lance_io::object_store::{ObjectStore, WrappingObjectStore};
-use object_store::{list::PaginatedListStore, path::Path};
+use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
 
 #[derive(Debug)]
 struct RequestWrapper;
@@ -34,25 +34,17 @@ impl WrappingObjectStore for RequestWrapper {
     fn wrap(
         &self,
         _prefix: &str,
-        original: Arc<dyn object_store::ObjectStore>,
-    ) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(ProxyObjectStore::new(
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        Arc::new(ProxyBackend::new(
             original,
-            Arc::new(Mutex::new(ProxyObjectStorePolicy::new())),
+            Arc::new(Mutex::new(ProxyBackendPolicy::new())),
         ))
-    }
-
-    fn wrap_paginated(
-        &self,
-        _prefix: &str,
-        _original: Arc<dyn PaginatedListStore>,
-    ) -> Option<Arc<dyn PaginatedListStore>> {
-        None
     }
 }
 
 struct Fixture {
-    object_store: ObjectStore,
+    storage: ObjectStore,
     metadata_cache: Arc<LanceCache>,
     index_cache: LanceCache,
     file_sizes: HashMap<String, u64>,
@@ -60,11 +52,11 @@ struct Fixture {
 
 impl Fixture {
     async fn new(partitions: u64, with_file_sizes: bool) -> Self {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let metadata_cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
         let index_cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(object_store.clone()),
+            Arc::new(storage.clone()),
             Path::from("index"),
             metadata_cache.clone(),
         ));
@@ -137,7 +129,7 @@ impl Fixture {
             file_sizes.clear();
         }
         Self {
-            object_store,
+            storage,
             metadata_cache,
             index_cache,
             file_sizes,
@@ -145,11 +137,11 @@ impl Fixture {
     }
 
     async fn open_request(&self) {
-        let mut object_store = self.object_store.clone();
-        object_store.apply_wrapper(&RequestWrapper);
+        let mut storage = self.storage.clone();
+        storage.apply_wrapper(&RequestWrapper);
         let store = Arc::new(
             LanceIndexStore::new(
-                Arc::new(object_store),
+                Arc::new(storage),
                 Path::from("index"),
                 self.metadata_cache.clone(),
             )
@@ -197,7 +189,7 @@ fn request_cache(c: &mut Criterion) {
                             try_join_all(tasks).await.unwrap();
                             // Test-util builds retain individual I/O records. Bound
                             // their lifetime to a batch on both compared revisions.
-                            black_box(fixture.object_store.io_stats_incremental());
+                            black_box(fixture.storage.io_stats_incremental());
                         });
                     },
                 );

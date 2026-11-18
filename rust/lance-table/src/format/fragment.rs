@@ -8,9 +8,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_file::version::ConcreteFileVersion;
 use lance_io::utils::CachedFileSize;
-use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
@@ -1006,8 +1006,8 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use lance_core::storage::path::Path;
     use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
-    use object_store::path::Path;
     use roaring::RoaringBitmap;
     use rstest::rstest;
     use serde_json::{Value, json};

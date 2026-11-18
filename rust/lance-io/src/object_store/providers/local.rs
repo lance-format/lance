@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
+#[cfg(any(windows, test))]
+use crate::object_store::backend::native::from_error;
 use std::{collections::HashMap, sync::Arc};
 
-#[cfg(any(windows, test))]
 use crate::object_store::LocalDirOperations;
+use crate::object_store::path::Path;
 use crate::object_store::{
-    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, ObjectStoreParams, ObjectStoreProvider,
+    StorageOptions,
 };
+use ::object_store::local::LocalFileSystem;
 use lance_core::Error;
 use lance_core::error::Result;
-use object_store::{local::LocalFileSystem, path::Path};
 #[cfg(any(windows, test))]
 use std::io::ErrorKind;
 use url::Url;
@@ -34,7 +37,10 @@ impl LocalDirOperations for FileSystemDirOperations {
         // while retaining its rooted path and Windows filename conversions.
         let placeholder = self
             .local_file_system
-            .path_to_filesystem(&path.clone().join("__lance_directory__"))?;
+            .path_to_filesystem(&crate::object_store::backend::native::to_path(
+                &path.clone().join("__lance_directory__"),
+            )?)
+            .map_err(from_error)?;
         placeholder
             .parent()
             .map(std::path::Path::to_path_buf)
@@ -42,11 +48,14 @@ impl LocalDirOperations for FileSystemDirOperations {
     }
 
     async fn remove_dir_all(&self, path: &Path) -> Result<()> {
-        let local_path = self.local_file_system.path_to_filesystem(path)?;
-        let object_store_path = path.to_string();
+        let local_path = self
+            .local_file_system
+            .path_to_filesystem(&crate::object_store::backend::native::to_path(path)?)
+            .map_err(from_error)?;
+        let storage_path = path.to_string();
         tokio::task::spawn_blocking(move || {
             std::fs::remove_dir_all(local_path).map_err(|error| match error.kind() {
-                ErrorKind::NotFound => Error::not_found(object_store_path),
+                ErrorKind::NotFound => Error::not_found(storage_path),
                 _ => Error::from(error),
             })
         })
@@ -55,7 +64,10 @@ impl LocalDirOperations for FileSystemDirOperations {
     }
 
     async fn canonicalize(&self, path: &Path) -> Result<Option<std::path::PathBuf>> {
-        let local_path = self.local_file_system.path_to_filesystem(path)?;
+        let local_path = self
+            .local_file_system
+            .path_to_filesystem(&crate::object_store::backend::native::to_path(path)?)
+            .map_err(from_error)?;
         crate::object_store::canonicalize_local_io_result(tokio::fs::canonicalize(local_path).await)
     }
 }
@@ -117,19 +129,74 @@ mod windows {
     }
 }
 
+impl FileStoreProvider {
+    pub(super) fn default_backend() -> BackendConfig {
+        Self::backend(
+            LocalFileSystem::new(),
+            None,
+            "file",
+            DEFAULT_LOCAL_BLOCK_SIZE,
+            false,
+        )
+    }
+
+    fn backend(
+        inner: LocalFileSystem,
+        local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
+        scheme: &str,
+        block_size: usize,
+        local_fsync: bool,
+    ) -> BackendConfig {
+        BackendConfig {
+            store_prefix: None,
+            backend: crate::object_store::backend::native::from_object_store(Arc::new(inner)),
+            direct_local_io: local_dir_operations.is_none(),
+            local_io: if local_dir_operations.is_some() {
+                crate::object_store::LocalIo::Backend
+            } else {
+                match scheme {
+                    "file-object-store" => crate::object_store::LocalIo::Backend,
+                    "file+uring" => crate::object_store::LocalIo::Uring,
+                    _ => crate::object_store::LocalIo::Standard,
+                }
+            },
+            is_local: true,
+            // This scheme exercises cloud IO policies against a local backend.
+            is_remote: scheme == "file-object-store",
+            max_single_copy_size: None,
+            local_dir_operations,
+            local_fsync,
+            scheme: scheme.to_owned(),
+            block_size,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: false,
+            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+            // Listed in full: reading a directory is one local walk whatever the page size,
+            // so there is no request for a page to be pushed into.
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectStoreProvider for FileStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+    fn is_local(&self) -> bool {
+        true
+    }
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig> {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
-        let download_retry_count = storage_options.download_retry_count();
         let local_fsync = storage_options.local_fsync()?;
 
         #[cfg(windows)]
         let (inner, local_dir_operations) = match windows::extract_unc_path(&base_path)? {
             Some(unc_path) => {
-                let inner =
-                    LocalFileSystem::new_with_prefix(unc_path.root)?.with_fsync(local_fsync);
+                let inner = LocalFileSystem::new_with_prefix(unc_path.root)
+                    .map_err(from_error)?
+                    .with_fsync(local_fsync);
                 let operations = FileSystemDirOperations {
                     local_file_system: inner.clone(),
                 };
@@ -145,28 +212,13 @@ impl ObjectStoreProvider for FileStoreProvider {
         #[cfg(not(windows))]
         let local_dir_operations = None;
 
-        Ok(ObjectStore {
-            inner: Arc::new(inner),
-            external_blob_inner: None,
-            direct_local_io: true,
-            _external_blob_origin: None,
+        Ok(Self::backend(
+            inner,
             local_dir_operations,
-            local_fsync,
-            scheme: base_path.scheme().to_owned(),
+            base_path.scheme(),
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: false,
-            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
-            download_retry_count,
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
-            // Listed in full: reading a directory is one local walk whatever the page size,
-            // so there is no request for a page to be pushed into.
-            paginated_lister: None,
-        })
+            local_fsync,
+        ))
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -185,7 +237,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         })
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
@@ -211,15 +263,28 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::object_store::ObjectStore;
+
+    #[rstest]
+    #[case::direct("file", false)]
+    #[case::backend("file-object-store", true)]
+    #[cfg_attr(target_os = "linux", case::uring("file+uring", false))]
+    #[tokio::test]
+    async fn test_local_cloud_policy(#[case] scheme: &str, #[case] cloud: bool) {
+        let (store, _) = ObjectStore::from_uri(&format!("{scheme}:///tmp"))
+            .await
+            .unwrap();
+        assert!(store.is_local());
+        assert_eq!(store.is_cloud(), cloud);
+    }
 
     #[rstest]
     #[case::direct("file")]
-    #[case::object_store("file-object-store")]
+    #[case::storage("file-object-store")]
     #[tokio::test]
     async fn test_local_fsync_storage_option(#[case] scheme: &str) {
-        let provider = FileStoreProvider;
         let url = Url::parse(&format!("{scheme}:///")).unwrap();
-        let default_store = provider
+        let default_store = crate::object_store::ObjectStoreRegistry::default()
             .new_store(url.clone(), &ObjectStoreParams::default())
             .await
             .unwrap();
@@ -231,7 +296,10 @@ mod tests {
             ))),
             ..Default::default()
         };
-        let store = provider.new_store(url, &params).await.unwrap();
+        let store = crate::object_store::ObjectStoreRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap();
         assert!(store.local_fsync);
 
         let directory = tempdir().unwrap();
@@ -249,7 +317,7 @@ mod tests {
             ))),
             ..Default::default()
         };
-        let error = FileStoreProvider
+        let error = crate::object_store::ObjectStoreRegistry::default()
             .new_store(Url::parse("file:///").unwrap(), &params)
             .await
             .unwrap_err();
@@ -263,25 +331,16 @@ mod tests {
         let local_dir_operations = Arc::new(FileSystemDirOperations {
             local_file_system: inner.clone(),
         });
-        ObjectStore {
-            inner: Arc::new(inner),
-            external_blob_inner: None,
-            direct_local_io: true,
-            _external_blob_origin: None,
-            local_dir_operations: Some(local_dir_operations),
-            local_fsync: false,
-            scheme: "file".to_owned(),
-            block_size: DEFAULT_LOCAL_BLOCK_SIZE,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: false,
-            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
-            download_retry_count: 0,
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: "file$rooted-test".to_owned(),
-            paginated_lister: None,
-        }
+        let mut config = BackendConfig::new(
+            crate::object_store::backend::native::from_object_store(Arc::new(inner)),
+            "file",
+        );
+        config.local_dir_operations = Some(local_dir_operations);
+        config.io_parallelism = DEFAULT_LOCAL_IO_PARALLELISM;
+        crate::utils::testing::TestObjectStoreProvider(config).build(
+            Url::parse("file:///").unwrap(),
+            &ObjectStoreParams::default(),
+        )
     }
 
     #[tokio::test]
@@ -419,26 +478,23 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_object_store_prefix() {
+    fn test_calculate_storage_prefix() {
         let provider = FileStoreProvider;
         assert_eq!(
             "file",
             provider
-                .calculate_object_store_prefix(&Url::parse("file:///etc").unwrap(), None)
+                .calculate_storage_prefix(&Url::parse("file:///etc").unwrap(), None)
                 .unwrap()
         );
     }
 
     #[test]
-    fn test_calculate_object_store_prefix_for_file_object_store() {
+    fn test_calculate_storage_prefix_for_file_storage() {
         let provider = FileStoreProvider;
         assert_eq!(
             "file-object-store",
             provider
-                .calculate_object_store_prefix(
-                    &Url::parse("file-object-store:///etc").unwrap(),
-                    None
-                )
+                .calculate_storage_prefix(&Url::parse("file-object-store:///etc").unwrap(), None)
                 .unwrap()
         );
     }
@@ -491,12 +547,8 @@ mod tests {
         assert_eq!(unc_path.relative_path.as_ref(), "data/my-dataset.lance");
         assert_eq!(unc_path.store_prefix, "file$server/My%20Share");
 
-        let object_store_url =
+        let storage_url =
             Url::parse("file-object-store://server/My%20Share/data/my-dataset.lance").unwrap();
-        assert!(
-            windows::extract_unc_path(&object_store_url)
-                .unwrap()
-                .is_none()
-        );
+        assert!(windows::extract_unc_path(&storage_url).unwrap().is_none());
     }
 }

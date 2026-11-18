@@ -31,13 +31,13 @@ use lance::dataset::{
 };
 use lance_core::datatypes::BlobHandling;
 use lance_core::is_system_column;
+use lance_core::storage::path::Path;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
-use object_store::path::Path;
 use pyo3::basic::CompareOp;
 use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};

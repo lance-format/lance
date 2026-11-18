@@ -282,7 +282,7 @@ async fn test_deferred_compaction_recognizes_ambiguous_commit_as_own() {
         .clone()
         .join(crate::dataset::TRANSACTIONS_DIR)
         .join(transaction_file);
-    assert!(dataset.object_store.exists(&path).await.unwrap());
+    assert!(dataset.storage.exists(&path).await.unwrap());
 }
 #[rstest]
 #[case::address_style(false, true)]
@@ -1116,7 +1116,7 @@ async fn test_commit_compaction_leaves_data_for_gc_on_commit_failure() {
     let mut dataset = DatasetBuilder::from_uri(&routed_uri)
         .with_read_params(crate::dataset::ReadParams {
             store_options: Some(ObjectStoreParams {
-                object_store_wrapper: Some(failing.clone()),
+                backend_wrappers: vec![failing.clone()],
                 ..Default::default()
             }),
             ..Default::default()
@@ -1195,7 +1195,7 @@ async fn test_commit_compaction_leaves_blob_v2_sidecars_for_gc_on_commit_failure
     let mut dataset = DatasetBuilder::from_uri(&routed_uri)
         .with_read_params(crate::dataset::ReadParams {
             store_options: Some(ObjectStoreParams {
-                object_store_wrapper: Some(failing.clone()),
+                backend_wrappers: vec![failing.clone()],
                 ..Default::default()
             }),
             ..Default::default()

@@ -121,7 +121,7 @@ async fn native_index(
 ) -> IvfRq {
     let index = dataset.load_indices().await.unwrap()[0].clone();
     IvfRq::try_new(
-        dataset.object_store.clone(),
+        dataset.storage.clone(),
         dataset.indice_files_dir(&index).unwrap(),
         index.uuid,
         None,

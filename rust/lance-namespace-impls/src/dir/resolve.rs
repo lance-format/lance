@@ -11,13 +11,13 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lance::dataset::refs::check_valid_branch;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
+use lance_io::object_store::Error as ObjectStoreError;
 use lance_io::object_store::throttle::is_throttle_error;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, ReadDirOptions};
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{DescribeTableRequest, Identity};
-use object_store::Error as ObjectStoreError;
-use object_store::path::Path;
 
 use super::{DirectoryNamespace, TableStatus, manifest};
 
@@ -42,7 +42,7 @@ impl DirectoryNamespace {
                     self.root.clone(),
                     self.storage_options.clone(),
                     self.session.clone(),
-                    self.object_store.clone(),
+                    self.storage.clone(),
                     self.base_path.clone(),
                     self.dir_listing_enabled,
                     self.inline_optimization_enabled,
@@ -80,7 +80,7 @@ impl DirectoryNamespace {
                     self.root.clone(),
                     self.storage_options.clone(),
                     self.session.clone(),
-                    self.object_store.clone(),
+                    self.storage.clone(),
                     self.base_path.clone(),
                     self.dir_listing_enabled,
                     self.inline_optimization_enabled,
@@ -179,7 +179,7 @@ impl DirectoryNamespace {
 
         loop {
             let page = self
-                .object_store
+                .storage
                 .read_dir_page(
                     self.base_path.clone(),
                     ReadDirOptions {
@@ -465,7 +465,7 @@ impl DirectoryNamespace {
 
     pub(super) async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
         manifest::ManifestNamespace::path_has_actual_manifests(
-            &self.object_store,
+            &self.storage,
             &self.table_path(table_name),
         )
         .await
@@ -547,12 +547,11 @@ impl DirectoryNamespace {
     }
 
     pub(super) async fn table_uri_has_actual_manifests(&self, table_uri: &str) -> Result<bool> {
-        let table_path = self.object_store_path_from_uri(table_uri)?;
-        manifest::ManifestNamespace::path_has_actual_manifests(&self.object_store, &table_path)
-            .await
+        let table_path = self.storage_path_from_uri(table_uri)?;
+        manifest::ManifestNamespace::path_has_actual_manifests(&self.storage, &table_path).await
     }
 
-    pub(super) fn object_store_path_from_uri(&self, uri: &str) -> Result<Path> {
+    pub(super) fn storage_path_from_uri(&self, uri: &str) -> Result<Path> {
         let registry = self
             .session
             .as_ref()
@@ -785,7 +784,7 @@ impl DirectoryNamespace {
     /// checking deregistration status.
     pub(crate) async fn check_table_status(&self, table_name: &str) -> Result<TableStatus> {
         let table_path = self.table_path(table_name);
-        match self.object_store.read_dir(table_path).await {
+        match self.storage.read_dir(table_path).await {
             Ok(entries) => {
                 let exists = !entries.is_empty();
                 let is_deregistered = entries.iter().any(|e| e.ends_with(".lance-deregistered"));
@@ -825,7 +824,7 @@ impl DirectoryNamespace {
             if is_throttle_error(os_err) {
                 return NamespaceError::Throttling {
                     message: format!(
-                        "Storage request was throttled while resolving table: {detail}"
+                        "ObjectStore request was throttled while resolving table: {detail}"
                     ),
                     retry_after: None,
                 }
@@ -833,13 +832,15 @@ impl DirectoryNamespace {
             }
             if Self::is_service_unavailable_error(os_err) {
                 return NamespaceError::ServiceUnavailable {
-                    message: format!("Storage service unavailable while resolving table: {detail}"),
+                    message: format!(
+                        "ObjectStore service unavailable while resolving table: {detail}"
+                    ),
                 }
                 .into();
             }
         }
         NamespaceError::Internal {
-            message: format!("Storage error while resolving table: {detail}"),
+            message: format!("ObjectStore error while resolving table: {detail}"),
         }
         .into()
     }

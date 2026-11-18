@@ -9,14 +9,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_io::object_store::WrappingObjectStore;
+use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
 
 /// Wraps the object store so that calls matching a configured method+path
 /// substring return a synthetic error.
 #[derive(Debug)]
 pub struct FailingProxyStore {
-    policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+    policy: Arc<Mutex<ProxyBackendPolicy>>,
 }
 
 impl Default for FailingProxyStore {
@@ -28,7 +28,7 @@ impl Default for FailingProxyStore {
 impl FailingProxyStore {
     pub fn new() -> Self {
         Self {
-            policy: Arc::new(Mutex::new(ProxyObjectStorePolicy::new())),
+            policy: Arc::new(Mutex::new(ProxyBackendPolicy::new())),
         }
     }
 
@@ -52,7 +52,7 @@ impl FailingProxyStore {
                 if called_method == method && path.as_ref().contains(path_substr) {
                     let count = counter.fetch_add(1, Ordering::SeqCst);
                     if count >= skip {
-                        return Err(object_store::Error::Generic {
+                        return Err(lance_io::object_store::Error::Generic {
                             store: "FailingProxyStore",
                             source: error_message.into(),
                         }
@@ -78,7 +78,7 @@ impl FailingProxyStore {
             Box::leak(policy_name.into_boxed_str()),
             Arc::new(move |called_method, path| {
                 if called_method == method && path.as_ref().contains(path_substr) {
-                    Err(object_store::Error::Generic {
+                    Err(lance_io::object_store::Error::Generic {
                         store: "FailingProxyStore",
                         source: error_message.into(),
                     }
@@ -101,17 +101,8 @@ impl WrappingObjectStore for FailingProxyStore {
     fn wrap(
         &self,
         _storage_prefix: &str,
-        original: Arc<dyn object_store::ObjectStore>,
-    ) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
-    }
-
-    // Injects behaviour into every request, so a listing must not go around it.
-    fn wrap_paginated(
-        &self,
-        _store_prefix: &str,
-        _original: Arc<dyn object_store::list::PaginatedListStore>,
-    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
-        None
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        Arc::new(ProxyBackend::new(original, self.policy.clone()))
     }
 }

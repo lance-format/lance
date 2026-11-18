@@ -36,7 +36,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, FieldRef as ArrowFieldRef, Schema as ArrowSchema};
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use roaring::RoaringBitmap;
 use snafu::Snafu;
 

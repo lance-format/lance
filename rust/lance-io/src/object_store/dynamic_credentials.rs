@@ -6,9 +6,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ::object_store::CredentialProvider;
 use async_trait::async_trait;
 use lance_core::error::{Error, Result};
-use object_store::{CredentialProvider, Result as ObjectStoreResult};
+use object_store::Result as ObjectStoreResult;
 
 use crate::object_store::{StorageOptionsAccessor, StorageOptionsProvider};
 

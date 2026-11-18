@@ -89,7 +89,7 @@ mod tests {
     use super::*;
     use crate::io::commit::{ManifestNamingScheme, write_manifest_file_to_path};
     use crate::transaction::test_support::sample_manifest;
-    use object_store::path::Path;
+    use lance_core::storage::path::Path;
     use uuid::Uuid;
 
     fn entry(name: &str, index_version: i32) -> IndexMetadata {

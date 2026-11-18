@@ -49,7 +49,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture};
 use lance_core::deepsize::{Context as DeepSizeContext, DeepSizeOf};
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use tokio::io::AsyncWrite;
 
 use lance_core::{Error, Result};
@@ -75,7 +75,7 @@ pub trait SpillStore: Send + Sync + 'static {
 
 /// The readable half of a spill, and the owner of its backing storage.
 ///
-/// Storage is reclaimed after it and all writers/readers have been dropped.
+/// ObjectStore is reclaimed after it and all writers/readers have been dropped.
 /// The trait is object-safe so it can be returned as `Box<dyn Spill>` from [`SpillStore::new_spill`].
 #[async_trait]
 pub trait Spill: Send + Sync {
@@ -561,7 +561,7 @@ impl SpillReadFile {
     fn read_range(
         self: Arc<Self>,
         range: Range<usize>,
-    ) -> BoxFuture<'static, object_store::Result<Bytes>> {
+    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
         Box::pin(async move {
             crate::local::join_local_io(tokio::task::spawn_blocking(move || {
                 // Keep both the file and quota in the blocking closure, whose
@@ -617,26 +617,29 @@ impl Reader for SpillReader {
         crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM
     }
 
-    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
         Box::pin(async move { Ok(self.size) })
     }
 
-    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+    fn get_range(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
         self.file.clone().read_range(range)
     }
 
-    fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
+    fn get_all(&self) -> BoxFuture<'_, crate::object_store::Result<Bytes>> {
         self.get_range(0..self.size)
     }
 
-    fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+    fn get_stream(&self) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
         self.get_range_stream(0..self.size)
     }
 
     fn get_range_stream(
         &self,
         range: Range<usize>,
-    ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+    ) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
         let stream = self
             .file
             .clone()

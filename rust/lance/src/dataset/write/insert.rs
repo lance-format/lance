@@ -13,11 +13,11 @@ use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
-use object_store::path::Path;
 
 use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
@@ -173,7 +173,7 @@ impl<'a> InsertBuilder<'a> {
             .with_exact_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
-            .with_object_store(context.object_store.clone())
+            .with_storage(context.storage.clone())
             .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
 
         if let Some(params) = context.params.store_params.as_ref() {
@@ -244,7 +244,7 @@ impl<'a> InsertBuilder<'a> {
         let target_base_info = validate_and_resolve_target_bases_with_primary(
             &mut context.params,
             existing_base_paths,
-            &context.object_store,
+            &context.storage,
             &context.base_path,
             &context.dest.uri(),
         )
@@ -258,7 +258,7 @@ impl<'a> InsertBuilder<'a> {
         let (written_fragments, written_schema) = Box::pin(write_fragments_internal_impl(
             context.storage_version,
             context.dest.dataset(),
-            context.object_store.clone(),
+            context.storage.clone(),
             &context.base_path,
             schema.clone(),
             stream,
@@ -423,9 +423,9 @@ impl<'a> InsertBuilder<'a> {
         if let Some(cb) = self.write_progress.clone() {
             params.write_progress = Some(cb);
         }
-        let (object_store, base_path, commit_handler) = match &self.dest {
+        let (storage, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
-                dataset.object_store.clone(),
+                dataset.storage.clone(),
                 dataset.base.clone(),
                 params
                     .commit_handler
@@ -438,7 +438,7 @@ impl<'a> InsertBuilder<'a> {
                     .as_ref()
                     .map(|s| s.store_registry())
                     .unwrap_or_else(|| Arc::new(Default::default()));
-                let (object_store, base_path) = ObjectStore::from_uri_and_params(
+                let (storage, base_path) = ObjectStore::from_uri_and_params(
                     registry,
                     uri,
                     &params.store_params.clone().unwrap_or_default(),
@@ -450,7 +450,7 @@ impl<'a> InsertBuilder<'a> {
                     &params.store_params,
                 )
                 .await?;
-                (object_store, base_path, commit_handler)
+                (storage, base_path, commit_handler)
             }
         };
         let dest = match &self.dest {
@@ -486,7 +486,7 @@ impl<'a> InsertBuilder<'a> {
         Ok(WriteContext {
             params,
             dest,
-            object_store,
+            storage,
             base_path,
             commit_handler,
             storage_version,
@@ -498,7 +498,7 @@ impl<'a> InsertBuilder<'a> {
 struct WriteContext<'a> {
     params: WriteParams,
     dest: WriteDestination<'a>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: ConcreteFileVersion,

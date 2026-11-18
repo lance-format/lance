@@ -1156,8 +1156,8 @@ async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() 
 
     let file_path = dataset.data_dir().join(data_file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     let file_scheduler = scheduler
         .open_file(&file_path, &CachedFileSize::unknown())

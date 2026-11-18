@@ -268,7 +268,7 @@ async fn do_take_rows(
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-            .buffered(builder.dataset.object_store.io_parallelism())
+            .buffered(builder.dataset.storage.io_parallelism())
             .try_collect()
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
@@ -306,7 +306,7 @@ async fn do_take_rows(
                     read_config.clone().with_row_address(true),
                 )
             })
-            .buffered(builder.dataset.object_store.io_parallelism())
+            .buffered(builder.dataset.storage.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let one_batch = if batches.len() > 1 {
@@ -1054,7 +1054,7 @@ mod test {
                 )
             })
             .collect();
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
         if offsets.is_empty() {
             assert!(
                 row_offsets_to_row_addresses(&fragments, &[])
@@ -1062,7 +1062,7 @@ mod test {
                     .unwrap()
                     .is_empty()
             );
-            assert_eq!(dataset.object_store.io_stats_snapshot().read_iops, 0);
+            assert_eq!(dataset.storage.io_stats_snapshot().read_iops, 0);
         }
         let batch = dataset
             .take(
@@ -1079,7 +1079,7 @@ mod test {
             expected_values
         );
         let deletion_reads: Vec<_> = dataset
-            .object_store
+            .storage
             .io_stats_incremental()
             .requests
             .into_iter()
@@ -1113,13 +1113,13 @@ mod test {
             metadata.id,
             dataset.version().version,
             &DeletionVector::from_iter(0..4),
-            &dataset.object_store,
+            &dataset.storage,
             0,
         )
         .await
         .unwrap();
         fragments[1] = FileFragment::new(dataset.clone(), metadata);
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
         let addresses = row_offsets_to_row_addresses(&fragments, &[4, 3, 4, 8])
             .await
             .unwrap();
@@ -1134,7 +1134,7 @@ mod test {
         );
         assert!(
             dataset
-                .object_store
+                .storage
                 .io_stats_incremental()
                 .requests
                 .iter()
@@ -1868,13 +1868,13 @@ mod test {
 
         let reads_deletion_file = |dataset: &Dataset| {
             dataset
-                .object_store
+                .storage
                 .io_stats_incremental()
                 .requests
                 .iter()
                 .any(|request| request.path.as_ref().contains("_deletions"))
         };
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
 
         let ignored = dataset
             .take_builder(&[0, 1, 7, 4], dataset.schema().clone())

@@ -13,6 +13,7 @@ use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::{future::try_join_all, prelude::*};
 use lance_arrow::{DataTypeExt, RecordBatchExt, SchemaExt, interleave_batches};
+use lance_core::storage::path::Path;
 use lance_core::{
     Error, Result,
     cache::LanceCache,
@@ -31,7 +32,6 @@ use lance_io::{
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
     utils::CachedFileSize,
 };
-use object_store::path::Path;
 
 use crate::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN};
 
@@ -204,7 +204,7 @@ impl ScratchDir {
 }
 
 pub struct IvfShuffler {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
     format_version: ConcreteFileVersion,
@@ -224,7 +224,7 @@ impl IvfShuffler {
 
     fn new_in(scratch: ScratchDir, num_partitions: usize) -> Self {
         Self {
-            object_store: Arc::new(ObjectStore::local()),
+            storage: Arc::new(ObjectStore::local()),
             output_dir: scratch.output_dir().clone(),
             num_partitions,
             format_version: ConcreteFileVersion::V2_0,
@@ -264,22 +264,22 @@ impl Shuffler for IvfShuffler {
                     .output_dir
                     .clone()
                     .join(format!("ivf_{}.spill", partition_id));
-                let object_store = self.object_store.clone();
+                let storage = self.storage.clone();
                 let schema = schema.clone();
                 let format_version = self.format_version;
                 async move {
-                    let writer = object_store.create(&part_path).await?;
+                    let writer = storage.create(&part_path).await?;
                     let file_writer = versions::create_writer(
                         format_version,
                         writer,
                         lance_core::datatypes::Schema::try_from(&schema)?,
                         FileWriterOptions::default(),
                     )?
-                    .with_page_metadata_spill(object_store.clone(), spill_path);
+                    .with_page_metadata_spill(storage.clone(), spill_path);
                     Result::Ok(file_writer)
                 }
             })
-            .buffered(self.object_store.io_parallelism())
+            .buffered(self.storage.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let mut parallel_sort_stream = data
@@ -349,7 +349,7 @@ impl Shuffler for IvfShuffler {
 
         Ok(Box::new(
             IvfShufflerReader::new(
-                self.object_store.clone(),
+                self.storage.clone(),
                 self.output_dir.clone(),
                 partition_sizes,
                 total_loss,
@@ -377,13 +377,13 @@ pub struct IvfShufflerReader {
 
 impl IvfShufflerReader {
     pub fn new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         output_dir: Path,
         partition_sizes: Vec<usize>,
         loss: f64,
     ) -> Self {
-        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+        let scheduler = ScanScheduler::new(storage, scheduler_config);
         Self {
             scheduler,
             output_dir,
@@ -663,7 +663,7 @@ fn shuffle_batch_bytes() -> usize {
 ///
 /// Then we read those ranges from the data file.
 pub struct TwoFileShuffler {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
     batch_size_bytes: usize,
@@ -683,7 +683,7 @@ impl TwoFileShuffler {
 
     fn new_in(scratch: ScratchDir, num_partitions: usize) -> Self {
         Self {
-            object_store: Arc::new(ObjectStore::local()),
+            storage: Arc::new(ObjectStore::local()),
             output_dir: scratch.output_dir().clone(),
             num_partitions,
             batch_size_bytes: shuffle_batch_bytes(),
@@ -789,24 +789,24 @@ impl Shuffler for TwoFileShuffler {
         // Create data file writer
         let data_path = self.output_dir.clone().join("shuffle_data.lance");
         let spill_path = self.output_dir.clone().join("shuffle_data.spill");
-        let writer = self.object_store.create(&data_path).await?;
+        let writer = self.storage.create(&data_path).await?;
         let mut file_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&schema)?,
             Default::default(),
         )?
-        .with_page_metadata_spill(self.object_store.clone(), spill_path);
+        .with_page_metadata_spill(self.storage.clone(), spill_path);
 
         // Create offsets file writer
         let offsets_path = self.output_dir.clone().join("shuffle_offsets.lance");
         let spill_path = self.output_dir.clone().join("shuffle_offsets.spill");
-        let writer = self.object_store.create(&offsets_path).await?;
+        let writer = self.storage.create(&offsets_path).await?;
         let mut offsets_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(offsets_schema.as_ref())?,
             Default::default(),
         )?
-        .with_page_metadata_spill(self.object_store.clone(), spill_path);
+        .with_page_metadata_spill(self.storage.clone(), spill_path);
 
         let mut num_batches: u64 = 0;
         let mut partition_counts: Vec<u64> = vec![0; num_partitions];
@@ -882,7 +882,7 @@ impl Shuffler for TwoFileShuffler {
         offsets_writer.finish().await?;
 
         TwoFileShuffleReader::try_new_with_preload_limit(
-            self.object_store.clone(),
+            self.storage.clone(),
             self.output_dir.clone(),
             num_partitions,
             num_batches,
@@ -1044,7 +1044,7 @@ fn preloaded_partition_ranges(
 
 impl TwoFileShuffleReader {
     pub(super) async fn try_new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         output_dir: Path,
         num_partitions: usize,
         num_batches: u64,
@@ -1053,7 +1053,7 @@ impl TwoFileShuffleReader {
         scratch_dir_guard: Option<Arc<tempfile::TempDir>>,
     ) -> Result<Box<dyn ShuffleReader>> {
         Self::try_new_with_preload_limit(
-            object_store,
+            storage,
             output_dir,
             num_partitions,
             num_batches,
@@ -1071,7 +1071,7 @@ impl TwoFileShuffleReader {
     // instance to attach it to afterwards the way `IvfShufflerReader` does.
     #[allow(clippy::too_many_arguments)]
     async fn try_new_with_preload_limit(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         output_dir: Path,
         num_partitions: usize,
         num_batches: u64,
@@ -1085,8 +1085,8 @@ impl TwoFileShuffleReader {
             return Ok(Box::new(EmptyReader));
         }
 
-        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+        let scheduler = ScanScheduler::new(storage, scheduler_config);
 
         let data_path = output_dir.clone().join("shuffle_data.lance");
         let file_reader = FileReader::try_open(
@@ -2266,11 +2266,9 @@ mod tests {
         let stream = batches_to_stream(vec![batch]);
         let reader = shuffler.shuffle(stream).await.unwrap();
 
-        let object_store = Arc::new(ObjectStore::local());
-        let scheduler = ScanScheduler::new(
-            object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
-        );
+        let storage = Arc::new(ObjectStore::local());
+        let scheduler =
+            ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(&storage));
         for filename in ["shuffle_data.lance", "shuffle_offsets.lance"] {
             let file_reader = FileReader::try_open(
                 scheduler

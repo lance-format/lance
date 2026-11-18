@@ -640,7 +640,7 @@ async fn resolve_target_bases(
     validate_and_resolve_target_bases_with_primary(
         &mut write_params,
         Some(&dataset.manifest.base_paths),
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.base,
         dataset.uri(),
     )

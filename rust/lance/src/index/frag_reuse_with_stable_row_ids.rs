@@ -648,7 +648,7 @@ mod tests {
                 &mut manifest,
                 Some(indices),
                 &dataset.base,
-                &dataset.object_store,
+                &dataset.storage,
                 write_manifest_file_to_path,
                 dataset.manifest_location.naming_scheme,
                 None,

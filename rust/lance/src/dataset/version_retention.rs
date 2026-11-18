@@ -60,7 +60,7 @@ impl ProtectedVersions {
             .map(|(_name, version)| version)
             .collect();
 
-        let hint_floor = read_version_hint(&dataset.object_store, &dataset.base).await?;
+        let hint_floor = read_version_hint(&dataset.storage, &dataset.base).await?;
 
         Ok(Self {
             latest: dataset.manifest.version,

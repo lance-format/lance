@@ -43,7 +43,7 @@ use lance_core::error::Result;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 
 use super::DataFile;
 use crate::format::pb;

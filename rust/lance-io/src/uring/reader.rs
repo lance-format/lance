@@ -15,8 +15,8 @@ use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
-use object_store::path::Path;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, ErrorKind};
@@ -177,7 +177,7 @@ impl UringReader {
         &self,
         offset: u64,
         length: usize,
-    ) -> Pin<Box<dyn Future<Output = object_store::Result<Bytes>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = crate::object_store::Result<Bytes>> + Send>> {
         let mut buffer = BytesMut::with_capacity(length);
         // SAFETY: the capacity covers `length`. `set_len` also asks for initialized bytes, and
         // these stay uninitialized until the kernel writes them, but nothing reads them before
@@ -208,7 +208,7 @@ impl UringReader {
                 URING_THREADS.initialization_errors.join("; ")
             };
             return Box::pin(async move {
-                Err(object_store::Error::Generic {
+                Err(crate::object_store::Error::Generic {
                     store: "UringReader",
                     source: Box::new(io::Error::other(format!(
                         "no io_uring worker threads are available: {initialization_errors}"
@@ -224,7 +224,7 @@ impl UringReader {
 
         if !thread.is_alive.load(Ordering::Acquire) {
             return Box::pin(async move {
-                Err(object_store::Error::Generic {
+                Err(crate::object_store::Error::Generic {
                     store: "UringReader",
                     source: Box::new(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -241,7 +241,7 @@ impl UringReader {
         {
             Ok(()) => Box::pin(UringReadFuture { request }),
             Err(_) => Box::pin(async move {
-                Err(object_store::Error::Generic {
+                Err(crate::object_store::Error::Generic {
                     store: "UringReader",
                     source: Box::new(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -270,13 +270,16 @@ impl Reader for UringReader {
     }
 
     /// Returns the file size.
-    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
         Box::pin(async move { Ok(self.size) })
     }
 
     /// Read a range of bytes using io_uring.
     #[instrument(level = "debug", skip(self))]
-    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+    fn get_range(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
         let io_tracker = self.io_tracker.clone();
         let path = self.handle.path.clone();
         let num_bytes = range.len() as u64;
@@ -296,7 +299,7 @@ impl Reader for UringReader {
 
     /// Read the entire file using io_uring.
     #[instrument(level = "debug", skip(self))]
-    fn get_all(&self) -> BoxFuture<'static, object_store::Result<Bytes>> {
+    fn get_all(&self) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
         let size = self.size;
         let io_tracker = self.io_tracker.clone();
         let path = self.handle.path.clone();

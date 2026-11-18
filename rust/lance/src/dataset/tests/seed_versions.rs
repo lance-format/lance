@@ -141,7 +141,7 @@ async fn commit_crafted_fragment(
     let schema = dataset.schema().clone();
     let filename = format!("crafted-{}.lance", dataset.manifest.version);
     let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
-    let object_writer = dataset.object_store.create(&path).await.unwrap();
+    let object_writer = dataset.storage.create(&path).await.unwrap();
     let mut writer = file_versions::create_writer(
         version,
         object_writer,
@@ -183,8 +183,8 @@ async fn commit_crafted_fragment(
 /// global buffers beyond the schema descriptor.
 async fn file_seeds(dataset: &Dataset, path: &str) -> (usize, HashMap<String, Bytes>) {
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     let path = dataset.base.clone().join(DATA_DIR).join(path);
     let file_scheduler = scheduler
@@ -462,7 +462,7 @@ async fn test_seed_harvest_uses_the_manifest_file_size() {
         };
 
     // The build: both seeds reused, no size probe on either data file.
-    dataset.object_store.io_stats_incremental();
+    dataset.storage.io_stats_incremental();
     let reports = SEED_REUSE_REPORTS
         .scope(std::sync::Mutex::new(Vec::new()), async {
             dataset
@@ -472,7 +472,7 @@ async fn test_seed_harvest_uses_the_manifest_file_size() {
             SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
         })
         .await;
-    let io = dataset.object_store.io_stats_incremental();
+    let io = dataset.storage.io_stats_incremental();
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(
         reports[0].reused_fragments,
@@ -498,13 +498,13 @@ async fn test_seed_harvest_uses_the_manifest_file_size() {
     let mut without_size = fragments[1].clone();
     without_size.files[0].file_size_bytes = CachedFileSize::unknown();
     let harvester = SeedHarvester::for_column(&dataset, "val").unwrap();
-    dataset.object_store.io_stats_incremental();
+    dataset.storage.io_stats_incremental();
     let seed = harvester
         .harvest(&without_size)
         .await
         .unwrap()
         .expect("the seed is harvested through the size probe");
-    let io = dataset.object_store.io_stats_incremental();
+    let io = dataset.storage.io_stats_incremental();
     assert_eq!(seed.physical_rows, ROWS_PER_FILE as u64);
     assert_eq!(
         requests_on(&io, &without_size, "head"),
@@ -513,9 +513,9 @@ async fn test_seed_harvest_uses_the_manifest_file_size() {
         io.requests
     );
     assert!(requests_on(&io, &without_size, "get_range") >= 1);
-    dataset.object_store.io_stats_incremental();
+    dataset.storage.io_stats_incremental();
     assert!(harvester.harvest(&fragments[1]).await.unwrap().is_some());
-    let io = dataset.object_store.io_stats_incremental();
+    let io = dataset.storage.io_stats_incremental();
     assert_eq!(requests_on(&io, &fragments[1], "head"), 0);
 
     let reopened = Dataset::open(dir.as_str()).await.unwrap();
@@ -947,12 +947,12 @@ async fn test_append_beside_unsupported_seed_version_writes_version_1() {
     // read is behind them) before the compared appends.
     append(&mut beside, TRAINING_ROWS + ROWS_PER_FILE).await;
 
-    plain.object_store.io_stats_incremental();
-    beside.object_store.io_stats_incremental();
+    plain.storage.io_stats_incremental();
+    beside.storage.io_stats_incremental();
     append(&mut plain, TRAINING_ROWS + ROWS_PER_FILE).await;
     append(&mut beside, TRAINING_ROWS + 2 * ROWS_PER_FILE).await;
-    let plain_io = plain.object_store.io_stats_incremental();
-    let beside_io = beside.object_store.io_stats_incremental();
+    let plain_io = plain.storage.io_stats_incremental();
+    let beside_io = beside.storage.io_stats_incremental();
     assert_eq!(
         (beside_io.read_iops, beside_io.write_iops),
         (plain_io.read_iops, plain_io.write_iops),

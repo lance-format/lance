@@ -1215,25 +1215,17 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         .unwrap();
     let session = dataset.session();
     let store = session.spill_store();
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.storage.as_ref().io_stats_incremental();
     let memory = index
         .prepare_pairwise_partition(0, BATCH_SIZE, 16 * 1024 * 1024, store)
         .await
         .unwrap();
-    let memory_bytes = dataset
-        .object_store
-        .as_ref()
-        .io_stats_incremental()
-        .read_bytes;
+    let memory_bytes = dataset.storage.as_ref().io_stats_incremental().read_bytes;
     let spilled = index
         .prepare_pairwise_partition(0, BATCH_SIZE, 0, store)
         .await
         .unwrap();
-    let spilled_bytes = dataset
-        .object_store
-        .as_ref()
-        .io_stats_incremental()
-        .read_bytes;
+    let spilled_bytes = dataset.storage.as_ref().io_stats_incremental().read_bytes;
     assert!(memory_bytes > 0);
     // Spilled source reads fetch each column's bytes about once; small
     // tail ranges round up to encoding chunks. Rereading the PQ code
@@ -1242,7 +1234,7 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         spilled_bytes < 2 * memory_bytes,
         "spilled preparation read {spilled_bytes} bytes, in-memory {memory_bytes}"
     );
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.storage.as_ref().io_stats_incremental();
     let mut seen = HashSet::new();
     for _ in 0..3 {
         for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
@@ -1258,7 +1250,7 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         }
     }
     assert_eq!(seen, (0..NUM_ROWS as u64).collect::<HashSet<u64>>());
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_eq!(
         stats.read_iops, 0,
         "replay must not reread the source index"
@@ -2430,7 +2422,7 @@ async fn test_distributed_vector_build_commits_multiple_segments_and_preserves_q
             .join(lance_index::INDEX_FILE_NAME);
         assert!(
             ds_split
-                .object_store
+                .storage
                 .as_ref()
                 .exists(&segment_index)
                 .await
@@ -3663,7 +3655,7 @@ async fn test_raw_index_commit_reads_each_segment_of_a_mixed_index(
     if matches!(commit, MixedIndexCommit::AddAfterACommit) {
         dataset.delete("false").await.unwrap();
         let saved = lance_table::io::manifest::read_manifest_indexes(
-            &dataset.object_store,
+            &dataset.storage,
             &dataset.manifest_location,
             &dataset.manifest,
         )
@@ -3789,13 +3781,13 @@ async fn test_raw_index_commit_reads_cloned_segment_through_its_base() {
     let own_tracker = Arc::new(lance_io::utils::tracking_store::IOTracker::default());
     let mut cloned = crate::DatasetBuilder::from_uri(&clone_uri)
         .with_store_params(ObjectStoreParams {
-            object_store_wrapper: Some(own_tracker.clone()),
+            backend_wrappers: vec![own_tracker.clone()],
             ..Default::default()
         })
         .with_base_store_params(
             &base.path,
             ObjectStoreParams {
-                object_store_wrapper: Some(base_tracker.clone()),
+                backend_wrappers: vec![base_tracker.clone()],
                 ..Default::default()
             },
         )
@@ -4073,7 +4065,7 @@ async fn index_file_version(dataset: &Dataset, segment: &IndexMetadata) -> (u16,
         .unwrap()
         .join(segment.uuid.to_string())
         .join(lance_index::INDEX_FILE_NAME);
-    let reader = dataset.object_store.open(&path).await.unwrap();
+    let reader = dataset.storage.open(&path).await.unwrap();
     let footer = lance_io::utils::read_last_block(reader.as_ref())
         .await
         .unwrap();
@@ -4455,7 +4447,7 @@ async fn test_merge_index_metadata_reports_progress() {
 
     let progress = Arc::new(RecordingProgress::default());
     let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         &dataset.indices_dir(),
         segments,
         progress.clone(),
@@ -4589,7 +4581,7 @@ async fn test_distributed_ivf_sq_worker_training_respects_fragment_filter() {
         .unwrap();
 
     let scheduler = ScanScheduler::new(
-        Arc::new(dataset.object_store.as_ref().clone()),
+        Arc::new(dataset.storage.as_ref().clone()),
         SchedulerConfig::default_for_testing(),
     );
     let sq_meta = get_sq_metadata(&dataset, scheduler, &segment.uuid.to_string()).await;
@@ -5975,7 +5967,7 @@ const HNSW_NEIGHBORS_COL: &str = "__neighbors";
 /// overlap, so a delay is what makes concurrency observable at all.
 #[derive(Debug)]
 struct ConcurrencyProbeStore {
-    target: Arc<dyn object_store::ObjectStore>,
+    target: Arc<dyn lance_io::object_store::StorageBackend>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: Arc<AtomicUsize>,
 }
@@ -5996,38 +5988,50 @@ impl ConcurrencyProbeStore {
 }
 
 #[async_trait::async_trait]
-impl object_store::ObjectStore for ConcurrencyProbeStore {
+impl lance_io::object_store::StorageBackend for ConcurrencyProbeStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
-        location: &object_store::path::Path,
-        payload: object_store::PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
+        location: &lance_core::storage::path::Path,
+        payload: lance_io::object_store::PutPayload,
+        opts: lance_io::object_store::PutOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
         self.target.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
-        location: &object_store::path::Path,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        location: &lance_core::storage::path::Path,
+        opts: lance_io::object_store::PutMultipartOptions,
+    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+    {
         self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
         &self,
-        location: &object_store::path::Path,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
+        location: &lance_core::storage::path::Path,
+        options: lance_io::object_store::GetOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
         self.enter().await;
         self.target.get_opts(location, options).await
     }
 
     async fn get_ranges(
         &self,
-        location: &object_store::path::Path,
+        location: &lance_core::storage::path::Path,
         ranges: &[Range<u64>],
-    ) -> object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
         self.enter().await;
         self.target.get_ranges(location, ranges).await
     }
@@ -6036,33 +6040,63 @@ impl object_store::ObjectStore for ConcurrencyProbeStore {
         &self,
         locations: futures::stream::BoxStream<
             'static,
-            object_store::Result<object_store::path::Path>,
+            lance_io::object_store::Result<lance_core::storage::path::Path>,
         >,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_core::storage::path::Path>,
+    > {
         self.target.delete_stream(locations)
     }
 
     fn list(
         &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        prefix: Option<&lance_core::storage::path::Path>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
         self.target.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> object_store::Result<object_store::ListResult> {
+        prefix: Option<&lance_core::storage::path::Path>,
+    ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(
         &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-        opts: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
+        from: &lance_core::storage::path::Path,
+        to: &lance_core::storage::path::Path,
+        opts: lance_io::object_store::CopyOptions,
+    ) -> lance_io::object_store::Result<()> {
         self.target.copy_opts(from, to, opts).await
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&lance_core::storage::path::Path>,
+        offset: &lance_core::storage::path::Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| std::future::ready(meta.location > offset),
+        ))
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &lance_core::storage::path::Path,
+        to: &lance_core::storage::path::Path,
+        opts: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
+        self.target.rename_opts(from, to, opts).await
     }
 }
 
@@ -6087,12 +6121,16 @@ async fn test_storage_open_fetches_ivf_and_quantizer_buffers_together() {
 
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
-    let mut probed = dataset.object_store.as_ref().clone();
-    probed.inner = Arc::new(ConcurrencyProbeStore {
-        target: probed.inner.clone(),
-        in_flight: in_flight.clone(),
-        max_in_flight: max_in_flight.clone(),
-    });
+    let mut probed = dataset.storage.as_ref().clone();
+    probed.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        |backend| {
+            Arc::new(ConcurrencyProbeStore {
+                target: backend,
+                in_flight: in_flight.clone(),
+                max_in_flight: max_in_flight.clone(),
+            })
+        },
+    ));
     let probed = Arc::new(probed);
     let scheduler = ScanScheduler::new(probed, SchedulerConfig::default_for_testing());
     let reader = open_rq_aux_reader(&dataset, scheduler, &indices[0].uuid.to_string()).await;
@@ -6219,7 +6257,7 @@ async fn test_hnsw_read_projection_moves_fewer_bytes() {
 
     let row_range = hnsw.ivf.row_range(0);
     assert!(!row_range.is_empty(), "partition 0 should hold rows");
-    let store = dataset.object_store.as_ref();
+    let store = dataset.storage.as_ref();
 
     let read_bytes_for = async |projection: lance_file::reader::ReaderProjection| {
         let _ = store.io_stats_incremental();
@@ -8276,7 +8314,7 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     let before_prewarm = dataset.session().cache_diagnostics();
 
     // Reset IO stats after index creation.
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.storage.as_ref().io_stats_incremental();
 
     // Concurrent prewarms should single-flight each partition through the
     // cache loader and leave a complete warm cache for both callers.
@@ -8290,7 +8328,7 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     .expect("concurrent prewarms deadlocked");
     first.unwrap();
     second.unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert!(
         stats.read_iops > 0,
         "prewarm should have read from disk, but read_iops was 0"
@@ -8319,7 +8357,7 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -8339,7 +8377,7 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
 
     // Second prewarm should not need IO (already cached).
     dataset.prewarm_index(INDEX_NAME).await.unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
 }
 
@@ -8678,7 +8716,7 @@ async fn test_prewarm_and_query_with_serializing_backend(
         "serialized IVF query recall is below threshold: {recall}"
     );
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.storage.as_ref().io_stats_incremental();
     dataset
         .scan()
         .nearest("vector", &q, 10)
@@ -8690,7 +8728,7 @@ async fn test_prewarm_and_query_with_serializing_backend(
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,

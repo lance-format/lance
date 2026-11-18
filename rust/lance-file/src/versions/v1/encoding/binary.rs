@@ -131,7 +131,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///
     /// ```rust
     /// use arrow_array::types::Utf8Type;
-    /// use object_store::path::Path;
+    /// use lance_core::storage::path::Path;
     /// use lance_file::versions::v1::encoding::binary::BinaryDecoder;
     /// use lance_io::{local::LocalObjectReader, traits::Reader};
     ///

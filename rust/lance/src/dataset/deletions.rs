@@ -79,7 +79,7 @@ impl Dataset {
                 .map(|fragment| async move {
                     dataset.inline_fragment_deletions(fragment, max_bytes).await
                 })
-                .buffer_unordered(self.object_store.io_parallelism())
+                .buffer_unordered(self.storage.io_parallelism())
                 .try_filter_map(|fragment| async move { Ok(fragment) })
                 .try_collect::<Vec<_>>()
                 .await?;
@@ -175,7 +175,7 @@ mod tests {
 
     fn deletion_file_requests(dataset: &Dataset) -> usize {
         dataset
-            .object_store
+            .storage
             .io_stats_incremental()
             .requests
             .iter()
@@ -219,7 +219,7 @@ mod tests {
         );
         assert!(
             dataset
-                .object_store
+                .storage
                 .read_dir(dataset.base.clone().join("_deletions"))
                 .await
                 .unwrap_or_default()
@@ -227,7 +227,7 @@ mod tests {
         );
 
         let reopened = Dataset::open(&dataset.uri).await.unwrap();
-        reopened.object_store.io_stats_incremental();
+        reopened.storage.io_stats_incremental();
         let values = live_values(&reopened).await;
         assert_eq!(values.len(), 36);
         assert!(!values.iter().any(|v| [3, 17, 18, 39].contains(v)));
@@ -332,7 +332,7 @@ mod tests {
         );
 
         let reopened = Dataset::open(&dataset.uri).await.unwrap();
-        reopened.object_store.io_stats_incremental();
+        reopened.storage.io_stats_incremental();
         let values = live_values(&reopened).await;
         assert_eq!(values.len(), 36);
         assert!(!values.iter().any(|v| [3, 17, 18, 39].contains(v)));

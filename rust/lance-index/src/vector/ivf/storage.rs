@@ -272,9 +272,9 @@ mod tests {
     use arrow_array::{Float32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
+    use lance_core::storage::path::Path;
     use lance_io::object_store::ObjectStore;
     use lance_table::format::SelfDescribingFileReader;
-    use object_store::path::Path;
 
     use crate::pb;
 
@@ -355,14 +355,14 @@ mod tests {
         ivf.add_partition(20);
         ivf.add_partition(50);
 
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let path = Path::from("/foo");
         let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float32, true)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         {
             let mut writer =
-                V1FileWriter::try_new(&object_store, &path, schema.clone(), &Default::default())
+                V1FileWriter::try_new(&storage, &path, schema.clone(), &Default::default())
                     .await
                     .unwrap();
             // Write some dummy data
@@ -376,7 +376,7 @@ mod tests {
             writer.finish().await.unwrap();
         }
 
-        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&storage, &path, None)
             .await
             .unwrap();
         assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));

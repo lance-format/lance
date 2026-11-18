@@ -28,13 +28,12 @@ use lance_core::{
 use lance_datagen::{BatchCount, RowCount, array};
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{
+    Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+};
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
-use object_store::{
-    Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
-    MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    path::Path,
-};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{
@@ -169,13 +168,24 @@ impl std::fmt::Display for RejectEmptyRangeObjectStore {
 }
 
 #[async_trait]
-impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
+impl lance_io::object_store::StorageBackend for RejectEmptyRangeObjectStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
         _location: &Path,
         _bytes: PutPayload,
         _opts: PutOptions,
-    ) -> object_store::Result<PutResult> {
+    ) -> lance_io::object_store::Result<PutResult> {
         unimplemented!("put_opts is not used by these tests")
     }
 
@@ -183,7 +193,8 @@ impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
         &self,
         _location: &Path,
         _opts: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+    {
         unimplemented!("put_multipart_opts is not used by these tests")
     }
 
@@ -191,12 +202,12 @@ impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
         &self,
         location: &Path,
         options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        let Some(GetRange::Bounded(range)) = options.range else {
+    ) -> lance_io::object_store::Result<GetResult> {
+        let Some(range) = options.range else {
             unreachable!("blob reads should always request a bounded range")
         };
         if range.start == range.end {
-            return Err(object_store::Error::Generic {
+            return Err(lance_io::object_store::Error::Generic {
                 store: "RejectEmptyRangeObjectStore",
                 source: format!(
                     "Range started at {} and ended at {}",
@@ -205,29 +216,29 @@ impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
                 .into(),
             });
         }
-        Err(object_store::Error::NotSupported {
+        Err(lance_io::object_store::Error::NotSupported {
             source: format!("unexpected non-empty range {range:?} for {location}").into(),
         })
     }
 
     fn delete_stream(
         &self,
-        _locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        _locations: futures::stream::BoxStream<'static, lance_io::object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, lance_io::object_store::Result<Path>> {
         unimplemented!("delete_stream is not used by these tests")
     }
 
     fn list(
         &self,
         _prefix: Option<&Path>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+    ) -> futures::stream::BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
         unimplemented!("list is not used by these tests")
     }
 
     async fn list_with_delimiter(
         &self,
         _prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    ) -> lance_io::object_store::Result<ListResult> {
         unimplemented!("list_with_delimiter is not used by these tests")
     }
 
@@ -236,23 +247,73 @@ impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
         _from: &Path,
         _to: &Path,
         _options: CopyOptions,
-    ) -> object_store::Result<()> {
+    ) -> lance_io::object_store::Result<()> {
         unimplemented!("copy_opts is not used by these tests")
+    }
+    async fn get_ranges(
+        &self,
+        location: &lance_io::object_store::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        futures::future::try_join_all(ranges.iter().map(|range| {
+            (self as &dyn lance_io::object_store::StorageBackend).get_range(location, range.clone())
+        }))
+        .await
+    }
+    fn list_with_offset(
+        &self,
+        prefix: Option<&lance_io::object_store::Path>,
+        offset: &lance_io::object_store::Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        Box::pin(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| futures::future::ready(meta.location > offset),
+        ))
+    }
+    async fn rename_opts(
+        &self,
+        from: &lance_io::object_store::Path,
+        to: &lance_io::object_store::Path,
+        options: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
+        let mode = match options.target_mode {
+            lance_io::object_store::RenameTargetMode::Create => {
+                lance_io::object_store::CopyMode::Create
+            }
+            lance_io::object_store::RenameTargetMode::Overwrite => {
+                lance_io::object_store::CopyMode::Overwrite
+            }
+        };
+        self.copy_opts(
+            from,
+            to,
+            lance_io::object_store::CopyOptions {
+                mode,
+                extensions: options.extensions,
+            },
+        )
+        .await?;
+        (self as &dyn lance_io::object_store::StorageBackend)
+            .delete(from)
+            .await
     }
 }
 
 pub fn reject_empty_range_store() -> Arc<ObjectStore> {
-    Arc::new(ObjectStore::new(
-        Arc::new(RejectEmptyRangeObjectStore) as Arc<dyn object_store::ObjectStore>,
-        Url::parse("mock:///blob-tests").unwrap(),
-        None,
-        None,
-        false,
-        true,
-        lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
-        lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
-        None,
-    ))
+    Arc::new({
+        let url = Url::parse("mock:///blob-tests").unwrap();
+        let mut config = lance_io::object_store::BackendConfig::new(
+            Arc::new(RejectEmptyRangeObjectStore),
+            url.scheme(),
+        );
+        config.io_parallelism = lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
+        config.list_is_lexically_ordered = true;
+        lance_io::utils::testing::TestObjectStoreProvider(config).build(url, &Default::default())
+    })
 }
 
 #[derive(Debug)]
@@ -338,13 +399,24 @@ impl std::fmt::Display for RecordingRangeObjectStore {
 }
 
 #[async_trait]
-impl object_store::ObjectStore for RecordingRangeObjectStore {
+impl lance_io::object_store::StorageBackend for RecordingRangeObjectStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
         _location: &Path,
         _bytes: PutPayload,
         _opts: PutOptions,
-    ) -> object_store::Result<PutResult> {
+    ) -> lance_io::object_store::Result<PutResult> {
         unimplemented!("put_opts is not used by these tests")
     }
 
@@ -352,7 +424,8 @@ impl object_store::ObjectStore for RecordingRangeObjectStore {
         &self,
         _location: &Path,
         _opts: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+    {
         unimplemented!("put_multipart_opts is not used by these tests")
     }
 
@@ -360,19 +433,11 @@ impl object_store::ObjectStore for RecordingRangeObjectStore {
         &self,
         location: &Path,
         options: GetOptions,
-    ) -> object_store::Result<GetResult> {
+    ) -> lance_io::object_store::Result<GetResult> {
         if options.head {
             self.head_requests.fetch_add(1, Ordering::Relaxed);
         }
-        let range = match options.range {
-            Some(GetRange::Bounded(range)) => range,
-            None => 0..self.data.len() as u64,
-            Some(other) => {
-                return Err(object_store::Error::NotSupported {
-                    source: format!("unsupported range request {other:?}").into(),
-                });
-            }
-        };
+        let range = options.range.unwrap_or(0..self.data.len() as u64);
         let is_full_object_probe = range.start == 0 && range.end == self.data.len() as u64;
         self.requested_ranges.lock().unwrap().push(range.clone());
         if !is_full_object_probe {
@@ -403,22 +468,22 @@ impl object_store::ObjectStore for RecordingRangeObjectStore {
 
     fn delete_stream(
         &self,
-        _locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        _locations: futures::stream::BoxStream<'static, lance_io::object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, lance_io::object_store::Result<Path>> {
         unimplemented!("delete_stream is not used by these tests")
     }
 
     fn list(
         &self,
         _prefix: Option<&Path>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+    ) -> futures::stream::BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
         unimplemented!("list is not used by these tests")
     }
 
     async fn list_with_delimiter(
         &self,
         _prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    ) -> lance_io::object_store::Result<ListResult> {
         unimplemented!("list_with_delimiter is not used by these tests")
     }
 
@@ -427,8 +492,59 @@ impl object_store::ObjectStore for RecordingRangeObjectStore {
         _from: &Path,
         _to: &Path,
         _options: CopyOptions,
-    ) -> object_store::Result<()> {
+    ) -> lance_io::object_store::Result<()> {
         unimplemented!("copy_opts is not used by these tests")
+    }
+    async fn get_ranges(
+        &self,
+        location: &lance_io::object_store::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        futures::future::try_join_all(ranges.iter().map(|range| {
+            (self as &dyn lance_io::object_store::StorageBackend).get_range(location, range.clone())
+        }))
+        .await
+    }
+    fn list_with_offset(
+        &self,
+        prefix: Option<&lance_io::object_store::Path>,
+        offset: &lance_io::object_store::Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        Box::pin(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| futures::future::ready(meta.location > offset),
+        ))
+    }
+    async fn rename_opts(
+        &self,
+        from: &lance_io::object_store::Path,
+        to: &lance_io::object_store::Path,
+        options: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
+        let mode = match options.target_mode {
+            lance_io::object_store::RenameTargetMode::Create => {
+                lance_io::object_store::CopyMode::Create
+            }
+            lance_io::object_store::RenameTargetMode::Overwrite => {
+                lance_io::object_store::CopyMode::Overwrite
+            }
+        };
+        self.copy_opts(
+            from,
+            to,
+            lance_io::object_store::CopyOptions {
+                mode,
+                extensions: options.extensions,
+            },
+        )
+        .await?;
+        (self as &dyn lance_io::object_store::StorageBackend)
+            .delete(from)
+            .await
     }
 }
 
@@ -441,17 +557,19 @@ pub fn recording_range_store_with_url_and_block_size(
     let mut padded = vec![0; TEST_RANGE_STORE_SIZE.max(data.len())];
     padded[..data.len()].copy_from_slice(data.as_ref());
     let inner = Arc::new(RecordingRangeObjectStore::new(Bytes::from(padded)));
-    let store = Arc::new(ObjectStore::new(
-        inner.clone() as Arc<dyn object_store::ObjectStore>,
-        Url::parse(url).unwrap(),
-        block_size,
-        None,
-        false,
-        true,
-        lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
-        lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
-        None,
-    ));
+    let store = Arc::new({
+        let url = Url::parse(url).unwrap();
+        let mut config = lance_io::object_store::BackendConfig::new(inner.clone(), url.scheme());
+        config.io_parallelism = lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
+        config.list_is_lexically_ordered = true;
+        lance_io::utils::testing::TestObjectStoreProvider(config).build(
+            url,
+            &lance_io::object_store::ObjectStoreParams {
+                block_size,
+                ..Default::default()
+            },
+        )
+    });
     (store, inner)
 }
 
@@ -482,17 +600,13 @@ pub fn gated_range_store(
         Bytes::from(padded),
         gate.clone(),
     ));
-    let store = Arc::new(ObjectStore::new(
-        inner.clone() as Arc<dyn object_store::ObjectStore>,
-        Url::parse(url).unwrap(),
-        None,
-        None,
-        false,
-        true,
-        lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
-        lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
-        None,
-    ));
+    let store = Arc::new({
+        let url = Url::parse(url).unwrap();
+        let mut config = lance_io::object_store::BackendConfig::new(inner.clone(), url.scheme());
+        config.io_parallelism = lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
+        config.list_is_lexically_ordered = true;
+        lance_io::utils::testing::TestObjectStoreProvider(config).build(url, &Default::default())
+    });
     (store, inner, gate)
 }
 

@@ -11,11 +11,11 @@ use arc_swap::ArcSwap;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use lance_core::datatypes::Schema;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_io::object_store::ObjectStore;
 use log::{debug, info, warn};
-use object_store::path::Path;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -332,7 +332,7 @@ struct SharedWriterState {
     memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
     config: ShardWriterConfig,
     epoch: u64,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_path: Path,
     shard_id: Uuid,
     max_memtable_batches: usize,
@@ -352,7 +352,7 @@ impl SharedWriterState {
         memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
         config: ShardWriterConfig,
         epoch: u64,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         shard_id: Uuid,
         stop_flush_retries: CancellationToken,
@@ -367,7 +367,7 @@ impl SharedWriterState {
             max_memtable_rows: config.max_memtable_rows,
             config,
             epoch,
-            object_store,
+            storage,
             base_path,
             shard_id,
             stop_flush_retries,
@@ -399,7 +399,7 @@ impl SharedWriterState {
         let source_store_params = self.config.store_params.clone().unwrap_or_default();
         let new_preprocessor = || {
             BlobPreprocessor::new(
-                self.object_store.as_ref().clone(),
+                self.storage.as_ref().clone(),
                 data_dir.clone(),
                 target.data_file_key().to_string(),
                 &logical_schema,
@@ -898,7 +898,7 @@ impl ShardWriter {
     /// a rename loses.
     #[instrument(name = "sw_open", level = "info", skip_all, fields(shard_id = %config.shard_id, index_count = index_specs.len()))]
     pub async fn open(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
         config: ShardWriterConfig,
@@ -906,7 +906,7 @@ impl ShardWriter {
         index_specs: Vec<MemIndexSpec>,
     ) -> Result<Self> {
         Box::pin(Self::open_inner(
-            object_store,
+            storage,
             base_path,
             base_uri.into(),
             config,
@@ -918,7 +918,7 @@ impl ShardWriter {
 
     /// Body of [`Self::open`].
     async fn open_inner(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         base_uri: String,
         config: ShardWriterConfig,
@@ -949,7 +949,7 @@ impl ShardWriter {
 
         let shard_id = config.shard_id;
         let manifest_store = Arc::new(ShardManifestStore::new(
-            object_store.clone(),
+            storage.clone(),
             &base_path,
             &config.dir_id,
             shard_id,
@@ -1050,7 +1050,7 @@ impl ShardWriter {
             .max(manifest.replay_after_wal_entry_position)
             .saturating_add(1);
         let wal_appender = Arc::new(WalAppender::with_claimed_epoch(
-            object_store.clone(),
+            storage.clone(),
             base_path.clone(),
             &config.dir_id,
             shard_id,
@@ -1092,7 +1092,7 @@ impl ShardWriter {
                 wal_flusher.clone(),
                 wal_flush_tx,
                 wal_flush_rx,
-                object_store.clone(),
+                storage.clone(),
                 base_path,
                 base_uri,
                 shard_id,
@@ -1135,7 +1135,7 @@ impl ShardWriter {
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
         wal_flush_rx: mpsc::UnboundedReceiver<TriggerWalFlush>,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         base_uri: String,
         shard_id: Uuid,
@@ -1169,7 +1169,7 @@ impl ShardWriter {
         // ones replay freezes below and the ones the live path freezes later.
         let flusher = Arc::new(
             MemTableFlusher::new(
-                object_store.clone(),
+                storage.clone(),
                 base_path.clone(),
                 base_uri.clone(),
                 config.dir_id.clone(),
@@ -1192,7 +1192,7 @@ impl ShardWriter {
             active: memtable,
             next_wal_position,
         } = replay_memtable_from_wal(
-            object_store.clone(),
+            storage.clone(),
             base_path.clone(),
             &config.dir_id,
             shard_id,
@@ -1287,7 +1287,7 @@ impl ShardWriter {
 
         let flusher = Arc::new(
             MemTableFlusher::new(
-                object_store.clone(),
+                storage.clone(),
                 base_path.clone(),
                 base_uri,
                 config.dir_id.clone(),
@@ -1376,7 +1376,7 @@ impl ShardWriter {
             memtable_flush_tx,
             config.clone(),
             epoch,
-            object_store,
+            storage,
             base_path,
             shard_id,
             stop_flush_retries,

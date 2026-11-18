@@ -91,6 +91,7 @@ hmac = { version = "0.12", optional = true }
 quick-xml = { version = "0.40", optional = true }
 
 [dev-dependencies]
+lance-io = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 wiremock.workspace = true
 rstest.workspace = true

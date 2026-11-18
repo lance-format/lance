@@ -12,6 +12,7 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -22,7 +23,6 @@ use lance_index::scalar::{SargableQuery, registry::ScalarIndexPlugin};
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
-use object_store::path::Path;
 
 fn bench_zonemap(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;

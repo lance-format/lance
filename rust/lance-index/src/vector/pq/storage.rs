@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::{
     reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
@@ -35,7 +36,6 @@ use lance_linalg::simd::dist_table::{
 };
 use lance_table::utils::LanceIteratorExtension;
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
-use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
@@ -426,7 +426,7 @@ impl ProductQuantizationStorage {
     ///
     /// Parameters
     /// ----------
-    /// object_store: &ObjectStore
+    /// storage: &ObjectStore
     ///   The object store to load the storage from.
     /// path: &Path
     ///  The path to the storage.
@@ -438,11 +438,11 @@ impl ProductQuantizationStorage {
     /// Currently it loads everything in memory.
     /// TODO: support lazy loading later.
     pub async fn load(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
+        let reader = V1FileReader::try_new_self_described(storage, path, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -1736,11 +1736,11 @@ mod tests {
     }
 
     async fn write_partitioned_pq_file(storage: &ProductQuantizationStorage) -> FileReader {
-        let object_store = ObjectStore::memory();
+        let file_storage = ObjectStore::memory();
         let path = Path::from("partitioned-pq.lance");
         let schema =
             lance_core::datatypes::Schema::try_from(storage.batch.schema().as_ref()).unwrap();
-        let object_writer = object_store.create(&path).await.unwrap();
+        let object_writer = file_storage.create(&path).await.unwrap();
         let mut writer =
             v2_1::create_writer(object_writer, schema, FileWriterOptions::default()).unwrap();
 
@@ -1775,8 +1775,8 @@ mod tests {
         writer.finish().await.unwrap();
 
         let scheduler = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(file_storage.clone()),
+            SchedulerConfig::max_bandwidth(&file_storage),
         );
         let file = scheduler
             .open_file(&path, &CachedFileSize::unknown())

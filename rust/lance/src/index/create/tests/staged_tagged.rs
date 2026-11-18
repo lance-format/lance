@@ -651,7 +651,7 @@ async fn root_metadata_exists(dataset: &Dataset, segment: &IndexMetadata) -> boo
         .indices_dir()
         .join(segment.uuid.to_string())
         .join(lance_index::scalar::inverted::METADATA_FILE);
-    dataset.object_store.exists(&path).await.unwrap()
+    dataset.storage.exists(&path).await.unwrap()
 }
 
 /// The NGram merge reads spill files and translates only through the v0

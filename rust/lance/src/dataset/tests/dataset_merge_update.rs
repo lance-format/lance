@@ -50,8 +50,8 @@ use lance_table::format::{BasePath, DataFile, Fragment};
 
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use futures::TryStreamExt;
+use lance_core::storage::path::Path;
 use lance_datafusion::datagen::DatafusionDatagenExt;
-use object_store::path::Path;
 use rand::seq::SliceRandom;
 use rstest::rstest;
 
@@ -984,7 +984,7 @@ async fn test_datafile_replacement() {
 
     // write a new datafile
     let object_writer = dataset
-        .object_store
+        .storage
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
@@ -1092,7 +1092,7 @@ async fn test_datafile_partial_replacement() {
 
     // write a new datafile
     let object_writer = dataset
-        .object_store
+        .storage
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
@@ -1331,11 +1331,7 @@ async fn test_replace_dataset() {
         .await
         .unwrap();
 
-    ds.object_store
-        .as_ref()
-        .remove_dir_all(test_path)
-        .await
-        .unwrap();
+    ds.storage.as_ref().remove_dir_all(test_path).await.unwrap();
 
     let ds2 = InsertBuilder::new(&test_uri)
         .execute(vec![data2.clone()])
@@ -2839,7 +2835,7 @@ async fn test_data_replacement_advances_row_lineage() {
     )
     .unwrap();
     let object_writer = dataset
-        .object_store
+        .storage
         .create(&Path::from("data/lineage_replacement.lance"))
         .await
         .unwrap();
@@ -2945,7 +2941,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
     .unwrap();
 
     let object_writer = dataset
-        .object_store
+        .storage
         .create(&Path::from("data/replacement.lance"))
         .await
         .unwrap();
@@ -3126,7 +3122,7 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
     )
     .unwrap();
     let new_a_path = dataset.data_dir().join("merge_new_a.lance");
-    let object_writer = dataset.object_store.create(&new_a_path).await.unwrap();
+    let object_writer = dataset.storage.create(&new_a_path).await.unwrap();
     let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         a_only.as_ref().try_into().unwrap(),
@@ -3176,7 +3172,7 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
 /// stale index entries are blocked at query time.
 #[tokio::test]
 async fn test_data_replacement_populates_invalidated_bitmap() {
-    use object_store::path::Path;
+    use lance_core::storage::path::Path;
 
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
@@ -3227,7 +3223,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
     .unwrap();
 
     let object_writer = dataset
-        .object_store
+        .storage
         .create(&Path::from("data/replacement_inv.lance"))
         .await
         .unwrap();
@@ -3351,11 +3347,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
     )
     .unwrap();
     let replacement_path = dataset.data_dir().join("replacement.lance");
-    let object_writer = dataset
-        .object_store
-        .create(&replacement_path)
-        .await
-        .unwrap();
+    let object_writer = dataset.storage.create(&replacement_path).await.unwrap();
     let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
@@ -3483,11 +3475,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
     )
     .unwrap();
     let replacement_path = dataset.data_dir().join("body_replacement.lance");
-    let object_writer = dataset
-        .object_store
-        .create(&replacement_path)
-        .await
-        .unwrap();
+    let object_writer = dataset.storage.create(&replacement_path).await.unwrap();
     let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         body_schema.as_ref().try_into().unwrap(),
@@ -3663,11 +3651,7 @@ async fn test_vector_index_after_data_replacement() {
     .unwrap();
 
     let replacement_path = dataset.data_dir().join("replacement.lance");
-    let object_writer = dataset
-        .object_store
-        .create(&replacement_path)
-        .await
-        .unwrap();
+    let object_writer = dataset.storage.create(&replacement_path).await.unwrap();
     let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),

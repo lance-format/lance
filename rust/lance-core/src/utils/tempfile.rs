@@ -14,7 +14,7 @@
 //!   `/` in the path.  This is not safe in general (e.g. paths may use `\` as
 //!   an escape) but it should be safe for temporary paths.
 
-use object_store::path::Path as ObjPath;
+use crate::storage::path::Path as ObjPath;
 use std::{
     ops::Deref,
     path::{Path as StdPath, PathBuf},

@@ -19,6 +19,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::DataTypeExt;
+use lance_core::storage::path::Path;
 use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
@@ -35,7 +36,6 @@ use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
 use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
-use object_store::path::Path;
 
 use super::Dataset;
 use super::blob::{BlobPayloadInventory, SidecarRewrite};
@@ -125,7 +125,7 @@ fn create_current_file_writer(
 pub(in crate::dataset) async fn write_fragments(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_dir: &Path,
     normalized_schema: Schema,
     data: SendableRecordBatchStream,
@@ -176,7 +176,7 @@ pub(in crate::dataset) async fn write_fragments(
     let fragments = write_fragments_direct(
         version,
         dataset,
-        object_store,
+        storage,
         base_dir,
         &schema,
         data,
@@ -256,7 +256,7 @@ pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -
 pub(in crate::dataset) async fn write_fragments_direct(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
     data: SendableRecordBatchStream,
@@ -337,17 +337,17 @@ pub(in crate::dataset) async fn write_fragments_direct(
     };
     write::do_write_fragments_impl(
         dataset,
-        object_store,
+        storage,
         base_dir,
         schema,
         buffered_reader,
         params,
-        move |object_store, schema, base_dir, options| {
+        move |storage, schema, base_dir, options| {
             let sidecar_rewrite = sidecar_rewrite.clone();
             async move {
                 let mut options = options;
                 options.sidecar_rewrite = sidecar_rewrite;
-                open_writer(version, &object_store, &schema, &base_dir, options).await
+                open_writer(version, &storage, &schema, &base_dir, options).await
             }
         },
         external_base_resolver,
@@ -665,15 +665,13 @@ pub async fn write_fragment(
 
 pub async fn open_writer(
     version: ConcreteFileVersion,
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
 ) -> Result<Box<dyn GenericWriter>> {
     match version {
-        ConcreteFileVersion::V1 => {
-            write::open_v1_writer(object_store, schema, base_dir, options).await
-        }
+        ConcreteFileVersion::V1 => write::open_v1_writer(storage, schema, base_dir, options).await,
         ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::open_current_writer(
                 move |object_writer, schema, filename, base_id, options| {
@@ -686,7 +684,7 @@ pub async fn open_writer(
                         options,
                     )
                 },
-                object_store,
+                storage,
                 schema,
                 base_dir,
                 options,
@@ -708,21 +706,15 @@ pub async fn open_writer(
                 write::open_current_blob_v2_writer(
                     version,
                     create_file_writer,
-                    object_store,
+                    storage,
                     schema,
                     base_dir,
                     options,
                 )
                 .await
             } else {
-                write::open_current_writer(
-                    create_file_writer,
-                    object_store,
-                    schema,
-                    base_dir,
-                    options,
-                )
-                .await
+                write::open_current_writer(create_file_writer, storage, schema, base_dir, options)
+                    .await
             }
         }
     }
@@ -765,14 +757,7 @@ pub async fn open_update_writer(
         external_base_resolver,
         allow_external_blob_outside_bases,
     );
-    open_writer(
-        version,
-        &dataset.object_store,
-        schema,
-        &dataset.base,
-        options,
-    )
-    .await
+    open_writer(version, &dataset.storage, schema, &dataset.base, options).await
 }
 
 pub async fn create_fragment_from_file(

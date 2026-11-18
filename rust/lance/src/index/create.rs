@@ -692,7 +692,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 // Capture file sizes after vector index creation
                 let index_dir = self.dataset.indices_dir().join(index_id.to_string());
                 let files =
-                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                    list_index_files_with_sizes(&self.dataset.storage, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
@@ -2180,7 +2180,7 @@ mod tests {
     /// shard files. Locks the "every segment has exactly one lookup" invariant.
     async fn assert_canonical_btree_segment(dataset: &Dataset, uuid: &Uuid) {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir)
+        let files = list_index_files_with_sizes(&dataset.storage, &index_dir)
             .await
             .unwrap();
         let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -2368,11 +2368,7 @@ mod tests {
             .indices_dir()
             .join(live_index.uuid.to_string())
             .join(BITMAP_LOOKUP_NAME);
-        let artifact_before = dataset
-            .object_store
-            .read_one_all(&artifact_path)
-            .await
-            .unwrap();
+        let artifact_before = dataset.storage.read_one_all(&artifact_path).await.unwrap();
         let version_before = dataset.version().version;
         let fragment_id = dataset.get_fragments()[0].id() as u32;
 
@@ -2398,11 +2394,7 @@ mod tests {
             );
         }
         assert_eq!(dataset.version().version, version_before);
-        let artifact_after = dataset
-            .object_store
-            .read_one_all(&artifact_path)
-            .await
-            .unwrap();
+        let artifact_after = dataset.storage.read_one_all(&artifact_path).await.unwrap();
         assert_eq!(artifact_after, artifact_before);
 
         let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
@@ -2921,7 +2913,7 @@ mod tests {
                 .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
-                    .object_store
+                    .storage
                     .as_ref()
                     .exists(&segment_index)
                     .await
@@ -3665,7 +3657,7 @@ mod tests {
             .join("staging")
             .join("orphan.lance");
         dataset
-            .object_store
+            .storage
             .put(&stale_staging_path, b"stale")
             .await
             .unwrap();
@@ -3683,7 +3675,7 @@ mod tests {
                 .join(lance_index::scalar::inverted::METADATA_FILE);
             assert!(
                 dataset
-                    .object_store
+                    .storage
                     .as_ref()
                     .exists(&metadata_path)
                     .await

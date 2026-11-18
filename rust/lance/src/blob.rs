@@ -36,6 +36,7 @@ use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, FieldExt,
 };
+use lance_core::storage::path::Path;
 use lance_core::{
     datatypes::{
         BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
@@ -47,7 +48,6 @@ use lance_io::{
     object_store::ObjectStore,
     traits::{Reader, WriteExt, Writer},
 };
-use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 use crate::dataset::BLOBS_DIR;
@@ -975,8 +975,8 @@ pub(crate) struct BlobObjectWriter {
 }
 
 impl BlobObjectWriter {
-    pub(crate) async fn try_new(object_store: ObjectStore, path: Path) -> Result<Self> {
-        let writer = object_store.create(&path).await?;
+    pub(crate) async fn try_new(storage: ObjectStore, path: Path) -> Result<Self> {
+        let writer = storage.create(&path).await?;
         Ok(Self {
             path,
             writer: Some(writer),
@@ -1099,14 +1099,10 @@ pub struct PackedBlobWriter {
 
 impl PackedBlobWriter {
     /// Create a packed blob writer for `data_file_path` and `blob_id`.
-    pub async fn try_new(
-        object_store: ObjectStore,
-        data_file_path: Path,
-        blob_id: u32,
-    ) -> Result<Self> {
+    pub async fn try_new(storage: ObjectStore, data_file_path: Path, blob_id: u32) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
         Ok(Self {
-            upload: BlobObjectWriter::try_new(object_store, path).await?,
+            upload: BlobObjectWriter::try_new(storage, path).await?,
             blob_id,
             ranges: Vec::new(),
         })
@@ -1244,14 +1240,14 @@ impl ManagedBlobWriter {
     /// # Ok(()) }
     /// ```
     pub async fn try_new(
-        object_store: ObjectStore,
+        storage: ObjectStore,
         base_path: Path,
         base_id: Option<u32>,
     ) -> Result<Self> {
         let location = ManagedBlobLocation::new(base_id);
         let path = location.path(&base_path);
         Ok(Self {
-            upload: BlobObjectWriter::try_new(object_store, path).await?,
+            upload: BlobObjectWriter::try_new(storage, path).await?,
             location,
             ranges: Vec::new(),
         })
@@ -1309,14 +1305,10 @@ pub struct DedicatedBlobWriter {
 
 impl DedicatedBlobWriter {
     /// Create a dedicated blob writer for `data_file_path` and `blob_id`.
-    pub async fn try_new(
-        object_store: ObjectStore,
-        data_file_path: Path,
-        blob_id: u32,
-    ) -> Result<Self> {
+    pub async fn try_new(storage: ObjectStore, data_file_path: Path, blob_id: u32) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
         Ok(Self {
-            upload: BlobObjectWriter::try_new(object_store, path).await?,
+            upload: BlobObjectWriter::try_new(storage, path).await?,
             blob_id,
         })
     }
@@ -2008,12 +2000,12 @@ mod tests {
         let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
         let data_file_key = "data-file".to_string();
         let data_file_path = data_dir.clone().join(format!("{data_file_key}.lance"));
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
 
         let packed_id = 7;
         let packed_path = blob_path(&data_dir, &data_file_key, packed_id);
         let mut packed =
-            PackedBlobWriter::try_new(object_store.clone(), data_file_path.clone(), packed_id)
+            PackedBlobWriter::try_new(storage.clone(), data_file_path.clone(), packed_id)
                 .await
                 .unwrap();
         assert_eq!(packed.path(), &packed_path);
@@ -2039,7 +2031,7 @@ mod tests {
         let dedicated_id = 8;
         let dedicated_path = blob_path(&data_dir, &data_file_key, dedicated_id);
         let mut dedicated =
-            DedicatedBlobWriter::try_new(object_store.clone(), data_file_path, dedicated_id)
+            DedicatedBlobWriter::try_new(storage.clone(), data_file_path, dedicated_id)
                 .await
                 .unwrap();
         assert_eq!(dedicated.path(), &dedicated_path);

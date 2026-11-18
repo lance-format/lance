@@ -448,11 +448,8 @@ async fn append_collects_seeds_from_external_plugin() {
     let fragment = &dataset.fragments()[0];
     let file = &fragment.files[0];
     let path = dataset.data_dir().join(file.path.as_str());
-    let object_store = dataset.object_store(file.base_id).await.unwrap();
-    let scheduler = ScanScheduler::new(
-        object_store.clone(),
-        SchedulerConfig::max_bandwidth(&object_store),
-    );
+    let storage = dataset.storage(file.base_id).await.unwrap();
+    let scheduler = ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(&storage));
     let file_scheduler = scheduler
         .open_file(&path, &CachedFileSize::unknown())
         .await

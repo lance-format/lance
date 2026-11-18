@@ -6,7 +6,7 @@ use futures::channel::oneshot;
 use futures::future::Either;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt, TryFutureExt};
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -34,7 +34,7 @@ const BACKPRESSURE_MIN: u64 = 5;
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
 const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
 
-/// Storage option used to configure scheduler error handling.
+/// ObjectStore option used to configure scheduler error handling.
 pub(crate) const SCHEDULER_ERROR_MODE_STORAGE_OPTION: &str = "scheduler_error_mode";
 
 // Global counter of how many IOPS we have issued
@@ -925,7 +925,7 @@ impl FromStr for SchedulerErrorMode {
 /// Note: The 2.X file readers already do this so this is only a concern if you are
 /// using the ScanScheduler directly.
 pub struct ScanScheduler {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
     error_mode: SchedulerErrorMode,
@@ -935,7 +935,7 @@ pub struct ScanScheduler {
 impl Debug for ScanScheduler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanScheduler")
-            .field("object_store", &self.object_store)
+            .field("storage", &self.storage)
             .field("error_mode", &self.error_mode)
             .finish()
     }
@@ -1023,20 +1023,20 @@ impl ScanScheduler {
     ///
     /// # Arguments
     ///
-    /// * object_store - the store to wrap
+    /// * storage - the storage handle to wrap
     /// * config - configuration settings for the scheduler
     ///
     /// The error mode is inherited from the object store's
     /// `scheduler_error_mode` storage option and defaults to `best_effort` when
     /// the option is absent. Fail-fast cancellation is scoped to the physical
     /// tasks of one logical request and does not affect other requests.
-    pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
-        let error_mode = object_store.scheduler_error_mode();
-        let io_capacity = object_store.io_parallelism();
+    pub fn new(storage: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
+        let error_mode = storage.scheduler_error_mode();
+        let io_capacity = storage.io_parallelism();
         let stats = IoStats::new();
         let use_lite = config
             .use_lite_scheduler
-            .unwrap_or_else(|| object_store.prefers_lite_scheduler());
+            .unwrap_or_else(|| storage.prefers_lite_scheduler());
         let io_queue = if use_lite {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
@@ -1058,7 +1058,7 @@ impl ScanScheduler {
             IoQueueType::Standard(io_queue)
         };
         Arc::new(Self {
-            object_store,
+            storage,
             io_queue,
             stats,
             error_mode,
@@ -1083,18 +1083,18 @@ impl ScanScheduler {
         let file_size_bytes = if let Some(size) = file_size_bytes.get() {
             u64::from(size)
         } else {
-            let size = self.object_store.size(path).await?;
+            let size = self.storage.size(path).await?;
             if let Some(size) = NonZero::new(size) {
                 file_size_bytes.set(size);
             }
             size
         };
         let reader = self
-            .object_store
+            .storage
             .open_with_size(path, file_size_bytes as usize)
             .await?;
-        let block_size = self.object_store.block_size() as u64;
-        let max_iop_size = self.object_store.max_iop_size();
+        let block_size = self.storage.block_size() as u64;
+        let max_iop_size = self.storage.max_iop_size();
         Ok(FileScheduler {
             reader: reader.into(),
             block_size,
@@ -1131,10 +1131,10 @@ impl ScanScheduler {
     pub fn open_reader(self: &Arc<Self>, reader: Arc<dyn Reader>) -> FileScheduler {
         FileScheduler {
             reader,
-            block_size: self.object_store.block_size() as u64,
+            block_size: self.storage.block_size() as u64,
             root: self.clone(),
             base_priority: 0,
-            max_iop_size: self.object_store.max_iop_size(),
+            max_iop_size: self.storage.max_iop_size(),
             bypass_backpressure: false,
             extra_stats: None,
             metadata_read_size: None,
@@ -1258,7 +1258,7 @@ impl ScanScheduler {
                 let run_fn = Box::new(move || {
                     // An empty range asks for no bytes, which IoTask::run
                     // answers without a request. Reaching a cloud store with
-                    // one is an InvalidGetRange error there.
+                    // one is an invalid-range error there.
                     if requested_range.start == requested_range.end {
                         return async { Ok(Bytes::new()) }.boxed();
                     }
@@ -1652,7 +1652,7 @@ mod tests {
     use rand::RngCore;
     use rstest::rstest;
 
-    use object_store::{GetRange, ObjectStore as OSObjectStore, ObjectStoreExt, memory::InMemory};
+    use ::object_store::memory::InMemory;
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 
@@ -1661,7 +1661,7 @@ mod tests {
             DEFAULT_DOWNLOAD_RETRY_COUNT, DEFAULT_MAX_IOP_SIZE, ObjectStoreParams,
             ObjectStoreRegistry, StorageOptionsAccessor,
         },
-        testing::MockObjectStore,
+        testing::MockStorageBackend,
     };
 
     use super::*;
@@ -1920,18 +1920,18 @@ mod tests {
             1
         }
 
-        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+        fn size(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<usize>> {
             Box::pin(async { Ok(0) })
         }
 
         fn get_range(
             &self,
             _range: Range<usize>,
-        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+        ) -> futures::future::BoxFuture<'static, crate::object_store::Result<Bytes>> {
             Box::pin(async { Ok(Bytes::new()) })
         }
 
-        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+        fn get_all(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<Bytes>> {
             Box::pin(async { Ok(Bytes::new()) })
         }
     }
@@ -2096,10 +2096,10 @@ mod tests {
     ) {
         let path = Path::parse("overlapping-ranges").unwrap();
         let source = (0_u8..64).collect::<Vec<_>>();
-        let object_store = Arc::new(ObjectStore::memory());
-        object_store.put(&path, &source).await.unwrap();
+        let storage = Arc::new(ObjectStore::memory());
+        storage.put(&path, &source).await.unwrap();
         let scheduler = ScanScheduler::new(
-            object_store,
+            storage,
             SchedulerConfig {
                 use_lite_scheduler: Some(use_lite_scheduler),
                 ..SchedulerConfig::default_for_testing()
@@ -2134,14 +2134,14 @@ mod tests {
     async fn test_unordered_ranges_are_rejected(#[case] use_lite_scheduler: bool) {
         let path = Path::parse("unordered-ranges").unwrap();
         let source = (0_u8..64).collect::<Vec<_>>();
-        let object_store = Arc::new(ObjectStore::memory());
-        object_store.put(&path, &source).await.unwrap();
+        let storage = Arc::new(ObjectStore::memory());
+        storage.put(&path, &source).await.unwrap();
 
         let config = SchedulerConfig {
             use_lite_scheduler: Some(use_lite_scheduler),
             ..SchedulerConfig::default_for_testing()
         };
-        let scheduler = ScanScheduler::new(object_store, config);
+        let scheduler = ScanScheduler::new(storage, config);
         let file_scheduler = scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await
@@ -2215,14 +2215,15 @@ mod tests {
     #[tokio::test]
     async fn test_priority() {
         let some_path = Path::parse("foo").unwrap();
-        let base_store = Arc::new(InMemory::new());
+        let base_store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         base_store
             .put(&some_path, vec![0; 1000].into())
             .await
             .unwrap();
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut obj_store = MockObjectStore::default();
+        let mut obj_store = MockStorageBackend::default();
         let semaphore_copy = semaphore.clone();
         obj_store
             .expect_get_opts()
@@ -2236,17 +2237,19 @@ mod tests {
                 }
                 .boxed()
             });
-        let obj_store = Arc::new(ObjectStore::new(
-            Arc::new(obj_store),
-            Url::parse("mem://").unwrap(),
-            Some(500),
-            None,
-            false,
-            false,
-            1,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let obj_store = Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config =
+                crate::object_store::BackendConfig::new(Arc::new(obj_store), url.scheme());
+            config.io_parallelism = 1;
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(500),
+                    ..Default::default()
+                },
+            )
+        });
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1024 * 1024,
@@ -2304,14 +2307,15 @@ mod tests {
     #[tokio::test]
     async fn test_standard_scheduler_state_tracks_queue_state() {
         let some_path = Path::parse("foo").unwrap();
-        let base_store = Arc::new(InMemory::new());
+        let base_store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         base_store
             .put(&some_path, vec![0; 1000].into())
             .await
             .unwrap();
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut obj_store = MockObjectStore::default();
+        let mut obj_store = MockStorageBackend::default();
         let semaphore_copy = semaphore.clone();
         obj_store
             .expect_get_opts()
@@ -2325,17 +2329,19 @@ mod tests {
                 }
                 .boxed()
             });
-        let obj_store = Arc::new(ObjectStore::new(
-            Arc::new(obj_store),
-            Url::parse("mem://").unwrap(),
-            Some(500),
-            None,
-            false,
-            false,
-            1,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let obj_store = Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config =
+                crate::object_store::BackendConfig::new(Arc::new(obj_store), url.scheme());
+            config.io_parallelism = 1;
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(500),
+                    ..Default::default()
+                },
+            )
+        });
 
         let scheduler = ScanScheduler::new(
             obj_store,
@@ -2434,40 +2440,40 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_backpressure() {
         let some_path = Path::parse("foo").unwrap();
-        let base_store = Arc::new(InMemory::new());
+        let base_store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         base_store
             .put(&some_path, vec![0; 100000].into())
             .await
             .unwrap();
 
         let bytes_read = Arc::new(AtomicU64::from(0));
-        let mut obj_store = MockObjectStore::default();
+        let mut obj_store = MockStorageBackend::default();
         let bytes_read_copy = bytes_read.clone();
         // Wraps the obj_store to keep track of how many bytes have been read
         obj_store
             .expect_get_opts()
             .returning(move |location, options| {
                 let range = options.range.as_ref().unwrap();
-                let num_bytes = match range {
-                    GetRange::Bounded(bounded) => bounded.end - bounded.start,
-                    _ => panic!(),
-                };
+                let num_bytes = range.end - range.start;
                 bytes_read_copy.fetch_add(num_bytes, Ordering::Release);
                 let location = location.clone();
                 let base_store = base_store.clone();
                 async move { base_store.get_opts(&location, options).await }.boxed()
             });
-        let obj_store = Arc::new(ObjectStore::new(
-            Arc::new(obj_store),
-            Url::parse("mem://").unwrap(),
-            Some(500),
-            None,
-            false,
-            false,
-            1,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let obj_store = Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config =
+                crate::object_store::BackendConfig::new(Arc::new(obj_store), url.scheme());
+            config.io_parallelism = 1;
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(500),
+                    ..Default::default()
+                },
+            )
+        });
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
@@ -2589,14 +2595,14 @@ mod tests {
             1
         }
 
-        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+        fn size(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<usize>> {
             Box::pin(async { Ok(1_000_000) })
         }
 
         fn get_range(
             &self,
             range: Range<usize>,
-        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+        ) -> futures::future::BoxFuture<'static, crate::object_store::Result<Bytes>> {
             self.get_range_count.fetch_add(1, Ordering::Release);
             let semaphore = self.semaphore.clone();
             let num_bytes = range.end - range.start;
@@ -2606,7 +2612,7 @@ mod tests {
             })
         }
 
-        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+        fn get_all(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<Bytes>> {
             Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
         }
     }
@@ -2668,14 +2674,14 @@ mod tests {
             2
         }
 
-        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+        fn size(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<usize>> {
             Box::pin(async { Ok(3) })
         }
 
         fn get_range(
             &self,
             range: Range<usize>,
-        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+        ) -> futures::future::BoxFuture<'static, crate::object_store::Result<Bytes>> {
             self.started.add_permits(1);
             let num_bytes = range.end - range.start;
             if range.start == self.failure_range_start {
@@ -2684,7 +2690,7 @@ mod tests {
                 Box::pin(async move {
                     failure_release.acquire().await.unwrap().forget();
                     failure_finished.add_permits(1);
-                    Err(object_store::Error::Generic {
+                    Err(crate::object_store::Error::Generic {
                         store: "controlled failure reader",
                         source: Box::new(io::Error::other("injected range failure")),
                     })
@@ -2704,7 +2710,7 @@ mod tests {
             }
         }
 
-        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+        fn get_all(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<Bytes>> {
             Box::pin(async { Ok(Bytes::from(vec![0_u8; 3])) })
         }
     }
@@ -2748,21 +2754,25 @@ mod tests {
         }
     }
 
-    fn scheduler_test_object_store() -> Arc<ObjectStore> {
-        Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("mem://").unwrap(),
-            Some(1),
-            None,
-            false,
-            false,
-            2,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ))
+    fn scheduler_test_storage() -> Arc<ObjectStore> {
+        Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config = crate::object_store::BackendConfig::new(
+                crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new())),
+                url.scheme(),
+            );
+            config.io_parallelism = 2;
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(1),
+                    ..Default::default()
+                },
+            )
+        })
     }
 
-    async fn scheduler_test_object_store_with_error_mode(error_mode: &str) -> Arc<ObjectStore> {
+    async fn scheduler_test_storage_with_error_mode(error_mode: &str) -> Arc<ObjectStore> {
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([(
@@ -2782,55 +2792,67 @@ mod tests {
         .0
     }
 
-    fn scheduler_test_object_store_from_public_constructor(error_mode: &str) -> Arc<ObjectStore> {
+    fn scheduler_test_storage_from_custom_provider(error_mode: &str) -> Arc<ObjectStore> {
         let storage_options = HashMap::from([(
             SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
             error_mode.to_string(),
         )]);
-        Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("mem://").unwrap(),
-            Some(1),
-            None,
-            false,
-            false,
-            2,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            Some(&storage_options),
-        ))
+        Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config = crate::object_store::BackendConfig::new(
+                crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new())),
+                url.scheme(),
+            );
+            config.io_parallelism = 2;
+            let mut options = Some(&storage_options).cloned().unwrap_or_default();
+            options.insert(
+                "download_retry_count".to_string(),
+                (DEFAULT_DOWNLOAD_RETRY_COUNT).to_string(),
+            );
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(1),
+                    storage_options_accessor: Some(Arc::new(
+                        crate::object_store::StorageOptionsAccessor::with_static_options(options),
+                    )),
+                    ..Default::default()
+                },
+            )
+        })
     }
 
     #[tokio::test]
     async fn scheduler_inherits_storage_option_error_mode() {
-        let object_store = scheduler_test_object_store_with_error_mode("fail_fast").await;
+        let storage = scheduler_test_storage_with_error_mode("fail_fast").await;
         let config = SchedulerConfig {
             io_buffer_size_bytes: 2,
             use_lite_scheduler: Some(false),
         };
 
-        let scheduler = ScanScheduler::new(object_store, config);
+        let scheduler = ScanScheduler::new(storage, config);
         assert_eq!(scheduler.error_mode, SchedulerErrorMode::FailFast);
     }
 
     #[rstest]
     #[case::standard(false, false)]
     #[case::lite(true, false)]
-    #[case::public_object_store_constructor(false, true)]
+    #[case::public_storage_constructor(false, true)]
     #[tokio::test(flavor = "multi_thread")]
     async fn fail_fast_cancels_related_tasks_and_preserves_original_error(
         #[case] use_lite_scheduler: bool,
-        #[case] is_public_object_store_constructor: bool,
+        #[case] is_custom_provider: bool,
     ) {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 2,
             use_lite_scheduler: Some(use_lite_scheduler),
         };
-        let object_store = if is_public_object_store_constructor {
-            scheduler_test_object_store_from_public_constructor("fail_fast")
+        let storage = if is_custom_provider {
+            scheduler_test_storage_from_custom_provider("fail_fast")
         } else {
-            scheduler_test_object_store_with_error_mode("fail_fast").await
+            scheduler_test_storage_with_error_mode("fail_fast").await
         };
-        let scheduler = ScanScheduler::new(object_store, config);
+        let scheduler = ScanScheduler::new(storage, config);
         let state = controlled_failure_state(1);
         let request = scheduler.submit_request(state.reader.clone(), vec![0..1, 1..2], 0, false);
         let request_handle = tokio::spawn(request);
@@ -2880,19 +2902,31 @@ mod tests {
             SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
             "fail_fast".to_string(),
         )]);
-        let object_store = Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("mem://").unwrap(),
-            Some(1),
-            None,
-            false,
-            false,
-            1,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            Some(&storage_options),
-        ));
+        let storage = Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config = crate::object_store::BackendConfig::new(
+                crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new())),
+                url.scheme(),
+            );
+            config.io_parallelism = 1;
+            let mut options = Some(&storage_options).cloned().unwrap_or_default();
+            options.insert(
+                "download_retry_count".to_string(),
+                (DEFAULT_DOWNLOAD_RETRY_COUNT).to_string(),
+            );
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(1),
+                    storage_options_accessor: Some(Arc::new(
+                        crate::object_store::StorageOptionsAccessor::with_static_options(options),
+                    )),
+                    ..Default::default()
+                },
+            )
+        });
         let scheduler = ScanScheduler::new(
-            object_store,
+            storage,
             SchedulerConfig {
                 io_buffer_size_bytes: 1024,
                 use_lite_scheduler: Some(false),
@@ -2970,7 +3004,7 @@ mod tests {
             io_buffer_size_bytes: 2,
             use_lite_scheduler: Some(false),
         };
-        let scheduler = ScanScheduler::new(scheduler_test_object_store(), config);
+        let scheduler = ScanScheduler::new(scheduler_test_storage(), config);
         let state = controlled_failure_state(1);
         let request = scheduler.submit_request(state.reader.clone(), vec![0..1, 1..2], 0, false);
         let mut request_handle = tokio::spawn(request);
@@ -3017,7 +3051,7 @@ mod tests {
             io_buffer_size_bytes: 2,
             use_lite_scheduler: Some(true),
         };
-        let scheduler = ScanScheduler::new(scheduler_test_object_store(), config);
+        let scheduler = ScanScheduler::new(scheduler_test_storage(), config);
         let state = controlled_failure_state(0);
         let request = scheduler.submit_request(state.reader, vec![0..1, 1..2], 0, false);
         let request_handle = tokio::spawn(request);
@@ -3056,17 +3090,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_same_priority_chunks_continue_after_higher_priority_request() {
-        let obj_store = Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("mem://").unwrap(),
-            Some(4096),
-            None,
-            false,
-            false,
-            1,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let obj_store = Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config = crate::object_store::BackendConfig::new(
+                crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new())),
+                url.scheme(),
+            );
+            config.io_parallelism = 1;
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(4096),
+                    ..Default::default()
+                },
+            )
+        });
         let scheduler = ScanScheduler::new(
             obj_store,
             SchedulerConfig {
@@ -3128,20 +3166,20 @@ mod tests {
             1
         }
 
-        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+        fn size(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<usize>> {
             Box::pin(async { Ok(1_000_000) })
         }
 
         fn get_range(
             &self,
             range: Range<usize>,
-        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+        ) -> futures::future::BoxFuture<'static, crate::object_store::Result<Bytes>> {
             self.get_range_count.fetch_add(1, Ordering::Release);
             let num_bytes = range.end - range.start;
             Box::pin(async move { Ok(Bytes::from(vec![0u8; num_bytes])) })
         }
 
-        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+        fn get_all(&self) -> futures::future::BoxFuture<'_, crate::object_store::Result<Bytes>> {
             Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
         }
     }
@@ -3174,7 +3212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_object_store_selects_scheduler() {
+    async fn test_storage_selects_scheduler() {
         // A memory:// store should use the standard scheduler when config is None
         let memory_store = Arc::new(ObjectStore::memory());
         assert!(!memory_store.prefers_lite_scheduler());
@@ -3186,17 +3224,7 @@ mod tests {
         assert!(!scheduler.uses_lite_scheduler());
 
         // A file+uring:// store should use the lite scheduler when config is None
-        let uring_store = Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("file+uring:///tmp").unwrap(),
-            None,
-            None,
-            false,
-            false,
-            8,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let (uring_store, _) = ObjectStore::from_uri("file+uring:///tmp").await.unwrap();
         assert!(uring_store.prefers_lite_scheduler());
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
@@ -3301,39 +3329,39 @@ mod tests {
         // A FileScheduler obtained via with_bypass_backpressure() submits reads that bypass
         // the byte budget, allowing them to proceed even when the budget is exhausted.
         let some_path = Path::parse("foo").unwrap();
-        let base_store = Arc::new(InMemory::new());
+        let base_store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         base_store
             .put(&some_path, vec![0u8; 1000].into())
             .await
             .unwrap();
 
         let bytes_dispatched = Arc::new(AtomicU64::from(0));
-        let mut obj_store = MockObjectStore::default();
+        let mut obj_store = MockStorageBackend::default();
         let bytes_dispatched_copy = bytes_dispatched.clone();
         obj_store
             .expect_get_opts()
             .returning(move |location, options| {
                 let range = options.range.as_ref().unwrap();
-                let num_bytes = match range {
-                    GetRange::Bounded(bounded) => bounded.end - bounded.start,
-                    _ => panic!(),
-                };
+                let num_bytes = range.end - range.start;
                 bytes_dispatched_copy.fetch_add(num_bytes, Ordering::Release);
                 let location = location.clone();
                 let base_store = base_store.clone();
                 async move { base_store.get_opts(&location, options).await }.boxed()
             });
-        let obj_store = Arc::new(ObjectStore::new(
-            Arc::new(obj_store),
-            Url::parse("mem://").unwrap(),
-            Some(500),
-            None,
-            false,
-            false,
-            1,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let obj_store = Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config =
+                crate::object_store::BackendConfig::new(Arc::new(obj_store), url.scheme());
+            config.io_parallelism = 1;
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(500),
+                    ..Default::default()
+                },
+            )
+        });
 
         // Budget = 10 bytes.
         let config = SchedulerConfig {
@@ -3391,17 +3419,21 @@ mod tests {
     // available only if fut1's dropped reservation was refunded. Returns whether fut2
     // completed within 2s (false = the reservation leaked and fut2 deadlocked).
     async fn run_caller_drop_scenario(use_lite_scheduler: bool) -> (bool, Duration) {
-        let obj_store = Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("mem://").unwrap(),
-            Some(4096),
-            None,
-            false,
-            false,
-            1,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        let obj_store = Arc::new({
+            let url = Url::parse("mem://").unwrap();
+            let mut config = crate::object_store::BackendConfig::new(
+                crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new())),
+                url.scheme(),
+            );
+            config.io_parallelism = 1;
+            crate::utils::testing::TestObjectStoreProvider(config).build(
+                url,
+                &crate::object_store::ObjectStoreParams {
+                    block_size: Some(4096),
+                    ..Default::default()
+                },
+            )
+        });
         let scheduler = ScanScheduler::new(
             obj_store,
             SchedulerConfig {

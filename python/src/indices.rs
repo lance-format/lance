@@ -36,7 +36,7 @@ use lance::index::DatasetIndexInternalExt;
 use crate::fragment::FileFragment;
 use crate::utils::{PyJson, PyLance};
 use crate::{
-    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
+    dataset::Dataset, error::PythonErrorExt, file::storage_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::{IndexDescription, IndexType};
@@ -422,7 +422,7 @@ async fn do_transform_vectors(
         .await
         .infer_error()?;
 
-    let (obj_store, path) = object_store_from_uri_or_path_no_options(dst_uri).await?;
+    let (obj_store, path) = storage_from_uri_or_path_no_options(dst_uri).await?;
     let writer = obj_store.create(&path).await.infer_error()?;
     write_vector_storage(
         &dataset.ds,
@@ -501,14 +501,13 @@ pub fn transform_vectors(
     )?
 }
 
-#[allow(deprecated)]
 async fn do_shuffle_transformed_vectors(
     unsorted_filenames: Vec<String>,
     dir_path: &str,
     ivf_centroids: FixedSizeListArray,
     shuffle_output_root_filename: &str,
 ) -> PyResult<Vec<String>> {
-    let (obj_store, path) = ObjectStore::from_path(dir_path).infer_error()?;
+    let (obj_store, path) = ObjectStore::from_uri(dir_path).await.infer_error()?;
     if !obj_store.is_local() {
         return Err(PyValueError::new_err(
             "shuffle_vectors input and output path is currently required to be local",
@@ -562,7 +561,7 @@ async fn do_load_shuffled_vectors(
     ivf_model: IvfModel,
     pq_model: ProductQuantizer,
 ) -> PyResult<()> {
-    let (_, path) = object_store_from_uri_or_path_no_options(dir_path).await?;
+    let (_, path) = storage_from_uri_or_path_no_options(dir_path).await?;
     let streams = IvfShuffler::load_partitioned_shuffles(&path, filenames)
         .await
         .infer_error()?;
@@ -583,8 +582,8 @@ async fn do_load_shuffled_vectors(
 
     let mut ds = dataset.ds.as_ref().clone();
     let index_dir = ds.indices_dir().clone().join(index_id.to_string());
-    let object_store = ds.object_store(None).await.infer_error()?;
-    let files = list_index_files_with_sizes(object_store.as_ref(), &index_dir)
+    let storage = ds.storage(None).await.infer_error()?;
+    let files = list_index_files_with_sizes(storage.as_ref(), &index_dir)
         .await
         .infer_error()?;
     let metadata = IndexMetadata {

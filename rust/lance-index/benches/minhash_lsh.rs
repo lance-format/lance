@@ -11,6 +11,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::ROW_ID;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_index::Index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pb;
@@ -22,7 +23,6 @@ use lance_index::scalar::minhash_lsh::{
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_io::object_store::ObjectStore;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
-use object_store::path::Path;
 
 fn bench_minhash_lsh(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_multi_thread()

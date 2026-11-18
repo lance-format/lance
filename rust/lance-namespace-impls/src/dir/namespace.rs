@@ -12,9 +12,11 @@ use lance::dataset::{
     WhenNotMatchedBySource, WriteMode,
 };
 use lance::index::DatasetIndexExt;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result, box_error};
 use lance_index::is_system_index;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_io::object_store::Error as ObjectStoreError;
 use lance_linalg::distance::MetricType;
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -49,8 +51,6 @@ use lance_namespace::models::{
     UpdateTableTagResponse,
 };
 use lance_table::io::commit::ManifestNamingScheme;
-use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStoreExt};
 
 use super::marker::{MarkerFileError, put_marker_file_atomic};
 use super::query::{apply_probe_bounds, build_engine_fts_query};
@@ -334,14 +334,11 @@ impl LanceNamespace for DirectoryNamespace {
         let table_uri = self.table_full_uri(&table_name);
         let table_path = self.table_path(&table_name);
 
-        self.object_store
-            .remove_dir_all(table_path)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to drop table {}: {:?}", table_name, e),
-                })
-            })?;
+        self.storage.remove_dir_all(table_path).await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to drop table {}: {:?}", table_name, e),
+            })
+        })?;
 
         Ok(DropTableResponse {
             id: request.id,
@@ -503,7 +500,7 @@ impl LanceNamespace for DirectoryNamespace {
         let reserved_file_path = self.table_reserved_file_path(&table_name);
 
         put_marker_file_atomic(
-            &self.object_store,
+            &self.storage,
             &reserved_file_path,
             &format!("table {}", table_name),
         )
@@ -595,7 +592,7 @@ impl LanceNamespace for DirectoryNamespace {
         // we'll get an AlreadyExists error which we convert to a proper message.
         let deregistered_path = self.table_deregistered_file_path(&table_name);
         put_marker_file_atomic(
-            &self.object_store,
+            &self.storage,
             &deregistered_path,
             &format!("deregistration marker for table {}", table_name),
         )
@@ -811,7 +808,7 @@ impl LanceNamespace for DirectoryNamespace {
         let (table_uri, table_path, branch_parent_version) = match branch {
             Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
             None => {
-                let table_path = self.object_store_path_from_uri(&table_uri)?;
+                let table_path = self.storage_path_from_uri(&table_uri)?;
                 (table_uri, table_path, None)
             }
         };
@@ -838,7 +835,7 @@ impl LanceNamespace for DirectoryNamespace {
         })?;
 
         // Idempotent retry: version path already published with the same content.
-        match self.object_store.stat(&final_path).await {
+        match self.storage.stat(&final_path).await {
             Ok(existing_meta) => {
                 return self
                     .resolve_existing_table_version(ExistingTableVersionResolve {
@@ -884,7 +881,7 @@ impl LanceNamespace for DirectoryNamespace {
             Err(ObjectStoreError::AlreadyExists { .. })
             | Err(ObjectStoreError::Precondition { .. }) => {
                 // Lost a Create race: succeed only if the winner published identical bytes.
-                let existing_meta = self.object_store.stat(&final_path).await.map_err(|e| {
+                let existing_meta = self.storage.stat(&final_path).await.map_err(|e| {
                     lance_core::Error::from(NamespaceError::Internal {
                         message: format!(
                             "Version {} conflict for table at '{}' but failed to stat winner: {}",
@@ -921,7 +918,7 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        let final_meta = self.object_store.stat(&final_path).await.map_err(|e| {
+        let final_meta = self.storage.stat(&final_path).await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!(
                     "Failed to stat created version {} for table at '{}': {}",
@@ -931,7 +928,7 @@ impl LanceNamespace for DirectoryNamespace {
         })?;
 
         // Delete the staging manifest after successful copy
-        if let Err(e) = self.object_store.inner.delete(&staging_path).await {
+        if let Err(e) = self.storage.delete(&staging_path).await {
             log::warn!(
                 "Failed to delete staging manifest at '{}': {:?}",
                 staging_path,

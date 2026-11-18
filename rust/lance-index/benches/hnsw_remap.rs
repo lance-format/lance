@@ -45,6 +45,7 @@ use arrow_array::{
 use arrow_schema::{Field, Schema};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID_FIELD;
+use lance_core::storage::path::Path;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::create_writer;
@@ -63,7 +64,6 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
-use object_store::path::Path;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;

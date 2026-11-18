@@ -572,7 +572,7 @@ impl Updater {
             base_id,
         ));
         cleanup_data_fragments(
-            &self.dataset().object_store,
+            &self.dataset().storage,
             &self.dataset().base,
             None,
             &[fragment],

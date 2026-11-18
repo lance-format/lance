@@ -260,7 +260,7 @@ mod test {
             uuid: &Uuid,
             _params: &dyn IndexParams,
         ) -> Result<()> {
-            let store = dataset.object_store.clone();
+            let store = dataset.storage.clone();
             let path = dataset
                 .indices_dir()
                 .join(uuid.to_string())

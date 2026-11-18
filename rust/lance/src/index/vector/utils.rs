@@ -412,11 +412,7 @@ pub(crate) async fn sample_unseen_training_data(
         column,
         num_rows,
         training_sample_batch_rows(byte_width)?,
-        training_sample_readahead(
-            sample_size,
-            byte_width,
-            dataset.object_store.io_parallelism(),
-        )?,
+        training_sample_readahead(sample_size, byte_width, dataset.storage.io_parallelism())?,
         fragment_ids,
         still_needed.clone(),
         Some(drawn_offsets),
@@ -538,7 +534,7 @@ async fn sample_training_data(
     let batch_readahead = training_sample_readahead(
         sample_size_hint,
         byte_width,
-        dataset.object_store.io_parallelism(),
+        dataset.storage.io_parallelism(),
     )?;
 
     if let Some(fragment_ids) = fragment_ids {
@@ -644,12 +640,12 @@ fn sample_training_data_scan(
     num_rows: usize,
     byte_width: usize,
 ) -> Result<crate::dataset::scanner::DatasetRecordBatchStream> {
-    let block_size = dataset.object_store.as_ref().block_size();
+    let block_size = dataset.storage.as_ref().block_size();
     let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width);
     Ok(dataset.take_scan(
         Box::pin(futures::stream::iter(ranges).map(Ok)),
         Arc::new(dataset.schema().project(&[column])?),
-        dataset.object_store.as_ref().io_parallelism(),
+        dataset.storage.as_ref().io_parallelism(),
     ))
 }
 
@@ -958,7 +954,7 @@ async fn sample_fsl_uniform(
     let batch_readahead = training_sample_readahead(
         sample_size_hint,
         byte_width,
-        dataset.object_store.io_parallelism(),
+        dataset.storage.io_parallelism(),
     )?;
     let mut values_buf = MutableBuffer::with_capacity(sample_size_hint * byte_width);
     let mut total_rows: usize = 0;
@@ -1408,7 +1404,7 @@ mod tests {
 
         // Retain the old range-reader path as an I/O control. With an 8 KiB
         // vector and a 4 KiB local block it returns one row per batch.
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
         let point_scan =
             sample_training_data_scan(&dataset, "vec", SAMPLE_ROWS, ROWS, 2048 * 4).unwrap();
         let point_sample = sample_nullable_fsl(
@@ -1422,11 +1418,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(point_sample.len(), SAMPLE_ROWS);
-        let point_reads = dataset.object_store.io_stats_incremental();
+        let point_reads = dataset.storage.io_stats_incremental();
         let sample = maybe_sample_training_data(&dataset, "vec", SAMPLE_ROWS, None)
             .await
             .unwrap();
-        let reads = dataset.object_store.io_stats_incremental();
+        let reads = dataset.storage.io_stats_incremental();
         assert_eq!(sample.len(), SAMPLE_ROWS);
         assert_eq!(sample.null_count(), 0);
         assert!(

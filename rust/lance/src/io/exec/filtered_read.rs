@@ -520,7 +520,7 @@ struct FilteredReadStream {
     touched_fragments: usize,
     planned_rows: u64,
     /// The dataset's primary store, whose labels the scan's `metrics` counters carry
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
 }
 
 /// Below this many fragments there are too few handoffs to be worth
@@ -660,8 +660,8 @@ impl FilteredReadStream {
             base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
         let threading_mode = options.threading_mode;
 
-        let io_parallelism = dataset.object_store.io_parallelism();
-        let object_store = dataset.object_store.clone();
+        let io_parallelism = dataset.storage.io_parallelism();
+        let storage = dataset.storage.clone();
         let fragment_readahead = options
             .fragment_readahead
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
@@ -757,7 +757,7 @@ impl FilteredReadStream {
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
-            object_store,
+            storage,
         })
     }
 
@@ -776,7 +776,7 @@ impl FilteredReadStream {
         options: &FilteredReadOptions,
         needs_row_ids: bool,
     ) -> Result<Vec<LoadedFragment>> {
-        let io_parallelism = dataset.object_store.io_parallelism();
+        let io_parallelism = dataset.storage.io_parallelism();
         let fragments = options.selected_fragments(dataset.as_ref());
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
@@ -802,7 +802,7 @@ impl FilteredReadStream {
     /// Create the I/O scheduler for a read (explicit option → env override →
     /// max bandwidth)
     fn make_scan_scheduler(dataset: &Dataset, options: &FilteredReadOptions) -> Arc<ScanScheduler> {
-        let obj_store = dataset.object_store.clone();
+        let obj_store = dataset.storage.clone();
         let scheduler_config = if let Some(io_buffer_size_bytes) = options
             .io_buffer_size_bytes
             .or_else(get_default_io_buffer_size_override)
@@ -1104,7 +1104,7 @@ impl FilteredReadStream {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
                 std::cmp::max(
-                    dataset.object_store.as_ref().block_size() / 4,
+                    dataset.storage.as_ref().block_size() / 4,
                     BATCH_SIZE_FALLBACK,
                 )
             }) as u32
@@ -1466,7 +1466,7 @@ impl FilteredReadStream {
         let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
             metrics,
             partition,
-            &self.object_store,
+            &self.storage,
         ));
 
         match self.threading_mode {
@@ -2909,7 +2909,7 @@ impl FilteredReadExec {
                 }
 
                 // Load fragments to compute the plan
-                let io_parallelism = dataset.object_store.io_parallelism();
+                let io_parallelism = dataset.storage.io_parallelism();
                 let fragments = options.selected_fragments(dataset.as_ref());
 
                 let with_deleted_rows = options.with_deleted_rows;
@@ -8423,7 +8423,7 @@ mod tests {
                     let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
                         &timer_metrics,
                         0,
-                        &dataset.object_store,
+                        &dataset.storage,
                     ));
                     let mut cancelled = Box::pin({
                         let partition_metrics = partition_metrics.clone();
