@@ -24,18 +24,18 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{IndexStore, registry::ScalarIndexPlugin};
-use lance_io::object_store::{ObjectStore, WrappingObjectStore};
+use lance_io::storage::{BackendWrapper, Storage};
 use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
 
 #[derive(Debug)]
 struct RequestWrapper;
 
-impl WrappingObjectStore for RequestWrapper {
+impl BackendWrapper for RequestWrapper {
     fn wrap(
         &self,
         _prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(ProxyBackend::new(
             original,
             Arc::new(Mutex::new(ProxyBackendPolicy::new())),
@@ -44,7 +44,7 @@ impl WrappingObjectStore for RequestWrapper {
 }
 
 struct Fixture {
-    storage: ObjectStore,
+    storage: Storage,
     metadata_cache: Arc<LanceCache>,
     index_cache: LanceCache,
     file_sizes: HashMap<String, u64>,
@@ -52,7 +52,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(partitions: u64, with_file_sizes: bool) -> Self {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let metadata_cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
         let index_cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let store = Arc::new(LanceIndexStore::new(

@@ -10,6 +10,88 @@ increments the shared major version number.
 - **Shared package versions (`1.0.0` and later)**: Following `0.39`, Lance adopted strict [semantic versioning](../community/release.md#release-versioning) starting at `1.0.0`. All language SDKs share the same release version. Major versions not listed on this page contained breaking changes limited to narrow or internal Rust traits that do not require migration steps for standard SDK callers (see the [GitHub Releases](https://github.com/lance-format/lance/releases) for full changelogs).
 - **On-disk format versions (`2.0`, `2.1`, `2.2`, `2.3`)**: Package release versions are independent of the dataset `data_storage_version`. Upgrading the SDK does not rewrite existing tables or force a file format upgrade. See [Choosing a data file version](read_and_write.md#choosing-a-data-file-version) for format compatibility details.
 
+## Unreleased: Rust Storage API
+
+The Rust storage API is now owned by Lance. This is a source-level breaking
+change with no compatibility aliases; it does not change the on-disk format.
+
+| Previous API | Replacement |
+| --- | --- |
+| `lance_io::object_store` | `lance_io::storage` |
+| `ObjectStore` | `Storage` |
+| `ObjectStoreParams` | `StorageParams` |
+| `ObjectStoreProvider` | `StorageProvider` |
+| `ObjectStoreRegistry` | `StorageRegistry` |
+| `WrappingObjectStore` | `BackendWrapper` |
+| `object_store_wrapper` / chained wrappers | `StorageParams::backend_wrappers`, in application order |
+
+### Opening and extending storage
+
+Open a configured handle with `Storage::from_uri` or
+`Storage::from_uri_and_params`. `Storage::local()` and `Storage::memory()` remain
+available for built-in stores. The old direct-backend constructors, backend
+injection through params, and deprecated dataset `with_object_store` entry
+points have been removed.
+
+Custom integrations implement `StorageProvider::new_backend`, return a
+`BackendConfig`, and register their provider in a `StorageRegistry`. Supply that
+registry through the dataset session, or pass it to
+`Storage::from_uri_and_params`. The registry owns handle construction and installs
+tracing, metrics, caller wrappers, and per-binding IO tracking. Providers should
+return an uninstrumented backend, retaining their authorization scope, endpoint,
+credential refresh, and cache identity.
+
+`Storage::inner` is private. Replace direct calls with `Storage` methods for
+reads, writes, metadata, listing, deletion, and conditional publication. Use
+`BackendWrapper` for middleware; migrate its implementation to Lance's
+`StorageBackend`. Use the getters for `store_prefix`,
+`use_constant_size_upload_parts`, and `list_is_lexically_ordered`; providers set
+these policies through their configuration instead of mutating a live handle.
+
+### Backend operations and value types
+
+Import `Path`, request options, metadata, payloads, and storage errors from
+`lance_io::storage`, rather than the third-party `object_store` crate.
+`StorageBackend` requires eleven operations, including `list_paginated`.
+Multipart implementations use Lance's `MultipartUpload`. Atomic conditional
+operations must remain atomic or return `NotSupported`.
+
+The separate `PaginatedBackend` and wrapper `wrap_paginated` method are removed.
+Implement pagination on the backend so it passes through the same policies and
+instrumentation as other IO. Return `NotSupported` if pagination cannot be
+provided; `Storage` falls back to the wrapped ordinary listing. Other errors
+propagate. Unsupported native operations are normalized to `NotSupported`; do
+not match the removed `NotImplemented` variant.
+
+Adapt an existing third-party backend once, at the provider boundary, with
+`storage::backend::object_store::from_object_store` (or
+`from_object_store_with_pagination`). Convert native errors there with
+`from_error`. There is no reverse adapter and no implicit conversion between
+`object_store::Error` and `lance_core::Error`.
+
+### Options, HTTP clients, and local access
+
+Use `StorageOptionsAccessor` with static options or a `StorageOptionsProvider`
+for renewable options. Credential providers must use distinct IDs for distinct
+authorization scopes. `StorageParams` no longer accepts third-party credential
+or HTTP client types. Use Lance's `storage::transport::HttpClientWrapper` for HTTP
+customization. The public `StorageOptions::client_options()` accessor is removed;
+pass timeout, proxy, and TLS settings as storage options instead.
+
+`BackendConfig` declares local directory semantics, remote IO, and single-request
+copy limits. A local scheme or `is_local` declaration does not grant host
+filesystem access. Native access remains restricted to the built-in file provider.
+Backend wrappers intercept object IO, including pagination. They do not disable
+provider-owned native directory maintenance: canonicalization, hidden staging-file
+cleanup, recursive directory deletion, and empty-directory cleanup retain the
+provider's local root mapping. Installing a wrapper still disables direct local
+file reads and writes, so those operations go through the wrapped backend.
+A backend wrapper alone does not define a local IO sandbox; custom integrations
+must establish their storage scope through the provider.
+
+See [Object Store Configuration](object_store.md) and the Rust API examples for
+provider registration and storage options.
+
 ## 11.0.0
 
 * `document_granularity="list_element"` requires v3 reader capability,

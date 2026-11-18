@@ -13,7 +13,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::index::{CreateIndexBuilder, DatasetIndexExt};
 use lance::{Error, Result};
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_io::storage::{StorageOptionsAccessor, StorageParams};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -67,7 +67,7 @@ async fn open_dataset(args: &Args) -> Result<lance::Dataset> {
         options.insert(key.clone(), val.clone());
     }
     let read_params = ReadParams {
-        store_options: Some(ObjectStoreParams {
+        store_options: Some(StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 options,
             ))),

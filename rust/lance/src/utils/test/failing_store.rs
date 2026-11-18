@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lance_io::object_store::WrappingObjectStore;
+use lance_io::storage::BackendWrapper;
 use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
 
 /// Wraps the object store so that calls matching a configured method+path
@@ -52,7 +52,7 @@ impl FailingProxyStore {
                 if called_method == method && path.as_ref().contains(path_substr) {
                     let count = counter.fetch_add(1, Ordering::SeqCst);
                     if count >= skip {
-                        return Err(lance_io::object_store::Error::Generic {
+                        return Err(lance_io::storage::Error::Generic {
                             store: "FailingProxyStore",
                             source: error_message.into(),
                         }
@@ -78,7 +78,7 @@ impl FailingProxyStore {
             Box::leak(policy_name.into_boxed_str()),
             Arc::new(move |called_method, path| {
                 if called_method == method && path.as_ref().contains(path_substr) {
-                    Err(lance_io::object_store::Error::Generic {
+                    Err(lance_io::storage::Error::Generic {
                         store: "FailingProxyStore",
                         source: error_message.into(),
                     }
@@ -97,12 +97,12 @@ impl FailingProxyStore {
     }
 }
 
-impl WrappingObjectStore for FailingProxyStore {
+impl BackendWrapper for FailingProxyStore {
     fn wrap(
         &self,
         _storage_prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(ProxyBackend::new(original, self.policy.clone()))
     }
 }

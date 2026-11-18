@@ -18,7 +18,7 @@ use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
 use crate::dataset::Dataset;
 use lance_core::datatypes::{BlobV2Layout, Field as LanceField};
 use lance_core::{Error, ROW_ADDR, Result};
-use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
+use lance_io::storage::{Storage, StorageRegistry};
 
 pub(in crate::dataset) fn field_contains_blob(field: &LanceField) -> bool {
     field.is_blob_v2() || field.children.iter().any(field_contains_blob)
@@ -283,8 +283,8 @@ async fn registered_root(
 /// `prefix` comes from the opened store and includes an Azure account.
 /// An unknown provider or a prefix that is not `scheme$location` matches.
 pub(in crate::dataset) fn may_be_same_store(
-    registry: &ObjectStoreRegistry,
-    owner: &ObjectStore,
+    registry: &StorageRegistry,
+    owner: &Storage,
     scheme: &str,
     prefix: &str,
 ) -> bool {
@@ -496,8 +496,8 @@ mod tests {
     use lance_core::storage::path::Path;
     use lance_core::{Error, utils::tempfile::TempStrDir};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::storage_options::StorageOptionsAccessor;
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+    use lance_io::storage::storage_options::StorageOptionsAccessor;
+    use lance_io::storage::{Storage, StorageParams, StorageRegistry};
     use lance_table::feature_flags::FLAG_MANAGED_BLOBS;
     use lance_table::format::BasePath;
     use rstest::rstest;
@@ -635,18 +635,18 @@ mod tests {
         assert!(recording.requested_ranges().is_empty());
     }
 
-    async fn opened_store(uri: &str, options: &[(&str, &str)]) -> Arc<ObjectStore> {
+    async fn opened_store(uri: &str, options: &[(&str, &str)]) -> Arc<Storage> {
         let options = options
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
-        let params = ObjectStoreParams {
+        let params = StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 options,
             ))),
             ..Default::default()
         };
-        ObjectStore::from_uri_and_params(Arc::new(ObjectStoreRegistry::default()), uri, &params)
+        Storage::from_uri_and_params(Arc::new(StorageRegistry::default()), uri, &params)
             .await
             .unwrap()
             .0
@@ -654,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_scheme_alias_names_one_store() {
-        let registry = ObjectStoreRegistry::default();
+        let registry = StorageRegistry::default();
         let owner = opened_store("file:///tmp/orders", &[]).await;
         let base = opened_store("file-object-store:///tmp/orders/_blobs", &[]).await;
         assert!(super::may_be_same_store(
@@ -668,7 +668,7 @@ mod tests {
     #[cfg(feature = "aws")]
     #[tokio::test]
     async fn distinct_buckets_are_different_stores() {
-        let registry = ObjectStoreRegistry::default();
+        let registry = StorageRegistry::default();
         let options = [
             ("region", "us-east-1"),
             ("aws_access_key_id", "test"),
@@ -701,7 +701,7 @@ mod tests {
     #[cfg(feature = "azure")]
     #[tokio::test]
     async fn azure_account_comes_from_storage_options() {
-        let registry = ObjectStoreRegistry::default();
+        let registry = StorageRegistry::default();
         let owner = opened_store("az://container/orders", &[("account_name", "account-a")]).await;
         let same_account = opened_store(
             "az://container/orders/_blobs",

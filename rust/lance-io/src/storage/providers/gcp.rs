@@ -1,0 +1,663 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use crate::storage::BackendConfig;
+use crate::storage::backend::object_store::from_error;
+use crate::storage::transport::Transport;
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+
+use object_store::{
+    ClientOptions, CredentialProvider, Result as ObjectStoreResult,
+    client::{HttpClient, HttpConnector, HttpRequestBody, ReqwestConnector},
+};
+use opendal::{Operator, services::Gcs};
+use reqsign_core::{Context as ReqsignContext, HttpSend, OsEnv, ProvideCredential};
+use reqsign_file_read_tokio::TokioFileRead;
+use reqsign_google::{Credential as ReqsignCredential, FileCredentialProvider};
+use tokio::sync::RwLock;
+
+use object_store::{
+    RetryConfig, StaticCredentialProvider,
+    gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
+};
+use url::Url;
+
+use crate::storage::opendal_store::OpendalStore;
+use crate::storage::{
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, StorageOptions, StorageOptionsAccessor,
+    StorageParams, StorageProvider,
+    dynamic_credentials::build_dynamic_credential_provider,
+    throttle::{
+        AimdThrottleState, cloud_http_connector, reject_http_client_wrapper_for_opendal,
+        shared_throttle_state, with_throttling,
+    },
+};
+use lance_core::error::{Error, Result};
+use lance_core::utils::parse::str_is_truthy;
+
+use super::opendal::finish_opendal_operator;
+
+#[derive(Default, Debug)]
+pub struct GcsStoreProvider;
+
+#[derive(Debug)]
+struct ObjectStoreHttpSend {
+    client: HttpClient,
+}
+
+impl HttpSend for ObjectStoreHttpSend {
+    async fn http_send(
+        &self,
+        request: http::Request<bytes::Bytes>,
+    ) -> reqsign_core::Result<http::Response<bytes::Bytes>> {
+        let (parts, body) = request.into_parts();
+        let request = http::Request::from_parts(parts, HttpRequestBody::from(body));
+        let response = self.client.execute(request).await.map_err(|source| {
+            reqsign_core::Error::unexpected("failed to send Google workload identity HTTP request")
+                .with_source(source)
+        })?;
+        let (parts, body) = response.into_parts();
+        let body = body.bytes().await.map_err(|source| {
+            reqsign_core::Error::unexpected("failed to read Google workload identity HTTP response")
+                .with_source(source)
+        })?;
+        Ok(http::Response::from_parts(parts, body))
+    }
+}
+
+#[derive(Debug)]
+struct WorkloadIdentityCredentialProvider {
+    provider: FileCredentialProvider,
+    context: ReqsignContext,
+    cached_credential: RwLock<Option<ReqsignCredential>>,
+}
+
+impl WorkloadIdentityCredentialProvider {
+    fn new(application_credentials_path: String, http_client: HttpClient) -> Self {
+        let context = ReqsignContext::new()
+            .with_file_read(TokioFileRead)
+            .with_http_send(ObjectStoreHttpSend {
+                client: http_client,
+            })
+            .with_env(OsEnv);
+        Self {
+            provider: FileCredentialProvider::new(application_credentials_path),
+            context,
+            cached_credential: RwLock::new(None),
+        }
+    }
+}
+
+fn usable_gcp_credential(credential: &ReqsignCredential) -> Option<GcpCredential> {
+    credential
+        .token
+        .as_ref()
+        .filter(|_| credential.has_valid_token())
+        .map(|token| GcpCredential {
+            bearer: token.access_token.clone(),
+        })
+}
+
+fn workload_identity_error(
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "GCS workload identity credentials",
+        source: Box::new(source),
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialProvider for WorkloadIdentityCredentialProvider {
+    type Credential = GcpCredential;
+
+    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
+        if let Some(credential) = self
+            .cached_credential
+            .read()
+            .await
+            .as_ref()
+            .and_then(usable_gcp_credential)
+        {
+            return Ok(Arc::new(credential));
+        }
+
+        let mut cached_credential = self.cached_credential.write().await;
+        if let Some(credential) = cached_credential.as_ref().and_then(usable_gcp_credential) {
+            return Ok(Arc::new(credential));
+        }
+
+        let credential = self
+            .provider
+            .provide_credential(&self.context)
+            .await
+            .map_err(workload_identity_error)?
+            .ok_or_else(|| {
+                workload_identity_error(std::io::Error::other(
+                    "application credentials did not provide a Google access token",
+                ))
+            })?;
+        let gcp_credential = usable_gcp_credential(&credential).ok_or_else(|| {
+            workload_identity_error(std::io::Error::other(
+                "application credentials provided an expired or unusable Google access token",
+            ))
+        })?;
+        *cached_credential = Some(credential);
+        Ok(Arc::new(gcp_credential))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApplicationCredentialKind {
+    #[serde(rename = "type")]
+    credential_type: String,
+}
+
+struct GcsClientOptions {
+    object_requests: ClientOptions,
+    credential_requests: ClientOptions,
+}
+
+fn gcs_client_options(storage_options: &StorageOptions) -> Result<GcsClientOptions> {
+    let mut object_requests = storage_options.client_options()?;
+    // headers.* options are scoped to object requests and may contain secrets. Credential
+    // exchanges can target unrelated identity endpoints, so only share typed client settings.
+    let mut credential_requests = object_requests
+        .clone()
+        .with_default_headers(Default::default());
+    for (key, value) in storage_options.as_gcs_options() {
+        if let GoogleConfigKey::Client(key) = key {
+            object_requests = object_requests.with_config(key, value.clone());
+            credential_requests = credential_requests.with_config(key, value);
+        }
+    }
+    Ok(GcsClientOptions {
+        object_requests,
+        credential_requests,
+    })
+}
+
+fn workload_identity_credential_provider(
+    storage_options: &StorageOptions,
+    client_options: &ClientOptions,
+) -> Result<Option<Arc<dyn CredentialProvider<Credential = GcpCredential>>>> {
+    let gcs_options = storage_options.as_gcs_options();
+    if gcs_options.contains_key(&GoogleConfigKey::ServiceAccount)
+        || gcs_options.contains_key(&GoogleConfigKey::ServiceAccountKey)
+    {
+        return Ok(None);
+    }
+
+    let Some(application_credentials_path) =
+        gcs_options.get(&GoogleConfigKey::ApplicationCredentials)
+    else {
+        return Ok(None);
+    };
+    let Ok(contents) = std::fs::read(application_credentials_path) else {
+        return Ok(None);
+    };
+    let Ok(credential_kind) = serde_json::from_slice::<ApplicationCredentialKind>(&contents) else {
+        return Ok(None);
+    };
+    if credential_kind.credential_type != "external_account" {
+        return Ok(None);
+    }
+
+    let http_client = ReqwestConnector::default()
+        .connect(client_options)
+        .map_err(from_error)?;
+    Ok(Some(Arc::new(WorkloadIdentityCredentialProvider::new(
+        application_credentials_path.clone(),
+        http_client,
+    ))))
+}
+
+impl GcsStoreProvider {
+    async fn build_opendal_gcs_store(
+        &self,
+        base_path: &Url,
+        storage_options: &StorageOptions,
+    ) -> Result<Arc<dyn crate::storage::StorageBackend>> {
+        let bucket = base_path
+            .host_str()
+            .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name"))?
+            .to_string();
+
+        let prefix = base_path.path().trim_start_matches('/').to_string();
+
+        // Start with all storage options as the config map
+        // OpenDAL will handle environment variables through its default credentials chain
+        let mut config_map: HashMap<String, String> = storage_options.0.clone();
+
+        // Set required OpenDAL configuration
+        config_map.insert("bucket".to_string(), bucket);
+
+        if !prefix.is_empty() {
+            config_map.insert("root".to_string(), format!("/{}", prefix));
+        }
+
+        let operator = Operator::from_iter::<Gcs>(config_map)
+            .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
+
+        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn crate::storage::StorageBackend>)
+    }
+
+    async fn build_google_cloud_store(
+        &self,
+        base_path: &Url,
+        storage_options: &StorageOptions,
+        accessor: Option<Arc<StorageOptionsAccessor>>,
+        throttle_state: Option<&AimdThrottleState>,
+        transport: Transport,
+        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
+        // needs: `PaginatedListStore` is a separate trait from `Storage`.
+    ) -> Result<Arc<GoogleCloudStorage>> {
+        // Use a low retry count since the AIMD throttle layer handles
+        // throttle recovery with its own retry loop.
+        let retry_config = RetryConfig {
+            backoff: Default::default(),
+            max_retries: storage_options.client_max_retries(),
+            retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
+        };
+
+        let client_options = gcs_client_options(storage_options)?;
+
+        let mut builder = GoogleCloudStorageBuilder::new()
+            .with_url(base_path.as_ref())
+            .with_retry(retry_config)
+            .with_client_options(client_options.object_requests.clone());
+        for (key, value) in storage_options.as_gcs_options() {
+            builder = builder.with_config(key, value);
+        }
+
+        if let Some(credentials) =
+            build_dynamic_credential_provider::<GcpCredential>(accessor).await?
+        {
+            builder = builder.with_credentials(credentials);
+        } else if let Some(storage_token) = storage_options.get("google_storage_token") {
+            let credential = GcpCredential {
+                bearer: storage_token.clone(),
+            };
+            let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
+            builder = builder.with_credentials(credential_provider);
+        } else if let Some(credential_provider) = workload_identity_credential_provider(
+            storage_options,
+            &client_options.credential_requests,
+        )? {
+            // object_store cannot exchange external-account ADC files, while reqsign supports
+            // the workload identity format emitted by google-github-actions/auth.
+            builder = builder.with_credentials(credential_provider);
+        }
+
+        let store_prefix = self.calculate_storage_prefix(base_path, Some(&storage_options.0))?;
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            crate::storage::metrics_base(&store_prefix, base_path),
+            transport,
+        ));
+
+        Ok(Arc::new(builder.build().map_err(from_error)?))
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageProvider for GcsStoreProvider {
+    async fn new_backend(&self, base_path: Url, params: &StorageParams) -> Result<BackendConfig> {
+        let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
+        let mut storage_options =
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
+        storage_options.with_env_gcs();
+
+        let use_opendal = storage_options
+            .0
+            .get("use_opendal")
+            .map(|v| str_is_truthy(v.as_str()))
+            .unwrap_or(false);
+
+        let accessor = params.get_accessor();
+
+        // Keyed like the registry cache so per-dataset stores share the bucket's budget.
+        let store_prefix = self.calculate_storage_prefix(&base_path, params.storage_options())?;
+        let throttle_state = shared_throttle_state(&store_prefix, params)?;
+
+        let inner = if use_opendal {
+            reject_http_client_wrapper_for_opendal(params)?;
+            // OpenDAL GCS intentionally uses static/environment-backed configuration only.
+            // Namespace-vended dynamic credentials are supported on the native object_store path.
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            self.build_opendal_gcs_store(&base_path, &storage_options)
+                .await?
+        } else {
+            let store = self
+                .build_google_cloud_store(
+                    &base_path,
+                    &storage_options,
+                    accessor,
+                    throttle_state.as_ref(),
+                    Transport::new(params.http_client_wrapper.as_ref()),
+                )
+                .await?;
+            crate::storage::backend::object_store::from_object_store_with_pagination(
+                store.clone(),
+                store,
+            )
+        };
+        let inner = with_throttling(throttle_state, !use_opendal, inner);
+
+        Ok(BackendConfig {
+            store_prefix: None,
+            backend: inner,
+            local_dir_operations: None,
+            local_fsync: false,
+            direct_local_io: false,
+            local_io: crate::storage::LocalIo::Backend,
+            is_local: false,
+            is_remote: true,
+            max_single_copy_size: Some(5 * 1024 * 1024 * 1024),
+            scheme: String::from("gs"),
+            block_size,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: true,
+            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+        })
+    }
+}
+
+impl StorageOptions {
+    /// Add values from the environment without overriding explicit options,
+    /// including aliases, case variants, and empty-string values.
+    pub fn with_env_gcs(&mut self) {
+        self.merge_env_options(std::env::vars_os(), |key| {
+            GoogleConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
+        // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token.
+        let token_key = "google_storage_token";
+        for (os_key, os_value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && key.eq_ignore_ascii_case(token_key)
+                && !self.0.contains_key(token_key)
+            {
+                self.0.insert(token_key.to_string(), value.to_string());
+            }
+        }
+    }
+
+    /// Return options recognized by [`GoogleConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as
+    /// `google_service_account`) wins, followed by case variants of that name.
+    /// Remaining ties use the lexicographically smallest original key. Empty
+    /// values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::storage::StorageOptions;
+    /// use object_store::gcp::GoogleConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("service_account".into(), "alias.json".into()),
+    ///     ("google_service_account".into(), "canonical.json".into()),
+    /// ]));
+    /// assert_eq!(options.as_gcs_options()[&GoogleConfigKey::ServiceAccount], "canonical.json");
+    /// ```
+    pub fn as_gcs_options(&self) -> HashMap<GoogleConfigKey, String> {
+        self.as_cloud_options()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::HashMap, fs, sync::Arc};
+
+    use crate::storage::test_utils::RecordingHttpClientWrapper;
+    use crate::storage::test_utils::StaticMockStorageOptionsProvider;
+    use crate::storage::{StorageOptionsAccessor, StorageParams};
+    use tempfile::TempDir;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[rstest::rstest]
+    #[case::canonical("google_service_account", "service_account")]
+    #[case::canonical_over_case_variant("google_service_account", "GOOGLE_SERVICE_ACCOUNT")]
+    #[case::canonical_case_tie("GOOGLE_SERVICE_ACCOUNT", "Google_Service_Account")]
+    #[case::case_variant_over_alias("GOOGLE_SERVICE_ACCOUNT", "service_account_path")]
+    #[case::lexical_alias("service_account", "service_account_path")]
+    #[case::case_alias("SERVICE_ACCOUNT", "service_account")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_gcs_options(),
+                HashMap::from([(GoogleConfigKey::ServiceAccount, preferred_value.to_string())])
+            );
+        }
+    }
+
+    fn external_account_storage_options(
+        temp_dir: &TempDir,
+        token_url: String,
+    ) -> HashMap<String, String> {
+        let subject_token_path = temp_dir.path().join("oidc-token");
+        fs::write(&subject_token_path, "github-oidc-token").unwrap();
+        let application_credentials_path = temp_dir.path().join("credentials.json");
+        fs::write(
+            &application_credentials_path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "external_account",
+                "audience": "test-audience",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": token_url,
+                "credential_source": {
+                    "file": subject_token_path.to_string_lossy(),
+                    "format": { "type": "text" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HashMap::from([
+            (
+                "google_application_credentials".to_string(),
+                application_credentials_path.to_string_lossy().into_owned(),
+            ),
+            ("allow_http".to_string(), "true".to_string()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn test_use_opendal_flag() {
+        let url = Url::parse("gs://test-bucket/path").unwrap();
+        let params_with_flag = StorageParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    (
+                        "service_account".to_string(),
+                        "test@example.iam.gserviceaccount.com".to_string(),
+                    ),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = crate::storage::StorageRegistry::default()
+            .new_store(url.clone(), &params_with_flag)
+            .await
+            .unwrap();
+        assert_eq!(store.scheme, "gs");
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_gcp_credentials_provider() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            StaticMockStorageOptionsProvider {
+                options: HashMap::from([(
+                    "google_storage_token".to_string(),
+                    "gcp-token".to_string(),
+                )]),
+            },
+        )));
+
+        let credentials = build_dynamic_credential_provider::<GcpCredential>(Some(accessor))
+            .await
+            .expect("dynamic gcp credentials should build")
+            .expect("expected credential provider")
+            .get_credential()
+            .await
+            .expect("expected gcp credential");
+
+        assert_eq!(credentials.bearer, "gcp-token");
+    }
+
+    #[tokio::test]
+    async fn test_external_account_application_credentials() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "federated-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut storage_options =
+            external_account_storage_options(&temp_dir, format!("{}/token", mock_server.uri()));
+        storage_options.insert(
+            "headers.Authorization".to_string(),
+            "Bearer storage-secret".to_string(),
+        );
+        let params = StorageParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                storage_options.clone(),
+            ))),
+            ..Default::default()
+        };
+
+        let store = crate::storage::StorageRegistry::default()
+            .new_store(Url::parse("gs://test-bucket/path").unwrap(), &params)
+            .await
+            .expect("external account credentials should build a GCS store");
+        assert_eq!(store.scheme, "gs");
+
+        let storage_options = StorageOptions::new(storage_options);
+        let client_options = gcs_client_options(&storage_options).unwrap();
+        let credential_provider = workload_identity_credential_provider(
+            &storage_options,
+            &client_options.credential_requests,
+        )
+        .expect("external account credential provider should build")
+        .expect("external account credentials should select the reqsign provider");
+        for _ in 0..2 {
+            let credential = credential_provider
+                .get_credential()
+                .await
+                .expect("workload identity token exchange should succeed");
+            assert_eq!(credential.bearer, "federated-token");
+        }
+        mock_server.verify().await;
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(!requests[0].headers.contains_key("authorization"));
+    }
+
+    #[tokio::test]
+    async fn test_external_account_respects_client_timeout() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(1))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "federated-token",
+                        "expires_in": 3600
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut storage_options =
+            external_account_storage_options(&temp_dir, format!("{}/token", mock_server.uri()));
+        storage_options.insert("timeout".to_string(), "50ms".to_string());
+        let storage_options = StorageOptions::new(storage_options);
+        let client_options = gcs_client_options(&storage_options).unwrap();
+        let credential_provider = workload_identity_credential_provider(
+            &storage_options,
+            &client_options.credential_requests,
+        )
+        .expect("external account credential provider should build")
+        .expect("external account credentials should select the reqsign provider");
+
+        let credential_result = tokio::time::timeout(
+            Duration::from_millis(200),
+            credential_provider.get_credential(),
+        )
+        .await
+        .expect("configured client timeout should bound the credential exchange");
+        let error = credential_result.expect_err("the delayed token exchange should time out");
+        assert!(matches!(&error, object_store::Error::Generic { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to send Google workload identity HTTP request"),
+            "unexpected error: {error}"
+        );
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_gcs_store_opens_its_clients_with_the_given_http_client_wrapper() {
+        let wrapper = Arc::new(RecordingHttpClientWrapper::default());
+        let params = StorageParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("google_skip_signature".to_string(), "true".to_string())]),
+            ))),
+            http_client_wrapper: Some(wrapper.clone()),
+            ..Default::default()
+        };
+
+        let url = Url::parse("gs://bucket/path").unwrap();
+        let store = crate::storage::StorageRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap();
+        let found = store
+            .inner
+            .get(&lance_core::storage::path::Path::from("path/file"))
+            .await;
+
+        assert!(
+            matches!(found, Err(crate::storage::Error::NotFound { .. })),
+            "{found:?}"
+        );
+        assert!(wrapper.clients.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let requests = wrapper.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/bucket/path%2Ffile"), "{requests:?}");
+    }
+}

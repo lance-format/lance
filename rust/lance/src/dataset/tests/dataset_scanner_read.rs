@@ -43,8 +43,8 @@ use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_io::object_store::ObjectStoreParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::storage::StorageParams;
 use lance_io::utils::testing::DelayConfig;
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -1690,7 +1690,7 @@ async fn test_limit_cancel() {
         },
     });
     let write_params = WriteParams {
-        store_params: Some(ObjectStoreParams {
+        store_params: Some(StorageParams {
             backend_wrappers: vec![throttled.clone()],
             ..Default::default()
         }),

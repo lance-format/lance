@@ -1941,7 +1941,7 @@ mod selection_tests {
     use arrow_array::StringArray;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use rstest::rstest;
     use std::collections::{BTreeMap, HashSet};
 
@@ -2140,7 +2140,7 @@ mod selection_tests {
 
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));

@@ -1966,7 +1966,7 @@ mod tests {
         use lance_index::IndexType;
         use lance_index::optimize::OptimizeOptions;
         use lance_index::scalar::ScalarIndexParams;
-        use lance_io::object_store::ObjectStoreParams;
+        use lance_io::storage::StorageParams;
         use lance_table::transaction::RewriteGroup;
 
         /// `i` indexed by `i_idx` over every fragment; `w`, an unindexed copy
@@ -4823,7 +4823,7 @@ mod tests {
             let routed = format!("file-object-store://{prefix}{slashed}");
             let mut faulted = DatasetBuilder::from_uri(&routed)
                 .with_read_params(ReadParams {
-                    store_options: Some(ObjectStoreParams {
+                    store_options: Some(StorageParams {
                         backend_wrappers: vec![failing],
                         ..Default::default()
                     }),

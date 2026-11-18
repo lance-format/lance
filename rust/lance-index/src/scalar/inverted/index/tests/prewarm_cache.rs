@@ -90,7 +90,7 @@ async fn test_byte_prewarm_reopens_serialized_groups(
 ) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -253,7 +253,7 @@ async fn cached_fts_versions_release_posting_readers(
     let tmpdir = TempObjDir::default();
     let metadata_cache = Arc::new(LanceCache::with_capacity(1 << 20));
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         metadata_cache.clone(),
     ));
@@ -306,7 +306,7 @@ async fn cached_fts_versions_release_posting_readers(
         for request_store in [
             store.clone(),
             Arc::new(LanceIndexStore::new(
-                ObjectStore::local().into(),
+                Storage::local().into(),
                 tmpdir.clone(),
                 metadata_cache.clone(),
             )),
@@ -418,7 +418,7 @@ impl CacheBackend for CacheWithoutResidentProbe {
 async fn test_posting_cache_conflict_across_partitions() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -548,7 +548,7 @@ async fn test_posting_cache_conflict_across_partitions() {
 async fn test_modern_prewarm_packs_group_with_shared_posting_buffer() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -681,7 +681,7 @@ async fn test_modern_prewarm_packs_group_with_shared_posting_buffer() {
 async fn test_packed_prewarm_groups_do_not_retain_the_full_chunk() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -821,7 +821,7 @@ async fn test_prewarm_streams_in_chunks_preserves_content(
 ) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -967,7 +967,7 @@ async fn test_prewarm_streams_in_chunks_with_positions(
 ) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1174,7 +1174,7 @@ async fn test_prewarm_streams_in_chunks_with_positions(
 async fn test_strict_modern_prewarm_fails_when_index_cache_cannot_hold_all_partitions() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

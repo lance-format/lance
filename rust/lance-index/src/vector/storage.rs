@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Vector ObjectStore, holding (quantized) vectors and providing distance calculation.
+//! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
 mod prewarm;
 
@@ -36,9 +36,9 @@ use lance_index_core::remapping::{
     BatchRowIdRemapper, remap_row_ids_async, remap_row_ids_preserving_layout_async,
 };
 use lance_io::ReadBatchParams;
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
 use lance_io::spill::SpillStore;
+use lance_io::storage::Storage;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
 use std::{
@@ -598,7 +598,7 @@ impl DeepSizeOf for QueryScratchPool {
     }
 }
 
-/// Vector ObjectStore is the abstraction to store the vectors.
+/// Vector Storage is the abstraction to store the vectors.
 ///
 /// It can be in-memory or on-disk, raw vector or quantized vectors.
 ///
@@ -637,7 +637,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     fn row_ids(&self) -> impl Iterator<Item = &u64>;
 
-    /// Append Raw [RecordBatch] into the ObjectStore.
+    /// Append Raw [RecordBatch] into the Storage.
     /// The storage implement will perform quantization if necessary.
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
 
@@ -767,7 +767,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
 
 /// Identifies an index file across the process: the index's UUID, and the
 /// prefix of the object store that holds the file (its scheme and bucket, or
-/// whatever else tells the store apart; see [`ObjectStore::store_prefix`])
+/// whatever else tells the store apart; see [`Storage::store_prefix`])
 /// with the file's path in that store. Every open of the file binds to the
 /// runtime handles registered under it, so that indexes opened at once, a
 /// re-open while an older index still runs, and a state read back from a
@@ -862,7 +862,7 @@ fn sequential_plane_loads_from(value: Option<&str>) -> Result<bool> {
 /// Latency class of an IVF_RQ index's origin reads, those that no cache tier
 /// serves: `auto` (default), `low` or `high`. `auto` takes the class the
 /// session opening the index declares, and without one the class of its
-/// object store: high for a cloud object store ([`ObjectStore::is_cloud`]) and
+/// object store: high for a cloud object store ([`Storage::is_cloud`]) and
 /// low for local files and memory. A process whose object store is wrapped in
 /// a local cache that also caches index files declares `low` on its session
 /// instead, since the wrapper hides that from the store's scheme; `low` or
@@ -885,7 +885,7 @@ pub enum OriginLatencyClass {
 
 impl OriginLatencyClass {
     /// The class `auto` resolves to for an index read from `object_store`.
-    pub fn of_store(storage: &ObjectStore) -> Self {
+    pub fn of_store(storage: &Storage) -> Self {
         if storage.is_cloud() {
             Self::High
         } else {
@@ -896,7 +896,7 @@ impl OriginLatencyClass {
     /// The class of an index read from `object_store` under `setting`, the
     /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, when no session
     /// declares one.
-    pub fn resolve(setting: Option<Self>, storage: &ObjectStore) -> Self {
+    pub fn resolve(setting: Option<Self>, storage: &Storage) -> Self {
         Self::resolve_with_hint(setting, None, storage)
     }
 
@@ -907,11 +907,7 @@ impl OriginLatencyClass {
     /// over the store's own class ([`Self::of_store`]): only the serving
     /// process knows whether a wrapper around the store serves index reads
     /// from a local cache.
-    pub fn resolve_with_hint(
-        setting: Option<Self>,
-        hint: Option<Self>,
-        storage: &ObjectStore,
-    ) -> Self {
+    pub fn resolve_with_hint(setting: Option<Self>, hint: Option<Self>, storage: &Storage) -> Self {
         setting.or(hint).unwrap_or_else(|| Self::of_store(storage))
     }
 

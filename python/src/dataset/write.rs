@@ -19,8 +19,8 @@ use lance::dataset::{
 };
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_file::writer::FileWriterOptions;
-use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
+use lance_io::storage::{
+    LanceNamespaceStorageOptionsProvider, StorageOptionsAccessor, StorageParams,
 };
 use lance_table::format::{BasePath, Fragment};
 use lance_table::io::commit::CommitHandler;
@@ -222,20 +222,20 @@ pub fn get_write_params(
                 (namespace_client_opt.as_ref(), table_id_opt.as_ref())
             {
                 let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                let provider: Arc<dyn lance_io::storage::StorageOptionsProvider> = Arc::new(
                     LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.clone()),
                 );
                 let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
                     so, provider,
                 ));
-                p.store_params = Some(ObjectStoreParams {
+                p.store_params = Some(StorageParams {
                     storage_options_accessor: Some(accessor),
                     ..Default::default()
                 });
             } else {
                 // No namespace, just use storage options directly
                 let accessor = Arc::new(StorageOptionsAccessor::with_static_options(so));
-                p.store_params = Some(ObjectStoreParams {
+                p.store_params = Some(StorageParams {
                     storage_options_accessor: Some(accessor),
                     ..Default::default()
                 });
@@ -314,7 +314,7 @@ pub fn get_write_params(
         {
             for (base_path, opts) in base_store_params {
                 let accessor = Arc::new(StorageOptionsAccessor::with_static_options(opts));
-                let store_params = ObjectStoreParams {
+                let store_params = StorageParams {
                     storage_options_accessor: Some(accessor),
                     ..Default::default()
                 };

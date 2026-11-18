@@ -20,8 +20,8 @@ use lance_file::{
     writer::FileWriterOptions,
 };
 use lance_io::{
-    object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    storage::Storage,
     utils::CachedFileSize,
 };
 use std::collections::HashMap;
@@ -41,9 +41,7 @@ fn bench_reader(c: &mut Criterion) {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let tmpdir = TempDir::default();
-        let (storage, base_path) = rt
-            .block_on(ObjectStore::from_uri(&tmpdir.path_str()))
-            .unwrap();
+        let (storage, base_path) = rt.block_on(Storage::from_uri(&tmpdir.path_str())).unwrap();
 
         let file_path = base_path.clone().join("foo.lance");
         let object_writer = rt.block_on(storage.create(&file_path)).unwrap();
@@ -192,10 +190,9 @@ fn get_cached_readers(
 
     // Create object store
     let (storage, base_path) = if filesystem == "mem" {
-        rt.block_on(ObjectStore::from_uri("memory://")).unwrap()
+        rt.block_on(Storage::from_uri("memory://")).unwrap()
     } else {
-        rt.block_on(ObjectStore::from_uri(&tmpdir.path_str()))
-            .unwrap()
+        rt.block_on(Storage::from_uri(&tmpdir.path_str())).unwrap()
     };
 
     // Create filename with version to avoid collisions
@@ -260,7 +257,7 @@ fn get_cached_readers(
     cached_readers
 }
 
-fn open_reader(rt: &Runtime, storage: &Arc<ObjectStore>, file_path: &Path) -> Arc<FileReader> {
+fn open_reader(rt: &Runtime, storage: &Arc<Storage>, file_path: &Path) -> Arc<FileReader> {
     rt.block_on(async {
         let store_scheduler =
             ScanScheduler::new(storage.clone(), SchedulerConfig::default_for_testing());

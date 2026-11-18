@@ -16,7 +16,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, ReadParams};
 use lance::index::DatasetIndexExt;
 use lance::{Error, Result};
-use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_io::storage::{StorageOptionsAccessor, StorageParams};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -215,7 +215,7 @@ async fn open_dataset(args: &Args) -> Result<Dataset> {
     let read_params = ReadParams {
         index_cache_size_bytes: args.index_cache_bytes,
         metadata_cache_size_bytes: args.metadata_cache_bytes,
-        store_options: Some(ObjectStoreParams {
+        store_options: Some(StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 options,
             ))),

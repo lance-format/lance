@@ -16,7 +16,7 @@ use arrow_schema::DataType;
 use lance_core::datatypes::{BlobHandling, BlobKind, Field};
 use lance_core::storage::path::Path;
 use lance_core::{Error, ROW_ADDR, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::{Fragment, Manifest};
 use uuid::Uuid;
@@ -217,7 +217,7 @@ async fn rewrite_blob_columns(
 
 pub async fn copy_blob_columns(
     source: Arc<Dataset>,
-    store: Arc<ObjectStore>,
+    store: Arc<Storage>,
     base: Path,
     uri: &str,
     manifest: &mut Manifest,

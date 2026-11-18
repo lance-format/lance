@@ -53,12 +53,12 @@ use futures::stream::{BoxStream, StreamExt};
 use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_core::storage::path::Path;
-use lance_io::object_store::backend::MultipartUpload;
-use lance_io::object_store::{
+use lance_io::storage::backend::MultipartUpload;
+use lance_io::storage::{BackendWrapper, StorageBackend, StorageParams};
+use lance_io::storage::{
     CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
     PutPayload, PutResult, RenameOptions, Result as OSResult,
 };
-use lance_io::object_store::{ObjectStoreParams, StorageBackend, WrappingObjectStore};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -112,10 +112,10 @@ impl StorageBackend for CountingStore {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -193,12 +193,12 @@ struct CountingStoreWrapper {
     counters: Arc<DeleteCounters>,
 }
 
-impl WrappingObjectStore for CountingStoreWrapper {
+impl BackendWrapper for CountingStoreWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(CountingStore {
             inner: original,
             counters: Arc::clone(&self.counters),
@@ -244,7 +244,7 @@ async fn write_dataset(dir: &TempDir, counters: Arc<DeleteCounters>, versions: u
     let uri = file_storage_uri(&dir.path().join("db"));
     let write_params = || WriteParams {
         mode: WriteMode::Overwrite,
-        store_params: Some(ObjectStoreParams {
+        store_params: Some(StorageParams {
             backend_wrappers: vec![Arc::new(CountingStoreWrapper {
                 counters: Arc::clone(&counters),
             })],

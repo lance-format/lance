@@ -46,7 +46,7 @@ use super::projection::{
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::reconcile::relabel_to;
 use crate::session::Session;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 
 /// Keys resolved per on-disk pass. Each unresolved key becomes a literal in
 /// every source's `IN` filter, so planning memory grows with the key count;
@@ -102,7 +102,7 @@ pub struct LsmPointLookupPlanner {
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
-    store_params: Option<ObjectStoreParams>,
+    store_params: Option<StorageParams>,
     /// Cache of opened SSTable datasets.
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
@@ -195,7 +195,7 @@ impl LsmPointLookupPlanner {
     }
 
     /// Set the store params used to open SSTables.
-    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+    pub fn with_store_params(mut self, store_params: StorageParams) -> Self {
         self.store_params = Some(store_params);
         self
     }

@@ -857,7 +857,7 @@ impl DatasetMemWalExt for Dataset {
         config.store_params = self.store_params().cloned();
         config.session = Some(self.session());
 
-        // Reuse the dataset's own object store + base path; `ObjectStore::from_uri`
+        // Reuse the dataset's own object store + base path; `Storage::from_uri`
         // would discard the store params the dataset was opened with, signing WAL
         // writes with the ambient identity. Mirrors `list_mem_wal_latest_shard_ids`.
         let base_uri = self.uri();

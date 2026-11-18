@@ -2299,7 +2299,7 @@ mod tests {
     use async_trait::async_trait;
     use lance_core::cache::{LanceCache, QuickCacheBackend};
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_select::RowAddrTreeMap;
     use roaring::RoaringTreemap;
     use tokio::sync::Notify;
@@ -2537,7 +2537,7 @@ mod tests {
         cache: Arc<LanceCache>,
     ) -> (TempObjDir, Arc<LanceIndexStore>, Arc<LanceCache>) {
         let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
+            Storage::local().into(),
             directory.clone(),
             cache.clone(),
         ));

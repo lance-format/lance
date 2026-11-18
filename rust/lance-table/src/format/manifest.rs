@@ -27,7 +27,7 @@ use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
-use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
+use lance_io::storage::{Storage, StorageRegistry};
 use lance_io::utils::read_struct;
 
 /// Manifest of a dataset
@@ -788,8 +788,8 @@ impl BasePath {
     /// Extract the object store path from this BasePath's URI.
     ///
     /// This is a synchronous operation that parses the URI without initializing an object store.
-    pub fn extract_path(&self, registry: Arc<ObjectStoreRegistry>) -> Result<Path> {
-        ObjectStore::extract_path_from_uri(registry, &self.path)
+    pub fn extract_path(&self, registry: Arc<StorageRegistry>) -> Result<Path> {
+        Storage::extract_path_from_uri(registry, &self.path)
     }
 }
 
@@ -1303,7 +1303,7 @@ pub trait SelfDescribingFileReader {
     /// When loading files from a dataset it is preferable to use
     /// the fragment reader to avoid this overhead.
     async fn try_new_self_described(
-        storage: &ObjectStore,
+        storage: &Storage,
         path: &Path,
         cache: Option<&LanceCache>,
     ) -> Result<Self>

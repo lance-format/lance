@@ -4,7 +4,7 @@
 //! Metadata guards for tagged fragment reuse histories.
 
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 
 use super::FRAG_REUSE_INDEX_NAME;
 use crate::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
@@ -68,7 +68,7 @@ pub fn validate_flags(manifest: &Manifest, indices: &[IndexMetadata]) -> Result<
     note = "guards the legacy clone workflow; use the dataset clone APIs, which relocate fragment reuse mapping references"
 )]
 pub async fn ensure_clone_supported(
-    store: &ObjectStore,
+    store: &Storage,
     location: &ManifestLocation,
     manifest: &Manifest,
 ) -> Result<()> {
@@ -145,7 +145,7 @@ mod tests {
     /// Writes `manifest` with the given index section into `store` and
     /// returns the location the deprecated guard reads it back from.
     async fn write_located(
-        store: &ObjectStore,
+        store: &Storage,
         manifest: &mut Manifest,
         indices: Vec<IndexMetadata>,
     ) -> ManifestLocation {
@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test]
     #[allow(deprecated)]
     async fn ensure_clone_supported_accepts_history_without_tagged_entries() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
 
         // Without the sticky flag the guard answers without reading anything:
         // the location points at a manifest that was never written.
@@ -204,7 +204,7 @@ mod tests {
     #[tokio::test]
     #[allow(deprecated)]
     async fn ensure_clone_supported_rejects_tagged_history() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let mut flagged = sample_manifest();
         flagged.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         flagged.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;

@@ -350,13 +350,13 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::datatypes::BlobKind;
     use lance_core::storage::path::Path;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use std::sync::Arc;
 
     fn recording_range_store_with_block_size(
         data: Bytes,
         block_size: usize,
-    ) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
+    ) -> (Arc<Storage>, Arc<RecordingRangeObjectStore>) {
         recording_range_store_with_url_and_block_size(
             data,
             "mock://recording/blob-range-tests",

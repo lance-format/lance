@@ -707,7 +707,7 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use lance_core::storage::path::Path;
     use lance_core::utils::tempfile::{TempObjFile, TempStrDir};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_io::traits::Writer;
     use lance_linalg::kernels::normalize_fsl;
     use tokio::io::AsyncWriteExt;
@@ -725,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_legacy_ivf_pq_partition_does_not_read_storage() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let reader = storage.open(&Path::from("missing-index")).await.unwrap();
         let codebook_values = Float32Array::from_iter_values((0..256).map(|value| value as f32));
         let codebook = FixedSizeListArray::try_new_from_values(codebook_values, 1).unwrap();
@@ -743,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_index_values_are_read_from_the_requested_offset() {
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut writer = storage.create(&path).await.unwrap();
         writer.write_all(&[0xFF]).await.unwrap();
         writer.write_all(&11_u64.to_le_bytes()).await.unwrap();

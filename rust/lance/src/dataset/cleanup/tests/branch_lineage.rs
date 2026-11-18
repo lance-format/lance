@@ -289,7 +289,7 @@ impl BranchDatasetFixture {
         let branch_path = self.dataset.base.clone();
 
         // Count files in a directory, filtering by optional extension(s).
-        async fn count_dir(os: &ObjectStore, dir: &Path, exts: Option<&[&str]>) -> Result<usize> {
+        async fn count_dir(os: &Storage, dir: &Path, exts: Option<&[&str]>) -> Result<usize> {
             let mut count = 0usize;
             let mut s = os.read_dir_all(dir, None);
             while let Some(meta) = s.try_next().await? {

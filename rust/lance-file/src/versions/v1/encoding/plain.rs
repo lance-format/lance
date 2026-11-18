@@ -718,7 +718,7 @@ mod tests {
 
     // #[tokio::test]
     // async fn test_boolean_slice() {
-    //     let store = ObjectStore::memory();
+    //     let store = Storage::memory();
     //     let path = Path::from("/bool_slice");
     //
     //     let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -763,7 +763,7 @@ mod tests {
     //
     // #[tokio::test]
     // async fn test_encode_fixed_size_list_slice() {
-    //     let store = ObjectStore::memory();
+    //     let store = Storage::memory();
     //     let path = Path::from("/shared_slice");
     //
     //     let array = Int32Array::from_iter_values(0..1600);

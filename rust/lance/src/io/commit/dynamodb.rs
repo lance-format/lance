@@ -33,7 +33,7 @@ mod test {
         },
     };
     use futures::future::join_all;
-    use lance_io::object_store::path::Path;
+    use lance_io::storage::path::Path;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
     use crate::{

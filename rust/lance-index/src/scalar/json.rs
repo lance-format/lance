@@ -1655,7 +1655,7 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
@@ -2123,7 +2123,7 @@ mod tests {
     async fn test_json_lookup_forwards_to_target(#[case] results_are_row_addresses: bool) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2624,11 +2624,11 @@ mod tests {
     fn local_json_index_store() -> (Arc<dyn IndexStore>, lance_core::utils::tempfile::TempObjDir) {
         use crate::scalar::lance_format::LanceIndexStore;
         use lance_core::utils::tempfile::TempObjDir;
-        use lance_io::object_store::ObjectStore;
+        use lance_io::storage::Storage;
 
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         )) as Arc<dyn IndexStore>;

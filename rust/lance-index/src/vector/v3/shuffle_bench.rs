@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use lance_core::Result;
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use serde::{Deserialize, Serialize};
 
 use super::shuffler::{ShuffleReader, TwoFileShuffleReader};
@@ -34,7 +34,7 @@ pub async fn open_two_file_shuffle_fixture(
     manifest: &TwoFileShuffleFixtureManifest,
 ) -> Result<Box<dyn ShuffleReader>> {
     TwoFileShuffleReader::try_new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         output_dir,
         manifest.num_partitions,
         manifest.num_flush_groups,

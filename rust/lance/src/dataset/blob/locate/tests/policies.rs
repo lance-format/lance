@@ -17,12 +17,10 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{
+use lance_io::storage::{BackendWrapper, StorageParams, StorageProvider, StorageRegistry};
+use lance_io::storage::{
     CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
     PutPayload, PutResult,
-};
-use lance_io::object_store::{
-    ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
 use rstest::rstest;
@@ -34,16 +32,16 @@ use url::Url;
 
 #[derive(Debug)]
 struct BlobProvider {
-    origin: Arc<dyn lance_io::object_store::StorageBackend>,
+    origin: Arc<dyn lance_io::storage::StorageBackend>,
     tracker: IOTracker,
     calls: AtomicUsize,
-    params: Mutex<Vec<ObjectStoreParams>>,
+    params: Mutex<Vec<StorageParams>>,
 }
 
 impl Default for BlobProvider {
     fn default() -> Self {
         Self {
-            origin: lance_io::object_store::backend::native::from_object_store(Arc::new(
+            origin: lance_io::storage::backend::object_store::from_object_store(Arc::new(
                 InMemory::new(),
             )),
             tracker: IOTracker::default(),
@@ -54,15 +52,15 @@ impl Default for BlobProvider {
 }
 
 #[async_trait]
-impl ObjectStoreProvider for BlobProvider {
+impl StorageProvider for BlobProvider {
     async fn new_backend(
         &self,
         _uri: Url,
-        params: &ObjectStoreParams,
-    ) -> Result<lance_io::object_store::BackendConfig> {
+        params: &StorageParams,
+    ) -> Result<lance_io::storage::BackendConfig> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.params.lock().unwrap().push(params.clone());
-        let mut config = lance_io::object_store::BackendConfig::new(
+        let mut config = lance_io::storage::BackendConfig::new(
             self.tracker.wrap("", self.origin.clone()),
             "memory",
         );
@@ -89,8 +87,8 @@ impl ObjectStoreProvider for BlobProvider {
 
 #[derive(Debug)]
 struct ReadThroughCache {
-    cache: Arc<dyn lance_io::object_store::StorageBackend>,
-    original: Arc<dyn lance_io::object_store::StorageBackend>,
+    cache: Arc<dyn lance_io::storage::StorageBackend>,
+    original: Arc<dyn lance_io::storage::StorageBackend>,
 }
 
 impl std::fmt::Display for ReadThroughCache {
@@ -100,14 +98,14 @@ impl std::fmt::Display for ReadThroughCache {
 }
 
 #[async_trait]
-impl lance_io::object_store::StorageBackend for ReadThroughCache {
+impl lance_io::storage::StorageBackend for ReadThroughCache {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -116,10 +114,10 @@ impl lance_io::object_store::StorageBackend for ReadThroughCache {
         &self,
         path: &Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         object_store::coalesce_ranges(
             ranges,
-            |range| (self as &dyn lance_io::object_store::StorageBackend).get_range(path, range),
+            |range| (self as &dyn lance_io::storage::StorageBackend).get_range(path, range),
             object_store::OBJECT_STORE_COALESCE_DEFAULT,
         )
         .await
@@ -129,7 +127,7 @@ impl lance_io::object_store::StorageBackend for ReadThroughCache {
         &self,
         path: &Path,
         options: GetOptions,
-    ) -> lance_io::object_store::Result<GetResult> {
+    ) -> lance_io::storage::Result<GetResult> {
         if self.cache.head(path).await.is_err() {
             let bytes = self.original.get(path).await?.bytes().await?;
             self.cache.put(path, bytes.into()).await?;
@@ -142,7 +140,7 @@ impl lance_io::object_store::StorageBackend for ReadThroughCache {
         path: &Path,
         bytes: PutPayload,
         options: PutOptions,
-    ) -> lance_io::object_store::Result<PutResult> {
+    ) -> lance_io::storage::Result<PutResult> {
         self.original.put_opts(path, bytes, options).await
     }
 
@@ -150,29 +148,28 @@ impl lance_io::object_store::StorageBackend for ReadThroughCache {
         &self,
         path: &Path,
         options: PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.original.put_multipart_opts(path, options).await
     }
 
     fn delete_stream(
         &self,
-        locations: BoxStream<'static, lance_io::object_store::Result<Path>>,
-    ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
+        locations: BoxStream<'static, lance_io::storage::Result<Path>>,
+    ) -> BoxStream<'static, lance_io::storage::Result<Path>> {
         self.original.delete_stream(locations)
     }
 
     fn list(
         &self,
         prefix: Option<&Path>,
-    ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
+    ) -> BoxStream<'static, lance_io::storage::Result<ObjectMeta>> {
         self.original.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
-    ) -> lance_io::object_store::Result<ListResult> {
+    ) -> lance_io::storage::Result<ListResult> {
         self.original.list_with_delimiter(prefix).await
     }
 
@@ -181,7 +178,7 @@ impl lance_io::object_store::StorageBackend for ReadThroughCache {
         from: &Path,
         to: &Path,
         options: CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+    ) -> lance_io::storage::Result<()> {
         self.original.copy_opts(from, to, options).await
     }
 
@@ -189,10 +186,8 @@ impl lance_io::object_store::StorageBackend for ReadThroughCache {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         let offset = offset.clone();
         futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
             self.list(prefix),
@@ -204,8 +199,8 @@ impl lance_io::object_store::StorageBackend for ReadThroughCache {
         &self,
         from: &Path,
         to: &Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.original.rename_opts(from, to, opts).await
     }
 }
@@ -218,14 +213,14 @@ struct ImmutableCache {
     external_wraps: AtomicUsize,
 }
 
-impl WrappingObjectStore for ImmutableCache {
+impl BackendWrapper for ImmutableCache {
     fn wrap(
         &self,
         _prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(ReadThroughCache {
-            cache: lance_io::object_store::backend::native::from_object_store(self.cache.clone()),
+            cache: lance_io::storage::backend::object_store::from_object_store(self.cache.clone()),
             original,
         })
     }
@@ -233,9 +228,9 @@ impl WrappingObjectStore for ImmutableCache {
     fn wrap_external_blob(
         &self,
         _prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-        _wrapped: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+        _wrapped: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         self.external_wraps.fetch_add(1, Ordering::Relaxed);
         original
     }
@@ -254,7 +249,7 @@ async fn test_external_write_policy_and_error(
 ) {
     let dir = TempStdDir::default();
     let provider = Arc::new(BlobProvider::default());
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    let registry = Arc::new(StorageRegistry::default());
     registry.insert("probe", provider.clone());
     let policy = if is_controlled {
         UnregisteredExternalBlobPolicy::Deny
@@ -376,7 +371,7 @@ async fn test_external_write_denies_filtered_providers(
     #[case] uri: &str,
     #[values(false, true)] allow_outside: bool,
 ) {
-    let registry = ObjectStoreRegistry::default();
+    let registry = StorageRegistry::default();
     let source = Arc::new(BlobProvider::default());
     for scheme in ["file", "file-object-store", "file+uring"] {
         registry.insert(scheme, source.clone());
@@ -464,15 +459,15 @@ async fn test_explicit_ingest_keeps_its_source_access_under_deny() {
 #[case::relative("external-base/payload")]
 #[tokio::test]
 async fn test_external_reference_matches_local_paths_when_provider_is_enabled(#[case] uri: &str) {
-    let registry = Arc::new(ObjectStoreRegistry::default());
-    let path = ObjectStore::extract_path_from_uri(registry.clone(), uri).unwrap();
+    let registry = Arc::new(StorageRegistry::default());
+    let path = Storage::extract_path_from_uri(registry.clone(), uri).unwrap();
     let base = path.parent().unwrap();
     let mut resolver = ExternalBaseResolver::new(
         vec![ExternalBaseCandidate {
             base_id: 2,
             store_prefix: "file".to_string(),
             base_path: base,
-            store_params: ObjectStoreParams::default(),
+            store_params: StorageParams::default(),
         }],
         registry,
     );
@@ -485,7 +480,7 @@ async fn test_external_reference_matches_local_paths_when_provider_is_enabled(#[
 #[tokio::test]
 async fn test_external_reference_preserves_registered_matches_and_input_errors() {
     let registry = Arc::new(
-        ObjectStoreRegistry::default()
+        StorageRegistry::default()
             .without_providers(["file", "file-object-store", "file+uring"])
             .unwrap(),
     );
@@ -496,7 +491,7 @@ async fn test_external_reference_preserves_registered_matches_and_input_errors()
             base_id: 2,
             store_prefix: "probe".to_string(),
             base_path: Path::from("base"),
-            store_params: ObjectStoreParams::default(),
+            store_params: StorageParams::default(),
         }],
         registry,
     );
@@ -536,7 +531,7 @@ async fn test_external_reference_preserves_registered_matches_and_input_errors()
 async fn test_unregistered_external_blob_policy(#[case] size: u64) {
     let fixture = create_multi_base_blob_v2_fixture(vec![1], None, false).await;
     let provider = Arc::new(BlobProvider::default());
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    let registry = Arc::new(StorageRegistry::default());
     registry.insert("probe", provider.clone());
     let session = Session::new(0, 0, registry)
         .with_unregistered_external_blob_policy(UnregisteredExternalBlobPolicy::Deny);
@@ -589,7 +584,7 @@ async fn test_unregistered_external_blob_allowed_by_default(#[case] is_wrapped: 
         .put(&Path::from("payload"), b"old".as_slice().into())
         .await
         .unwrap();
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    let registry = Arc::new(StorageRegistry::default());
     registry.insert("probe", provider.clone());
     let session = Arc::new(Session::new(0, 0, registry));
     assert_eq!(
@@ -597,9 +592,9 @@ async fn test_unregistered_external_blob_allowed_by_default(#[case] is_wrapped: 
         UnregisteredExternalBlobPolicy::Allow
     );
     let cache = Arc::new(ImmutableCache::default());
-    let params = ObjectStoreParams {
+    let params = StorageParams {
         backend_wrappers: is_wrapped
-            .then(|| cache.clone() as Arc<dyn WrappingObjectStore>)
+            .then(|| cache.clone() as Arc<dyn BackendWrapper>)
             .into_iter()
             .collect(),
         ..Default::default()
@@ -647,9 +642,9 @@ async fn test_external_preserves_runtime_base_store(#[values(false, true)] is_wr
         .await
         .unwrap();
     let dataset = DatasetBuilder::from_uri(fixture.dataset.uri())
-        .with_store_params(ObjectStoreParams {
+        .with_store_params(StorageParams {
             backend_wrappers: is_wrapped
-                .then(|| Arc::new(IOTracker::default()) as Arc<dyn WrappingObjectStore>)
+                .then(|| Arc::new(IOTracker::default()) as Arc<dyn BackendWrapper>)
                 .into_iter()
                 .collect(),
             ..Default::default()
@@ -708,7 +703,7 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         .put(&payload_path, b"old".as_slice().into())
         .await
         .unwrap();
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    let registry = Arc::new(StorageRegistry::default());
     registry.insert("probe", provider.clone());
     let session = Arc::new(
         Session::new(0, 0, registry).with_unregistered_external_blob_policy(if is_registered {
@@ -719,12 +714,12 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
     );
     let cache = Arc::new(ImmutableCache::default());
     let observer = Arc::new(IOTracker::default());
-    let wrappers: Vec<Arc<dyn WrappingObjectStore>> = vec![cache.clone(), observer.clone()];
+    let wrappers: Vec<Arc<dyn BackendWrapper>> = vec![cache.clone(), observer.clone()];
     let options = HashMap::from([
         ("credential".to_string(), "base-secret".to_string()),
         ("endpoint".to_string(), "base-endpoint".to_string()),
     ]);
-    let params = ObjectStoreParams {
+    let params = StorageParams {
         backend_wrappers: wrappers.clone(),
         block_size: Some(4096),
         ..Default::default()
@@ -738,11 +733,9 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
             .await
             .unwrap()
     } else if exact_binding {
-        let params = ObjectStoreParams {
+        let params = StorageParams {
             storage_options_accessor: Some(Arc::new(
-                lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                    options.clone(),
-                ),
+                lance_io::storage::StorageOptionsAccessor::with_static_options(options.clone()),
             )),
             ..params
         };

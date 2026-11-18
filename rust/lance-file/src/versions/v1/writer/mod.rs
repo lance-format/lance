@@ -19,7 +19,7 @@ use lance_arrow::*;
 use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_io::traits::{WriteExt, Writer};
 use tokio::io::AsyncWriteExt;
 
@@ -97,7 +97,7 @@ pub struct FileWriterOptions {
 
 impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     pub async fn try_new(
-        storage: &ObjectStore,
+        storage: &Storage,
         path: &Path,
         schema: Schema,
         options: &FileWriterOptions,
@@ -879,7 +879,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
         schema.set_dictionary(&batch).unwrap();
 
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
             &store,
@@ -916,7 +916,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
         schema.set_dictionary(&batch).unwrap();
 
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
             &store,
@@ -961,7 +961,7 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
 
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
             &store,
@@ -990,7 +990,7 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/empty");
         let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
             &store,
@@ -1040,7 +1040,7 @@ mod tests {
 
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/foo");
 
         let options = FileWriterOptions {
@@ -1205,11 +1205,7 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), columns).unwrap()
     }
 
-    async fn read_file_as_one_batch(
-        storage: &ObjectStore,
-        path: &Path,
-        schema: Schema,
-    ) -> RecordBatch {
+    async fn read_file_as_one_batch(storage: &Storage, path: &Path, schema: Schema) -> RecordBatch {
         let reader = FileReader::try_new(storage, path, schema).await.unwrap();
         let mut batches = vec![];
         for i in 0..reader.num_batches() {
@@ -1227,7 +1223,7 @@ mod tests {
     /// Test encoding arrays that share the same underneath buffer.
     #[tokio::test]
     async fn test_encode_slice() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/shared_slice");
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1263,7 +1259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_schema_with_holes() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("test");
 
         let mut field0 = Field::try_from(&ArrowField::new("a", DataType::Int32, true)).unwrap();

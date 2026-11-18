@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lance_core::Result;
-use lance_io::object_store::uri_to_url;
+use lance_io::storage::uri_to_url;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::Identity;
 use log::{debug, info, warn};

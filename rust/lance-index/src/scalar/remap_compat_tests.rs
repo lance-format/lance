@@ -17,7 +17,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
@@ -159,7 +159,7 @@ fn hops_with_budget(budget: u64) -> Arc<Hops> {
 fn temp_store() -> (TempObjDir, Arc<LanceIndexStore>) {
     let dir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

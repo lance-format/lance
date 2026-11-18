@@ -10,8 +10,8 @@ use lance_core::{cache::LanceCache, datatypes::Schema, utils::tempfile::TempObjF
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_io::{
     ReadBatchParams,
-    object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    storage::Storage,
     utils::CachedFileSize,
 };
 
@@ -21,14 +21,14 @@ use crate::{versions, writer::FileWriterOptions};
 
 pub struct FsFixture {
     pub tmp_path: TempObjFile,
-    pub storage: Arc<ObjectStore>,
+    pub storage: Arc<Storage>,
     pub scheduler: Arc<ScanScheduler>,
 }
 
 impl Default for FsFixture {
     fn default() -> Self {
         let tmp_path = TempObjFile::default();
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let scheduler = ScanScheduler::new(storage.clone(), SchedulerConfig::default_for_testing());
         Self {
             storage,

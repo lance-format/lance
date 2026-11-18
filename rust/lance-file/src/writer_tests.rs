@@ -41,7 +41,7 @@ mod tests {
         encode_batch,
     };
     use lance_encoding::repdef::RepDefBuilder;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
     use rstest::rstest;
@@ -106,7 +106,7 @@ mod tests {
         let expected_sum: f64 = vals.iter().sum();
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut writer = create_v2_3_writer_with_compression(
             storage.create(&path).await.unwrap(),
             lance_schema,
@@ -171,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_write() {
         let tmp_path = TempObjFile::default();
-        let obj_store = Arc::new(ObjectStore::local());
+        let obj_store = Arc::new(Storage::local());
 
         let reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
@@ -379,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_empty() {
         let tmp_path = TempObjFile::default();
-        let obj_store = Arc::new(ObjectStore::local());
+        let obj_store = Arc::new(Storage::local());
 
         let reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
@@ -1895,7 +1895,7 @@ mod tests {
         };
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut writer = create_writer(
             storage.create(&path).await.unwrap(),
             lance_schema,
@@ -1967,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn test_zero_max_page_bytes_rejected(#[case] lazy: bool) {
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let object_writer = storage.create(&path).await.unwrap();
         let options = FileWriterOptions {
             max_page_bytes: Some(0),
@@ -1998,7 +1998,7 @@ mod tests {
     #[tokio::test]
     async fn test_v2_0_writer_rejects_zero_max_page_bytes() {
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let object_writer = storage.create(&path).await.unwrap();
         let schema = LanceSchema::try_from(&Schema::new(vec![Field::new(
             "data",
@@ -2020,7 +2020,7 @@ mod tests {
     #[tokio::test]
     async fn test_v2_1_lazy_writer_rejects_zero_max_page_bytes() {
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let object_writer = storage.create(&path).await.unwrap();
         let options = FileWriterOptions {
             max_page_bytes: Some(0),
@@ -2055,7 +2055,7 @@ mod tests {
         };
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut writer = create_writer(
             storage.create(&path).await.unwrap(),
             lance_schema.clone(),
@@ -2187,7 +2187,7 @@ mod tests {
 
         // Write the file
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
 
         let mut writer = create_v2_1_writer_with_compression(
             storage.create(&path).await.unwrap(),
@@ -2315,7 +2315,7 @@ mod tests {
         .unwrap();
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
 
         // Create encoding strategy that will read from field metadata
         let params = CompressionParams::new();
@@ -2405,7 +2405,7 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(status_array)]).unwrap();
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
 
         // Create encoding strategy that will read from field metadata
         let params = CompressionParams::new();
@@ -2482,7 +2482,7 @@ mod tests {
         .unwrap();
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut writer = create_v2_3_writer_with_compression(
             storage.create(&path).await.unwrap(),
             lance_schema.clone(),
@@ -2590,7 +2590,7 @@ mod tests {
         .unwrap();
 
         let path = TempObjFile::default();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut writer = create_v2_3_writer_with_compression(
             storage.create(&path).await.unwrap(),
             lance_schema.clone(),
@@ -2783,9 +2783,9 @@ mod tests {
         assert!(read_binary.value(0).iter().all(|&b| b == 42u8));
     }
 
-    fn spill_config() -> (TempObjFile, Arc<ObjectStore>) {
+    fn spill_config() -> (TempObjFile, Arc<Storage>) {
         let spill_path = TempObjFile::default();
-        (spill_path, Arc::new(ObjectStore::local()))
+        (spill_path, Arc::new(Storage::local()))
     }
 
     fn make_batches(num_batches: i32, num_cols: usize, rows_per_batch: i32) -> Vec<RecordBatch> {
@@ -2809,7 +2809,7 @@ mod tests {
 
     async fn write_and_read_batches(
         batches: &[RecordBatch],
-        spill: Option<(Arc<ObjectStore>, lance_core::storage::path::Path)>,
+        spill: Option<(Arc<Storage>, lance_core::storage::path::Path)>,
     ) -> Vec<RecordBatch> {
         let fs = FsFixture::default();
         let lance_schema = LanceSchema::try_from(batches[0].schema().as_ref()).unwrap();

@@ -48,7 +48,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use lance::dataset::{Dataset, InsertBuilder, WriteMode, WriteParams, builder::DatasetBuilder};
 use lance::session::Session;
 use lance_core::utils::parse::str_is_truthy;
-use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
+use lance_io::storage::{StorageOptionsAccessor, StorageParams, StorageRegistry};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
@@ -104,7 +104,7 @@ fn batch(start_id: usize, num_rows: usize) -> RecordBatch {
 ///
 /// S3 Express directory buckets don't support GetBucketLocation, so we also
 /// require the caller to set `AWS_REGION` and forward it explicitly.
-fn store_params_for(uri: &str) -> Option<ObjectStoreParams> {
+fn store_params_for(uri: &str) -> Option<StorageParams> {
     if !uri.contains("--x-s3") {
         return None;
     }
@@ -116,7 +116,7 @@ fn store_params_for(uri: &str) -> Option<ObjectStoreParams> {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-    Some(ObjectStoreParams {
+    Some(StorageParams {
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             storage_options,
         ))),
@@ -124,7 +124,7 @@ fn store_params_for(uri: &str) -> Option<ObjectStoreParams> {
     })
 }
 
-fn write_params(session: Arc<Session>, store_params: Option<ObjectStoreParams>) -> WriteParams {
+fn write_params(session: Arc<Session>, store_params: Option<StorageParams>) -> WriteParams {
     WriteParams {
         mode: WriteMode::Append,
         session: Some(session),
@@ -139,7 +139,7 @@ async fn create_base_dataset(
     base_rows: usize,
     rows_per_append: usize,
     session: Arc<Session>,
-    store_params: Option<ObjectStoreParams>,
+    store_params: Option<StorageParams>,
 ) -> Dataset {
     // When `base_rows == 0` the dataset starts empty: one create commit with a
     // zero-row batch so the writers begin at version 1 with no data.
@@ -192,7 +192,7 @@ async fn run_writer(
     deadline: Option<Instant>,
     per_attempt_timeout: Option<Duration>,
     session: Arc<Session>,
-    store_params: Option<ObjectStoreParams>,
+    store_params: Option<StorageParams>,
 ) -> WriterStats {
     // Each writer keeps its own dataset handle; CommitBuilder rebases on
     // conflict so we don't need to manually reload between appends.
@@ -324,8 +324,8 @@ fn bench_concurrent_append(c: &mut Criterion) {
     println!("Base rows: {base_rows}, keep_dataset: {keep_dataset}");
     println!();
 
-    // Share one ObjectStoreRegistry so all writers reuse warm TCP/TLS sessions.
-    let registry = Arc::new(ObjectStoreRegistry::default());
+    // Share one StorageRegistry so all writers reuse warm TCP/TLS sessions.
+    let registry = Arc::new(StorageRegistry::default());
     let session = Arc::new(Session::new(0, 0, registry));
 
     println!("Seeding base dataset ({base_rows} rows)...");

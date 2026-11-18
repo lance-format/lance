@@ -17,7 +17,7 @@ use crate::dataset::mem_wal::write::test_support::*;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, StringArray};
 use arrow_schema::{DataType, Field};
 use lance_core::FenceReason;
-use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::storage::StorageRegistry;
 use rstest::rstest;
 
 /// A PK-only flush must wait for the asynchronous index apply before it
@@ -157,7 +157,7 @@ async fn test_abort_wakes_flush_waiting_for_index_apply() {
 #[tokio::test]
 async fn test_shard_writer_auto_flush_repeatedly_memory_store() {
     let base_uri = "memory:///bench_test_flush";
-    let (store, base_path) = ObjectStore::from_uri(base_uri).await.unwrap();
+    let (store, base_path) = Storage::from_uri(base_uri).await.unwrap();
     let base_uri = base_uri.to_string();
     let schema = create_test_schema();
 
@@ -780,13 +780,10 @@ async fn test_close_propagates_frozen_memtable_flush_failure() {
 async fn test_close_shuts_down_after_sstable_failure_during_index_drain() {
     let (_store, _base_path, base_uri, _temp) = create_local_store().await;
     let (params, controls) = observable_store_params();
-    let (store, base_path) = ObjectStore::from_uri_and_params(
-        Arc::new(ObjectStoreRegistry::default()),
-        &base_uri,
-        &params,
-    )
-    .await
-    .unwrap();
+    let (store, base_path) =
+        Storage::from_uri_and_params(Arc::new(StorageRegistry::default()), &base_uri, &params)
+            .await
+            .unwrap();
     let schema = schema_with_pk();
     let config = ShardWriterConfig {
         store_params: Some(params),
@@ -848,13 +845,10 @@ async fn test_close_shuts_down_after_sstable_failure_during_index_drain() {
 async fn test_terminal_sstable_failure_is_sticky_and_replay_recovers_later_generations() {
     let (_store, _base_path, base_uri, _temp) = create_local_store().await;
     let (params, controls) = observable_store_params();
-    let (store, base_path) = ObjectStore::from_uri_and_params(
-        Arc::new(ObjectStoreRegistry::default()),
-        &base_uri,
-        &params,
-    )
-    .await
-    .unwrap();
+    let (store, base_path) =
+        Storage::from_uri_and_params(Arc::new(StorageRegistry::default()), &base_uri, &params)
+            .await
+            .unwrap();
     let schema = create_test_schema();
     let config = ShardWriterConfig {
         store_params: Some(params),

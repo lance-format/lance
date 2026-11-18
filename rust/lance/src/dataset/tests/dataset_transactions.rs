@@ -11,7 +11,7 @@ use crate::dataset::{
     ColumnAlteration, ManifestWriteConfig, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
     UpdateBuilder, write_manifest_file,
 };
-use crate::io::ObjectStoreParams;
+use crate::io::StorageParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_core::storage::path::Path;
@@ -210,7 +210,7 @@ async fn test_session_store_registry() {
     // If we create another with **different parameters**, it should create a new store.
     let write_params2 = WriteParams {
         session: Some(session.clone()),
-        store_params: Some(ObjectStoreParams {
+        store_params: Some(StorageParams {
             block_size: Some(10_000),
             ..Default::default()
         }),
@@ -1569,7 +1569,7 @@ impl CommitHandler for GateNextCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &lance_io::object_store::ObjectStore,
+        storage: &lance_io::storage::Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<ManifestTransaction>,

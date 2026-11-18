@@ -11,7 +11,7 @@ use lance_encoding::{
     compression_config::CompressionParams,
     encoder::{BatchEncoder, EncodedBatch},
 };
-use lance_io::{object_store::ObjectStore, traits::Writer as ObjectWriter};
+use lance_io::{storage::Storage, traits::Writer as ObjectWriter};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
@@ -93,7 +93,7 @@ impl Writer {
     }
 
     /// Spill page metadata to a sidecar file instead of retaining it in memory.
-    pub fn with_page_metadata_spill(mut self, storage: Arc<ObjectStore>, path: Path) -> Self {
+    pub fn with_page_metadata_spill(mut self, storage: Arc<Storage>, path: Path) -> Self {
         self.sink.with_page_metadata_spill(storage, path);
         self
     }

@@ -10,7 +10,7 @@ Exercises the pyo3 additions in ``python/src/storage.rs`` and the new
 through the registry-selected store rather than the default built-in scheme
 resolver.
 
-The full Python-to-Rust ``ObjectStoreProvider`` callable bridge is not exercised
+The full Python-to-Rust ``StorageProvider`` callable bridge is not exercised
 here — that is a follow-up. See the module docstring in
 ``python/src/storage.rs``.
 """
@@ -19,18 +19,18 @@ import lance
 import pyarrow as pa
 import pytest
 from lance.lance import (
-    _ObjectStoreProvider,
-    _ObjectStoreRegistry,
     _Session,
+    _StorageProvider,
+    _StorageRegistry,
 )
 
 
-def _make_registry_and_session(scheme: str) -> tuple[_ObjectStoreRegistry, _Session]:
+def _make_registry_and_session(scheme: str) -> tuple[_StorageRegistry, _Session]:
     """Return a fresh registry with ``scheme`` bound to an in-memory provider,
     plus a Session that consults it.
     """
-    registry = _ObjectStoreRegistry()
-    provider = _ObjectStoreProvider.memory()
+    registry = _StorageRegistry()
+    provider = _StorageProvider.memory()
     registry.register_provider(scheme, provider)
     session = _Session(store_registry=registry)
     return registry, session
@@ -39,7 +39,7 @@ def _make_registry_and_session(scheme: str) -> tuple[_ObjectStoreRegistry, _Sess
 def test_custom_scheme_registration_roundtrip():
     """Register ``test-mem`` and round-trip a small table through it.
 
-    Note on lifetimes: ``ObjectStoreRegistry`` caches active stores under
+    Note on lifetimes: ``StorageRegistry`` caches active stores under
     ``Weak<Storage>``. Every call to ``MemoryStoreProvider::new_backend``
     allocates a fresh ``InMemory`` backend, so the writer's dataset handle
     must stay alive across the read to keep the same in-memory store visible
@@ -103,7 +103,7 @@ def test_missing_scheme_raises_helpful_error():
     the error message must name the missing scheme.
     """
     # Fresh registry with nothing custom registered.
-    session = _Session(store_registry=_ObjectStoreRegistry())
+    session = _Session(store_registry=_StorageRegistry())
 
     with pytest.raises(Exception) as excinfo:  # OSError or lance.LanceError
         lance.dataset("no-such-scheme://foo/bar.lance", session=session)
@@ -115,24 +115,24 @@ def test_missing_scheme_raises_helpful_error():
 
 def test_register_provider_rejects_empty_scheme():
     """Empty schemes are rejected at registration time."""
-    registry = _ObjectStoreRegistry()
+    registry = _StorageRegistry()
     with pytest.raises(ValueError):
-        registry.register_provider("", _ObjectStoreProvider.memory())
+        registry.register_provider("", _StorageProvider.memory())
 
 
 def test_from_capsule_roundtrip():
     """Exercise the ``PyCapsule`` handoff end to end with an in-process producer.
 
     ``_memory_capsule()`` mirrors what an external, ABI-compatible wheel emits:
-    a ``PyCapsule`` named ``lance_object_store_provider`` holding an
-    ``Arc<dyn ObjectStoreProvider>``. ``from_capsule`` must accept it (name
+    a ``PyCapsule`` named ``lance_storage_provider`` holding an
+    ``Arc<dyn StorageProvider>``. ``from_capsule`` must accept it (name
     check passes), adopt the provider, and the result must be registrable and
     usable for a read/write round-trip — covering the clone-on-adopt and the
     capsule's own drop when it is garbage-collected.
     """
-    registry = _ObjectStoreRegistry()
-    capsule = _ObjectStoreProvider._memory_capsule()
-    provider = _ObjectStoreProvider.from_capsule(capsule)
+    registry = _StorageRegistry()
+    capsule = _StorageProvider._memory_capsule()
+    provider = _StorageProvider.from_capsule(capsule)
     # Drop our reference to the capsule; the adopted Arc must keep the provider
     # alive independently of the capsule.
     del capsule
@@ -164,4 +164,4 @@ def test_from_capsule_rejects_wrong_name():
     capsule = make(ctypes.addressof(storage), b"not-a-lance-provider", None)
 
     with pytest.raises(ValueError):
-        _ObjectStoreProvider.from_capsule(capsule)
+        _StorageProvider.from_capsule(capsule)

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use futures::TryStreamExt;
 use lance_core::Result;
 use lance_core::storage::path::Path;
-use lance_io::object_store::{Error as StorageError, ObjectMeta, PutMode, PutOptions};
+use lance_io::storage::{Error as StorageError, ObjectMeta, PutMode, PutOptions};
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{CreateTableVersionResponse, TableVersion};
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};

@@ -14,8 +14,8 @@ use futures::{FutureExt, TryStreamExt};
 use lance_core::storage::path::Path;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::reader::FileReaderOptions;
-use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptionsAccessor,
+use lance_io::storage::{
+    LanceNamespaceStorageOptionsProvider, Storage, StorageOptionsAccessor, StorageParams,
 };
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
@@ -43,14 +43,14 @@ pub struct DatasetBuilder {
     manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
-    options: ObjectStoreParams,
+    options: StorageParams,
     version: Option<Ref>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
-    /// ObjectStore options that override user-provided options (e.g., from namespace client)
+    /// Storage options that override user-provided options (e.g., from namespace client)
     storage_options_override: Option<HashMap<String, String>>,
     /// Runtime-only exact object store bindings keyed by base path URI.
-    base_store_params: HashMap<String, ObjectStoreParams>,
+    base_store_params: HashMap<String, StorageParams>,
     /// Namespace-managed table info `(client, table_id)`, set by `from_namespace`
     /// when the table uses managed versioning. The commit handler is built in
     /// `build_storage`, rooted at the resolved table path; the branch a
@@ -87,7 +87,7 @@ impl DatasetBuilder {
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             index_cache_backend: None,
             table_uri: table_uri.as_ref().to_string(),
-            options: ObjectStoreParams::default(),
+            options: StorageParams::default(),
             commit_handler: None,
             session: None,
             version: None,
@@ -104,7 +104,7 @@ impl DatasetBuilder {
     /// This will automatically fetch the table location and storage options from the namespace
     /// client via `describe_table()`.
     ///
-    /// ObjectStore options from the namespace client will override any user-provided storage options
+    /// Storage options from the namespace client will override any user-provided storage options
     /// set via `.with_storage_options()`. This ensures the namespace client is always the source
     /// of truth for storage options.
     ///
@@ -168,7 +168,7 @@ impl DatasetBuilder {
         builder.storage_options_override = namespace_storage_options.clone();
 
         if let Some(initial_opts) = namespace_storage_options {
-            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+            let provider: Arc<dyn lance_io::storage::StorageOptionsProvider> = Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
             );
             builder.options.storage_options_accessor = Some(Arc::new(
@@ -365,7 +365,7 @@ impl DatasetBuilder {
     /// use std::sync::Arc;
     /// use std::time::Duration;
     /// use lance_namespace_impls::ConnectBuilder;
-    /// use lance_io::object_store::{StorageOptionsProvider, LanceNamespaceStorageOptionsProvider};
+    /// use lance_io::storage::{StorageOptionsProvider, LanceNamespaceStorageOptionsProvider};
     ///
     /// // Connect to a REST namespace
     /// let namespace_client = ConnectBuilder::new("rest")
@@ -396,7 +396,7 @@ impl DatasetBuilder {
     ///     .await?;
     pub fn with_storage_options_provider(
         mut self,
-        provider: Arc<dyn lance_io::object_store::StorageOptionsProvider>,
+        provider: Arc<dyn lance_io::storage::StorageOptionsProvider>,
     ) -> Self {
         // Preserve existing storage options if any
         if let Some(existing) = self.options.storage_options_accessor.take() {
@@ -427,7 +427,7 @@ impl DatasetBuilder {
     /// ```ignore
     /// use std::sync::Arc;
     /// use std::time::Duration;
-    /// use lance_io::object_store::StorageOptionsAccessor;
+    /// use lance_io::storage::StorageOptionsAccessor;
     ///
     /// // Create an accessor with a dynamic provider
     /// let accessor = Arc::new(StorageOptionsAccessor::with_provider(
@@ -455,7 +455,7 @@ impl DatasetBuilder {
     pub fn with_base_store_params(
         mut self,
         base_path: impl AsRef<str>,
-        store_params: ObjectStoreParams,
+        store_params: StorageParams,
     ) -> Self {
         self.base_store_params
             .insert(base_path.as_ref().to_string(), store_params);
@@ -511,15 +511,13 @@ impl DatasetBuilder {
     }
 
     /// Set exact object store params used as the dataset-level default binding.
-    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+    pub fn with_store_params(mut self, store_params: StorageParams) -> Self {
         self.options = store_params;
         self
     }
 
     /// Build a lance object store for the given config
-    pub async fn build_storage(
-        mut self,
-    ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
+    pub async fn build_storage(mut self) -> Result<(Arc<Storage>, Path, Arc<dyn CommitHandler>)> {
         let store_registry = self
             .session
             .as_ref()
@@ -527,8 +525,7 @@ impl DatasetBuilder {
             .unwrap_or_default();
 
         let (storage, base_path) =
-            ObjectStore::from_uri_and_params(store_registry, &self.table_uri, &self.options)
-                .await?;
+            Storage::from_uri_and_params(store_registry, &self.table_uri, &self.options).await?;
 
         // Resolve the commit handler: an explicitly set one wins; otherwise a
         // namespace-managed table builds a manifest store rooted at the resolved
@@ -601,12 +598,12 @@ impl DatasetBuilder {
     }
 
     // Runtime per-base overrides are supplied as storage options, but the dataset
-    // ultimately resolves object stores from ObjectStoreParams. Normalize once in
+    // ultimately resolves object stores from StorageParams. Normalize once in
     // the builder so reads only need to look up the prepared params by base path.
     fn merge_store_params_with_storage_options(
-        params: &ObjectStoreParams,
+        params: &StorageParams,
         override_options: &HashMap<String, String>,
-    ) -> ObjectStoreParams {
+    ) -> StorageParams {
         if override_options.is_empty() {
             return params.clone();
         }
@@ -827,11 +824,11 @@ impl DatasetBuilder {
         file_reader_options: Option<FileReaderOptions>,
         table_uri: String,
         version_number: Option<u64>,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         base_path: Path,
         commit_handler: Arc<dyn CommitHandler>,
-        store_params: Option<ObjectStoreParams>,
-        base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+        store_params: Option<StorageParams>,
+        base_store_params: Option<Arc<HashMap<String, StorageParams>>>,
     ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             ensure_can_read_manifest(&manifest)?;
@@ -902,7 +899,7 @@ impl DatasetBuilder {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use lance_io::object_store::StorageOptionsProvider;
+    use lance_io::storage::StorageOptionsProvider;
     use lance_table::io::commit::UnsafeCommitHandler;
 
     use super::*;
@@ -940,7 +937,7 @@ mod tests {
             ("caller-only".to_string(), "caller-value".to_string()),
         ]);
         let provider: Arc<dyn StorageOptionsProvider> = Arc::new(TestStorageOptionsProvider);
-        let options = ObjectStoreParams {
+        let options = StorageParams {
             storage_options_accessor: Some(Arc::new(
                 StorageOptionsAccessor::with_initial_and_provider(caller_options, provider),
             )),

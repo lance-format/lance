@@ -27,8 +27,8 @@ use lance_file::versions;
 use lance_file::writer::FileWriterOptions;
 use lance_io::{
     ReadBatchParams,
-    object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    storage::Storage,
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
     utils::CachedFileSize,
 };
@@ -204,7 +204,7 @@ impl ScratchDir {
 }
 
 pub struct IvfShuffler {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     output_dir: Path,
     num_partitions: usize,
     format_version: ConcreteFileVersion,
@@ -224,7 +224,7 @@ impl IvfShuffler {
 
     fn new_in(scratch: ScratchDir, num_partitions: usize) -> Self {
         Self {
-            storage: Arc::new(ObjectStore::local()),
+            storage: Arc::new(Storage::local()),
             output_dir: scratch.output_dir().clone(),
             num_partitions,
             format_version: ConcreteFileVersion::V2_0,
@@ -377,7 +377,7 @@ pub struct IvfShufflerReader {
 
 impl IvfShufflerReader {
     pub fn new(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         output_dir: Path,
         partition_sizes: Vec<usize>,
         loss: f64,
@@ -663,7 +663,7 @@ fn shuffle_batch_bytes() -> usize {
 ///
 /// Then we read those ranges from the data file.
 pub struct TwoFileShuffler {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     output_dir: Path,
     num_partitions: usize,
     batch_size_bytes: usize,
@@ -683,7 +683,7 @@ impl TwoFileShuffler {
 
     fn new_in(scratch: ScratchDir, num_partitions: usize) -> Self {
         Self {
-            storage: Arc::new(ObjectStore::local()),
+            storage: Arc::new(Storage::local()),
             output_dir: scratch.output_dir().clone(),
             num_partitions,
             batch_size_bytes: shuffle_batch_bytes(),
@@ -1044,7 +1044,7 @@ fn preloaded_partition_ranges(
 
 impl TwoFileShuffleReader {
     pub(super) async fn try_new(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         output_dir: Path,
         num_partitions: usize,
         num_batches: u64,
@@ -1071,7 +1071,7 @@ impl TwoFileShuffleReader {
     // instance to attach it to afterwards the way `IvfShufflerReader` does.
     #[allow(clippy::too_many_arguments)]
     async fn try_new_with_preload_limit(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         output_dir: Path,
         num_partitions: usize,
         num_batches: u64,
@@ -2266,7 +2266,7 @@ mod tests {
         let stream = batches_to_stream(vec![batch]);
         let reader = shuffler.shuffle(stream).await.unwrap();
 
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let scheduler =
             ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(&storage));
         for filename in ["shuffle_data.lance", "shuffle_offsets.lance"] {
@@ -2501,7 +2501,7 @@ mod tests {
         // Force the bounded-memory fallback and verify its u64 range reads
         // produce the same partition order and empty-partition behavior.
         let fallback_reader = TwoFileShuffleReader::try_new_with_preload_limit(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             output_dir,
             num_partitions,
             4,
@@ -2600,7 +2600,7 @@ mod tests {
         drop(reader);
 
         let fallback_reader = TwoFileShuffleReader::try_new_with_preload_limit(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             output_dir.clone(),
             3,
             2,
@@ -2623,7 +2623,7 @@ mod tests {
         // Writer-side offsets that exceed the byte cap must take the same
         // sidecar on-demand path rather than staying Preloaded.
         let over_limit_reader = TwoFileShuffleReader::try_new_with_preload_limit(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             output_dir,
             3,
             2,
@@ -2702,7 +2702,7 @@ mod tests {
         assert_eq!(window.partition_range, 0..window_end);
 
         let reopened = TwoFileShuffleReader::try_new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             output_dir,
             3,
             2,
@@ -2769,7 +2769,7 @@ mod tests {
         // under the default 256 MiB cap. ForcedOnDemand must still stay
         // on-demand instead of retrying a full sidecar preload.
         let forced = TwoFileShuffleReader::try_new_with_preload_limit(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             output_dir.clone(),
             3,
             2,
@@ -2791,7 +2791,7 @@ mod tests {
         );
 
         let sidecar = TwoFileShuffleReader::try_new_with_preload_limit(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             output_dir,
             3,
             2,

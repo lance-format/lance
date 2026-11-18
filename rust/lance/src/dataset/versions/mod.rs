@@ -32,7 +32,7 @@ use lance_file::{
     versions as file_versions,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_io::traits::Writer as ObjectWriter;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
 use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
@@ -125,7 +125,7 @@ fn create_current_file_writer(
 pub(in crate::dataset) async fn write_fragments(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_dir: &Path,
     normalized_schema: Schema,
     data: SendableRecordBatchStream,
@@ -256,7 +256,7 @@ pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -
 pub(in crate::dataset) async fn write_fragments_direct(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_dir: &Path,
     schema: &Schema,
     data: SendableRecordBatchStream,
@@ -665,7 +665,7 @@ pub async fn write_fragment(
 
 pub async fn open_writer(
     version: ConcreteFileVersion,
-    storage: &ObjectStore,
+    storage: &Storage,
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,

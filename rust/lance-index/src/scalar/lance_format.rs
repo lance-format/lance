@@ -22,7 +22,7 @@ use lance_file::versions::{self, OpenedFileReader};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_io::{ReadBatchParams, object_store::ObjectStore};
+use lance_io::{ReadBatchParams, storage::Storage};
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::format::list_index_files_with_sizes;
 use std::cmp::min;
@@ -70,7 +70,7 @@ impl CacheKey for IndexFileMetadataKey<'_> {
 /// each collection in a file in the lance format.
 #[derive(Debug, Clone)]
 pub struct LanceIndexStore {
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
@@ -97,11 +97,7 @@ impl DeepSizeOf for LanceIndexStore {
 
 impl LanceIndexStore {
     /// Create a new index store at the given directory
-    pub fn new(
-        storage: Arc<ObjectStore>,
-        index_dir: Path,
-        metadata_cache: Arc<LanceCache>,
-    ) -> Self {
+    pub fn new(storage: Arc<Storage>, index_dir: Path, metadata_cache: Arc<LanceCache>) -> Self {
         Self::with_format_version(
             storage,
             index_dir,
@@ -112,7 +108,7 @@ impl LanceIndexStore {
 
     /// Create a new index store at the given directory with a specific format version
     pub fn with_format_version(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
         format_version: ConcreteFileVersion,
@@ -770,7 +766,7 @@ mod tests {
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();
-        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = Storage::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();
@@ -806,7 +802,7 @@ mod tests {
 
         let index_dir = TempDir::default();
         let test_path = index_dir.obj_path();
-        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = Storage::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();
@@ -831,9 +827,9 @@ mod tests {
 
     /// Build a concrete store over `tempdir` so tests can reach the object store's
     /// IO counters and the store's scheduler.
-    fn concrete_test_store(tempdir: &TempDir) -> (Arc<ObjectStore>, LanceIndexStore) {
+    fn concrete_test_store(tempdir: &TempDir) -> (Arc<Storage>, LanceIndexStore) {
         let test_path = tempdir.obj_path();
-        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = Storage::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();

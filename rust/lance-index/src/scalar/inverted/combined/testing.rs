@@ -19,7 +19,7 @@ use lance_core::Result;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::error::DataFusionResult;
 use lance_core::utils::tempfile::TempObjDir;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_select::RowAddrTreeMap;
 use roaring::RoaringTreemap;
 
@@ -171,7 +171,7 @@ pub(super) async fn modern_identity_docs(
     let tmpdir = TempObjDir::default();
     let cache = Arc::new(LanceCache::no_cache());
     let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         cache.clone(),
     ));
@@ -306,7 +306,7 @@ pub(super) async fn element_document_index(
         .collect();
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

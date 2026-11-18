@@ -10,7 +10,7 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
 use lance_arrow::FieldExt;
 use lance_core::storage::path::Path;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, uri_to_url};
+use lance_io::storage::{Storage, StorageParams, StorageRegistry, uri_to_url};
 use roaring::RoaringBitmap;
 use url::Url;
 
@@ -30,7 +30,7 @@ pub(in crate::dataset) struct ExternalBaseCandidate {
     pub base_id: u32,
     pub store_prefix: String,
     pub base_path: Path,
-    pub store_params: ObjectStoreParams,
+    pub store_params: StorageParams,
 }
 
 #[derive(Debug)]
@@ -38,13 +38,13 @@ pub(in crate::dataset) struct ExternalBaseResolver {
     candidates: Vec<ExternalBaseCandidate>,
     pub(in crate::dataset) registered_base_ids: RoaringBitmap,
     pub(in crate::dataset) unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
-    store_registry: Arc<ObjectStoreRegistry>,
+    store_registry: Arc<StorageRegistry>,
 }
 
 impl ExternalBaseResolver {
     pub(in crate::dataset) fn new(
         candidates: Vec<ExternalBaseCandidate>,
-        store_registry: Arc<ObjectStoreRegistry>,
+        store_registry: Arc<StorageRegistry>,
     ) -> Self {
         Self {
             registered_base_ids: candidates.iter().map(|base| base.base_id).collect(),
@@ -66,7 +66,7 @@ impl ExternalBaseResolver {
         {
             return Ok(None);
         }
-        let uri_path = ObjectStore::extract_path_from_uri(self.store_registry.clone(), uri)?;
+        let uri_path = Storage::extract_path_from_uri(self.store_registry.clone(), uri)?;
 
         let mut best_match: Option<(usize, ResolvedExternalBase)> = None;
         for candidate in &self.candidates {
@@ -346,16 +346,14 @@ mod tests {
     use lance_core::datatypes::{BlobHandling, BlobKind, OnMissing};
     use lance_core::utils::tempfile::TempDir;
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::{
-        ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
-    };
+    use lance_io::storage::{Storage, StorageOptionsAccessor, StorageParams, StorageRegistry};
     use lance_table::format::BasePath;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     #[cfg(feature = "azure")]
-    fn azure_store_params(account_name: &str) -> ObjectStoreParams {
-        ObjectStoreParams {
+    fn azure_store_params(account_name: &str) -> StorageParams {
+        StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("account_name".to_string(), account_name.to_string()),
@@ -369,7 +367,7 @@ mod tests {
     #[cfg(feature = "azure")]
     #[tokio::test]
     async fn test_external_base_resolver_uses_candidate_store_params() {
-        let store_registry = Arc::new(ObjectStoreRegistry::default());
+        let store_registry = Arc::new(StorageRegistry::default());
         let base_a = BasePath::new(
             1,
             "az://container/path-a".to_string(),
@@ -387,11 +385,11 @@ mod tests {
         let base_b_params = azure_store_params("account-b");
 
         let (store_a, extracted_a) =
-            ObjectStore::from_uri_and_params(store_registry.clone(), &base_a.path, &base_a_params)
+            Storage::from_uri_and_params(store_registry.clone(), &base_a.path, &base_a_params)
                 .await
                 .unwrap();
         let (store_b, extracted_b) =
-            ObjectStore::from_uri_and_params(store_registry.clone(), &base_b.path, &base_b_params)
+            Storage::from_uri_and_params(store_registry.clone(), &base_b.path, &base_b_params)
                 .await
                 .unwrap();
 

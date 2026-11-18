@@ -111,7 +111,7 @@ use lance::dataset::{
 };
 use lance::session::Session;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
-use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::storage::StorageRegistry;
 use lance_table::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
 use lance_table::rowids::version::write_dataset_versions;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -318,7 +318,7 @@ fn batch(schema: Arc<ArrowSchema>, start: i64, len: usize) -> RecordBatch {
 /// A fresh session with no caches, so each measurement pays the real decode
 /// rather than reading back what the previous one memoized.
 fn cold_session() -> Arc<Session> {
-    Arc::new(Session::new(0, 0, Arc::new(ObjectStoreRegistry::default())))
+    Arc::new(Session::new(0, 0, Arc::new(StorageRegistry::default())))
 }
 
 async fn open_cold(uri: &str) -> Dataset {

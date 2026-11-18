@@ -46,7 +46,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::deletion::relative_deletion_file_path;
 use rstest::rstest;
@@ -152,7 +152,7 @@ async fn scoped_count_reads_only_scoped_deletions(
     let io = Arc::new(IOTracker::default());
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {
-            store_options: Some(ObjectStoreParams {
+            store_options: Some(StorageParams {
                 backend_wrappers: vec![io.clone()],
                 ..Default::default()
             }),

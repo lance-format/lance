@@ -236,7 +236,7 @@ async fn load_counted_v2_index_with_counter(
 ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
     let tmpdir = TempObjDir::default();
     let inner_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -337,7 +337,7 @@ async fn load_counted_v3_index(
 ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1365,7 +1365,7 @@ async fn load_v2_index_with_grouped_postings(
 ) -> (Arc<InvertedIndex>, Arc<LanceCache>) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

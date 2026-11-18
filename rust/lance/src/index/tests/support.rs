@@ -865,7 +865,7 @@ impl RequestIndexStoreWrapper {
                 if path.as_ref().contains(&index_path) {
                     policy_requests.lock().unwrap().push(method.to_owned());
                     if policy_revoked.load(Ordering::Relaxed) {
-                        return Err(lance_io::object_store::Error::Generic {
+                        return Err(lance_io::storage::Error::Generic {
                             store: "RequestIndexStoreWrapper",
                             source: "request credentials have been revoked".into(),
                         }
@@ -883,12 +883,12 @@ impl RequestIndexStoreWrapper {
     }
 }
 
-impl WrappingObjectStore for RequestIndexStoreWrapper {
+impl BackendWrapper for RequestIndexStoreWrapper {
     fn wrap(
         &self,
         _storage_prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(ProxyBackend::new(original, self.policy.clone()))
     }
 }

@@ -1595,7 +1595,7 @@ mod tests {
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
     use lance_core::{Error, ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_select::RowAddrTreeMap;
 
     use crate::scalar::{
@@ -1637,7 +1637,7 @@ mod tests {
     async fn test_empty_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1680,7 +1680,7 @@ mod tests {
     async fn test_basic_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1750,7 +1750,7 @@ mod tests {
     async fn test_multiple_fragments_bloomfilter() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1837,7 +1837,7 @@ mod tests {
     async fn test_nan_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1935,7 +1935,7 @@ mod tests {
     async fn test_complex_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2025,7 +2025,7 @@ mod tests {
     async fn test_string_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2105,7 +2105,7 @@ mod tests {
     async fn test_binary_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2173,7 +2173,7 @@ mod tests {
     async fn test_large_data_types_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2235,7 +2235,7 @@ mod tests {
     async fn test_timestamp_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2294,7 +2294,7 @@ mod tests {
     async fn test_timestamp_types_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2374,7 +2374,7 @@ mod tests {
     async fn test_time_types_bloomfilter_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2430,7 +2430,7 @@ mod tests {
     async fn test_bloomfilter_supported_operations() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2493,7 +2493,7 @@ mod tests {
         // Test that bloomfilter index correctly returns null_list for queries
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2614,7 +2614,7 @@ mod tests {
     async fn test_bloomfilter_chunked_write_and_load() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2716,7 +2716,7 @@ mod tests {
     async fn test_bloomfilter_chunked_write_rejects_oversized_filter() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2799,7 +2799,7 @@ mod tests {
     async fn test_update_legacy_none_null_rows_not_treated_as_no_nulls() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2870,7 +2870,7 @@ mod tests {
     async fn test_legacy_bloomfilter_no_null_bitmap() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2902,7 +2902,7 @@ mod tests {
         fn create_store() -> (TempObjDir, Arc<LanceIndexStore>) {
             let tmpdir = TempObjDir::default();
             let store = Arc::new(LanceIndexStore::new(
-                Arc::new(ObjectStore::local()),
+                Arc::new(Storage::local()),
                 tmpdir.clone(),
                 Arc::new(LanceCache::no_cache()),
             ));

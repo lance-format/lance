@@ -78,7 +78,7 @@ use lance_index::{
 };
 use lance_io::local::to_local_path;
 use lance_io::stream::RecordBatchStream;
-use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
+use lance_io::{storage::Storage, stream::RecordBatchStreamAdapter};
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::IndexFile;
@@ -355,7 +355,7 @@ impl ExistingIndex {
 // To build the index for given IVF, quantizer, data stream,
 // call `with_ivf`, `with_quantizer`, `shuffle_data_input`, and `build` in order.
 pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
-    store: ObjectStore,
+    store: Storage,
     column: String,
     index_dir: Path,
     distance_type: DistanceType,
@@ -1817,7 +1817,7 @@ async fn take_partition_batches(
 
 /// Where and how `merge_partitions` writes the index files.
 struct MergeTarget<'a> {
-    store: &'a ObjectStore,
+    store: &'a Storage,
     index_dir: &'a Path,
     format_version: ConcreteFileVersion,
     distance_type: DistanceType,
@@ -2234,7 +2234,7 @@ async fn shuffle_transformed(
 /// keeping them off the builder compiles them once instead of once per
 /// sub-index and quantizer combination.
 struct PartitionAdjuster<'a> {
-    store: &'a ObjectStore,
+    store: &'a Storage,
     column: String,
     temp_dir: &'a Path,
     distance_type: DistanceType,
@@ -2252,7 +2252,7 @@ impl PartitionAdjuster<'_> {
     async fn take_vectors(
         dataset: &Dataset,
         column: &str,
-        store: &ObjectStore,
+        store: &Storage,
         row_ids: &[u64],
     ) -> Result<Vec<RecordBatch>> {
         Self::take_vectors_stream(

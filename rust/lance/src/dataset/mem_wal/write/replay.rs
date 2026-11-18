@@ -8,7 +8,7 @@ use std::sync::Arc;
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use uuid::Uuid;
 
 use super::schema::conform_to_storage_schema;
@@ -64,7 +64,7 @@ pub(super) struct ReplayResult {
 /// WAL append.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn replay_memtable_from_wal(
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: Path,
     dir_id: &str,
     shard_id: Uuid,

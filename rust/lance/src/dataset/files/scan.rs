@@ -158,7 +158,7 @@ pub fn scan_manifests(dataset: &Dataset, min_version: Option<u64>) -> ManifestSc
 /// ahead of the reader.
 fn spawn_lister(
     commit_handler: Arc<dyn lance_table::io::commit::CommitHandler>,
-    storage: Arc<lance_io::object_store::ObjectStore>,
+    storage: Arc<lance_io::storage::Storage>,
     base: Path,
     min_version: Option<u64>,
     tx_locations: tokio::sync::mpsc::Sender<ManifestLocation>,
@@ -197,7 +197,7 @@ fn spawn_lister(
 /// Read failures travel as `Err` items in the stream rather than ending the
 /// walk, so this task itself is infallible.
 fn spawn_reader(
-    storage: Arc<lance_io::object_store::ObjectStore>,
+    storage: Arc<lance_io::storage::Storage>,
     base: Path,
     mut rx_locations: tokio::sync::mpsc::Receiver<ManifestLocation>,
     tx_manifest: tokio::sync::mpsc::Sender<Result<ScannedManifest>>,
@@ -421,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn read_failure_surfaces_as_an_error_item() {
         use crate::dataset::builder::DatasetBuilder;
-        use crate::dataset::{ObjectStoreParams, ReadParams};
+        use crate::dataset::{ReadParams, StorageParams};
         use crate::utils::test::FailingProxyStore;
 
         // A real store, not `memory://`: the failing proxy wraps the store, and
@@ -438,7 +438,7 @@ mod tests {
         let failing = Arc::new(FailingProxyStore::new());
         let dataset = DatasetBuilder::from_uri(uri)
             .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
+                store_options: Some(StorageParams {
                     backend_wrappers: vec![failing.clone()],
                     ..Default::default()
                 }),

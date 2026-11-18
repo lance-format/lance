@@ -50,7 +50,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_io::stream::RecordBatchStream;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_tokenizer::{
@@ -1190,7 +1190,7 @@ impl NGramIndexBuilder {
 
         let tmpdir = Arc::new(TempDir::default());
         let spill_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2145,7 +2145,7 @@ mod tests {
     use lance_core::{Error, ROW_ID, Result, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_file::version::ConcreteFileVersion;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_io::stream::{
         RecordBatchStream, RecordBatchStreamAdapter as LanceRecordBatchStreamAdapter,
     };
@@ -2340,7 +2340,7 @@ mod tests {
 
         let tmpdir = Arc::new(TempDir::default());
         let test_store = LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         );
@@ -2540,7 +2540,7 @@ mod tests {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
         let spill_files = builder.train(data).await.unwrap();
         let tmpdir = TempDir::default();
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let store = Arc::new(LanceIndexStore::new(
             storage.clone(),
             tmpdir.obj_path(),
@@ -2783,7 +2783,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(TempDir::default());
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2820,7 +2820,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(TempDir::default());
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2882,7 +2882,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(TempDir::default());
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2948,7 +2948,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(TempDir::default());
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2991,7 +2991,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(TempDir::default());
         let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             new_tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3194,7 +3194,7 @@ mod tests {
 
         let tmpdir = Arc::new(TempDir::default());
         let store = LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         );
@@ -3257,7 +3257,7 @@ mod tests {
 
         let tmpdir = Arc::new(TempDir::default());
         let store = LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         );
@@ -3322,7 +3322,7 @@ mod tests {
 
         let tmpdir = Arc::new(TempDir::default());
         let store = LanceIndexStore::with_format_version(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
             ConcreteFileVersion::V2_2,

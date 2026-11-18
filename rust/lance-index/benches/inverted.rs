@@ -25,7 +25,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
     metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
 };
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -40,7 +40,7 @@ fn bench_inverted(c: &mut Criterion) {
         let index_dir = Path::from_filesystem_path(path).unwrap();
         rt.block_on(async {
             Arc::new(LanceIndexStore::new(
-                Arc::new(ObjectStore::local()),
+                Arc::new(Storage::local()),
                 index_dir,
                 Arc::new(LanceCache::no_cache()),
             ))

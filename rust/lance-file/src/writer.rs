@@ -8,7 +8,7 @@ use bytes::Bytes;
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::decoder::{ColumnInfo, PageEncoding};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use prost::Message;
 use prost_types::Any;
 
@@ -150,7 +150,7 @@ impl From<versions::v2_3::Writer> for FileWriter {
 
 impl FileWriter {
     /// Spill page metadata to a sidecar file.
-    pub fn with_page_metadata_spill(self, storage: Arc<ObjectStore>, path: Path) -> Self {
+    pub fn with_page_metadata_spill(self, storage: Arc<Storage>, path: Path) -> Self {
         match self {
             Self::V2_0(writer) => {
                 Self::V2_0(Box::new((*writer).with_page_metadata_spill(storage, path)))

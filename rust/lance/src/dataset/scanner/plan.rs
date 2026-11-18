@@ -1221,7 +1221,7 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::storage::StorageParams;
     use lance_io::utils::tracking_store::IOTracker;
     use lance_select::result::IndexExprResultWireFormat;
     use rstest::rstest;
@@ -1902,7 +1902,7 @@ mod tests {
             .unwrap();
         let tracker = Arc::new(IOTracker::default());
         let dataset = crate::dataset::builder::DatasetBuilder::from_uri(data_dir.as_str())
-            .with_store_params(ObjectStoreParams {
+            .with_store_params(StorageParams {
                 backend_wrappers: vec![tracker.clone()],
                 ..Default::default()
             })

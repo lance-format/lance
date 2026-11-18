@@ -19,7 +19,7 @@ pub trait ProtoStruct {
     type Proto: Message;
 }
 
-pub type ByteStream = BoxStream<'static, crate::object_store::Result<Bytes>>;
+pub type ByteStream = BoxStream<'static, crate::storage::Result<Bytes>>;
 
 /// A trait for writing to a file on local file system or object store.
 #[async_trait]
@@ -143,24 +143,21 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn io_parallelism(&self) -> usize;
 
     /// Object/File Size.
-    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>>;
+    fn size(&self) -> BoxFuture<'_, crate::storage::Result<usize>>;
 
     /// Read a range of bytes from the object.
     ///
     /// TODO: change to read_at()?
-    fn get_range(
-        &self,
-        range: Range<usize>,
-    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>>;
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, crate::storage::Result<Bytes>>;
 
     /// Read all bytes from the object.
     ///
     /// By default this reads the size in a separate IOP but some implementations
     /// may not need the size beforehand.
-    fn get_all(&self) -> BoxFuture<'_, crate::object_store::Result<Bytes>>;
+    fn get_all(&self) -> BoxFuture<'_, crate::storage::Result<Bytes>>;
 
     /// Read the entire object as a byte stream.
-    fn get_stream(&self) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
+    fn get_stream(&self) -> BoxFuture<'_, crate::storage::Result<ByteStream>> {
         Box::pin(async move {
             let bytes = self.get_all().await?;
             Ok(futures::stream::once(async move { Ok(bytes) }).boxed())
@@ -171,7 +168,7 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn get_range_stream(
         &self,
         range: Range<usize>,
-    ) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
+    ) -> BoxFuture<'_, crate::storage::Result<ByteStream>> {
         Box::pin(async move {
             let bytes = self.get_range(range).await?;
             Ok(futures::stream::once(async move { Ok(bytes) }).boxed())

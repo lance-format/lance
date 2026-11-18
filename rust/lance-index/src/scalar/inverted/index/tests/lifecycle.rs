@@ -14,7 +14,7 @@ use crate::Index;
 async fn test_calculate_included_frags_is_unsupported() -> Result<()> {
     let dir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -102,7 +102,7 @@ async fn build_multi_partition_index(
 async fn test_posting_data_size_bytes_uses_file_length() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -128,7 +128,7 @@ async fn test_posting_data_size_bytes_uses_file_length() {
 async fn test_partitions_load_with_distinct_priorities() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -163,12 +163,12 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
     let src_dir = TempObjDir::default();
     let dest_dir = TempObjDir::default();
     let src_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         src_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let dest_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dest_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -246,12 +246,12 @@ async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()
     let src_dir = TempObjDir::default();
     let dest_dir = TempObjDir::default();
     let src_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         src_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let dest_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dest_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -301,12 +301,12 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
     let src_dir = TempObjDir::default();
     let dest_dir = TempObjDir::default();
     let src_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         src_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let dest_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dest_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -359,12 +359,12 @@ async fn test_merge_segments_preserves_format_version(
     let src_dir = TempObjDir::default();
     let dest_dir = TempObjDir::default();
     let src_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         src_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let dest_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dest_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -402,17 +402,17 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
     let populated_dir = TempObjDir::default();
     let dest_dir = TempObjDir::default();
     let empty_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         empty_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let populated_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         populated_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let dest_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dest_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -469,17 +469,17 @@ async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()
     let src_dir_2 = TempObjDir::default();
     let dest_dir = TempObjDir::default();
     let src_store_1 = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         src_dir_1.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let src_store_2 = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         src_dir_2.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
     let dest_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dest_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -528,7 +528,7 @@ async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
     // The load path should gracefully handle this with an empty bitmap.
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

@@ -19,14 +19,14 @@ use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
 };
-use lance::io::ObjectStore;
+use lance::io::Storage;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{BlobHandling, OnMissing, Projection, Schema};
 use lance_core::storage::path::Path;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_file::versions as file_versions;
-use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::storage::{StorageParams, StorageRegistry};
 use lance_io::{
     ReadBatchParams,
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -112,14 +112,14 @@ fn inner_open<'local>(
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
     let reader = block_on(async move {
-        let object_params = ObjectStoreParams {
+        let object_params = StorageParams {
             storage_options_accessor: Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(storage_options),
             )),
             ..Default::default()
         };
-        let (obj_store, path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let (obj_store, path) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             &file_uri_str,
             &object_params,
         )

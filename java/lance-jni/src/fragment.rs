@@ -23,9 +23,9 @@ use roaring::RoaringBitmap;
 
 use lance::dataset::NewColumnTransform;
 use lance::dataset::fragment::write::FragmentCreateBuilder;
-use lance::io::ObjectStoreParams;
+use lance::io::StorageParams;
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use lance_io::storage::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -374,7 +374,7 @@ fn create_fragment<'a>(
                 ),
             )
         };
-        write_params.store_params = Some(ObjectStoreParams {
+        write_params.store_params = Some(StorageParams {
             storage_options_accessor: Some(accessor),
             ..Default::default()
         });

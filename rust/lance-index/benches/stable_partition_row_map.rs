@@ -23,7 +23,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_index::frag_reuse::row_map::{RowMapReader, RowMapWriter, SourceRows};
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
@@ -49,7 +49,7 @@ fn fixture() -> &'static Fixture {
         // The store's IO scheduler spawns onto the ambient tokio runtime.
         let _guard = runtime.enter();
         let (storage, path) = runtime
-            .block_on(ObjectStore::from_uri(tempdir.obj_path().as_ref()))
+            .block_on(Storage::from_uri(tempdir.obj_path().as_ref()))
             .unwrap();
         // 2.1+ has the miniblock dictionary path; 2.0 stores the labels as
         // plain u16 and roughly triples the file.

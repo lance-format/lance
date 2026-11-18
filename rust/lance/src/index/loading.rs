@@ -1284,7 +1284,7 @@ impl Dataset {
     /// its distance type, both read before any centroid or quantizer.
     pub(crate) async fn read_vector_index_metadata(
         &self,
-        storage: &Arc<lance_io::object_store::ObjectStore>,
+        storage: &Arc<lance_io::storage::Storage>,
         index_file: &lance_core::storage::path::Path,
         file_sizes: &HashMap<String, u64>,
     ) -> Result<lance_index::IndexMetadata> {

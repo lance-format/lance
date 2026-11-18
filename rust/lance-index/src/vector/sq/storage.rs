@@ -17,7 +17,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::storage::path::Path;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_linalg::distance::{DistanceType, dot_u8::dot_u8_u64, l2_u8::l2_u8_u64};
 use lance_table::format::SelfDescribingFileReader;
 use num_traits::AsPrimitive;
@@ -224,7 +224,7 @@ impl ScalarQuantizationStorage {
     }
 
     pub async fn load(
-        storage: &ObjectStore,
+        storage: &Storage,
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {

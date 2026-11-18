@@ -35,7 +35,7 @@ use lance_core::{
 use lance_datafusion_exec::datagen::DatafusionDatagenExt;
 use lance_datagen::ArrayGeneratorExt;
 use lance_datagen::{BatchCount, RowCount, array};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::ops::Bound;
 
@@ -329,7 +329,7 @@ async fn test_merge_legacy_decimal_mixed_null_singleton_is_rejected() {
 
     let dest_tmpdir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dest_tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -423,7 +423,7 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
 
     let dest_tmpdir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dest_tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -498,7 +498,7 @@ async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
 
     let dest_tmpdir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dest_tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -633,7 +633,7 @@ async fn test_lookup_is_not_supported() {
 async fn test_empty_zonemap_index() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -683,7 +683,7 @@ async fn test_empty_zonemap_index() {
 async fn test_null_zonemap_index() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -822,7 +822,7 @@ async fn test_zonemap_null_handling_in_queries() {
     // Test that zonemap index correctly returns null_list for queries
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -904,7 +904,7 @@ async fn test_zonemap_null_handling_in_queries() {
 async fn test_nan_zonemap_index() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1134,7 +1134,7 @@ async fn test_nan_zonemap_index() {
 async fn test_basic_zonemap_index() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1341,7 +1341,7 @@ async fn test_basic_zonemap_index() {
 async fn test_complex_zonemap_index() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1476,7 +1476,7 @@ async fn test_complex_zonemap_index() {
 async fn test_multiple_fragments_zonemap() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1961,7 +1961,7 @@ async fn test_fragment_id_assignment() {
 async fn test_like_prefix_query() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2081,7 +2081,7 @@ async fn test_like_prefix_query() {
 async fn test_like_prefix_edge_cases() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2170,7 +2170,7 @@ async fn test_like_prefix_edge_cases() {
 async fn test_like_prefix_large_utf8() {
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2339,7 +2339,7 @@ fn test_compute_next_prefix() {
 async fn test_merge_with_legacy_none_segment_not_treated_as_no_nulls() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2432,7 +2432,7 @@ async fn test_merge_with_legacy_none_segment_not_treated_as_no_nulls() {
 
     let dest_tmpdir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dest_tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2516,7 +2516,7 @@ async fn write_legacy_zonemap(store: &dyn IndexStore, null_count: u32) {
 async fn test_legacy_zonemap_no_null_bitmap() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2766,7 +2766,7 @@ async fn test_update_with_seeds_propagates_null_bitmap() {
     // Build an initial zone map index with one fragment that has nulls at rows 0 and 2.
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2836,7 +2836,7 @@ async fn test_update_with_seeds_propagates_null_bitmap() {
     // Update the index with the seed.
     let dest_tmpdir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dest_tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2892,7 +2892,7 @@ async fn test_update_with_seeds_legacy_index_keeps_null_rows_none() {
 
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -2954,7 +2954,7 @@ async fn test_update_with_seeds_legacy_index_keeps_null_rows_none() {
 
     let dest_tmpdir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dest_tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -3007,7 +3007,7 @@ async fn test_merge_modern_and_legacy_index_drops_null_bitmap() {
 
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -3087,7 +3087,7 @@ async fn test_merge_modern_and_legacy_index_drops_null_bitmap() {
 
     let dest_tmpdir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         dest_tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -3826,7 +3826,7 @@ async fn train_and_load_fsl(rows: Vec<Vec<Option<f32>>>, list_size: i32) -> Arc<
 
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -3947,7 +3947,7 @@ async fn test_fsl_zonemap_null_list() {
 
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -4064,7 +4064,7 @@ async fn test_fsl_zonemap_all_null_zone() {
     let batch = RecordBatch::try_new(schema.clone(), vec![fsl_arr, row_addr]).unwrap();
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -4132,7 +4132,7 @@ async fn test_struct_zonemap_null_tracking() {
 
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -4211,7 +4211,7 @@ async fn test_list_zonemap_null_tracking() {
 
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -4465,7 +4465,7 @@ async fn test_list_zonemap_training_ignores_child_nulls() {
 
     let tmpdir = TempObjDir::default();
     let test_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -5322,7 +5322,7 @@ async fn build_segment_from_batches(
 
 fn local_store(dir: &TempObjDir) -> Arc<LanceIndexStore> {
     Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         (**dir).clone(),
         Arc::new(LanceCache::no_cache()),
     ))

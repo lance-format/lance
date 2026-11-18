@@ -14,8 +14,8 @@ use std::{
 use bytes::Bytes;
 use futures::FutureExt;
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
+use lance_io::storage::Storage;
 use tokio::sync::{Mutex, OnceCell, oneshot};
 
 use lance_core::datatypes::BlobKind;
@@ -31,7 +31,7 @@ use lance_core::{Error, Result};
 /// existing I/O scheduler.
 #[derive(Debug)]
 pub(super) struct BlobSource {
-    pub(super) storage: Arc<ObjectStore>,
+    pub(super) storage: Arc<Storage>,
     pub(super) path: Path,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
@@ -42,7 +42,7 @@ pub(super) struct BlobSource {
 
 impl BlobSource {
     /// Create a shared read context for one physical backing object.
-    pub(super) fn new(storage: Arc<ObjectStore>, path: Path) -> Self {
+    pub(super) fn new(storage: Arc<Storage>, path: Path) -> Self {
         Self {
             storage,
             path,
@@ -251,7 +251,7 @@ impl BlobSourceKey {
 /// single lazy-open scheduler and pending-read queue.
 pub(super) fn shared_blob_source(
     source_cache: &mut HashMap<BlobSourceKey, Arc<BlobSource>>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     path: &Path,
 ) -> Arc<BlobSource> {
     let key = BlobSourceKey {
@@ -307,7 +307,7 @@ impl BlobFile {
     /// * `path` - Full path to the data file containing inline blob bytes.
     /// * `position` - Byte offset of the blob payload inside the data file.
     /// * `size` - Blob payload length in bytes.
-    pub fn new_inline(storage: Arc<ObjectStore>, path: Path, position: u64, size: u64) -> Self {
+    pub fn new_inline(storage: Arc<Storage>, path: Path, position: u64, size: u64) -> Self {
         Self::with_source(
             Arc::new(BlobSource::new(storage, path)),
             position,
@@ -327,7 +327,7 @@ impl BlobFile {
     /// * `object_store` - The store that owns `path`; reads are issued against this store.
     /// * `path` - Full path to the dedicated sidecar blob file.
     /// * `size` - Total byte length to expose from the sidecar file.
-    pub fn new_dedicated(storage: Arc<ObjectStore>, path: Path, size: u64) -> Self {
+    pub fn new_dedicated(storage: Arc<Storage>, path: Path, size: u64) -> Self {
         Self::with_source(
             Arc::new(BlobSource::new(storage, path)),
             0,
@@ -348,7 +348,7 @@ impl BlobFile {
     /// * `path` - Full path to the packed sidecar blob file.
     /// * `position` - Start offset of this blob within the packed sidecar.
     /// * `size` - Blob payload length in bytes.
-    pub fn new_packed(storage: Arc<ObjectStore>, path: Path, position: u64, size: u64) -> Self {
+    pub fn new_packed(storage: Arc<Storage>, path: Path, position: u64, size: u64) -> Self {
         Self::with_source(
             Arc::new(BlobSource::new(storage, path)),
             position,
@@ -372,7 +372,7 @@ impl BlobFile {
     /// * `position` - Start offset of the blob payload in the external object.
     /// * `size` - Number of bytes exposed from `position`.
     pub fn new_external(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         path: Path,
         uri: String,
         position: u64,
@@ -758,7 +758,7 @@ mod tests {
         utils::tempfile::{TempDir, TempStrDir},
     };
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use rstest::rstest;
     use std::sync::{Arc, atomic::Ordering};
     use std::time::Duration;
@@ -780,7 +780,7 @@ mod tests {
         std::fs::write(&file_path, b"abcd").unwrap();
 
         let path = Path::from_absolute_path(file_path).unwrap();
-        let blob = BlobFile::new_packed(Arc::new(ObjectStore::local()), path, 1, 2);
+        let blob = BlobFile::new_packed(Arc::new(Storage::local()), path, 1, 2);
 
         assert_eq!(blob.read().await.unwrap().as_ref(), b"bc");
         assert_eq!(blob.tell().await.unwrap(), 2);
@@ -837,7 +837,7 @@ mod tests {
         let file_path = test_dir.std_path().join("blob.bin");
         std::fs::write(&file_path, b"abcdefgh").unwrap();
         let path = Path::from_absolute_path(&file_path).unwrap();
-        let blob = BlobFile::new_packed(Arc::new(ObjectStore::local()), path, 2, 4);
+        let blob = BlobFile::new_packed(Arc::new(Storage::local()), path, 2, 4);
         std::fs::OpenOptions::new()
             .write(true)
             .open(&file_path)

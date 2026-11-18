@@ -13,9 +13,9 @@ use lance::dataset::refs::check_valid_branch;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
-use lance_io::object_store::Error as ObjectStoreError;
-use lance_io::object_store::throttle::is_throttle_error;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, ReadDirOptions};
+use lance_io::storage::Error as ObjectStoreError;
+use lance_io::storage::throttle::is_throttle_error;
+use lance_io::storage::{ReadDirOptions, Storage, StorageParams, StorageRegistry};
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{DescribeTableRequest, Identity};
 
@@ -167,7 +167,7 @@ impl DirectoryNamespace {
         None
     }
 
-    /// Page size requested from [`ObjectStore::read_dir_page`] while scanning the namespace
+    /// Page size requested from [`Storage::read_dir_page`] while scanning the namespace
     /// directory for tables. Only bounds the cost of one backend request on stores that push
     /// pagination down (S3, GCS, Azure); `list_directory_tables` always walks every page.
     const LIST_DIRECTORY_PAGE_SIZE: usize = 1000;
@@ -556,8 +556,8 @@ impl DirectoryNamespace {
             .session
             .as_ref()
             .map(|session| session.store_registry())
-            .unwrap_or_else(|| Arc::new(ObjectStoreRegistry::default()));
-        ObjectStore::extract_path_from_uri(registry, uri)
+            .unwrap_or_else(|| Arc::new(StorageRegistry::default()));
+        Storage::extract_path_from_uri(registry, uri)
     }
 
     /// Normalize and validate a branch selector: `None`, empty, and `main` mean
@@ -718,9 +718,9 @@ impl DirectoryNamespace {
         if let Some(extra_storage_options) = extra_storage_options {
             merged_storage_options.extend(extra_storage_options);
         }
-        let store_params = (!merged_storage_options.is_empty()).then(|| ObjectStoreParams {
+        let store_params = (!merged_storage_options.is_empty()).then(|| StorageParams {
             storage_options_accessor: Some(Arc::new(
-                lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                lance_io::storage::StorageOptionsAccessor::with_static_options(
                     merged_storage_options,
                 ),
             )),
@@ -824,7 +824,7 @@ impl DirectoryNamespace {
             if is_throttle_error(os_err) {
                 return NamespaceError::Throttling {
                     message: format!(
-                        "ObjectStore request was throttled while resolving table: {detail}"
+                        "Storage request was throttled while resolving table: {detail}"
                     ),
                     retry_after: None,
                 }
@@ -832,15 +832,13 @@ impl DirectoryNamespace {
             }
             if Self::is_service_unavailable_error(os_err) {
                 return NamespaceError::ServiceUnavailable {
-                    message: format!(
-                        "ObjectStore service unavailable while resolving table: {detail}"
-                    ),
+                    message: format!("Storage service unavailable while resolving table: {detail}"),
                 }
                 .into();
             }
         }
         NamespaceError::Internal {
-            message: format!("ObjectStore error while resolving table: {detail}"),
+            message: format!("Storage error while resolving table: {detail}"),
         }
         .into()
     }

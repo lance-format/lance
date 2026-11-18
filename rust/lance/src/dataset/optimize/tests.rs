@@ -77,8 +77,8 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{Index, IndexType};
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::storage::Storage;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::feature_flags::{FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_SPILLED_ROW_LINEAGE};
 use lance_table::format::Manifest;
@@ -493,7 +493,7 @@ impl CommitHandler for RaceBeforeRewrite {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &lance_core::storage::path::Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<lance_table::format::Transaction>,

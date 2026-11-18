@@ -70,8 +70,8 @@ use lance_index::{
         sq::builder::SQBuildParams,
     },
 };
-use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
+use lance_io::storage::{
+    LanceNamespaceStorageOptionsProvider, StorageOptionsAccessor, StorageParams,
 };
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, IndexMetadata};
@@ -623,7 +623,7 @@ impl Dataset {
             // Auto-create storage options provider from namespace client
             // when storage_options are present (meaning credentials came from namespace.describe_table)
             if initial_storage_options.is_some() {
-                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                let provider: Arc<dyn lance_io::storage::StorageOptionsProvider> = Arc::new(
                     LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
                 );
                 // Create accessor with initial options and provider for credential refresh
@@ -655,7 +655,7 @@ impl Dataset {
         if let Some(base_store_params) = base_store_params {
             for (base_path, opts) in base_store_params {
                 let accessor = Arc::new(StorageOptionsAccessor::with_static_options(opts));
-                let store_params = ObjectStoreParams {
+                let store_params = StorageParams {
                     storage_options_accessor: Some(accessor),
                     ..Default::default()
                 };
@@ -1868,7 +1868,7 @@ impl Dataset {
         // Perform a shallow clone of the dataset into the target path.
         // `version` can be a version number or a tag name.
         // `storage_options` will be forwarded to the object store params for the new dataset.
-        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+        let store_params = storage_options.as_ref().map(|opts| StorageParams {
             storage_options_accessor: Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(opts.clone()),
             )),
@@ -1902,7 +1902,7 @@ impl Dataset {
         reference: Option<Bound<PyAny>>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+        let store_params = storage_options.as_ref().map(|opts| StorageParams {
             storage_options_accessor: Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(opts.clone()),
             )),
@@ -2197,7 +2197,7 @@ impl Dataset {
     ) -> PyResult<Self> {
         let mut new_self = self.ds.as_ref().clone();
         let reference = self.transform_ref(reference)?;
-        let store_params = storage_options.map(|opts| ObjectStoreParams {
+        let store_params = storage_options.map(|opts| StorageParams {
             storage_options_accessor: Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(opts),
             )),
@@ -2885,7 +2885,7 @@ impl Dataset {
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let storage_params = if accessor.is_some() {
-            Some(ObjectStoreParams {
+            Some(StorageParams {
                 storage_options_accessor: accessor,
                 ..Default::default()
             })
@@ -3022,7 +3022,7 @@ impl Dataset {
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let storage_params = if accessor.is_some() {
-            Some(ObjectStoreParams {
+            Some(StorageParams {
                 storage_options_accessor: accessor,
                 ..Default::default()
             })

@@ -37,11 +37,11 @@
 //! # Example
 //!
 //! ```no_run
-//! # use lance_io::object_store::ObjectStore;
+//! # use lance_io::storage::Storage;
 //! # async fn example() -> lance_core::Result<()> {
 //! // Enable io_uring by using the file+uring:// scheme
 //! let uri = "file+uring:///path/to/file.dat";
-//! let (store, path) = ObjectStore::from_uri(uri).await?;
+//! let (store, path) = Storage::from_uri(uri).await?;
 //! let reader = store.open(&path).await?;
 //!
 //! // Reader will use io_uring

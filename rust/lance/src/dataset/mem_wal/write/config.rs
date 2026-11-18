@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use lance_core::Result;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 use uuid::Uuid;
 
 use super::backpressure::BackpressureController;
@@ -210,7 +210,7 @@ pub struct ShardWriterConfig {
     /// these to the params of the dataset at `base_uri`, not to params bound to
     /// some other path — generation URIs are derived from them.
     /// Default: `None` (open by URI alone).
-    pub store_params: Option<ObjectStoreParams>,
+    pub store_params: Option<StorageParams>,
 
     /// Session for those opens, injected alongside `store_params`.
     /// Default: `None`.

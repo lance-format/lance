@@ -52,8 +52,7 @@ async fn test_read_fts_format_fixture(#[case] fixture_path: &str, #[case] expect
             "_indices/{}",
             indices[0].uuid
         )));
-        let request =
-            dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+        let request = dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn BackendWrapper>]);
         assert_eq!(
             search_ids(
                 &request,

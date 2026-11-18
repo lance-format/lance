@@ -562,7 +562,7 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{Error, ROW_ADDR, ROW_ID};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -610,7 +610,7 @@ mod tests {
     fn new_store() -> (Arc<LanceIndexStore>, TempObjDir) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1656,7 +1656,7 @@ mod tests {
         // them never reaches the object store.
         const PAGE_SIZE: u64 = 4096;
         let rows: Vec<Row> = (0..8 * PAGE_SIZE).map(|i| (Some(i as i32), i)).collect();
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             storage.clone(),

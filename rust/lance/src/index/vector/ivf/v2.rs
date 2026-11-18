@@ -87,9 +87,7 @@ use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 use lance_io::local::to_local_path;
 use lance_io::scheduler::{IoStats, ScanStats, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_io::{
-    ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
-};
+use lance_io::{ReadBatchParams, scheduler::ScanScheduler, storage::Storage, traits::Reader};
 use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrTreeMap;
 use prost::Message;
@@ -891,7 +889,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
 
     fn reconstruct<'a>(
         &'a self,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<ResolvedRemapping>,
@@ -1068,7 +1066,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
 
     fn reconstruct<'a>(
         &'a self,
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<ResolvedRemapping>,
@@ -1345,7 +1343,7 @@ pub(crate) struct IvfOpenContext {
 /// The key of the auxiliary (storage) file of index `uuid` in `index_dir`
 /// on `storage`, which IVF_RQ runtime handles, the resident store and
 /// the lazy scan's far gather pools, are shared by.
-pub(crate) fn aux_file_key(storage: &ObjectStore, index_dir: &Path, uuid: &Uuid) -> IndexFileKey {
+pub(crate) fn aux_file_key(storage: &Storage, index_dir: &Path, uuid: &Uuid) -> IndexFileKey {
     let uuid = uuid.to_string();
     let aux_path = index_dir
         .clone()
@@ -1778,7 +1776,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// Create a new IVF index.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_new(
-        storage: Arc<ObjectStore>,
+        storage: Arc<Storage>,
         index_dir: Path,
         uuid: Uuid,
         frag_reuse_index: Option<ResolvedRemapping>,
@@ -2016,7 +2014,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// [`OriginLatencyClass::resolve_with_hint`]); any other index takes the
     /// class of its store, since no reader policy of theirs depends on it.
     fn origin_latency_at_open(
-        storage: &ObjectStore,
+        storage: &Storage,
         hint: Option<OriginLatencyClass>,
     ) -> Result<OriginLatencyClass> {
         if Q::quantization_type() != QuantizationType::Rabit {
@@ -3535,7 +3533,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PartitionSearchSource 
 
 async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     state: &IvfIndexState<Q>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
     frag_reuse_index: Option<ResolvedRemapping>,

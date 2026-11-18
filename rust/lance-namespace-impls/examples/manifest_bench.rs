@@ -274,11 +274,9 @@ async fn seed_large(
     };
     if !storage_options.is_empty() {
         let accessor = Arc::new(
-            lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                storage_options.clone(),
-            ),
+            lance_io::storage::StorageOptionsAccessor::with_static_options(storage_options.clone()),
         );
-        write_params.store_params = Some(lance_io::object_store::ObjectStoreParams {
+        write_params.store_params = Some(lance_io::storage::StorageParams {
             storage_options_accessor: Some(accessor),
             ..Default::default()
         });

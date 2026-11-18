@@ -10,7 +10,7 @@
 #![cfg(unix)]
 
 use lance_core::utils::tempfile::TempStdDir;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 
 #[tokio::test]
 async fn relative_uri_fails_cleanly_when_the_working_directory_is_gone() {
@@ -21,7 +21,7 @@ async fn relative_uri_fails_cleanly_when_the_working_directory_is_gone() {
     std::fs::remove_dir(&workdir).unwrap();
 
     // Resolving the relative location has to read the working directory.
-    let err = ObjectStore::from_uri("./dataset.lance")
+    let err = Storage::from_uri("./dataset.lance")
         .await
         .expect_err("a relative location cannot resolve without a working directory");
 

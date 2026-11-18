@@ -19,11 +19,11 @@ pub use io::LanceEncodingsIo;
 use format::MAGIC;
 use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use version::ConcreteFileVersion;
 
 pub async fn determine_file_version(
-    store: &ObjectStore,
+    store: &Storage,
     path: &Path,
     known_size: Option<usize>,
 ) -> Result<ConcreteFileVersion> {

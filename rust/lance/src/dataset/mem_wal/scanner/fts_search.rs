@@ -78,7 +78,7 @@ use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
 };
 use crate::session::Session;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 
 /// `_score` column name in FTS results — kept aligned with
 /// `lance_index::scalar::inverted::SCORE_COL` so this module doesn't
@@ -668,7 +668,7 @@ pub struct LsmFtsSearchPlanner {
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
-    store_params: Option<ObjectStoreParams>,
+    store_params: Option<StorageParams>,
     /// Cache of opened SSTable datasets.
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
@@ -735,7 +735,7 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Set the store params used to open SSTables.
-    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+    pub fn with_store_params(mut self, store_params: StorageParams) -> Self {
         self.store_params = Some(store_params);
         self
     }

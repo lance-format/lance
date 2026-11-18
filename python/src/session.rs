@@ -14,8 +14,8 @@ use lance_core::cache::{
     build_from_uri,
 };
 
-use crate::object_store::PyObjectStoreRegistry;
 use crate::rt;
+use crate::storage::PyStorageRegistry;
 
 /// The Session holds stateful information for a dataset.
 ///
@@ -285,7 +285,7 @@ impl Session {
         metadata_cache_size_bytes: Option<usize>,
         index_cache_backend: Option<Bound<'_, PyAny>>,
         metadata_cache_backend: Option<Bound<'_, PyAny>>,
-        store_registry: Option<PyObjectStoreRegistry>,
+        store_registry: Option<PyStorageRegistry>,
     ) -> PyResult<Self> {
         let index_cache = resolve_cache_spec(
             "index_cache_backend",

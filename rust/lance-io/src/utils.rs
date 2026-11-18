@@ -37,7 +37,7 @@ pub fn read_range_in_chunks(
     reader: &dyn Reader,
     range: Range<usize>,
     chunk_size: usize,
-) -> impl Stream<Item = crate::object_store::Result<Bytes>> + '_ {
+) -> impl Stream<Item = crate::storage::Result<Bytes>> + '_ {
     let end = range.end;
     let chunk_ranges = range
         .step_by(chunk_size)
@@ -213,7 +213,7 @@ pub async fn read_struct<
     T::try_from(msg)
 }
 
-pub async fn read_last_block(reader: &dyn Reader) -> crate::object_store::Result<Bytes> {
+pub async fn read_last_block(reader: &dyn Reader) -> crate::storage::Result<Bytes> {
     let file_size = reader.size().await?;
     let block_size = reader.block_size();
     let begin = file_size.saturating_sub(block_size);
@@ -379,8 +379,8 @@ mod tests {
     use crate::{
         Error, Result,
         object_reader::CloudObjectReader,
-        object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, ObjectStore},
         object_writer::ObjectWriter,
+        storage::{DEFAULT_DOWNLOAD_RETRY_COUNT, Storage},
         traits::{ProtoStruct, WriteExt, Writer},
         utils::{
             METADATA_READ_CHUNK_SIZE, read_message_from_buf, read_range_in_chunks, read_struct,
@@ -411,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_proto_structs() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/foo");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
@@ -430,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_range_in_chunks_reassembles_in_order() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/chunked");
         // Patterned data with a range that neither starts nor ends on a chunk
         // boundary, so ordering or off-by-one mistakes change the bytes.
@@ -451,7 +451,7 @@ mod tests {
     async fn test_read_range_in_chunks_zero_parallelism_reader() {
         // A reader advertising io_parallelism 0 (e.g. LANCE_URING_IO_PARALLELISM=0)
         // must not hang the chunked read: the window is clamped to at least 1.
-        let store = crate::object_store::backend::native::from_object_store(std::sync::Arc::new(
+        let store = crate::storage::backend::object_store::from_object_store(std::sync::Arc::new(
             object_store::memory::InMemory::new(),
         ));
         let path = Path::from("/zero_parallelism");
@@ -481,7 +481,7 @@ mod tests {
     async fn test_read_message_larger_than_chunk_size() {
         // A message body crossing METADATA_READ_CHUNK_SIZE forces read_message
         // to fetch the remainder as multiple concurrent chunks.
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/large_message");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
@@ -499,7 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_reader_to_writer() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let src = Path::from("/src");
         let dst = Path::from("/dst");
         store.put(&src, b"abcdef").await.unwrap();
@@ -515,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_reader_range_to_writer() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let src = Path::from("/src-range");
         let dst = Path::from("/dst-range");
         store.put(&src, b"abcdef").await.unwrap();
@@ -598,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn read_message_decodes_body_larger_than_one_block_from_chunks() {
         // A message larger than the reader block size takes the chunked path.
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/large_message");
         let payload = Bytes::from(
             (0..300_000u32)

@@ -17,7 +17,7 @@ use lance_core::FenceReason;
 use lance_index::IndexType;
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use uuid::Uuid;
 
 mod future_depth;
@@ -124,7 +124,7 @@ fn durable_writer_config(shard_id: Uuid) -> ShardWriterConfig {
 #[tokio::test]
 async fn durable_put_is_readable_through_public_scan() {
     let base_uri = "memory://".to_string();
-    let (store, base_path) = ObjectStore::from_uri(&base_uri).await.unwrap();
+    let (store, base_path) = Storage::from_uri(&base_uri).await.unwrap();
     let batch = record_batch!(("id", Int32, [1, 2, 3])).unwrap();
     let writer = ShardWriter::open(
         store,
@@ -163,7 +163,7 @@ async fn durable_put_is_readable_through_public_scan() {
 #[tokio::test]
 async fn durable_put_does_not_alias_across_memtable_generations() {
     let base_uri = "memory://".to_string();
-    let (store, base_path) = ObjectStore::from_uri(&base_uri).await.unwrap();
+    let (store, base_path) = Storage::from_uri(&base_uri).await.unwrap();
     let shard_id = Uuid::new_v4();
     let first_batch = record_batch!(("id", Int32, [1])).unwrap();
     let schema = first_batch.schema();

@@ -7,7 +7,7 @@ use lance::dataset::Dataset;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance_core::Result;
 use lance_core::storage::path::Path;
-use lance_io::object_store::Error as StorageError;
+use lance_io::storage::Error as StorageError;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::DescribeTransactionResponse;
 

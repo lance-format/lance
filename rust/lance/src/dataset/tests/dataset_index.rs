@@ -7365,7 +7365,7 @@ async fn test_fts_best_effort_prewarm_result_reports_dataset_partial_residency()
     let session = Arc::new(Session::with_index_cache_backend(
         Arc::new(QuickCacheBackend::with_capacity(8 * 1024)),
         8 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_session(session)
@@ -7555,7 +7555,7 @@ async fn open_with_single_scalar_container_cache(uri: &str) -> Dataset {
     let session = Arc::new(Session::with_index_cache_backend(
         Arc::new(SingleScalarContainerCacheBackend::new(128 * 1024 * 1024)),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     DatasetBuilder::from_uri(uri)
         .with_session(session)
@@ -7670,7 +7670,7 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_session(session)
@@ -7785,7 +7785,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_session(session)
@@ -7823,7 +7823,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
     let session = Arc::new(Session::with_index_cache_backend(
         backend,
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_session(session)
@@ -7909,7 +7909,7 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_session(session)
@@ -8099,7 +8099,7 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_session(session)

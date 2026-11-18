@@ -16,10 +16,10 @@ use lance_core::{Error, Result};
 pub mod ffi;
 pub mod local;
 pub mod object_reader;
-pub mod object_store;
 pub mod object_writer;
 pub mod scheduler;
 pub mod spill;
+pub mod storage;
 pub mod stream;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;

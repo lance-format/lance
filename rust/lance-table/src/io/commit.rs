@@ -38,8 +38,8 @@ use futures::{
     stream::BoxStream,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_store::{Error as ObjectStoreError, path::Path};
 use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
+use lance_io::storage::{Error as ObjectStoreError, path::Path};
 use tracing::{debug, info};
 use url::Url;
 
@@ -48,7 +48,7 @@ pub mod dynamodb;
 pub mod external_manifest;
 
 use lance_core::{Error, Result};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::storage::{Storage, StorageParams};
 use lance_io::traits::{WriteExt, Writer};
 
 use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
@@ -58,7 +58,7 @@ use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
     aws_credential_types::provider::ProvideCredentials,
     aws_credential_types::provider::error::CredentialsError,
-    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
+    lance_io::storage::{StorageOptions, providers::aws::build_aws_credential},
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
@@ -170,7 +170,7 @@ impl ManifestNamingScheme {
 ///
 /// However, it should not be run while other concurrent operations are happening.
 /// And it should also run until completion before resuming other operations.
-pub async fn migrate_scheme_to_v2(storage: &ObjectStore, dataset_base: &Path) -> Result<()> {
+pub async fn migrate_scheme_to_v2(storage: &Storage, dataset_base: &Path) -> Result<()> {
     storage
         .list_objects(Some(&dataset_base.clone().join(VERSIONS_DIR)))
         .try_filter(|res| {
@@ -197,7 +197,7 @@ pub async fn migrate_scheme_to_v2(storage: &ObjectStore, dataset_base: &Path) ->
 ///
 /// Returns the size of the written manifest.
 pub type ManifestWriter = for<'a> fn(
-    storage: &'a ObjectStore,
+    storage: &'a Storage,
     manifest: &'a mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
@@ -208,7 +208,7 @@ pub type ManifestWriter = for<'a> fn(
 /// Rationale: keep a crate-local writer implementation so call sites can pass this function
 /// directly without non-primitive casts or lifetime coercions.
 pub fn write_manifest_file_to_path<'a>(
-    storage: &'a ObjectStore,
+    storage: &'a Storage,
     manifest: &'a mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
@@ -277,10 +277,10 @@ pub struct ManifestLocation {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
-impl TryFrom<lance_io::object_store::ObjectMeta> for ManifestLocation {
+impl TryFrom<lance_io::storage::ObjectMeta> for ManifestLocation {
     type Error = Error;
 
-    fn try_from(meta: lance_io::object_store::ObjectMeta) -> Result<Self> {
+    fn try_from(meta: lance_io::storage::ObjectMeta) -> Result<Self> {
         let filename = meta.location.filename().ok_or_else(|| {
             Error::internal("ObjectMeta location does not have a filename".to_string())
         })?;
@@ -310,7 +310,7 @@ impl TryFrom<lance_io::object_store::ObjectMeta> for ManifestLocation {
 ///   listing on these stores is O(n) in the number of versions.
 /// - Lexicographically ordered stores (e.g. S3 Standard, GCS): the listing
 ///   already resolves the latest version in roughly one request.
-async fn current_manifest_path(storage: &ObjectStore, base: &Path) -> Result<ManifestLocation> {
+async fn current_manifest_path(storage: &Storage, base: &Path) -> Result<ManifestLocation> {
     if storage.has_direct_local_paths() {
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
@@ -355,7 +355,7 @@ fn version_hint_globally_enabled() -> bool {
 /// read) it only on stores where listing is not lexicographically ordered —
 /// S3 Express and the local filesystem. Can be force-disabled with the
 /// `LANCE_USE_VERSION_HINT=0` environment variable.
-pub fn uses_version_hint(storage: &ObjectStore) -> bool {
+pub fn uses_version_hint(storage: &Storage) -> bool {
     version_hint_globally_enabled() && !storage.list_is_lexically_ordered()
 }
 
@@ -373,7 +373,7 @@ fn version_hint_path(base: &Path) -> Path {
 /// do not benefit from a hint (see [`uses_version_hint`]).
 /// Local write failures on Windows are logged at debug level, since readers
 /// holding the hint open can prevent replacement.
-pub async fn write_version_hint(storage: &ObjectStore, base: &Path, version: u64) {
+pub async fn write_version_hint(storage: &Storage, base: &Path, version: u64) {
     if is_detached_version(version) || !uses_version_hint(storage) {
         return;
     }
@@ -390,7 +390,7 @@ pub async fn write_version_hint(storage: &ObjectStore, base: &Path, version: u64
 
 /// Read the latest version from the hint file, or `None` if it does not exist
 /// or cannot be parsed.
-async fn read_version_from_hint(storage: &ObjectStore, base: &Path) -> Option<u64> {
+async fn read_version_from_hint(storage: &Storage, base: &Path) -> Option<u64> {
     read_version_hint(storage, base).await.ok().flatten()
 }
 
@@ -399,15 +399,15 @@ async fn read_version_from_hint(storage: &ObjectStore, base: &Path) -> Option<u6
 ///
 /// ```
 /// # use lance_core::Result;
-/// # use lance_io::object_store::ObjectStore;
+/// # use lance_io::storage::Storage;
 /// # use lance_table::io::commit::read_version_hint;
 /// # use lance_core::storage::path::Path;
-/// # async fn example(store: &ObjectStore, base: &Path) -> Result<()> {
+/// # async fn example(store: &Storage, base: &Path) -> Result<()> {
 /// let version = read_version_hint(store, base).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn read_version_hint(storage: &ObjectStore, base: &Path) -> Result<Option<u64>> {
+pub async fn read_version_hint(storage: &Storage, base: &Path) -> Result<Option<u64>> {
     let result = match storage.read_object(&version_hint_path(base)).await {
         Ok(result) => result,
         Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
@@ -427,10 +427,7 @@ pub async fn read_version_hint(storage: &ObjectStore, base: &Path) -> Result<Opt
 ///
 /// Returns `None` if the hint file is missing, the hinted version no longer
 /// exists, or any error occurred — callers should fall back to listing.
-async fn read_version_hint_and_probe(
-    storage: &ObjectStore,
-    base: &Path,
-) -> Option<ManifestLocation> {
+async fn read_version_hint_and_probe(storage: &Storage, base: &Path) -> Option<ManifestLocation> {
     let hint_version = read_version_from_hint(storage, base).await?;
     let (version, scheme, mut probed) = probe_versions_upward(storage, base, hint_version)
         .await
@@ -471,14 +468,14 @@ const MAX_HINT_PROBE_GAP: u64 = 1000;
 ///   be incomplete; callers should fall back to a full listing rather than
 ///   trust a possibly-stale result.
 async fn probe_versions_upward(
-    storage: &ObjectStore,
+    storage: &Storage,
     base: &Path,
     from_version: u64,
 ) -> Result<
     Option<(
         u64,
         ManifestNamingScheme,
-        Vec<(u64, lance_io::object_store::ObjectMeta)>,
+        Vec<(u64, lance_io::storage::ObjectMeta)>,
     )>,
 > {
     // Newer datasets use V2; fall back to V1 if the V2 path is not found.
@@ -528,7 +525,7 @@ async fn probe_versions_upward(
 /// usable — callers should fall back to a full listing. `Some(vec![])` is the
 /// fast path where the hint confirms there are no new versions.
 async fn list_manifests_since_version_with_hint(
-    storage: &ObjectStore,
+    storage: &Storage,
     base: &Path,
     since_version: u64,
 ) -> Option<Vec<ManifestLocation>> {
@@ -606,10 +603,7 @@ async fn list_manifests_since_version_with_hint(
 }
 
 /// Resolve the latest manifest by listing the versions directory.
-async fn resolve_version_from_listing(
-    storage: &ObjectStore,
-    base: &Path,
-) -> Result<ManifestLocation> {
+async fn resolve_version_from_listing(storage: &Storage, base: &Path) -> Result<ManifestLocation> {
     let manifest_files = storage.list(Some(base.clone().join(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
@@ -760,7 +754,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
 
 fn list_manifests<'a>(
     base_path: &Path,
-    storage: &'a ObjectStore,
+    storage: &'a Storage,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
     storage
         .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
@@ -776,7 +770,7 @@ fn list_manifests<'a>(
 
 /// Convert object metadata to ManifestLocation for detached manifests.
 fn detached_manifest_location_from_meta(
-    meta: lance_io::object_store::ObjectMeta,
+    meta: lance_io::storage::ObjectMeta,
 ) -> Option<ManifestLocation> {
     let filename = meta.location.filename()?;
     let version = ManifestNamingScheme::parse_detached_version(filename)?;
@@ -794,7 +788,7 @@ fn detached_manifest_location_from_meta(
 /// List all detached manifest files in the versions directory.
 pub fn list_detached_manifests<'a>(
     base_path: &Path,
-    storage: &'a ObjectStore,
+    storage: &'a Storage,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
     let versions_dir = base_path.clone().join(VERSIONS_DIR);
     // Detached names sort after every attached manifest and temporary file, so
@@ -823,7 +817,7 @@ const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 /// Object-store listing of `_versions/`; the `CommitHandler` defaults.
 pub(crate) fn default_list_manifest_locations<'a>(
     base_path: &Path,
-    storage: &'a ObjectStore,
+    storage: &'a Storage,
     sorted_descending: bool,
 ) -> BoxStream<'a, Result<ManifestLocation>> {
     let underlying_stream = list_manifests(base_path, storage);
@@ -877,7 +871,7 @@ pub(crate) fn default_list_manifest_locations<'a>(
 
 pub(crate) fn default_list_manifest_locations_since<'a>(
     base_path: &Path,
-    storage: &'a ObjectStore,
+    storage: &'a Storage,
     since_version: u64,
 ) -> BoxStream<'a, Result<ManifestLocation>> {
     if !uses_version_hint(storage) {
@@ -946,7 +940,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
     ) -> Result<ManifestLocation> {
         Ok(current_manifest_path(storage, base_path).await?)
     }
@@ -955,7 +949,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         version: u64,
-        storage: &ObjectStore,
+        storage: &Storage,
     ) -> Result<ManifestLocation> {
         default_resolve_version(base_path, version, storage).await
     }
@@ -969,7 +963,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         version: u64,
-        storage: &ObjectStore,
+        storage: &Storage,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<bool> {
         let path = naming_scheme.manifest_path(base_path, version);
@@ -991,7 +985,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         base_path: &Path,
         version: u64,
         path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
     ) -> Result<bool> {
         match self
             .resolve_version_location(base_path, version, storage)
@@ -1009,7 +1003,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     fn list_detached_manifest_locations<'a>(
         &self,
         base_path: &Path,
-        storage: &'a ObjectStore,
+        storage: &'a Storage,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         list_detached_manifests(base_path, storage).boxed()
     }
@@ -1023,7 +1017,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     fn list_manifest_locations<'a>(
         &self,
         base_path: &Path,
-        storage: &'a ObjectStore,
+        storage: &'a Storage,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         default_list_manifest_locations(base_path, storage, sorted_descending)
@@ -1039,7 +1033,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     fn list_manifest_locations_since<'a>(
         &self,
         base_path: &Path,
-        storage: &'a ObjectStore,
+        storage: &'a Storage,
         since_version: u64,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         default_list_manifest_locations_since(base_path, storage, since_version)
@@ -1054,7 +1048,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1070,7 +1064,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn resolve_latest_identity(
         &self,
         _base_path: &Path,
-        _storage: &ObjectStore,
+        _storage: &Storage,
     ) -> Result<Option<PredecessorIdentity>> {
         Ok(None)
     }
@@ -1080,7 +1074,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn resolve_identity(
         &self,
         _base_path: &Path,
-        _storage: &ObjectStore,
+        _storage: &Storage,
         _version: u64,
     ) -> Result<Option<PredecessorIdentity>> {
         Ok(None)
@@ -1095,7 +1089,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         _manifest: &mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _base_path: &Path,
-        _storage: &ObjectStore,
+        _storage: &Storage,
         _manifest_writer: ManifestWriter,
         _naming_scheme: ManifestNamingScheme,
         _transaction: Option<Transaction>,
@@ -1126,7 +1120,7 @@ pub trait CommitHandler: Debug + Send + Sync {
 async fn default_resolve_version(
     base_path: &Path,
     version: u64,
-    storage: &ObjectStore,
+    storage: &Storage,
 ) -> Result<ManifestLocation> {
     if is_detached_version(version) {
         return Ok(ManifestLocation {
@@ -1243,7 +1237,7 @@ async fn build_dynamodb_external_store(
 pub async fn commit_handler_from_url(
     url_or_path: &str,
     // This looks unused if dynamodb feature disabled
-    #[allow(unused_variables)] options: &Option<ObjectStoreParams>,
+    #[allow(unused_variables)] options: &Option<StorageParams>,
 ) -> Result<Arc<dyn CommitHandler>> {
     let local_handler: Arc<dyn CommitHandler> = if cfg!(windows) {
         Arc::new(RenameCommitHandler)
@@ -1398,7 +1392,7 @@ impl CommitHandler for UnsafeCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1530,7 +1524,7 @@ where
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1599,7 +1593,7 @@ where
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1638,7 +1632,7 @@ impl CommitHandler for RenameCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1703,14 +1697,14 @@ impl CommitHandler for ConditionalPutCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
-        let memory_store = ObjectStore::memory();
+        let memory_store = Storage::memory();
         let dummy_path = "dummy";
         manifest_writer(
             &memory_store,
@@ -1772,7 +1766,7 @@ impl CommitHandler for TencentCosCommitHandler {
         _manifest: &mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _base_path: &Path,
-        _storage: &ObjectStore,
+        _storage: &Storage,
         _manifest_writer: ManifestWriter,
         _naming_scheme: ManifestNamingScheme,
         _transaction: Option<Transaction>,
@@ -1827,7 +1821,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_io::object_store::{
+    use lance_io::storage::{
         CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
         PutOptions, PutPayload, PutResult,
     };
@@ -1845,7 +1839,7 @@ mod tests {
 
     #[derive(Debug)]
     struct FailingManifestBackend {
-        inner: Arc<dyn lance_io::object_store::StorageBackend>,
+        inner: Arc<dyn lance_io::storage::StorageBackend>,
         failure: ManifestFailure,
     }
 
@@ -1856,14 +1850,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl lance_io::object_store::StorageBackend for FailingManifestBackend {
+    impl lance_io::storage::StorageBackend for FailingManifestBackend {
         async fn list_paginated(
             &self,
             prefix: Option<&str>,
-            options: lance_io::object_store::PaginatedListOptions,
-        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            options: lance_io::storage::PaginatedListOptions,
+        ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
             let _ = (prefix, options);
-            Err(lance_io::object_store::Error::NotSupported {
+            Err(lance_io::storage::Error::NotSupported {
                 source: "native pagination is unavailable".into(),
             })
         }
@@ -1873,7 +1867,7 @@ mod tests {
             path: &Path,
             data: PutPayload,
             opts: PutOptions,
-        ) -> lance_io::object_store::Result<PutResult> {
+        ) -> lance_io::storage::Result<PutResult> {
             self.inner.put_opts(path, data, opts).await
         }
 
@@ -1881,7 +1875,7 @@ mod tests {
             &self,
             path: &Path,
             opts: PutMultipartOptions,
-        ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+        ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>>
         {
             self.inner.put_multipart_opts(path, opts).await
         }
@@ -1890,13 +1884,13 @@ mod tests {
             &self,
             path: &Path,
             opts: GetOptions,
-        ) -> lance_io::object_store::Result<GetResult> {
+        ) -> lance_io::storage::Result<GetResult> {
             let mut result = self.inner.get_opts(path, opts).await?;
             if let ManifestFailure::ReadBody(failed_path) = &self.failure
                 && path == failed_path
             {
                 let path = path.to_string();
-                result.payload = lance_io::object_store::GetResultPayload::Stream(
+                result.payload = lance_io::storage::GetResultPayload::Stream(
                     futures::stream::once(async move {
                         Err(ObjectStoreError::NotFound {
                             path,
@@ -1913,21 +1907,21 @@ mod tests {
             &self,
             path: &Path,
             ranges: &[Range<u64>],
-        ) -> lance_io::object_store::Result<Vec<Bytes>> {
+        ) -> lance_io::storage::Result<Vec<Bytes>> {
             self.inner.get_ranges(path, ranges).await
         }
 
         fn delete_stream(
             &self,
-            paths: BoxStream<'static, lance_io::object_store::Result<Path>>,
-        ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
+            paths: BoxStream<'static, lance_io::storage::Result<Path>>,
+        ) -> BoxStream<'static, lance_io::storage::Result<Path>> {
             self.inner.delete_stream(paths)
         }
 
         fn list(
             &self,
             prefix: Option<&Path>,
-        ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
+        ) -> BoxStream<'static, lance_io::storage::Result<ObjectMeta>> {
             let ManifestFailure::Listing(first_path) = &self.failure else {
                 return self.inner.list(prefix);
             };
@@ -1950,7 +1944,7 @@ mod tests {
         async fn list_with_delimiter(
             &self,
             prefix: Option<&Path>,
-        ) -> lance_io::object_store::Result<ListResult> {
+        ) -> lance_io::storage::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
@@ -1959,7 +1953,7 @@ mod tests {
             from: &Path,
             to: &Path,
             opts: CopyOptions,
-        ) -> lance_io::object_store::Result<()> {
+        ) -> lance_io::storage::Result<()> {
             self.inner.copy_opts(from, to, opts).await
         }
 
@@ -1969,7 +1963,7 @@ mod tests {
             offset: &Path,
         ) -> futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+            lance_io::storage::Result<lance_io::storage::ObjectMeta>,
         > {
             let offset = offset.clone();
             futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
@@ -1982,8 +1976,8 @@ mod tests {
             &self,
             from: &Path,
             to: &Path,
-            opts: lance_io::object_store::RenameOptions,
-        ) -> lance_io::object_store::Result<()> {
+            opts: lance_io::storage::RenameOptions,
+        ) -> lance_io::storage::Result<()> {
             self.inner.rename_opts(from, to, opts).await
         }
     }
@@ -2035,7 +2029,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_manifest_naming_migration() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base = Path::from("base");
         let versions_dir = base.clone().join(VERSIONS_DIR);
 
@@ -2074,11 +2068,11 @@ mod tests {
     ) {
         let tempdir;
         let (storage, base) = if lexical_list_store {
-            (Box::new(ObjectStore::memory()), Path::from("base"))
+            (Box::new(Storage::memory()), Path::from("base"))
         } else {
             tempdir = TempObjDir::default();
             let path = tempdir.clone().join("base");
-            let store = Box::new(ObjectStore::local());
+            let store = Box::new(Storage::local());
             assert!(!store.list_is_lexically_ordered());
             (store, path)
         };
@@ -2106,7 +2100,7 @@ mod tests {
         // The listing already sees ObjectMeta, so the manifest write time is free.
         // Dropping it forces callers that only need a version's age to read the whole
         // manifest, which is the cost `expire_versions` exists to avoid.
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base = Path::from("base");
         for version in 0..3 {
             let path = ManifestNamingScheme::V2.manifest_path(&base, version);
@@ -2131,11 +2125,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_current_manifest_path_respects_local_wrapper() {
-        use lance_io::object_store::{StorageBackend, WrappingObjectStore};
+        use lance_io::storage::{BackendWrapper, StorageBackend};
 
         #[derive(Debug)]
         struct Replacement(Arc<dyn StorageBackend>);
-        impl WrappingObjectStore for Replacement {
+        impl BackendWrapper for Replacement {
             fn wrap(&self, _: &str, _: Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend> {
                 self.0.clone()
             }
@@ -2143,13 +2137,13 @@ mod tests {
 
         let directory = TempObjDir::default();
         let base = directory.clone().join("dataset");
-        let mut local = ObjectStore::local();
+        let mut local = Storage::local();
         let naming_scheme = ManifestNamingScheme::V2;
         local
             .put(&naming_scheme.manifest_path(&base, 9), b"disk")
             .await
             .unwrap();
-        let replacement = lance_io::object_store::backend::native::from_object_store(Arc::new(
+        let replacement = lance_io::storage::backend::object_store::from_object_store(Arc::new(
             object_store::memory::InMemory::new(),
         ));
         replacement
@@ -2166,7 +2160,7 @@ mod tests {
             3
         );
         assert_eq!(
-            current_manifest_path(&ObjectStore::local(), &base)
+            current_manifest_path(&Storage::local(), &base)
                 .await
                 .unwrap()
                 .version,
@@ -2201,9 +2195,9 @@ mod tests {
 
     /// A memory store that reports `list_is_lexically_ordered == false`, like
     /// S3 Express, so the version-hint paths are exercised.
-    fn memory_store(lexical: bool) -> Box<ObjectStore> {
-        let mut config = lance_io::object_store::BackendConfig::new(
-            lance_io::object_store::backend::native::from_object_store(Arc::new(
+    fn memory_store(lexical: bool) -> Box<Storage> {
+        let mut config = lance_io::storage::BackendConfig::new(
+            lance_io::storage::backend::object_store::from_object_store(Arc::new(
                 object_store::memory::InMemory::new(),
             )),
             "memory",
@@ -2211,12 +2205,12 @@ mod tests {
         config.list_is_lexically_ordered = lexical;
         config.is_remote = false;
         Box::new(
-            lance_io::utils::testing::TestObjectStoreProvider(config)
+            lance_io::utils::testing::TestStorageProvider(config)
                 .build(url::Url::parse("memory:///").unwrap(), &Default::default()),
         )
     }
 
-    fn non_lexical_memory_store() -> Box<ObjectStore> {
+    fn non_lexical_memory_store() -> Box<Storage> {
         memory_store(false)
     }
 
@@ -2240,8 +2234,8 @@ mod tests {
                 Ok(())
             }),
         );
-        let mut store = ObjectStore::memory();
-        store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        let mut store = Storage::memory();
+        store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
         ));
         let result = read_version_hint(&store, &Path::from("dataset")).await;
@@ -2259,12 +2253,12 @@ mod tests {
     async fn test_version_hint_body_not_found_is_an_error() {
         let base = Path::from("dataset");
         let path = version_hint_path(&base);
-        let mut store = ObjectStore::memory();
+        let mut store = Storage::memory();
         store
             .put_payload(&path, Bytes::from_static(br#"{"version":1}"#).into())
             .await
             .unwrap();
-        store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| {
                 Arc::new(FailingManifestBackend {
                     inner: backend,
@@ -2282,7 +2276,7 @@ mod tests {
         let base = Path::from("base");
 
         // No hint is written on lexically-ordered stores (it would not be read).
-        let lexical = ObjectStore::memory();
+        let lexical = Storage::memory();
         write_version_hint(&lexical, &base, 42).await;
         assert_eq!(read_version_from_hint(&lexical, &base).await, None);
 
@@ -2318,7 +2312,7 @@ mod tests {
     ) {
         let tempdir = TempObjDir::default();
         let base = tempdir.clone();
-        let mut storage = ObjectStore::local();
+        let mut storage = Storage::local();
 
         for version in 1..=3 {
             storage
@@ -2329,7 +2323,7 @@ mod tests {
         write_version_hint(&storage, &base, hint_version).await;
 
         let listing_count = Arc::new(AtomicUsize::new(0));
-        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        storage.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| Arc::new(CountingBackend::new(backend, listing_count.clone())),
         ));
 
@@ -2367,7 +2361,7 @@ mod tests {
             // same best-effort error boundary as an open hint on Windows.
             std::fs::create_dir_all(lance_io::local::to_local_path(&version_hint_path(&base)))
                 .unwrap();
-            ObjectStore::local()
+            Storage::local()
         } else {
             let mut storage = *non_lexical_memory_store();
             let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
@@ -2380,7 +2374,7 @@ mod tests {
                     Ok(())
                 }),
             );
-            storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            storage.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
                 |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
             ));
             storage
@@ -2407,7 +2401,7 @@ mod tests {
     async fn test_version_hint_held_open_on_windows() {
         let tempdir = TempObjDir::default();
         let base = tempdir.clone();
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         for version in 1..=2 {
             storage
                 .put(
@@ -2584,7 +2578,7 @@ mod tests {
             .unwrap();
         write_version_hint(&storage, &base, 20).await;
         let mut failing_store = (*storage).clone();
-        failing_store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        failing_store.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| {
                 Arc::new(FailingManifestBackend {
                     inner: backend,
@@ -2637,7 +2631,7 @@ mod tests {
         use crate::format::DETACHED_VERSION_MASK;
         use futures::TryStreamExt;
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base = Path::from("base");
         let versions_dir = base.clone().join(VERSIONS_DIR);
 
@@ -2788,7 +2782,7 @@ mod tests {
     /// A manifest writer that succeeds immediately, so the commit reaches the
     /// explicit lease release.
     fn succeeding_manifest_writer<'a>(
-        _storage: &'a ObjectStore,
+        _storage: &'a Storage,
         _manifest: &'a mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _path: &'a Path,
@@ -2828,7 +2822,7 @@ mod tests {
                 &mut manifest,
                 None,
                 &Path::from("test"),
-                &ObjectStore::memory(),
+                &Storage::memory(),
                 succeeding_manifest_writer,
                 ManifestNamingScheme::V2,
                 None,
@@ -2844,7 +2838,7 @@ mod tests {
 
     /// A manifest writer that never completes, simulating a hung object store.
     fn hanging_manifest_writer<'a>(
-        _storage: &'a ObjectStore,
+        _storage: &'a Storage,
         _manifest: &'a mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _path: &'a Path,
@@ -2868,7 +2862,7 @@ mod tests {
             released: released.clone(),
         };
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("test");
         let mut manifest = test_manifest();
 
@@ -2914,7 +2908,7 @@ mod tests {
             released: released.clone(),
         };
 
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         let base_path = Path::from("test");
         let mut manifest = test_manifest();
 
@@ -2966,7 +2960,7 @@ mod tests {
         #[case] leftover_staging: bool,
         #[case] expected_entries_listed: usize,
     ) {
-        let mut storage = ObjectStore::memory();
+        let mut storage = Storage::memory();
 
         let base = Path::from("base");
         for version in 0..10u64 {
@@ -2988,7 +2982,7 @@ mod tests {
             "count_listed_entries",
             Arc::new({
                 let entries_listed = entries_listed.clone();
-                move |op: &str, meta: lance_io::object_store::ObjectMeta| {
+                move |op: &str, meta: lance_io::storage::ObjectMeta| {
                     if op == "list" {
                         entries_listed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2996,7 +2990,7 @@ mod tests {
                 }
             }),
         );
-        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        storage.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
         ));
 

@@ -61,8 +61,8 @@ use lance_core::{
         TRACE_FILE_AUDIT,
     },
 };
-use lance_io::object_store::ObjectMeta;
-use lance_io::object_store::{ObjectStore, ObjectStoreRegistry, uri_to_url};
+use lance_io::storage::ObjectMeta;
+use lance_io::storage::{Storage, StorageRegistry, uri_to_url};
 use lance_table::{
     feature_flags::{
         ensure_can_read_manifest, ensure_can_write_manifest, validate_auto_cleanup_config,
@@ -334,8 +334,8 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 /// Whether `uri` may refer to `base`.
 /// Unknown locations match so cleanup does not delete live files.
 fn may_be_same_location(
-    registry: &ObjectStoreRegistry,
-    store: &ObjectStore,
+    registry: &StorageRegistry,
+    store: &Storage,
     storage_options: Option<&HashMap<String, String>>,
     uri: &str,
     base: &Path,
@@ -548,7 +548,7 @@ fn is_removed_detached_version(location: &ManifestLocation, base: &Path, error: 
 }
 
 async fn read_manifest_and_indexes(
-    storage: &ObjectStore,
+    storage: &Storage,
     location: &ManifestLocation,
 ) -> Result<(Manifest, Vec<IndexMetadata>)> {
     let manifest = read_manifest(storage, &location.path, location.size).await?;
@@ -563,7 +563,7 @@ async fn read_manifest_and_indexes(
 /// deleted once the commit is finalized, after it is copied to the canonical path,
 /// so a staging copy that is gone when read is retried at the canonical path.
 async fn read_listed_manifest(
-    storage: &ObjectStore,
+    storage: &Storage,
     location: ManifestLocation,
     base: &Path,
 ) -> (ManifestLocation, Result<(Manifest, Vec<IndexMetadata>)>) {
@@ -611,7 +611,7 @@ impl BlobDescriptorFiles {
     /// Whether the descriptors are gone: every data file holding a blob field is
     /// missing. A file in another base counts as present. A missing deletion file
     /// does not count, since the data files still hold the descriptors.
-    async fn removed(&self, store: &ObjectStore) -> Result<bool> {
+    async fn removed(&self, store: &Storage) -> Result<bool> {
         if self.data.is_empty() {
             return Ok(false);
         }
@@ -2594,7 +2594,7 @@ impl<'a> CleanupTask<'a> {
                             // through cleanup (see
                             // <https://github.com/lance-format/lance/issues/6093>).
                             Some(
-                                lance_io::object_store::ObjectStore::from_uri_and_params(
+                                lance_io::storage::Storage::from_uri_and_params(
                                     self.dataset.session.store_registry(),
                                     &base_path.path,
                                     &Default::default(),
@@ -2786,11 +2786,7 @@ impl<'a> CleanupTask<'a> {
 /// first and acts after, so a concurrent cleanup can remove one in between — and that is
 /// the outcome this sweep wanted. Propagating `NotFound` here would abandon an entire
 /// sweep over a single file that is already in the desired state.
-async fn expired_manifest_size(
-    storage: &ObjectStore,
-    path: &Path,
-    known: Option<u64>,
-) -> Result<u64> {
+async fn expired_manifest_size(storage: &Storage, path: &Path, known: Option<u64>) -> Result<u64> {
     match known {
         Some(size_bytes) => Ok(size_bytes),
         None => match storage.size(path).await {
@@ -3334,10 +3330,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_io::object_store::storage_options::StorageOptionsAccessor;
-    use lance_io::object_store::{
-        ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
-    };
+    use lance_io::storage::storage_options::StorageOptionsAccessor;
+    use lance_io::storage::{BackendWrapper, Storage, StorageParams, StorageRegistry};
     use lance_io::utils::testing::{DelayConfig, DelayedBackend};
     use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
     use lance_linalg::distance::MetricType;
@@ -3371,19 +3365,19 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct MockWrappingObjectStore {
+    struct MockBackendWrapper {
         delete_latency: Duration,
         policy: Arc<Mutex<ProxyBackendPolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
 
-    impl WrappingObjectStore for MockWrappingObjectStore {
+    impl BackendWrapper for MockBackendWrapper {
         fn wrap(
             &self,
             _storage_prefix: &str,
-            original: Arc<dyn lance_io::object_store::StorageBackend>,
-        ) -> Arc<dyn lance_io::object_store::StorageBackend> {
-            let original: Arc<dyn lance_io::object_store::StorageBackend> =
+            original: Arc<dyn lance_io::storage::StorageBackend>,
+        ) -> Arc<dyn lance_io::storage::StorageBackend> {
+            let original: Arc<dyn lance_io::storage::StorageBackend> =
                 if self.delete_latency.is_zero() {
                     original
                 } else {
@@ -3399,7 +3393,7 @@ mod tests {
         }
     }
 
-    impl MockWrappingObjectStore {
+    impl MockBackendWrapper {
         pub(crate) fn new() -> Self {
             let instance = Self {
                 delete_latency: Duration::ZERO,
@@ -3450,7 +3444,7 @@ mod tests {
         // is dropped
         tmpdir: TempStrDir,
         dataset_path: String,
-        mock_store: Arc<MockWrappingObjectStore>,
+        mock_store: Arc<MockBackendWrapper>,
     }
 
     impl MockDatasetFixture {
@@ -3463,8 +3457,8 @@ mod tests {
         fn try_new() -> Result<Self> {
             let tmpdir = TempStrDir::default();
             let tmpdir_path = tmpdir.as_str();
-            // Use file-object-store:// scheme so that writes go through the ObjectStore
-            // wrapper chain (MockWrappingObjectStore) instead of the optimized local writer path.
+            // Use file-object-store:// scheme so that writes go through the Storage
+            // wrapper chain (MockBackendWrapper) instead of the optimized local writer path.
             // The path must always start with "/" (three slashes after the scheme) so that
             // on Windows, a drive letter like "C:" isn't parsed as the URL authority.
             let path_prefix = if tmpdir_path.starts_with('/') {
@@ -3476,7 +3470,7 @@ mod tests {
             Ok(Self {
                 tmpdir,
                 dataset_path,
-                mock_store: Arc::new(MockWrappingObjectStore::new()),
+                mock_store: Arc::new(MockBackendWrapper::new()),
             })
         }
 
@@ -3487,8 +3481,8 @@ mod tests {
                 .join(uuid.to_string())
         }
 
-        fn os_params(&self) -> ObjectStoreParams {
-            ObjectStoreParams {
+        fn os_params(&self) -> StorageParams {
+            StorageParams {
                 backend_wrappers: vec![self.mock_store.clone()],
                 ..Default::default()
             }
@@ -3693,9 +3687,9 @@ mod tests {
         }
 
         async fn count_files(&self) -> Result<FileCounts> {
-            let registry = Arc::new(ObjectStoreRegistry::default());
+            let registry = Arc::new(StorageRegistry::default());
             let (os, path) =
-                ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
+                Storage::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
                     .await?;
             let mut file_stream = os.read_dir_all(&path, None);
             let mut file_count = FileCounts {
@@ -3721,9 +3715,9 @@ mod tests {
         }
 
         async fn count_blob_files(&self) -> Result<usize> {
-            let registry = Arc::new(ObjectStoreRegistry::default());
+            let registry = Arc::new(StorageRegistry::default());
             let (os, path) =
-                ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
+                Storage::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
                     .await?;
             let mut file_stream = os.read_dir_all(&path, None);
             let mut blob_count = 0usize;
@@ -4069,7 +4063,7 @@ mod tests {
             .clone()
             .with_io_parallelism(2)
             .unwrap();
-        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+        storage.apply_wrapper(&lance_io::utils::testing::TestBackendWrapper::new(
             |backend| {
                 Arc::new(DelayedBackend::new(
                     backend,
@@ -5120,10 +5114,10 @@ mod tests {
     ) {
         let uri = TempStrDir::default();
         let respelled = respell(uri.as_str());
-        let registry = Arc::new(ObjectStoreRegistry::default());
+        let registry = Arc::new(StorageRegistry::default());
         assert_eq!(
-            ObjectStore::extract_path_from_uri(registry.clone(), &respelled).unwrap(),
-            ObjectStore::extract_path_from_uri(registry, uri.as_str()).unwrap()
+            Storage::extract_path_from_uri(registry.clone(), &respelled).unwrap(),
+            Storage::extract_path_from_uri(registry, uri.as_str()).unwrap()
         );
         assert_cleanup_keeps_branch_parent_objects(uri.as_str(), &respelled).await;
     }
@@ -5647,8 +5641,8 @@ mod tests {
     #[cfg(feature = "aws")]
     #[tokio::test]
     async fn different_buckets_are_not_the_same_location() {
-        let registry = Arc::new(ObjectStoreRegistry::default());
-        let params = ObjectStoreParams {
+        let registry = Arc::new(StorageRegistry::default());
+        let params = StorageParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("region".to_string(), "us-east-1".to_string()),
@@ -5659,7 +5653,7 @@ mod tests {
             ..Default::default()
         };
         let (owner, base) =
-            ObjectStore::from_uri_and_params(registry.clone(), "s3://bucket-a/orders", &params)
+            Storage::from_uri_and_params(registry.clone(), "s3://bucket-a/orders", &params)
                 .await
                 .unwrap();
         assert!(may_be_same_location(
@@ -5699,7 +5693,7 @@ mod tests {
         .unwrap();
 
         async fn parent_base(dataset: &Dataset, base_account: &str) -> (String, bool) {
-            let params = ObjectStoreParams {
+            let params = StorageParams {
                 storage_options_accessor: Some(Arc::new(
                     StorageOptionsAccessor::with_static_options(HashMap::from([
                         ("account_name".to_string(), "account-a".to_string()),
@@ -5710,7 +5704,7 @@ mod tests {
                 ..Default::default()
             };
             let registry = dataset.session.store_registry();
-            let (owner, owner_base) = ObjectStore::from_uri_and_params(
+            let (owner, owner_base) = Storage::from_uri_and_params(
                 registry,
                 "az://container/orders",
                 &params.scoped_to_base(None),
@@ -7143,9 +7137,9 @@ mod tests {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
 
-        let registry = Arc::new(ObjectStoreRegistry::default());
+        let registry = Arc::new(StorageRegistry::default());
         let (os, base) =
-            ObjectStore::from_uri_and_params(registry, &fixture.dataset_path, &fixture.os_params())
+            Storage::from_uri_and_params(registry, &fixture.dataset_path, &fixture.os_params())
                 .await
                 .unwrap();
 
@@ -7183,11 +7177,11 @@ mod tests {
     #[case::wrapped(true)]
     #[tokio::test]
     async fn expired_manifest_size_tolerates_a_vanished_manifest(#[case] is_wrapped: bool) {
-        let wrapper = Arc::new(MockWrappingObjectStore::new());
-        let (store, _) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let wrapper = Arc::new(MockBackendWrapper::new());
+        let (store, _) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             "memory://",
-            &ObjectStoreParams {
+            &StorageParams {
                 backend_wrappers: vec![wrapper.clone()],
                 ..Default::default()
             },
@@ -7514,15 +7508,15 @@ mod tests {
         } else {
             Duration::ZERO
         };
-        let mock_store = Arc::new(MockWrappingObjectStore {
+        let mock_store = Arc::new(MockBackendWrapper {
             delete_latency,
-            ..MockWrappingObjectStore::new()
+            ..MockBackendWrapper::new()
         });
         let mut parent = Dataset::write(
             data(),
             "memory://cleanup",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
+                store_params: Some(StorageParams {
                     backend_wrappers: vec![mock_store.clone()],
                     ..Default::default()
                 }),
@@ -7696,7 +7690,7 @@ mod tests {
         /// A version whose first lookup moves its record off the recorded copy, as
         /// finalizing the commit does: the copy is copied to the given canonical
         /// path, the record is repointed and the copy is deleted.
-        finalize_on_lookup: Mutex<Option<(u64, Arc<ObjectStore>, Path)>>,
+        finalize_on_lookup: Mutex<Option<(u64, Arc<Storage>, Path)>>,
         /// Whether that lookup answers with the record as it was before the move,
         /// as when the version is finalized between the lookup and the read.
         answers_before_finalizing: bool,
@@ -7979,8 +7973,8 @@ mod tests {
         let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: store.clone(),
         });
-        let mock_store = Arc::new(MockWrappingObjectStore::new());
-        let os_params = ObjectStoreParams {
+        let mock_store = Arc::new(MockBackendWrapper::new());
+        let os_params = StorageParams {
             backend_wrappers: vec![mock_store.clone()],
             ..Default::default()
         };
@@ -8059,14 +8053,11 @@ mod tests {
         impl MockDatasetFixture {
             /// The `_fri/<map_id>/` directories currently on disk.
             async fn list_fri_map_dirs(&self) -> Vec<String> {
-                let registry = Arc::new(ObjectStoreRegistry::default());
-                let (os, path) = ObjectStore::from_uri_and_params(
-                    registry,
-                    &self.dataset_path,
-                    &self.os_params(),
-                )
-                .await
-                .unwrap();
+                let registry = Arc::new(StorageRegistry::default());
+                let (os, path) =
+                    Storage::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
+                        .await
+                        .unwrap();
                 let mut ids = std::collections::HashSet::new();
                 let mut stream = os.read_dir_all(&path.clone().join("_fri"), None);
                 loop {

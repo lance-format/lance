@@ -16,7 +16,7 @@ use lance_core::storage::path::Path;
 use lance_core::{Error, Result, box_error};
 use lance_index::is_system_index;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_io::object_store::Error as ObjectStoreError;
+use lance_io::storage::Error as ObjectStoreError;
 use lance_linalg::distance::MetricType;
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;

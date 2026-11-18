@@ -367,7 +367,7 @@ impl UringCurrentThreadReader {
         &self,
         offset: u64,
         length: usize,
-    ) -> Pin<Box<dyn Future<Output = crate::object_store::Result<Bytes>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = crate::storage::Result<Bytes>> + Send>> {
         let mut buffer = BytesMut::with_capacity(length);
         // SAFETY: the capacity covers `length`. `set_len` also asks for initialized bytes, and
         // these stay uninitialized until the kernel writes them, but nothing reads them before
@@ -395,7 +395,7 @@ impl UringCurrentThreadReader {
                 request,
             )),
             Err(e) => Box::pin(async move {
-                Err(crate::object_store::Error::Generic {
+                Err(crate::storage::Error::Generic {
                     store: "io_uring_ct",
                     source: Box::new(e),
                 })
@@ -421,16 +421,13 @@ impl Reader for UringCurrentThreadReader {
     }
 
     /// Returns the file size
-    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::storage::Result<usize>> {
         Box::pin(async move { Ok(self.size) })
     }
 
     /// Read a range of bytes using thread-local io_uring
     #[instrument(level = "debug", skip(self))]
-    fn get_range(
-        &self,
-        range: Range<usize>,
-    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, crate::storage::Result<Bytes>> {
         let io_tracker = self.io_tracker.clone();
         let path = self.handle.path.clone();
         let num_bytes = range.len() as u64;
@@ -450,7 +447,7 @@ impl Reader for UringCurrentThreadReader {
 
     /// Read the entire file using thread-local io_uring
     #[instrument(level = "debug", skip(self))]
-    fn get_all(&self) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
+    fn get_all(&self) -> BoxFuture<'static, crate::storage::Result<Bytes>> {
         let size = self.size;
         let io_tracker = self.io_tracker.clone();
         let path = self.handle.path.clone();

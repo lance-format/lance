@@ -4,7 +4,7 @@
 use super::*;
 use crate::scalar::inverted::InvertedIndexPlugin;
 use crate::scalar::registry::ScalarIndexPlugin;
-use lance_io::object_store::WrappingObjectStore;
+use lance_io::storage::BackendWrapper;
 use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
 
 #[derive(Debug, Default)]
@@ -12,12 +12,12 @@ struct RequestWrapper {
     policy: Arc<std::sync::Mutex<ProxyBackendPolicy>>,
 }
 
-impl WrappingObjectStore for RequestWrapper {
+impl BackendWrapper for RequestWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        original: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(ProxyBackend::new(original, self.policy.clone()))
     }
 }
@@ -37,7 +37,7 @@ impl BatchRowIdRemapper for OffsetBatchRemapper {
 
 #[tokio::test]
 async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_resources() {
-    let storage = ObjectStore::memory();
+    let storage = Storage::memory();
     let metadata_cache = Arc::new(LanceCache::with_capacity(1 << 20));
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(storage.clone()),
@@ -133,7 +133,7 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
 
 #[tokio::test]
 async fn test_request_wrappers_preserve_prewarmed_index_state() {
-    let storage = ObjectStore::memory();
+    let storage = Storage::memory();
     let directory = lance_core::storage::path::Path::from("index");
     let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
     let store = Arc::new(LanceIndexStore::new(
@@ -229,7 +229,7 @@ async fn test_request_wrappers_preserve_prewarmed_index_state() {
 
 #[tokio::test]
 async fn test_deferred_posting_reader_retries_current_credentials_and_validates_metadata() {
-    let storage = ObjectStore::memory();
+    let storage = Storage::memory();
     let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(storage.clone()),
@@ -277,7 +277,7 @@ async fn test_deferred_posting_reader_retries_current_credentials_and_validates_
     assert!(requests.load(Ordering::Relaxed) > 0);
 
     let changed_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::memory().into(),
+        Storage::memory().into(),
         "index".into(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -337,7 +337,7 @@ async fn write_partition_spanning_many_batches(store: &dyn IndexStore) {
 async fn test_write_many_posting_list_batches_preserves_all_batches() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -381,7 +381,7 @@ async fn test_write_many_posting_list_batches_preserves_all_batches() {
 async fn test_and_query_skips_partition_missing_required_term() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -437,7 +437,7 @@ async fn test_and_query_skips_partition_missing_required_term() {
 async fn test_fuzzy_and_groups_expansions_by_original_position() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -536,7 +536,7 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query(
 ) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -711,7 +711,7 @@ async fn prepared_results(
 async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
     let first_dir = TempObjDir::default();
     let first_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         first_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -729,7 +729,7 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
 
     let second_dir = TempObjDir::default();
     let second_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         second_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -937,7 +937,7 @@ async fn test_prepared_term_ids_search_like_dictionary_lookups(
 ) {
     let dir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1002,7 +1002,7 @@ async fn test_prepared_term_ids_search_like_dictionary_lookups(
 async fn test_prepared_term_ids_apply_only_to_their_segment() {
     let prepared_dir = TempObjDir::default();
     let prepared_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         prepared_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1014,7 +1014,7 @@ async fn test_prepared_term_ids_apply_only_to_their_segment() {
     // here would match the "aaa beta" document instead.
     let other_dir = TempObjDir::default();
     let other_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         other_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1077,7 +1077,7 @@ async fn test_canonical_fuzzy_rewrite_is_independent_of_segment_and_partition_sh
 
     let single_dir = TempObjDir::default();
     let single_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         single_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1086,7 +1086,7 @@ async fn test_canonical_fuzzy_rewrite_is_independent_of_segment_and_partition_sh
 
     let partitioned_dir = TempObjDir::default();
     let partitioned_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         partitioned_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1106,7 +1106,7 @@ async fn test_canonical_fuzzy_rewrite_is_independent_of_segment_and_partition_sh
     for document in &documents {
         let segment_dir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
+            Storage::local().into(),
             segment_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -1178,7 +1178,7 @@ async fn test_canonical_fuzzy_rewrite_is_independent_of_segment_and_partition_sh
 async fn test_fuzzy_injected_scorer_requires_prepared_vocabulary() {
     let subset_dir = TempObjDir::default();
     let subset_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         subset_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1187,7 +1187,7 @@ async fn test_fuzzy_injected_scorer_requires_prepared_vocabulary() {
 
     let other_dir = TempObjDir::default();
     let other_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         other_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1271,7 +1271,7 @@ async fn test_fuzzy_injected_scorer_requires_prepared_vocabulary() {
 async fn test_unicode_fuzzy_prefix_uses_character_boundaries() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1315,7 +1315,7 @@ async fn test_unicode_fuzzy_prefix_uses_character_boundaries() {
 async fn test_fuzzy_expansion_uses_unicode_scalar_edit_distance() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1356,7 +1356,7 @@ async fn test_fuzzy_expansion_uses_unicode_scalar_edit_distance() {
 async fn test_unicode_fuzzy_cap_order_is_independent_of_partition_shape() {
     let single_dir = TempObjDir::default();
     let single_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         single_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1371,7 +1371,7 @@ async fn test_unicode_fuzzy_cap_order_is_independent_of_partition_shape() {
 
     let split_dir = TempObjDir::default();
     let split_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         split_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1403,7 +1403,7 @@ async fn test_unicode_fuzzy_cap_order_is_independent_of_partition_shape() {
 async fn test_json_fuzzy_prefix_keeps_path_and_type_exact() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1442,7 +1442,7 @@ async fn test_json_fuzzy_prefix_keeps_path_and_type_exact() {
 async fn test_fuzzy_expansion_cap_is_global_across_partitions() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1476,7 +1476,7 @@ async fn test_fuzzy_expansion_cap_is_global_across_partitions() {
 async fn test_fuzzy_candidate_merge_stays_bounded_across_partitions() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1505,7 +1505,7 @@ async fn test_fuzzy_candidate_merge_stays_bounded_across_partitions() {
 async fn test_fuzzy_expansion_merges_same_position_alternatives_canonically() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1541,7 +1541,7 @@ async fn test_fuzzy_results_independent_of_partition_shape() {
     // match the same documents with the same scores.
     let single_dir = TempObjDir::default();
     let single_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         single_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1556,7 +1556,7 @@ async fn test_fuzzy_results_independent_of_partition_shape() {
 
     let split_dir = TempObjDir::default();
     let split_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         split_dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1610,7 +1610,7 @@ async fn test_fuzzy_results_independent_of_partition_shape() {
 async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1679,7 +1679,7 @@ async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
 async fn test_grouped_scoring_keeps_exact_winner_outside_proxy_window(#[case] operator: Operator) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1732,7 +1732,7 @@ async fn test_grouped_scoring_keeps_exact_winner_outside_proxy_window(#[case] op
 async fn test_fuzzy_and_grouped_rescore_keeps_wand_limit_bounded() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -1802,7 +1802,7 @@ async fn test_fuzzy_and_grouped_rescore_keeps_wand_limit_bounded() {
 async fn test_phrase_query_reads_legacy_per_doc_positions() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

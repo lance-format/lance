@@ -2408,7 +2408,7 @@ mod tests {
     use futures::stream;
     use lance_core::storage::path::Path;
     use lance_core::{ROW_ADDR, cache::LanceCache};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;
@@ -2618,7 +2618,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2662,7 +2662,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2730,7 +2730,7 @@ mod tests {
     ) {
         let tempdir = tempfile::tempdir().unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             Path::from_filesystem_path(tempdir.path()).unwrap(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2804,7 +2804,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2844,7 +2844,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2886,7 +2886,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2952,7 +2952,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3051,7 +3051,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3107,7 +3107,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3205,7 +3205,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3319,7 +3319,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let inner = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         )) as Arc<dyn IndexStore>;
@@ -3350,7 +3350,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let inner = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         )) as Arc<dyn IndexStore>;
@@ -3412,7 +3412,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
+            Arc::new(Storage::local()),
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
@@ -3522,7 +3522,7 @@ mod tests {
             let tempdir = tempfile::tempdir().unwrap();
             let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
             let store = Arc::new(LanceIndexStore::new(
-                Arc::new(ObjectStore::local()),
+                Arc::new(Storage::local()),
                 index_dir,
                 Arc::new(LanceCache::no_cache()),
             ));

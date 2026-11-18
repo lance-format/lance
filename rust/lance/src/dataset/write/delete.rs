@@ -856,7 +856,7 @@ mod tests {
             utils::test::DelayedStoreWrapper,
         };
         use futures::future::try_join_all;
-        use lance_io::object_store::ObjectStoreParams;
+        use lance_io::storage::StorageParams;
         use lance_io::utils::testing::DelayConfig;
         use tokio::sync::Barrier;
 
@@ -886,7 +886,7 @@ mod tests {
 
         let mut dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
-                store_params: Some(ObjectStoreParams {
+                store_params: Some(StorageParams {
                     backend_wrappers: vec![throttled.clone()],
                     ..Default::default()
                 }),
@@ -907,7 +907,7 @@ mod tests {
             let handle = tokio::task::spawn(async move {
                 let dataset = DatasetBuilder::from_uri("memory://")
                     .with_read_params(ReadParams {
-                        store_options: Some(ObjectStoreParams {
+                        store_options: Some(StorageParams {
                             backend_wrappers: vec![throttled_ref.clone()],
                             ..Default::default()
                         }),

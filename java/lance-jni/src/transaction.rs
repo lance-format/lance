@@ -22,7 +22,7 @@ use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
-use lance::io::ObjectStoreParams;
+use lance::io::StorageParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::key_existence::{FilterType, KeyExistenceFilter};
 use lance::table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -30,7 +30,7 @@ use lance::table::format::{DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use lance_io::storage::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_table::format::Manifest;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
@@ -1429,8 +1429,8 @@ fn inner_commit_to_dataset<'local>(
         }
     };
 
-    // Build ObjectStoreParams using the merged accessor
-    let store_params = ObjectStoreParams {
+    // Build StorageParams using the merged accessor
+    let store_params = StorageParams {
         storage_options_accessor,
         ..Default::default()
     };
@@ -2410,7 +2410,7 @@ fn inner_commit_to_uri<'local>(
         (true, None) => None,
     };
 
-    let store_params = ObjectStoreParams {
+    let store_params = StorageParams {
         storage_options_accessor: accessor,
         ..Default::default()
     };

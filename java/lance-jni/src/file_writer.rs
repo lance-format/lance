@@ -20,9 +20,9 @@ use jni::{
     objects::{JObject, JString},
     sys::jlong,
 };
-use lance::io::ObjectStore;
+use lance::io::Storage;
 use lance_file::{version::LanceFileVersion, versions as file_versions, writer::FileWriter};
-use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::storage::{StorageParams, StorageRegistry};
 
 pub const NATIVE_WRITER: &str = "nativeFileWriterHandle";
 
@@ -95,14 +95,14 @@ fn inner_open<'local>(
         extract_file_writer_options(env, &file_write_options)?.unwrap_or_default();
 
     let writer = block_on(async move {
-        let object_params = ObjectStoreParams {
+        let object_params = StorageParams {
             storage_options_accessor: Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(storage_options),
             )),
             ..Default::default()
         };
-        let (obj_store, path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
+        let (obj_store, path) = Storage::from_uri_and_params(
+            Arc::new(StorageRegistry::default()),
             &file_uri_str,
             &object_params,
         )

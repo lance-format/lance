@@ -401,9 +401,9 @@ constructing their shared session:
 ```rust
 use std::sync::Arc;
 use lance::session::{Session, UnregisteredExternalBlobPolicy};
-use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::storage::StorageRegistry;
 
-let registry = ObjectStoreRegistry::default()
+let registry = StorageRegistry::default()
     .without_providers(["file", "file-object-store", "file+uring"])?;
 let session = Session::new(0, 0, Arc::new(registry))
     .with_unregistered_external_blob_policy(UnregisteredExternalBlobPolicy::Deny);
@@ -423,7 +423,7 @@ credentials and deployment restrictions.
 
 Externally owned objects can change independently of table versions. Rust store
 wrappers prepare their external read view through
-`WrappingObjectStore::wrap_external_blob`, reusing the same physical store,
+`BackendWrapper::wrap_external_blob`, reusing the same physical store,
 credentials, endpoint, and connection pool. This hook retains the regular
 wrapper by default. A service's immutable page-cache wrapper should return the
 provided original view to bypass that cache, while retaining authorization and

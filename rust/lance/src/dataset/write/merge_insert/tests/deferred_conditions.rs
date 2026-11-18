@@ -4,7 +4,7 @@
 use super::*;
 use arrow_array::{ArrayRef, LargeBinaryArray};
 use lance_datagen::{ArrayGeneratorExt, ByteCount};
-use lance_io::{object_store::WrappingObjectStore, utils::tracking_store::IOTracker};
+use lance_io::{storage::BackendWrapper, utils::tracking_store::IOTracker};
 use rstest::rstest;
 
 const PAYLOAD_BYTES: u64 = 16 * 1024;
@@ -49,8 +49,7 @@ async fn fixture() -> Fixture {
     .await
     .unwrap();
     let io = IOTracker::default();
-    let ds =
-        Arc::new(ds.with_backend_wrappers([Arc::new(io.clone()) as Arc<dyn WrappingObjectStore>]));
+    let ds = Arc::new(ds.with_backend_wrappers([Arc::new(io.clone()) as Arc<dyn BackendWrapper>]));
     io.incremental_stats();
     Fixture { ds, batch, io }
 }

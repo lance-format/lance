@@ -17,7 +17,7 @@ use lance_index::frag_reuse::{
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
-use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
+use lance_io::storage::{Storage, StorageRegistry};
 use lance_table::format::pb::fragment_reuse_index_details::{
     self as pb_fri, Content, InlineContent,
 };
@@ -860,7 +860,7 @@ async fn fri_external_location(
     dataset: &Dataset,
     index: &IndexMetadata,
     file: &ExternalFile,
-) -> lance_core::Result<(Arc<ObjectStore>, Path)> {
+) -> lance_core::Result<(Arc<Storage>, Path)> {
     let path = dataset
         .indice_files_dir(index)?
         .join(index.uuid.to_string())
@@ -869,7 +869,7 @@ async fn fri_external_location(
 }
 
 async fn read_fri_external_range(
-    store: &ObjectStore,
+    store: &Storage,
     path: &Path,
     file: &ExternalFile,
 ) -> lance_core::Result<bytes::Bytes> {
@@ -2272,7 +2272,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
 /// spilling to `<indices_dir>/<index_id>/details.binpb` above the inline
 /// threshold.
 async fn encode_tagged_frag_reuse_details(
-    storage: &ObjectStore,
+    storage: &Storage,
     indices_dir: Path,
     index_id: Uuid,
     content: Vec<u8>,
@@ -2507,13 +2507,13 @@ pub(crate) enum CloneBaseRemap {
 /// it again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn relocate_tagged_entry_for_clone(
-    source_store: &ObjectStore,
+    source_store: &Storage,
     source_base: &Path,
     source_manifest: &Manifest,
-    store_registry: Arc<ObjectStoreRegistry>,
+    store_registry: Arc<StorageRegistry>,
     entry: &IndexMetadata,
     base_remap: CloneBaseRemap,
-    target_store: &ObjectStore,
+    target_store: &Storage,
     target_base: &Path,
 ) -> lance_core::Result<(IndexMetadata, Option<Path>)> {
     let details = entry
@@ -2553,12 +2553,9 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
                 // clone commit path. Documented limitation shared with deep
                 // clone's base reads (see
                 // <https://github.com/lance-format/lance/issues/6093>).
-                let (store, _) = ObjectStore::from_uri_and_params(
-                    registry,
-                    &base_path.path,
-                    &Default::default(),
-                )
-                .await?;
+                let (store, _) =
+                    Storage::from_uri_and_params(registry, &base_path.path, &Default::default())
+                        .await?;
                 (Some(store), dir)
             }
         };
@@ -4637,7 +4634,7 @@ mod tests {
             async fn resolve_latest_location(
                 &self,
                 base_path: &Path,
-                storage: &ObjectStore,
+                storage: &Storage,
             ) -> lance_core::Result<ManifestLocation> {
                 if base_path.as_ref().ends_with(self.fail_suffix) {
                     return Err(Error::io("injected resolver outage"));
@@ -4650,7 +4647,7 @@ mod tests {
                 manifest: &mut Manifest,
                 indices: Option<Vec<IndexMetadata>>,
                 base_path: &Path,
-                storage: &ObjectStore,
+                storage: &Storage,
                 manifest_writer: ManifestWriter,
                 naming_scheme: ManifestNamingScheme,
                 transaction: Option<lance_table::format::Transaction>,

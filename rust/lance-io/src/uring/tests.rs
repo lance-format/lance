@@ -9,7 +9,7 @@ use super::future::UringReadFuture;
 use super::reader::{CacheKey, HANDLE_CACHE};
 use super::requests::{IoRequest, PendingRequests, RequestState};
 use super::thread::push_to_sq;
-use crate::object_store::ObjectStore;
+use crate::storage::Storage;
 use crate::utils::tracking_store::IOTracker;
 use bytes::BytesMut;
 use io_uring::IoUring;
@@ -58,7 +58,7 @@ async fn test_read_small_file() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Read entire file
@@ -75,7 +75,7 @@ async fn test_read_range() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Read a range in the middle
@@ -93,7 +93,7 @@ async fn test_read_multiple_ranges() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Read multiple ranges
@@ -114,7 +114,7 @@ async fn test_file_size() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     assert_eq!(reader.size().await.unwrap(), size);
@@ -129,7 +129,7 @@ async fn test_concurrent_reads() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
 
     // Perform multiple concurrent reads
     let mut tasks = vec![];
@@ -160,7 +160,7 @@ async fn test_large_file_read() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Read entire file
@@ -178,7 +178,7 @@ async fn test_read_edge_cases() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Read from start
@@ -200,7 +200,7 @@ async fn test_read_edge_cases() -> Result<()> {
 async fn test_file_not_found() -> Result<()> {
     skip_if_no_uring_workers!();
     let uri = "file+uring:///nonexistent/file.dat";
-    let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+    let (store, path) = Storage::from_uri(uri).await.unwrap();
 
     // Should fail to open non-existent file
     let result = store.open(&path).await;
@@ -216,7 +216,7 @@ async fn test_block_size_and_parallelism() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Check default values (or configured values)
@@ -233,7 +233,7 @@ async fn test_path() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Verify path is preserved
@@ -254,7 +254,7 @@ async fn test_short_read_get_all() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
 
     // Open with inflated known_size — the reader will think the file is 2x its real size
     let inflated_size = actual_size * 2;
@@ -277,7 +277,7 @@ async fn test_short_read_get_range_past_eof() -> Result<()> {
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Request a range that starts inside the file but extends past EOF.
@@ -449,7 +449,7 @@ async fn test_queued_read_keeps_its_file_open() -> Result<()> {
     let mut file = NamedTempFile::new()?;
     file.write_all(&expected_data)?;
     let uri = format!("file+uring://{}", file.path().to_str().unwrap());
-    let (_, path) = ObjectStore::from_uri(&uri).await?;
+    let (_, path) = Storage::from_uri(&uri).await?;
 
     let reader =
         UringCurrentThreadReader::open(&path, 4096, None, Arc::new(IOTracker::default())).await?;
@@ -480,7 +480,7 @@ async fn test_uring_not_enabled_with_file_scheme() -> Result<()> {
     // Use regular file:// scheme, should NOT use uring
     let uri = format!("file://{}", file_path);
 
-    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let (store, path) = Storage::from_uri(&uri).await?;
     let reader = store.open(&path).await?;
 
     // Should still be able to read, just won't use uring

@@ -681,14 +681,14 @@ mod tests {
     use crate::scalar::{IndexStore, lance_format::LanceIndexStore};
     use futures::FutureExt;
     use lance_core::utils::tempfile::TempDir;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();
-        let (storage, test_path) = ObjectStore::from_uri(test_path.as_ref())
+        let (storage, test_path) = Storage::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();

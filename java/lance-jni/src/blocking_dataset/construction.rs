@@ -26,10 +26,10 @@ use lance::dataset::refs::Ref;
 use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, ReadParams, WriteParams};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance::io::{ObjectStore, ObjectStoreParams};
+use lance::io::{Storage, StorageParams};
 use lance::session::Session as LanceSession;
-use lance_io::object_store::ObjectStoreRegistry;
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use lance_io::storage::StorageRegistry;
+use lance_io::storage::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::ManifestLocation;
@@ -60,14 +60,14 @@ impl BlockingDataset {
 
     pub fn drop(uri: &str, storage_options: HashMap<String, String>) -> Result<()> {
         block_on(async move {
-            let registry = Arc::new(ObjectStoreRegistry::default());
-            let storage_params = ObjectStoreParams {
+            let registry = Arc::new(StorageRegistry::default());
+            let storage_params = StorageParams {
                 storage_options_accessor: Some(Arc::new(
                     lance::io::StorageOptionsAccessor::with_static_options(storage_options),
                 )),
                 ..Default::default()
             };
-            let (storage, path) = ObjectStore::from_uri_and_params(registry, uri, &storage_params)
+            let (storage, path) = Storage::from_uri_and_params(registry, uri, &storage_params)
                 .await
                 .map_err(|e| Error::io_error(e.to_string()))?;
             lance::dataset::validate_dataset_root_for_drop(&storage, &path)
@@ -90,7 +90,7 @@ impl BlockingDataset {
             ))
         });
         let params = ReadParams {
-            store_options: Some(ObjectStoreParams {
+            store_options: Some(StorageParams {
                 storage_options_accessor: accessor,
                 ..Default::default()
             }),
@@ -120,7 +120,7 @@ impl BlockingDataset {
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
-        base_store_params: HashMap<String, ObjectStoreParams>,
+        base_store_params: HashMap<String, StorageParams>,
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
         session: Option<Arc<LanceSession>>,
@@ -145,7 +145,7 @@ impl BlockingDataset {
             (true, None) => None,
         };
 
-        let store_params = ObjectStoreParams {
+        let store_params = StorageParams {
             block_size: block_size.map(|size| size as usize),
             storage_options_accessor: accessor,
             ..Default::default()
@@ -210,7 +210,7 @@ impl BlockingDataset {
             uri,
             operation,
             read_version,
-            Some(ObjectStoreParams {
+            Some(StorageParams {
                 storage_options_accessor: accessor,
                 ..Default::default()
             }),
@@ -533,7 +533,7 @@ fn create_dataset<'local>(
                 ),
             )
         };
-        write_params.store_params = Some(ObjectStoreParams {
+        write_params.store_params = Some(StorageParams {
             storage_options_accessor: Some(accessor),
             ..Default::default()
         });

@@ -49,8 +49,8 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
+use lance_io::storage::Storage;
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
@@ -933,7 +933,7 @@ impl BaseSchedulers {
 
     /// Return the scheduler for `base_id`, building it once from `object_store`
     /// and reusing it for every later file read from the same base.
-    fn get_or_create(&self, base_id: u32, storage: Arc<ObjectStore>) -> Arc<ScanScheduler> {
+    fn get_or_create(&self, base_id: u32, storage: Arc<Storage>) -> Arc<ScanScheduler> {
         let mut schedulers = self.schedulers.lock().unwrap();
         schedulers
             .entry(base_id)
@@ -4399,7 +4399,7 @@ mod tests {
     use lance_datagen::{RowCount, array, gen_batch};
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_file::writer::FileWriterOptions;
-    use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
+    use lance_io::{assert_io_eq, assert_io_lt, storage::Storage};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::collections::HashMap;
@@ -8209,7 +8209,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (storage, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
+        let (storage, base_path) = Storage::from_uri(test_uri).await.unwrap();
         let file_reader = V1FileReader::try_new_with_fragment_id(
             &storage,
             &base_path
@@ -8336,7 +8336,7 @@ mod tests {
         use super::*;
         use arrow_array::types::Int32Type;
         use lance_datagen::ArrayGeneratorExt;
-        use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore, uri_to_url};
+        use lance_io::storage::{BackendWrapper, StorageRegistry, uri_to_url};
         use lance_io::utils::tracking_store::{IOTracker, IoStats};
         use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
         use pretty_assertions::assert_eq;
@@ -8419,7 +8419,7 @@ mod tests {
                 .with_session(Arc::new(Session::new(
                     0,
                     0,
-                    Arc::new(ObjectStoreRegistry::default()),
+                    Arc::new(StorageRegistry::default()),
                 )))
                 .load()
                 .await
@@ -8710,8 +8710,8 @@ mod tests {
             let failures = Arc::new(FailingProxyStore::new());
             let tracker = Arc::new(IOTracker::default());
             let request_dataset = dataset.with_backend_wrappers([
-                failures.clone() as Arc<dyn WrappingObjectStore>,
-                tracker.clone() as Arc<dyn WrappingObjectStore>,
+                failures.clone() as Arc<dyn BackendWrapper>,
+                tracker.clone() as Arc<dyn BackendWrapper>,
             ]);
             let fragment = request_dataset.get_fragments().remove(0);
             let mut reader = fragment
@@ -8850,7 +8850,7 @@ mod tests {
             .await;
 
         let new_data = make_gen().into_batch_rows(RowCount::from(128)).unwrap();
-        let store = ObjectStore::local();
+        let store = Storage::local();
         let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer = lance_file::versions::create_lazy_writer(
@@ -9194,7 +9194,7 @@ mod tests {
     #[tokio::test]
     async fn test_base_schedulers_shares_one_per_base() {
         let cache = BaseSchedulers::new(4 * 1024 * 1024);
-        let store = Arc::new(ObjectStore::local());
+        let store = Arc::new(Storage::local());
 
         // Repeated resolutions of the same base reuse one scheduler, so opening
         // many files from a base does not multiply scheduler budgets.

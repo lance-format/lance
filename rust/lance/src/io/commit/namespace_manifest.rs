@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lance_core::Result;
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
@@ -62,8 +62,8 @@ impl LanceNamespaceExternalManifestStore {
         table_id: Vec<String>,
         table_uri: &str,
     ) -> Result<Self> {
-        let table_root = lance_io::object_store::ObjectStore::extract_path_from_uri(
-            Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        let table_root = lance_io::storage::Storage::extract_path_from_uri(
+            Arc::new(lance_io::storage::StorageRegistry::default()),
             table_uri,
         )?;
         Ok(Self::new(namespace_client, table_id, table_root))
@@ -137,7 +137,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         staging_path: &Path,
         size: u64,
         e_tag: Option<String>,
-        _storage: &ObjectStore,
+        _storage: &Storage,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
         // create_table_version reads staging manifest and writes to final location

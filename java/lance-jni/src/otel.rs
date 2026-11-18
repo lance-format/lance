@@ -200,7 +200,7 @@ impl Recorder for LanceRecorder {
 
 fn register_bounds() {
     let mut bounds = HISTOGRAM_BOUNDS.write().unwrap();
-    for (name, values) in lance_io::object_store::metrics::histogram_bounds() {
+    for (name, values) in lance_io::storage::metrics::histogram_bounds() {
         bounds.insert((*name).to_string(), Arc::from(*values));
     }
     for (name, values) in lance_core::cache::histogram_bounds() {
@@ -212,7 +212,7 @@ fn register_bounds() {
 }
 
 fn describe_all() {
-    lance_io::object_store::metrics::describe_metrics();
+    lance_io::storage::metrics::describe_metrics();
     lance_core::cache::describe_metrics();
     lance_core::memory::describe_metrics();
 }

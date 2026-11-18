@@ -725,7 +725,7 @@ pub mod tests {
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_table::format::BasePath;
     use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
     use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
@@ -3433,7 +3433,7 @@ pub mod tests {
         };
         if let Some(bytes) = bytes {
             assert_eq!(bytes.len() as u64, file.size);
-            let (store, root) = ObjectStore::from_uri_and_params(
+            let (store, root) = Storage::from_uri_and_params(
                 clone.session().store_registry(),
                 &elsewhere,
                 &Default::default(),

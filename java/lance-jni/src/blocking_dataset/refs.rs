@@ -12,7 +12,7 @@ use jni::JNIEnv;
 use jni::objects::{JMap, JObject, JString, JValue};
 use jni::sys::jlong;
 use lance::dataset::refs::{Ref, TagContents};
-use lance::io::ObjectStoreParams;
+use lance::io::StorageParams;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -567,14 +567,14 @@ pub(super) fn transform_jref_to_ref(jref: JObject, env: &mut JNIEnv) -> Result<R
 fn transform_jstorage_options(
     jstorage_options: JObject,
     env: &mut JNIEnv,
-) -> Result<Option<ObjectStoreParams>> {
+) -> Result<Option<StorageParams>> {
     let storage_options = env.get_optional(&jstorage_options, |env, map_obj| {
         let jmap = JMap::from_env(env, &map_obj)?;
         to_rust_map(env, &jmap)
     })?;
     Ok(storage_options
         .map(|options| {
-            Some(ObjectStoreParams {
+            Some(StorageParams {
                 storage_options_accessor: Some(Arc::new(
                     lance::io::StorageOptionsAccessor::with_static_options(options),
                 )),

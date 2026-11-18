@@ -300,7 +300,7 @@ mod tests {
     use std::str::FromStr;
 
     use lance_core::storage::path::Path;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
 
     use super::*;
 
@@ -448,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_version_detection_accepts_all_legacy_footer_aliases() {
-        let storage = ObjectStore::memory();
+        let storage = Storage::memory();
         for minor in 0u16..=2 {
             let path = Path::from(format!("legacy-{minor}.lance"));
             let mut footer = Vec::with_capacity(8);

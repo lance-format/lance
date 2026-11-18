@@ -21,7 +21,7 @@ use lance_index::scalar::minhash_lsh::{
     MinHashLshIndex, MinHashLshIndexBuilder, MinHashLshIndexParams, SIGNATURE_VERSION,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 
 fn bench_minhash_lsh(c: &mut Criterion) {
@@ -44,7 +44,7 @@ fn bench_minhash_lsh(c: &mut Criterion) {
         let path = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = runtime.block_on(async {
             Arc::new(LanceIndexStore::new(
-                Arc::new(ObjectStore::local()),
+                Arc::new(Storage::local()),
                 path,
                 Arc::new(LanceCache::no_cache()),
             ))

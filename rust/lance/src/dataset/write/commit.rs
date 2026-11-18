@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::storage::{Storage, StorageParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::ClusteringDefinition;
 use lance_table::{
@@ -42,9 +42,9 @@ pub struct CommitBuilder<'a> {
     enable_v2_manifest_paths: bool,
     storage_format: Option<ConcreteFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
-    store_params: Option<ObjectStoreParams>,
-    storage: Option<Arc<ObjectStore>>,
-    source_store: Option<Arc<ObjectStore>>,
+    store_params: Option<StorageParams>,
+    storage: Option<Arc<Storage>>,
+    source_store: Option<Arc<Storage>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
@@ -128,7 +128,7 @@ impl<'a> CommitBuilder<'a> {
     }
 
     /// Pass an object store to use.
-    pub fn with_storage(mut self, storage: Arc<ObjectStore>) -> Self {
+    pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         self.storage = Some(storage);
         self
     }
@@ -140,7 +140,7 @@ impl<'a> CommitBuilder<'a> {
     /// cross object stores/accounts (e.g. between two Azure accounts), where the source
     /// is not reachable with the destination's credentials. Defaults to the destination
     /// store when not set, preserving same-store behavior.
-    pub fn with_source_store(mut self, source_store: Arc<ObjectStore>) -> Self {
+    pub fn with_source_store(mut self, source_store: Arc<Storage>) -> Self {
         self.source_store = Some(source_store);
         self
     }
@@ -202,7 +202,7 @@ impl<'a> CommitBuilder<'a> {
     /// Pass store parameters to use for the dataset.
     ///
     /// If an object store is passed, these parameters will be ignored.
-    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+    pub fn with_store_params(mut self, store_params: StorageParams) -> Self {
         self.store_params = Some(store_params);
         self
     }
@@ -429,10 +429,10 @@ impl<'a> CommitBuilder<'a> {
                 let (storage, base_path) = if let Some(passed_store) = self.storage {
                     (
                         passed_store,
-                        ObjectStore::extract_path_from_uri(session.store_registry(), uri)?,
+                        Storage::extract_path_from_uri(session.store_registry(), uri)?,
                     )
                 } else {
-                    ObjectStore::from_uri_and_params(
+                    Storage::from_uri_and_params(
                         session.store_registry(),
                         uri,
                         &self.store_params.clone().unwrap_or_default(),
@@ -853,7 +853,7 @@ mod tests {
             _manifest: &mut Manifest,
             _indices: Option<Vec<IndexMetadata>>,
             _base_path: &lance_core::storage::path::Path,
-            _storage: &ObjectStore,
+            _storage: &Storage,
             _manifest_writer: ManifestWriter,
             _naming_scheme: ManifestNamingScheme,
             _transaction: Option<TableTransaction>,
@@ -1006,7 +1006,7 @@ mod tests {
             },
         });
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
@@ -1179,7 +1179,7 @@ mod tests {
             },
         });
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
@@ -1218,7 +1218,7 @@ mod tests {
             },
         });
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
@@ -1262,7 +1262,7 @@ mod tests {
             },
         });
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
@@ -1343,7 +1343,7 @@ mod tests {
             manifest: &mut Manifest,
             indices: Option<Vec<IndexMetadata>>,
             base_path: &lance_core::storage::path::Path,
-            storage: &ObjectStore,
+            storage: &Storage,
             manifest_writer: ManifestWriter,
             naming_scheme: ManifestNamingScheme,
             transaction: Option<TableTransaction>,
@@ -1383,7 +1383,7 @@ mod tests {
             },
         });
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled],
                 ..Default::default()
             }),
@@ -1523,7 +1523,7 @@ mod tests {
         });
         let session = Arc::new(Session::default());
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
+            store_params: Some(StorageParams {
                 backend_wrappers: vec![throttled],
                 list_is_lexically_ordered: Some(false),
                 ..Default::default()

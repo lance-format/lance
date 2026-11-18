@@ -14,7 +14,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
@@ -438,7 +438,7 @@ impl<'a> InsertBuilder<'a> {
                     .as_ref()
                     .map(|s| s.store_registry())
                     .unwrap_or_else(|| Arc::new(Default::default()));
-                let (storage, base_path) = ObjectStore::from_uri_and_params(
+                let (storage, base_path) = Storage::from_uri_and_params(
                     registry,
                     uri,
                     &params.store_params.clone().unwrap_or_default(),
@@ -498,7 +498,7 @@ impl<'a> InsertBuilder<'a> {
 struct WriteContext<'a> {
     params: WriteParams,
     dest: WriteDestination<'a>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: ConcreteFileVersion,

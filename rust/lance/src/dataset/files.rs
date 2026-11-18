@@ -191,8 +191,8 @@ fn manifest_file_batches<'a>(
 async fn get_index_files(
     uuids: impl IntoIterator<Item = Uuid>,
     base: &Path,
-    storage: &lance_io::object_store::ObjectStore,
-    cache: &mut HashMap<Uuid, Vec<lance_io::object_store::ObjectMeta>>,
+    storage: &lance_io::storage::Storage,
+    cache: &mut HashMap<Uuid, Vec<lance_io::storage::ObjectMeta>>,
 ) -> Result<Vec<Path>> {
     let uuids: Vec<Uuid> = uuids.into_iter().collect();
 
@@ -204,17 +204,17 @@ async fn get_index_files(
         .collect();
     if !uncached.is_empty() {
         let parallelism = storage.io_parallelism();
-        // Clone for use in async move closures (ObjectStore is Arc-backed).
+        // Clone for use in async move closures (Storage is Arc-backed).
         let base_owned = base.clone();
         let os = storage.clone();
-        let new_entries: Vec<(Uuid, Vec<lance_io::object_store::ObjectMeta>)> =
+        let new_entries: Vec<(Uuid, Vec<lance_io::storage::ObjectMeta>)> =
             futures::stream::iter(uncached)
                 .map(|uuid| {
                     let base = base_owned.clone();
                     let os = os.clone();
                     async move {
                         let prefix = base.join(INDICES_DIR).join(uuid.to_string());
-                        let files: Vec<lance_io::object_store::ObjectMeta> =
+                        let files: Vec<lance_io::storage::ObjectMeta> =
                             os.list(Some(prefix)).try_collect().await?;
                         lance_core::Result::Ok((uuid, files))
                     }
@@ -285,7 +285,7 @@ impl Dataset {
     /// | Column     | Type                              | Notes |
     /// |------------|-----------------------------------|-------|
     /// | `version`  | `Int64` (non-null)                | Manifest version number |
-    /// | `base_uri` | `Dictionary(Int32, Utf8)` (non-null) | ObjectStore root for this file |
+    /// | `base_uri` | `Dictionary(Int32, Utf8)` (non-null) | Storage root for this file |
     /// | `path`     | `Utf8` (non-null)                 | Relative to `base_uri` |
     /// | `type`     | `Dictionary(Int8, Utf8)` (non-null)  | One of: `data file`, `manifest`, `deletion file`, `transaction file`, `index file` |
     ///
@@ -379,8 +379,7 @@ impl Dataset {
         let os_idx = storage;
         let base_idx = base;
         lance_core::utils::tokio::spawn(async move {
-            let mut uuid_cache: HashMap<Uuid, Vec<lance_io::object_store::ObjectMeta>> =
-                HashMap::new();
+            let mut uuid_cache: HashMap<Uuid, Vec<lance_io::storage::ObjectMeta>> = HashMap::new();
             while let Some((version, indexes)) = rx_indexes.recv().await {
                 let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();
                 match get_index_files(uuids, &base_idx, &os_idx, &mut uuid_cache).await {
@@ -428,7 +427,7 @@ impl Dataset {
     ///
     /// | Column          | Type                                       | Notes |
     /// |-----------------|--------------------------------------------|-------|
-    /// | `base_uri`      | `Dictionary(Int32, Utf8)` (non-null)       | ObjectStore root |
+    /// | `base_uri`      | `Dictionary(Int32, Utf8)` (non-null)       | Storage root |
     /// | `path`          | `Utf8` (non-null)                          | Relative to `base_uri` |
     /// | `size_bytes`    | `Int64` (non-null)                         | File size in bytes |
     /// | `last_modified` | `Timestamp(Microsecond, "UTC")` (non-null) | Last modification time |
@@ -457,7 +456,7 @@ impl Dataset {
 }
 
 fn build_all_files_batch(
-    chunk: &[lance_io::object_store::ObjectMeta],
+    chunk: &[lance_io::storage::ObjectMeta],
     base: &Path,
     uri: &str,
 ) -> Result<RecordBatch> {

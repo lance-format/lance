@@ -180,7 +180,7 @@ async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
     .unwrap();
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -314,7 +314,7 @@ async fn test_ngram_match_requires_all_terms_indexed_and_flat(
     .unwrap();
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
+        Storage::local().into(),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
@@ -511,7 +511,7 @@ async fn test_document_lengths_indexed_and_flat(
     for with_position in [false, true] {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
+            Storage::local().into(),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));

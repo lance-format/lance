@@ -9,9 +9,6 @@ pub mod exec;
 
 pub use lance_io::{
     bytes_read_counter, iops_counter,
-    object_store::{
-        ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
-        WrappingObjectStore,
-    },
+    storage::{BackendWrapper, Storage, StorageOptionsAccessor, StorageParams, StorageRegistry},
     stream::RecordBatchStream,
 };

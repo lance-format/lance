@@ -1638,7 +1638,7 @@ impl Drop for ReadGuard<'_> {
 
 #[derive(Debug)]
 struct SlowReads {
-    target: Arc<dyn lance_io::object_store::StorageBackend>,
+    target: Arc<dyn lance_io::storage::StorageBackend>,
     watch: Arc<ReadWatch>,
 }
 
@@ -1649,14 +1649,14 @@ impl std::fmt::Display for SlowReads {
 }
 
 #[async_trait::async_trait]
-impl lance_io::object_store::StorageBackend for SlowReads {
+impl lance_io::storage::StorageBackend for SlowReads {
     async fn list_paginated(
         &self,
         prefix: Option<&str>,
-        options: lance_io::object_store::PaginatedListOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        options: lance_io::storage::PaginatedListOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PaginatedListResult> {
         let _ = (prefix, options);
-        Err(lance_io::object_store::Error::NotSupported {
+        Err(lance_io::storage::Error::NotSupported {
             source: "native pagination is unavailable".into(),
         })
     }
@@ -1664,26 +1664,25 @@ impl lance_io::object_store::StorageBackend for SlowReads {
     async fn put_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        bytes: lance_io::object_store::PutPayload,
-        opts: lance_io::object_store::PutOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::PutResult> {
+        bytes: lance_io::storage::PutPayload,
+        opts: lance_io::storage::PutOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::PutResult> {
         self.target.put_opts(location, bytes, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::PutMultipartOptions,
-    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
-    {
+        opts: lance_io::storage::PutMultipartOptions,
+    ) -> lance_io::storage::Result<Box<dyn lance_io::storage::backend::MultipartUpload>> {
         self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
         &self,
         location: &lance_core::storage::path::Path,
-        options: lance_io::object_store::GetOptions,
-    ) -> lance_io::object_store::Result<lance_io::object_store::GetResult> {
+        options: lance_io::storage::GetOptions,
+    ) -> lance_io::storage::Result<lance_io::storage::GetResult> {
         let _read = self.watch.enter().await;
         self.target.get_opts(location, options).await
     }
@@ -1692,7 +1691,7 @@ impl lance_io::object_store::StorageBackend for SlowReads {
         &self,
         location: &lance_core::storage::path::Path,
         ranges: &[std::ops::Range<u64>],
-    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+    ) -> lance_io::storage::Result<Vec<bytes::Bytes>> {
         let _read = self.watch.enter().await;
         self.target.get_ranges(location, ranges).await
     }
@@ -1701,11 +1700,11 @@ impl lance_io::object_store::StorageBackend for SlowReads {
         &self,
         locations: futures::stream::BoxStream<
             'static,
-            lance_io::object_store::Result<lance_core::storage::path::Path>,
+            lance_io::storage::Result<lance_core::storage::path::Path>,
         >,
     ) -> futures::stream::BoxStream<
         'static,
-        lance_io::object_store::Result<lance_core::storage::path::Path>,
+        lance_io::storage::Result<lance_core::storage::path::Path>,
     > {
         self.target.delete_stream(locations)
     }
@@ -1713,17 +1712,15 @@ impl lance_io::object_store::StorageBackend for SlowReads {
     fn list(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         self.target.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
-    ) -> lance_io::object_store::Result<lance_io::object_store::ListResult> {
+    ) -> lance_io::storage::Result<lance_io::storage::ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
 
@@ -1731,8 +1728,8 @@ impl lance_io::object_store::StorageBackend for SlowReads {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::CopyOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::CopyOptions,
+    ) -> lance_io::storage::Result<()> {
         self.target.copy_opts(from, to, opts).await
     }
 
@@ -1740,8 +1737,8 @@ impl lance_io::object_store::StorageBackend for SlowReads {
         &self,
         from: &lance_core::storage::path::Path,
         to: &lance_core::storage::path::Path,
-        opts: lance_io::object_store::RenameOptions,
-    ) -> lance_io::object_store::Result<()> {
+        opts: lance_io::storage::RenameOptions,
+    ) -> lance_io::storage::Result<()> {
         self.target.rename_opts(from, to, opts).await
     }
 
@@ -1749,10 +1746,8 @@ impl lance_io::object_store::StorageBackend for SlowReads {
         &self,
         prefix: Option<&lance_core::storage::path::Path>,
         offset: &lance_core::storage::path::Path,
-    ) -> futures::stream::BoxStream<
-        'static,
-        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
-    > {
+    ) -> futures::stream::BoxStream<'static, lance_io::storage::Result<lance_io::storage::ObjectMeta>>
+    {
         let offset = offset.clone();
         futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
             self.list(prefix),
@@ -1764,12 +1759,12 @@ impl lance_io::object_store::StorageBackend for SlowReads {
 #[derive(Debug)]
 struct SlowReadsWrapper(Arc<ReadWatch>);
 
-impl lance_io::object_store::WrappingObjectStore for SlowReadsWrapper {
+impl lance_io::storage::BackendWrapper for SlowReadsWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        target: Arc<dyn lance_io::object_store::StorageBackend>,
-    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        target: Arc<dyn lance_io::storage::StorageBackend>,
+    ) -> Arc<dyn lance_io::storage::StorageBackend> {
         Arc::new(SlowReads {
             target,
             watch: self.0.clone(),
@@ -1785,7 +1780,7 @@ impl lance_io::object_store::WrappingObjectStore for SlowReadsWrapper {
 #[allow(clippy::print_stderr)]
 async fn test_harvest_reads_are_bounded_and_concurrent() {
     let watch = Arc::new(ReadWatch::default());
-    let store_params = lance_io::object_store::ObjectStoreParams {
+    let store_params = lance_io::storage::StorageParams {
         backend_wrappers: vec![Arc::new(SlowReadsWrapper(watch.clone()))],
         ..Default::default()
     };
@@ -1794,7 +1789,7 @@ async fn test_harvest_reads_are_bounded_and_concurrent() {
     let session = Arc::new(crate::session::Session::new(
         0,
         0,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        Arc::new(lance_io::storage::StorageRegistry::default()),
     ));
     let params = WriteParams {
         max_rows_per_file: ROWS_PER_FILE,
@@ -1841,7 +1836,7 @@ async fn test_harvest_reads_are_bounded_and_concurrent() {
         "{} concurrent harvests for a concurrency of {concurrency}",
         report.max_concurrent_harvests
     );
-    // ObjectStore-level concurrency is reported separately: one harvest can
+    // Storage-level concurrency is reported separately: one harvest can
     // issue several reads, so only the overlap itself is asserted.
     let max_reads_in_flight = watch.max_in_flight.load(Ordering::SeqCst);
     assert!(

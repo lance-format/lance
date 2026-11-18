@@ -9,7 +9,7 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::cache::LanceCache;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_select::RowAddrTreeMap;
 use rstest::rstest;
 
@@ -20,7 +20,7 @@ use crate::scalar::lance_format::LanceIndexStore;
 fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
+        Arc::new(Storage::local()),
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));

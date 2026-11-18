@@ -6,7 +6,7 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::cache::{LanceCache, QuickCacheBackend};
 use lance_core::utils::tempfile::TempObjDir;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 
 use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
 use crate::prefilter::NoFilter;

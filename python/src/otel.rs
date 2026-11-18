@@ -255,7 +255,7 @@ impl Recorder for LanceRecorder {
 /// subsystem. New subsystems add their `histogram_bounds()` here.
 fn register_bounds() {
     let mut bounds = HISTOGRAM_BOUNDS.write().unwrap();
-    for (name, values) in lance_io::object_store::metrics::histogram_bounds() {
+    for (name, values) in lance_io::storage::metrics::histogram_bounds() {
         bounds.insert((*name).to_string(), Arc::from(*values));
     }
     for (name, values) in lance_core::cache::histogram_bounds() {
@@ -270,7 +270,7 @@ fn register_bounds() {
 /// run after the recorder is installed. New subsystems add their
 /// `describe_metrics()` here.
 fn describe_all() {
-    lance_io::object_store::metrics::describe_metrics();
+    lance_io::storage::metrics::describe_metrics();
     lance_core::cache::describe_metrics();
     lance_core::memory::describe_metrics();
 }
@@ -632,7 +632,7 @@ mod tests {
     fn describe_all_covers_emitted_metrics() {
         use lance_core::cache::telemetry as cache;
         use lance_core::memory;
-        use lance_io::object_store::metrics as os;
+        use lance_io::storage::metrics as os;
 
         let registry = Arc::new(Registry::new(LanceStorage));
         let recorder = LanceRecorder { registry };

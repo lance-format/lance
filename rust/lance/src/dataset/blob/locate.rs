@@ -7,7 +7,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, StructArray};
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 
 use super::file::{BlobFile, BlobSource, BlobSourceKey, shared_blob_source};
 use crate::dataset::Dataset;
@@ -269,8 +269,8 @@ pub(super) struct BlobLocator<'a> {
     field_id: u32,
     fragments: HashMap<u32, BlobReadLocation>,
     base_roots: HashMap<u32, Path>,
-    stores: HashMap<u32, Arc<ObjectStore>>,
-    external_stores: HashMap<u32, Arc<ObjectStore>>,
+    stores: HashMap<u32, Arc<Storage>>,
+    external_stores: HashMap<u32, Arc<Storage>>,
     sources: HashMap<BlobSourceKey, Arc<BlobSource>>,
 }
 
@@ -334,7 +334,7 @@ impl<'a> BlobLocator<'a> {
                         .cloned()
                         .unwrap_or_default();
                     let (store, path) =
-                        ObjectStore::from_uri_and_params(registry, uri, &params).await?;
+                        Storage::from_uri_and_params(registry, uri, &params).await?;
                     (store.for_external_blobs(), path)
                 } else {
                     let root = self.base_root(Some(base_id))?;
@@ -419,7 +419,7 @@ impl<'a> BlobLocator<'a> {
 
     fn file(
         &mut self,
-        store: Arc<ObjectStore>,
+        store: Arc<Storage>,
         path: &Path,
         position: u64,
         size: u64,
@@ -468,7 +468,7 @@ impl<'a> BlobLocator<'a> {
         Ok(root)
     }
 
-    async fn external_store(&mut self, base_id: u32) -> Result<Arc<ObjectStore>> {
+    async fn external_store(&mut self, base_id: u32) -> Result<Arc<Storage>> {
         if let Some(store) = self.external_stores.get(&base_id) {
             return Ok(store.clone());
         }
@@ -479,7 +479,7 @@ impl<'a> BlobLocator<'a> {
         Ok(store)
     }
 
-    async fn store(&mut self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
+    async fn store(&mut self, base_id: Option<u32>) -> Result<Arc<Storage>> {
         let Some(base_id) = base_id else {
             return Ok(self.dataset.storage.clone());
         };

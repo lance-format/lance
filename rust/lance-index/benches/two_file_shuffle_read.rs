@@ -76,9 +76,9 @@ use lance_index::vector::v3::shuffler::{
     DEFAULT_PARTITION_WINDOW_BYTES, ShuffleReader, Shuffler, TwoFileShuffler,
 };
 use lance_io::ReadBatchParams;
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::scheduler::{bytes_read_counter, iops_counter};
+use lance_io::storage::Storage;
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_io::utils::CachedFileSize;
 
@@ -127,7 +127,7 @@ impl BaselineTwoFileShuffleReader {
         output_dir: Path,
         manifest: &TwoFileShuffleFixtureManifest,
     ) -> lance_core::Result<Arc<dyn ShuffleReader>> {
-        let storage = Arc::new(ObjectStore::local());
+        let storage = Arc::new(Storage::local());
         let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
         let scheduler = ScanScheduler::new(storage, scheduler_config);
 

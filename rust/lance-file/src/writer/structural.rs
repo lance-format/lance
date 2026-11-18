@@ -21,7 +21,7 @@ use lance_encoding::{
     },
     repdef::RepDefBuilder,
 };
-use lance_io::{object_store::ObjectStore, traits::Writer as ObjectWriter};
+use lance_io::{storage::Storage, traits::Writer as ObjectWriter};
 use log::{debug, warn};
 use prost::Message;
 use prost_types::Any;
@@ -48,7 +48,7 @@ const DEFAULT_SPILL_BUFFER_LIMIT: usize = 256 * 1024;
 
 struct PageMetadataSpill {
     writer: Box<dyn ObjectWriter>,
-    storage: Arc<ObjectStore>,
+    storage: Arc<Storage>,
     path: Path,
     position: u64,
     column_buffers: Vec<Vec<u8>>,
@@ -57,7 +57,7 @@ struct PageMetadataSpill {
 }
 
 impl PageMetadataSpill {
-    async fn new(storage: Arc<ObjectStore>, path: Path, num_columns: usize) -> Result<Self> {
+    async fn new(storage: Arc<Storage>, path: Path, num_columns: usize) -> Result<Self> {
         let writer = storage.create(&path).await?;
         let per_column_limit = (DEFAULT_SPILL_BUFFER_LIMIT / num_columns.max(1)).max(64);
         Ok(Self {
@@ -129,7 +129,7 @@ fn decode_spilled_chunk(data: &Bytes) -> Result<Vec<pbfile::column_metadata::Pag
 }
 
 enum PageSpillState {
-    Pending(Arc<ObjectStore>, Path),
+    Pending(Arc<Storage>, Path),
     Active(PageMetadataSpill),
 }
 
@@ -166,7 +166,7 @@ impl StructuralFileSink {
         }
     }
 
-    pub fn with_page_metadata_spill(&mut self, storage: Arc<ObjectStore>, path: Path) {
+    pub fn with_page_metadata_spill(&mut self, storage: Arc<Storage>, path: Path) {
         self.page_spill = Some(PageSpillState::Pending(storage, path));
     }
 

@@ -313,7 +313,7 @@ pub struct PyPackedBlobWriter {
 
 impl PyPackedBlobWriter {
     pub(crate) async fn try_new(
-        storage: Arc<lance_io::object_store::ObjectStore>,
+        storage: Arc<lance_io::storage::Storage>,
         data_file_path: lance_core::storage::path::Path,
         blob_id: u32,
     ) -> PyResult<Self> {
@@ -478,7 +478,7 @@ pub struct PyManagedBlobWriter {
 
 impl PyManagedBlobWriter {
     pub(crate) async fn try_new(
-        storage: Arc<lance_io::object_store::ObjectStore>,
+        storage: Arc<lance_io::storage::Storage>,
         base_path: lance_core::storage::path::Path,
         base_id: Option<u32>,
     ) -> PyResult<Self> {
@@ -584,7 +584,7 @@ pub struct PyDedicatedBlobWriter {
 
 impl PyDedicatedBlobWriter {
     pub(crate) async fn try_new(
-        storage: Arc<lance_io::object_store::ObjectStore>,
+        storage: Arc<lance_io::storage::Storage>,
         data_file_path: lance_core::storage::path::Path,
         blob_id: u32,
     ) -> PyResult<Self> {

@@ -41,8 +41,8 @@ use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_file::writer::FileWriterOptions;
 use lance_io::ReadBatchParams;
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::storage::Storage;
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::SelfDescribingFileReader;
@@ -491,7 +491,7 @@ impl IvfShuffler {
         &mut self,
         data: impl Stream<Item = Result<RecordBatch>>,
     ) -> Result<()> {
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let path = self.output_dir.clone().join(UNSORTED_BUFFER);
         let writer = storage.create(&path).await?;
 
@@ -544,7 +544,7 @@ impl IvfShuffler {
     async fn total_batches(&self) -> Result<Vec<usize>> {
         let mut total_batches = vec![];
         for buffer in &self.unsorted_buffers {
-            let storage = ObjectStore::local();
+            let storage = Storage::local();
             let path = self.output_dir.clone().join(buffer.as_str());
 
             if self.is_legacy {
@@ -579,7 +579,7 @@ impl IvfShuffler {
     }
 
     async fn count_partition_size(&self, inputs: &[ShuffleInput]) -> Result<Vec<u64>> {
-        let storage = ObjectStore::local();
+        let storage = Storage::local();
         let mut partition_sizes = vec![0; self.num_partitions as usize];
         let scheduler = ScanScheduler::new(
             Arc::new(storage.clone()),
@@ -667,7 +667,7 @@ impl IvfShuffler {
             end,
         } in inputs
         {
-            let storage = ObjectStore::local();
+            let storage = Storage::local();
             let file_name = &self.unsorted_buffers[file_idx];
             let path = self.output_dir.clone().join(file_name.as_str());
             let mut _reader_handle = None;
@@ -805,7 +805,7 @@ impl IvfShuffler {
                         .await?;
 
                     // finally, write the shuffled data to disk
-                    let storage = ObjectStore::local();
+                    let storage = Storage::local();
                     let output_file = format!("{}_{}.lance", this.shuffle_output_root_filename, i);
                     let path = this.output_dir.clone().join(output_file.clone());
                     let writer = storage.create(&path).await?;
@@ -859,7 +859,7 @@ impl IvfShuffler {
         let mut streams = vec![];
 
         for file in files {
-            let storage = Arc::new(ObjectStore::local());
+            let storage = Arc::new(Storage::local());
             let path = basedir.clone().join(file);
             let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
             let scan_scheduler = ScanScheduler::new(storage, scheduler_config);
@@ -1349,7 +1349,7 @@ mod test {
         pq_dim: u32,
     ) {
         let schema = make_schema(pq_dim);
-        let writer = ObjectStore::local()
+        let writer = Storage::local()
             .create(&dir_path.clone().join(filename))
             .await
             .unwrap();

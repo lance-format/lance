@@ -125,7 +125,7 @@ async fn test_deregister_table() {
     // Location should be a proper file:// URI with the temp path
     // Use uri_to_url to normalize the temp path to a URL for comparison
     let expected_url =
-        lance_io::object_store::uri_to_url(temp_path).expect("Failed to convert temp path to URL");
+        lance_io::storage::uri_to_url(temp_path).expect("Failed to convert temp path to URL");
     let expected_prefix = expected_url.to_string();
     assert!(
         location.starts_with(&expected_prefix),
@@ -196,7 +196,7 @@ async fn test_deregister_table_in_child_namespace() {
     // Location should be a proper file:// URI with the temp path
     // Use uri_to_url to normalize the temp path to a URL for comparison
     let expected_url =
-        lance_io::object_store::uri_to_url(temp_path).expect("Failed to convert temp path to URL");
+        lance_io::storage::uri_to_url(temp_path).expect("Failed to convert temp path to URL");
     let expected_prefix = expected_url.to_string();
     assert!(
         location.starts_with(&expected_prefix),

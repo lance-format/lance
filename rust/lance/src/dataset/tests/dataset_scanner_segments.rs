@@ -20,7 +20,7 @@ use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::storage::StorageParams;
 use lance_io::utils::tracking_store::IOTracker;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::format::Fragment;
@@ -671,7 +671,7 @@ async fn test_vector_prefilter_prunes_scalar_segments(
         .join(excluded_segment.uuid.to_string());
     let tracker = Arc::new(IOTracker::default());
     test_ds.dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_ds.tmp_dir.as_str())
-        .with_store_params(ObjectStoreParams {
+        .with_store_params(StorageParams {
             backend_wrappers: vec![tracker.clone()],
             ..Default::default()
         })

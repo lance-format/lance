@@ -216,7 +216,7 @@ mod tests {
     use lance_core::Error;
     use lance_core::storage::path::Path as ObjectPath;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::storage::Storage;
     use lance_table::format::{IndexMetadata, Manifest, Transaction as ManifestTransaction};
     use lance_table::io::commit::{
         CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
@@ -251,7 +251,7 @@ mod tests {
             manifest: &mut Manifest,
             indices: Option<Vec<IndexMetadata>>,
             base_path: &ObjectPath,
-            storage: &ObjectStore,
+            storage: &Storage,
             manifest_writer: ManifestWriter,
             naming_scheme: ManifestNamingScheme,
             transaction: Option<ManifestTransaction>,

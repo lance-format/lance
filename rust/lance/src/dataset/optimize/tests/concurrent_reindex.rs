@@ -273,7 +273,7 @@ impl CommitHandler for BeforeFirstIndexCommit {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &lance_core::storage::path::Path,
-        storage: &ObjectStore,
+        storage: &Storage,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<lance_table::format::Transaction>,

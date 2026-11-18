@@ -13,7 +13,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::storage::path::Path;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use uuid::Uuid;
 
 use super::super::test_support::*;
@@ -95,7 +95,7 @@ mod replay {
     }
 
     async fn manifest_generations(
-        store: &Arc<ObjectStore>,
+        store: &Arc<Storage>,
         base_path: &Path,
         shard_id: Uuid,
     ) -> Vec<u64> {

@@ -21,7 +21,7 @@ use tracing::instrument;
 
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
-    object_store::ObjectStore,
+    storage::Storage,
     traits::{WriteExt, Writer},
     utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
@@ -42,12 +42,12 @@ use super::commit::ManifestLocation;
 ///
 /// ```no_run
 /// # async fn example() -> lance_core::Result<()> {
-/// use lance_io::object_store::ObjectStore;
+/// use lance_io::storage::Storage;
 /// use lance_table::format::pb;
 /// use lance_table::io::manifest::read_manifest_proto;
 /// use lance_core::storage::path::Path;
 ///
-/// let object_store = ObjectStore::local();
+/// let object_store = Storage::local();
 /// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
 /// let manifest: pb::Manifest = read_manifest_proto(&object_store, &path, None).await?;
 /// println!("manifest version: {}", manifest.version);
@@ -56,7 +56,7 @@ use super::commit::ManifestLocation;
 /// ```
 #[instrument(level = "debug", skip(storage))]
 pub async fn read_manifest_proto(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<pb::Manifest> {
@@ -65,7 +65,7 @@ pub async fn read_manifest_proto(
 }
 
 async fn read_manifest_proto_with_length(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<(pb::Manifest, usize)> {
@@ -173,12 +173,12 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<(pb::Manifes
 ///
 /// ```no_run
 /// # async fn example() -> lance_core::Result<()> {
-/// use lance_io::object_store::ObjectStore;
+/// use lance_io::storage::Storage;
 /// use lance_table::format::Manifest;
 /// use lance_table::io::manifest::read_manifest;
 /// use lance_core::storage::path::Path;
 ///
-/// let object_store = ObjectStore::local();
+/// let object_store = Storage::local();
 /// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
 /// let manifest: Manifest = read_manifest(&object_store, &path, None).await?;
 /// println!("fragments: {}", manifest.summary().total_fragments);
@@ -187,7 +187,7 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<(pb::Manifes
 /// ```
 #[instrument(level = "debug", skip(storage))]
 pub async fn read_manifest(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<Manifest> {
@@ -200,7 +200,7 @@ pub async fn read_manifest(
 
 #[instrument(level = "debug", skip(storage, manifest))]
 pub async fn read_manifest_indexes(
-    storage: &ObjectStore,
+    storage: &Storage,
     location: &ManifestLocation,
     manifest: &Manifest,
 ) -> Result<Vec<IndexMetadata>> {
@@ -232,7 +232,7 @@ pub async fn read_manifest_indexes(
 /// Read the index section message at `pos`, opening the manifest with a known
 /// size when one is provided.
 async fn read_index_section(
-    storage: &ObjectStore,
+    storage: &Storage,
     path: &Path,
     size: Option<u64>,
     pos: usize,
@@ -535,7 +535,7 @@ mod test {
     #[case::head_size(None)]
     #[tokio::test]
     async fn test_read_empty_manifest_reports_path(#[case] known_size: Option<u64>) {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("dataset/_versions/1.manifest");
         store.put_payload(&path, Bytes::new().into()).await.unwrap();
 
@@ -548,8 +548,8 @@ mod test {
     async fn write_test_manifest(
         prefix_size: usize,
         manifest_min_size: usize,
-    ) -> (ObjectStore, Path, Manifest) {
-        let store = ObjectStore::memory();
+    ) -> (Storage, Path, Manifest) {
+        let store = Storage::memory();
         let path = Path::from("/read_large_manifest");
 
         let mut writer = store.create(&path).await.unwrap();
@@ -640,7 +640,7 @@ mod test {
 
     #[tokio::test]
     async fn test_write_manifest_clears_unwritten_index_section() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/clear_unwritten_index_section");
         let mut writer = store.create(&path).await.unwrap();
         let mut manifest = Manifest::new(
@@ -667,7 +667,7 @@ mod test {
 
     #[tokio::test]
     async fn test_update_schema_metadata() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let path = Path::from("/update_schema_metadata");
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -931,7 +931,7 @@ mod test {
         );
     }
 
-    async fn write_manifest_file(store: &ObjectStore, path: &Path, manifest: &mut Manifest) {
+    async fn write_manifest_file(store: &Storage, path: &Path, manifest: &mut Manifest) {
         let mut writer = store.create(path).await.unwrap();
         let pos = write_manifest(writer.as_mut(), manifest, Some(vec![]), None)
             .await
@@ -947,7 +947,7 @@ mod test {
     /// one written by encoding every fragment, and reads back the same.
     #[tokio::test]
     async fn test_write_manifest_from_cached_fragments_matches_cold_write() {
-        let store = ObjectStore::memory();
+        let store = Storage::memory();
         let mut manifest = manifest_with_fragments(50);
 
         let cold = Path::from("cold");

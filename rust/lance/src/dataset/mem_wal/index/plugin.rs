@@ -25,7 +25,7 @@ use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
-use lance_io::object_store::ObjectStore;
+use lance_io::storage::Storage;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -245,7 +245,7 @@ pub struct GenerationWrite<'a> {
     /// Directory holding the generation's files.
     pub path: &'a Path,
     /// Store to write through.
-    pub storage: &'a Arc<ObjectStore>,
+    pub storage: &'a Arc<Storage>,
     /// The generation as committed.
     pub dataset: &'a Dataset,
     /// How many rows the generation holds.
