@@ -843,6 +843,9 @@ impl<'a> CleanupTask<'a> {
         if let Some(rules) = &operation.retention_policy {
             validate_retention_policy(rules)?;
         }
+        // Check staged before detached since STAGED_VERSION sits in the detached
+        // range and should report the staged dataset error.
+        operation.dataset.ensure_published()?;
         // Cleanup keeps every version numbered at or above the one it reads from.
         // Detached versions have the high bit set, so from a detached checkout every
         // attached version, the latest included, could expire.

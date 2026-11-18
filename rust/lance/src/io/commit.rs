@@ -59,8 +59,8 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    ManifestWriteConfig, NewTransactionResult, STAGED_VERSION, TRANSACTIONS_DIR,
+    ensure_prepared_on_published, load_new_transactions, write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
     ReadSnapshot, validate_frag_reuse_history,
@@ -1308,6 +1308,15 @@ pub(crate) fn detect_overlapping_fragments(
     }
 }
 
+fn detached_version(mut draw: impl FnMut() -> u64) -> u64 {
+    loop {
+        let version = draw() | DETACHED_VERSION_MASK;
+        if version != STAGED_VERSION {
+            return version;
+        }
+    }
+}
+
 pub(crate) async fn do_commit_detached_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
@@ -1317,6 +1326,8 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_published()?;
+    ensure_prepared_on_published(transaction)?;
     ensure_can_write_manifest(&dataset.manifest)?;
     // Definitions are allocated against the version chain: a detached
     // manifest's ids and field-identity activation would be invisible to it.
@@ -1371,7 +1382,7 @@ pub(crate) async fn do_commit_detached_transaction(
     let start = Instant::now();
     while backoff.attempt() < commit_config.num_retries {
         // Pick a random u64 with the highest bit set to indicate it is detached
-        let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
+        let random_version = detached_version(|| rng().random());
 
         let build_config = build_config_for_attempt(dataset, transaction, write_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
@@ -1824,6 +1835,8 @@ pub(crate) async fn commit_transaction(
     affected_rows: Option<&RowAddrTreeMap>,
     expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_published()?;
+    ensure_prepared_on_published(transaction)?;
     dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -2356,6 +2369,20 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[rstest::rstest]
+    #[case::every_bit_set(vec![u64::MAX, 7], DETACHED_VERSION_MASK | 7)]
+    #[case::every_bit_below_the_mask(vec![u64::MAX >> 1, 7], DETACHED_VERSION_MASK | 7)]
+    #[case::reserved_twice(vec![u64::MAX, u64::MAX, 9], DETACHED_VERSION_MASK | 9)]
+    #[case::ordinary(vec![7, u64::MAX], DETACHED_VERSION_MASK | 7)]
+    fn test_detached_commit_draws_again_on_the_staged_version(
+        #[case] draws: Vec<u64>,
+        #[case] expected: u64,
+    ) {
+        let mut draws = draws.into_iter();
+        let version = detached_version(|| draws.next().unwrap());
+        assert_eq!(version, expected);
+    }
 
     #[rstest::rstest]
     #[case::unset(None, DEFAULT_COMMIT_RETRY_TIMEOUT)]

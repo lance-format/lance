@@ -1659,6 +1659,62 @@ async fn test_restore_from_does_not_rebase_after_predecessor_validation() {
     assert_eq!(latest.count_rows(None).await.unwrap(), 3);
 }
 
+#[tokio::test]
+async fn test_staged_commit_after_a_scan_does_not_rebase_past_a_racer() {
+    let (dir, dataset) = restore_fence_dataset().await;
+    let handler = Arc::new(GateNextCommitHandler {
+        inner: Arc::new(ConditionalPutCommitHandler),
+        gate_next: AtomicBool::new(false),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    handler.arm();
+
+    let mut staged = dataset.begin_transaction().await.unwrap();
+    staged
+        .append(vec![record_batch!(("id", Int32, [3])).unwrap()])
+        .await
+        .unwrap();
+    let staged_rows = staged.scan().unwrap().try_into_batch().await.unwrap();
+    assert_eq!(staged_rows.num_rows(), 3);
+
+    let gated_handler: Arc<dyn CommitHandler> = handler.clone();
+    let commit = tokio::spawn(async move {
+        staged
+            .commit_with()
+            .with_commit_handler(gated_handler)
+            .execute()
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handler.entered.notified(),
+    )
+    .await
+    .expect("staged commit must reach publication");
+
+    InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![record_batch!(("id", Int32, [4])).unwrap()])
+        .await
+        .unwrap();
+
+    handler.release.notify_one();
+    let error = commit.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 3, .. }),
+        "staged commit must not rebase after a scan: {error:?}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    let rows = latest.scan().try_into_batch().await.unwrap();
+    assert_eq!(rows["id"].as_primitive::<Int32Type>().values(), &[1, 2, 4]);
+}
+
 /// Partial RewriteColumns refresh in `build_manifest`: only matched physical
 /// rows get `last_updated_at_version` bumped; same-fragment unmatched rows and
 /// untouched fragments keep both version sequences.

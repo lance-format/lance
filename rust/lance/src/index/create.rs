@@ -750,6 +750,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     async fn execute(mut self) -> Result<IndexMetadata> {
+        self.dataset.ensure_published()?;
         // Multi-segment FM-Index path: split whole-table builds into fragment groups.
         // Explicit fragment selections stay on the single-segment path.
         if self.fragments.is_none()

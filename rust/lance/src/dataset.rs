@@ -115,6 +115,9 @@ pub mod transaction {
         translate_schema_metadata_updates, validate_operation,
     };
 }
+mod staged;
+pub(crate) use staged::{STAGED_VERSION, ensure_prepared_on_published};
+pub use staged::{StagedCommitBuilder, StagedTransaction};
 pub mod udtf;
 mod update_join;
 #[cfg(feature = "update-join-bench")]
@@ -291,6 +294,9 @@ pub struct Dataset {
     /// Object stores for additional base paths, normally shared across clones.
     /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
+    /// Index metadata held in memory for an uncommitted staged dataset. `None`
+    /// on a committed dataset.
+    pub(crate) staged_indices: Option<Arc<Vec<IndexMetadata>>>,
 }
 
 /// The `OnceCell` coalesces concurrent first resolutions into one build.
@@ -667,6 +673,7 @@ impl Dataset {
         }
         self.manifest = manifest;
         self.manifest_location = manifest_location;
+        self.staged_indices = None;
         self.fragment_bitmap = Arc::new(
             self.manifest
                 .fragments
@@ -1263,6 +1270,7 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
+            staged_indices: None,
         })
     }
 
@@ -1600,7 +1608,10 @@ impl Dataset {
     ///
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
+    ///
+    /// Fails on an uncommitted staged dataset, which has no transaction file.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
+        self.ensure_published()?;
         let transaction_key = TransactionKey {
             version: self.manifest.version,
         };
@@ -1908,7 +1919,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
-    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    /// Returns an invalid-input error when this dataset is checked out at a detached version
+    /// or is an uncommitted staged dataset.
     ///
     /// # Arguments
     ///
@@ -1950,7 +1962,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
-    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    /// Returns an invalid-input error when this dataset is checked out at a detached version
+    /// or is an uncommitted staged dataset.
     ///
     /// # Arguments
     ///
@@ -1972,7 +1985,7 @@ impl Dataset {
     /// The returned operation can be explained without deleting files, or
     /// executed to re-evaluate the current dataset state and remove files.
     /// Both return an invalid-input error when this dataset is checked out at a
-    /// detached version.
+    /// detached version or is an uncommitted staged dataset.
     pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
         CleanupOperation::new(self, policy)
     }
@@ -3528,7 +3541,10 @@ impl Dataset {
     }
 
     /// Return whether the dataset has a newer committed version.
+    ///
+    /// Fails on an uncommitted staged dataset.
     pub async fn is_stale(&self) -> Result<bool> {
+        self.ensure_published()?;
         let latest_version = self.latest_version_id().await?;
         Ok(latest_version != self.manifest.version)
     }
@@ -3539,8 +3555,11 @@ impl Dataset {
     /// version and may return `false` if intermediate manifests have been
     /// removed. Callers that need a general freshness check should use
     /// [`Self::is_stale`].
+    ///
+    /// Fails on an uncommitted staged dataset.
     #[doc(hidden)]
     pub async fn has_successor_version(&self) -> Result<bool> {
+        self.ensure_published()?;
         let Some(next_version) = self.manifest.version.checked_add(1) else {
             return Ok(false);
         };

@@ -495,7 +495,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             // A guess: a compatible transaction can commit before this one, in
             // which case the real commit version is later. `matched_offsets`
             // below is what lets `build_manifest` correct the stamp.
-            let current_version = dataset.manifest.version + 1;
+            let current_version = dataset.manifest.version.saturating_add(1);
             let PatchedFragments {
                 updated_fragments,
                 new_fragments,
