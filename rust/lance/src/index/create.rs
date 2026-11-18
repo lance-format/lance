@@ -955,7 +955,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .build();
 
             self.dataset
-                .apply_commit(transaction, &Default::default(), &Default::default())
+                .apply_commit_reclaiming_minted_index_dirs(
+                    transaction,
+                    &Default::default(),
+                    &Default::default(),
+                )
                 .await?;
 
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
@@ -1042,7 +1046,11 @@ impl<'a> CreateIndexBuilder<'a> {
         .build();
 
         self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
+            .apply_commit_reclaiming_minted_index_dirs(
+                transaction,
+                &Default::default(),
+                &Default::default(),
+            )
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
@@ -1671,6 +1679,65 @@ mod tests {
 
         let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
         assert_eq!(latest_indices.len(), 1);
+    }
+
+    /// A multi-segment FM-Index build that loses to a concurrent CreateIndex of
+    /// the same name must reclaim the segment directories it minted, and the
+    /// winner's directories must survive.
+    #[tokio::test]
+    async fn test_concurrent_multi_segment_fmindex_reclaims_segment_dirs() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let read_version = dataset.manifest.version;
+        let mut winner = dataset.checkout_version(read_version).await.unwrap();
+        let mut loser = dataset.checkout_version(read_version).await.unwrap();
+        let params = ScalarIndexParams {
+            index_type: "fm".to_string(),
+            params: Some(r#"{"num_segments": 2}"#.to_string()),
+        };
+        CreateIndexBuilder::new(&mut winner, &["text"], IndexType::Fm, &params)
+            .name("text_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+        let dirs_before = index_dir_names(&winner).await;
+        assert_eq!(dirs_before.len(), 2);
+
+        let error = CreateIndexBuilder::new(&mut loser, &["text"], IndexType::Fm, &params)
+            .name("text_idx".to_string())
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(
+                "CreateIndex transaction was preempted by concurrent transaction CreateIndex"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            index_dir_names(&winner).await,
+            dirs_before,
+            "the segment directories of the rejected multi-segment build must be reclaimed"
+        );
+        let committed = winner.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(committed.len(), 2);
     }
 
     #[rstest]
