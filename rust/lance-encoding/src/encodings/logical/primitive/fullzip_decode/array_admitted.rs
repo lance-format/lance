@@ -4,6 +4,7 @@
 //! Keep structural reconstruction inside the read/decode admission envelope.
 
 pub mod batch;
+mod flat;
 
 use std::{future::Future, ops::Range, sync::Arc};
 
@@ -212,11 +213,26 @@ impl FullZipArrayInput {
 
     /// Consume input and decode using the remainder of its original workspace.
     /// Performs no I/O, pool dispatch or allocation wait. `None` means the entire
-    /// compound attempt must be dropped and replanned, never EOF. Reused raw
-    /// output keeps the full compact allocation charged through its last alias.
+    /// compound attempt must be dropped and replanned, never EOF. Flat raw byte
+    /// arrays materialize offsets, values and optional validity in one allocation,
+    /// without intermediate definition levels. Every output alias retains the
+    /// complete physical allocation that backs it.
     /// Errors consume input; previously decoded sibling columns remain the
     /// caller's responsibility. See [`FullZipScheduler::prepare_array_range_in`].
     pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<ArrayRef>> {
+        if matches!(
+            self.data_type,
+            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8
+        ) && matches!(
+            &self.scheduler.details.value_decompressor,
+            super::PerValueDecompressor::Variable(codec)
+                if codec.supports_direct_byte_materialization()
+        ) {
+            Shape::new(&self.scheduler, &self.data_type)?;
+            let array = flat::decode(&self, workspace);
+            self.input.recycle(workspace)?;
+            return array;
+        }
         let task = self.scheduler.try_unzip_owned_in(
             std::slice::from_ref(&self.input),
             self.count,

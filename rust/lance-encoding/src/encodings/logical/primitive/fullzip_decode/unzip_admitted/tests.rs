@@ -72,7 +72,7 @@ fn fixture(bits: u8, fsst: bool, kind: &str) -> Fixture {
 
 fn fixture_with_values(bits: u8, fsst: bool, kind: &str, values: Vec<Vec<u8>>) -> Fixture {
     let rows = values.len();
-    if kind != "flat" {
+    if !matches!(kind, "flat" | "nullable") {
         assert_eq!(rows, 4);
     }
     let (rep, def, meanings, value_starts, level_starts) = match kind {
@@ -85,10 +85,10 @@ fn fixture_with_values(bits: u8, fsst: bool, kind: &str, values: Vec<Vec<u8>>) -
         ),
         "nullable" => (
             None,
-            Some(vec![0, 1, 0, 0]),
+            Some((0..rows).map(|row| u16::from(row % 3 == 1)).collect()),
             vec![Meaning::NullableItem],
-            vec![0, 1, 2, 3, 4],
-            vec![0, 1, 2, 3, 4],
+            (0..=rows).collect(),
+            (0..=rows).collect(),
         ),
         "list" => (
             Some(vec![1, 0, 1, 1, 1, 0]),

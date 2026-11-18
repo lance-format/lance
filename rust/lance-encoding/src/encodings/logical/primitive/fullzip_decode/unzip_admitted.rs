@@ -54,7 +54,7 @@ fn has_def(parser: ControlWordParser) -> bool {
 
 /// Walk complete row-aligned buffers; callbacks see only the requested rows.
 /// Validate all framing, including unselected tails, before admitting output.
-fn visit(
+pub(super) fn visit(
     scheduler: &FullZipScheduler,
     data: &[impl AsRef<[u8]>],
     num_rows: u64,

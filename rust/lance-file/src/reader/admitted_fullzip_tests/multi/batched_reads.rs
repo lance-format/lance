@@ -86,8 +86,27 @@ fn instrument(reader: &FileReader, fault: Fault) -> (FileReader, Arc<BatchIo>) {
 async fn real_columns_share_two_owned_read_phases(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
+    #[values(false, true)] nullable_labels: bool,
 ) {
-    let expected = batches().remove(0);
+    let mut expected = batches().remove(0);
+    if nullable_labels {
+        let mut fields = expected.schema().fields().to_vec();
+        fields[0] = Arc::new(fields[0].as_ref().clone().with_nullable(true));
+        let labels: ArrayRef = Arc::new(StringArray::from_iter((0..expected.num_rows()).map(
+            |row| {
+                if row == 1 {
+                    None
+                } else {
+                    Some(format!("label {row} α"))
+                }
+            },
+        )));
+        expected = RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            vec![labels, expected.column(1).clone()],
+        )
+        .unwrap();
+    }
     let (_fs, reader) = fixture_batches(version, lite, vec![expected.clone()], 1).await;
     let (reader, io) = instrument(&reader, Fault::None);
     let budget = AllocationBudget::new(65536);

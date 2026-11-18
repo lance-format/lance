@@ -1297,6 +1297,10 @@ impl VariablePerValueDecompressor for VariableDecoder {
         true
     }
 
+    fn supports_direct_byte_materialization(&self) -> bool {
+        true
+    }
+
     fn try_reuse_admitted_input(&self, data: &VariableWidthBlock) -> Result<Option<DataBlock>> {
         crate::compression::variable::reuse(data)
     }

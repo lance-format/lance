@@ -409,4 +409,5 @@ async fn corrupt_selected_payload_recycles_exclusive_read() {
 mod coalesce;
 mod compact;
 mod cpu;
+mod flat;
 mod prefix;

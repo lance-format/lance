@@ -1547,6 +1547,22 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
         false
     }
 
+    /// Whether framed values can be copied directly into Arrow byte buffers.
+    /// Opting in asserts that the bytes are already decoded and that no extra
+    /// codec validation or transformation is required beyond checked framing,
+    /// signed offsets and Arrow type validation. This is stronger than the
+    /// scheduling hint [`Self::is_identity`]. Custom codecs default to their
+    /// existing admitted decode path, including any codec-specific validation.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     encodings::physical::binary::VariableDecoder};
+    /// assert!(VariableDecoder::default().supports_direct_byte_materialization());
+    /// ```
+    fn supports_direct_byte_materialization(&self) -> bool {
+        false
+    }
+
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
 
