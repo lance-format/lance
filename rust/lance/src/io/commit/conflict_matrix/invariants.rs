@@ -45,6 +45,51 @@ pub(super) async fn check_all(before: &Dataset, after: &Dataset, ours: Scenario,
     }
     manifest_round_trips(after, context);
     dataset_scans(after, context).await;
+    indexed_queries_match_a_full_scan(after, context).await;
+}
+
+/// A query answered through the scalar index on `a` returns what a full scan
+/// returns. An index segment left describing values a concurrent writer
+/// replaced, or covering rows twice, shows up here and nowhere else.
+async fn indexed_queries_match_a_full_scan(after: &Dataset, context: &str) {
+    use crate::index::DatasetIndexExt;
+    let has_index_on_a = after
+        .load_indices()
+        .await
+        .expect("indices load")
+        .iter()
+        .any(|index| index.name == "a_idx");
+    if !has_index_on_a {
+        return;
+    }
+    for filter in ["a >= 0", "a = 1", "a = 4", "a < 3"] {
+        let mut rows = Vec::new();
+        for use_index in [true, false] {
+            let batch = after
+                .scan()
+                .filter(filter)
+                .expect("filter parses")
+                .use_scalar_index(use_index)
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap_or_else(|e| panic!("{context}: scan with {filter:?} failed: {e}"));
+            let mut ids: Vec<u64> = batch
+                .column_by_name(lance_core::ROW_ID)
+                .expect("row ids requested")
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .expect("row ids are u64")
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            rows.push(ids);
+        }
+        assert_eq!(
+            rows[0], rows[1],
+            "{context}: an indexed query for {filter:?} disagrees with a full scan",
+        );
+    }
 }
 
 /// Delegate to [`Dataset::validate`], the production integrity check.

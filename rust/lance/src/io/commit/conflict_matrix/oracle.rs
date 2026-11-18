@@ -171,6 +171,7 @@ async fn content(dataset: &Dataset) -> Vec<String> {
 
     let mut rows = Vec::with_capacity(batch.num_rows() + 1);
     rows.push(format!("schema: {header}"));
+    rows.push(format!("metadata: {}", metadata_lines(dataset).join(" | ")));
     for row in 0..batch.num_rows() {
         let cells = formatters
             .iter()
@@ -182,4 +183,41 @@ async fn content(dataset: &Dataset) -> Vec<String> {
     // with a data row.
     rows[1..].sort();
     rows
+}
+
+/// What a reader sees of the table besides its rows: each field's name, type,
+/// nullability and metadata, the schema metadata, the dataset config, the
+/// table metadata, and which indices exist over which fields. Index coverage
+/// is left out on purpose: a rebased build legitimately covers less than a
+/// serial one, and coverage loss only costs a scan.
+fn metadata_lines(dataset: &Dataset) -> Vec<String> {
+    let sorted = |map: &std::collections::HashMap<String, String>| {
+        let mut entries: Vec<String> = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        entries.sort();
+        entries.join(",")
+    };
+    let manifest = dataset.manifest();
+    let mut lines: Vec<String> = manifest
+        .schema
+        .fields_pre_order()
+        .map(|field| {
+            format!(
+                "field {} {} nullable={} {{{}}}",
+                field.name,
+                field.data_type(),
+                field.nullable,
+                sorted(&field.metadata)
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "schema_metadata {{{}}}",
+        sorted(&manifest.schema.metadata)
+    ));
+    lines.push(format!("config {{{}}}", sorted(&manifest.config)));
+    lines.push(format!(
+        "table_metadata {{{}}}",
+        sorted(&manifest.table_metadata)
+    ));
+    lines
 }
