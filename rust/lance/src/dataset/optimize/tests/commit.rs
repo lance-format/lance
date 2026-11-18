@@ -1655,3 +1655,95 @@ async fn test_retry_after_concurrent_append_keeps_index_dirs() {
     );
     assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
 }
+
+/// Gives the table a tagged history whose details exceed the inline limit, so
+/// the installed entry already lives in its own `_indices/{uuid}` directory
+/// and every entry assembled on a rebase spills to a fresh one.
+async fn install_external_tagged_history(dataset: &mut Dataset) {
+    use crate::index::frag_reuse::{
+        FRAG_REUSE_INLINE_DETAILS_LIMIT, build_tagged_frag_reuse_entry,
+    };
+    use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+    use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion};
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use prost::Message;
+
+    // One version holding every group: a tagged history rejects repeated
+    // history stamps. The count clears the limit on the wrapped content, not
+    // on the per-version form `inline_padding_capacity` measures.
+    let groups = padding_reuse_versions(inline_padding_capacity() as u64 + 1_000)
+        .into_iter()
+        .flat_map(|version| version.groups)
+        .collect();
+    let details = FragReuseIndexDetails {
+        versions: vec![FragReuseVersion {
+            dataset_version: 1,
+            groups,
+        }],
+    };
+    let content = InlineContent::from(&details).encode_to_vec();
+    assert!(content.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT);
+    let tagged = build_tagged_frag_reuse_entry(dataset, content, details.new_frag_bitmap())
+        .await
+        .unwrap();
+    assert!(stores_reuse_details_externally(&tagged));
+
+    let mut indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
+    indices.push(tagged);
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+    manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+    crate::index::frag_reuse_reader::tests::persist_fixture(dataset, indices).await;
+}
+
+/// A tagged deferred compaction whose first attempt loses to a non-conflicting
+/// append: the rebase assembles an entry whose details spill to a new
+/// directory, and the retry is verified not to have landed. That rebased
+/// directory must be reclaimed; everything present before the failure,
+/// including the installed history's own directory, must stay.
+#[tokio::test]
+async fn test_tagged_rebase_details_dir_reclaimed_after_verified_loss() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    install_external_tagged_history(&mut dataset).await;
+    let before = index_dir_names(&dataset).await;
+    let before_details = reuse_details_dirs(uri);
+    assert_eq!(before_details.len(), 1);
+
+    handler.arm(&dataset, vec![Race::Append, Race::Reject]);
+    let error = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1000,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect_err("the retry's injected commit failure must surface");
+    assert!(
+        error
+            .to_string()
+            .contains("injected rewrite commit failure"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        handler.races.lock().unwrap().is_empty(),
+        "the append must preempt the first attempt and the second must fail"
+    );
+
+    assert_eq!(
+        index_dir_names(&dataset).await,
+        before,
+        "the directory the rebase spilled must be reclaimed, and the installed \
+         history's directory must survive"
+    );
+    assert_eq!(
+        reuse_details_dirs(uri),
+        before_details,
+        "only the installed history may keep its details file"
+    );
+}

@@ -486,6 +486,9 @@ enum Race {
     CompactEagerlyElsewhere {
         excluded: &'static [u32],
     },
+    /// Rejects the rewrite's manifest write with an injected I/O error, so
+    /// verification finds no manifest at the target version.
+    Reject,
 }
 
 #[derive(Debug, Default)]
@@ -504,6 +507,12 @@ impl RaceBeforeRewrite {
 
 #[async_trait]
 impl CommitHandler for RaceBeforeRewrite {
+    // Every real write goes through the built-in conditional put handler, whose
+    // "version not found" is definitive.
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -568,6 +577,11 @@ impl CommitHandler for RaceBeforeRewrite {
                     compact_files(&mut elsewhere, eager_compaction_excluding(excluded), None)
                         .await
                         .unwrap();
+                }
+                Race::Reject => {
+                    return Err(CommitError::OtherError(Error::io(
+                        "injected rewrite commit failure",
+                    )));
                 }
             }
         }

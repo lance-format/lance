@@ -2158,11 +2158,16 @@ async fn commit_transaction_inner(
 
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
-            // A rebase can mint a new fragment reuse UUID; collect it so a
-            // call that later fails can reclaim its directory too.
+            // A rebase can mint fresh UUIDs, both for the indices it rewrites
+            // and for the tagged fragment reuse entry it assembles outside the
+            // operation; collect them so a call that later fails can reclaim
+            // their directories too.
             minted
                 .uuids
                 .extend(minted_index_uuids(&transaction.operation));
+            if let Some(assembly) = assembly.as_ref() {
+                minted.uuids.insert(assembly.entry.uuid);
+            }
             tagged_rewrite = assembly;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
