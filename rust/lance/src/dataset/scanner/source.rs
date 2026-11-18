@@ -1163,10 +1163,7 @@ impl Scanner {
         let fields_to_take = output_projection
             .clone()
             .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if !fields_to_take.has_data_fields()
-            && !fields_to_take.with_row_id
-            && !fields_to_take.with_row_addr
-        {
+        if fields_to_take.is_empty() {
             // No new columns needed
             return Ok(input);
         }

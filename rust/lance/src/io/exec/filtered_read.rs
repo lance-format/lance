@@ -45,7 +45,8 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{
-    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result, datatypes::Projection,
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD, Result, datatypes::Projection,
 };
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
@@ -2625,7 +2626,7 @@ impl FilteredReadExec {
             .subtract_arrow_schema(input_schema.as_ref(), OnMissing::Ignore)?;
         let synthesize_row_id = fields_to_read.with_row_id;
         let synthesize_row_addr = fields_to_read.with_row_addr;
-        if !fields_to_read.has_data_fields() && !synthesize_row_id && !synthesize_row_addr {
+        if fields_to_read.is_empty() {
             return Err(Error::invalid_input_source(
                 "the input plan already contains every projected field; there is nothing to read"
                     .into(),
@@ -2687,6 +2688,12 @@ impl FilteredReadExec {
             && !new_fields.iter().any(|field| field.name() == ROW_ADDR)
         {
             new_fields.push(Arc::new(ROW_ADDR_FIELD.clone()));
+        }
+        if fields_to_read.with_row_last_updated_at_version {
+            new_fields.push(Arc::new(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone()));
+        }
+        if fields_to_read.with_row_created_at_version {
+            new_fields.push(Arc::new(ROW_CREATED_AT_VERSION_FIELD.clone()));
         }
         let new_fields_schema = Arc::new(arrow_schema::Schema::new(new_fields));
 
@@ -7857,6 +7864,76 @@ mod tests {
                 .unwrap()
                 .as_primitive::<arrow::datatypes::UInt64Type>();
             assert_eq!(addr_col.values(), &expected_addrs[..]);
+        }
+
+        #[rstest]
+        #[case::created("_row_created_at_version")]
+        #[case::updated("_row_last_updated_at_version")]
+        #[tokio::test]
+        async fn take_version_columns(
+            #[case] version: &str,
+            #[values(false, true)] with_data: bool,
+            #[values(false, true)] all_null: bool,
+            #[values(ROW_ID, ROW_ADDR)] key: &str,
+        ) {
+            let fixture = take_fixture(true).await;
+            let ids = if all_null {
+                vec![None, None]
+            } else {
+                vec![Some(21_u64), None, Some(3), Some(999), Some(21)]
+            };
+            let keys = ids
+                .into_iter()
+                .map(|id| {
+                    id.map(|id| {
+                        if key == ROW_ID {
+                            id
+                        } else {
+                            u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                                (id / 10) as u32,
+                                (id % 10) as u32,
+                            ))
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let input = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    key,
+                    DataType::UInt64,
+                    true,
+                )])),
+                vec![Arc::new(UInt64Array::from(keys))],
+            )
+            .unwrap();
+            let columns = if with_data {
+                vec!["i", version]
+            } else {
+                vec![version]
+            };
+            let plan = take_plan(&fixture.dataset, rows_input(vec![input]), &columns).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let expected_rows = if all_null { 0 } else { 3 };
+            assert_eq!(result.num_rows(), expected_rows);
+            assert_eq!(result.num_columns(), 1 + usize::from(with_data));
+            assert_eq!(result.schema(), plan.schema());
+            assert_eq!(
+                result[version]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .as_ref(),
+                vec![1; expected_rows]
+            );
+            if with_data {
+                let expected: &[i32] = if all_null { &[] } else { &[21, 3, 21] };
+                assert_eq!(
+                    result["i"]
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .as_ref(),
+                    expected
+                );
+            }
         }
 
         /// New sub-fields merge into an existing struct column
