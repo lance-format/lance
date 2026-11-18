@@ -53,7 +53,8 @@ impl FragmentReader {
     /// a smaller prefix, down to one row. No whole-fragment selection is built.
     /// The row ceiling is a per-batch candidate, not a total-result cap.
     /// Successful smaller prefixes are reused, with periodic growth attempts to
-    /// recover after wide rows. This hint does not replace allocation admission.
+    /// recover after wide rows. Repeated failed growth backs off to at most 64
+    /// accepted batches between probes. This hint does not replace admission.
     ///
     /// `try_next` never waits for allocation credit. Consume/drop returned output
     /// before requesting the next batch, or provide an independent drain path.

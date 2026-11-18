@@ -394,6 +394,73 @@ async fn dataset_cursor_carries_prefix_hint_and_resets_for_replanning() {
     assert!(scan.position().is_none());
 }
 
+#[rstest]
+#[tokio::test]
+async fn dataset_cursor_recovers_from_repeated_growth_refusals(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+) {
+    // A long wide region triggers repeated failed growth. The narrow tail must
+    // still recover within the same fragment; permanently pinning the small
+    // prefix would also reduce failed probes but is not an acceptable fix.
+    let values = (0..2048)
+        .map(|row| {
+            let len = if row < 512 { 128 } else { 1 };
+            vec![(row % 251) as u8; len]
+        })
+        .collect::<Vec<_>>();
+    let payload = Arc::new(LargeBinaryArray::from_iter_values(
+        values.iter().map(Vec::as_slice),
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![fullzip_field(
+        "payload",
+        DataType::LargeBinary,
+    )]));
+    let expected = RecordBatch::try_new(schema.clone(), vec![payload]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(expected.clone())], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1024,
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let budget = AllocationBudget::new(2048);
+    let mut scan = dataset
+        .try_scan_admitted_fullzip(
+            dataset.schema().clone(),
+            Default::default(),
+            16,
+            2048,
+            budget.clone(),
+        )
+        .unwrap();
+    let mut delivered = 0;
+    let mut recovered_before_boundary = false;
+    while let Outcome::Batch { rows, batch, .. } = scan.try_next().await.unwrap() {
+        assert_eq!(rows.start as usize, delivered % 1024);
+        assert_eq!(batch, expected.slice(delivered, batch.num_rows()));
+        if delivered < 496 {
+            assert!(batch.num_rows() < 16, "wide rows cannot fit the ceiling");
+        }
+        if (512..1008).contains(&delivered) && batch.num_rows() == 16 {
+            recovered_before_boundary = true;
+        }
+        if delivered == 1024 {
+            assert_eq!(batch.num_rows(), 16, "new fragment resets the hint");
+        }
+        delivered += batch.num_rows();
+        drop(batch);
+        assert_eq!(budget.reserved(), 0);
+    }
+    assert_eq!(delivered, expected.num_rows());
+    assert!(recovered_before_boundary, "growth backoff must stay finite");
+    assert!(scan.position().is_none());
+}
+
 #[tokio::test]
 async fn dataset_cursor_empty_snapshot_and_invalid_options() {
     let dataset = null_dataset(0).await;

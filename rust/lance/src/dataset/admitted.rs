@@ -61,14 +61,26 @@ pub struct RowLimit {
     ceiling: u64,
     rows: u64,
     successes: u8,
+    growth_after: u8,
+    // Previous accepted size while a larger candidate is pending; None means
+    // the current size has not been raised speculatively.
+    growth_from: Option<u64>,
 }
 
 impl RowLimit {
+    // Start responsive to narrower rows, but amortize repeated failed growth
+    // probes over up to 64 accepted batches. The cap keeps recovery possible
+    // within a fragment; this is a scheduling hint, never a capacity estimate.
+    const INITIAL_GROWTH_AFTER: u8 = 8;
+    const MAX_GROWTH_AFTER: u8 = 64;
+
     pub fn new(ceiling: u32) -> Self {
         Self {
             ceiling: u64::from(ceiling),
             rows: u64::from(ceiling),
             successes: 0,
+            growth_after: Self::INITIAL_GROWTH_AFTER,
+            growth_from: None,
         }
     }
 
@@ -78,18 +90,28 @@ impl RowLimit {
 
     pub fn record_success(&mut self, first_attempt: u64, accepted: u64) {
         if accepted < first_attempt {
+            self.growth_after = if self.growth_from == Some(accepted) {
+                (self.growth_after * 2).min(Self::MAX_GROWTH_AFTER)
+            } else {
+                // A newly wider region needs its own history.
+                Self::INITIAL_GROWTH_AFTER
+            };
             self.rows = accepted;
             self.successes = 0;
-        } else if accepted == self.rows && self.rows < self.ceiling {
-            // Amortize a rejected growth attempt over eight complete batches,
-            // while allowing recovery after a wide region. This is a performance
-            // heuristic, never evidence that a larger prefix fits the workspace.
-            const SUCCESSES_BEFORE_GROWTH: u8 = 8;
-            self.successes += 1;
-            if self.successes == SUCCESSES_BEFORE_GROWTH {
-                // Both values are bounded by the original u32 row ceiling.
-                self.rows = (self.rows * 2).min(self.ceiling);
-                self.successes = 0;
+            self.growth_from = None;
+        } else if accepted == self.rows {
+            if self.growth_from.take().is_some() {
+                // Growth succeeded: recover promptly through the narrower region.
+                self.growth_after = Self::INITIAL_GROWTH_AFTER;
+            }
+            if self.rows < self.ceiling {
+                self.successes += 1;
+                if self.successes == self.growth_after {
+                    self.growth_from = Some(self.rows);
+                    // Both values are bounded by the original u32 row ceiling.
+                    self.rows = (self.rows * 2).min(self.ceiling);
+                    self.successes = 0;
+                }
             }
         }
     }
@@ -122,8 +144,10 @@ impl Dataset {
     /// ceiling and workspace do not cap cumulative output. Decoder support and
     /// exclusions are those of [`FragmentReader::try_take_admitted_fullzip`].
     /// Within each fragment, reuse successful prefix sizes and periodically probe
-    /// growth. A new fragment or changed workspace resets this scheduling hint;
-    /// every attempt still needs full admission and complete decoding.
+    /// growth. Repeated failed growth probes back off, up to 64 accepted batches;
+    /// successful growth restores the initial interval. A new fragment or changed
+    /// workspace resets this hint. Every attempt still needs full admission and
+    /// complete decoding.
     ///
     /// Each attempt reserves the same `workspace_bytes` from `budget`, including
     /// selection, dependent input, scratch and output. `NeedsCapacity` is not EOF:

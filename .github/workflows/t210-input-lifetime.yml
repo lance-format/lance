@@ -37,6 +37,13 @@ jobs:
           print(io[0])
           print("lance-examples benchmark has no lance-io/test-util feature")
           PYFEATURES
+      - name: Verify fragment and dataset growth, cancellation and prefetch
+        env:
+          LANCE_CPU_THREADS: 1
+        run: |
+          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::cursor:: -- --nocapture
+          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
+          cargo test --profile ci --locked -p lance --doc try_scan_admitted_fullzip -- --nocapture
       - name: Verify complete outputs with the benchmark feature graph
         env:
           LANCE_CPU_THREADS: 1
@@ -44,3 +51,6 @@ jobs:
       - name: Lint benchmark paths
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-examples --example admitted_dataset --no-deps -- -D warnings
+      - name: Lint changed Lance paths
+        if: ${{ !cancelled() }}
+        run: cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings

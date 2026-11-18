@@ -180,15 +180,15 @@ async fn cursor_drains_more_than_its_workspace_and_honors_alias_backpressure(#[c
 
 #[tokio::test]
 async fn cursor_reuses_capacity_without_repeating_every_large_attempt() {
-    let reader = null_reader(128).await;
+    let reader = null_reader(1024).await;
     let budget = AllocationBudget::new(64);
     let mut scan = reader
-        .try_scan_admitted_fullzip(0..128, 16, 64, budget.clone())
+        .try_scan_admitted_fullzip(0..1024, 16, 64, budget.clone())
         .unwrap();
     let mut attempts = Vec::new();
     let mut delivered = 0;
     let mut batches = 0;
-    while delivered < 128 {
+    while delivered < 1024 {
         let result = scan
             .next_with(AdmissionMode::Try, |indices, workspace| {
                 attempts.push(indices.len());
@@ -210,11 +210,11 @@ async fn cursor_reuses_capacity_without_repeating_every_large_attempt() {
         drop(batch);
         assert_eq!(budget.reserved(), 0);
     }
-    assert_eq!(delivered, 128);
+    assert_eq!(delivered, 1024);
     assert!(attempts[0] > attempts[attempts.len() - 1]);
     assert!(
-        (attempts.len() - batches) * 2 < batches,
-        "uniform input must not repeat rejected larger prefixes for every batch: {attempts:?}"
+        attempts.len() - batches <= 8,
+        "uniform input must back off repeated failed probes, not keep retrying every eight batches: {attempts:?}"
     );
 }
 
@@ -362,6 +362,16 @@ async fn cursor_recovers_after_a_wide_prefix_without_committing_failed_hints() {
     };
     assert_eq!(rows, 0..1);
     drop(batch);
+    // Reach a speculative growth probe, then abandon it twice. The probe and
+    // its backoff history must remain unchanged until a batch is committed.
+    for row in 1..=8 {
+        let Outcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
+            panic!("the one-row prefix fits");
+        };
+        assert_eq!(rows, row..row + 1);
+        drop(batch);
+    }
+    assert_eq!(scan.row_limit.rows(), 2);
     let committed_hint = scan.row_limit;
     let mut cancelled = Box::pin(scan.next_with(
         AdmissionMode::Try,
@@ -373,7 +383,7 @@ async fn cursor_recovers_after_a_wide_prefix_without_committing_failed_hints() {
     ));
     assert!(matches!(futures::poll!(cancelled.as_mut()), Poll::Pending));
     drop(cancelled);
-    assert_eq!(scan.position(), 1);
+    assert_eq!(scan.position(), 9);
     assert_eq!(scan.row_limit, committed_hint);
     assert_eq!(budget.reserved(), 0);
     let error = scan
@@ -386,7 +396,7 @@ async fn cursor_recovers_after_a_wide_prefix_without_committing_failed_hints() {
     assert!(matches!(error, Error::CorruptFile { .. }));
     assert!(error.to_string().contains("wide-prefix failure"));
     assert_eq!(scan.row_limit, committed_hint);
-    let mut delivered = 1;
+    let mut delivered = 9;
     let mut recovered = false;
     while let Outcome::Batch { rows, batch } = scan.try_next().await.unwrap() {
         assert_eq!(rows.start, delivered);
