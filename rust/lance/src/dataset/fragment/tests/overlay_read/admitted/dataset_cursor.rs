@@ -6,6 +6,10 @@ use crate::dataset::{
     AdmittedDatasetScanOutcome as Outcome, AdmittedScanPosition,
     schema_evolution::NewColumnTransform,
 };
+use lance_encoding::{
+    constants::{COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY},
+    format::metadata::compressive_encoding::Compression,
+};
 
 mod cancellation;
 mod dictionary;
@@ -394,14 +398,7 @@ async fn dataset_cursor_carries_prefix_hint_and_resets_for_replanning() {
     assert!(scan.position().is_none());
 }
 
-#[rstest]
-#[tokio::test]
-async fn dataset_cursor_recovers_from_repeated_growth_refusals(
-    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
-) {
-    // A long wide region triggers repeated failed growth. The narrow tail must
-    // still recover within the same fragment; permanently pinning the small
-    // prefix would also reduce failed probes but is not an acceptable fix.
+async fn growth_fixture(version: LanceFileVersion, is_raw: bool) -> (Dataset, RecordBatch) {
     let values = (0..2048)
         .map(|row| {
             let len = if row < 512 { 128 } else { 1 };
@@ -411,10 +408,17 @@ async fn dataset_cursor_recovers_from_repeated_growth_refusals(
     let payload = Arc::new(LargeBinaryArray::from_iter_values(
         values.iter().map(Vec::as_slice),
     ));
-    let schema = Arc::new(ArrowSchema::new(vec![fullzip_field(
-        "payload",
-        DataType::LargeBinary,
-    )]));
+    let mut field = fullzip_field("payload", DataType::LargeBinary);
+    if is_raw {
+        // A structural preference does not disable dictionary encoding. Keep
+        // this fixture's minimum admission dependent on row width, not a shared
+        // page dictionary that is larger than the entire test workspace.
+        let mut metadata = field.metadata().clone();
+        metadata.insert(DICT_DIVISOR_META_KEY.into(), u64::MAX.to_string());
+        metadata.insert(COMPRESSION_META_KEY.into(), "none".into());
+        field = field.with_metadata(metadata);
+    }
+    let schema = Arc::new(ArrowSchema::new(vec![field]));
     let expected = RecordBatch::try_new(schema.clone(), vec![payload]).unwrap();
     let dataset = Dataset::write(
         RecordBatchIterator::new([Ok(expected.clone())], schema),
@@ -428,6 +432,85 @@ async fn dataset_cursor_recovers_from_repeated_growth_refusals(
     .await
     .unwrap();
     assert_eq!(dataset.fragments().len(), 2);
+    let scheduler = ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::new(1024));
+    for fragment in dataset.fragments() {
+        let file = &fragment.files[0];
+        let source = scheduler
+            .open_file(
+                &dataset.data_dir().join(file.path.as_str()),
+                &file.file_size_bytes,
+            )
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            source,
+            None,
+            Default::default(),
+            &Arc::new(LanceCache::no_cache()),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let pages = &reader.metadata().column_infos[0].page_infos;
+        assert!(!pages.is_empty());
+        for page in pages.iter() {
+            let layout = match &page.encoding {
+                PageEncoding::Structural(layout) => layout.clone(),
+                PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+                PageEncoding::Legacy(_) => panic!("current-format fixture"),
+            };
+            match &layout.layout {
+                Some(Layout::FullZipLayout(layout)) if is_raw => assert!(matches!(
+                    layout.value_compression.as_ref().unwrap().compression,
+                    Some(Compression::Variable(_))
+                )),
+                Some(Layout::MiniBlockLayout(layout)) if !is_raw => {
+                    assert!(layout.dictionary.is_some());
+                    assert!(layout.num_dictionary_items > 1);
+                }
+                _ => panic!("unexpected growth fixture layout: {layout:?}"),
+            }
+        }
+    }
+    (dataset, expected)
+}
+
+#[rstest]
+#[tokio::test]
+async fn dataset_cursor_dictionary_refusal_does_not_consume_rows(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+) {
+    // Preserve the original counterexample: even one row needs the shared
+    // dictionary, so halving the prefix cannot make this workspace sufficient.
+    let (dataset, _) = growth_fixture(version, false).await;
+    let budget = AllocationBudget::new(2048);
+    let mut scan = dataset
+        .try_scan_admitted_fullzip(
+            dataset.schema().clone(),
+            Default::default(),
+            16,
+            2048,
+            budget.clone(),
+        )
+        .unwrap();
+    let position = scan.position();
+    assert!(matches!(
+        scan.try_next().await.unwrap(),
+        Outcome::NeedsCapacity
+    ));
+    assert_eq!(scan.position(), position);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn dataset_cursor_recovers_from_repeated_growth_refusals(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+) {
+    // A long wide region triggers repeated failed growth. The narrow tail must
+    // still recover within the same fragment; permanently pinning the small
+    // prefix would also reduce failed probes but is not an acceptable fix.
+    let (dataset, expected) = growth_fixture(version, true).await;
     let budget = AllocationBudget::new(2048);
     let mut scan = dataset
         .try_scan_admitted_fullzip(
@@ -440,7 +523,12 @@ async fn dataset_cursor_recovers_from_repeated_growth_refusals(
         .unwrap();
     let mut delivered = 0;
     let mut recovered_before_boundary = false;
-    while let Outcome::Batch { rows, batch, .. } = scan.try_next().await.unwrap() {
+    loop {
+        let (rows, batch) = match scan.try_next().await.unwrap() {
+            Outcome::Batch { rows, batch, .. } => (rows, batch),
+            Outcome::NeedsCapacity => panic!("a minimal raw row must fit the empty workspace"),
+            Outcome::Finished => break,
+        };
         assert_eq!(rows.start as usize, delivered % 1024);
         assert_eq!(batch, expected.slice(delivered, batch.num_rows()));
         if delivered < 496 {
