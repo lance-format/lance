@@ -17,6 +17,9 @@ use tokio::sync::Notify;
 
 use crate::{Error, Result};
 
+mod writer;
+pub use writer::ReservedBufferWriter;
+
 /// A shared ceiling for outstanding payload/workspace reservations.
 ///
 /// ```

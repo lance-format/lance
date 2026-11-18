@@ -217,28 +217,34 @@ fn build_bytes<T: ByteArrayType>(
     workspace: &mut Reservation,
 ) -> Result<ArrayRef> {
     let mut output = workspace
-        .try_allocate(plan.total_bytes)?
+        .try_allocate_writer(plan.total_bytes)?
         .ok_or_else(|| Error::internal("admitted interleave exceeded its complete output plan"))?;
 
-    let bytes = output.as_mut();
+    // Initialize metadata separately; copied values need no preceding zero pass.
+    // The writer cannot expose or publish any uninitialized part of the layout.
+    output.extend_zeros(plan.offset_bytes)?;
     let mut value_end = 0;
     for (index, (array_index, row)) in selection.iter().enumerate() {
         let array = source::<T>(arrays[array_index])?;
         if array.is_valid(row) {
             let value: &[u8] = array.value(row).as_ref();
             // The first pass checked the sum and every selected source/row.
-            let next_end = value_end + value.len();
-            bytes[plan.offset_bytes + value_end..plan.offset_bytes + next_end]
-                .copy_from_slice(value);
-            value_end = next_end;
-            if plan.validity_bytes != 0 {
-                bit_util::set_bit(&mut bytes[plan.offset_bytes + plan.value_bytes..], index);
+            output.extend_from_slice(value)?;
+            value_end += value.len();
+        }
+        plan.write_offset(output.initialized_mut(), index, value_end);
+    }
+    output.extend_zeros(plan.validity_bytes)?;
+    if plan.validity_bytes != 0 {
+        let validity = &mut output.initialized_mut()[plan.offset_bytes + plan.value_bytes..];
+        for (index, (array_index, row)) in selection.iter().enumerate() {
+            if source::<T>(arrays[array_index])?.is_valid(row) {
+                bit_util::set_bit(validity, index);
             }
         }
-        plan.write_offset(bytes, index, value_end);
     }
 
-    let (offsets, values, nulls) = plan.finish::<T::Offset>(Buffer::from(output.freeze()));
+    let (offsets, values, nulls) = plan.finish::<T::Offset>(Buffer::from(output.finish()?));
     Ok(Arc::new(GenericByteArray::<T>::try_new(
         offsets, values, nulls,
     )?))
