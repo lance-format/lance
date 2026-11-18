@@ -22,11 +22,11 @@ from typing import (
     cast,
 )
 
-import numpy as np
 import pyarrow as pa
 from pyarrow import RecordBatch, Schema
 
 from ..dependencies import _check_for_numpy
+from ..dependencies import numpy as np
 from ..dependencies import pandas as pd
 from ..fragment import LanceFragment
 from ..lance import (
@@ -420,8 +420,9 @@ def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
 
 def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
     # if the query is a multivector, convert it to pa.ListArray
-    if hasattr(query, "__getitem__") and isinstance(
-        query[0], (list, tuple, np.ndarray, pa.Array)
+    if hasattr(query, "__getitem__") and (
+        isinstance(query[0], (list, tuple, pa.Array))
+        or (_check_for_numpy(query[0]) and isinstance(query[0], np.ndarray))
     ):
         dim = len(query[0])
         multivector_query = []
@@ -441,9 +442,9 @@ def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
             query = query.value
         if isinstance(query.type, pa.FixedSizeListType):
             query = query.values
-    elif isinstance(query, (list, tuple)) or (
-        _check_for_numpy(query) and isinstance(query, np.ndarray)
-    ):
+    elif isinstance(query, (list, tuple)):
+        query = pa.array(query, type=pa.float32(), from_pandas=True)
+    elif _check_for_numpy(query) and isinstance(query, np.ndarray):
         query = np.array(query).astype("float64")  # workaround for GH-608
         query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
     elif not isinstance(query, pa.Array):
@@ -490,6 +491,8 @@ def _build_vector_search_query(
     refine_column: Optional[str] = None,
     refine_q: Optional[QueryVectorLike] = None,
     refine_metric: Optional[str] = None,
+    warp_imputation_rank: Optional[int] = None,
+    rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -573,6 +576,34 @@ def _build_vector_search_query(
         and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
         coarse TopM still precedes refinement. Query filters are unsupported;
         scalar filters retain their usual prefilter/postfilter behavior.
+    warp_imputation_rank: int, optional
+        Most callers should leave it unset. Indexed multivector
+        (late-interaction) search uses `WARP <https://arxiv.org/abs/2501.17788>`_
+        when every index segment supports it (IVF_FLAT, IVF_PQ, IVF_SQ and IVF_RQ,
+        but not HNSW sub-indices or the legacy IVF_PQ format) and XTR otherwise,
+        which ignores this setting. WARP probes partitions per query token, 32 by
+        default, scores every token in them, and estimates the scores of the rest
+        from the centroids. ``nprobes``, ``minimum_nprobes``, ``maximum_nprobes``
+        and ``search_effort`` set the partitions as for IVF search, except that a
+        ``maximum_nprobes`` set alone is the count WARP probes, since it never
+        expands its search. More partitions trade latency for recall.
+
+        When none of a document's tokens is in the partitions a query token
+        probed, WARP cannot compute that token's similarity to the document, so it
+        imputes the similarity of roughly the ``warp_imputation_rank``-th most
+        similar token in the whole index, estimated from the centroids and
+        partition sizes; 0 imputes 0. The default follows the WARP reference
+        implementation: ``floor(sqrt(8 * N) / 1000) * 1000`` for ``N`` indexed
+        tokens in up to 65,536 partitions (so 0 below 125,000 tokens), and 50,000,
+        or 100,000 when ``k`` exceeds 100, beyond that. It is not a latency knob:
+        it reads no extra data. Larger values impute lower similarities, so
+        documents that only some query tokens observe rank lower.
+    rq_graph_scoring: {"multi_bit", "one_bit_rerank"}, default "multi_bit"
+        How an IVF_HNSW_RQ graph search scores the nodes it visits. Other index
+        types ignore this setting. ``multi_bit`` scores every visited node with
+        the full multi-bit RQ codes. ``one_bit_rerank`` walks the graph with
+        the 1-bit sign codes and rescores only the ``ef`` finalists with the
+        full codes, which is faster but can lower recall at a given ``ef``.
 
     Returns
     -------
@@ -670,8 +701,10 @@ def _build_vector_search_query(
         "ef": ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
+        "rq_graph_scoring": rq_graph_scoring,
         "search_effort": search_effort,
         "distance_range": distance_range,
+        "warp_imputation_rank": warp_imputation_rank,
         "refine_column": refine_column,
         "refine_q": refine_q,
         "refine_metric": refine_metric,
@@ -1048,6 +1081,8 @@ class ScannerBuilder:
         refine_column: Optional[str] = None,
         refine_q: Optional[QueryVectorLike] = None,
         refine_metric: Optional[str] = None,
+        warp_imputation_rank: Optional[int] = None,
+        rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -1119,6 +1154,34 @@ class ScannerBuilder:
             and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
             coarse TopM still precedes refinement. Query filters are unsupported;
             scalar filters retain their usual prefilter/postfilter behavior.
+        warp_imputation_rank: int, optional
+            Most callers should leave it unset. Indexed multivector
+            (late-interaction) search uses `WARP <https://arxiv.org/abs/2501.17788>`_
+            when every index segment supports it (IVF_FLAT, IVF_PQ, IVF_SQ and IVF_RQ,
+            but not HNSW sub-indices or the legacy IVF_PQ format) and XTR otherwise,
+            which ignores this setting. WARP probes partitions per query token, 32 by
+            default, scores every token in them, and estimates the scores of the rest
+            from the centroids. ``nprobes``, ``minimum_nprobes``, ``maximum_nprobes``
+            and ``search_effort`` set the partitions as for IVF search, except that a
+            ``maximum_nprobes`` set alone is the count WARP probes, since it never
+            expands its search. More partitions trade latency for recall.
+
+            When none of a document's tokens is in the partitions a query token
+            probed, WARP cannot compute that token's similarity to the document, so it
+            imputes the similarity of roughly the ``warp_imputation_rank``-th most
+            similar token in the whole index, estimated from the centroids and
+            partition sizes; 0 imputes 0. The default follows the WARP reference
+            implementation: ``floor(sqrt(8 * N) / 1000) * 1000`` for ``N`` indexed
+            tokens in up to 65,536 partitions (so 0 below 125,000 tokens), and 50,000,
+            or 100,000 when ``k`` exceeds 100, beyond that. It is not a latency knob:
+            it reads no extra data. Larger values impute lower similarities, so
+            documents that only some query tokens observe rank lower.
+        rq_graph_scoring: {"multi_bit", "one_bit_rerank"}, default "multi_bit"
+            How an IVF_HNSW_RQ graph search scores the nodes it visits. Other index
+            types ignore this setting. ``multi_bit`` scores every visited node with
+            the full multi-bit RQ codes. ``one_bit_rerank`` walks the graph with
+            the 1-bit sign codes and rescores only the ``ef`` finalists with the
+            full codes, which is faster but can lower recall at a given ``ef``.
 
         Examples
         --------
@@ -1151,9 +1214,11 @@ class ScannerBuilder:
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
+            warp_imputation_rank=warp_imputation_rank,
             refine_column=refine_column,
             refine_q=refine_q,
             refine_metric=refine_metric,
+            rq_graph_scoring=rq_graph_scoring,
         )
         return self
 
@@ -1506,7 +1571,14 @@ class LanceScanner(pa.dataset.Scanner):
         indices = list(indices)
         if not indices:
             raise ValueError("take requires at least one index")
-        if any(not isinstance(i, (int, np.integer)) or i < 0 for i in indices):
+        if any(
+            not (
+                isinstance(i, int)
+                or (_check_for_numpy(i) and isinstance(i, np.integer))
+            )
+            or i < 0
+            for i in indices
+        ):
             raise ValueError(f"indices must be non-negative integers, got {indices}")
 
         # Collect the rows at the requested filtered-relative positions. Rows
@@ -1631,6 +1703,7 @@ class VectorSearchQuery:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         search_effort: Optional[float] = None,
+        rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -1646,6 +1719,7 @@ class VectorSearchQuery:
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
             search_effort=search_effort,
+            rq_graph_scoring=rq_graph_scoring,
         )
 
     def inner(self):

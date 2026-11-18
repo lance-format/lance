@@ -39,7 +39,7 @@ use lance_index::{
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use std::{collections::HashMap, future::IntoFuture, sync::Arc};
-use tracing::{instrument, warn};
+use tracing::{Instrument, instrument, warn};
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
@@ -210,10 +210,17 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
-        self.execute_uncommitted_impl().await
+        let (index_metadata, observed) = self.execute_uncommitted_impl().await?;
+        observed.finish();
+        Ok(index_metadata)
     }
 
-    fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
+    /// Builds the index and returns it with the memory observation of the
+    /// build still open, so that a caller that commits the index can finish
+    /// the observation once the commit has succeeded.
+    fn execute_uncommitted_impl(
+        &mut self,
+    ) -> BoxFuture<'_, Result<(IndexMetadata, ObservedBuild)>> {
         async move {
         if self.columns.len() != 1 {
             return Err(Error::index(
@@ -736,8 +743,7 @@ impl<'a> CreateIndexBuilder<'a> {
         };
         // A generic scalar request only resolves to an implementation here.
         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
-        observed.finish();
-        Ok(index_metadata)
+        Ok((index_metadata, observed))
         }
         .boxed()
     }
@@ -753,7 +759,10 @@ impl<'a> CreateIndexBuilder<'a> {
             return self.execute_multi_segment_fmindex(num_segments).await;
         }
 
-        let new_idx = self.execute_uncommitted().await?;
+        let (new_idx, observed) = self
+            .execute_uncommitted_impl()
+            .instrument(tracing::info_span!("execute_uncommitted"))
+            .await?;
         let index_uuid = new_idx.uuid;
         let removed_indices = if self.replace {
             load_all_indices(self.dataset)
@@ -781,7 +790,8 @@ impl<'a> CreateIndexBuilder<'a> {
 
         // Rebasing may withdraw all query coverage while keeping the committed
         // segment's definition for rebuilding. Include that stored metadata.
-        self.dataset
+        let committed = self
+            .dataset
             .load_index_with_purpose(&index_uuid, OpenPurpose::Maintenance)
             .await?
             .ok_or_else(|| {
@@ -789,7 +799,9 @@ impl<'a> CreateIndexBuilder<'a> {
                     "Index with UUID {} not found after commit",
                     index_uuid
                 ))
-            })
+            })?;
+        observed.finish();
+        Ok(committed)
     }
     /// Extract `num_segments` from FM-Index params if this is an FM-Index build.
     fn fmindex_num_segments(&self) -> Option<u32> {
@@ -988,7 +1000,6 @@ impl<'a> CreateIndexBuilder<'a> {
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
             segment_metadatas.push(segment);
         }
-        observed.finish();
 
         // Convert to IndexSegments and build proper transaction metadata
         let segments = segment_metadatas
@@ -1023,18 +1034,21 @@ impl<'a> CreateIndexBuilder<'a> {
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
-        if let Some(index) = indices.into_iter().next() {
-            return Ok(index);
-        }
-        // A rebase can withdraw all query coverage and leave empty
-        // definitions, which tagged query listings omit.
-        let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
-        indices.into_iter().next().ok_or_else(|| {
-            Error::internal(format!(
-                "FM-Index segments for '{}' not found after commit",
-                index_name
-            ))
-        })
+        let committed = if let Some(index) = indices.into_iter().next() {
+            index
+        } else {
+            // A rebase can withdraw all query coverage and leave empty
+            // definitions, which tagged query listings omit.
+            let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
+            indices.into_iter().next().ok_or_else(|| {
+                Error::internal(format!(
+                    "FM-Index segments for '{}' not found after commit",
+                    index_name
+                ))
+            })?
+        };
+        observed.finish();
+        Ok(committed)
     }
 }
 
@@ -1205,9 +1219,10 @@ mod tests {
     use datafusion::common::ScalarValue;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
-    use lance_datagen::{self, gen_batch};
+    use lance_datagen::{self, ArrayGeneratorExt, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
+    use lance_index::scalar::BuiltinIndexType;
     use lance_index::scalar::{
         AnyQuery, BloomFilterQuery, FullTextSearchQuery, LabelListQuery, SargableQuery,
         SearchResult, TextQuery, TokenQuery, inverted::tokenizer::InvertedIndexParams,
@@ -2145,6 +2160,334 @@ mod tests {
                 .any(|e| e == "progress:write_merged_metadata"),
             "expected write_merged_metadata progress during public merge"
         );
+    }
+
+    /// Records every stage event with the reads and writes the dataset's
+    /// object store has done by then.
+    #[derive(Debug)]
+    struct IoRecordingProgress {
+        store: Arc<lance_io::object_store::ObjectStore>,
+        events: std::sync::Mutex<Vec<(String, String, u64, u64)>>,
+    }
+
+    impl IoRecordingProgress {
+        fn record(&self, kind: &str, stage: &str) {
+            let io = self.store.io_stats_snapshot();
+            self.events.lock().unwrap().push((
+                kind.to_string(),
+                stage.to_string(),
+                io.read_iops,
+                io.write_iops,
+            ));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IndexBuildProgress for IoRecordingProgress {
+        async fn stage_start(&self, stage: &str, _: Option<u64>, _: &str) -> Result<()> {
+            self.record("start", stage);
+            Ok(())
+        }
+
+        async fn stage_progress(&self, _: &str, _: u64) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_complete(&self, stage: &str) -> Result<()> {
+            self.record("complete", stage);
+            Ok(())
+        }
+    }
+
+    /// The I/O a stage does on the dataset's object store.
+    #[derive(Debug, Clone, Copy)]
+    enum StageIo {
+        Read,
+        Write,
+        ReadWrite,
+        Nothing,
+        /// Not checked.
+        Any,
+    }
+
+    /// Builds the index and checks that it reports `expected` stages, in
+    /// order and one at a time, and the I/O each of them does.
+    async fn assert_build_stages(
+        mut dataset: Dataset,
+        column: &str,
+        index_type: IndexType,
+        params: &ScalarIndexParams,
+        fragments: Option<Vec<u32>>,
+        train: bool,
+        expected: &[(&str, StageIo)],
+    ) {
+        let progress = Arc::new(IoRecordingProgress {
+            store: dataset.object_store.clone(),
+            events: Default::default(),
+        });
+        let mut builder = CreateIndexBuilder::new(&mut dataset, &[column], index_type, params)
+            .train(train)
+            .progress(progress.clone());
+        if let Some(fragments) = fragments {
+            builder = builder.fragments(fragments);
+        }
+        builder.execute_uncommitted().await.unwrap();
+
+        let events = progress.events.lock().unwrap().clone();
+        let tags = events
+            .iter()
+            .map(|(kind, stage, _, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let expected_tags = expected
+            .iter()
+            .flat_map(|(stage, _)| [format!("start:{stage}"), format!("complete:{stage}")])
+            .collect::<Vec<_>>();
+        assert_eq!(tags, expected_tags);
+        for ((stage, io), events) in expected.iter().zip(events.chunks(2)) {
+            let reads = events[1].2 - events[0].2;
+            let writes = events[1].3 - events[0].3;
+            let matches = match io {
+                StageIo::Read => reads > 0 && writes == 0,
+                StageIo::Write => reads == 0 && writes > 0,
+                StageIo::ReadWrite => reads > 0 && writes > 0,
+                StageIo::Nothing => reads == 0 && writes == 0,
+                StageIo::Any => true,
+            };
+            assert!(
+                matches,
+                "{stage} did {reads} reads and {writes} writes, expected {io:?}"
+            );
+        }
+    }
+
+    /// Two fragments with a column for each scalar index type built below.
+    async fn stage_test_dataset() -> Dataset {
+        let json = std::collections::HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+        )]);
+        gen_batch()
+            .col("id", lance_datagen::array::step::<Int64Type>())
+            .col(
+                "labels",
+                lance_datagen::array::rand_list(&DataType::Int64, false),
+            )
+            .col("text", lance_datagen::array::random_sentence(2, 6, false))
+            .col(
+                "doc",
+                lance_datagen::array::cycle_utf8_literals(&[
+                    r#"{"x":1}"#,
+                    r#"{"x":2}"#,
+                    r#"{"x":3}"#,
+                ])
+                .with_metadata(json),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(20))
+            .await
+            .unwrap()
+    }
+
+    fn json_btree_params() -> ScalarIndexParams {
+        ScalarIndexParams {
+            index_type: "json".to_string(),
+            params: Some(r#"{"target_index_type":"btree","path":"x"}"#.to_string()),
+        }
+    }
+
+    #[rstest]
+    #[case::btree(
+        "id",
+        IndexType::BTree,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("sort_values", StageIo::Read),
+            ("write_btree_index", StageIo::Write),
+        ]
+    )]
+    #[case::bitmap(
+        "id",
+        IndexType::Bitmap,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("sort_values", StageIo::Read),
+            ("write_bitmap_index", StageIo::Write),
+        ]
+    )]
+    #[case::bitmap_segment(
+        "id",
+        IndexType::Bitmap,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+        Some(vec![0]),
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("sort_values", StageIo::Read),
+            ("write_bitmap_index", StageIo::Write),
+        ]
+    )]
+    #[case::bitmap_shard(
+        "id",
+        IndexType::Scalar,
+        ScalarIndexParams::new("bitmap".to_string()),
+        Some(vec![0]),
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("sort_values", StageIo::Read),
+            ("build_bitmap_shard", StageIo::Write),
+        ]
+    )]
+    #[case::label_list(
+        "labels",
+        IndexType::LabelList,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("sort_values", StageIo::Read),
+            ("write_label_list_index", StageIo::Write),
+        ]
+    )]
+    #[case::zonemap(
+        "id",
+        IndexType::ZoneMap,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("train_zones", StageIo::Read),
+            ("write_zonemap_index", StageIo::Write),
+        ]
+    )]
+    #[case::zonemap_untrained(
+        "id",
+        IndexType::ZoneMap,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        None,
+        false,
+        &[
+            ("load_data", StageIo::Any),
+            ("train_zones", StageIo::Nothing),
+            ("write_zonemap_index", StageIo::Write),
+        ]
+    )]
+    #[case::bloomfilter(
+        "id",
+        IndexType::BloomFilter,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("train_zones", StageIo::Read),
+            ("write_bloomfilter_index", StageIo::Write),
+        ]
+    )]
+    #[case::ngram(
+        "text",
+        IndexType::NGram,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("tokenize_docs", StageIo::Read),
+            ("write_ngram_index", StageIo::Write),
+        ]
+    )]
+    #[case::fmindex(
+        "text",
+        IndexType::Fm,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::Fm),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("build_fmindex_partitions", StageIo::ReadWrite),
+        ]
+    )]
+    #[case::minhash_lsh(
+        "text",
+        IndexType::MinHashLsh,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::MinHashLsh),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("compute_signatures", StageIo::ReadWrite),
+            ("write_bands", StageIo::Write),
+        ]
+    )]
+    // Type inference may already have read every fragment, so the target's
+    // sort reads what is left, if anything.
+    #[case::json_btree(
+        "doc",
+        IndexType::Scalar,
+        json_btree_params(),
+        None,
+        true,
+        &[
+            ("load_data", StageIo::Any),
+            ("infer_json_type", StageIo::Read),
+            ("sort_values", StageIo::Any),
+            ("write_btree_index", StageIo::Write),
+        ]
+    )]
+    #[tokio::test]
+    async fn test_scalar_index_build_reports_its_stages(
+        #[case] column: &str,
+        #[case] index_type: IndexType,
+        #[case] params: ScalarIndexParams,
+        #[case] fragments: Option<Vec<u32>>,
+        #[case] train: bool,
+        #[case] expected: &[(&str, StageIo)],
+    ) {
+        let dataset = stage_test_dataset().await;
+        assert_build_stages(
+            dataset, column, index_type, &params, fragments, train, expected,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "geo")]
+    #[tokio::test]
+    async fn test_rtree_build_reports_its_stages() {
+        let (schema, batches) = crate::utils::test::geo::batches(20, 2);
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // The bounding boxes are sorted from a local spill file, which is
+        // not the dataset's object store.
+        assert_build_stages(
+            dataset,
+            "geometry",
+            IndexType::RTree,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::RTree),
+            None,
+            true,
+            &[
+                ("load_data", StageIo::Any),
+                ("compute_bboxes", StageIo::Read),
+                ("sort_bboxes", StageIo::Nothing),
+                ("write_rtree_index", StageIo::Write),
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]

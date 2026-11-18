@@ -20,14 +20,18 @@ use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
 pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
+#[cfg(feature = "pcodec")]
+use crate::encodings::physical::pcodec::{PcodecMiniBlockDecompressor, PcodecMiniBlockEncoder};
 use crate::{
     buffer::LanceBuffer,
     compression_config::{AlpMode, BssMode, CompressionFieldParams},
     constants::{
         ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
-        RLE_THRESHOLD_META_KEY,
+        PCODEC_COMPRESSION, RLE_THRESHOLD_META_KEY,
     },
-    data::{DataBlock, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock},
+    data::{
+        DataBlock, DataBlockBuilder, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock,
+    },
     encodings::{
         logical::primitive::{
             fullzip::PerValueCompressor,
@@ -81,7 +85,7 @@ use arrow_array::{cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
-use std::{str::FromStr, sync::Arc};
+use std::{ops::Range, str::FromStr, sync::Arc};
 
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
 ///
@@ -245,6 +249,39 @@ fn rle_payload_lower_bound(data: &FixedWidthDataBlock) -> u128 {
     rle_encoded_size_from_entries(run_count, data.bits_per_value, RunLengthWidth::U8)
 }
 
+/// Upper bound on the `U8` RLE payload derived purely from `(num_values, RunCount)`.
+///
+/// Across `R` runs summing to `N` values (`N - R` intra-run steps), at most
+/// `(N - R) / M` steps cross a segment boundary of size `M`, and at most
+/// `(N - R) / 255` steps cross a `u8::MAX` run-length split (segment resets can
+/// only delay a 255-step rollover). When even this worst-case entry count beats
+/// raw and bitpacking, we can select `U8` RLE without scanning the page again.
+fn rle_u8_payload_upper_bound(
+    data: &FixedWidthDataBlock,
+    max_segment_values: Option<u64>,
+) -> Option<u128> {
+    let type_size = (data.bits_per_value / 8) as usize;
+    let expected_bytes = usize::try_from(data.num_values)
+        .ok()?
+        .checked_mul(type_size)?;
+    if data.data.len() != expected_bytes {
+        return None;
+    }
+    let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+    if run_count == 0 || data.num_values < run_count {
+        return None;
+    }
+    let extra_values = data.num_values - run_count;
+    let max_entries = run_count
+        .saturating_add(extra_values / (u8::MAX as u64))
+        .saturating_add(max_segment_values.map_or(0, |seg| extra_values / seg.max(1)));
+    Some(rle_encoded_size_from_entries(
+        max_entries,
+        data.bits_per_value,
+        RunLengthWidth::U8,
+    ))
+}
+
 fn rle_beats_raw_and_bitpacking(
     data: &FixedWidthDataBlock,
     encoded_bytes: u128,
@@ -274,6 +311,13 @@ fn try_fixed_u8_rle_for_mini_block(
     // Skip the value scan when even the lower bound cannot win.
     if !rle_beats_raw_and_bitpacking(data, rle_payload_lower_bound(data), raw_bytes) {
         return None;
+    }
+    if let Some(upper_bound) = rle_u8_payload_upper_bound(data, Some(*MAX_MINIBLOCK_VALUES))
+        && rle_beats_raw_and_bitpacking(data, upper_bound, raw_bytes)
+    {
+        return Some(Box::new(RleEncoder::with_run_length_width(
+            RunLengthWidth::U8,
+        )));
     }
     let rle_bytes = estimate_rle_size_for_width_from_data(
         data,
@@ -736,6 +780,56 @@ pub fn try_alp_miniblock(
     try_alp_for_mini_block(field, data, params)
 }
 
+/// Select pcodec compression when the field requests `compression=pcodec`.
+///
+/// pcodec applies to float16/float32/float64 values and fixed-size lists of them. A
+/// request for any other type is rejected instead of silently ignored.
+pub fn try_pcodec_miniblock(
+    field: &Field,
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn MiniBlockCompressor>>> {
+    if params.compression.as_deref() != Some(PCODEC_COMPRESSION) {
+        return Ok(None);
+    }
+    let mut item_type = field.data_type();
+    while let DataType::FixedSizeList(item, _) = item_type {
+        item_type = item.data_type().clone();
+    }
+    if !matches!(
+        item_type,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
+        return Err(Error::invalid_input(format!(
+            "pcodec compression requires float16, float32 or float64 values or fixed-size lists of them, \
+             but field '{}' has type {}",
+            field.name,
+            field.data_type()
+        )));
+    }
+    if let DataBlock::FixedSizeList(fsl) = data
+        && fsl.clone().try_into_flat().is_none()
+    {
+        log::warn!(
+            "Field '{}' requests pcodec but has null list items; storing the page uncompressed",
+            field.name
+        );
+        return Ok(None);
+    }
+    #[cfg(feature = "pcodec")]
+    {
+        Ok(Some(Box::new(PcodecMiniBlockEncoder::try_new(
+            params.compression_level,
+        )?)))
+    }
+    #[cfg(not(feature = "pcodec"))]
+    {
+        Err(Error::not_supported_source(
+            "package was not built with pcodec support".into(),
+        ))
+    }
+}
+
 /// Select the original fixed-u8 RLE miniblock grammar.
 pub fn try_fixed_u8_rle_miniblock(
     data: &DataBlock,
@@ -1155,10 +1249,48 @@ pub fn try_fixed_size_list_block(
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Decompress only `range` (`0 <= range.start <= range.end <= num_values`) from a mini-block
+    /// chunk containing `num_values` items.
+    ///
+    /// Codecs that support random or prefix/sub-range extraction override this to avoid
+    /// materializing unselected items during point `take` and sub-chunk reads.
+    fn decompress_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: Range<u64>,
+    ) -> Result<DataBlock> {
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "mini-block",
+                format!(
+                    "mini-block selection {:?} exceeds {} values in chunk",
+                    range, num_values
+                ),
+            ));
+        }
+        let block = self.decompress(data, num_values)?;
+        if range == (0..num_values) {
+            return Ok(block);
+        }
+        let estimated_bytes = self
+            .decoded_size_bytes(range.end - range.start)
+            .unwrap_or(64);
+        let mut builder = DataBlockBuilder::with_capacity_estimate(estimated_bytes);
+        builder.append(&block, range)?;
+        Ok(builder.finish())
+    }
+
     /// Number of payload buffers consumed by each independently decoded chunk.
     /// Decoders with multiple buffers must override the single-buffer default.
     fn num_buffers(&self) -> usize {
         1
+    }
+
+    /// Whether every buffer returned by `decompress_range` is newly allocated with exact
+    /// capacity (never a `slice_with_length` view pinning the raw mini-block/page buffer).
+    fn allocates_output(&self) -> bool {
+        false
     }
 
     /// Returns the output bit width when this is the single-buffer inline
@@ -1173,7 +1305,7 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by
-    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// [`DataBlockBuilder`] to preallocate the decoded output
     /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
     /// represented by one aggregate estimate should return `None`.
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
@@ -1221,7 +1353,7 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by
-    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// [`DataBlockBuilder`] to preallocate the decoded output
     /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
     /// represented by one aggregate estimate should return `None`.
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
@@ -1447,8 +1579,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::Alp(description) => Ok(Box::new(
                 AlpMiniBlockDecompressor::from_description(description)?,
             )),
+            #[cfg(feature = "pcodec")]
+            Compression::Pcodec(description) => Ok(Box::new(
+                PcodecMiniBlockDecompressor::from_description(description)?,
+            )),
+            #[cfg(not(feature = "pcodec"))]
             Compression::Pcodec(_) => Err(Error::not_supported_source(
-                "pcodec decoding is not yet implemented".into(),
+                "package was not built with pcodec support".into(),
             )),
             Compression::General(general) => {
                 // Create inner decompressor

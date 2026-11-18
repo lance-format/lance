@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from lance import LanceDataset
 from lance.fragment import FragmentMetadata
@@ -61,6 +61,8 @@ class RewriteResult:
 
 class CompactionTask:
     read_version: int
+    kind: Literal["rewrite_fragments", "repack_columns"]
+    repack_files: Optional[List[List[int]]]
     fragments: List["FragmentMetadata"]
 
     def execute(self, dataset: "LanceDataset") -> RewriteResult: ...
@@ -180,5 +182,7 @@ class OptimizeIndices:
     ) -> OptimizeIndicesPlan: ...
     @staticmethod
     def commit(
-        dataset: "LanceDataset", results: List[Optional[IndexSegmentResult]]
+        dataset: "LanceDataset",
+        results: List[Optional[IndexSegmentResult]],
+        options: Optional[Dict[str, Any]] = None,
     ) -> None: ...

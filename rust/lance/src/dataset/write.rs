@@ -165,6 +165,34 @@ impl Dataset {
         blob_ids: Option<Range<u32>>,
         data: impl Stream<Item = Result<RecordBatch>> + Send,
     ) -> Result<DataFilePart> {
+        self.write_data_file_part_with_file_writer_options(
+            target,
+            blob_ids,
+            data,
+            FileWriterOptions::default(),
+        )
+        .await
+    }
+
+    /// Encode one managed part with runtime file-writer options.
+    ///
+    /// This has the same part description, Blob handling and concat semantics
+    /// as [`Self::write_data_file_part`]. The options control buffering and
+    /// execution only: the target still selects the file grammar and physical
+    /// layout, so an assembled target is indistinguishable from one whose parts
+    /// were written without them.
+    ///
+    /// Use this when the caller owns a memory budget for the writer. A part
+    /// retains its encoded pages until [`Self::concat_data_file_parts`], so
+    /// without an explicit budget each cache-owning field encoder buffers its
+    /// own default allowance regardless of how many fields the schema has.
+    pub async fn write_data_file_part_with_file_writer_options(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<DataFilePart> {
         self.validate_data_file_target(target)?;
         validate_blob_v2_write_schema(target.schema.as_ref())?;
         let managed = managed_blobs_enabled(target.schema.as_ref())?;
@@ -221,7 +249,7 @@ impl Dataset {
                 target.version,
                 store.create(&path).await?,
                 target.schema.as_ref().clone(),
-                FileWriterOptions::default(),
+                file_writer_options,
             )?,
             None,
             preprocessor,
@@ -1754,6 +1782,11 @@ async fn build_external_base_resolver(
     .await?;
 
     let mut resolver = ExternalBaseResolver::new(candidates, store_registry);
+    resolver.unregistered_external_blob_policy = dataset
+        .map(|dataset| dataset.session.as_ref())
+        .or(params.session.as_deref())
+        .map(|session| session.unregistered_external_blob_policy())
+        .unwrap_or_default();
     resolver.registered_base_ids = dataset
         .into_iter()
         .flat_map(|dataset| dataset.manifest.base_paths.keys().copied())
@@ -2320,12 +2353,14 @@ impl WriterOptions {
         source_store_registry: Arc<ObjectStoreRegistry>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
+        file_writer_options: FileWriterOptions,
     ) -> Self {
         Self {
             add_data_dir: true,
             external_base_resolver,
             allow_external_blob_outside_bases,
             source_store_registry,
+            file_writer_options,
             ..Default::default()
         }
     }

@@ -6,7 +6,8 @@
 //! This module provides functions to convert between JsonArrow schema representations
 //! and Arrow schema types.
 
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use lance_core::datatypes::LogicalType;
 use lance_core::{Error, Result};
 use lance_namespace_reqwest_client::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
 
@@ -87,11 +88,19 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
         DataType::Date64 => Ok(JsonArrowDataType::new("date64".to_string())),
         DataType::Time32(_) => Ok(JsonArrowDataType::new("time32".to_string())),
         DataType::Time64(_) => Ok(JsonArrowDataType::new("time64".to_string())),
-        DataType::Timestamp(_, _tz) => {
-            // TODO: We could encode timezone info if needed
+        // Preserve the legacy encoding where it already represents the exact type.
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
             Ok(JsonArrowDataType::new("timestamp".to_string()))
         }
-        DataType::Duration(_) => Ok(JsonArrowDataType::new("duration".to_string())),
+        DataType::Duration(TimeUnit::Microsecond) => {
+            Ok(JsonArrowDataType::new("duration".to_string()))
+        }
+        // Other temporal types use Lance's existing logical-type spelling so their
+        // unit and timezone survive the namespace JSON round trip.
+        DataType::Timestamp(_, _) | DataType::Duration(_) => {
+            let logical_type = LogicalType::try_from(data_type)?;
+            Ok(JsonArrowDataType::new(logical_type.to_string()))
+        }
         DataType::Interval(_) => Ok(JsonArrowDataType::new("interval".to_string())),
 
         // String and Binary types
@@ -250,7 +259,17 @@ pub fn convert_json_arrow_field(json_field: &JsonArrowField) -> Result<Field> {
 pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType> {
     use std::sync::Arc;
 
-    let type_name = json_type.r#type.to_lowercase();
+    let raw_type_name = json_type.r#type.as_str();
+    let type_name = raw_type_name.to_ascii_lowercase();
+
+    if type_name.starts_with("timestamp:") || type_name.starts_with("duration:") {
+        let logical_type = LogicalType::from(raw_type_name);
+        return DataType::try_from(&logical_type).map_err(|error| {
+            Error::namespace(format!(
+                "Invalid temporal Arrow type '{raw_type_name}': {error}"
+            ))
+        });
+    }
 
     match type_name.as_str() {
         // Primitive types
@@ -376,6 +395,7 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::TimeUnit;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -700,6 +720,139 @@ mod tests {
             let back = convert_json_arrow_type(&json)
                 .unwrap_or_else(|e| panic!("convert_json_arrow_type failed for {:?}: {}", dt, e));
             assert_eq!(&back, dt, "Roundtrip mismatch for {:?}: got {:?}", dt, back);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_unit_and_timezone_roundtrip() {
+        let timezones: [Option<&str>; 5] = [
+            None,
+            Some("UTC"),
+            Some("America/New_York"),
+            Some("+08:00"),
+            Some("-05:00"),
+        ];
+
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            for timezone in timezones {
+                let data_type = DataType::Timestamp(unit, timezone.map(Arc::<str>::from));
+                let json = arrow_type_to_json(&data_type).unwrap();
+                if unit == TimeUnit::Microsecond && timezone.is_none() {
+                    assert_eq!(json.r#type, "timestamp");
+                } else {
+                    assert!(
+                        json.r#type.starts_with("timestamp:"),
+                        "unexpected timestamp encoding: {json:?}"
+                    );
+                }
+                assert_eq!(convert_json_arrow_type(&json).unwrap(), data_type);
+            }
+        }
+
+        let fixed_offset =
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::<str>::from("+08:00")));
+        assert_eq!(
+            arrow_type_to_json(&fixed_offset).unwrap().r#type,
+            "timestamp:ns:+08:00"
+        );
+    }
+
+    #[test]
+    fn test_duration_unit_roundtrip() {
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            let data_type = DataType::Duration(unit);
+            let json = arrow_type_to_json(&data_type).unwrap();
+            if unit == TimeUnit::Microsecond {
+                assert_eq!(json.r#type, "duration");
+            }
+            assert_eq!(convert_json_arrow_type(&json).unwrap(), data_type);
+        }
+    }
+
+    #[test]
+    fn test_legacy_timestamp_and_duration_payloads_still_decode() {
+        let legacy_timestamp: JsonArrowDataType =
+            serde_json::from_str(r#"{"type":"timestamp"}"#).unwrap();
+        assert_eq!(
+            convert_json_arrow_type(&legacy_timestamp).unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+
+        let legacy_duration: JsonArrowDataType =
+            serde_json::from_str(r#"{"type":"duration"}"#).unwrap();
+        assert_eq!(
+            convert_json_arrow_type(&legacy_duration).unwrap(),
+            DataType::Duration(TimeUnit::Microsecond)
+        );
+    }
+
+    #[test]
+    fn test_temporal_types_in_nullable_and_nested_fields() {
+        let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::<str>::from("UTC")));
+        let duration = DataType::Duration(TimeUnit::Millisecond);
+
+        let cases = vec![
+            DataType::List(Arc::new(Field::new("items", timestamp.clone(), true))),
+            DataType::FixedSizeList(Arc::new(Field::new("items", duration.clone(), false)), 2),
+            DataType::Struct(
+                vec![
+                    Field::new("timestamp", timestamp.clone(), false),
+                    Field::new("duration", duration, true),
+                ]
+                .into(),
+            ),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", timestamp.clone(), true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+        ];
+
+        for data_type in cases {
+            let json = arrow_type_to_json(&data_type).unwrap();
+            assert_eq!(convert_json_arrow_type(&json).unwrap(), data_type);
+        }
+
+        let field = Field::new("timestamp", timestamp, true);
+        let json_field = arrow_field_to_json(&field).unwrap();
+        assert!(json_field.nullable);
+        assert_eq!(convert_json_arrow_field(&json_field).unwrap(), field);
+    }
+
+    #[test]
+    fn test_invalid_temporal_units_are_rejected() {
+        for encoded in [
+            "timestamp:decade:UTC",
+            "timestamp:decade:+08:00",
+            "duration:decade",
+            "timestamp:us",
+            "duration:us:extra",
+        ] {
+            let data_type: JsonArrowDataType =
+                serde_json::from_str(&format!(r#"{{"type":"{encoded}"}}"#)).unwrap();
+            assert!(
+                convert_json_arrow_type(&data_type).is_err(),
+                "expected {encoded} to be rejected"
+            );
         }
     }
 

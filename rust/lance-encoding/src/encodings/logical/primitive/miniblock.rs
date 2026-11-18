@@ -87,6 +87,10 @@ impl MiniBlockCompressionContext {
     pub(crate) fn allows_generic_offsets(self) -> bool {
         self.allow_generic_offsets
     }
+
+    pub(crate) fn supports_large_chunk(self) -> bool {
+        self.support_large_chunk
+    }
 }
 
 /// Describes the size of a mini-block chunk of data

@@ -18,6 +18,7 @@ pub mod fts;
 pub(crate) mod knn;
 pub mod minhash;
 mod optimizer;
+pub mod ordered_index_scan;
 mod prefilter_union;
 mod projection;
 mod pushdown_scan;
