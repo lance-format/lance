@@ -185,6 +185,26 @@ fn structural_list_test_values(kind: &str) -> ArrayRef {
                 Some(NullBuffer::from(vec![true, false, true, true, true, true])),
             ))
         }
+        // A struct whose only child is stored full-zip, so list structure reads use that page.
+        "binary_struct" | "vector_struct" => {
+            let child: ArrayRef = if kind == "binary_struct" {
+                structural_list_test_values("binary")
+            } else {
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    128,
+                    Arc::new(Float32Array::from_iter_values(
+                        (0..6 * 128).map(|v| v as f32),
+                    )),
+                    None,
+                ))
+            };
+            Arc::new(StructArray::new(
+                vec![ArrowField::new("value", child.data_type().clone(), true)].into(),
+                vec![child],
+                None,
+            ))
+        }
         "map" => {
             let mut builder =
                 MapBuilder::new(None, StringBuilder::new(), LargeBinaryBuilder::new());
@@ -667,6 +687,9 @@ async fn test_list_structure_omits_image_payload(
 #[rstest]
 #[case::primitive("int")]
 #[case::nested_structure("nested")]
+// The second file has no nulls, so its full-zip pages have no control words.
+#[case::full_zip_variable("binary_struct")]
+#[case::full_zip_fixed("vector_struct")]
 #[tokio::test]
 async fn test_list_structure_fixed_outer(
     #[case] kind: &str,

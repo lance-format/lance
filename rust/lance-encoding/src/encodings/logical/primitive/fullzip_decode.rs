@@ -3001,31 +3001,34 @@ mod tests {
         }
     }
 
-    /// Two 3-byte values of a NIL page, each preceded by `padding` if it is given.
+    const NIL_PAGE_VALUES: [&[u8]; 3] = [b"abc", b"x", b"hello"];
+
+    /// Three values of different lengths in a NIL page, each preceded by `padding` if given.
     fn nil_variable_page(padding: Option<u8>) -> Vec<u8> {
-        [b"abc", b"xyz"]
+        NIL_PAGE_VALUES
             .into_iter()
             .flat_map(|value| {
                 padding
                     .into_iter()
-                    .chain(3_u32.to_le_bytes())
+                    .chain((value.len() as u32).to_le_bytes())
                     .chain(value.iter().copied())
             })
             .collect()
     }
 
     /// Writers before #9018 could put a zero byte before each value of a NIL page. A padded
-    /// page reads like the unpadded one, whole or one row at a time.
+    /// page reads like the unpadded one, whole or a few rows at a time.
     #[rstest]
     fn variable_full_zip_reads_nil_page(
         #[values(None, Some(0))] padding: Option<u8>,
-        #[values(1, 2)] rows_per_drain: u64,
+        #[values(1, 2, 3)] rows_per_drain: u64,
     ) {
+        let num_rows = NIL_PAGE_VALUES.len() as u64;
         let new_decoder = |padding| {
             VariableFullZipDecoder::new(
                 truncated_tail_details(),
                 std::collections::VecDeque::from([LanceBuffer::from(nil_variable_page(padding))]),
-                2,
+                num_rows,
                 32,
                 32,
             )
@@ -3034,21 +3037,21 @@ mod tests {
         let mut decoder = new_decoder(padding);
         let mut unpadded = new_decoder(None);
         let mut values = Vec::new();
-        for _ in 0..2 / rows_per_drain {
+        let mut remaining = num_rows;
+        while remaining > 0 {
+            let rows = rows_per_drain.min(remaining);
+            remaining -= rows;
             assert_eq!(
-                decoder.decoded_bytes(rows_per_drain).unwrap(),
-                unpadded.decoded_bytes(rows_per_drain).unwrap()
+                decoder.decoded_bytes(rows).unwrap(),
+                unpadded.decoded_bytes(rows).unwrap()
             );
-            unpadded.drain(rows_per_drain).unwrap();
-            let DataBlock::VariableWidth(block) = decoder
-                .drain(rows_per_drain)
-                .unwrap()
-                .decode()
-                .unwrap()
-                .data
+            unpadded.drain(rows).unwrap();
+            let DataBlock::VariableWidth(block) =
+                decoder.drain(rows).unwrap().decode().unwrap().data
             else {
                 panic!("expected a variable-width block");
             };
+            assert_eq!(block.num_values, rows);
             let offsets = block.offsets.borrow_to_typed_slice::<u32>();
             values.extend(
                 offsets
@@ -3057,7 +3060,7 @@ mod tests {
                     .map(|w| block.data.as_ref()[w[0] as usize..w[1] as usize].to_vec()),
             );
         }
-        assert_eq!(values, [b"abc".to_vec(), b"xyz".to_vec()]);
+        assert_eq!(values, NIL_PAGE_VALUES.map(<[u8]>::to_vec));
     }
 
     /// Only zero padding is accepted; otherwise the error from the NIL walk is reported.

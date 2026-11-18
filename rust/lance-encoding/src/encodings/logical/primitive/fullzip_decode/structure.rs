@@ -93,7 +93,7 @@ impl FullZipScheduler {
                         return Err(corrupt("Variable values have no row index"));
                     };
                     let row_bytes = bytes
-                        .checked_add(details.bytes_per_word() as u64)
+                        .checked_add(details.ctrl_word_parser.bytes_per_word() as u64)
                         .ok_or_else(|| corrupt("Fixed row size overflow"))?;
                     for row in range.clone() {
                         let start = row
@@ -403,8 +403,10 @@ impl DecodePageTask for ListStructureTask {
             .iter()
             .flat_map(|r| r.rep.iter().copied())
             .collect::<Vec<_>>();
-        // Pages written before #9018 can have nullable layers but a NIL control word. Such a
-        // page stores no def levels, so read every item as valid, as the value path does.
+        // A NIL page stores no def levels even when its layers are nullable: the writer picks
+        // NIL when every rep and def level of a page is zero (no nulls and no list layers), and
+        // writers before #9018 also padded such pages. Read every item as valid, as the value
+        // path does.
         let has_defs = !matches!(self.details.ctrl_word_parser, ControlWordParser::NIL)
             && self
                 .details

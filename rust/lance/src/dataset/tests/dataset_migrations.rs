@@ -832,11 +832,16 @@ async fn test_v10_0_0_dictionary_merged_past_key_type() {
 /// Lance 11.0.0 wrote a zero control-word byte before each value of the second file's
 /// full-zip pages while their layouts record no control-word bits. The binary column
 /// could not be read and the vector column read back shifted by one byte per value.
+/// A batch size of 3 rows reads each padded page in two parts.
 #[rstest]
-#[case::scan(None)]
-#[case::take(Some(vec![2, 5, 7]))]
+#[case::scan(None, None)]
+#[case::scan_small_batches(None, Some(3))]
+#[case::take(Some(vec![2, 5, 7]), None)]
 #[tokio::test]
-async fn test_v11_0_0_fullzip_padded_control_words(#[case] rows: Option<Vec<u64>>) {
+async fn test_v11_0_0_fullzip_padded_control_words(
+    #[case] rows: Option<Vec<u64>>,
+    #[case] batch_size: Option<usize>,
+) {
     let test_dir = copy_test_data_to_tmp("v11.0.0/fullzip_padded_control_words.lance").unwrap();
     let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
@@ -846,10 +851,13 @@ async fn test_v11_0_0_fullzip_padded_control_words(#[case] rows: Option<Vec<u64>
             let schema = Arc::new(dataset.schema().clone());
             (dataset.take(&rows, schema).await.unwrap(), rows)
         }
-        None => (
-            dataset.scan().try_into_batch().await.unwrap(),
-            (0..8).collect(),
-        ),
+        None => {
+            let mut scan = dataset.scan();
+            if let Some(batch_size) = batch_size {
+                scan.batch_size(batch_size);
+            }
+            (scan.try_into_batch().await.unwrap(), (0..8).collect())
+        }
     };
     assert_eq!(batch.num_rows(), rows.len());
     let binary = batch["binary"].as_fixed_size_list();
