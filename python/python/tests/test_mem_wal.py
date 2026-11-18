@@ -4,8 +4,10 @@ import math
 import os
 import time
 import uuid
+import weakref
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pytest
 from lance.mem_wal import (
@@ -369,10 +371,8 @@ def test_shard_writer_reader_byte_limit(tmp_path, operation, max_bytes):
 
 @pytest.mark.parametrize("operation", ["put", "delete"])
 @pytest.mark.parametrize("slice_kind", ["array", "buffer", "dictionary", "nested"])
-@pytest.mark.parametrize("max_bytes", [64 * 1024, 2 * 128 * 1024 + 16 * 1024])
-def test_shard_writer_reader_retained_parent_limit(
-    tmp_path, operation, slice_kind, max_bytes
-):
+def test_shard_writer_reader_retained_parent_limit(tmp_path, operation, slice_kind):
+    max_bytes = 64 * 1024
     dictionary_type = pa.dictionary(pa.int8(), pa.string())
     name_type = {
         "array": pa.string(),
@@ -422,15 +422,95 @@ def test_shard_writer_reader_retained_parent_limit(
 
     reader = pa.RecordBatchReader.from_batches(schema, batches())
     with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
-        with pytest.raises((OSError, ValueError)) as error:
+        with pytest.raises(ValueError, match="reader exhausted"):
             getattr(writer, operation)(reader, max_bytes=max_bytes)
-        # A tiny visible slice must still charge its complete retained parent.
+        # The owned copies must release the complete parents of tiny slices.
         # Allow overlap between the producer's previous and incoming batches.
         assert peak_bytes <= max_bytes + 2 * parent_bytes + 4096
-        assert isinstance(error.value, OSError)
-        assert f"exceeds max_bytes={max_bytes}" in str(error.value)
-        assert generated == (1 if max_bytes < parent_bytes else 3)
+        assert generated == 12
         assert writer.stats()["put_count"] == 0
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize(
+    "layout", ["key", "primitive", "validity", "dictionary", "nested"]
+)
+@pytest.mark.parametrize("reader_error", [False, True])
+def test_shard_writer_reader_foreign_owners(tmp_path, operation, layout, reader_error):
+    name_type = {
+        "key": pa.string(),
+        "primitive": pa.int64(),
+        "validity": pa.int64(),
+        "dictionary": pa.dictionary(pa.int8(), pa.int64()),
+        "nested": pa.struct([("value", pa.dictionary(pa.int8(), pa.int64()))]),
+    }[layout]
+    schema = pa.schema([_LOOKUP_SCHEMA.field("id"), pa.field("name", name_type)])
+    base_name = "base" if layout == "key" else {"value": 0} if layout == "nested" else 0
+    base = pa.table({"id": [0], "name": [base_name]}, schema=schema)
+    ds = lance.write_dataset(base, tmp_path / "base")
+    ds.initialize_mem_wal()
+    owner_bytes = 128 * 1024
+    owners = []
+    expected = base.to_pylist()
+    peak_bytes = 0
+
+    def batches():
+        nonlocal peak_bytes
+        for i in range(12):
+            parent = np.arange(owner_bytes // 8, dtype=np.int64)
+            owners.append(weakref.ref(parent))
+            # A nonzero view offset also checks that copying preserves values.
+            values = pa.array(parent[1:4])
+            ids = pa.array([3 * i + 1, 3 * i + 2, 3 * i + 3], pa.int64())
+            if layout == "key":
+                parent[1:4] = [3 * i + 1, 3 * i + 2, 3 * i + 3]
+                ids, values = values, pa.array(["small"] * 3)
+            elif layout == "validity":
+                parent = np.full(owner_bytes, 0b00000101, dtype=np.uint8)
+                owners.append(weakref.ref(parent))
+                values = pa.Array.from_buffers(
+                    pa.int64(), 3, [pa.py_buffer(parent[:1]), values.buffers()[1]]
+                )
+            elif layout in ("dictionary", "nested"):
+                values = pa.DictionaryArray.from_arrays(
+                    pa.array([1, 0, 2], pa.int8()), values
+                )
+                if layout == "nested":
+                    values = pa.StructArray.from_arrays([values], names=["value"])
+            batch = pa.record_batch([ids, values], schema=schema)
+            del parent
+            expected.extend(batch.to_pylist())
+            # Weak references observe foreign allocations without retaining them.
+            peak_bytes = max(
+                peak_bytes,
+                sum(
+                    owner.nbytes
+                    for ref in owners
+                    for owner in [ref()]
+                    if owner is not None
+                ),
+            )
+            yield batch
+        if reader_error:
+            raise ValueError("reader failed")
+
+    reader = pa.RecordBatchReader.from_batches(schema, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        if reader_error:
+            with pytest.raises(ValueError, match="reader failed"):
+                getattr(writer, operation)(reader, max_bytes=64 * 1024)
+            assert writer.stats()["put_count"] == 0
+        else:
+            getattr(writer, operation)(reader, max_bytes=64 * 1024)
+        # Allow previous/incoming producer overlap, including validity owners.
+        incoming_bytes = owner_bytes * (2 if layout == "validity" else 1)
+        assert peak_bytes <= 64 * 1024 + 2 * incoming_bytes + 4096
+        assert all(ref() is None for ref in owners)
+        actual = writer.lsm_scanner().to_table().to_pylist()
+        expected = (
+            expected if operation == "put" and not reader_error else base.to_pylist()
+        )
+        assert sorted(actual, key=lambda row: row["id"]) == expected
 
 
 @pytest.mark.parametrize("operation", ["put", "delete"])
