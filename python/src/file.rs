@@ -769,6 +769,32 @@ impl LanceFileSession {
         })?
     }
 
+    /// Return the size in bytes of a file in the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// the other session methods. This issues a single metadata (HEAD) request
+    /// and reads no data. A missing object raises `OSError`, consistent with
+    /// `read_range` and `download_file`.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path`.
+    ///
+    /// Returns
+    /// -------
+    /// int
+    ///     The object size in bytes.
+    pub fn size(&self, path: String) -> PyResult<u64> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            self.object_store
+                .size(&full_path)
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to get remote file size: {}", e)))
+        })?
+    }
+
     /// Read a byte range from a file in the object store.
     ///
     /// The path is interpreted relative to the session's `base_path`, matching
