@@ -1643,6 +1643,53 @@ async fn build_config_for_attempt(
     Ok(config)
 }
 
+/// `error`, which applying `staged` to the latest version, `latest`, raised,
+/// as the commit reports it.
+///
+/// An action set that fails to apply on the latest version after it applied
+/// on its own read version failed because of what committed in between: a
+/// fragment or field it names is gone, or a name it adds is now taken. That
+/// is a conflict to retry, not invalid input. A set that fails on its read
+/// version too was malformed to begin with, and keeps its error.
+async fn classify_failed_apply(
+    error: Error,
+    read: &Dataset,
+    staged: &Transaction,
+    build_config: &lance_table::format::ManifestBuildConfig,
+    transaction_file: &str,
+    read_version_state: Option<crate::dataset::transaction::ReadVersionState<'_>>,
+    latest: u64,
+) -> Error {
+    if !matches!(staged.operation, Operation::CompositeOperation(_)) {
+        return error;
+    }
+    let Ok(prepared) = prepare_attempt(read, staged, build_config, FragReuseUpdate::None).await
+    else {
+        return error;
+    };
+    let applies_at_read_version = staged
+        .build_manifest_prepared(
+            Some(read.manifest.as_ref()),
+            prepared,
+            transaction_file,
+            build_config,
+            read_version_state,
+        )
+        .is_ok();
+    if !applies_at_read_version {
+        return error;
+    }
+    Error::retryable_commit_conflict_source(
+        latest,
+        format!(
+            "this action set applies to the version it read, {}, but not to the latest, \
+             {latest}: {error}",
+            read.manifest.version
+        )
+        .into(),
+    )
+}
+
 /// What an action-based transaction's attempt supplies for the fragment reuse
 /// history: the history itself when it lives in an external file, which
 /// applying the actions cannot read, and this build's notion of a usable
@@ -1870,6 +1917,7 @@ pub(crate) async fn commit_transaction(
         indices: read_version_indices.as_slice(),
     });
 
+    let staged_transaction = transaction;
     let mut transaction = transaction.clone();
     // What a rewrite on a tagged fragment reuse history assembled for the
     // attempt; handed to the manifest build, never written back into
@@ -2052,13 +2100,35 @@ pub(crate) async fn commit_transaction(
                 let prepared =
                     prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
                         .await?;
-                let (mut manifest, mut indices) = attempt_transaction.build_manifest_prepared(
+                let built = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &build_config,
                     read_version_state,
-                )?;
+                );
+                // Boxed whole, the failed build's error included, so nothing
+                // it holds sits in the commit future across the await.
+                let built = match built {
+                    Err(error)
+                        if matches!(error, Error::InvalidInput { .. })
+                            && dataset.manifest.version
+                                != read_version_dataset.manifest.version =>
+                    {
+                        Err(Box::pin(classify_failed_apply(
+                            error,
+                            &read_version_dataset,
+                            staged_transaction,
+                            &build_config,
+                            transaction_file,
+                            read_version_state,
+                            dataset.manifest.version,
+                        ))
+                        .await)
+                    }
+                    built => built,
+                };
+                let (mut manifest, mut indices) = built?;
                 finish_built_manifest(&dataset, &attempt_transaction, &mut manifest, &mut indices)
                     .await?;
                 (manifest, indices)
@@ -2369,6 +2439,78 @@ mod tests {
     #[case::nan(Some("NaN"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
     fn test_parse_commit_retry_timeout(#[case] raw: Option<&str>, #[case] expected: Duration) {
         assert_eq!(parse_commit_retry_timeout(raw), expected);
+    }
+
+    /// A failure to apply an action set at the latest version is classified
+    /// by re-applying it at its read version: if it applies there, what
+    /// committed in between broke it and the commit may retry; if not, the
+    /// set was malformed and keeps its original error.
+    #[rstest::rstest]
+    #[case::applies_at_read_version(0, true)]
+    #[case::fails_at_read_version_too(99, false)]
+    #[tokio::test]
+    async fn test_failed_apply_is_retryable_only_if_it_applies_at_read_version(
+        #[case] tombstoned_fragment: u64,
+        #[case] retryable: bool,
+    ) {
+        use lance_table::transaction::action::{
+            Action, CompositeOperation, FieldRef, Ref, TombstoneFieldData, UserStep,
+        };
+
+        let read = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        let staged = Transaction::new_from_version(
+            read.manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step",
+                vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(tombstoned_fragment),
+                    vec![FieldRef::Committed(0)],
+                ))],
+            )])),
+        );
+        let build_config =
+            build_config_for_attempt(&read, &staged, &ManifestWriteConfig::default())
+                .await
+                .unwrap();
+        let indices = load_all_indices(&read).await.unwrap();
+        let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
+            manifest: read.manifest.as_ref(),
+            indices: indices.as_slice(),
+        });
+        let latest = read.manifest.version + 1;
+
+        let classified = classify_failed_apply(
+            Error::invalid_input("fragment 0 is gone at the latest version"),
+            &read,
+            &staged,
+            &build_config,
+            "transaction_file",
+            read_version_state,
+            latest,
+        )
+        .await;
+
+        if retryable {
+            assert!(
+                matches!(classified, Error::RetryableCommitConflict { version, .. } if version == latest),
+                "{classified:?}"
+            );
+        } else {
+            assert!(
+                matches!(classified, Error::InvalidInput { .. }),
+                "{classified:?}"
+            );
+            assert!(
+                classified
+                    .to_string()
+                    .contains("fragment 0 is gone at the latest version"),
+                "{classified}"
+            );
+        }
     }
 
     #[tokio::test]
