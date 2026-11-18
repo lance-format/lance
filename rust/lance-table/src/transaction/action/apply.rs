@@ -33,18 +33,24 @@ use crate::format::{
     BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
 };
 use crate::rowids::read_row_ids;
-use crate::rowids::version::build_version_meta;
+use crate::rowids::version::{SpilledRowLineage, build_version_meta};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::frag_reuse::FragReuseActionInputs;
 use crate::system_index::is_system_index;
-use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
+use crate::system_index::mem_wal::{
+    CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
+};
 use crate::transaction::manifest_build::{apply_range_segments, check_blob_nesting};
 use crate::transaction::validate::schema_fragments_valid;
-use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
+use crate::transaction::{FragReuseUpdate, LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
+
+mod frag_reuse_history;
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -61,6 +67,7 @@ impl Transaction {
     /// action set is a delta, so there is nothing for it to be a delta against
     /// when the dataset does not exist yet. The caller turns the absent case
     /// into an error, which is where the `Option` it holds actually lives.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::transaction) fn build_manifest_from_actions(
         &self,
         composite_operation: &CompositeOperation,
@@ -69,6 +76,7 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
+        frag_reuse: &FragReuseUpdate,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         // No `migration_next_row_id` escape, unlike the legacy guard in
         // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
@@ -117,6 +125,9 @@ impl Transaction {
             self.read_version,
             ReadMarks::of(read_manifest),
         );
+        if let FragReuseUpdate::Actions(inputs) = frag_reuse {
+            state.frag_reuse_inputs = inputs.clone();
+        }
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
@@ -201,6 +212,10 @@ pub(super) struct ApplyState<'a> {
     /// Ids of the fragments this operation added, whether minted from the
     /// counter or claimed out of a reservation.
     new_fragments: HashSet<u64>,
+    /// The new fragments an [`AddFragment`](super::AddFragment) added with
+    /// `data_change = false`: rows moved from elsewhere in the table, whose
+    /// values no action in the operation may change.
+    rearranged_fragments: HashSet<u64>,
 
     /// How many fragment ids this operation reserved for a later writer. Like
     /// [`Self::reserved_row_ids`], taken off the counter after this
@@ -222,8 +237,27 @@ pub(super) struct ApplyState<'a> {
     tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
 
     /// Committed fragments whose values a data-changing action changed in
-    /// place, which on a stable row id table leaves their row versions stale.
+    /// place, which on a stable row id table leaves their row versions stale,
+    /// and the committed fragments a
+    /// [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)
+    /// restamped, wholly or in part. Every value-changed fragment has to be
+    /// restamped.
     value_changed_fragments: BTreeSet<u64>,
+    restamped_fragments: BTreeSet<u64>,
+
+    /// Fragments a [`RemoveFragment`](super::RemoveFragment) removed: a
+    /// fragment reuse transition may only consume a fragment a compaction
+    /// removed as it was committed.
+    removed_fragments: HashMap<u64, RemovedFragment>,
+    /// Committed fields whose values a data-changing tombstone replaced, by
+    /// fragment. On a tagged fragment reuse history the coverage of segments
+    /// translating into the fragment is withdrawn along the lineage.
+    rebound_fields: Vec<(u64, Vec<u32>)>,
+    /// What the operation asks of the fragment reuse history, settled once
+    /// the whole operation has run.
+    frag_reuse: frag_reuse_history::FragReuseChanges,
+    /// What the commit attempt supplied for the history.
+    frag_reuse_inputs: Arc<FragReuseActionInputs>,
 
     /// The version the transaction was built against. Not the current
     /// manifest's version: on a retry the set is replayed onto something newer,
@@ -237,6 +271,15 @@ struct TombstonedField {
     data_change: bool,
     /// Whether an [`AddDataFile`](super::AddDataFile) has bound it again.
     rebound: bool,
+}
+
+/// A fragment a [`RemoveFragment`](super::RemoveFragment) removed.
+#[derive(Debug, Clone, Copy)]
+struct RemovedFragment {
+    data_change: bool,
+    /// Whether an earlier action in the operation changed it from the
+    /// committed fragment.
+    modified: bool,
 }
 
 impl<'a> ApplyState<'a> {
@@ -266,11 +309,17 @@ impl<'a> ApplyState<'a> {
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
             new_fragments: HashSet::new(),
+            rearranged_fragments: HashSet::new(),
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
             touched_index_names: BTreeSet::new(),
             tombstoned_fields: HashMap::new(),
             value_changed_fragments: BTreeSet::new(),
+            restamped_fragments: BTreeSet::new(),
+            removed_fragments: HashMap::new(),
+            rebound_fields: Vec::new(),
+            frag_reuse: Default::default(),
+            frag_reuse_inputs: Default::default(),
         }
     }
 
@@ -289,6 +338,7 @@ impl<'a> ApplyState<'a> {
         self.check_spilled_lineage_is_bound()?;
         self.check_reencodes_are_rebound()?;
         self.check_value_changes_are_restamped()?;
+        let publishes_frag_reuse = self.finish_frag_reuse_history()?;
 
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
@@ -359,6 +409,9 @@ impl<'a> ApplyState<'a> {
         }
         inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         apply_index_object_metadata_flag(&mut manifest, &indices);
+        if publishes_frag_reuse {
+            frag_reuse_history::set_feature_flags(&mut manifest, &indices);
+        }
 
         for base in new_bases {
             manifest.base_paths.insert(base.id, base);
@@ -424,6 +477,14 @@ impl<'a> ApplyState<'a> {
         self.read_version
     }
 
+    /// The version this delta produces, for the actions that stamp it into what
+    /// they write. Distinct from [`Self::read_version`]: a retry against a newer
+    /// manifest re-runs the apply, so anything stamped with this is re-stamped
+    /// rather than carried over.
+    pub(super) fn new_version(&self) -> u64 {
+        self.current_manifest.version + 1
+    }
+
     /// Add an index segment. A segment's uuid identifies it, so re-adding one
     /// that is already there is a mistake rather than a replacement -- swapping
     /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)
@@ -465,6 +526,17 @@ impl<'a> ApplyState<'a> {
         Ok(())
     }
 
+    /// Record MemWAL SSTable compaction progress against the table's existing
+    /// MemWAL index, which has to already be there -- progress against an index
+    /// no one built is rejected rather than inventing the metadata.
+    pub(super) fn update_compacted_sstables(
+        &mut self,
+        compacted_sstables: Vec<CompactedSsTable>,
+    ) -> Result<()> {
+        let new_version = self.new_version();
+        update_mem_wal_index_compacted_sstables(&mut self.indices, new_version, compacted_sstables)
+    }
+
     /// Where the segment `uuid` lives, checking on the way that it really
     /// belongs to `name`. A mismatch means the operation was planned against a
     /// different set of segments, the same way a missing segment does.
@@ -494,6 +566,12 @@ impl<'a> ApplyState<'a> {
         };
         self.touched_index_names.insert(name.to_string());
         Ok(&mut self.indices[position])
+    }
+
+    /// Row lineage the caller read ahead of time for fragments whose lineage
+    /// lives in a data file, which applying cannot read itself.
+    pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
+        &self.build_config.spilled_row_lineage
     }
 
     pub(super) fn schema(&self) -> &Schema {
@@ -577,16 +655,34 @@ impl<'a> ApplyState<'a> {
 
     /// Drop a fragment and forget everything recorded about it. `false` if no
     /// such fragment was present.
-    pub(super) fn remove_fragment(&mut self, fragment_id: u64) -> bool {
-        let before = self.fragments.len();
-        self.fragments.retain(|fragment| fragment.id != fragment_id);
-        if self.fragments.len() == before {
+    pub(super) fn remove_fragment(&mut self, fragment_id: u64, data_change: bool) -> bool {
+        let Some(position) = self
+            .fragments
+            .iter()
+            .position(|fragment| fragment.id == fragment_id)
+        else {
             return false;
-        }
+        };
+        let removed = self.fragments.remove(position);
+        let modified = self
+            .current_manifest
+            .fragments
+            .iter()
+            .find(|fragment| fragment.id == fragment_id)
+            .is_some_and(|committed| *committed != removed);
+        self.removed_fragments.insert(
+            fragment_id,
+            RemovedFragment {
+                data_change,
+                modified,
+            },
+        );
         self.new_fragments.remove(&fragment_id);
+        self.rearranged_fragments.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
         self.value_changed_fragments.remove(&fragment_id);
+        self.restamped_fragments.remove(&fragment_id);
         true
     }
 
@@ -599,8 +695,10 @@ impl<'a> ApplyState<'a> {
         self.fragments.clear();
         self.indices.clear();
         self.new_fragments.clear();
+        self.rearranged_fragments.clear();
         self.tombstoned_fields.clear();
         self.value_changed_fragments.clear();
+        self.restamped_fragments.clear();
     }
 
     /// The base paths this apply can see: the current manifest's, plus the ones
@@ -824,6 +922,47 @@ impl<'a> ApplyState<'a> {
         self.new_fragments.contains(&fragment_id)
     }
 
+    pub(super) fn note_rearranged(&mut self, fragment_id: u64) {
+        self.rearranged_fragments.insert(fragment_id);
+    }
+
+    /// Whether `fragment_id` is one this operation added with
+    /// `data_change = false`.
+    pub(super) fn is_rearranged(&self, fragment_id: u64) -> bool {
+        self.rearranged_fragments.contains(&fragment_id)
+    }
+
+    /// Refuse a write that changes the values of a fragment this operation
+    /// added with `data_change = false`.
+    ///
+    /// Such a fragment's rows were already in the table: they keep their row
+    /// versions, and the footprint records no inserted rows and no write to a
+    /// committed fragment. A value change in the same operation would hide
+    /// behind all three -- an incremental reader would miss the changed rows,
+    /// a concurrent key assertion would not see a changed key, and an index
+    /// carried onto the fragment through the fragment reuse history would
+    /// answer from the old values.
+    pub(super) fn reject_data_change_to_rearranged(
+        &self,
+        fragment_id: u64,
+        action: &str,
+    ) -> Result<()> {
+        if !self.is_rearranged(fragment_id) {
+            return Ok(());
+        }
+        Err(Error::invalid_input(format!(
+            "{action} changes the values of fragment {fragment_id}, which this operation adds \
+             with data_change = false; a fragment that only moves rows cannot also change \
+             them, so add it with data_change = true, or change the rows in a later operation"
+        )))
+    }
+
+    /// Record that a [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)
+    /// restamped some or all of this fragment's rows.
+    pub(super) fn note_restamp(&mut self, fragment_id: u64) {
+        self.restamped_fragments.insert(fragment_id);
+    }
+
     /// Record that these fields' data in this fragment no longer matches what
     /// an index built over them recorded.
     ///
@@ -836,6 +975,13 @@ impl<'a> ApplyState<'a> {
         fields: impl IntoIterator<Item = i32>,
     ) -> Result<()> {
         let fields: Vec<i32> = fields.into_iter().collect();
+        self.rebound_fields.push((
+            fragment_id,
+            fields
+                .iter()
+                .filter_map(|field| u32::try_from(*field).ok())
+                .collect(),
+        ));
         prune_rebound_fields_from_indices(
             &mut self.indices,
             fragment_id,
@@ -921,24 +1067,32 @@ impl<'a> ApplyState<'a> {
     /// On a stable row id table, `get_updated_rows()` reads which rows changed
     /// from `last_updated_at_version_meta`. Apply cannot infer which rows of a
     /// committed fragment a data file or tombstone changed (a column rewrite
-    /// writes the whole fragment but may change only some rows), and no
-    /// action yet lets the writer say, so such a change is refused rather
-    /// than published with stale row versions.
+    /// writes the whole fragment but may change only some rows), so the
+    /// writer has to say with a
+    /// [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata), or the
+    /// change would publish with stale row versions. Checked once every action
+    /// has been seen, because the refresh may come before or after the change.
+    ///
+    /// Any selection of the fragment's rows satisfies it, down to one row:
+    /// which rows changed is exactly what the files cannot say, so the
+    /// writer's selection is taken as given.
     fn check_value_changes_are_restamped(&self) -> Result<()> {
-        if !self.uses_stable_row_ids() || self.value_changed_fragments.is_empty() {
+        if !self.uses_stable_row_ids() {
             return Ok(());
         }
-        let changed = self
+        let unrestamped = self
             .value_changed_fragments
-            .iter()
+            .difference(&self.restamped_fragments)
             .map(|fragment| format!("fragment {fragment}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        if unrestamped.is_empty() {
+            return Ok(());
+        }
+        let unrestamped = unrestamped.join(", ");
         Err(Error::invalid_input(format!(
             "the table has stable row ids, and the operation changes values in place in \
-             committed {changed}, which would leave last_updated_at_version_meta stale; an \
-             action-based transaction cannot yet restamp row versions, so write such a change \
-             with a named operation"
+             committed {unrestamped}, which would leave last_updated_at_version_meta stale; add \
+             a RefreshRowVersionMetadata covering the changed rows of {unrestamped}"
         )))
     }
 
@@ -1393,6 +1547,7 @@ mod tests {
         MANAGED_BLOBS_META_KEY,
     };
     use crate::format::DataFile;
+    use crate::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
     use crate::rowids::write_row_ids;
     use crate::system_index::mem_wal::{
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
@@ -1400,7 +1555,8 @@ mod tests {
     };
     use crate::transaction::action::test_support::{
         added_field, any_deletion_file, apply, apply_after_reading, apply_with_indices,
-        backed_manifest, manifest_with_base, mint_base, one_column_file, replace_field_data,
+        backed_manifest, last_updated_versions, manifest_with_base, mint_base, one_column_file,
+        refresh, refresh_rows, replace_field_data,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
@@ -2619,12 +2775,28 @@ mod tests {
         assert!(!read_row_ids(data).unwrap().range_runs_span_a_gap());
     }
 
-    /// Fragment 0 of a stable row id table, backed by a file for a nullable
-    /// field 0, so its data can be tombstoned without a replacement.
+    /// Fragments 0 and 1 of a stable row id table, each backed by a file for a
+    /// nullable field 0, so its data can be tombstoned without a replacement.
+    /// Every row was last updated at version 2.
     fn stable_row_id_backed_manifest() -> Manifest {
-        let mut fragment = backed_manifest().fragments[0].clone();
-        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&(0..10).into()).into()));
-        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        let fragments = (0..2u64)
+            .map(|id| {
+                let mut fragment = backed_manifest().fragments[0].clone();
+                fragment.id = id;
+                fragment.files[0].path = format!("data/{id}.lance");
+                fragment.row_id_meta = Some(RowIdMeta::Inline(
+                    write_row_ids(&(id * 10..id * 10 + 10).into()).into(),
+                ));
+                fragment.last_updated_at_version_meta = Some(
+                    RowDatasetVersionMeta::from_sequence(
+                        &RowDatasetVersionSequence::from_uniform_row_count(10, 2),
+                    )
+                    .unwrap(),
+                );
+                fragment
+            })
+            .collect();
+        let mut manifest = make_stable_row_id_manifest(fragments);
         manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
         manifest
     }
@@ -2647,80 +2819,104 @@ mod tests {
         })
     }
 
-    /// `get_updated_rows()` reads `last_updated_at_version_meta`, which only a
-    /// restamp of the changed rows keeps current. Apply cannot tell which rows
-    /// a file for an existing fragment changed, so until an action can say so,
-    /// a value change to a committed fragment of a stable row id table is
-    /// refused. Moving values, writing new fragments, and deleting rows leave
-    /// no row's value changed in place.
-    #[rstest]
-    #[case::new_column_in_a_committed_fragment(
+    fn new_column() -> Vec<Action> {
         vec![
             mint_field(0, "added", None),
             write_data(Ref::Committed(0), FieldRef::Local(0)),
-        ],
-        Some("fragment 0")
-    )]
-    #[case::column_dropped_out_of_a_committed_fragment(
-        vec![tombstone_field_zero(true)],
-        Some("fragment 0")
-    )]
-    #[case::column_rewritten_in_a_committed_fragment(
-        vec![tombstone_field_zero(true), reencode_field_zero(true)],
-        Some("fragment 0")
-    )]
-    #[case::reencode_of_a_committed_fragment(
-        vec![tombstone_field_zero(false), reencode_field_zero(false)],
-        None
-    )]
-    #[case::new_fragment(
-        vec![mint_fragment(0), write_data(Ref::Local(0), FieldRef::Committed(0))],
-        None
-    )]
-    #[case::deletion_in_a_committed_fragment(
-        vec![Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: any_deletion_file(),
-            data_change: true,
-            base: None,
-        })],
-        None
-    )]
-    #[case::changed_fragment_removed_afterwards(
-        vec![
-            tombstone_field_zero(true),
-            Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(0),
-                data_change: true,
-            }),
-        ],
-        None
-    )]
-    fn test_a_value_change_to_a_committed_fragment_needs_a_row_version_restamp(
-        #[case] actions: Vec<Action>,
-        #[case] expected_error: Option<&str>,
-    ) {
-        let result = apply(&stable_row_id_backed_manifest(), actions.clone());
+        ]
+    }
 
-        match expected_error {
-            None => {
-                result.unwrap();
+    fn dropped_column() -> Vec<Action> {
+        vec![tombstone_field_zero(true)]
+    }
+
+    fn rewritten_column() -> Vec<Action> {
+        vec![tombstone_field_zero(true), reencode_field_zero(true)]
+    }
+
+    /// `get_updated_rows()` reads `last_updated_at_version_meta`, which only a
+    /// restamp of the changed rows keeps current. Apply cannot tell which rows
+    /// a file for an existing fragment changed, so a value change to a
+    /// committed fragment of a stable row id table needs a
+    /// `RefreshRowVersionMetadata` covering that fragment, before or after the
+    /// change. The writer's selection is taken as given, down to one row.
+    #[rstest]
+    #[case::not_restamped(vec![], vec![], None)]
+    #[case::restamped_whole(vec![], vec![refresh(&[0])], Some(&[true; 10][..]))]
+    #[case::restamped_rows(
+        vec![],
+        vec![refresh_rows(0, &[1, 3])],
+        Some(&[false, true, false, true, false, false, false, false, false, false][..])
+    )]
+    #[case::restamped_before_the_change(vec![refresh(&[0])], vec![], Some(&[true; 10][..]))]
+    #[case::other_fragment_restamped(vec![], vec![refresh(&[1])], None)]
+    fn test_a_value_change_to_a_committed_fragment_needs_a_row_version_restamp(
+        #[values(new_column, dropped_column, rewritten_column)] change: fn() -> Vec<Action>,
+        #[case] before: Vec<Action>,
+        #[case] after: Vec<Action>,
+        #[case] restamped_rows: Option<&[bool]>,
+    ) {
+        let manifest = stable_row_id_backed_manifest();
+        let actions = [before, change(), after].concat();
+
+        let result = apply(&manifest, actions);
+
+        match restamped_rows {
+            Some(restamped_rows) => {
+                let next = result.unwrap();
+                let expected: Vec<u64> = restamped_rows
+                    .iter()
+                    .map(|&restamped| if restamped { manifest.version + 1 } else { 2 })
+                    .collect();
+                assert_eq!(last_updated_versions(&next.fragments[0]), expected);
             }
-            Some(fragment) => {
+            None => {
                 let error = result.unwrap_err();
                 assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
                 let message = error.to_string();
-                assert!(message.contains(fragment), "{message}");
+                assert!(message.contains("fragment 0"), "{message}");
+                assert!(!message.contains("fragment 1"), "{message}");
                 assert!(
                     message.contains("last_updated_at_version_meta"),
                     "{message}"
                 );
+                assert!(message.contains("RefreshRowVersionMetadata"), "{message}");
                 // Without stable row ids there is no row version to keep.
                 let mut manifest = backed_manifest();
                 manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
-                apply(&manifest, actions).unwrap();
+                apply(&manifest, change()).unwrap();
             }
         }
+    }
+
+    /// Moving values, writing new fragments, and deleting rows leave no row's
+    /// value changed in place, so none of them needs a restamp.
+    #[rstest]
+    #[case::reencode_of_a_committed_fragment(vec![
+        tombstone_field_zero(false),
+        reencode_field_zero(false),
+    ])]
+    #[case::new_fragment(vec![
+        mint_fragment(0),
+        write_data(Ref::Local(0), FieldRef::Committed(0)),
+    ])]
+    #[case::deletion_in_a_committed_fragment(vec![Action::SetDeletionFile(SetDeletionFile {
+        fragment: 0,
+        deletion_file: any_deletion_file(),
+        data_change: true,
+        base: None,
+    })])]
+    #[case::changed_fragment_removed_afterwards(vec![
+        tombstone_field_zero(true),
+        Action::RemoveFragment(RemoveFragment {
+            fragment: Ref::Committed(0),
+            data_change: true,
+        }),
+    ])]
+    fn test_a_change_leaving_no_value_changed_in_place_needs_no_restamp(
+        #[case] actions: Vec<Action>,
+    ) {
+        apply(&stable_row_id_backed_manifest(), actions).unwrap();
     }
 
     /// The fragment reuse history is not an index on the action path: no
