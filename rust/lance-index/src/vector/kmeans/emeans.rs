@@ -69,14 +69,33 @@ const MAX_BATCH_TASKS: usize = 64;
 /// [`assign_batch`].
 const TASK_SUMS_MAX_BYTES: usize = 1024 * 1024;
 
+/// How many vectors each e-means mini-batch holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BatchSize {
+    /// The paper's batch law (Equation 7) times `scale`, rounded to the
+    /// nearest power of two and capped at the number of training vectors.
+    /// `scale` 1 is the law itself; it must be positive and finite. A scale
+    /// rather than a count suits hierarchical training, where nodes hold
+    /// different numbers of vectors.
+    Law { scale: f64 },
+    /// This many vectors, in `[1, n]` for `n` training vectors.
+    Fixed(usize),
+}
+
+impl Default for BatchSize {
+    fn default() -> Self {
+        Self::Law { scale: 1.0 }
+    }
+}
+
 /// Parameters of [`train_emeans`].
 #[derive(Debug, Clone)]
 pub struct EMeansParams {
     /// Passes over the training vectors. The paper reaches the loss of 25
     /// Lloyd iterations in about 2 epochs.
     pub epochs: u32,
-    /// Vectors per mini-batch. `None` uses the paper's batch law.
-    pub batch_size: Option<usize>,
+    /// Vectors per mini-batch. Defaults to the paper's batch law.
+    pub batch_size: BatchSize,
     /// Peak EMA step `alpha_0 = 1 - decay`, in `(0, 1]`. `None` uses the
     /// paper's step law.
     pub peak_step: Option<f64>,
@@ -92,7 +111,7 @@ impl Default for EMeansParams {
     fn default() -> Self {
         Self {
             epochs: 3,
-            batch_size: None,
+            batch_size: BatchSize::default(),
             peak_step: None,
             revival_threshold: 0.1,
             seed: None,
@@ -150,13 +169,18 @@ pub fn train_emeans(data: &FixedSizeListArray, k: usize, params: &EMeansParams) 
         )));
     }
     let batch_size = match params.batch_size {
-        Some(batch_size) if batch_size == 0 || batch_size > n => {
+        BatchSize::Fixed(batch_size) if batch_size == 0 || batch_size > n => {
             return Err(Error::invalid_input(format!(
                 "e-means: batch_size must be in [1, n={n}], got {batch_size}"
             )));
         }
-        Some(batch_size) => batch_size,
-        None => batch_size_law(n, k, params.epochs),
+        BatchSize::Fixed(batch_size) => batch_size,
+        BatchSize::Law { scale } if !(scale > 0.0 && scale.is_finite()) => {
+            return Err(Error::invalid_input(format!(
+                "e-means: the batch law scale must be positive and finite, got {scale}"
+            )));
+        }
+        BatchSize::Law { scale } => batch_size_law(n, k, params.epochs, scale),
     };
     let peak_step = match params.peak_step {
         Some(step) if !(step > 0.0 && step <= 1.0) => {
@@ -185,16 +209,19 @@ pub fn train_emeans(data: &FixedSizeListArray, k: usize, params: &EMeansParams) 
     }
 }
 
-/// The paper's batch law (Equation 7, Table 2), rounded to the nearest power
-/// of two and capped at `n`.
-fn batch_size_law(n: usize, k: usize, epochs: u32) -> usize {
+/// The paper's batch law (Equation 7, Table 2) times `scale`, rounded to the
+/// nearest power of two and capped at `n`.
+fn batch_size_law(n: usize, k: usize, epochs: u32, scale: f64) -> usize {
     let coefficient = if n > LARGE_DATASET_ROWS {
         0.0044
     } else {
         0.035
     };
-    let batch_size =
-        coefficient * (k as f64).powf(0.13) * (n as f64).powf(0.88) * f64::from(epochs).powf(0.81);
+    let batch_size = scale
+        * coefficient
+        * (k as f64).powf(0.13)
+        * (n as f64).powf(0.88)
+        * f64::from(epochs).powf(0.81);
     let rounded = 2f64.powi(batch_size.max(1.0).log2().round() as i32) as usize;
     rounded.min(n)
 }
@@ -624,7 +651,7 @@ mod tests {
         // batch missed; their centroids must not become 0 / 0.
         let data = blobs(4, 64, 4, 50.0);
         let params = EMeansParams {
-            batch_size: Some(data.len()),
+            batch_size: BatchSize::Fixed(data.len()),
             peak_step: Some(1.0),
             revival_threshold: 0.0,
             ..seeded()
@@ -644,8 +671,10 @@ mod tests {
     #[case::zero_k(0, EMeansParams::default())]
     #[case::k_above_n(1_000, EMeansParams::default())]
     #[case::zero_epochs(4, EMeansParams { epochs: 0, ..Default::default() })]
-    #[case::zero_batch(4, EMeansParams { batch_size: Some(0), ..Default::default() })]
-    #[case::batch_above_n(4, EMeansParams { batch_size: Some(1_000), ..Default::default() })]
+    #[case::zero_batch(4, EMeansParams { batch_size: BatchSize::Fixed(0), ..Default::default() })]
+    #[case::batch_above_n(4, EMeansParams { batch_size: BatchSize::Fixed(1_000), ..Default::default() })]
+    #[case::zero_batch_scale(4, EMeansParams { batch_size: BatchSize::Law { scale: 0.0 }, ..Default::default() })]
+    #[case::nan_batch_scale(4, EMeansParams { batch_size: BatchSize::Law { scale: f64::NAN }, ..Default::default() })]
     #[case::zero_step(4, EMeansParams { peak_step: Some(0.0), ..Default::default() })]
     #[case::step_above_one(4, EMeansParams { peak_step: Some(1.5), ..Default::default() })]
     #[case::nan_step(4, EMeansParams { peak_step: Some(f64::NAN), ..Default::default() })]
@@ -702,9 +731,18 @@ mod tests {
         #[case] k: usize,
         #[case] epochs: u32,
     ) {
-        let batch_size = batch_size_law(n, k, epochs);
+        let batch_size = batch_size_law(n, k, epochs, 1.0);
         assert!(batch_size <= n);
         assert!(batch_size.is_power_of_two() || batch_size == n);
+    }
+
+    #[test]
+    fn test_batch_size_law_scale_moves_by_powers_of_two() {
+        let law = batch_size_law(8_192, 16, 3, 1.0);
+        assert_eq!(batch_size_law(8_192, 16, 3, 4.0), 4 * law);
+        assert_eq!(batch_size_law(8_192, 16, 3, 0.25), law / 4);
+        // A scale that would overshoot the training vectors is capped there.
+        assert_eq!(batch_size_law(8_192, 16, 3, 1e6), 8_192);
     }
 
     #[test]

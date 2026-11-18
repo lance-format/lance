@@ -99,6 +99,11 @@ impl Work {
 pub struct Total {
     pub secs: f64,
     pub calls: u64,
+    /// Duration of the first call to complete. The root of the hierarchy
+    /// samples, trains and assigns before any other node starts, so for the
+    /// node phases this is the root's, which runs with the whole pool to
+    /// itself.
+    pub first_secs: f64,
 }
 
 /// Totals of every timer since the last [`reset`].
@@ -130,6 +135,8 @@ mod imp {
     }
 
     static THREADS: Mutex<Vec<Arc<Slots>>> = Mutex::new(Vec::new());
+    /// Nanoseconds of the first call of each slot to complete; 0 until then.
+    static FIRST: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 
     thread_local! {
         static LOCAL: OnceCell<Arc<Slots>> = const { OnceCell::new() };
@@ -157,6 +164,12 @@ mod imp {
     impl Drop for Timer {
         fn drop(&mut self) {
             let nanos = self.start.elapsed().as_nanos() as u64;
+            let _ = FIRST[self.slot].compare_exchange(
+                0,
+                nanos.max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             let is_work = self.slot >= Phase::ALL.len();
             with_slots(|slots| {
                 slots.nanos[self.slot].fetch_add(nanos, Ordering::Relaxed);
@@ -205,6 +218,7 @@ mod imp {
                 .iter()
                 .map(|t| t.calls[slot].load(Ordering::Relaxed))
                 .sum(),
+            first_secs: FIRST[slot].load(Ordering::Relaxed) as f64 * 1e-9,
         }
     }
 
@@ -225,6 +239,9 @@ mod imp {
     }
 
     pub fn reset() {
+        for first in &FIRST {
+            first.store(0, Ordering::Relaxed);
+        }
         for slots in THREADS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

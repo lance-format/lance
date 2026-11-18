@@ -5,6 +5,10 @@
 //! hierarchical k-means with e-means nodes on DINO10B-style `.bvecs` data
 //! (per row: a little-endian `u32` dimension, then one `u8` per component).
 //!
+//! With `--pca` and `--dim`, every vector is centered and projected onto its
+//! leading `dim` principal components (from `pca.py`) as it loads, which
+//! varies the dimension while keeping the data real.
+//!
 //! Trains through `train_kmeans` with the parameters Lance's IVF build uses
 //! (50 Lloyd iterations, balance factor 1, fan-out 16, `sample_rate * k`
 //! training rows), then reports as one JSON line:
@@ -39,7 +43,7 @@ use std::time::{Duration, Instant};
 use arrow_array::Float32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
-use lance_index::vector::kmeans::emeans::EMeansParams;
+use lance_index::vector::kmeans::emeans::{BatchSize, EMeansParams};
 use lance_index::vector::kmeans::profile;
 use lance_index::vector::kmeans::{
     HierarchicalNodeAlgorithm, KMeansAlgoFloat, KMeansParams, compute_partitions_with_dists,
@@ -48,6 +52,8 @@ use lance_index::vector::kmeans::{
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::l2::l2_distance_batch_into;
 use lance_linalg::kernels::argmin_value_float;
+use ndarray::linalg::general_mat_mul;
+use ndarray::{ArrayView2, ArrayViewMut2};
 use rayon::prelude::*;
 use serde_json::json;
 
@@ -62,6 +68,9 @@ struct Args {
     balance_factor: f32,
     node_algorithm: String,
     epochs: u32,
+    batch_scale: f64,
+    pca: Option<PathBuf>,
+    dim: Option<usize>,
     threads: usize,
     seed: u64,
     num_queries: usize,
@@ -83,6 +92,9 @@ fn parse_args() -> Args {
         balance_factor: 1.0,
         node_algorithm: "lloyd".to_string(),
         epochs: EMeansParams::default().epochs,
+        batch_scale: 1.0,
+        pca: None,
+        dim: None,
         threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         seed: 1,
         num_queries: 100_000,
@@ -107,6 +119,9 @@ fn parse_args() -> Args {
             "--balance-factor" => args.balance_factor = value.parse().unwrap(),
             "--node-algorithm" => args.node_algorithm = value.clone(),
             "--epochs" => args.epochs = value.parse().unwrap(),
+            "--batch-scale" => args.batch_scale = value.parse().unwrap(),
+            "--pca" => args.pca = Some(PathBuf::from(value)),
+            "--dim" => args.dim = Some(value.parse().unwrap()),
             "--threads" => args.threads = value.parse().unwrap(),
             "--seed" => args.seed = value.parse().unwrap(),
             "--num-queries" => args.num_queries = value.parse().unwrap(),
@@ -123,22 +138,109 @@ fn parse_args() -> Args {
     args
 }
 
-/// Read the first `rows` vectors of a `.bvecs` file as `f32`. Returns the
-/// values and the dimension.
-fn read_bvecs(path: &PathBuf, rows: usize) -> (Vec<f32>, usize) {
+/// Centering and projection onto the leading principal components.
+struct Projection {
+    /// Mean of the source vectors, `source_dim` values.
+    mean: Vec<f32>,
+    /// The leading `dim` principal components, one row of `source_dim` values
+    /// each, in decreasing order of variance.
+    components: Vec<f32>,
+    dim: usize,
+}
+
+impl Projection {
+    /// Read the leading `dim` components of a `pca.py` file: the mean, then
+    /// every component, all `source_dim` little-endian `f32` values long.
+    fn read(path: &PathBuf, source_dim: usize, dim: usize) -> Self {
+        let bytes = std::fs::read(path).unwrap();
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        assert_eq!(
+            values.len(),
+            (source_dim + 1) * source_dim,
+            "{path:?} does not hold a {source_dim}-dimensional PCA"
+        );
+        assert!(
+            dim <= source_dim,
+            "--dim {dim} exceeds the source dimension {source_dim}"
+        );
+        Self {
+            mean: values[..source_dim].to_vec(),
+            components: values[source_dim..source_dim * (dim + 1)].to_vec(),
+            dim,
+        }
+    }
+}
+
+/// Rows read and converted at a time.
+const READ_CHUNK_ROWS: usize = 65_536;
+/// Rows projected by one task: one GEMM of this many rows.
+const PROJECT_BLOCK_ROWS: usize = 256;
+
+/// Read the first `rows` vectors of a `.bvecs` file as `f32`, projected when
+/// `projection` is given. Returns the values and their dimension.
+fn read_bvecs(path: &PathBuf, rows: usize, projection: Option<&Projection>) -> (Vec<f32>, usize) {
     let mut file = BufReader::with_capacity(64 << 20, File::open(path).unwrap());
     let mut header = [0u8; 4];
     file.read_exact(&mut header).unwrap();
-    let dim = u32::from_le_bytes(header) as usize;
-    let mut values = Vec::with_capacity(rows * dim);
-    let mut row = vec![0u8; dim];
-    for i in 0..rows {
-        if i > 0 {
-            file.read_exact(&mut header).unwrap();
-            assert_eq!(u32::from_le_bytes(header) as usize, dim, "row {i} header");
+    let source_dim = u32::from_le_bytes(header) as usize;
+    file.seek_relative(-4).unwrap();
+    let dim = projection.map_or(source_dim, |p| p.dim);
+    let row_bytes = 4 + source_dim;
+    let mut values = vec![0f32; rows * dim];
+    let mut bytes = vec![0u8; READ_CHUNK_ROWS * row_bytes];
+    for (chunk_index, out) in values.chunks_mut(READ_CHUNK_ROWS * dim).enumerate() {
+        let chunk_rows = out.len() / dim;
+        let bytes = &mut bytes[..chunk_rows * row_bytes];
+        file.read_exact(bytes).unwrap();
+        for (i, row) in bytes.chunks_exact(row_bytes).enumerate() {
+            let header = u32::from_le_bytes(row[..4].try_into().unwrap()) as usize;
+            assert_eq!(
+                header,
+                source_dim,
+                "row {} header",
+                chunk_index * READ_CHUNK_ROWS + i
+            );
         }
-        file.read_exact(&mut row).unwrap();
-        values.extend(row.iter().map(|&b| f32::from(b)));
+        let bytes = &*bytes;
+        match projection {
+            None => out
+                .par_chunks_mut(source_dim)
+                .zip(bytes.par_chunks_exact(row_bytes))
+                .for_each(|(out, row)| {
+                    for (v, &b) in out.iter_mut().zip(&row[4..]) {
+                        *v = f32::from(b);
+                    }
+                }),
+            Some(projection) => out
+                .par_chunks_mut(PROJECT_BLOCK_ROWS * dim)
+                .zip(bytes.par_chunks(PROJECT_BLOCK_ROWS * row_bytes))
+                .for_each(|(out, block)| {
+                    let block_rows = out.len() / dim;
+                    let mut centered = Vec::with_capacity(block_rows * source_dim);
+                    for row in block.chunks_exact(row_bytes) {
+                        centered.extend(
+                            row[4..]
+                                .iter()
+                                .zip(&projection.mean)
+                                .map(|(&b, &m)| f32::from(b) - m),
+                        );
+                    }
+                    general_mat_mul(
+                        1.0,
+                        &ArrayView2::from_shape((block_rows, source_dim), &centered).unwrap(),
+                        &ArrayView2::from_shape((dim, source_dim), &projection.components)
+                            .unwrap()
+                            .t(),
+                        0.0,
+                        &mut ArrayViewMut2::from_shape((block_rows, dim), out).unwrap(),
+                    );
+                }),
+        }
     }
     (values, dim)
 }
@@ -246,14 +348,28 @@ fn ceiling_speedup(dim: usize) -> f64 {
 
 fn main() {
     let args = parse_args();
+    // The projection runs one GEMM per rayon task; keep matrixmultiply from
+    // handing each to its own small pool. Training is unaffected: e-means
+    // tiles stay below the size at which matrixmultiply threads at all.
+    // SAFETY: no other thread exists yet to read the environment.
+    unsafe { std::env::set_var("MATMUL_NUM_THREADS", "1") };
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build_global()
         .unwrap();
 
     let load_start = Instant::now();
-    let (base, dim) = read_bvecs(&args.base, args.rows);
-    let (queries, query_dim) = read_bvecs(&args.queries, args.num_queries);
+    let projection = args.pca.as_ref().map(|path| {
+        let mut header = [0u8; 4];
+        File::open(&args.base)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        let source_dim = u32::from_le_bytes(header) as usize;
+        Projection::read(path, source_dim, args.dim.unwrap_or(source_dim))
+    });
+    let (base, dim) = read_bvecs(&args.base, args.rows, projection.as_ref());
+    let (queries, query_dim) = read_bvecs(&args.queries, args.num_queries, projection.as_ref());
     assert_eq!(
         dim, query_dim,
         "query dimension differs from base dimension"
@@ -269,6 +385,9 @@ fn main() {
         "lloyd" => HierarchicalNodeAlgorithm::Lloyd,
         "emeans" => HierarchicalNodeAlgorithm::EMeans(EMeansParams {
             epochs: args.epochs,
+            batch_size: BatchSize::Law {
+                scale: args.batch_scale,
+            },
             ..Default::default()
         }),
         other => panic!("unknown --node-algorithm {other}"),
@@ -335,7 +454,7 @@ fn main() {
         .map(|(phase, total)| {
             (
                 phase.name().to_string(),
-                json!({ "secs": total.secs, "calls": total.calls }),
+                json!({ "secs": total.secs, "calls": total.calls, "first_secs": total.first_secs }),
             )
         })
         .collect();
@@ -345,7 +464,7 @@ fn main() {
         .map(|(work, total)| {
             (
                 work.name().to_string(),
-                json!({ "secs": total.secs, "calls": total.calls }),
+                json!({ "secs": total.secs, "calls": total.calls, "first_secs": total.first_secs }),
             )
         })
         .collect();
@@ -353,6 +472,8 @@ fn main() {
         "label": args.label,
         "node_algorithm": args.node_algorithm,
         "epochs": args.epochs,
+        "batch_scale": args.batch_scale,
+        "pca": args.pca.is_some(),
         "rows": args.rows,
         "k": args.k,
         "dim": dim,

@@ -67,3 +67,15 @@ seeds and thread counts. `analyze.py` writes `summary.md`, `headline.png`,
 
 DINO10B is described at <https://swannbessa.github.io/blog/dino10b/>; cite the
 e-means paper when using it.
+
+## Sweep
+
+`sweep.sh` runs both methods across dimensions (PCA of DINO10B, fitted with `pca.py`), e-means batch sizes and epochs, thread counts, and 33.5M vectors with k=131,072; `sweep_analyze.py` writes `summary.md` and figures into the sweep folder:
+
+```bash
+uv run benchmarks/emeans/pca.py --base ~/data/dino10b/base.bvecs --out ~/data/dino10b/pca.f32
+DATA=~/data/dino10b OUT=sweep ./benchmarks/emeans/sweep.sh
+uv run benchmarks/emeans/sweep_analyze.py --sweep sweep
+```
+
+The 33.5M runs need the first 33,554,432 rows of the chunk (34.5 GB).
