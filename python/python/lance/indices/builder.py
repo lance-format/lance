@@ -6,9 +6,9 @@ import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 
+from lance.dependencies import numpy as np
 from lance.indices.ivf import IvfModel
 from lance.indices.pq import PqModel
 

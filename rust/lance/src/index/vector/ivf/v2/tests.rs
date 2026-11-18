@@ -78,7 +78,7 @@ use lance_index::vector::quantizer::{Quantization, QuantizerMetadata};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::{
-    ApproxMode, DEFAULT_QUERY_PARALLELISM, Query,
+    ApproxMode, DEFAULT_QUERY_PARALLELISM, Query, RqGraphScoring,
     pq::storage::ProductQuantizationMetadata,
     sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
     storage::STORAGE_METADATA_KEY,
@@ -456,6 +456,78 @@ fn test_balanced_query_ranges(
     }
 }
 
+/// A cached state carries its quantizer from the moment it is exported or
+/// decoded, so the cache charges for it on admission and a later
+/// reconstruction neither rebuilds it nor grows the entry.
+#[tokio::test]
+async fn test_state_entry_carries_quantizer_before_admission() {
+    let (batch, schema) = make_seeded_vector_batch(PQ_MATRIX_NUM_ROWS);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+    ivf.max_iters = 2;
+    ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        ivf,
+        lightweight_pq_params_with_bits(8),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let uuid = dataset.load_indices_by_name("vector_idx").await.unwrap()[0].uuid;
+    let index = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+    let exported = index.to_state_entry();
+    let codec = lance_core::cache::CacheCodec::from_impl::<IvfStateEntryBox>();
+    let mut encoded = Vec::new();
+    codec
+        .serialize(
+            &(Arc::new(IvfStateEntryBox(exported.0.clone())) as lance_core::cache::CacheEntry),
+            &mut encoded,
+        )
+        .unwrap();
+    let decoded = codec
+        .deserialize(&bytes::Bytes::from(encoded))
+        .hit()
+        .unwrap()
+        .downcast::<IvfStateEntryBox>()
+        .unwrap();
+    for entry in [Arc::new(exported), decoded] {
+        // Without this the size check below would also hold for an entry that
+        // never got a quantizer.
+        assert!(entry.0.has_quantizer());
+        let charged = entry.deep_size_of();
+        entry
+            .0
+            .reconstruct(
+                dataset.object_store.clone(),
+                dataset.metadata_cache.as_ref(),
+                LanceCache::no_cache(),
+                None,
+                super::IvfOpenContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entry.deep_size_of(), charged);
+    }
+}
+
 #[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
@@ -482,6 +554,7 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
@@ -5420,6 +5493,7 @@ async fn test_score_partition_candidates_matches_accurate_native_search(
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: f32::NAN,
         approx_mode: ApproxMode::Fast,
+        rq_graph_scoring: Default::default(),
     };
     let (partition_ids, centroid_distances) = index.find_partitions(&query).unwrap();
     let partition_position = (0..partition_ids.len())
@@ -5629,6 +5703,7 @@ async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(#[cas
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Accurate,
+        rq_graph_scoring: Default::default(),
     };
     let scored = index
         .score_partition_candidates(0, &query, &[0, 1, 2, 3], &NoOpMetricsCollector)
@@ -5913,37 +5988,46 @@ async fn test_create_ivf_hnsw_rq(
     }
 }
 
+/// Searches with both [`RqGraphScoring`] modes, which must each use the index
+/// and recall the true neighbors.
 async fn assert_ivf_hnsw_rq_search(dataset: &Dataset, query: &dyn Array, nlist: usize) {
     const K: usize = 10;
 
-    let mut scan = dataset.scan();
-    scan.nearest("vector", query, K)
-        .unwrap()
-        .minimum_nprobes(nlist)
-        .maximum_nprobes(nlist);
-    scan.with_row_id();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(
-        plan.contains("ANNSubIndex"),
-        "IVF_HNSW_RQ scan should use the vector index, got:\n{plan}"
-    );
-
-    let result = scan.try_into_batch().await.unwrap();
-    assert_eq!(result.num_rows(), K);
-    let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
-    assert_eq!(
-        row_ids.iter().copied().collect::<HashSet<_>>().len(),
-        K,
-        "IVF_HNSW_RQ returned duplicate row ids"
-    );
-
     let ground_truth = ground_truth(dataset, "vector", query, K, DistanceType::L2).await;
-    let recall = row_ids
-        .iter()
-        .filter(|row_id| ground_truth.contains(row_id))
-        .count() as f32
-        / K as f32;
-    assert_ge!(recall, 0.8, "recall: {recall}, row_ids: {row_ids:?}");
+    for scoring in [RqGraphScoring::MultiBit, RqGraphScoring::OneBitRerank] {
+        let mut scan = dataset.scan();
+        scan.nearest("vector", query, K)
+            .unwrap()
+            .minimum_nprobes(nlist)
+            .maximum_nprobes(nlist)
+            .rq_graph_scoring(scoring);
+        scan.with_row_id();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "IVF_HNSW_RQ scan with {scoring:?} should use the vector index, got:\n{plan}"
+        );
+
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), K);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(
+            row_ids.iter().copied().collect::<HashSet<_>>().len(),
+            K,
+            "IVF_HNSW_RQ with {scoring:?} returned duplicate row ids"
+        );
+
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(
+            recall,
+            0.8,
+            "{scoring:?} recall: {recall}, row_ids: {row_ids:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6904,6 +6988,7 @@ async fn test_global_topk_search_bounds_in_flight_prepared_partitions() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
     let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();
     assert_eq!(partitions.len(), num_partitions);
