@@ -101,7 +101,7 @@ impl DirectReadCredit {
 
 impl Drop for DirectReadCredit {
     fn drop(&mut self) {
-        let event = {
+        let (event, has_waiting_work) = {
             let mut state = self
                 .queue
                 .state
@@ -110,10 +110,17 @@ impl Drop for DirectReadCredit {
             state.iops_avail += 1;
             state.bytes_avail += self.num_bytes as i64;
             state.priorities_in_flight.remove(self.priority);
-            state.scheduler_state_event()
+            (
+                state.scheduler_state_event(),
+                !state.pending_requests.is_empty() || state.done_scheduling,
+            )
         };
         emit_scheduler_state_event(event, &self.queue.stats);
-        self.queue.notify.notify_one();
+        // A later push or close supplies its own notification. Refunding credit
+        // to an empty open queue cannot make work runnable, so let it sleep.
+        if has_waiting_work {
+            self.queue.notify.notify_one();
+        }
     }
 }
 

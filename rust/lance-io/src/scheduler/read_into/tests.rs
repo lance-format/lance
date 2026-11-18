@@ -8,6 +8,11 @@ use lance_core::{
     utils::allocation::AllocationBudget,
 };
 use rstest::rstest;
+use std::{
+    future::Future,
+    sync::atomic::AtomicUsize,
+    task::{Context as TaskContext, Poll, Wake, Waker},
+};
 use tokio::sync::Semaphore;
 
 mod many;
@@ -659,4 +664,112 @@ async fn direct_read_respects_iop_limit_and_cancel_wakes_same_priority_peer() {
     let state = queue.state.lock().unwrap();
     assert_eq!(state.iops_avail, 1);
     assert!(!state.priorities_in_flight.contains(0));
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[rstest]
+fn direct_credit_refund_leaves_empty_queue_asleep(#[values(1, 2)] count: u32) {
+    // Poll a standalone queue: an actual scheduler must remain its sole consumer.
+    let queue = Arc::new(IoQueue::new(count, u64::from(count) * 8, IoStats::new()));
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut pending = Box::pin(queue.pop());
+    assert!(pending.as_mut().poll(&mut cx).is_pending());
+    let credits: Vec<_> = (0..count)
+        .map(|_| DirectReadCredit::try_new(&queue, 5, 8, false).unwrap())
+        .collect();
+    assert_eq!(queue.reserved_bytes(), u64::from(count) * 8);
+    drop(credits);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    assert_eq!(queue.reserved_bytes(), 0);
+    {
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.iops_avail, count);
+        assert!(state.priorities_in_flight.is_empty());
+    }
+    queue.close();
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(None)));
+}
+
+#[rstest]
+fn queued_read_wakes_before_or_after_direct_credit_refund(
+    #[values(false, true)] is_queued_before_refund: bool,
+) {
+    let queue = Arc::new(IoQueue::new(1, 8, IoStats::new()));
+    let credit = DirectReadCredit::try_new(&queue, 5, 8, false).unwrap();
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut pending = Box::pin(queue.pop());
+    assert!(pending.as_mut().poll(&mut cx).is_pending());
+    let task = IoTask {
+        reader: Arc::new(ControlledReader {
+            path: Path::from("owned"),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: Arc::new(Semaphore::new(0)),
+            batches: AtomicUsize::new(0),
+        }),
+        to_read: 8..16,
+        buffer: None,
+        when_done: Box::new(|_, _| {}),
+        priority: 7,
+        bypass_backpressure: false,
+        request_cancellation: None,
+    };
+    if is_queued_before_refund {
+        queue.push(task);
+        assert_eq!(wakes.0.swap(0, Ordering::SeqCst), 1);
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        drop(credit);
+    } else {
+        drop(credit);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        queue.push(task);
+    }
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    let Poll::Ready(Some(task)) = pending.as_mut().poll(&mut cx) else {
+        panic!("refunded credit must make the queued read runnable");
+    };
+    assert_eq!(task.to_read, 8..16);
+    assert_eq!(task.priority, 7);
+    assert_eq!(queue.reserved_bytes(), 8);
+    let state = queue.state.lock().unwrap();
+    assert_eq!(state.iops_avail, 0);
+    assert!(state.pending_requests.is_empty());
+    assert!(!state.priorities_in_flight.contains(5));
+    assert!(state.priorities_in_flight.contains(7));
+}
+
+#[test]
+fn close_wakes_queue_with_live_direct_credit() {
+    let queue = Arc::new(IoQueue::new(1, 8, IoStats::new()));
+    let credit = DirectReadCredit::try_new(&queue, 5, 8, false).unwrap();
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut pending = Box::pin(queue.pop());
+    assert!(pending.as_mut().poll(&mut cx).is_pending());
+    queue.close();
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(None)));
+    assert!(DirectReadCredit::try_new(&queue, 7, 8, false).is_none());
+    drop(credit);
+    assert_eq!(queue.reserved_bytes(), 0);
+    let state = queue.state.lock().unwrap();
+    assert_eq!(state.iops_avail, 1);
+    assert!(state.priorities_in_flight.is_empty());
 }

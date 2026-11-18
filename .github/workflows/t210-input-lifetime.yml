@@ -25,17 +25,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify direct raw list output and actual file composition
+      - name: Verify direct credit wakes and actual file composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::unzip_admitted::tests:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib scheduler::read_into::tests:: -- --nocapture
           cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::multi::batched_reads:: -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::take:: -- --nocapture
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted:: -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --doc prepare_array_range_in -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --doc supports_direct_byte_materialization -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-encoding -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-io --all-features --all-targets --no-deps -- -D warnings
