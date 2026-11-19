@@ -11,7 +11,6 @@ use lance_file::{
         encoding::write_schema_dictionaries, writer::ManifestProvider as V1ManifestProvider,
     },
 };
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 use rayon::prelude::*;
@@ -74,7 +73,7 @@ async fn read_manifest_proto_with_length(
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
-        object_store.inner.head(path).await?.size
+        object_store.stat(path).await?.size
     };
     if file_size < 16 {
         if known_size.is_some() {
@@ -91,7 +90,7 @@ async fn read_manifest_proto_with_length(
         start: initial_start,
         end: file_size,
     };
-    let buf = object_store.inner.get_range(path, range).await?;
+    let buf = object_store.read_range(path, range).await?;
 
     // In case of corruption, the known_size might be wrong. We can retry without
     // the size to be more robust.
@@ -546,7 +545,7 @@ mod test {
     async fn test_read_empty_manifest_reports_path(#[case] known_size: Option<u64>) {
         let store = ObjectStore::memory();
         let path = Path::from("dataset/_versions/1.manifest");
-        store.inner.put(&path, Bytes::new().into()).await.unwrap();
+        store.put_payload(&path, Bytes::new().into()).await.unwrap();
 
         let error = read_manifest(&store, &path, known_size).await.unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
@@ -604,7 +603,7 @@ mod test {
 
         assert_eq!(manifest, roundtripped_manifest);
 
-        store.inner.delete(&path).await.unwrap();
+        store.delete(&path).await.unwrap();
     }
 
     #[tokio::test]
@@ -622,14 +621,14 @@ mod test {
         let roundtripped_manifest = read_manifest_proto(&store, &path, None).await.unwrap();
 
         assert_eq!(expected, roundtripped_manifest);
-        store.inner.delete(&path).await.unwrap();
+        store.delete(&path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_read_manifest_proto_retries_stale_known_size() {
         let (store, path, manifest) = write_test_manifest(1000, 1000).await;
         let expected = pb::Manifest::from(&manifest);
-        let actual_size = store.inner.head(&path).await.unwrap().size;
+        let actual_size = store.stat(&path).await.unwrap().size;
         let stale_known_size = actual_size - 1;
 
         let roundtripped_manifest = read_manifest_proto(&store, &path, Some(stale_known_size))
@@ -637,7 +636,7 @@ mod test {
             .unwrap();
 
         assert_eq!(expected, roundtripped_manifest);
-        store.inner.delete(&path).await.unwrap();
+        store.delete(&path).await.unwrap();
     }
 
     #[tokio::test]

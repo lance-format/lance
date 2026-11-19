@@ -1218,6 +1218,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     Arc::new(self.existing_indices.clone()),
                     Some(PartitionAdjustment::Split {
                         affected_partitions: split_result.affected_partitions,
+                        reindexed_row_ids: split_result.reindexed_row_ids,
                         split_shuffle_reader: split_result.shuffle_reader,
                     }),
                 )
@@ -1457,16 +1458,19 @@ fn build_merged_partitions(
         let build_partition = build_partition.clone();
         let partition_adjustment = partition_adjustment.clone();
         async move {
-            let (is_affected, split_reader) = match partition_adjustment.as_ref() {
-                Some(PartitionAdjustment::Split {
-                    affected_partitions,
-                    split_shuffle_reader,
-                }) => (
-                    affected_partitions.contains(&partition),
-                    Some(split_shuffle_reader.clone()),
-                ),
-                _ => (false, None),
-            };
+            let (is_affected, split_reindexed_row_ids, split_reader) =
+                match partition_adjustment.as_ref() {
+                    Some(PartitionAdjustment::Split {
+                        affected_partitions,
+                        reindexed_row_ids,
+                        split_shuffle_reader,
+                    }) => (
+                        affected_partitions.contains(&partition),
+                        Some(reindexed_row_ids.clone()),
+                        Some(split_shuffle_reader.clone()),
+                    ),
+                    _ => (false, None, None),
+                };
             let partition = match partition_adjustment.as_ref() {
                 Some(PartitionAdjustment::Join {
                     kept_partitions, ..
@@ -1490,8 +1494,13 @@ fn build_merged_partitions(
             };
 
             // For unaffected partitions during a split, vectors from
-            // affected partitions may have been reassigned here.
+            // affected partitions may have been reassigned here. The split
+            // reshuffles whole logical rows, so the old entries of those rows
+            // leave this partition first.
             if !is_affected && let Some(sr) = split_reader.as_ref() {
+                if let Some(reindexed_row_ids) = split_reindexed_row_ids.as_deref() {
+                    drop_row_ids(&mut batches, reindexed_row_ids)?;
+                }
                 let (extra, extra_loss) =
                     take_partition_batches(partition, &[], Some(sr.as_ref())).await?;
                 batches.extend(extra);
@@ -1506,15 +1515,7 @@ fn build_merged_partitions(
                 ..
             }) = partition_adjustment.as_ref()
             {
-                if !reindexed_row_ids.is_empty() {
-                    for batch in batches.iter_mut() {
-                        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                        let mask = BooleanArray::from_iter(row_ids.iter().map(|row_id| {
-                            row_id.map(|row_id| !reindexed_row_ids.contains(&row_id))
-                        }));
-                        *batch = arrow::compute::filter_record_batch(batch, &mask)?;
-                    }
-                }
+                drop_row_ids(&mut batches, reindexed_row_ids)?;
                 let (extra, extra_loss) =
                     take_partition_batches(partition, &[], Some(join_shuffle_reader.as_ref()))
                         .await?;
@@ -1534,6 +1535,23 @@ fn build_merged_partitions(
     stream::iter(build_iter)
         .buffered(get_num_compute_intensive_cpus())
         .boxed()
+}
+
+/// Drops the entries of `row_ids` from every batch.
+fn drop_row_ids(batches: &mut [RecordBatch], row_ids: &HashSet<u64>) -> Result<()> {
+    if row_ids.is_empty() {
+        return Ok(());
+    }
+    for batch in batches.iter_mut() {
+        let batch_row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let mask = BooleanArray::from_iter(
+            batch_row_ids
+                .iter()
+                .map(|row_id| row_id.map(|row_id| !row_ids.contains(&row_id))),
+        );
+        *batch = arrow::compute::filter_record_batch(batch, &mask)?;
+    }
+    Ok(())
 }
 
 fn build_fresh_partitions_windowed(
@@ -2423,13 +2441,14 @@ impl PartitionAdjuster<'_> {
 
         // Stream raw vectors for affected partitions through the IVF+quantizer
         // transform, writing to temp files via a second shuffler.
-        let split_shuffle_reader = self
+        let (reindexed_row_ids, split_shuffle_reader) = self
             .reshuffle_partitions(&affected_partitions, &new_centroids)
             .await?;
 
         Ok(Some(SplitResult {
             new_centroids,
             affected_partitions,
+            reindexed_row_ids,
             shuffle_reader: split_shuffle_reader.into(),
         }))
     }
@@ -2482,12 +2501,14 @@ impl PartitionAdjuster<'_> {
     }
 
     /// Stream raw vectors for the given partitions through the IVF+quantizer
-    /// transform, writing to temp files. Returns a ShuffleReader for the results.
+    /// transform, writing to temp files. Returns the rows whose old entries
+    /// must leave the unaffected partitions, and a ShuffleReader for the
+    /// results.
     async fn reshuffle_partitions(
         &self,
         affected_partitions: &HashSet<usize>,
         new_centroids: &FixedSizeListArray,
-    ) -> Result<Box<dyn ShuffleReader>> {
+    ) -> Result<(Arc<HashSet<u64>>, Box<dyn ShuffleReader>)> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input("dataset not set before reshuffle"));
         };
@@ -2500,11 +2521,19 @@ impl PartitionAdjuster<'_> {
         }
         all_row_ids.sort();
         all_row_ids.dedup();
+        // Every vector of a reshuffled row is reassigned, and only a
+        // multivector row can also have vectors in unaffected partitions.
+        let multivector = is_multivector_column(dataset.schema(), &self.column)?;
+        let reindexed_row_ids = Arc::new(if multivector {
+            all_row_ids.iter().copied().collect()
+        } else {
+            HashSet::new()
+        });
 
         let (transformer, vector_field) = self.assign_transformer(new_centroids)?;
         let transformer = Arc::new(transformer);
         let (rows_per_fetch, prefetch) = raw_vector_fetch_shape(
-            is_multivector_column(dataset.schema(), &self.column)?,
+            multivector,
             new_centroids.value_length() as usize,
             &vector_field,
             self.store.block_size(),
@@ -2556,7 +2585,7 @@ impl PartitionAdjuster<'_> {
                     vec![0; new_centroids.len()],
                     0.0,
                 ));
-                return Ok(empty_reader);
+                return Ok((Arc::new(HashSet::new()), empty_reader));
             }
         };
 
@@ -2570,7 +2599,8 @@ impl PartitionAdjuster<'_> {
             self.format_version,
             None,
         );
-        shuffler.shuffle(transformed_stream).await
+        let shuffle_reader = shuffler.shuffle(transformed_stream).await?;
+        Ok((reindexed_row_ids, shuffle_reader))
     }
 
     /// Sample raw vectors from a partition for kmeans training.
@@ -3464,6 +3494,9 @@ struct JoinResult {
 struct SplitResult {
     new_centroids: FixedSizeListArray,
     affected_partitions: HashSet<usize>,
+    /// For a multivector column, every row found in the affected partitions;
+    /// their entries leave the unaffected partitions. Empty otherwise.
+    reindexed_row_ids: Arc<HashSet<u64>>,
     shuffle_reader: Arc<dyn ShuffleReader>,
 }
 
@@ -3475,9 +3508,12 @@ enum AssignOp {
 enum PartitionAdjustment {
     /// Split partitions. Carries the set of all affected partitions (split
     /// targets, the partitions appended for them and their neighbors) and a
-    /// shuffle reader with re-quantized data.
+    /// shuffle reader with re-quantized data. Every entry of a row in
+    /// `reindexed_row_ids` is dropped from the unaffected partitions before
+    /// the reader's entries are added.
     Split {
         affected_partitions: HashSet<usize>,
+        reindexed_row_ids: Arc<HashSet<u64>>,
         split_shuffle_reader: Arc<dyn ShuffleReader>,
     },
     /// Join partitions away; `kept_partitions[i]` is the old id of output
@@ -3496,10 +3532,12 @@ impl std::fmt::Debug for PartitionAdjustment {
         match self {
             Self::Split {
                 affected_partitions,
+                reindexed_row_ids,
                 ..
             } => f
                 .debug_struct("Split")
                 .field("affected_partitions", affected_partitions)
+                .field("reindexed_rows", &reindexed_row_ids.len())
                 .finish(),
             Self::Join {
                 kept_partitions,
@@ -4728,6 +4766,123 @@ mod tests {
             .flat_map(|b| b["vec"].as_primitive::<Float32Type>().values().to_vec())
             .collect();
         assert_eq!(sliced, values);
+    }
+
+    /// A split reshuffles whole logical rows, so a multivector row found in an
+    /// affected partition is re-assigned everywhere its vectors live. Its old
+    /// entries must leave the unaffected partitions too, or the vectors it
+    /// holds there are indexed twice. Partition F's centroid sits far outside
+    /// the 64-neighbor window of partition 0's, so F stays unaffected while
+    /// partition 0 splits, and the multivector rows' second vectors sit in F.
+    #[tokio::test]
+    async fn optimize_split_drops_reindexed_rows_old_entries_in_unaffected_partitions() {
+        use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use arrow_array::RecordBatchIterator;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        const C0: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+        // Cosine compares directions, so F is the direction opposite C0: the
+        // farthest a centroid can be from it.
+        const CF: [f32; 4] = [-1.0, 0.0, 0.0, 0.0];
+        // 385 single-vector rows at C0 plus five rows holding one vector at C0
+        // and one at CF leave partition 0 just under the split threshold of
+        // 400; every other partition gets 30 rows, over the join floor of 25.
+        const C0_SINGLE_ROWS: usize = 385;
+        const MULTIVECTOR_ROWS: usize = 5;
+        const OTHER_PARTITION_ROWS: usize = 30;
+        const APPENDED_ROWS: usize = 20;
+
+        // Seventy-eight centroid directions at a fixed small angle from C0,
+        // spread so each keeps its own rows, and all nearer to C0 than F's
+        // opposite direction is: the split of partition 0 picks its 64
+        // neighbors among them and leaves F (partition 79) unaffected.
+        let golden = std::f32::consts::PI * (3.0f32.sqrt() - 1.0);
+        let ring_angle = 0.5f32;
+        let mut centers = vec![C0];
+        centers.extend((0..78).map(|i| {
+            let y = 1.0 - 2.0 * (i as f32 + 0.5) / 78.0;
+            let r = (1.0 - y * y).sqrt();
+            let phi = golden * i as f32;
+            [
+                ring_angle.cos(),
+                ring_angle.sin() * r * phi.cos(),
+                ring_angle.sin() * r * phi.sin(),
+                ring_angle.sin() * y,
+            ]
+        }));
+        centers.push(CF);
+
+        let mut rows: Vec<Vec<[f32; 4]>> = (0..C0_SINGLE_ROWS).map(|_| vec![C0]).collect();
+        rows.extend((0..MULTIVECTOR_ROWS).map(|_| vec![C0, CF]));
+        let mut batches = vec![multivector_batch(&rows, 0)];
+        for center in centers[1..].iter() {
+            batches.push(multivector_batch(
+                &vec![vec![*center]; OTHER_PARTITION_ROWS],
+                0,
+            ));
+        }
+        let schema = batches[0].schema();
+        let reader =
+            RecordBatchIterator::new(batches.into_iter().map(Ok).collect::<Vec<_>>(), schema);
+        let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
+        let values: Vec<f32> = centers.iter().flat_map(|center| center.to_vec()).collect();
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), 4).unwrap();
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(centers.len(), Arc::new(centroids)).unwrap();
+        ivf_params.target_partition_size = Some(100);
+        let params = VectorIndexParams::with_ivf_flat_params(MetricType::Cosine, ivf_params);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // The appended rows also put a vector in F, so F holds entries of
+        // reshuffled rows from both the old index and the new data.
+        let append = multivector_batch(&vec![vec![C0, CF]; APPENDED_ROWS], 0);
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![append])
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let optimized = open_single_segment(&dataset).await;
+        let ivf = optimized.ivf_model();
+        let sizes: Vec<usize> = (0..ivf.num_partitions())
+            .map(|p| optimized.partition_size(p))
+            .collect();
+        assert!(
+            ivf.num_partitions() > centers.len(),
+            "the oversized partition 0 should have split, not joined: {} partitions, {sizes:?}",
+            ivf.num_partitions()
+        );
+        let total_vectors = C0_SINGLE_ROWS
+            + APPENDED_ROWS * 2
+            + MULTIVECTOR_ROWS * 2
+            + (centers.len() - 1) * OTHER_PARTITION_ROWS;
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            total_vectors,
+            "every vector indexed once"
+        );
     }
 
     #[tokio::test]

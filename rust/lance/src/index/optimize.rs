@@ -2554,35 +2554,31 @@ mod tests {
         assert_bloom_answers(&dataset, &unchanged).await;
     }
 
-    /// `update` keeps the zones of a deleted fragment while the segment's
-    /// coverage drops it. A column rewrite did not leave those zones, so they
-    /// do not keep a bounded optimize in one task.
+    /// A column rewrite leaves zones outside the segment's coverage. Once
+    /// that fragment is deleted, its zones no longer answer queries and do
+    /// not keep a bounded optimize in one task.
     #[tokio::test]
     async fn test_bloom_filter_segments_split_with_zones_of_a_deleted_fragment() {
         let test_dir = TempStrDir::default();
-        let mut dataset = bloom_dataset(&test_dir, 0).await;
+        let dataset = bloom_dataset(&test_dir, 0).await;
+        let mut dataset = rewrite_value(dataset, test_dir.as_str(), 150).await;
         dataset.delete("id >= 150").await.unwrap(); // fragment 3
-        append(&mut dataset, 50, 50).await; // fragment 4
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
         let updated = segments(&dataset, BLOOM_INDEX).await.pop().unwrap();
         assert_eq!(
             updated.fragment_bitmap,
-            Some(RoaringBitmap::from_iter([2u32, 4]))
+            Some(RoaringBitmap::from_iter([2u32]))
         );
         // One zone per fragment, the deleted fragment 3 included.
         let index = dataset
             .open_scalar_index("value", &updated.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(index.statistics().unwrap()["num_blocks"], 3);
+        assert_eq!(index.statistics().unwrap()["num_blocks"], 2);
 
-        append(&mut dataset, 50, 25).await; // fragments 5 and 6
+        append(&mut dataset, 50, 25).await; // fragments 4 and 5
         let options = OptimizeOptions::merge(2).max_rows_per_task(Some(25));
         let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
-        assert_eq!(task_groups(&plan), vec![(0, vec![5]), (0, vec![6])]);
+        assert_eq!(task_groups(&plan), vec![(0, vec![4]), (0, vec![5])]);
         assert_eq!(plan.merges[0].old_segments.len(), 2);
     }
 

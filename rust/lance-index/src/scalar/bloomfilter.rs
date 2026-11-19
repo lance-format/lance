@@ -15,7 +15,7 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
 };
-use arrow_array::{Array, UInt64Array};
+use arrow_array::{Array, BooleanArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow_stats::StatisticsAccumulator;
@@ -23,8 +23,10 @@ use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
-use lance_select::RowAddrTreeMap;
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, remap_row_addrs_tree_map_async, remap_row_ids_async,
+};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
@@ -35,7 +37,8 @@ use datafusion_execution::SendableRecordBatchStream;
 use std::sync::Arc;
 
 use crate::scalar::{
-    AnyQuery, IndexStore, MetricsCollector, RowIdRemapper, ScalarIndex, SearchResult,
+    AnyQuery, IndexStore, MetricsCollector, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+    SearchResult,
 };
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
@@ -190,6 +193,91 @@ impl BloomFilterIndex {
             frag_reuse_index: fri,
             batch_remapper: None,
         })
+    }
+
+    /// The zones and null rows `filter` keeps, as the file stores them. The
+    /// filter names the fragments this segment answers for now. An entry of
+    /// any other fragment may hold rows a deferred compaction moved into one
+    /// of them, so a zone stays when the filter keeps any of its rows
+    /// translated through the segment's remapper, and a null row when it
+    /// keeps its translation. The reader translates the file again on load.
+    async fn retained_old_data(
+        &self,
+        filter: &OldIndexDataFilter,
+    ) -> Result<(Vec<BloomFilterStatistics>, Option<RowAddrTreeMap>)> {
+        let translates = self.frag_reuse_index.is_some() || self.batch_remapper.is_some();
+        let mut zones = Vec::with_capacity(self.zones.len());
+        for zone in &self.zones {
+            let mut kept = zone_kept_by(filter, &zone.bound);
+            if !kept && translates {
+                let start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
+                let mut rows = start..start.saturating_add(zone.bound.length as u64);
+                // The rows of a zone move together, so its first row mostly decides.
+                if let Some(first) = rows.next() {
+                    kept = self
+                        .translated_rows_kept(filter, &[first])
+                        .await?
+                        .true_count()
+                        > 0
+                        || self
+                            .translated_rows_kept(filter, &rows.collect::<Vec<_>>())
+                            .await?
+                            .true_count()
+                            > 0;
+                }
+            }
+            if kept {
+                zones.push(zone.clone());
+            }
+        }
+
+        let Some(null_rows) = &self.null_rows else {
+            return Ok((zones, None));
+        };
+        let mut kept_null_rows = null_rows.clone();
+        filter.retain_old_rows(&mut kept_null_rows);
+        if translates {
+            let others = null_rows.clone() - &kept_null_rows;
+            let mut other_rows = others
+                .row_addrs()
+                .ok_or_else(|| {
+                    Error::internal("BloomFilterIndex: null rows select a whole fragment")
+                })?
+                .map(u64::from);
+            loop {
+                let rows = other_rows.by_ref().take(64 * 1024).collect::<Vec<_>>();
+                if rows.is_empty() {
+                    break;
+                }
+                let keep = self.translated_rows_kept(filter, &rows).await?;
+                kept_null_rows.extend(
+                    rows.into_iter()
+                        .zip(&keep)
+                        .filter_map(|(row, is_kept)| (is_kept == Some(true)).then_some(row)),
+                );
+            }
+        }
+        Ok((zones, Some(kept_null_rows)))
+    }
+
+    /// For each of `rows`, whether `filter` keeps it translated through the
+    /// segment's remapper. A row the remapper drops is not kept.
+    async fn translated_rows_kept(
+        &self,
+        filter: &OldIndexDataFilter,
+        rows: &[u64],
+    ) -> Result<BooleanArray> {
+        let translated: UInt64Array = if let Some(remapper) = &self.frag_reuse_index {
+            rows.iter().map(|row| remapper.remap_row_id(*row)).collect()
+        } else if let Some(remapper) = &self.batch_remapper {
+            remap_row_ids_async(remapper.as_ref(), rows)
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            rows.iter().copied().map(Some).collect()
+        };
+        Ok(filter.filter_row_ids(&translated))
     }
 
     fn read_batch_size(
@@ -582,7 +670,7 @@ impl ScalarIndex for BloomFilterIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         // Re-train bloom filters for the appended data using the shared trainer
         let params = BloomFilterIndexBuilderParams {
@@ -595,15 +683,25 @@ impl ScalarIndex for BloomFilterIndex {
             move || BloomFilterProcessor::new(factory_params.clone()),
             params.number_of_items,
         )?;
-        let (updated_blocks, new_null_rows) =
-            rebuild_zones_parallel(&self.zones, trainer, new_data).await?;
+        let (updated_blocks, new_null_rows, old_null_rows) = match &old_data_filter {
+            None => {
+                let (blocks, new_null_rows) =
+                    rebuild_zones_parallel(&self.zones, trainer, new_data).await?;
+                (blocks, new_null_rows, self.null_rows.clone())
+            }
+            Some(filter) => {
+                let (mut blocks, old_null_rows) = self.retained_old_data(filter).await?;
+                let (mut new_blocks, new_null_rows) = trainer.train(new_data).await?;
+                blocks.append(&mut new_blocks);
+                (blocks, new_null_rows, old_null_rows)
+            }
+        };
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
         // (legacy format — null positions unknown), preserve that None: updating cannot
         // recover the missing information, and claiming the result has zero nulls would
         // be a false negative.  Only a full retrain produces a fresh, complete bitmap.
-        let merged_null_rows = self.null_rows.as_ref().map(|existing| {
-            let mut merged = existing.clone();
+        let merged_null_rows = old_null_rows.map(|mut merged| {
             merged |= &new_null_rows;
             merged
         });
@@ -762,6 +860,24 @@ pub async fn read_bloomfilter_zone_fragments(store: &dyn IndexStore) -> Result<R
             })
         })
         .collect()
+}
+
+/// Whether `filter` keeps the zone at `bound`: a fragment filter keeps the
+/// zones of its fragments, an allow-list the zones holding an allowed row.
+fn zone_kept_by(filter: &OldIndexDataFilter, bound: &ZoneBound) -> bool {
+    match filter {
+        OldIndexDataFilter::Fragments { to_keep, .. }
+        | OldIndexDataFilter::RowAddresses { to_keep, .. } => {
+            u32::try_from(bound.fragment_id).is_ok_and(|fragment_id| to_keep.contains(fragment_id))
+        }
+        OldIndexDataFilter::RowIds(_) => {
+            let zone_start = (bound.fragment_id << 32).saturating_add(bound.start);
+            let mut rows = RowAddrTreeMap::new();
+            rows.insert_range(zone_start..zone_start.saturating_add(bound.length as u64));
+            filter.retain_old_rows(&mut rows);
+            !rows.is_empty()
+        }
+    }
 }
 
 /// Merge caller-selected BloomFilter segments into one self-contained segment.
@@ -1551,12 +1667,20 @@ impl BloomFilterIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<BloomFilterIndexBuilderParams>,
+        progress: &dyn crate::progress::IndexBuildProgress,
     ) -> Result<Vec<IndexFile>> {
         let mut builder = BloomFilterIndexBuilder::try_new(options.unwrap_or_default())?;
 
+        progress.stage_start("train_zones", None, "rows").await?;
         builder.train(batches_source).await?;
+        progress.stage_complete("train_zones").await?;
 
-        builder.write_index(index_store).await
+        progress
+            .stage_start("write_bloomfilter_index", None, "files")
+            .await?;
+        let files = builder.write_index(index_store).await?;
+        progress.stage_complete("write_bloomfilter_index").await?;
+        Ok(files)
     }
 }
 
@@ -1621,7 +1745,7 @@ impl BasicTrainer for BloomFilterIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()
@@ -1630,7 +1754,13 @@ impl BasicTrainer for BloomFilterIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        let files = Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
+        let files = Self::train_bloomfilter_index(
+            data,
+            index_store,
+            Some(request.params),
+            progress.as_ref(),
+        )
+        .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
@@ -1743,6 +1873,7 @@ impl TrainingRequest for BloomFilterIndexTrainingRequest {
 #[cfg(test)]
 mod tests {
     use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
+    use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1755,12 +1886,15 @@ mod tests {
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
     use lance_core::deepsize::DeepSizeOf;
+    use lance_core::utils::address::RowAddress;
     use lance_core::{Error, ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
+    use lance_index_core::remapping::BatchRowIdRemapper;
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
+    use rstest::rstest;
 
     use crate::scalar::{
-        BloomFilterQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult,
+        BloomFilterQuery, CreatedIndex, IndexStore, OldIndexDataFilter, ScalarIndex, SearchResult,
         bloomfilter::{
             BloomFilterFileInfo, BloomFilterIndex, BloomFilterIndexBuilder,
             BloomFilterIndexBuilderParams, BloomFilterProcessor, BloomFilterStatistics, ZoneBound,
@@ -1819,9 +1953,14 @@ mod tests {
         ));
         let data_stream = add_row_addr(data_stream);
 
-        BloomFilterIndexPlugin::train_bloomfilter_index(data_stream, test_store.as_ref(), None)
-            .await
-            .unwrap();
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            None,
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
 
         log::debug!("Successfully wrote the index file");
 
@@ -1865,6 +2004,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1949,6 +2089,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.05)), // ~5% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2034,6 +2175,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2122,6 +2264,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(1000, 0.001)), // 10 blocks total
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2212,6 +2355,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2294,6 +2438,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.05)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2362,6 +2507,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.05)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2422,6 +2568,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.01)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2482,6 +2629,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.01)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2564,6 +2712,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(25, 0.05)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2615,6 +2764,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(250, 0.01)), // 4 zones total
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2672,9 +2822,14 @@ mod tests {
         let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
         // Train and write the bloomfilter index
-        BloomFilterIndexPlugin::train_bloomfilter_index(stream, store.as_ref(), None)
-            .await
-            .unwrap();
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            stream,
+            store.as_ref(),
+            None,
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
 
         let cache = LanceCache::with_capacity(1024 * 1024);
         let index = BloomFilterIndex::load(store.clone(), None, &cache)
@@ -2958,8 +3113,18 @@ mod tests {
     // None into an empty RowAddrTreeMap; after the merge the updated index has
     // `null_rows = Some(empty)`, so an IsNull search returns `exact(empty)` — a
     // false negative even though the legacy zone recorded has_null = true.
+    // With a filter the legacy zone is kept, directly or, under a remapper
+    // that moved fragment 0 to fragment 3, by its translation.
+    #[rstest]
+    #[case::no_filter(None, None)]
+    #[case::fragment_filter(Some(0), None)]
+    #[case::legacy_remapper(Some(3), Some(false))]
+    #[case::tagged_remapper(Some(3), Some(true))]
     #[tokio::test]
-    async fn test_update_legacy_none_null_rows_not_treated_as_no_nulls() {
+    async fn test_update_legacy_none_null_rows_not_treated_as_no_nulls(
+        #[case] kept_fragment: Option<u32>,
+        #[case] tagged: Option<bool>,
+    ) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -2970,9 +3135,21 @@ mod tests {
         // Write a legacy-format index (no null bitmap) with has_null=true in its zone.
         write_legacy_bloomfilter(store.as_ref(), true).await;
 
-        let index = BloomFilterIndex::load(store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
+        let index = match tagged {
+            None => BloomFilterIndex::load(store.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap(),
+            Some(tagged) => {
+                let mapping: HashMap<u64, Option<u64>> = (0..3)
+                    .map(|offset| (offset, Some((3 << 32) + offset)))
+                    .collect();
+                load_remapped(store.clone(), &mapping, tagged).await
+            }
+        };
+        let old_data_filter = kept_fragment.map(|fragment_id| OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([fragment_id]),
+            to_remove: RoaringBitmap::new(),
+        });
         assert!(
             index.null_rows.is_none(),
             "precondition: legacy null_rows is None"
@@ -3004,7 +3181,7 @@ mod tests {
         ));
 
         index
-            .update(new_stream, store.as_ref(), None)
+            .update(new_stream, store.as_ref(), old_data_filter)
             .await
             .unwrap();
 
@@ -3027,6 +3204,258 @@ mod tests {
             "IsNull on an updated legacy index must not return exact(empty); \
              the legacy zone had has_null=true so nulls exist at unknown positions"
         );
+        assert_eq!(
+            result.row_addrs().selected_rows(),
+            &row_addrs(&[(0, 0), (0, 1), (0, 2)])
+        );
+    }
+
+    fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        (tmpdir, store)
+    }
+
+    fn row_addrs(rows: &[(u32, u32)]) -> RowAddrTreeMap {
+        rows.iter()
+            .map(|&(fragment_id, offset)| {
+                u64::from(RowAddress::new_from_parts(fragment_id, offset))
+            })
+            .collect()
+    }
+
+    /// Zones of two rows over fragment 0, `[10, null, 30, null, 40, 60]`, and
+    /// fragment 1, `[50, null, 70, 80]`.
+    async fn write_two_fragment_index(store: &dyn IndexStore) {
+        let batch = record_batch!(
+            (
+                VALUE_COLUMN_NAME,
+                Int64,
+                [
+                    Some(10),
+                    None,
+                    Some(30),
+                    None,
+                    Some(40),
+                    Some(60),
+                    Some(50),
+                    None,
+                    Some(70),
+                    Some(80)
+                ]
+            ),
+            (
+                ROW_ADDR,
+                UInt64,
+                [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    1_u64 << 32,
+                    (1_u64 << 32) + 1,
+                    (1_u64 << 32) + 2,
+                    (1_u64 << 32) + 3
+                ]
+            )
+        )
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::once(async move { Ok(batch) }),
+        ));
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            stream,
+            store,
+            Some(BloomFilterIndexBuilderParams::new(2, 0.01)),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The rows an update indexes: fragment 2, `[90, null]`.
+    fn fragment_two_stream() -> SendableRecordBatchStream {
+        let batch = record_batch!(
+            (VALUE_COLUMN_NAME, Int64, [Some(90), None]),
+            (ROW_ADDR, UInt64, [2_u64 << 32, (2_u64 << 32) + 1])
+        )
+        .unwrap();
+        Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::once(async move { Ok(batch) }),
+        ))
+    }
+
+    /// `(fragment_id, start, length)` of every zone, sorted.
+    fn zone_bounds(index: &BloomFilterIndex) -> Vec<(u64, u64, usize)> {
+        let mut bounds = index
+            .zones
+            .iter()
+            .map(|zone| (zone.bound.fragment_id, zone.bound.start, zone.bound.length))
+            .collect::<Vec<_>>();
+        bounds.sort_unstable();
+        bounds
+    }
+
+    async fn assert_exact_nulls(index: &BloomFilterIndex, expected: RowAddrTreeMap) {
+        let result = index
+            .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(result.is_exact(), "{result:?}");
+        assert_eq!(result.row_addrs().selected_rows(), &expected);
+    }
+
+    // Without a remapper `update` keeps the old zones and null rows its filter
+    // keeps, and all of them without a filter.
+    #[rstest]
+    #[case::no_filter(
+        None,
+        &[(0, 0, 2), (0, 2, 2), (0, 4, 2), (1, 0, 2), (1, 2, 2)],
+        &[(0, 1), (0, 3), (1, 1)]
+    )]
+    #[case::fragments(
+        Some(OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([0]),
+            to_remove: RoaringBitmap::from_iter([1]),
+        }),
+        &[(0, 0, 2), (0, 2, 2), (0, 4, 2)],
+        &[(0, 1), (0, 3)]
+    )]
+    #[case::row_addresses(
+        Some(OldIndexDataFilter::RowAddresses {
+            to_keep: RoaringBitmap::from_iter([0, 1]),
+            to_remove: RoaringBitmap::new(),
+            deleted_rows: row_addrs(&[(0, 3)]),
+        }),
+        &[(0, 0, 2), (0, 2, 2), (0, 4, 2), (1, 0, 2), (1, 2, 2)],
+        &[(0, 1), (1, 1)]
+    )]
+    #[case::row_ids(
+        Some(OldIndexDataFilter::RowIds(row_addrs(&[(0, 0), (0, 1), (1, 3)]))),
+        &[(0, 0, 2), (1, 2, 2)],
+        &[(0, 1)]
+    )]
+    #[tokio::test]
+    async fn test_update_keeps_the_old_data_its_filter_keeps(
+        #[case] old_data_filter: Option<OldIndexDataFilter>,
+        #[case] kept_zones: &[(u64, u64, usize)],
+        #[case] kept_nulls: &[(u32, u32)],
+    ) {
+        let (_old_dir, old_store) = test_store();
+        write_two_fragment_index(old_store.as_ref()).await;
+        let index = BloomFilterIndex::load(old_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let (_new_dir, new_store) = test_store();
+        index
+            .update(fragment_two_stream(), new_store.as_ref(), old_data_filter)
+            .await
+            .unwrap();
+
+        let updated = BloomFilterIndex::load(new_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let mut zones = kept_zones.to_vec();
+        zones.push((2, 0, 2));
+        assert_eq!(zone_bounds(&updated), zones);
+        let mut nulls = kept_nulls.to_vec();
+        nulls.push((2, 1));
+        assert_exact_nulls(&updated, row_addrs(&nulls)).await;
+    }
+
+    /// The asynchronous counterpart of a one-version `FragReuseIndex`: a
+    /// mapped address moves or is dropped, any other address stays.
+    #[derive(Debug)]
+    struct MappedRows(HashMap<u64, Option<u64>>);
+
+    #[async_trait::async_trait]
+    impl BatchRowIdRemapper for MappedRows {
+        async fn remap_row_ids(&self, row_ids: &[u64]) -> lance_core::Result<Vec<Option<u64>>> {
+            Ok(row_ids
+                .iter()
+                .map(|row_id| self.0.get(row_id).copied().unwrap_or(Some(*row_id)))
+                .collect())
+        }
+    }
+
+    async fn load_remapped(
+        store: Arc<LanceIndexStore>,
+        mapping: &HashMap<u64, Option<u64>>,
+        tagged: bool,
+    ) -> Arc<BloomFilterIndex> {
+        if tagged {
+            BloomFilterIndex::load_with_remapping(
+                store,
+                Some(Arc::new(MappedRows(mapping.clone()))),
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap()
+        } else {
+            let remapper = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
+                uuid::Uuid::new_v4(),
+                vec![mapping.clone()],
+                FragReuseIndexDetails { versions: vec![] },
+            )));
+            BloomFilterIndex::load(store, Some(Arc::new(remapper)), &LanceCache::no_cache())
+                .await
+                .unwrap()
+        }
+    }
+
+    // A deferred compaction moved fragment 0 to fragment 3, reordering its rows
+    // and dropping rows 2, 4 and 5, and fragment 1 was rewritten in place, so
+    // the filter keeps fragment 3 alone. Old entries of other fragments are
+    // judged by their translation and kept as the file stores them: both
+    // zones holding a row that moved to fragment 3 stay, even the one whose
+    // first row was dropped, while the zone of dropped rows and fragment 1's
+    // zones go, and a reader that translates finds the nulls in fragment 3.
+    #[rstest]
+    #[case::legacy(false)]
+    #[case::tagged(true)]
+    #[tokio::test]
+    async fn test_update_keeps_old_data_whose_translation_the_filter_keeps(#[case] tagged: bool) {
+        let moved = |offset| Some(u64::from(RowAddress::new_from_parts(3, offset)));
+        let mapping = HashMap::from([
+            (0, moved(0)),
+            (1, moved(2)),
+            (2, None),
+            (3, moved(1)),
+            (4, None),
+            (5, None),
+        ]);
+        let (_old_dir, old_store) = test_store();
+        write_two_fragment_index(old_store.as_ref()).await;
+        let index = load_remapped(old_store, &mapping, tagged).await;
+        let (_new_dir, new_store) = test_store();
+        let old_data_filter = OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([3]),
+            to_remove: RoaringBitmap::from_iter([0]),
+        };
+        index
+            .update(
+                fragment_two_stream(),
+                new_store.as_ref(),
+                Some(old_data_filter),
+            )
+            .await
+            .unwrap();
+
+        let stored = BloomFilterIndex::load(new_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(zone_bounds(&stored), vec![(0, 0, 2), (0, 2, 2), (2, 0, 2)]);
+        assert_exact_nulls(&stored, row_addrs(&[(0, 1), (0, 3), (2, 1)])).await;
+        let translated = load_remapped(new_store, &mapping, tagged).await;
+        assert_exact_nulls(&translated, row_addrs(&[(2, 1), (3, 1), (3, 2)])).await;
     }
 
     #[tokio::test]
@@ -3107,6 +3536,7 @@ mod tests {
             fragment_values(fragments),
             store.as_ref(),
             Some(params.clone()),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();

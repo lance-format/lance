@@ -24,6 +24,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
             external_blob_inner: None,
+            direct_local_io: false,
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,

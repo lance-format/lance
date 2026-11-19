@@ -44,6 +44,9 @@ class DatasetOptimizer:
         source_budget_mode: Optional[Literal["hard", "soft"]] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
         data_storage_version: Optional[str] = None,
+        max_data_files_per_fragment: Optional[int] = None,
+        scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]] = None,
+        data_cache_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -51,6 +54,8 @@ class DatasetOptimizer:
          * Removes deleted rows from fragments
          * Removes dropped columns from fragments
          * Merges small fragments into larger ones
+         * Repacks a fragment's columns into fewer data files, when
+           ``max_data_files_per_fragment`` asks for it
 
         This method preserves the insertion order of the dataset. This may mean
         it leaves small fragments in the dataset if they are not adjacent to
@@ -79,6 +84,7 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
         ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.max_data_files_per_fragment``,
         ``lance.compaction.source_budget_mode``,
         ``lance.compaction.data_storage_version``.
 
@@ -175,6 +181,29 @@ class DatasetOptimizer:
             Uses the compaction config target when set, otherwise the dataset's
             default write version. Does not change that default or the versions
             of unselected files. V1/V2 cross-family targets are rejected.
+        max_data_files_per_fragment: int, optional
+            Maximum number of data files a fragment may hold columns in before
+            its columns are repacked into fewer files. Each ``add_columns``
+            backfill adds one file per fragment. A repack rewrites only the
+            columns that move and keeps rows, fragment ids and indices as they
+            are. If not specified, uses the manifest config value, or no limit.
+            The file count is the only repack trigger.
+        scope: str, optional
+            Which tasks to plan: ``"rewrite_fragments"`` only rewrites
+            fragments, ``"repack_columns"`` only repacks columns, and
+            ``"all"`` (the default) does both. ``"repack_columns"`` requires
+            ``max_data_files_per_fragment``, as an argument or from the table
+            config, and refuses the ``"force_binary_copy"`` mode. A run that
+            does both commits the rewrites and the repacks separately; if the
+            repack commit fails, the dataset is left at the rewrite's version.
+        data_cache_bytes: int, optional
+            Total budget in bytes for buffering column data in each output
+            file writer during re-encoding. Divided evenly among cache-owning
+            field encoders, including nested fields. Defaults to the Rust
+            writer's 8 MiB per cache owner when omitted or None. Must be
+            non-negative; zero is allowed. Does not affect binary copy or the
+            input scanner's buffers.
+            For example, ``compact_files(data_cache_bytes=4 * 1024 * 1024)``.
 
         Returns
         -------
@@ -205,6 +234,9 @@ class DatasetOptimizer:
                 source_budget_mode=source_budget_mode,
                 excluded_fragment_ids=excluded_fragment_ids,
                 data_storage_version=data_storage_version,
+                max_data_files_per_fragment=max_data_files_per_fragment,
+                scope=scope,
+                data_cache_bytes=data_cache_bytes,
             ).items()
             if v is not None
         }
