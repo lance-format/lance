@@ -555,8 +555,9 @@ fn consolidated_stream(
     builder.build()
 }
 
-/// Merge batches up to `target` rows; batches already at the target pass
-/// through whole (never split). Order is preserved.
+/// Merge consecutive batches while the merged batch stays within `target`
+/// rows; a batch already at or above the target passes through whole (never
+/// split). Order is preserved.
 pub fn coalesce_batches(
     input: SendableRecordBatchStream,
     target: usize,
@@ -614,8 +615,12 @@ pub fn coalesce_batches(
                 return Ok::<_, DataFusionError>(None);
             }
             match this.input.try_next().await? {
-                Some(batch) if batch.num_rows() >= this.target && !this.buffered.is_empty() => {
-                    // Emit the partial buffer on its own; the large batch
+                Some(batch)
+                    if !this.buffered.is_empty()
+                        && this.buffered_rows + batch.num_rows() > this.target =>
+                {
+                    // Emit the partial buffer on its own so merging never
+                    // overshoots the target; a batch already at the target
                     // then passes through whole on the next iteration
                     let out = this.emit()?;
                     this.buffer(batch);
@@ -7516,6 +7521,28 @@ mod tests {
             let mixed = vec![batch.slice(0, 2), batch.slice(2, 5)];
             let plan = take_plan_sized(&fixture.dataset, rows_input(mixed), &["i"], 3).unwrap();
             assert_batches(run(&plan).await, plan.schema(), vec![2, 5]);
+
+            // A batch that would push the buffer past the target flushes it
+            // first, so merged batches never exceed the target
+            let pairs = vec![
+                batch.slice(0, 2),
+                batch.slice(2, 2),
+                batch.slice(4, 2),
+                batch.slice(6, 1),
+            ];
+            let plan = take_plan_sized(&fixture.dataset, rows_input(pairs), &["i"], 3).unwrap();
+            assert_batches(run(&plan).await, plan.schema(), vec![2, 2, 3]);
+
+            // Mixed sizes: small batches merge without overshooting, and a
+            // batch at the target after a partial buffer passes through whole
+            let mixed = vec![
+                batch.slice(0, 1),
+                batch.slice(1, 1),
+                batch.slice(2, 2),
+                batch.slice(4, 3),
+            ];
+            let plan = take_plan_sized(&fixture.dataset, rows_input(mixed), &["i"], 3).unwrap();
+            assert_batches(run(&plan).await, plan.schema(), vec![2, 2, 3]);
         }
 
         /// Storage-ordered input exercises the aligned fast path
