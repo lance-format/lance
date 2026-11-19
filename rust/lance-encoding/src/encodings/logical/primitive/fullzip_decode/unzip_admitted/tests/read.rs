@@ -408,6 +408,8 @@ async fn corrupt_selected_payload_recycles_exclusive_read() {
 
 mod coalesce;
 mod compact;
+#[cfg(all(feature = "zstd", feature = "lz4"))]
+mod compressed;
 mod cpu;
 mod flat;
 mod list;

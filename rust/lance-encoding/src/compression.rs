@@ -1563,6 +1563,24 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
         false
     }
 
+    /// Identify the independent frame format for direct admitted Arrow output.
+    /// `None` preserves the codec's ordinary admitted block path. Opting in
+    /// requires exactly the named general codec's framing and validation, with
+    /// no additional dictionary, transformation or codec-specific checks.
+    /// Identity implementations inherit their explicit direct-copy guarantee.
+    /// This is not an inline scheduling hint: compressed work stays on the CPU pool.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     encodings::physical::{binary::VariableDecoder, block::CompressionScheme}};
+    /// assert_eq!(VariableDecoder::default().direct_byte_compression(),
+    ///     Some(CompressionScheme::None));
+    /// ```
+    fn direct_byte_compression(&self) -> Option<CompressionScheme> {
+        self.supports_direct_byte_materialization()
+            .then_some(CompressionScheme::None)
+    }
+
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
 

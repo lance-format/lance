@@ -45,7 +45,7 @@ use crate::{
 };
 
 mod admitted;
-mod per_value_admitted;
+pub(crate) mod per_value_admitted;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompressionConfig {
@@ -1164,6 +1164,16 @@ impl PerValueCompressor for CompressedBufferEncoder {
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
+    fn direct_byte_compression(&self) -> Option<CompressionScheme> {
+        let scheme = self.compressor.config().scheme();
+        match scheme {
+            CompressionScheme::None | CompressionScheme::Zstd | CompressionScheme::Lz4 => {
+                Some(scheme)
+            }
+            CompressionScheme::Fsst => None,
+        }
+    }
+
     fn plan_decode(
         &self,
         data: &VariableWidthBlock,

@@ -10,7 +10,7 @@
 use arrow_buffer::Buffer;
 use lance_core::{
     Error, Result,
-    utils::allocation::{Reservation, ReservedBufferWriter},
+    utils::allocation::{Reservation, ReservedBuffer, ReservedBufferWriter},
 };
 
 use super::CompressionScheme;
@@ -20,7 +20,7 @@ use crate::{
     data::{BlockInfo, DataBlock, VariableWidthBlock},
 };
 
-fn context_bytes(scheme: CompressionScheme) -> Result<usize> {
+pub fn context_bytes(scheme: CompressionScheme) -> Result<usize> {
     match scheme {
         CompressionScheme::None => Ok(0),
         #[cfg(feature = "lz4")]
@@ -93,6 +93,75 @@ fn frame(scheme: CompressionScheme, input: &[u8]) -> Result<(&[u8], usize)> {
         _ => Err(Error::not_supported(
             "general per-value codec is not enabled",
         )),
+    }
+}
+
+/// Frame validation is shared with the block decoder; no full-page value table.
+pub fn decoded_len(scheme: CompressionScheme, input: &[u8]) -> Result<usize> {
+    Ok(frame(scheme, input)?.1)
+}
+
+/// One exclusive context for an entire direct Arrow materialization attempt.
+/// The caller must preflight final outputs and this scratch together before entry.
+pub struct FrameDecoder {
+    scheme: CompressionScheme,
+    context: ReservedBuffer,
+    #[cfg(feature = "zstd")]
+    initialized: bool,
+}
+
+impl FrameDecoder {
+    pub(crate) fn with_in<T>(
+        scheme: CompressionScheme,
+        workspace: &mut Reservation,
+        build: impl FnOnce(&mut Self, &mut Reservation) -> Result<T>,
+    ) -> Result<T> {
+        let context = workspace
+            .try_allocate(context_bytes(scheme)?)?
+            .ok_or_else(|| Error::internal("direct frame context exceeded preflight"))?;
+        let mut decoder = Self {
+            scheme,
+            context,
+            #[cfg(feature = "zstd")]
+            initialized: false,
+        };
+        let result = build(&mut decoder, workspace);
+        decoder.context.recycle(workspace)?;
+        result
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        input: &[u8],
+        output: &mut ReservedBufferWriter,
+    ) -> Result<usize> {
+        let (compressed, len) = frame(self.scheme, input)?;
+        if input.is_empty() {
+            return Ok(0);
+        }
+        match self.scheme {
+            CompressionScheme::None => output.extend_from_slice(compressed)?,
+            #[cfg(feature = "lz4")]
+            CompressionScheme::Lz4 => {
+                let start = output.initialized_mut().len();
+                output.extend_zeros(len)?;
+                super::admitted::lz4_into(compressed, &mut output.initialized_mut()[start..])?;
+            }
+            #[cfg(feature = "zstd")]
+            CompressionScheme::Zstd => zstd_append(
+                compressed,
+                len,
+                output,
+                self.context.as_mut(),
+                &mut self.initialized,
+            )?,
+            _ => {
+                return Err(Error::not_supported(
+                    "general per-value codec is not enabled",
+                ));
+            }
+        }
+        Ok(len)
     }
 }
 

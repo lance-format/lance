@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Materialize raw flat bytes without transient dense definition levels.
+//! Materialize flat raw/LZ4/Zstd bytes without transient dense definition levels.
 
 use arrow_array::{ArrayRef, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, alloc::ALIGNMENT};
@@ -9,7 +9,13 @@ use arrow_data::ArrayData;
 use lance_core::{Error, Result, utils::allocation::Reservation};
 
 use super::{super::unzip_admitted::visit, FullZipArrayInput};
-use crate::compression::MiniBlockOutputLayout;
+use crate::{
+    compression::MiniBlockOutputLayout,
+    encodings::physical::block::{
+        CompressionScheme,
+        per_value_admitted::{self, FrameDecoder},
+    },
+};
 
 struct Plan {
     rows: usize,
@@ -27,6 +33,7 @@ fn add(left: usize, right: usize) -> Result<usize> {
 
 pub(super) fn decode(
     input: &FullZipArrayInput,
+    scheme: CompressionScheme,
     workspace: &mut Reservation,
 ) -> Result<Option<ArrayRef>> {
     let mut rows = 0;
@@ -47,7 +54,7 @@ pub(super) fn decode(
                 ));
             }
             rows = add(rows, 1)?;
-            values = add(values, value.len())?;
+            values = add(values, per_value_admitted::decoded_len(scheme, value)?)?;
             nulls = add(nulls, usize::from(def != 0))?;
             Ok(())
         },
@@ -73,27 +80,33 @@ pub(super) fn decode(
         validity,
         total,
     };
-    match (width, nulls != 0) {
-        (4, false) => materialize::<4, false>(input, plan, workspace),
-        (4, true) => materialize::<4, true>(input, plan, workspace),
-        (8, false) => materialize::<8, false>(input, plan, workspace),
-        (8, true) => materialize::<8, true>(input, plan, workspace),
-        _ => Err(Error::internal(
-            "validated flat FullZip offset width changed",
-        )),
+    if add(total, per_value_admitted::context_bytes(scheme)?)? > workspace.len() {
+        return Ok(None);
     }
+    FrameDecoder::with_in(scheme, workspace, |decoder, workspace| {
+        match (width, nulls != 0) {
+            (4, false) => materialize::<4, false>(input, plan, decoder, workspace),
+            (4, true) => materialize::<4, true>(input, plan, decoder, workspace),
+            (8, false) => materialize::<8, false>(input, plan, decoder, workspace),
+            (8, true) => materialize::<8, true>(input, plan, decoder, workspace),
+            _ => Err(Error::internal(
+                "validated flat FullZip offset width changed",
+            )),
+        }
+    })
 }
 
 fn materialize<const WIDTH: usize, const HAS_NULLS: bool>(
     input: &FullZipArrayInput,
     plan: Plan,
+    decoder: &mut FrameDecoder,
     workspace: &mut Reservation,
 ) -> Result<Option<ArrayRef>> {
     let Some(mut output) = workspace.try_allocate_writer(plan.total)? else {
         return Ok(None);
     };
     // Keep offsets and validity in the initialized prefix; values are appended
-    // exactly once. Byte values need no padding or offset alignment.
+    // by the codec. Byte values need no padding or offset alignment.
     output.extend_zeros(plan.offsets + plan.validity)?;
     let mut row = 0;
     let mut written = 0;
@@ -104,8 +117,7 @@ fn materialize<const WIDTH: usize, const HAS_NULLS: bool>(
         input.count,
         0..input.count,
         |_, def, _, value| {
-            output.extend_from_slice(value)?;
-            written += value.len();
+            written += decoder.append(value, &mut output)?;
             if HAS_NULLS {
                 if def == 0 {
                     output.initialized_mut()[plan.offsets + row / 8] |= 1 << (row % 8);

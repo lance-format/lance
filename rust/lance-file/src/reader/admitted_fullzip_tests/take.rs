@@ -369,13 +369,14 @@ async fn compressed_cross_page_take_reuses_unzip_workspace(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
     #[values(false, true)] nested: bool,
+    #[values("zstd", "lz4")] compression: &str,
 ) {
     let metadata = HashMap::from([
         (
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             STRUCTURAL_ENCODING_FULLZIP.to_string(),
         ),
-        (COMPRESSION_META_KEY.to_string(), "zstd".to_string()),
+        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
     ]);
     // Independent deterministic bytes keep compressed input comparable to output.
     // Repeated strings would conceal the intermediate ownership cost.
@@ -453,7 +454,11 @@ async fn compressed_cross_page_take_reuses_unzip_workspace(
         };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),
-            CompressionScheme::CompressionAlgorithmZstd
+            if compression == "zstd" {
+                CompressionScheme::CompressionAlgorithmZstd
+            } else {
+                CompressionScheme::CompressionAlgorithmLz4
+            }
         );
     }
     let indices = (0..expected.len() as u32).collect::<Vec<_>>();

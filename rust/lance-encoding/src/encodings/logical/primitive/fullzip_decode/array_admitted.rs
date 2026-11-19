@@ -214,28 +214,27 @@ impl FullZipArrayInput {
 
     /// Consume input and decode using the remainder of its original workspace.
     /// Performs no I/O, pool dispatch or allocation wait. `None` means the entire
-    /// compound attempt must be dropped and replanned, never EOF. Flat raw byte
-    /// arrays materialize offsets, values and optional validity in one allocation,
-    /// without intermediate definition levels. One List/LargeList layer over raw
-    /// bytes similarly uses only the final parent and child allocations, without
-    /// dense repetition/definition levels. These raw paths initialize metadata
-    /// before copying values once; only complete allocations become Arrow buffers.
-    /// Deeper/compressed shapes retain the
-    /// general admitted decoder. Consumed unzip scratch returns to this workspace
+    /// compound attempt must be dropped and replanned, never EOF. Flat raw/LZ4/Zstd
+    /// byte arrays materialize offsets, values and optional validity in one allocation,
+    /// without intermediate definition levels. One List/LargeList layer over these
+    /// codecs similarly uses only the final parent and child allocations, without
+    /// dense repetition/definition levels. These paths initialize metadata
+    /// before appending decoded values; only complete allocations become Arrow buffers.
+    /// Codec context and final buffers are preflighted together in the original
+    /// workspace. Deeper shapes and other codecs retain the general admitted decoder. Consumed unzip scratch returns to this workspace
     /// only after its last shared view is gone; output aliases retain their full
     /// backing allocation.
     /// Errors consume input; previously decoded sibling columns remain the
     /// caller's responsibility. See [`FullZipScheduler::prepare_array_range_in`].
     pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<ArrayRef>> {
-        if matches!(
-            &self.scheduler.details.value_decompressor,
-            super::PerValueDecompressor::Variable(codec)
-                if codec.supports_direct_byte_materialization()
-        ) {
+        if let super::PerValueDecompressor::Variable(codec) =
+            &self.scheduler.details.value_decompressor
+            && let Some(scheme) = codec.direct_byte_compression()
+        {
             let direct = match &self.data_type {
                 DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
                     Shape::new(&self.scheduler, &self.data_type)?;
-                    Some(flat::decode(&self, workspace))
+                    Some(flat::decode(&self, scheme, workspace))
                 }
                 DataType::List(field) | DataType::LargeList(field)
                     if matches!(
@@ -247,7 +246,7 @@ impl FullZipArrayInput {
                     ) =>
                 {
                     Shape::new(&self.scheduler, &self.data_type)?;
-                    Some(list::decode(&self, workspace))
+                    Some(list::decode(&self, scheme, workspace))
                 }
                 _ => None,
             };

@@ -7,7 +7,7 @@ use arrow_schema::Field as ArrowField;
 
 use super::*;
 
-fn list_case(
+pub(super) fn list_case(
     data_type: &DataType,
     large: bool,
     nullable: bool,
