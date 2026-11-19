@@ -29,6 +29,8 @@ use crate::{
     traits::{ByteStream, Reader},
 };
 
+mod streaming;
+
 trait StaticGetRange {
     fn path(&self) -> &Path;
     fn get_range(&self) -> BoxFuture<'static, OSResult<GetResult>>;
@@ -292,20 +294,19 @@ impl Reader for CloudObjectReader {
     }
 
     fn get_stream(&self) -> BoxFuture<'_, OSResult<ByteStream>> {
-        let get_request = Arc::new(GetRequest {
+        let get_request = GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
             options: GetOptions::default(),
-        });
-        Box::pin(async move {
-            let get_request_clone = get_request.clone();
-            let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
-            Ok(get_result.into_stream())
-        })
+        };
+        Box::pin(streaming::get_stream(
+            get_request,
+            self.download_retry_count,
+        ))
     }
 
     fn get_range_stream(&self, range: Range<usize>) -> BoxFuture<'_, OSResult<ByteStream>> {
-        let get_request = Arc::new(GetRequest {
+        let get_request = GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
             options: GetOptions {
@@ -318,12 +319,11 @@ impl Reader for CloudObjectReader {
                 ),
                 ..Default::default()
             },
-        });
-        Box::pin(async move {
-            let get_request_clone = get_request.clone();
-            let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
-            Ok(get_result.into_stream())
-        })
+        };
+        Box::pin(streaming::get_stream(
+            get_request,
+            self.download_retry_count,
+        ))
     }
 }
 
@@ -654,6 +654,7 @@ impl DeepSizeOf for LazyReader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fmt::{Display, Formatter};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -669,12 +670,14 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::traits::{WriteExt, Writer};
     use crate::utils::tracking_store::{IoStats, IoTrackingStore};
 
-    /// Answers every read with a body that fails partway: the request
-    /// succeeded and the download did not. Reads are all these tests do.
+    /// Injects request failures, response metadata, and partial streaming bodies.
     #[derive(Debug)]
     struct PartialBodyStore {
+        responses: Option<Mutex<VecDeque<OSResult<GetResult>>>>,
+        request_options: Mutex<Vec<GetOptions>>,
         metadata_size: u64,
         returned_range: Option<Range<u64>>,
         body: Vec<Bytes>,
@@ -688,6 +691,8 @@ mod tests {
     impl Default for PartialBodyStore {
         fn default() -> Self {
             Self {
+                responses: None,
+                request_options: Mutex::new(Vec::new()),
                 metadata_size: 1024,
                 returned_range: None,
                 body: vec![Bytes::from(vec![7; 1024])],
@@ -725,6 +730,10 @@ mod tests {
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             let request = self.requests.fetch_add(1, Ordering::SeqCst);
+            if let Some(responses) = &self.responses {
+                self.request_options.lock().unwrap().push(options);
+                return responses.lock().unwrap().pop_front().unwrap();
+            }
             if options.head {
                 self.head_requests.fetch_add(1, Ordering::SeqCst);
             }
@@ -799,6 +808,376 @@ mod tests {
             download_retry_count,
         )
         .unwrap()
+    }
+
+    fn streaming_store(responses: Vec<OSResult<GetResult>>) -> Arc<PartialBodyStore> {
+        Arc::new(PartialBodyStore {
+            responses: Some(Mutex::new(responses.into())),
+            ..Default::default()
+        })
+    }
+
+    fn stream_response(range: Range<u64>, chunks: Vec<OSResult<Bytes>>) -> OSResult<GetResult> {
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(stream::iter(chunks).boxed()),
+            meta: ObjectMeta {
+                location: Path::from("test/data.lance"),
+                last_modified: Default::default(),
+                size: 16,
+                e_tag: Some("original-etag".into()),
+                version: Some("original-version".into()),
+            },
+            range,
+            attributes: Attributes::default(),
+            extensions: Default::default(),
+        })
+    }
+
+    fn connection_reset() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "PartialBodyStore",
+            source: "connection reset".into(),
+        }
+    }
+
+    #[rstest]
+    #[case::whole_object(None)]
+    #[case::range(Some(3..13))]
+    #[tokio::test]
+    async fn streaming_copy_resumes_at_the_first_undelivered_byte(
+        #[case] range: Option<Range<usize>>,
+        #[values(0, 4)] delivered: usize,
+        #[values(false, true)] is_truncated: bool,
+    ) {
+        let data = Bytes::from_static(b"abcdefghijklmnop");
+        let requested = range.clone().unwrap_or(0..data.len());
+        let offset = requested.start + delivered;
+        let mut partial = vec![Ok(data.slice(requested.start..offset))];
+        if !is_truncated {
+            partial.push(Err(connection_reset()));
+        }
+        let store = streaming_store(vec![
+            stream_response(requested.start as u64..requested.end as u64, partial),
+            stream_response(
+                offset as u64..requested.end as u64,
+                vec![Ok(data.slice(offset..requested.end))],
+            ),
+        ]);
+        let reader = reader(store.clone(), 1);
+        let target = crate::object_store::ObjectStore::memory();
+        let target_path = Path::from("copied");
+        let mut writer = crate::object_writer::ObjectWriter::new(&target, &target_path)
+            .await
+            .unwrap();
+        let copied = match range {
+            Some(range) => writer.copy_range_from_reader(&reader, range).await,
+            None => writer.copy_from_reader(&reader).await,
+        }
+        .unwrap();
+        writer.shutdown().await.unwrap();
+        assert_eq!(copied, requested.len());
+        assert_eq!(
+            target
+                .inner
+                .get(&target_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            data.slice(requested.clone())
+        );
+        let options = store.request_options.lock().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(
+            options[1].range,
+            Some((offset as u64..requested.end as u64).into())
+        );
+        assert_eq!(options[1].if_match.as_deref(), Some("original-etag"));
+        assert_eq!(options[1].version.as_deref(), Some("original-version"));
+    }
+
+    #[rstest]
+    #[case::no_retries(0)]
+    #[case::one_retry(1)]
+    #[case::default(3)]
+    #[case::raised(5)]
+    #[tokio::test]
+    async fn streaming_request_retries_follow_configuration(
+        #[case] retry_count: usize,
+        #[values(false, true)] is_range: bool,
+    ) {
+        let store = streaming_store((0..=retry_count).map(|_| Err(connection_reset())).collect());
+        let reader = reader(store.clone(), retry_count);
+        let result = if is_range {
+            reader.get_range_stream(3..13).await
+        } else {
+            reader.get_stream().await
+        };
+        let error = result.err().unwrap();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(error.to_string().contains("connection reset"), "{error}");
+        assert_eq!(store.requests.load(Ordering::SeqCst), retry_count + 1);
+    }
+
+    #[rstest]
+    #[case::no_retries(0)]
+    #[case::one_retry(1)]
+    #[case::default(3)]
+    #[case::raised(5)]
+    #[tokio::test]
+    async fn streaming_body_retries_are_bounded_across_delivered_chunks(
+        #[case] retry_count: usize,
+        #[values(false, true)] is_range: bool,
+    ) {
+        let start = if is_range { 3 } else { 0 };
+        let end = if is_range { 13 } else { 16 };
+        let store = streaming_store(
+            (0..=retry_count)
+                .map(|attempt| {
+                    stream_response(
+                        start + attempt as u64..end,
+                        vec![Ok(Bytes::from_static(b"a")), Err(connection_reset())],
+                    )
+                })
+                .collect(),
+        );
+        let reader = reader(store.clone(), retry_count);
+        let mut stream = if is_range {
+            reader.get_range_stream(start as usize..end as usize).await
+        } else {
+            reader.get_stream().await
+        }
+        .unwrap();
+        for _ in 0..=retry_count {
+            assert_eq!(stream.next().await.unwrap().unwrap(), "a");
+        }
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(error.to_string().contains("connection reset"), "{error}");
+        assert!(stream.next().await.is_none());
+        assert_eq!(store.requests.load(Ordering::SeqCst), retry_count + 1);
+    }
+
+    #[rstest]
+    #[case::exhausted(2, false)]
+    #[case::recovered(3, true)]
+    #[tokio::test]
+    async fn streaming_request_and_body_failures_share_one_retry_budget(
+        #[case] retry_count: usize,
+        #[case] is_recovered: bool,
+    ) {
+        let store = streaming_store(vec![
+            Err(connection_reset()),
+            stream_response(
+                0..16,
+                vec![Ok(Bytes::from_static(b"abcd")), Err(connection_reset())],
+            ),
+            Err(connection_reset()),
+            stream_response(4..16, vec![Ok(Bytes::from_static(b"efghijklmnop"))]),
+        ]);
+        let reader = reader(store.clone(), retry_count);
+        let mut stream = reader.get_stream().await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), "abcd");
+        let next = stream.next().await.unwrap();
+        if is_recovered {
+            assert_eq!(next.unwrap(), "efghijklmnop");
+        } else {
+            let error = next.unwrap_err();
+            assert!(matches!(error, object_store::Error::Generic { .. }));
+            assert!(error.to_string().contains("connection reset"), "{error}");
+        }
+        assert!(stream.next().await.is_none());
+        assert_eq!(store.requests.load(Ordering::SeqCst), retry_count + 1);
+        let options = store.request_options.lock().unwrap();
+        for options in &options[2..] {
+            assert_eq!(options.range, Some((4..16).into()));
+            assert_eq!(options.if_match.as_deref(), Some("original-etag"));
+        }
+    }
+
+    #[rstest]
+    #[case::etag_only(true, false)]
+    #[case::version_only(false, true)]
+    #[case::neither(false, false)]
+    #[tokio::test]
+    async fn streaming_resume_requires_an_object_identifier(
+        #[case] has_etag: bool,
+        #[case] has_version: bool,
+    ) {
+        let mut initial = stream_response(0..16, vec![Err(connection_reset())]).unwrap();
+        let mut resumed =
+            stream_response(0..16, vec![Ok(Bytes::from_static(b"abcdefghijklmnop"))]).unwrap();
+        for result in [&mut initial, &mut resumed] {
+            if !has_etag {
+                result.meta.e_tag = None;
+            }
+            if !has_version {
+                result.meta.version = None;
+            }
+        }
+        let store = streaming_store(vec![Ok(initial), Ok(resumed)]);
+        let reader = reader(store.clone(), 1);
+        let mut stream = reader.get_stream().await.unwrap();
+        let result = stream.next().await.unwrap();
+        if has_etag || has_version {
+            assert_eq!(result.unwrap(), "abcdefghijklmnop");
+            let options = store.request_options.lock().unwrap();
+            assert_eq!(options.len(), 2);
+            assert_eq!(options[1].if_match.is_some(), has_etag);
+            assert_eq!(options[1].version.is_some(), has_version);
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, object_store::Error::Generic { .. }));
+            assert!(
+                error.to_string().contains("without an ETag or version"),
+                "{error}"
+            );
+            assert_eq!(store.requests.load(Ordering::SeqCst), 1);
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    #[rstest]
+    #[case::etag("etag")]
+    #[case::version("version")]
+    #[case::size("size")]
+    #[case::precondition("precondition")]
+    #[tokio::test]
+    async fn streaming_resume_rejects_object_replacement(#[case] changed: &str) {
+        let mut resumed =
+            stream_response(4..16, vec![Ok(Bytes::from_static(b"NEW CONTENT!"))]).unwrap();
+        match changed {
+            "etag" => resumed.meta.e_tag = Some("replacement-etag".into()),
+            "version" => resumed.meta.version = Some("replacement-version".into()),
+            "size" => resumed.meta.size += 1,
+            "precondition" => (),
+            _ => unreachable!(),
+        }
+        let resumed = if changed == "precondition" {
+            Err(object_store::Error::Precondition {
+                path: "test/data.lance".into(),
+                source: "object changed".into(),
+            })
+        } else {
+            // Deliberately ignore the request's conditions to exercise response validation.
+            Ok(resumed)
+        };
+        let store = streaming_store(vec![
+            stream_response(
+                0..16,
+                vec![Ok(Bytes::from_static(b"abcd")), Err(connection_reset())],
+            ),
+            resumed,
+        ]);
+        let reader = reader(store.clone(), 3);
+        let mut stream = reader.get_stream().await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), "abcd");
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(error, object_store::Error::Precondition { .. }));
+        assert!(error.to_string().contains("object changed"), "{error}");
+        assert!(stream.next().await.is_none());
+        assert_eq!(store.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[rstest]
+    #[case::initial_range(false, false, "expected 0..16")]
+    #[case::resumed_range(true, false, "expected remaining range 4..16")]
+    #[case::overlong_body(false, true, "exceeds remaining range")]
+    #[tokio::test]
+    async fn streaming_rejects_inconsistent_responses(
+        #[case] is_retry: bool,
+        #[case] is_overlong: bool,
+        #[case] message: &str,
+    ) {
+        let bad_response = if is_overlong {
+            stream_response(
+                0..16,
+                vec![Ok(Bytes::from_static(b"too many bytes for this object"))],
+            )
+        } else {
+            stream_response(0..15, vec![])
+        };
+        let responses = if is_retry {
+            vec![
+                stream_response(
+                    0..16,
+                    vec![Ok(Bytes::from_static(b"abcd")), Err(connection_reset())],
+                ),
+                bad_response,
+            ]
+        } else {
+            vec![bad_response]
+        };
+        let store = streaming_store(responses);
+        let reader = reader(store.clone(), 3);
+        let error = match reader.get_stream().await {
+            Err(error) => error,
+            Ok(mut stream) => {
+                if is_retry {
+                    assert_eq!(stream.next().await.unwrap().unwrap(), "abcd");
+                }
+                let error = stream.next().await.unwrap().unwrap_err();
+                assert!(stream.next().await.is_none());
+                error
+            }
+        };
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(
+            store.requests.load(Ordering::SeqCst),
+            if is_retry { 2 } else { 1 }
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_does_not_resume_until_polled() {
+        let store = streaming_store(vec![stream_response(
+            0..16,
+            vec![Ok(Bytes::from_static(b"abcd")), Err(connection_reset())],
+        )]);
+        let reader = reader(store.clone(), 3);
+        let mut stream = reader.get_stream().await.unwrap();
+        assert_eq!(store.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(stream.next().await.unwrap().unwrap(), "abcd");
+        drop(stream);
+        assert_eq!(store.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[case::empty(b"")]
+    #[case::nonempty(b"abcdefghijklmnop")]
+    #[tokio::test]
+    async fn streaming_reads_without_retries(#[case] data: &'static [u8]) {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("test/data.lance");
+        store
+            .put(&path, Bytes::from_static(data).into())
+            .await
+            .unwrap();
+        let reader = reader(store, 0);
+        let mut stream = reader.get_stream().await.unwrap();
+        let mut actual = BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(actual.as_ref(), data);
+    }
+
+    #[tokio::test]
+    async fn streaming_does_not_retry_after_delivering_the_complete_body() {
+        let store = streaming_store(vec![stream_response(
+            0..16,
+            vec![
+                Ok(Bytes::from_static(b"abcdefghijklmnop")),
+                Err(connection_reset()),
+            ],
+        )]);
+        let reader = reader(store.clone(), 0);
+        let mut stream = reader.get_stream().await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), "abcdefghijklmnop");
+        assert!(stream.next().await.is_none());
+        assert_eq!(store.requests.load(Ordering::SeqCst), 1);
     }
 
     /// A body that stops partway is what `download_retry_count` documents, and
