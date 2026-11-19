@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::session::Session;
 
 async fn width_changes(version: LanceFileVersion) -> (Dataset, RecordBatch) {
     let values = (0..2048)
@@ -29,6 +30,10 @@ async fn width_changes(version: LanceFileVersion) -> (Dataset, RecordBatch) {
         Some(WriteParams {
             max_rows_per_file: 512,
             data_storage_version: Some(version),
+            // The two scans must pay identical metadata I/O. A shared cache
+            // would let whichever scan runs second reuse the first scan's
+            // metadata, confounding the payload reread comparison.
+            session: Some(Arc::new(Session::new(0, 0, Default::default()))),
             ..Default::default()
         }),
     )
@@ -78,13 +83,14 @@ async fn width_changes(version: LanceFileVersion) -> (Dataset, RecordBatch) {
 async fn fragment_hint_reduces_rereads_and_recovers_across_width_changes(
     #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
     #[values(false, true)] lite: bool,
+    #[values(false, true)] reset_first: bool,
 ) {
     let (dataset, expected) = width_changes(version).await;
-    let mut second_fragment_bytes = Vec::new();
+    let mut second_fragment_bytes = [0; 2];
     // The control explicitly replans at boundaries, with the same final budget.
     // It therefore forgets its history through the public API. No timing gate
     // or assertion about private growth counters is needed.
-    for reset_at_boundary in [false, true] {
+    for reset_at_boundary in [reset_first, !reset_first] {
         let scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
             SchedulerConfig {
@@ -132,7 +138,8 @@ async fn fragment_hint_reduces_rereads_and_recovers_across_width_changes(
             }
             assert_eq!(delivered, 512);
             if fragment == 1 {
-                second_fragment_bytes.push(scheduler.stats().bytes_read - before);
+                second_fragment_bytes[usize::from(reset_at_boundary)] =
+                    scheduler.stats().bytes_read - before;
             }
             if fragment == 2 {
                 assert_eq!(largest, 16, "a narrower fragment must regain the ceiling");
