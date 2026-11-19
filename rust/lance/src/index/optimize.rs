@@ -824,6 +824,15 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     Ok(Some(plan))
 }
 
+/// Tasks copy the model configuration. Overlay facts travel only with the
+/// physical segments that supply indexed rows.
+fn model_reference(mut segment: IndexMetadata) -> Result<IndexMetadata> {
+    if let Some(details) = &mut segment.index_details {
+        *details = lance_table::format::overlay::freshness::configuration_details(details)?;
+    }
+    Ok(segment)
+}
+
 /// One index as one task: the single-process optimize over every segment and
 /// every unindexed fragment, with the caller's options, and a merge that
 /// passes the result through.
@@ -849,7 +858,7 @@ async fn plan_unsplit_index(
             .iter()
             .map(|fragment| fragment.id as u32)
             .collect(),
-        reference: last.clone(),
+        reference: model_reference(last.clone())?,
         old_segments: segments.iter().map(|segment| (*segment).clone()).collect(),
         num_indices_to_merge: options.num_indices_to_merge,
         enable_partition_rebalancing: options.enable_partition_rebalancing,
@@ -1255,6 +1264,7 @@ async fn pack_split_index(
         absorbed,
         replaces,
     } = inputs;
+    let reference = model_reference(reference)?;
     // A scalar segment absorbed to shed stale postings is rewritten even
     // alone, but only alongside new data, as the single-process optimize
     // does: the deletion files outlive the rewrite, so a segment too large to
@@ -1425,16 +1435,60 @@ impl OptimizeIndexTask {
             merge_indices_with_unindexed_frags(dataset.clone(), &candidates, &fragments, &options)
                 .await?
         };
-        Ok(results.map(|results| IndexSegmentResult {
+        let Some(results) = results else {
+            return Ok(None);
+        };
+        let replaces = results
+            .removed_indices
+            .iter()
+            .map(|index| index.uuid)
+            .collect();
+        let freshness = if segment_has_vector_details(&self.reference)
+            || segment_has_inverted_details(&self.reference)
+        {
+            // A full rebuild scanned every covered fragment at this snapshot.
+            // Otherwise carry only entries from the physical segments actually consumed.
+            Some(if results.new_dataset_version == dataset.manifest.version {
+                Default::default()
+            } else {
+                let sources = &results.removed_indices;
+                let coverage = if dataset.manifest.reader_feature_flags
+                    & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+                    != 0
+                {
+                    tagged_segment_coverage(&dataset, sources, None).await?
+                } else {
+                    None
+                };
+                super::overlay_freshness::merged_overlay_freshness(
+                    &dataset,
+                    &self.reference.dependency_fields(),
+                    results.new_dataset_version,
+                    sources.iter().map(|&source| {
+                        (
+                            source,
+                            coverage
+                                .as_ref()
+                                .and_then(|map| map.get(&source.uuid))
+                                .or(source.fragment_bitmap.as_ref()),
+                        )
+                    }),
+                    &fragments,
+                )?
+            })
+        } else {
+            None
+        };
+        let mut segment = results.into_metadata(&self.reference);
+        if let Some(freshness) = freshness {
+            freshness.apply(&dataset, &mut segment).await?;
+        }
+        Ok(Some(IndexSegmentResult {
             plan_id: self.plan_id,
             read_version: self.read_version,
             group: self.group,
-            replaces: results
-                .removed_indices
-                .iter()
-                .map(|segment| segment.uuid)
-                .collect(),
-            segment: results.into_metadata(&self.reference),
+            replaces,
+            segment,
         }))
     }
 }
@@ -1563,34 +1617,46 @@ async fn merge_vector_segments(
             inputs.len()
         )));
     }
-    Ok(IndexMetadata {
+    let dataset_version = inputs
+        .iter()
+        .map(|metadata| metadata.dataset_version)
+        .min()
+        .unwrap_or(dataset.manifest.version);
+    let freshness = super::overlay_freshness::merged_overlay_freshness(
+        dataset,
+        &last.dependency_fields(),
+        dataset_version,
+        inputs
+            .iter()
+            .map(|source| (source, source.fragment_bitmap.as_ref())),
+        &[],
+    )?;
+    let details = last
+        .index_details
+        .clone()
+        .unwrap_or_else(|| Arc::new(super::vector::details::vector_index_details_default()));
+    let mut output = IndexMetadata {
         uuid,
         name: last.name.clone(),
         fields: last.fields.clone(),
         covering_fields: last.covering_fields.clone(),
-        dataset_version: inputs
-            .iter()
-            .map(|metadata| metadata.dataset_version)
-            .min()
-            .unwrap_or(dataset.manifest.version),
+        dataset_version,
         fragment_bitmap: Some(
             inputs
                 .iter()
                 .filter_map(|metadata| metadata.fragment_bitmap.clone())
                 .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap),
         ),
-        index_details: last.index_details.clone().or_else(|| {
-            Some(Arc::new(
-                super::vector::details::vector_index_details_default(),
-            ))
-        }),
+        index_details: Some(details),
         index_version: last.index_version,
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
         clustering_id: None,
         metadata: Default::default(),
-    })
+    };
+    freshness.apply(dataset, &mut output).await?;
+    Ok(output)
 }
 
 /// Commit the merged segments in one `CreateIndex` transaction.

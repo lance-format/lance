@@ -38,7 +38,8 @@ use crate::index::loading::{DatasetIndexInternalExt, load_all_indices, load_all_
 use crate::index::optimize;
 use crate::index::prewarm::{filter_index_segments_by_ids, prewarm_index_segments_by_metadata};
 use crate::index::provenance::{
-    prune_stale_segment_coverage, remap_merged_segment_coverage, replay_staged_segments,
+    CoverageCheck, prune_ranked_merge_sources, prune_stale_segment_coverage,
+    remap_merged_segment_coverage, replay_staged_segments,
 };
 use crate::index::scalar::{self, IndexDetails, index_matches_criteria};
 use crate::index::segment::{
@@ -70,6 +71,33 @@ pub(super) async fn build_index_metadata_from_segments(
         return Err(Error::invalid_input(
             "CreateIndex: at least one index segment is required".to_string(),
         ));
+    }
+
+    let mut replay_withdrawn = HashMap::new();
+    let mut check = CoverageCheck::Staged;
+    if segments
+        .iter()
+        .any(|segment| segment.dataset_version() < dataset.manifest.version)
+    {
+        // Replay the input before validating overlaps. Tagged rewrites can
+        // withdraw live coverage or translate retired fragment addresses.
+        let replayed = replay_staged_segments(
+            dataset,
+            segments
+                .into_iter()
+                .map(|s| s.into_metadata(index_name))
+                .collect(),
+        )
+        .await?;
+        segments = replayed
+            .segments
+            .into_iter()
+            .map(IntoIndexSegment::into_index_segment)
+            .collect::<Result<_>>()?;
+        if let Some(withdrawn) = replayed.fts_withdrawals {
+            check = CoverageCheck::Replayed;
+            replay_withdrawn = withdrawn;
+        }
     }
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
@@ -176,10 +204,44 @@ pub(super) async fn build_index_metadata_from_segments(
         covered_fragments |= segment.fragment_bitmap().clone();
     }
 
-    prune_stale_segment_coverage(dataset, &mut segments, false, &RoaringBitmap::new(), false)
-        .await?;
+    let mut staged_fts = HashMap::new();
+    for segment in &segments {
+        let details = segment.index_details();
+        if details.type_url.ends_with("InvertedIndexDetails")
+            && (segment.dataset_version() < dataset.manifest.version
+                || replay_withdrawn.contains_key(&segment.uuid())
+                || lance_table::format::overlay::freshness::has_overlay_freshness(details)?)
+        {
+            staged_fts.insert(
+                segment.uuid(),
+                segment.fragment_bitmap() & dataset.fragment_bitmap.as_ref(),
+            );
+        }
+    }
+    prune_stale_segment_coverage(dataset, &mut segments, check).await?;
 
-    let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
+    let staged_fts = &staged_fts;
+    let replay_withdrawn = &replay_withdrawn;
+    let new_indices = futures::stream::iter(segments.into_iter().map(|mut segment| async move {
+        if let Some(requested) = staged_fts.get(&segment.uuid()) {
+            let mut removed = requested - segment.fragment_bitmap();
+            if let Some(replayed) = replay_withdrawn.get(&segment.uuid()) {
+                removed |= replayed;
+            }
+            if !removed.is_empty() {
+                // FTS shares a prefilter across sibling segments. Once another
+                // sibling covers a withdrawn fragment, stale postings in these
+                // files would be visible again, including to BM25 scoring.
+                let withdrawn = HashMap::from([(segment.uuid(), removed)]);
+                segment = dataset
+                    .merge_staged_index_segments(
+                        vec![segment.into_metadata(index_name)],
+                        Some(withdrawn),
+                    )
+                    .await?
+                    .into_index_segment()?;
+            }
+        }
         let clustering_id = segment.clustering_id();
         let metadata = segment.metadata().clone();
         let (
@@ -240,6 +302,267 @@ pub(super) async fn build_index_metadata_from_segments(
 }
 
 impl Dataset {
+    /// Materialize the staged files, retaining source-specific withdrawals when
+    /// commit validation has already narrowed a single inverted segment.
+    async fn merge_staged_index_segments(
+        &self,
+        source_segments: Vec<IndexMetadata>,
+        withdrawn: Option<HashMap<Uuid, RoaringBitmap>>,
+    ) -> Result<IndexMetadata> {
+        validate_segment_metadata("uncommitted", &source_segments)?;
+        if let Some(segment) = source_segments
+            .iter()
+            .find(|segment| segment.dataset_version > self.manifest.version)
+        {
+            return Err(Error::invalid_input(format!(
+                "merge_existing_index_segments: segment {} was built at future dataset version {} (current version {})",
+                segment.uuid, segment.dataset_version, self.manifest.version
+            )));
+        }
+        // On a tagged table the staged segments are validated against this
+        // snapshot before anything reads their addresses or projects their
+        // coverage: a rewrite since their build may have moved their rows
+        // (fine, they translate) or rewritten an indexed column in place (the
+        // affected coverage is withdrawn). See `replay_staged_segments`.
+        let replayed = replay_staged_segments(self, source_segments).await?;
+        let mut source_segments = replayed.segments;
+        let source_dataset_version = source_segments
+            .iter()
+            .map(|segment| segment.dataset_version)
+            .min()
+            .unwrap_or(self.manifest.version);
+        let field_id = *source_segments[0].fields.first().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing field ids",
+                source_segments[0].uuid
+            ))
+        })?;
+        let expected_covering_fields = source_segments[0].covering_fields.clone();
+        for segment in &source_segments {
+            // Same rule as `build_index_metadata_from_segments`: only the
+            // keyed-field count matters here, not the exact `fields` vector,
+            // so a covered segment is not rejected outright.
+            if segment.keyed_field() != Some(field_id) {
+                return Err(Error::invalid_input(format!(
+                    "merge_existing_index_segments: segment {} was built for fields {:?} \
+                     (carried {:?}), expected keyed field [{}]",
+                    segment.uuid, segment.fields, segment.covering_fields, field_id
+                )));
+            }
+            segment.validate_covering_fields()?;
+            // Merging requires one coherent output declaration, so every
+            // input must carry the same columns (not merely the same count).
+            if segment.covering_fields != expected_covering_fields {
+                return Err(Error::invalid_input(
+                    "merge_existing_index_segments requires segments with identical fields"
+                        .to_string(),
+                ));
+            }
+        }
+        let all_vector = source_segments.iter().all(segment_has_vector_details);
+        let all_inverted = source_segments.iter().all(segment_has_inverted_details);
+        let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
+        let all_bloomfilter = source_segments.iter().all(segment_has_bloomfilter_details);
+        let all_btree = source_segments.iter().all(segment_has_btree_details);
+        let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
+        let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
+        let all_label_list = source_segments.iter().all(segment_has_label_list_details);
+        let all_rtree = source_segments.iter().all(segment_has_rtree_details);
+        let all_ngram = source_segments.iter().all(segment_has_ngram_details);
+        let all_minhashlsh = source_segments.iter().all(segment_has_minhashlsh_details);
+        if !all_vector
+            && !all_inverted
+            && !all_bitmap
+            && !all_bloomfilter
+            && !all_btree
+            && !all_fmindex
+            && !all_zonemap
+            && !all_label_list
+            && !all_rtree
+            && !all_ngram
+            && !all_minhashlsh
+        {
+            return Err(Error::invalid_input(
+                "merge_existing_index_segments requires all segments to have the same supported index type"
+                    .to_string(),
+            ));
+        }
+
+        validate_segment_params_compatible(&[], &source_segments)?;
+
+        // Before the coverage work below, which would be wasted without `geo`.
+        #[cfg(not(feature = "geo"))]
+        if all_rtree {
+            return Err(Error::not_supported(
+                "RTree segment merge requires the `geo` feature".to_string(),
+            ));
+        }
+
+        let mut withdrawn = match withdrawn {
+            Some(known) => known,
+            None if all_inverted || all_vector => {
+                prune_ranked_merge_sources(self, &mut source_segments).await?
+            }
+            None => HashMap::new(),
+        };
+        if let Some(replayed) = replayed.fts_withdrawals {
+            for (uuid, removed) in replayed {
+                *withdrawn.entry(uuid).or_default() |= removed;
+            }
+        }
+
+        // Coverage may only move with the row addresses. A scalar merge loads its
+        // sources through the reuse index as a row-address remapper, so those
+        // addresses land in the current fragment space and the coverage has to
+        // follow them.
+        //
+        // Vector is exempt because its merge cannot remap: it hands the segments
+        // to the distributed file merger with an object store and a directory,
+        // reaching no dataset and so no reuse index.
+        //
+        // Staged segments are unknown to the snapshot plan: on a tagged table
+        // they are planned here as one group and every open below uses that
+        // plan (see `frag_reuse::plan_staged_segments`).
+        let staged = if all_vector {
+            None
+        } else {
+            frag_reuse::plan_staged_segments(self, &source_segments).await?
+        };
+        // Before the staleness pass, which drops the retired fragments this remaps.
+        let staged_coverage: Vec<Option<RoaringBitmap>> = source_segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap.clone())
+            .collect();
+        let remapped_fragments = if !all_vector {
+            let index_name = source_segments[0].name.clone();
+            remap_merged_segment_coverage(self, &index_name, &mut source_segments, staged.as_ref())
+                .await?
+        } else {
+            None
+        };
+        let has_remapped_source_coverage = remapped_fragments.is_some();
+        if staged.is_none() && has_remapped_source_coverage {
+            // The untagged remapper assigns the union to all donors. A valid
+            // sibling can own a fragment whose stale postings this donor lost.
+            for segment in &mut source_segments {
+                if let Some(removed) = withdrawn.get(&segment.uuid)
+                    && let Some(coverage) = &mut segment.fragment_bitmap
+                {
+                    *coverage -= removed;
+                }
+            }
+        }
+        // A tagged history reports its remap even when every plan is the
+        // identity, so whether row addresses moved is read off the coverage.
+        let source_coverage_moved = source_segments
+            .iter()
+            .zip(&staged_coverage)
+            .any(|(segment, staged)| &segment.fragment_bitmap != staged);
+
+        if all_rtree {
+            let mut source_coverage = source_segments
+                .iter()
+                .cloned()
+                .map(IntoIndexSegment::into_index_segment)
+                .collect::<Result<Vec<_>>>()?;
+            // Only fragments the remap added are exempt.
+            let exempt = remapped_fragments.unwrap_or_default();
+            prune_stale_segment_coverage(
+                self,
+                &mut source_coverage,
+                CoverageCheck::Remapped(&exempt),
+            )
+            .await?;
+            for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {
+                source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
+            }
+        }
+
+        let merged_dataset_version = if all_rtree || has_remapped_source_coverage {
+            self.manifest.version
+        } else {
+            source_dataset_version
+        };
+
+        let mut overlay_freshness = if all_vector || all_inverted {
+            let sources =
+                source_segments
+                    .iter()
+                    .zip(&staged_coverage)
+                    .map(|(segment, original)| {
+                        // Tagged plans resolve ownership per source. The legacy remapper
+                        // copies the union onto each source, which loses that distinction.
+                        let coverage = if staged.is_some() {
+                            &segment.fragment_bitmap
+                        } else {
+                            original
+                        };
+                        (segment, coverage.as_ref())
+                    });
+            super::overlay_freshness::merged_overlay_freshness(
+                self,
+                &source_segments[0].dependency_fields(),
+                merged_dataset_version,
+                sources,
+                &[],
+            )?
+        } else {
+            Default::default()
+        };
+        let staged = staged.as_ref();
+        let mut merged_segment = if all_vector {
+            crate::index::vector::ivf::merge_segments(self, source_segments).await?
+        } else if all_inverted {
+            crate::index::scalar::inverted::merge_segments(
+                self,
+                source_segments,
+                staged,
+                !withdrawn.is_empty()
+                    || source_coverage_moved
+                    || (staged.is_none() && has_remapped_source_coverage),
+                std::mem::take(&mut overlay_freshness.refresh),
+            )
+            .await?
+        } else if all_fmindex {
+            crate::index::scalar::fmindex::merge_segments(
+                self,
+                source_segments,
+                has_remapped_source_coverage,
+                staged,
+            )
+            .await?
+        } else if all_bitmap {
+            crate::index::scalar::bitmap::merge_segments(self, source_segments, staged).await?
+        } else if all_bloomfilter {
+            crate::index::scalar::bloomfilter::merge_segments(self, source_segments, staged).await?
+        } else if all_label_list {
+            crate::index::scalar::label_list::merge_segments(self, source_segments, staged).await?
+        } else if all_zonemap {
+            crate::index::scalar::zonemap::merge_segments(self, source_segments, staged).await?
+        } else if all_ngram {
+            crate::index::scalar::ngram::merge_segments(self, source_segments, staged).await?
+        } else if all_minhashlsh {
+            crate::index::scalar::minhash_lsh::merge_segments(self, source_segments, staged).await?
+        } else if all_rtree {
+            #[cfg(feature = "geo")]
+            {
+                crate::index::scalar::rtree::merge_segments(self, source_segments, staged).await?
+            }
+            // Refused above, before the coverage work.
+            #[cfg(not(feature = "geo"))]
+            unreachable!("an RTree merge without `geo` returns before this point")
+        } else {
+            crate::index::scalar::btree::merge_segments(self, source_segments, staged).await?
+        };
+        if !all_ngram && !all_fmindex {
+            merged_segment.dataset_version = merged_dataset_version;
+        }
+        if all_vector || all_inverted {
+            overlay_freshness.apply(self, &mut merged_segment).await?;
+        }
+        Ok(merged_segment)
+    }
+
     /// Whether an otherwise empty commit would record a new MemWAL catch-up
     /// position.
     ///
@@ -658,198 +981,8 @@ impl DatasetIndexExt for Dataset {
         &self,
         source_segments: Vec<IndexMetadata>,
     ) -> Result<IndexMetadata> {
-        validate_segment_metadata("uncommitted", &source_segments)?;
-        if let Some(segment) = source_segments
-            .iter()
-            .find(|segment| segment.dataset_version > self.manifest.version)
-        {
-            return Err(Error::invalid_input(format!(
-                "merge_existing_index_segments: segment {} was built at future dataset version {} (current version {})",
-                segment.uuid, segment.dataset_version, self.manifest.version
-            )));
-        }
-        // On a tagged table the staged segments are validated against this
-        // snapshot before anything reads their addresses or projects their
-        // coverage: a rewrite since their build may have moved their rows
-        // (fine, they translate) or rewritten an indexed column in place (the
-        // affected coverage is withdrawn). See `replay_staged_segments`.
-        let source_segments = replay_staged_segments(self, source_segments).await?;
-        let mut source_segments = source_segments;
-        let source_dataset_version = source_segments
-            .iter()
-            .map(|segment| segment.dataset_version)
-            .min()
-            .unwrap_or(self.manifest.version);
-        let field_id = *source_segments[0].fields.first().ok_or_else(|| {
-            Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing field ids",
-                source_segments[0].uuid
-            ))
-        })?;
-        let expected_covering_fields = source_segments[0].covering_fields.clone();
-        for segment in &source_segments {
-            // Same rule as `build_index_metadata_from_segments`: only the
-            // keyed-field count matters here, not the exact `fields` vector,
-            // so a covered segment is not rejected outright.
-            if segment.keyed_field() != Some(field_id) {
-                return Err(Error::invalid_input(format!(
-                    "merge_existing_index_segments: segment {} was built for fields {:?} \
-                     (carried {:?}), expected keyed field [{}]",
-                    segment.uuid, segment.fields, segment.covering_fields, field_id
-                )));
-            }
-            segment.validate_covering_fields()?;
-            // Merging requires one coherent output declaration, so every
-            // input must carry the same columns (not merely the same count).
-            if segment.covering_fields != expected_covering_fields {
-                return Err(Error::invalid_input(
-                    "merge_existing_index_segments requires segments with identical fields"
-                        .to_string(),
-                ));
-            }
-        }
-        let all_vector = source_segments.iter().all(segment_has_vector_details);
-        let all_inverted = source_segments.iter().all(segment_has_inverted_details);
-        let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
-        let all_bloomfilter = source_segments.iter().all(segment_has_bloomfilter_details);
-        let all_btree = source_segments.iter().all(segment_has_btree_details);
-        let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
-        let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
-        let all_label_list = source_segments.iter().all(segment_has_label_list_details);
-        let all_rtree = source_segments.iter().all(segment_has_rtree_details);
-        let all_ngram = source_segments.iter().all(segment_has_ngram_details);
-        let all_minhashlsh = source_segments.iter().all(segment_has_minhashlsh_details);
-        if !all_vector
-            && !all_inverted
-            && !all_bitmap
-            && !all_bloomfilter
-            && !all_btree
-            && !all_fmindex
-            && !all_zonemap
-            && !all_label_list
-            && !all_rtree
-            && !all_ngram
-            && !all_minhashlsh
-        {
-            return Err(Error::invalid_input(
-                "merge_existing_index_segments requires all segments to have the same supported index type"
-                    .to_string(),
-            ));
-        }
-
-        validate_segment_params_compatible(&[], &source_segments)?;
-
-        // Before the coverage work below, which would be wasted without `geo`.
-        #[cfg(not(feature = "geo"))]
-        if all_rtree {
-            return Err(Error::not_supported(
-                "RTree segment merge requires the `geo` feature".to_string(),
-            ));
-        }
-
-        // Coverage may only move with the row addresses. A scalar merge loads its
-        // sources through the reuse index as a row-address remapper, so those
-        // addresses land in the current fragment space and the coverage has to
-        // follow them.
-        //
-        // Vector is exempt because its merge cannot remap: it hands the segments
-        // to the distributed file merger with an object store and a directory,
-        // reaching no dataset and so no reuse index.
-        //
-        // Staged segments are unknown to the snapshot plan: on a tagged table
-        // they are planned here as one group and every open below uses that
-        // plan (see `frag_reuse::plan_staged_segments`).
-        let staged = if all_vector {
-            None
-        } else {
-            frag_reuse::plan_staged_segments(self, &source_segments).await?
-        };
-        // Before the staleness pass, which drops the retired fragments this remaps.
-        let staged_coverage: Vec<Option<RoaringBitmap>> = source_segments
-            .iter()
-            .map(|segment| segment.fragment_bitmap.clone())
-            .collect();
-        let remapped_fragments = if !all_vector {
-            let index_name = source_segments[0].name.clone();
-            remap_merged_segment_coverage(self, &index_name, &mut source_segments, staged.as_ref())
-                .await?
-        } else {
-            None
-        };
-        let has_remapped_source_coverage = remapped_fragments.is_some();
-        // A tagged history reports its remap even when every plan is the
-        // identity, so whether row addresses moved is read off the coverage.
-        let source_coverage_moved = source_segments
-            .iter()
-            .zip(&staged_coverage)
-            .any(|(segment, staged)| &segment.fragment_bitmap != staged);
-
-        if all_rtree {
-            let mut source_coverage = source_segments
-                .iter()
-                .cloned()
-                .map(IntoIndexSegment::into_index_segment)
-                .collect::<Result<Vec<_>>>()?;
-            // Only fragments the remap added are exempt.
-            let exempt = remapped_fragments.unwrap_or_default();
-            prune_stale_segment_coverage(self, &mut source_coverage, true, &exempt, true).await?;
-            for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {
-                source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
-            }
-        }
-
-        let merged_dataset_version = if all_rtree || has_remapped_source_coverage {
-            self.manifest.version
-        } else {
-            source_dataset_version
-        };
-
-        let staged = staged.as_ref();
-        let mut merged_segment = if all_vector {
-            crate::index::vector::ivf::merge_segments(self, source_segments).await?
-        } else if all_inverted {
-            crate::index::scalar::inverted::merge_segments(
-                self,
-                source_segments,
-                staged,
-                source_coverage_moved,
-            )
-            .await?
-        } else if all_fmindex {
-            crate::index::scalar::fmindex::merge_segments(
-                self,
-                source_segments,
-                has_remapped_source_coverage,
-                staged,
-            )
-            .await?
-        } else if all_bitmap {
-            crate::index::scalar::bitmap::merge_segments(self, source_segments, staged).await?
-        } else if all_bloomfilter {
-            crate::index::scalar::bloomfilter::merge_segments(self, source_segments, staged).await?
-        } else if all_label_list {
-            crate::index::scalar::label_list::merge_segments(self, source_segments, staged).await?
-        } else if all_zonemap {
-            crate::index::scalar::zonemap::merge_segments(self, source_segments, staged).await?
-        } else if all_ngram {
-            crate::index::scalar::ngram::merge_segments(self, source_segments, staged).await?
-        } else if all_minhashlsh {
-            crate::index::scalar::minhash_lsh::merge_segments(self, source_segments, staged).await?
-        } else if all_rtree {
-            #[cfg(feature = "geo")]
-            {
-                crate::index::scalar::rtree::merge_segments(self, source_segments, staged).await?
-            }
-            // Refused above, before the coverage work.
-            #[cfg(not(feature = "geo"))]
-            unreachable!("an RTree merge without `geo` returns before this point")
-        } else {
-            crate::index::scalar::btree::merge_segments(self, source_segments, staged).await?
-        };
-        if !all_ngram && !all_fmindex {
-            merged_segment.dataset_version = merged_dataset_version;
-        }
-        Ok(merged_segment)
+        self.merge_staged_index_segments(source_segments, None)
+            .await
     }
 
     async fn commit_existing_index_segments(
@@ -896,24 +1029,6 @@ impl DatasetIndexExt for Dataset {
                 ));
             }
         }
-        // On a tagged table the segments are first validated against this
-        // snapshot (`replay_staged_segments`): a rewrite since their build
-        // keeps their provenance translating, an in-place column rewrite
-        // withdraws the affected coverage, a rewrite they cannot be carried
-        // across says to rebuild. The commit then reads from this snapshot,
-        // and the commit loop carries the segments across anything newer
-        // through the same rules.
-        let segments = replay_staged_segments(
-            self,
-            segments
-                .into_iter()
-                .map(|segment| segment.into_metadata(index_name))
-                .collect(),
-        )
-        .await?
-        .into_iter()
-        .map(IntoIndexSegment::into_index_segment)
-        .collect::<Result<Vec<_>>>()?;
         let new_indices =
             build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
         validate_segment_metadata(index_name, &new_indices)?;

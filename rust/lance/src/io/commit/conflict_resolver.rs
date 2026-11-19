@@ -23,7 +23,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
-use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
+use lance_table::format::overlay::staleness::field_affects_index;
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
@@ -473,18 +473,29 @@ impl UntaggedReuse {
         groups: &[RewriteGroup],
         indices: &mut [IndexMetadata],
     ) -> bool {
+        let mut freshness_by_segment = HashMap::new();
         for group in groups {
+            if group
+                .old_fragments
+                .iter()
+                .all(|fragment| fragment.overlays.is_empty())
+            {
+                continue;
+            }
             for index in indices.iter_mut() {
                 let dependency_fields = index.dependency_fields();
+                let freshness = freshness_by_segment.entry(index.uuid).or_insert_with(|| {
+                    lance_table::format::overlay::freshness::OverlayFreshness::read(index)
+                        .unwrap_or_default()
+                });
                 let folded = group.old_fragments.iter().any(|fragment| {
-                    fragment.overlays.iter().any(|overlay| {
-                        overlay_affects_index(
-                            overlay,
-                            &dependency_fields,
-                            index.dataset_version,
-                            &self.manifest.schema,
-                        )
-                    })
+                    lance_table::format::overlay::staleness::fragment_has_stale_overlay(
+                        fragment,
+                        &dependency_fields,
+                        index.dataset_version,
+                        freshness,
+                        &self.manifest.schema,
+                    )
                 });
                 if !folded {
                     continue;

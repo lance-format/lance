@@ -668,6 +668,7 @@ impl Transaction {
         groups: &[RewriteGroup],
         schema: &Schema,
     ) {
+        let mut freshness_by_segment = HashMap::new();
         for group in groups {
             // field id -> newest overlay committed_version supplying that field
             let mut overlaid_field_versions: HashMap<i32, u64> = HashMap::new();
@@ -702,7 +703,27 @@ impl Transaction {
                             overlay_version > index.dataset_version
                                 && field_affects_index(field_id, &dependency_fields, schema)
                         });
-                if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                if !is_stale {
+                    continue;
+                }
+                let freshness = freshness_by_segment.entry(index.uuid).or_insert_with(|| {
+                    crate::format::overlay::freshness::OverlayFreshness::read(index)
+                        .unwrap_or_default()
+                });
+                if !freshness.is_empty()
+                    && !group.old_fragments.iter().any(|fragment| {
+                        crate::format::overlay::staleness::fragment_has_stale_overlay(
+                            fragment,
+                            &dependency_fields,
+                            index.dataset_version,
+                            freshness,
+                            schema,
+                        )
+                    })
+                {
+                    continue;
+                }
+                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                     for id in &fragment_ids {
                         fragment_bitmap.remove(*id);
                     }
@@ -990,6 +1011,12 @@ impl Transaction {
                 .iter()
                 .any(|replacement| replacement.old_id != replacement.new_id)
             {
+                if replacements.len() == 1 && replacement.base_id.is_some() {
+                    crate::format::overlay::freshness::OverlayFreshness::relocate_to_local(
+                        &mut replacement,
+                        false,
+                    )?;
+                }
                 replacement.base_id = None;
             }
             // Independent remaps preserve the source's historical metadata. Only

@@ -25,6 +25,7 @@ pub(crate) mod loading;
 pub mod mem_wal;
 pub(crate) mod memory_progress;
 pub mod optimize;
+pub(crate) mod overlay_freshness;
 pub mod prefilter;
 mod prewarm;
 pub(crate) mod provenance;

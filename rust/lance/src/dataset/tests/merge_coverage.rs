@@ -37,8 +37,10 @@ use crate::dataset::{
     WriteDestination, WriteParams,
 };
 use crate::index::{
-    CreateIndexBuilder, DatasetIndexExt, IntoIndexSegment, provenance::fresh_fragments,
-    provenance::prune_stale_segment_coverage, vector::details::vector_index_details_default,
+    CreateIndexBuilder, DatasetIndexExt, IntoIndexSegment,
+    provenance::fresh_fragments,
+    provenance::{CoverageCheck, prune_stale_segment_coverage},
+    vector::details::vector_index_details_default,
 };
 use crate::utils::test::compact_into_two;
 #[cfg(feature = "geo")]
@@ -2096,15 +2098,9 @@ impl SegmentFreshnessCheck {
         match self {
             Self::PruneStaleSegmentCoverage => {
                 let mut segments = [segment.into_index_segment().unwrap()];
-                prune_stale_segment_coverage(
-                    dataset,
-                    &mut segments,
-                    false,
-                    &RoaringBitmap::new(),
-                    false,
-                )
-                .await
-                .unwrap();
+                prune_stale_segment_coverage(dataset, &mut segments, CoverageCheck::Staged)
+                    .await
+                    .unwrap();
                 !segments[0].fragment_bitmap().contains(0)
             }
             Self::FreshFragments => {

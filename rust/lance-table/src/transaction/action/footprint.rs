@@ -18,6 +18,7 @@
 
 use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::format::key_existence::KeyExistenceFilter;
+use crate::format::overlay::freshness::index_configuration;
 use crate::transaction::UpdateMap;
 use lance_core::datatypes::{Field, Schema};
 use roaring::RoaringTreemap;
@@ -428,19 +429,37 @@ struct IndexClaim {
 /// What an index is, for the purpose of deciding whether two writers are
 /// building the same one.
 ///
-/// Keyed fields, carried fields, and the index details compared byte for byte.
-/// `lance-table` cannot tell which details matter to a query, so any
-/// difference counts; a conflict is only a retry, so being strict costs
-/// little. The apply-time segment check is looser, since its rejections are
-/// permanent. The index version is left out: a newer library may write
-/// segments of the same index.
-#[derive(Debug, Clone, PartialEq)]
+/// Keyed fields, carried fields, and the encoded index configuration.
+/// Physical overlay coverage belongs to each individual segment. Other
+/// configuration differences count as conflicts. Apply-time rejections are
+/// permanent and use a looser check. A newer library may write segments of
+/// the same index, so the index version is excluded.
+#[derive(Debug, Clone)]
 pub(super) struct IndexIdentity {
     pub fields: Vec<FieldRef>,
     /// Which of `fields` are merely carried: two writers that disagree about
     /// this disagree about what the index answers for, not just what it holds.
     pub covering_fields: Vec<FieldRef>,
     pub index_details: Option<Arc<prost_types::Any>>,
+}
+
+impl PartialEq for IndexIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        if self.fields != other.fields || self.covering_fields != other.covering_fields {
+            return false;
+        }
+        match (&self.index_details, &other.index_details) {
+            (None, None) => true,
+            (Some(left), Some(right)) if left.type_url == right.type_url => {
+                Arc::ptr_eq(left, right)
+                    || match (index_configuration(left), index_configuration(right)) {
+                        (Ok(left), Ok(right)) => left == right,
+                        _ => left == right,
+                    }
+            }
+            _ => false,
+        }
+    }
 }
 
 impl IndexClaim {

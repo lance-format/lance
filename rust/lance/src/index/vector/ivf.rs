@@ -3125,16 +3125,18 @@ async fn merge_segments_inner(
         })?;
         fragment_bitmap |= source_fragment_bitmap.clone();
     }
-    let mut index_details = crate::index::vector::details::vector_index_details_default();
+    let mut index_details = None;
     for segment in &segments {
-        if let Some(details) = segment.index_details.as_deref() {
-            let details = details.clone();
-            if !details.value.is_empty() {
-                index_details = details;
+        if let Some(details) = &segment.index_details {
+            let config = lance_table::format::overlay::freshness::configuration_details(details)?;
+            if !config.value.is_empty() {
+                index_details = Some(config);
                 break;
             }
         }
     }
+    let index_details = index_details
+        .unwrap_or_else(|| Arc::new(crate::index::vector::details::vector_index_details_default()));
 
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
@@ -3152,7 +3154,7 @@ async fn merge_segments_inner(
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(index_details)),
+        index_details: Some(index_details),
         index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,

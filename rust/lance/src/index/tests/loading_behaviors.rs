@@ -383,6 +383,23 @@ async fn test_legacy_vector_index_details_inferred_on_load_and_migration() {
     // Simulate a legacy dataset by clearing details from the manifest.
     // Write a new manifest with empty VectorIndexDetails value bytes.
     let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+    let mut sibling = indices[0].clone();
+    sibling.uuid = uuid::Uuid::new_v4();
+    let sibling_details = Arc::make_mut(sibling.index_details.as_mut().unwrap());
+    lance_table::format::overlay::freshness::set_overlay_freshness(
+        sibling_details,
+        vec![lance_table::format::pb::IndexOverlayFreshness {
+            fragment_id: 0,
+            source_versions: vec![2],
+            overlays: vec![lance_table::format::pb::IndexedDataOverlay {
+                committed_version: 2,
+                path: "patch.lance".into(),
+                base_id: None,
+            }],
+        }],
+        None,
+    )
+    .unwrap();
     for idx in &mut indices {
         if let Some(details) = idx.index_details.as_ref()
             && details.type_url.ends_with("VectorIndexDetails")
@@ -390,6 +407,9 @@ async fn test_legacy_vector_index_details_inferred_on_load_and_migration() {
             idx.index_details = Some(Arc::new(vector_index_details_default()));
         }
     }
+    let mut siblings = [indices[0].clone(), sibling.clone()];
+    crate::index::vector::details::infer_missing_vector_details(&dataset, &mut siblings).await;
+    assert_eq!(siblings[1].index_details, sibling.index_details);
     // Write back via a no-op commit that carries the cleared indices.
     // We commit by doing a delete("false") after replacing the cached indices.
     dataset.index_cache.clear().await;

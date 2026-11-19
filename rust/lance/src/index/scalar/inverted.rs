@@ -26,7 +26,8 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{IndexFile, IndexStore, index_files_to_table};
+use lance_index::scalar::{IndexFile, IndexStore, ScalarIndex, index_files_to_table};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -961,7 +962,7 @@ fn single_segment_keeps_row_addresses(
 async fn promote_finalized_segment(
     dataset: &Dataset,
     segment: &IndexMetadata,
-    details: InvertedIndexDetails,
+    inferred_posting_format: Option<u32>,
 ) -> Result<IndexMetadata> {
     let files = match finalize_segment_files_if_needed(dataset, segment).await? {
         Some(files) => files,
@@ -975,14 +976,23 @@ async fn promote_finalized_segment(
                 .collect()
         }
     };
-    let details_any = prost_types::Any::from_msg(&details).map_err(|error| {
-        Error::io(format!(
-            "failed to encode InvertedIndexDetails payload: {error}"
-        ))
-    })?;
+    let mut index_details = segment.index_details.clone();
+    if let Some(version) = inferred_posting_format {
+        // The files keep their original configuration, including fields written
+        // by a newer producer. Append just the missing posting format.
+        let supplement = InvertedIndexDetails {
+            posting_format_version: Some(version),
+            ..Default::default()
+        };
+        if let Some(details) = &mut index_details {
+            supplement.encode(&mut Arc::make_mut(details).value)?;
+        } else {
+            index_details = Some(Arc::new(prost_types::Any::from_msg(&supplement)?));
+        }
+    }
     Ok(IndexMetadata {
         dataset_version: dataset.manifest.version,
-        index_details: Some(Arc::new(details_any)),
+        index_details,
         files: Some(index_files_to_table(files)),
         ..segment.clone()
     })
@@ -994,6 +1004,7 @@ pub(crate) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
     source_coverage_moved: bool,
+    mut refresh: RowAddrTreeMap,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -1007,24 +1018,28 @@ pub(crate) async fn merge_segments(
     })?;
     let details = match segments[0].index_details.as_ref() {
         Some(details_any) => {
-            let details =
-                InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
-                    Error::io(format!(
-                        "failed to decode InvertedIndexDetails payload: {error}"
-                    ))
-                })?;
-            normalize_inverted_details(&segments[0], details)?
+            InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails payload: {error}"
+                ))
+            })?
         }
-        None => normalize_inverted_details(&segments[0], InvertedIndexDetails::default())?,
+        None => InvertedIndexDetails::default(),
     };
+    let needs_posting_format = details.posting_format_version.is_none();
+    let details = normalize_inverted_details(&segments[0], details)?;
     let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
     let resolved = resolve_fts_field_by_id(dataset.schema(), field_id, document_granularity)?;
     load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
 
     if let [segment] = segments.as_slice()
+        && refresh.is_empty()
         && single_segment_keeps_row_addresses(staged, &segment.uuid, source_coverage_moved)
     {
-        return promote_finalized_segment(dataset, segment, details).await;
+        let inferred = details
+            .posting_format_version
+            .filter(|_| needs_posting_format);
+        return promote_finalized_segment(dataset, segment, inferred).await;
     }
 
     let mut source_indices = Vec::with_capacity(segments.len());
@@ -1069,15 +1084,42 @@ pub(crate) async fn merge_segments(
     // fragments it covers, so a stale posting for a row that moved into another
     // source's fragment is not carried into the merged segment.
     let segment_refs = segments.iter().collect::<Vec<_>>();
-    let (_, old_data_filters) =
+    let (_, mut old_data_filters) =
         crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
             .await?;
 
+    if !refresh.is_empty() {
+        refresh.retain_fragments(fragment_bitmap.iter());
+    }
+    let updates = if refresh.is_empty() {
+        empty_inverted_update_stream(dataset, &resolved)?
+    } else {
+        // The remap needs a current address watermark. Refresh only the rows
+        // whose old postings that watermark would otherwise admit.
+        let rows = if dataset.manifest().uses_stable_row_ids() {
+            crate::dataset::rowids::translate_addr_treemap_to_row_ids(dataset, &refresh).await?
+        } else {
+            refresh
+        };
+        for filter in &mut old_data_filters {
+            *filter = crate::index::append::block_stale_rows(dataset, filter.take(), &rows);
+        }
+        super::load_fts_training_data(
+            dataset,
+            &resolved,
+            &source_indices[0].update_criteria().data_criteria,
+            Some(super::TrainingRows::Rows(rows)),
+            true,
+            None,
+            source_indices[0].params(),
+        )
+        .await?
+    };
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
-        empty_inverted_update_stream(dataset, &resolved)?,
+        updates,
         &new_store,
         &old_data_filters,
         lance_index::progress::noop_progress(),
@@ -1547,8 +1589,11 @@ mod tests {
     /// A single staged intermediate covering every fragment is finalized in
     /// place and committed under its own uuid (ENT-1419 kept: the root
     /// metadata exists), with no second copy of the index.
+    #[rstest::rstest]
+    #[case::explicit_posting_format(true)]
+    #[case::inferred_posting_format(false)]
     #[tokio::test]
-    async fn test_single_intermediate_is_promoted_in_place() {
+    async fn test_single_intermediate_is_promoted_in_place(#[case] has_posting_format: bool) {
         use futures::TryStreamExt;
         use lance_core::utils::tempfile::TempStrDir;
         use lance_index::IndexType;
@@ -1565,13 +1610,23 @@ mod tests {
         let params = InvertedIndexParams::default()
             .num_workers(2)
             .memory_limit_mb(1);
-        let segment = dataset
+        let mut segment = dataset
             .create_index_builder(&["text"], IndexType::Inverted, &params)
             .name("text_idx".to_string())
             .fragments(fragment_ids)
             .execute_uncommitted()
             .await
             .unwrap();
+        let source = Arc::make_mut(segment.index_details.as_mut().unwrap());
+        let mut config = InvertedIndexDetails::decode(source.value.as_slice()).unwrap();
+        let posting_format = config.posting_format_version.unwrap();
+        if !has_posting_format {
+            config.posting_format_version = None;
+            source.value = config.encode_to_vec();
+        }
+        // This producer uses a different type URL prefix and a field unknown to this reader.
+        source.type_url = "type.googleapis.com/lance.table.InvertedIndexDetails".into();
+        source.value.extend_from_slice(&[0xc2, 0x02, 1, b'x']); // length-delimited field 40
         let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
         let staged_paths = dataset
             .object_store
@@ -1645,6 +1700,20 @@ mod tests {
         let committed = dataset.load_indices().await.unwrap();
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].uuid, segment.uuid);
+        let stored = committed[0].index_details.as_deref().unwrap();
+        let source = segment.index_details.as_deref().unwrap();
+        assert_eq!(stored.type_url, source.type_url);
+        if has_posting_format {
+            assert_eq!(stored.value, source.value);
+        } else {
+            assert!(stored.value.starts_with(&source.value));
+            assert_eq!(
+                InvertedIndexDetails::decode(stored.value.as_slice())
+                    .unwrap()
+                    .posting_format_version,
+                Some(posting_format)
+            );
+        }
 
         // Reference: the same column indexed in one committed build.
         let reference_dir = TempStrDir::default();

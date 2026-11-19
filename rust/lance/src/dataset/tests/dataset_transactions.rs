@@ -5049,35 +5049,51 @@ mod composite {
         assert_eq!(index_coverage(&dataset, "shared").await, vec![0, 1]);
     }
 
-    /// Concurrent writers extending one index must agree on its details byte
-    /// for byte, since `lance-table` cannot tell which ones matter to a query.
-    /// A training knob chosen per build is enough to conflict.
+    /// A training knob is part of the shared configuration, while incorporated
+    /// overlays belong to the physical segment being attached.
     #[rstest::rstest]
-    #[case::identical_details(1024, false)]
-    #[case::different_target_partition_size(4096, true)]
+    #[case::identical_details(1024, false, false)]
+    #[case::different_overlays(1024, true, false)]
+    #[case::different_target_partition_size(4096, true, true)]
     #[tokio::test]
     async fn test_concurrent_segments_of_one_index_must_share_details(
         #[case] their_target_partition_size: u64,
+        #[case] has_overlay: bool,
         #[case] conflicts: bool,
     ) {
-        let details = |target_partition_size: u64| {
-            Some(Arc::new(
-                prost_types::Any::from_msg(&VectorIndexDetails {
-                    metric_type: VectorMetricType::L2.into(),
-                    target_partition_size,
-                    hnsw_index_config: None,
-                    compression: Some(Compression::Flat(FlatCompression {})),
-                    runtime_hints: Default::default(),
-                })
-                .unwrap(),
-            ))
+        let details = |target_partition_size: u64, has_overlay: bool| {
+            let mut details = prost_types::Any::from_msg(&VectorIndexDetails {
+                metric_type: VectorMetricType::L2.into(),
+                target_partition_size,
+                hnsw_index_config: None,
+                compression: Some(Compression::Flat(FlatCompression {})),
+                runtime_hints: Default::default(),
+            })
+            .unwrap();
+            if has_overlay {
+                lance_table::format::overlay::freshness::set_overlay_freshness(
+                    &mut details,
+                    vec![lance_table::format::pb::IndexOverlayFreshness {
+                        fragment_id: 1,
+                        source_versions: vec![2],
+                        overlays: vec![lance_table::format::pb::IndexedDataOverlay {
+                            committed_version: 2,
+                            path: "delta.lance".into(),
+                            base_id: None,
+                        }],
+                    }],
+                    None,
+                )
+                .unwrap();
+            }
+            Some(Arc::new(details))
         };
         let dataset = test_dataset(false).await;
         let stale = Arc::new(dataset.clone());
         commit(
             dataset,
             vec![Action::AddIndexSegment(AddIndexSegment {
-                index_details: details(1024),
+                index_details: details(1024, false),
                 ..index_segment("shared", vec![Ref::Committed(0)])
             })],
         )
@@ -5086,7 +5102,7 @@ mod composite {
         let result = commit_from_stale(
             stale,
             vec![Action::AddIndexSegment(AddIndexSegment {
-                index_details: details(their_target_partition_size),
+                index_details: details(their_target_partition_size, has_overlay),
                 ..index_segment("shared", vec![Ref::Committed(1)])
             })],
         )

@@ -19,6 +19,7 @@ use lance_core::datatypes::Schema;
 use roaring::RoaringBitmap;
 
 use crate::format::overlay::DataOverlayFile;
+use crate::format::overlay::freshness::OverlayFreshness;
 use crate::format::{Fragment, IndexMetadata};
 
 /// The physical offsets within a fragment whose value for an indexed field may be
@@ -38,11 +39,23 @@ pub fn overlay_exclusion_offsets(
     index_version: u64,
     schema: &Schema,
 ) -> Result<RoaringBitmap> {
+    stale_overlay_offsets(
+        overlays
+            .iter()
+            .filter(|overlay| overlay.committed_version > index_version),
+        indexed_field_ids,
+        schema,
+    )
+}
+
+/// Collect the affected offsets from overlays already classified as stale for this segment.
+pub fn stale_overlay_offsets<'a>(
+    overlays: impl Iterator<Item = &'a DataOverlayFile>,
+    indexed_field_ids: &[i32],
+    schema: &Schema,
+) -> Result<RoaringBitmap> {
     let mut excluded = RoaringBitmap::new();
     for overlay in overlays {
-        if overlay.committed_version <= index_version {
-            continue;
-        }
         for (field_pos, field_id) in overlay.data_file.fields.iter().enumerate() {
             let affects_index = field_affects_index(*field_id, indexed_field_ids, schema);
             if affects_index {
@@ -82,23 +95,39 @@ pub fn field_affects_index(field_id: i32, indexed_field_ids: &[i32], schema: &Sc
     })
 }
 
-// Stale row offsets contributed by one fragment's overlays for a given index version.
-// Applies a cheap version gate first: if every overlay predates the segment it is already
-// incorporated by the index, so there is nothing stale and the field/bitmap work is skipped.
+/// Whether folding this fragment's overlays into base data would leave stale index entries.
+pub fn fragment_has_stale_overlay(
+    fragment: &Fragment,
+    fields: &[i32],
+    version: u64,
+    freshness: &OverlayFreshness,
+    schema: &Schema,
+) -> bool {
+    fragment.overlays.iter().any(|overlay| {
+        freshness.is_stale(fragment.id as u32, overlay, version)
+            && overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|&field| field >= 0 && field_affects_index(field, fields, schema))
+    })
+}
+
 fn stale_offsets_for_fragment(
     fragment: &Fragment,
     fields: &[i32],
     index_version: u64,
+    freshness: &OverlayFreshness,
     schema: &Schema,
 ) -> Result<RoaringBitmap> {
-    if fragment
-        .overlays
-        .iter()
-        .all(|o| o.committed_version <= index_version)
-    {
-        return Ok(RoaringBitmap::new());
-    }
-    overlay_exclusion_offsets(&fragment.overlays, fields, index_version, schema)
+    stale_overlay_offsets(
+        fragment
+            .overlays
+            .iter()
+            .filter(|o| freshness.is_stale(fragment.id as u32, o, index_version)),
+        fields,
+        schema,
+    )
 }
 
 // A missing `fragment_bitmap` means the index predates fragment-bitmap tracking; treat it as
@@ -134,12 +163,34 @@ pub fn collect_overlay_stale_frags(
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
     let fields = segment.dependency_fields();
-    for (&frag_id, fragment) in overlaid_frags {
-        if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
+    let covered = overlaid_frags.iter().filter(|(id, frag)| {
+        covers_fragment(coverage, **id)
+            && frag
+                .overlays
+                .last()
+                .is_some_and(|o| o.committed_version > segment.dataset_version)
+    });
+    if !covered.clone().any(|(_, fragment)| {
+        fragment
+            .overlays
+            .iter()
+            .any(|overlay| overlay_affects_index(overlay, &fields, segment.dataset_version, schema))
+    }) {
+        return Ok(());
+    }
+    let freshness = OverlayFreshness::read(segment)?;
+    for (&frag_id, fragment) in covered {
+        if stale.contains(frag_id) {
             continue;
         }
-        if !stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?
-            .is_empty()
+        if !stale_offsets_for_fragment(
+            fragment,
+            &fields,
+            segment.dataset_version,
+            &freshness,
+            schema,
+        )?
+        .is_empty()
         {
             stale.insert(frag_id);
         }
@@ -162,12 +213,30 @@ pub fn collect_overlay_stale_rows_for_segment(
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
     let fields = segment.dependency_fields();
-    for (&frag_id, fragment) in overlaid_frags {
-        if !covers_fragment(coverage, frag_id) {
-            continue;
-        }
-        let excluded =
-            stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?;
+    let covered = overlaid_frags.iter().filter(|(id, frag)| {
+        covers_fragment(coverage, **id)
+            && frag
+                .overlays
+                .last()
+                .is_some_and(|o| o.committed_version > segment.dataset_version)
+    });
+    if !covered.clone().any(|(_, fragment)| {
+        fragment
+            .overlays
+            .iter()
+            .any(|overlay| overlay_affects_index(overlay, &fields, segment.dataset_version, schema))
+    }) {
+        return Ok(());
+    }
+    let freshness = OverlayFreshness::read(segment)?;
+    for (&frag_id, fragment) in covered {
+        let excluded = stale_offsets_for_fragment(
+            fragment,
+            &fields,
+            segment.dataset_version,
+            &freshness,
+            schema,
+        )?;
         if !excluded.is_empty() {
             *stale.entry(frag_id).or_default() |= &excluded;
         }
@@ -188,12 +257,30 @@ pub fn remove_overlay_stale_frags(
     schema: &Schema,
 ) {
     let fields = index.dependency_fields();
+    let mut freshness = None;
     for fragment in fragments {
-        if fragment
-            .overlays
-            .iter()
-            .any(|overlay| overlay_affects_index(overlay, &fields, index.dataset_version, schema))
+        if !coverage.contains(fragment.id as u32)
+            || fragment
+                .overlays
+                .last()
+                .is_none_or(|overlay| overlay.committed_version <= index.dataset_version)
         {
+            continue;
+        }
+        if freshness.is_none()
+            && !fragment.overlays.iter().any(|overlay| {
+                overlay_affects_index(overlay, &fields, index.dataset_version, schema)
+            })
+        {
+            continue;
+        }
+        let freshness = freshness.get_or_insert_with(|| {
+            OverlayFreshness::read(index).unwrap_or_else(|error| {
+                log::warn!("Withdrawing coverage conservatively for index {} with invalid overlay metadata: {error}", index.uuid);
+                OverlayFreshness::default()
+            })
+        });
+        if fragment_has_stale_overlay(fragment, &fields, index.dataset_version, freshness, schema) {
             coverage.remove(fragment.id as u32);
         }
     }
@@ -204,6 +291,11 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::format::pb::{
+        IndexOverlayFreshness, IndexOverlayFreshnessList, IndexedDataOverlay,
+        RankedIndexOverlayDetails,
+    };
+    use prost::Message;
 
     fn bitmap(offsets: impl IntoIterator<Item = u32>) -> RoaringBitmap {
         RoaringBitmap::from_iter(offsets)
@@ -380,6 +472,57 @@ mod tests {
         let mut fragment = Fragment::new(id);
         fragment.overlays.push(overlay);
         fragment
+    }
+
+    #[rstest::rstest]
+    #[case::vector("example.org/LANCE.INDEX.PB.VectorIndexDetails", true)]
+    #[case::inverted("/LANCE.TABLE.InvertedIndexDetails", true)]
+    #[case::mem_wal_vector("/LaNcE.InDeX.VectorIndexDetails", true)]
+    #[case::v036_inverted("/LaNcE.InDeX.Pb.InvertedIndexDetails", true)]
+    #[case::missing_slash("lance.table.InvertedIndexDetails", false)]
+    #[case::third_party("/third.party.InvertedIndexDetails", false)]
+    #[case::unknown_vector("/lance.table.VectorIndexDetails", false)]
+    fn ranked_type_url_controls_overlay_mask(#[case] type_url: &str, #[case] recognized: bool) {
+        let mut fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1], 9));
+        fragment.overlays.push(dense_overlay(vec![3], [2], 10));
+        let incorporated = &fragment.overlays[0];
+        let value = RankedIndexOverlayDetails {
+            overlay_freshness: Some(IndexOverlayFreshnessList {
+                entries: vec![IndexOverlayFreshness {
+                    fragment_id: 3,
+                    source_versions: vec![9],
+                    overlays: vec![IndexedDataOverlay {
+                        committed_version: incorporated.committed_version,
+                        path: incorporated.data_file.path.clone(),
+                        base_id: None,
+                    }],
+                }],
+                validation_version: None,
+            }),
+        }
+        .encode_to_vec();
+        let mut source = segment(vec![3], 5, Some(bitmap([3])));
+        source.index_details = Some(
+            prost_types::Any {
+                type_url: type_url.into(),
+                value,
+            }
+            .into(),
+        );
+        let mut stale = HashMap::new();
+        collect_overlay_stale_rows_for_segment(
+            &source,
+            &HashMap::from([(3, &fragment)]),
+            &mut stale,
+            &flat_test_schema(),
+        )
+        .unwrap();
+        let expected = if recognized {
+            bitmap([2])
+        } else {
+            bitmap([1, 2])
+        };
+        assert_eq!(stale, HashMap::from([(3, expected)]));
     }
 
     #[test]
