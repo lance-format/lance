@@ -472,15 +472,6 @@ key. A segment with a `key_layout` has one key for each entry of
 
 ### Carried Page Layout
 
-A writer stores carried columns in a BTree segment only when the manifest that
-it commits the segment to sets `FLAG_COVERED_INDEX_METADATA` and
-`FLAG_INDEPENDENT_COVERING_FIELDS` in its reader and writer feature flags. If a
-commit retries against a manifest that lacks them, the writer either
-activates the independent contract in the manifest that it builds, as
-[Activating independent declarations](../index.md#activating-independent-declarations)
-describes, or does not commit the segment. It stores carried columns only in
-`page_data.lance`, never in `part_*_page_data.lance` page files.
-
 A segment that carries columns adds one column for each carried field to
 `page_data.lance`, after `values` and `ids`. Without a `key_layout`, the schema
 is:
@@ -521,29 +512,16 @@ the [encoded](#encoded-page-layout) page layout, and `value_type` is the
 carried column, in column order, as the dataset schema has it when the writer
 writes the file. Carried columns change neither `page_lookup.lance` nor the
 rows of `page_data.lance`, their order, or the pages that they form. They do
-not change the Lance file version of `page_data.lance` either, and a reader
-accepts every file version that it accepts for the same page file without
-carried columns. Each page that `page_lookup.lance` references holds 1 to
-`batch_size` rows. An empty index has no rows in either file. Its
-`page_data.lance` may still have carried columns, and `covering_field_ids` then
-lists them as in any other file.
+not change the Lance file version of `page_data.lance` either. Each page that
+`page_lookup.lance` references holds 1 to `batch_size` rows. An empty index has
+no rows in either file. Its `page_data.lance` may still have carried columns,
+and `covering_field_ids` then lists them as in any other file.
 
 - Each carried column holds a field that `covering_fields` declares, which is
   a top-level field as [Loading an index](../index.md#loading-an-index)
-  requires. The writer gives the column the name, the Arrow type, and the
-  nullability that the field has in the dataset schema when the writer writes
-  the file. A reader ignores the column's top-level nullability when it binds
-  the column (see [Carried Column Reader Rules](#carried-column-reader-rules)),
-  so a later nullability change of the field keeps the binding. The
-  nullability of nested children is part of the storage type.
+  requires.
 - Row `i` of a carried column holds the field's value for the row that
-  `ids[i]` identifies. A null value is a null in the table. A writer never
-  writes a null for a value that it does not have.
-- A writer does not store a [blob](../../table/schema.md#blob-type) field, or a
-  field that contains one, as a carried column. The data files of a blob
-  field hold descriptors instead of its values (see
-  [Blob v2](../../table/blob.md)).
-- A writer does not store a field named `values` or `ids` as a carried column.
+  `ids[i]` identifies. A null value is a null in the table.
 - `covering_field_ids` lists the field id of each carried column in the order
   of the columns in the schema, separated by single commas. Each id is a
   signed 32-bit integer in canonical decimal form: `0`, or a digit from `1` to
@@ -551,78 +529,36 @@ lists them as in any other file.
   `+`, no leading zero, and no whitespace. The key is present exactly when the
   file has at least one carried column.
 
-The file may hold fewer carried columns than `covering_fields` declares. A
-declared field without a carried column is a legal state, and a reader takes its
-values from the table.
-
-### Serving Keys
-
-`values` holds every key of a segment for every row, in the segment's layout:
-the raw value without a `key_layout`, and the encoded tuple with one. A reader
-may therefore serve a key field of any BTree segment from `values`, whether or
-not `covering_fields` declares it. That holds under either
-[covering-field contract](../index.md#covering-field-contracts) and for a
-segment without covering fields. The
-[Carried Column Reader Rules](#carried-column-reader-rules) name the segments
-that serve no value at all.
-
-The reader serves a field in `covering_fields` that is not a key from its
-carried column when one binds (see
-[Carried Column Reader Rules](#carried-column-reader-rules)), and takes it from
-the table otherwise. A key that `covering_fields` also declares may have its
-own carried column too. That copy is optional. The reader serves the key from
-the copy when the segment holds one that binds, and from `values` otherwise.
-Under the legacy contract no carried column binds. A segment that omits or
-withdraws the copy, or that cannot store it because the key is named `values`
-or `ids`, still serves the key from `values`.
-
-A reader serves a key from `values` as follows:
-
-- Without a `key_layout`, row `i` of `values` holds the key's value for the row
-  that `ids[i]` identifies, nulls included. The value is exactly the one that
-  the table stores, so a float keeps its bit pattern. The reader serves the key
-  only when the [storage type](#carried-column-reader-rules) of `values` equals
-  the storage type of the key field in the dataset schema, and otherwise takes
-  the key from the table.
-- With a `key_layout`, the reader splits the encoded tuple of row `i` into its
-  keys from left to right, then inverts
-  [Encoding `arrow_row` Version 1](#encoding-arrow_row-version-1) for the key's
-  type, `descending`, and `nulls_first`. The inverse gives back each null and
-  the original bits of each value, NaN payloads and `-0.0` included, in the
-  type that the key field has in the dataset schema.
-
-A key served from `values` covers the same rows that a carried column of the
-segment would, the rows that remain after
-[Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows).
+The file may hold fewer carried columns than `covering_fields` declares.
 
 ### Carried Column Reader Rules
 
 A reader applies these rules together with the rules of the segment's page
-layout, including the [Key Layout Reader Rules](#key-layout-reader-rules). From
-the manifest alone, it treats a BTree segment as unusable when either of these
-is true:
+layout, including the [Key Layout Reader Rules](#key-layout-reader-rules). It
+must treat a BTree segment as unusable, from the manifest alone, when either of
+these is true:
 
 - Under the legacy contract, `covering_fields` is not a suffix of `fields`
   that leaves at least one key.
 - The segment has no `key_layout` and does not have exactly one key.
 
-Under the legacy contract, a reader takes the [key fields](#key-fields) from
-the suffix rule and applies the key-count rules above: one key without a
-`key_layout`, and `len(key_layout.keys)` keys with one. It serves no carried
-column, serves the keys from `values` as [Serving Keys](#serving-keys)
-describes, and takes every other projected column from the table. The segment
-still answers key queries. This holds whatever `page_data.lance` stores, for
-example after a writer converts the manifest back to the legacy contract.
+Under the legacy contract, a reader must take the [key fields](#key-fields)
+from the suffix rule and apply the key-count rules above: one key without a
+`key_layout`, and `len(key_layout.keys)` keys with one. It must not serve a
+carried column, whatever `page_data.lance` stores. It may serve the keys from
+`values` as [Serving Keys](#serving-keys) describes, and must take every other
+projected column from the table. It may still use the segment to answer key
+queries.
 
-Under the independent contract, a reader finds the carried columns of
-`page_data.lance` by exclusion: every column other than `values` and `ids` is a
-carried column. It binds the carried column at position `i` among them to the
-field id at position `i` of `covering_field_ids`. This physical order binds the
-columns, and the order of `covering_fields` does not. Binding ignores the
-column name. The reader serves a carried column only when its storage type
-equals the storage type of the bound field in the dataset schema. It serves the
-values under the current dataset field, with that field's current name,
-metadata, and extension type.
+Under the independent contract, a reader must treat every column of
+`page_data.lance` other than `values` and `ids` as a carried column. It must
+bind the carried column at position `i` among them to the field id at position
+`i` of `covering_field_ids`. It must bind by this physical order, not by the
+order of `covering_fields`. It must ignore the column name when it binds. It
+may serve a carried column only when the column's storage type equals the
+storage type of the bound field in the dataset schema. When it serves a carried
+column, it must serve the values under the current dataset field, with that
+field's current name, metadata, and extension type.
 
 Two fields have the same storage type when their Arrow data types are equal.
 The comparison covers the type and its parameters, such as bit widths, units,
@@ -630,21 +566,22 @@ time zones, list sizes, and decimal precision and scale. For a nested type it
 also covers each child's name, storage type, and nullability, in order. For a
 dictionary it covers the key type and the value type. Field metadata at any
 level, the name and the nullability of the top-level field, and the
-dictionary's `ordered` flag are not part of the storage type. A metadata or
-nullability change keeps the field id and rewrites no data (see
-[Schema Evolution](../../table/schema.md#schema-evolution)), so the stored
-values still equal what a take returns. A type change creates a replacement
-field with a new id, so a carried column of the old field never binds to it.
-Neither a carried column nor `values` binds to a reused id, because
-[Removed and replaced fields](../index.md#removed-and-replaced-fields) removes
-the segment in the manifest that removes the field.
+dictionary's `ordered` flag are not part of the storage type.
 
-A usable segment serves no value, neither a key nor a carried column, when its
-pages are in `part_*_page_data.lance` files instead of `page_data.lance`, or
-when a column name appears more than once in `page_data.lance`. It still
-answers key queries.
+A reader may serve a field in `covering_fields` that is not a key from its
+carried column when one binds, and must take it from the table otherwise,
+including when the file holds no carried column for the field.
 
-A usable segment serves no carried column when any of these is true:
+A reader must accept every Lance file version of `page_data.lance` that it
+accepts for the same page file without carried columns.
+
+A reader must not serve any value, neither a key nor a carried column, from a
+usable segment whose pages are in `part_*_page_data.lance` files instead of
+`page_data.lance`, or whose `page_data.lance` has a column name more than once.
+It may still use the segment to answer key queries.
+
+A reader must not serve a carried column from a usable segment when any of
+these is true:
 
 - `covering_fields` names a field twice, or names a field that is not a
   top-level field of the dataset schema.
@@ -657,32 +594,98 @@ A usable segment serves no carried column when any of these is true:
 - A field that `covering_fields` declares is a blob field, or contains one, in
   the dataset schema.
 
-Such a segment still answers key queries and serves its keys as
-[Serving Keys](#serving-keys) describes, and the reader takes every other
-projected column from the table. A reader serves carried values only for the
-rows that the segment returns once
+It may still use such a segment to answer key queries and serve its keys as
+[Serving Keys](#serving-keys) describes, and must take every other projected
+column from the table. A reader may serve carried values only for the rows that
+the segment returns once
 [Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows)
-has filtered them, and it checks each segment on its own, as
+has filtered them. It must check each segment on its own, as
 [Serving carried columns](../index.md#serving-carried-columns) requires.
 
-### Maintaining Carried Columns
+#### Serving Keys
 
-A writer that rewrites a segment either keeps each carried value in the row it
-belongs to, or withdraws the column. It never keeps a carried column whose
+A reader may serve a key field of any BTree segment from `values`, whether or
+not `covering_fields` declares it. That holds under either
+[covering-field contract](../index.md#covering-field-contracts) and for a
+segment without covering fields. The
+[Carried Column Reader Rules](#carried-column-reader-rules) name the segments
+that serve no value at all.
+
+A key that `covering_fields` also declares may have its own carried column too.
+A reader that serves such a key from the segment must take it from the copy
+when the segment holds one that binds, and from `values` otherwise. It may still
+serve the key from `values` when the segment omits or withdraws the copy, or
+cannot store it because the key is named `values` or `ids`.
+
+A reader that serves a key from `values` must read it as follows:
+
+- Without a `key_layout`, row `i` of `values` holds the key's value for the row
+  that `ids[i]` identifies, nulls included. The reader may serve the key only
+  when the [storage type](#carried-column-reader-rules) of `values` equals the
+  storage type of the key field in the dataset schema, and must take the key
+  from the table otherwise.
+- With a `key_layout`, the reader must split the encoded tuple of row `i` into
+  its keys from left to right, then invert
+  [Encoding `arrow_row` Version 1](#encoding-arrow_row-version-1) for the key's
+  type, `descending`, and `nulls_first`. It must serve each null and the
+  original bits of each value, NaN payloads and `-0.0` included, in the type
+  that the key field has in the dataset schema.
+
+A reader may serve a key from `values` only for the rows that remain after
+[Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows),
+the same rows that a carried column of the segment would cover.
+
+### Carried Column Writer Rules
+
+A writer must not store carried columns in a BTree segment unless the manifest
+that it commits the segment to sets `FLAG_COVERED_INDEX_METADATA` and
+`FLAG_INDEPENDENT_COVERING_FIELDS` in its reader and writer feature flags. If a
+commit retries against a manifest that lacks them, the writer must either
+activate the independent contract in the manifest that it builds, as
+[Activating independent declarations](../index.md#activating-independent-declarations)
+describes, or not commit the segment. It must store carried columns only in
+`page_data.lance`, never in `part_*_page_data.lance` page files.
+
+A writer must give each carried column the name, the Arrow type, and the
+nullability that the field has in the dataset schema when the writer writes the
+file. It must not write a null for a value that it does not have. It must not
+store a [blob](../../table/schema.md#blob-type) field, or a field that contains
+one, as a carried column. It must not store a field named `values` or `ids` as
+a carried column.
+
+A writer that rewrites a segment must either keep each carried value in the row
+it belongs to, or withdraw the column. It must not keep a carried column whose
 values it has not moved with their rows.
 
-- Index optimization takes the carried value of each row that it keeps from
-  the source segment's column that binds to the same field, and the value of
-  each new row from the table version that it indexes. It writes a carried
-  column only if it has a value for every row of the new page data file.
-- Remapping changes `ids` and leaves each carried value in its row. A row that
-  remapping removes takes its carried values with it.
-- A writer never fills one carried column from source columns that bind to
+- Index optimization must take the carried value of each row that it keeps
+  from the source segment's column that binds to the same field, and the value
+  of each new row from the table version that it indexes. It must not write a
+  carried column unless it has a value for every row of the new page data file.
+- Remapping changes `ids` and must leave each carried value in its row.
+  Remapping that removes a row must remove the row's carried values with it.
+- A writer must not fill one carried column from source columns that bind to
   different field ids, even when their names and types match.
-- A writer that withdraws a column writes the new page data file without it
+- A writer that withdraws a column must write the new page data file without it
   and without its id in `covering_field_ids`. The field may stay in
-  `covering_fields`. A file without carried columns has no
-  `covering_field_ids` key.
+  `covering_fields`.
+
+### Carried Column Rationale
+
+`values` holds every key of a segment for every row, in the segment's layout:
+the raw value without a `key_layout`, and the encoded tuple with one. A raw
+value is exactly the one that the table stores, so a float keeps its bit
+pattern. A metadata or nullability change keeps the field id and rewrites no
+data (see [Schema Evolution](../../table/schema.md#schema-evolution)), so the
+stored values still equal what a take returns and the binding survives the
+change. A type change creates a replacement field with a new id, so a carried
+column of the old field never binds to it. Neither a carried column nor
+`values` binds to a reused id, because
+[Removed and replaced fields](../index.md#removed-and-replaced-fields) removes
+the segment in the manifest that removes the field. Blob fields are not carried
+because their data files hold descriptors instead of their values (see
+[Blob v2](../../table/blob.md)). A legacy manifest can hold a segment whose
+`page_data.lance` has carried columns, for example after a writer converts the
+manifest back to the legacy contract.
 
 ### Carried Column Compatibility
 
