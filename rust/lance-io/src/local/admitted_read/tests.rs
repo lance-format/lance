@@ -59,6 +59,9 @@ async fn ordinary_and_rejected_reads_do_not_initialize_gate() {
     let outputs = reader.get_ranges_into(Vec::new()).await.unwrap();
     assert!(outputs.is_empty());
     assert!(reader.admitted_read.gate.get().is_none());
+    let output = budget.try_reserve(0).unwrap().allocate().unwrap();
+    drop(reader.get_range_into(2..2, output).await.unwrap());
+    assert!(reader.admitted_read.gate.get().is_none());
     let output = budget.try_reserve(4).unwrap().allocate().unwrap();
     let output = reader.get_range_into(0..4, output).await.unwrap();
     assert_eq!(output.as_ref(), b"abcd");
@@ -71,7 +74,9 @@ async fn ordinary_and_rejected_reads_do_not_initialize_gate() {
 #[case::single(1)]
 #[case::batch(2)]
 #[tokio::test]
-async fn detached_read_keeps_inode_gate_and_credit_but_other_files_progress(#[case] count: usize) {
+async fn detached_read_keeps_overlap_permit_and_credit_but_other_files_progress(
+    #[case] count: usize,
+) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data");
     let link = dir.path().join("hard-link");
@@ -90,15 +95,19 @@ async fn detached_read_keeps_inode_gate_and_credit_but_other_files_progress(#[ca
         .collect::<Vec<_>>();
     let (started_tx, started_rx) = oneshot::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let mut held = Box::pin(first.admitted_read.run(first.file.clone(), move |file| {
-        started_tx.send(()).unwrap();
-        release_rx.recv_timeout(DEADLINE).unwrap();
-        for mut output in held_outputs {
-            file.read_exact_at(output.as_mut(), 0)?;
-            assert_eq!(output.as_ref(), b"abcd");
-        }
-        Ok(())
-    }));
+    let mut held = Box::pin(first.admitted_read.run(
+        first.file.clone(),
+        ReadRanges::Single(0..4),
+        move |file| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(DEADLINE).unwrap();
+            for mut output in held_outputs {
+                file.read_exact_at(output.as_mut(), 0)?;
+                assert_eq!(output.as_ref(), b"abcd");
+            }
+            Ok(())
+        },
+    ));
     assert!(poll!(&mut held).is_pending());
     timeout(DEADLINE, started_rx).await.unwrap().unwrap();
     let output = budget.try_reserve(4).unwrap().allocate().unwrap();
@@ -112,7 +121,7 @@ async fn detached_read_keeps_inode_gate_and_credit_but_other_files_progress(#[ca
     let right = budget.try_reserve(4).unwrap().allocate().unwrap();
     let mut batch = linked.get_ranges_into(vec![(4..8, left), (0..4, right)]);
     assert!(poll!(&mut batch).is_pending());
-    // Dropping the waiter must not admit another same-inode read while the
+    // Dropping the waiter must not admit an overlapping same-inode read while the
     // detached blocking closure still owns and uses the first allocation.
     drop(held);
     assert!(poll!(&mut batch).is_pending());
@@ -150,7 +159,7 @@ async fn replaced_path_uses_new_inode_while_open_reader_keeps_old_file() {
     std::fs::write(&path, b"old!").unwrap();
     let old = reader(&path).await;
     let old_gate = old.admitted_read.get(old.file.clone()).await.unwrap();
-    let guard = old_gate.lock().await;
+    let guard = old_gate.acquire(ReadRanges::Single(0..4)).await.unwrap();
     std::fs::write(&replacement, b"new!").unwrap();
     std::fs::rename(&replacement, &path).unwrap();
     let new = reader(&path).await;
@@ -172,6 +181,141 @@ async fn replaced_path_uses_new_inode_while_open_reader_keeps_old_file() {
     assert_eq!(budget.reserved(), 0);
 }
 
+#[tokio::test]
+async fn detached_batch_allows_disjoint_reads_in_its_gaps_after_readers_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data");
+    let link = dir.path().join("link");
+    std::fs::write(&path, b"abcdefghijklmnop").unwrap();
+    std::fs::hard_link(&path, &link).unwrap();
+    let first = reader(&path).await;
+    let budget = AllocationBudget::new(16);
+    let left = budget.try_reserve(4).unwrap().allocate().unwrap();
+    let right = budget.try_reserve(4).unwrap().allocate().unwrap();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut held = Box::pin(first.admitted_read.run(
+        first.file.clone(),
+        ReadRanges::Batch(vec![12..16, 0..4]),
+        move |file| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(DEADLINE).unwrap();
+            for (offset, mut output, expected) in [(12, right, b"mnop"), (0, left, b"abcd")] {
+                file.read_exact_at(output.as_mut(), offset)?;
+                assert_eq!(output.as_ref(), expected);
+            }
+            Ok(())
+        },
+    ));
+    assert!(poll!(&mut held).is_pending());
+    timeout(DEADLINE, started_rx).await.unwrap().unwrap();
+    drop(held);
+    drop(first);
+
+    // Only the detached operation now retains the shared inode coordinator.
+    let linked = reader(&link).await;
+    let output = budget.try_reserve(4).unwrap().allocate().unwrap();
+    let mut overlap = linked.get_range_into(2..6, output);
+    assert!(poll!(&mut overlap).is_pending());
+    let output = budget.try_reserve(4).unwrap().allocate().unwrap();
+    let output = timeout(DEADLINE, linked.get_range_into(8..12, output))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.as_ref(), b"ijkl");
+    assert_eq!(budget.reserved(), 16);
+    drop(output);
+    assert!(poll!(&mut overlap).is_pending());
+    release_tx.send(()).unwrap();
+    let output = timeout(DEADLINE, overlap).await.unwrap().unwrap();
+    assert_eq!(output.as_ref(), b"cdef");
+    assert_eq!(budget.reserved(), 4);
+    drop(output);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[tokio::test]
+async fn batch_skips_held_gap_and_preserves_allocation_order() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"abcdefghijklmnop").unwrap();
+    let reader = reader(file.path()).await;
+    let coordinator = reader.admitted_read.get(reader.file.clone()).await.unwrap();
+    let held_gap = coordinator
+        .acquire(ReadRanges::Single(6..10))
+        .await
+        .unwrap();
+    let budget = AllocationBudget::new(8);
+    let left = budget.try_reserve(4).unwrap().allocate().unwrap();
+    let right = budget.try_reserve(4).unwrap().allocate().unwrap();
+    let empty = budget.try_reserve(0).unwrap().allocate().unwrap();
+    let pointers = [right.as_ref().as_ptr(), left.as_ref().as_ptr()];
+    let outputs = timeout(
+        DEADLINE,
+        reader.get_ranges_into(vec![(8..8, empty), (12..16, right), (0..4, left)]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(outputs[0].as_ref().is_empty());
+    assert_eq!(outputs[1].as_ref(), b"mnop");
+    assert_eq!(outputs[2].as_ref(), b"abcd");
+    assert_eq!(outputs[1].as_ref().as_ptr(), pointers[0]);
+    assert_eq!(outputs[2].as_ref().as_ptr(), pointers[1]);
+    assert_eq!(budget.reserved(), 8);
+    drop((outputs, held_gap));
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[tokio::test]
+async fn overlapping_waiters_keep_order_but_disjoint_ranges_bypass() {
+    let coordinator = Arc::new(Coordinator::default());
+    let first = coordinator.acquire(ReadRanges::Single(0..8)).await.unwrap();
+    let mut second = Box::pin(coordinator.acquire(ReadRanges::Single(4..12)));
+    assert!(poll!(&mut second).is_pending());
+    let mut third = Box::pin(coordinator.acquire(ReadRanges::Single(8..16)));
+    assert!(poll!(&mut third).is_pending());
+    let independent = timeout(DEADLINE, coordinator.acquire(ReadRanges::Single(16..20)))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(first);
+    let second = timeout(DEADLINE, second).await.unwrap().unwrap();
+    assert!(poll!(&mut third).is_pending());
+    drop(second);
+    let third = timeout(DEADLINE, third).await.unwrap().unwrap();
+    drop((third, independent));
+    let last = coordinator
+        .acquire(ReadRanges::Single(0..20))
+        .await
+        .unwrap();
+    assert_eq!(coordinator.requests.lock().unwrap().len(), 1);
+    drop(last);
+}
+
+#[tokio::test]
+async fn cancelled_bridge_unblocks_disjoint_waiter_without_releasing_active_overlap() {
+    let coordinator = Arc::new(Coordinator::default());
+    let active = coordinator.acquire(ReadRanges::Single(0..4)).await.unwrap();
+    let mut bridge = Box::pin(coordinator.acquire(ReadRanges::Single(2..8)));
+    assert!(poll!(&mut bridge).is_pending());
+    let mut disjoint = Box::pin(coordinator.acquire(ReadRanges::Single(6..10)));
+    assert!(poll!(&mut disjoint).is_pending());
+    let mut overlap = Box::pin(coordinator.acquire(ReadRanges::Single(1..3)));
+    assert!(poll!(&mut overlap).is_pending());
+    drop(bridge);
+    let disjoint = timeout(DEADLINE, disjoint).await.unwrap().unwrap();
+    assert!(poll!(&mut overlap).is_pending());
+    drop(active);
+    let overlap = timeout(DEADLINE, overlap).await.unwrap().unwrap();
+    drop((disjoint, overlap));
+    let last = coordinator
+        .acquire(ReadRanges::Single(0..10))
+        .await
+        .unwrap();
+    assert_eq!(coordinator.requests.lock().unwrap().len(), 1);
+    drop(last);
+}
+
 #[rstest]
 #[case::io_error(false)]
 #[case::panic(true)]
@@ -184,7 +328,7 @@ async fn failed_blocking_operation_releases_gate_and_buffer(#[case] panic: bool)
     let output = budget.try_reserve(4).unwrap().allocate().unwrap();
     let error = reader
         .admitted_read
-        .run(reader.file.clone(), move |_| {
+        .run(reader.file.clone(), ReadRanges::Single(0..4), move |_| {
             let _output = output;
             if panic {
                 panic!("injected owned read panic");

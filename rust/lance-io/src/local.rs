@@ -406,13 +406,17 @@ impl Reader for LocalObjectReader {
             // waiter must not refund memory while the read still writes into it.
             let result = self
                 .admitted_read
-                .run(file, move |file| {
-                    #[cfg(unix)]
-                    file.read_exact_at(output.as_mut(), range.start as u64)?;
-                    #[cfg(windows)]
-                    read_exact_at(file, output.as_mut(), range.start as u64)?;
-                    Ok(output)
-                })
+                .run(
+                    file,
+                    admitted_read::ReadRanges::Single(range.clone()),
+                    move |file| {
+                        #[cfg(unix)]
+                        file.read_exact_at(output.as_mut(), range.start as u64)?;
+                        #[cfg(windows)]
+                        read_exact_at(file, output.as_mut(), range.start as u64)?;
+                        Ok(output)
+                    },
+                )
                 .await;
             metrics.record(&result, bytes);
             if result.is_ok() {
@@ -440,11 +444,14 @@ impl Reader for LocalObjectReader {
             if requests.is_empty() {
                 return Ok(Vec::new());
             }
+            let ranges = admitted_read::ReadRanges::Batch(
+                requests.iter().map(|(range, _)| range.clone()).collect(),
+            );
             // One blocking dispatch, still one positional read and metric per
             // range. The closure owns every buffer even if its waiter is dropped.
             Ok(self
                 .admitted_read
-                .run(file, move |file| {
+                .run(file, ranges, move |file| {
                     let mut outputs = Vec::with_capacity(requests.len());
                     for (range, mut output) in requests {
                         let metrics = io_tracker.begin_io("get");

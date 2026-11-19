@@ -37,7 +37,7 @@ jobs:
           print(io[0])
           print("lance-examples benchmark has no lance-io/test-util feature")
           PYFEATURES
-      - name: Verify owned local read coordination and cancellation
+      - name: Verify overlapping read order, disjoint progress and cancellation
         env:
           LANCE_CPU_THREADS: 1
         run: |
