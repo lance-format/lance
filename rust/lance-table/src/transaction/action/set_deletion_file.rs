@@ -48,10 +48,7 @@ impl SetDeletionFile {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         self.deletion_file.validate_location()?;
         let fragment_id = state.resolve_fragment(self.fragment)?;
-        if self.fragment.local().is_some()
-            && self.deletion_file.path.is_none()
-            && !self.deletion_file.is_inline()
-        {
+        if self.fragment.local().is_some() && self.deletion_file.uses_derived_path() {
             return Err(Error::invalid_input(format!(
                 "SetDeletionFile for local fragment {fragment_id} cannot use a derived path; \
                  a deletion file on a minted fragment must set an explicit path or inline vector"

@@ -54,6 +54,17 @@ async fn test_v0_7_5_migration() {
 
     // Assert num rows, deletions, and physical rows are all correct.
     let dataset = Dataset::open(&test_uri).await.unwrap();
+    // A v0.7.5 deletion file has no explicit path.
+    let deletion_file = dataset.get_fragments()[0]
+        .metadata()
+        .deletion_file
+        .clone()
+        .unwrap();
+    assert_eq!(deletion_file.path, None);
+    assert_eq!(
+        lance_table::io::deletion::relative_deletion_file_path(0, &deletion_file),
+        "_deletions/0-1-8958018423523767581.arrow"
+    );
     assert_eq!(dataset.count_rows(None).await.unwrap(), 90);
     assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
     let total_physical_rows = futures::stream::iter(dataset.get_fragments())
