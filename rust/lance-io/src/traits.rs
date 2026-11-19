@@ -137,6 +137,7 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// The pool admitting this reader's raw buffers, if configured. Callers
     /// should share it for reassembly and decode workspace instead of creating
     /// another allowance. This does not imply decoded arrays are accounted.
+    #[doc(hidden)]
     fn memory_reserver(
         &self,
     ) -> Option<std::sync::Arc<dyn lance_core::utils::memory::MemoryReserver>> {
@@ -146,6 +147,7 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Admit read buffers before allocation and retain their reservations with
     /// returned bytes and detached I/O. Configure once before submitting reads.
     /// Unsupported readers fail explicitly instead of wrapping an unaccounted read.
+    #[doc(hidden)]
     fn configure_memory_reserver(
         &mut self,
         _pool: std::sync::Arc<dyn lance_core::utils::memory::MemoryReserver>,

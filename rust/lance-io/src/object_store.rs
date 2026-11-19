@@ -1354,6 +1354,7 @@ impl ObjectStore {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(hidden)]
     pub fn with_memory_reserver(
         &self,
         pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
@@ -1384,6 +1385,7 @@ impl ObjectStore {
     ///     Ok(())
     /// }
     /// ```
+    #[doc(hidden)]
     pub async fn open_with_memory_reserver(
         &self,
         path: &Path,
@@ -1422,6 +1424,7 @@ impl ObjectStore {
     ///     Ok(())
     /// }
     /// ```
+    #[doc(hidden)]
     pub async fn create_with_memory_reserver(
         &self,
         path: &Path,
@@ -1458,11 +1461,26 @@ impl ObjectStore {
     ///     Ok(())
     /// }
     /// ```
+    #[doc(hidden)]
     pub async fn create_with_output_lifecycle(
         &self,
         path: &Path,
         pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
         owner: Arc<dyn crate::object_writer::OutputLifecycle>,
+    ) -> Result<Box<dyn Writer>> {
+        self.create_with_resources_mode(path, pool, PutMode::Create, Some(owner))
+            .await
+    }
+
+    /// Experimental resource API; publication mode is independent of notification.
+    /// Conditional updates are refused before output is created.
+    #[doc(hidden)]
+    pub async fn create_with_resources_mode(
+        &self,
+        path: &Path,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+        mode: PutMode,
+        owner: Option<Arc<dyn crate::object_writer::OutputLifecycle>>,
     ) -> Result<Box<dyn Writer>> {
         if self.scheme != "file" || !self.has_direct_local_paths() {
             return Err(Error::not_supported(format!(
@@ -1471,11 +1489,12 @@ impl ObjectStore {
             )));
         }
         Ok(Box::new(
-            crate::object_writer::ResourceLocalWriter::create_with_output_lifecycle(
+            crate::object_writer::ResourceLocalWriter::create_with_mode(
                 path,
                 pool,
                 Arc::new(self.io_tracker.clone()),
-                Some(owner),
+                owner,
+                mode,
                 self.local_fsync,
             )
             .await?,
@@ -2276,13 +2295,48 @@ impl ObjectStore {
             .boxed()
     }
 
+    async fn resource_local_size(
+        &self,
+        path: &Path,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<u64> {
+        let bytes = path
+            .as_ref()
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(8192))
+            .ok_or_else(|| Error::invalid_input("local HEAD control size overflow"))?;
+        let owner = pool.reserve("local HEAD path and metadata", bytes)?;
+        let path = path.clone();
+        let tracker = self.io_tracker.clone();
+        lance_core::utils::tokio::io_task_with_resources(pool, "local HEAD", move || {
+            let _owner = owner;
+            let metrics = tracker.begin_io("head");
+            let result = (|| {
+                let file =
+                    std::fs::File::open(crate::local::to_local_path(&path)).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            Error::not_found(path.to_string())
+                        } else {
+                            error.into()
+                        }
+                    })?;
+                let metadata = file.metadata()?;
+                if metadata.is_dir() {
+                    return Err(Error::not_found(path.to_string()));
+                }
+                Ok(metadata.len())
+            })();
+            metrics.record(&result, 0);
+            result
+        })?
+        .await?
+    }
+
     /// Check a file exists.
     pub async fn exists(&self, path: &Path) -> Result<bool> {
         if let Some(pool) = &self.resource_pool {
-            return match self
-                .open_with_memory_reserver(path, None, pool.clone())
-                .await
-            {
+            return match self.resource_local_size(path, pool.clone()).await {
                 Ok(_) => Ok(true),
                 Err(error) if error.is_not_found() => Ok(false),
                 Err(error) => Err(error),
@@ -2298,11 +2352,7 @@ impl ObjectStore {
     /// Get file size.
     pub async fn size(&self, path: &Path) -> Result<u64> {
         if let Some(pool) = &self.resource_pool {
-            let reader = self
-                .open_with_memory_reserver(path, None, pool.clone())
-                .await?;
-            return u64::try_from(reader.size().await?)
-                .map_err(|_| Error::invalid_input("local file size exceeds u64"));
+            return self.resource_local_size(path, pool.clone()).await;
         }
         Ok(self.inner.head(path).await?.size)
     }

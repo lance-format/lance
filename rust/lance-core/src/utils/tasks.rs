@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Experimental, unstable cross-crate resource API.
+//!
 //! Cancellation and completion of actual resource-owned work.
 
 use std::sync::{
@@ -32,6 +34,7 @@ const ACTIVE: usize = CANCELLED - 1;
 /// # Ok::<(), lance_core::Error>(())
 /// ```
 #[derive(Debug, Default)]
+#[doc(hidden)]
 pub struct ResourceTaskGroup {
     state: AtomicUsize,
     peak: AtomicUsize,
@@ -40,6 +43,7 @@ pub struct ResourceTaskGroup {
 
 impl ResourceTaskGroup {
     /// Register before dispatch, atomically refusing work after cancellation.
+    #[doc(hidden)]
     pub fn start(self: &Arc<Self>, stage: &str) -> Result<ResourceTask> {
         let previous = self
             .state
@@ -63,28 +67,33 @@ impl ResourceTaskGroup {
     }
 
     /// Signal cooperative cancellation and prevent subsequent task admission.
+    #[doc(hidden)]
     pub fn cancel(&self) {
         self.state.fetch_or(CANCELLED, Ordering::AcqRel);
         self.completed.notify_waiters();
     }
 
     /// Read the cancellation signal without locking or waiting.
+    #[doc(hidden)]
     pub fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) & CANCELLED != 0
     }
 
     /// Number of dispatched tasks whose actual completion is still pending.
+    #[doc(hidden)]
     pub fn active(&self) -> usize {
         self.state.load(Ordering::Acquire) & ACTIVE
     }
 
     /// Highest simultaneous number of dispatched tasks, including queued work.
+    #[doc(hidden)]
     pub fn peak(&self) -> usize {
         self.peak.load(Ordering::Acquire).max(self.active())
     }
 
     /// Await actual completion after signalling cancellation and dropping the
     /// pipeline futures. This does not wait for ordinary model/data ownership.
+    #[doc(hidden)]
     pub async fn wait(&self) {
         loop {
             let completed = self.completed.notified();
@@ -99,6 +108,7 @@ impl ResourceTaskGroup {
 }
 
 /// Completion ownership for one task. Drop only after its actual work stops.
+#[doc(hidden)]
 pub struct ResourceTask {
     group: Arc<ResourceTaskGroup>,
 }

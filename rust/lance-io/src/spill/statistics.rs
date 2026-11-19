@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Experimental, unstable cross-crate resource API.
+//!
 //! Counters do not own files, quotas, memory pools, or cleanup jobs.
 
 use std::sync::{
@@ -11,6 +13,7 @@ use std::sync::{
 /// A logical scratch-usage snapshot, including pending I/O and deferred cleanup.
 /// These are accounted file bytes, not filesystem allocation blocks or free space.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct SpillUsage {
     /// Bytes currently reserved by live scratch backing owners.
     pub reserved_bytes: u64,
@@ -44,12 +47,14 @@ pub(super) struct Counters {
 /// assert_eq!(statistics.snapshot().reserved_bytes, 0);
 /// ```
 #[derive(Debug, Clone, Default)]
+#[doc(hidden)]
 pub struct SpillStatistics {
     pub(super) inner: Arc<Counters>,
 }
 
 impl SpillStatistics {
     /// Read independently updated counters; concurrent snapshots are approximate.
+    #[doc(hidden)]
     pub fn snapshot(&self) -> SpillUsage {
         SpillUsage {
             reserved_bytes: self.inner.used.load(Ordering::Acquire),

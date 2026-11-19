@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Experimental, unstable cross-crate resource API.
+//!
 //! Detached local I/O completes and releases its owners before join notification.
 
 use std::{panic::resume_unwind, sync::Arc};
@@ -28,41 +30,56 @@ use super::global_cpu_runtime;
 /// # Ok(())
 /// # }
 /// ```
+#[doc(hidden)]
 pub fn io_task_with_resources<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(
     pool: Arc<dyn MemoryReserver>,
     stage: &'static str,
     work: F,
 ) -> Result<BoxFuture<'static, Result<T>>> {
+    // Native closure storage and the channel's result slot are explicit;
+    // runtime task headers and channel bookkeeping use a fixed surcharge.
+    // Work and output each occupy one admitted box. Runtime/channel frames
+    // contain pointers rather than copies of arbitrarily large inline values.
+    // The surcharge covers those frames and their allocation headers; this is
+    // cooperative accounting, not a stable promise about Tokio's internals.
     let bytes = size_of::<F>()
-        .checked_mul(2)
-        .and_then(|bytes| {
-            size_of::<T>()
-                .checked_mul(2)
-                .and_then(|output| bytes.checked_add(output))
-        })
+        .checked_add(size_of::<T>())
         .and_then(|bytes| bytes.checked_add(4096))
         .ok_or_else(|| {
             Error::invalid_input(format!(
                 "I/O completion control size overflow: stage={stage}"
             ))
         })?;
-    let control = pool.reserve("I/O completion driver control", bytes)?;
+    let control = Arc::new(pool.reserve("I/O completion driver control", bytes)?);
+    let work = Box::new(work);
     let running = pool
         .task_group()
         .map(|tasks| tasks.start(stage))
         .transpose()?;
     // Dispatch before entering the independent completion driver, using the
     // caller's I/O pool. The returned await may be dropped without stopping it.
-    let native = tokio::task::spawn_blocking(work);
+    let runtime = tokio::runtime::Handle::current();
     let (completed, outcome) = tokio::sync::oneshot::channel();
     let driver = async move {
-        let result = native.await;
+        let work_control = control.clone();
+        let result = runtime
+            .spawn_blocking(move || Box::new((work(), work_control)))
+            .await;
         let _ = completed.send(result);
         drop(control);
         drop(running);
     };
-    let driver = global_cpu_runtime().spawn(driver);
-    Ok(Box::pin(async move {
+    let driver_control = pool.reserve("I/O completion future", size_of_val(&driver))?;
+    // Build and admit the public await before dispatch. Transfer the actual
+    // handle only after all reservations succeed, so a refused write has no
+    // side effects and can safely be retried by its caller.
+    let (dispatch, dispatched) = tokio::sync::oneshot::channel::<tokio::task::JoinHandle<()>>();
+    let future = async move {
+        let driver = dispatched.await.map_err(|error| {
+            Error::io(format!(
+                "I/O driver was not dispatched: stage={stage}, {error}"
+            ))
+        })?;
         if let Err(error) = driver.await {
             match error.try_into_panic() {
                 Ok(panic) => resume_unwind(panic),
@@ -78,7 +95,10 @@ pub fn io_task_with_resources<T: Send + 'static, F: FnOnce() -> T + Send + 'stat
                 "I/O completion outcome lost: stage={stage}, {error}"
             ))
         })? {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                let (value, _control) = *result;
+                Ok(value)
+            }
             Err(error) => match error.try_into_panic() {
                 Ok(panic) => resume_unwind(panic),
                 Err(error) => Err(Error::io(format!(
@@ -86,5 +106,17 @@ pub fn io_task_with_resources<T: Send + 'static, F: FnOnce() -> T + Send + 'stat
                 ))),
             },
         }
+    };
+    let await_control = pool.reserve("I/O await future", size_of_val(&future))?;
+    let driver = global_cpu_runtime().spawn(async move {
+        driver.await;
+        drop(driver_control);
+    });
+    // The receiver is owned by `future` and cannot have been dropped or polled.
+    let _ = dispatch.send(driver);
+    Ok(Box::pin(async move {
+        let result = future.await;
+        drop(await_control);
+        result
     }))
 }

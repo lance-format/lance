@@ -14,7 +14,9 @@ use tracing::Span;
 
 mod io;
 mod resources;
+#[doc(hidden)]
 pub use io::io_task_with_resources;
+#[doc(hidden)]
 pub use resources::{CpuTaskResources, MemoryOwned, ResourceCpuTask, cpu_task_with_resources};
 
 /// We cache the call to num_cpus::get() because:

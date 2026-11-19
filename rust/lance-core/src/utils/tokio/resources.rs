@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Experimental, unstable cross-crate resource API.
+//!
 //! Task ownership for cooperative memory admission.
 
 use std::convert::Infallible;
@@ -34,6 +36,7 @@ struct TaskMemory {
 /// Memory owners transferred with a CPU task's result. Keep them until that
 /// result's backing allocations and retained slices are freed or transferred to
 /// another accounted owner.
+#[doc(hidden)]
 pub struct CpuTaskResources {
     _workspace: Box<dyn MemoryLease>,
     workspace_bytes: usize,
@@ -45,6 +48,7 @@ pub struct CpuTaskResources {
 
 /// A value and the memory reservations that accompany its backing allocations.
 /// Field drop order frees the value before returning its allowance.
+#[doc(hidden)]
 pub struct MemoryOwned<T> {
     value: T,
     resources: CpuTaskResources,
@@ -65,6 +69,7 @@ impl<T> MemoryOwned<T> {
     ///     MemoryOwned::try_new(pool, "index metadata", 128, || Ok(vec![0_u8; 128]))
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn try_new(
         pool: &dyn MemoryReserver,
         stage: &str,
@@ -111,6 +116,7 @@ impl<T> MemoryOwned<T> {
     ///     value.with_owner(schema_owner)
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn with_owner(mut self, owner: Arc<dyn Send + Sync>) -> Result<Self> {
         if self.resources.retained_owner.is_some() {
             drop(self);
@@ -134,6 +140,7 @@ impl<T> MemoryOwned<T> {
     ///     value.try_map(|value| value.ok_or_else(|| lance_core::Error::invalid_input("missing output")))
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn try_map<U>(self, convert: impl FnOnce(T) -> Result<U>) -> Result<MemoryOwned<U>> {
         if size_of::<MemoryOwned<U>>() > size_of::<Self>() {
             return Err(Error::invalid_input(format!(
@@ -169,6 +176,7 @@ impl<T> MemoryOwned<T> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(hidden)]
     pub fn into_cpu_task<U, F>(
         self,
         pool: Arc<dyn MemoryReserver>,
@@ -227,6 +235,7 @@ impl<T> MemoryOwned<T> {
     ///     value.reserved_bytes()
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn reserved_bytes(&self) -> usize {
         self.resources.reserved_bytes
     }
@@ -244,6 +253,7 @@ impl<T> MemoryOwned<T> {
     ///     Ok(value)
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn try_shrink_workspace(&mut self, backing_bytes: usize) -> Result<bool> {
         let released = self.resources.workspace_bytes.checked_sub(backing_bytes)
             .ok_or_else(|| Error::invalid_input(format!(
@@ -267,6 +277,7 @@ impl<T> MemoryOwned<T> {
     /// Borrow the result while retaining all of its reservations. Any derived
     /// slice or clone must keep this owner alive; use [`Self::into_parts`] when
     /// transferring backing allocations to another consumer.
+    #[doc(hidden)]
     pub fn value(&self) -> &T {
         &self.value
     }
@@ -282,12 +293,14 @@ impl<T> MemoryOwned<T> {
     ///     drop(resources);
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn into_parts(self) -> (T, CpuTaskResources) {
         (self.value, self.resources)
     }
 }
 
 /// A lazy CPU task whose result retains its accounting owners.
+#[doc(hidden)]
 pub type ResourceCpuTask<T> = BoxFuture<'static, Result<MemoryOwned<T>>>;
 
 struct ChargedWork<F> {
@@ -377,29 +390,15 @@ impl<T: Send + 'static, F: FnOnce() -> Result<T> + Send + 'static> PendingWork<F
             drop(running);
         }
         .instrument(tracing::Span::current());
-        let control_bytes = self
-            .reserved_bytes
-            .checked_sub(self.workspace_bytes)
-            .ok_or_else(|| Error::internal("CPU task workspace exceeds total reservation"))?;
-        let required = size_of_val(&driver)
-            .checked_mul(2)
-            .and_then(|bytes| {
-                size_of::<F>()
-                    .checked_mul(2)
-                    .and_then(|work| bytes.checked_add(work))
-            })
-            .and_then(|bytes| {
-                size_of::<T>()
-                    .checked_mul(2)
-                    .and_then(|output| bytes.checked_add(output))
-            })
-            .ok_or_else(|| Error::invalid_input("CPU completion driver control size overflow"))?;
-        if required > control_bytes {
-            return Err(Error::internal(format!(
-                "CPU completion driver control estimate exceeded: stage={}, required_bytes={required}, reserved_bytes={control_bytes}",
-                self.stage,
-            )));
-        }
+        // Charge the concrete completion future separately before Tokio stores it.
+        // The fixed surcharge covers opaque runtime/channel bookkeeping.
+        let driver_control = self
+            .pool
+            .reserve("CPU completion future", size_of_val(&driver))?;
+        let driver = async move {
+            driver.await;
+            drop(driver_control);
+        };
         global_cpu_runtime().spawn(driver).await.map_err(|source| {
             Error::internal(format!(
                 "CPU completion driver failed: stage={}, {source}",
@@ -444,6 +443,7 @@ impl<T: Send + 'static, F: FnOnce() -> Result<T> + Send + 'static> PendingWork<F
 /// # Ok(())
 /// # }
 /// ```
+#[doc(hidden)]
 pub fn cpu_task_with_resources<T, F>(
     pool: Arc<dyn MemoryReserver>,
     stage: &'static str,
@@ -458,24 +458,15 @@ where
     // Pending futures, the independent completion driver, blocking-task storage
     // and their inline results can coexist. Count their control allocations and
     // consumer names before allocating any of those task objects.
-    let control_bytes = size_of::<F>()
-        .checked_mul(4)
-        .and_then(|bytes| size_of::<T>().checked_mul(4).and_then(|result| bytes.checked_add(result)))
-        .and_then(|bytes| {
-            stage
-                .len()
-                .checked_mul(2)
-                .and_then(|names| bytes.checked_add(names))
-        })
+    // Account the concrete submitted-work and result envelopes; the lazy
+    // future and completion driver receive their own measured reservations.
+    let control_bytes = size_of::<ChargedWork<F>>()
+        .checked_add(size_of::<CpuTaskOutcome<T>>())
+        // The native task result and completion channel can coexist.
+        .and_then(|bytes| bytes.checked_add(size_of::<std::thread::Result<Result<T>>>()))
+        .and_then(|bytes| bytes.checked_add(stage.len()))
         .and_then(|bytes| bytes.checked_add(TASK_CONTROL_HEADROOM_BYTES))
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "CPU task control size overflow: stage={stage}, closure_bytes={}, result_bytes={}, stage_bytes={}",
-                size_of::<F>(),
-                size_of::<T>(),
-                stage.len(),
-            ))
-        })?;
+        .ok_or_else(|| Error::invalid_input("CPU task control size overflow"))?;
     let reserved_bytes = control_bytes.checked_add(workspace_bytes).ok_or_else(|| {
         Error::invalid_input(format!("CPU task total size overflow: stage={stage}, control_bytes={control_bytes}, workspace_bytes={workspace_bytes}"))
     })?;
@@ -484,6 +475,7 @@ where
         _input_owner: input_owner,
         _control: control,
     });
+    let pool_for_future = pool.clone();
     let future = PendingWork {
         work,
         pool,
@@ -493,22 +485,13 @@ where
         memory,
     }
     .run();
-    let required_bytes = size_of_val(&future)
-        .checked_add(size_of::<F>())
-        .and_then(|bytes| {
-            size_of::<T>()
-                .checked_mul(2)
-                .and_then(|result| bytes.checked_add(result))
-        })
-        .and_then(|bytes| bytes.checked_add(size_of::<TaskMemory>()))
-        .and_then(|bytes| bytes.checked_add(size_of::<CpuTaskResources>()))
-        .ok_or_else(|| Error::invalid_input("CPU task future size overflow"))?;
-    if required_bytes > control_bytes {
-        return Err(Error::internal(format!(
-            "CPU task control estimate exceeded: stage={stage}, required_bytes={required_bytes}, reserved_bytes={control_bytes}",
-        )));
+    let future_control = pool_for_future.reserve("CPU task control", size_of_val(&future))?;
+    Ok(async move {
+        let result = future.await;
+        drop(future_control);
+        result
     }
-    Ok(future.boxed())
+    .boxed())
 }
 
 #[cfg(test)]

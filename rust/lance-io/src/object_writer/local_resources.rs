@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::File,
     future::Future,
-    io::{self, Write},
+    io::{self},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -20,7 +20,7 @@ use lance_core::{
     Error, Result,
     utils::{memory::MemoryReserver, tokio::io_task_with_resources},
 };
-use object_store::path::Path;
+use object_store::{PutMode, path::Path};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{OutputLifecycle, WriteResult, get_etag};
@@ -42,18 +42,8 @@ struct StagedFile {
     metrics: IoMetricsGuard,
     _control: Box<dyn Send + Sync>,
     lifecycle: Option<Arc<dyn OutputLifecycle>>,
+    mode: PutMode,
     fsync: bool,
-}
-
-struct WriteBuffer {
-    bytes: Vec<u8>,
-    _charge: Box<dyn Send + Sync>,
-}
-
-impl AsRef<[u8]> for WriteBuffer {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
 }
 
 struct FinishedOutput {
@@ -61,6 +51,7 @@ struct FinishedOutput {
     control: Box<dyn Send + Sync>,
 }
 
+#[doc(hidden)]
 pub struct ResourceLocalWriter {
     file: Option<Arc<StagedFile>>,
     pending: Option<BoxFuture<'static, io::Result<()>>>,
@@ -73,22 +64,29 @@ pub struct ResourceLocalWriter {
 }
 
 impl ResourceLocalWriter {
+    #[doc(hidden)]
     pub async fn create(
         path: &Path,
         pool: Arc<dyn MemoryReserver>,
         tracker: Arc<IOTracker>,
         fsync: bool,
     ) -> Result<Self> {
-        Self::create_with_output_lifecycle(path, pool, tracker, None, fsync).await
+        Self::create_with_mode(path, pool, tracker, None, PutMode::Overwrite, fsync).await
     }
 
-    pub(crate) async fn create_with_output_lifecycle(
+    pub(crate) async fn create_with_mode(
         path: &Path,
         pool: Arc<dyn MemoryReserver>,
         tracker: Arc<IOTracker>,
         lifecycle: Option<Arc<dyn OutputLifecycle>>,
+        mode: PutMode,
         fsync: bool,
     ) -> Result<Self> {
+        if matches!(mode, PutMode::Update(_)) {
+            return Err(Error::not_supported(
+                "resource-aware local output does not support PutMode::Update",
+            ));
+        }
         let bytes = path
             .as_ref()
             .len()
@@ -122,6 +120,7 @@ impl ResourceLocalWriter {
                     tracker,
                     _control: control,
                     lifecycle,
+                    mode,
                     fsync,
                 }))
             },
@@ -191,21 +190,19 @@ impl AsyncWrite for ResourceLocalWriter {
                 return Poll::Ready(Err(io::Error::other(error)));
             }
         };
-        let data = WriteBuffer {
+        let data = crate::local::resources::OwnedIoBuffer {
             bytes: bytes[..length].to_vec(),
-            _charge: charge,
+            _reservation: Some(charge),
         };
         let Some(file) = self.file.clone() else {
             self.failed = true;
             return Poll::Ready(Err(Self::closed_error()));
         };
-        let pool = self.pool.clone();
-        let task = io_task_with_resources(pool.clone(), "local output write", move || {
-            let mut handle = &file.file;
-            let result = handle.write(data.as_ref());
+        let task = io_task_with_resources(self.pool.clone(), "local output write", move || {
+            let result = crate::local::resources::write_all(&file.file, data.as_ref());
             (result, file, data)
         });
-        let mut task = match task {
+        let task = match task {
             Ok(task) => task,
             Err(error) => {
                 self.failed = true;
@@ -213,30 +210,8 @@ impl AsyncWrite for ResourceLocalWriter {
             }
         };
         self.pending = Some(Box::pin(async move {
-            let mut written = 0;
-            loop {
-                let (result, file, data) = task.await.map_err(io::Error::other)?;
-                match result {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "local output write made no progress",
-                        ));
-                    }
-                    Ok(bytes) => written += bytes,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(error),
-                }
-                if written == data.as_ref().len() {
-                    return Ok(());
-                }
-                task = io_task_with_resources(pool.clone(), "local output write", move || {
-                    let mut handle = &file.file;
-                    let result = handle.write(&data.as_ref()[written..]);
-                    (result, file, data)
-                })
-                .map_err(io::Error::other)?;
-            }
+            let (result, _file, _data) = task.await.map_err(io::Error::other)?;
+            result
         }));
         // Acknowledge the admitted copy now. A later call must drain it before
         // accepting its own buffer; flush/shutdown report actual I/O failures.
@@ -285,6 +260,7 @@ impl AsyncWrite for ResourceLocalWriter {
                         metrics,
                         _control,
                         lifecycle,
+                        mode,
                         fsync,
                     } = file;
                     let result = (|| -> Result<WriteResult> {
@@ -293,7 +269,7 @@ impl AsyncWrite for ResourceLocalWriter {
                         }
                         drop(file);
                         let local = crate::local::to_local_path(&path);
-                        let published = if lifecycle.is_some() {
+                        let published = if matches!(mode, PutMode::Create) {
                             temp_path.persist_noclobber(&local)
                         } else {
                             temp_path.persist(&local)

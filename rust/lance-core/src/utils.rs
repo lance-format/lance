@@ -14,11 +14,13 @@ pub mod fragment_reuse;
 pub mod futures;
 pub mod hash;
 pub mod io_stats;
+#[doc(hidden)]
 pub mod memory;
 pub mod parse;
 pub mod path;
 pub mod row_addr_remap;
 pub mod stable_partition;
+#[doc(hidden)]
 pub mod tasks;
 pub mod tempfile;
 pub mod testing;

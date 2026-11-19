@@ -1,13 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Cooperative memory admission shared by encoding, I/O, and index stages.
+//! Experimental, unstable resource API shared by encoding, I/O and index stages.
+//!
+//! The first planned complete consumer is bounded local BTree/Bitmap creation
+//! and supported maintenance (#7306/#7309 within #7301/#7302). One operation's
+//! DataFusion pool will cover reads/decoding, retained batches, external sort
+//! and spills, encoding, metadata and publication. Adapter/read/write work must
+//! precede that consumer; this foundation alone does not bound an index build.
+//!
+//! The adapter registers DataFusion MemoryConsumers in that same pool and uses
+//! MemoryReservation::try_grow; returned owners retain reservations until drop
+//! or shrink. It must not create independent stage allowances. Low-level denial
+//! signals spill/reduction/error without waiting on retained pipeline state.
+//! Whole-operation admission may wait before materialization. Read-budget wait
+//! and overdraft policies (#10802) require separate agreement before this shared
+//! ownership interface is stabilized. Hidden APIs remain public Rust items;
+//! their visibility does not itself settle the API policy discussion.
 
 use crate::{Error, Result};
 
 /// An admitted workspace whose allowance may shrink after temporaries are freed.
 /// Backends may retain the larger allowance when they cannot resize it. The
 /// owner still releases the entire remaining reservation on drop.
+#[doc(hidden)]
 pub trait MemoryLease: Send + Sync {
     /// Reduce to `bytes` without acquiring memory. Return `true` if the new
     /// allowance is in effect, or `false` if the original allowance remains.
@@ -54,32 +70,12 @@ impl MemoryLease for FixedMemoryLease {
 ///     Ok(())
 /// }
 /// ```
+#[doc(hidden)]
 pub trait MemoryReserver: std::fmt::Debug + Send + Sync + 'static {
     /// Completion tracking shared by this operation's CPU and I/O tasks.
     /// Existing implementations retain their original untracked behavior.
     fn task_group(&self) -> Option<std::sync::Arc<super::tasks::ResourceTaskGroup>> {
         None
-    }
-
-    /// Known admission ceiling for choosing default cache and tile sizes.
-    /// `None` means unknown or unrestricted; every allocation must still call
-    /// [`Self::reserve`] before relying on the available allowance.
-    fn memory_limit_bytes(&self) -> Option<usize> {
-        None
-    }
-
-    /// Identify a typed admission denial so a caller can reduce uncommitted work.
-    /// Unknown errors return false. Retry only before exposing output or other
-    /// side effects, and release the failed attempt's owners before retrying.
-    ///
-    /// ```
-    /// # use lance_core::{Error, utils::memory::MemoryReserver};
-    /// fn can_reduce(pool: &dyn MemoryReserver, error: &Error) -> bool {
-    ///     pool.is_capacity_error(error)
-    /// }
-    /// ```
-    fn is_capacity_error(&self, _error: &Error) -> bool {
-        false
     }
 
     /// Charge `bytes` to `stage`, returning an owner that releases the charge.

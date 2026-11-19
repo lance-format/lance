@@ -235,7 +235,7 @@ pub(crate) async fn join_local_io<T>(
     }
 }
 
-mod resources;
+pub(crate) mod resources;
 
 /// Object reader for local file system.
 #[derive(Debug)]
@@ -640,6 +640,158 @@ mod tests {
             std::fs::read_dir(local.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[derive(Debug)]
+    struct PublicationObserver(Arc<AtomicUsize>);
+    impl crate::object_writer::OutputLifecycle for PublicationObserver {
+        fn published(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn resource_publication_mode(
+        #[values(false, true)] create: bool,
+        #[values(false, true)] exists: bool,
+        #[values(false, true)] notify: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("output");
+        if exists {
+            std::fs::write(&local, b"old").unwrap();
+        }
+        let path = Path::from_absolute_path(&local).unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 256 * 1024,
+            ..Default::default()
+        });
+        let store = ObjectStore::local();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let owner = notify.then(|| {
+            Arc::new(PublicationObserver(notifications.clone()))
+                as Arc<dyn crate::object_writer::OutputLifecycle>
+        });
+        let mut writer = store
+            .create_with_resources_mode(
+                &path,
+                pool.clone(),
+                if create {
+                    object_store::PutMode::Create
+                } else {
+                    object_store::PutMode::Overwrite
+                },
+                owner,
+            )
+            .await
+            .unwrap();
+        AsyncWriteExt::write_all(writer.as_mut(), b"new")
+            .await
+            .unwrap();
+        let result = Writer::shutdown(writer.as_mut()).await;
+        assert_eq!(result.is_err(), create && exists);
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            usize::from(notify && !(create && exists))
+        );
+        drop(writer);
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            if create && exists { b"old" } else { b"new" }
+        );
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::file("file")]
+    #[case::missing("missing")]
+    #[case::directory("directory")]
+    #[tokio::test]
+    async fn resource_metadata_matches_default(#[case] kind: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("object");
+        match kind {
+            "file" => std::fs::write(&local, b"data").unwrap(),
+            "directory" => std::fs::create_dir(&local).unwrap(),
+            _ => {}
+        }
+        let path = Path::from_absolute_path(&local).unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 256 * 1024,
+            ..Default::default()
+        });
+        let store = ObjectStore::local();
+        let resource = store.with_memory_reserver(pool.clone()).unwrap();
+        assert_eq!(
+            store.exists(&path).await.unwrap(),
+            resource.exists(&path).await.unwrap()
+        );
+        let ordinary = store.size(&path).await;
+        let charged = resource.size(&path).await;
+        if kind == "file" {
+            assert_eq!(ordinary.unwrap(), charged.unwrap());
+        } else {
+            assert!(ordinary.unwrap_err().is_not_found());
+            assert!(charged.unwrap_err().is_not_found());
+        }
+        drop(resource);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn resource_conditional_update_refuses_before_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::from_absolute_path(directory.path().join("output")).unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 0,
+            ..Default::default()
+        });
+        let error = ObjectStore::local()
+            .create_with_resources_mode(
+                &path,
+                pool.clone(),
+                object_store::PutMode::Update(object_store::UpdateVersion {
+                    e_tag: None,
+                    version: None,
+                }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("PutMode::Update"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn resource_metadata_follows_symlinks(#[values(false, true)] is_directory: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        if is_directory {
+            std::fs::create_dir(&target).unwrap();
+        } else {
+            std::fs::write(&target, b"data").unwrap();
+        }
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let path = Path::from_absolute_path(&link).unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 256 * 1024,
+            ..Default::default()
+        });
+        let store = ObjectStore::local();
+        let resource = store.with_memory_reserver(pool.clone()).unwrap();
+        assert_eq!(
+            store.exists(&path).await.unwrap(),
+            resource.exists(&path).await.unwrap()
+        );
+        assert_eq!(resource.exists(&path).await.unwrap(), !is_directory);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

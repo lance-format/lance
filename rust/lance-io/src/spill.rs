@@ -34,16 +34,19 @@
 //! on directory cleanup. The quota
 //! counts accepted file bytes, excluding filesystem metadata and block rounding.
 
-mod statistics;
-pub use statistics::{SpillStatistics, SpillUsage as ResourceSpillUsage};
+#[doc(hidden)]
+pub mod statistics;
+use lance_core::utils::memory::MemoryReserver;
+#[doc(hidden)]
+pub use statistics::SpillStatistics;
 
 use std::collections::LinkedList;
 use std::fs::File;
 use std::future::Future;
-use std::io::{self, Write};
+use std::io::{self};
 use std::ops::Range;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, FileExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -265,6 +268,7 @@ impl SpillMetrics {
 /// its 2 MiB stack and control state. Admission policies must reserve this once,
 /// separately from operation grants. Queued cleanup requests retain operation
 /// owners; their small metadata remains covered by operation headroom.
+#[doc(hidden)]
 pub const SPILL_CLEANUP_RUNTIME_HEADROOM_BYTES: usize = 4 * 1024 * 1024;
 
 // File/control ownership includes task, path, handle, and deferred-cleanup
@@ -287,6 +291,7 @@ const CLEANUP_WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 enum CleanupRequest {
+    Wake,
     File(PendingCleanup),
     Spill {
         directory: Arc<SpillDirectory>,
@@ -318,6 +323,10 @@ struct DeferredCleanup {
     next: *mut Self,
 }
 
+// Cleanup must progress without a new allocation: the next operation may be
+// waiting for the grant retained by a failed deletion. It also must survive
+// shutdown of the caller runtime. This registry does not promise arbitrary
+// post-fork execution of the rest of Lance.
 // A worker initialization/send failure must not release ownership of a file
 // that still exists. This lock-free backstop also remains usable after fork.
 static DEFERRED_CLEANUP: AtomicPtr<DeferredCleanup> = AtomicPtr::new(std::ptr::null_mut());
@@ -337,7 +346,19 @@ fn retain_cleanup(request: CleanupRequest) {
             Ordering::Release,
             Ordering::Relaxed,
         ) {
-            Ok(_) => return,
+            Ok(_) => {
+                // Publish before notifying: startup drains the list, while an
+                // already idle worker receives this wake even after its drain.
+                let worker = CLEANUP_WORKER.load(Ordering::Acquire);
+                if !worker.is_null() {
+                    // SAFETY: published snapshots are immutable and never freed.
+                    let worker = unsafe { &*worker };
+                    if worker.process_id == std::process::id() {
+                        let _ = worker.send.send(CleanupRequest::Wake);
+                    }
+                }
+                return;
+            }
             Err(current) => head = current,
         }
     }
@@ -357,6 +378,7 @@ fn take_deferred_cleanup(pending: &mut LinkedList<CleanupRequest>) {
 
 fn fallback_cleanup(request: CleanupRequest) {
     let removed = match &request {
+        CleanupRequest::Wake => true,
         CleanupRequest::Output { path, .. } => match std::fs::remove_file(path) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
@@ -419,7 +441,14 @@ fn cleanup_worker() -> io::Result<&'static CleanupWorker> {
         let started = std::thread::Builder::new()
             .name("lance-spill-cleanup".to_string())
             .stack_size(CLEANUP_WORKER_STACK_BYTES)
-            .spawn(move || run_cleanup_worker(receive));
+            .spawn(move || {
+                // Do not drain then sleep before our sender is published: a
+                // fallback inserted in that gap could otherwise miss its wake.
+                while CLEANUP_INITIALIZER.load(Ordering::Acquire) == process_id {
+                    std::thread::yield_now();
+                }
+                run_cleanup_worker(receive);
+            });
         if let Err(error) = started {
             CLEANUP_INITIALIZER.store(0, Ordering::Release);
             return Err(io::Error::new(
@@ -445,10 +474,22 @@ fn run_cleanup_worker(receive: mpsc::Receiver<CleanupRequest>) {
     let mut pending = LinkedList::new();
     loop {
         take_deferred_cleanup(&mut pending);
-        match receive.recv_timeout(CLEANUP_RETRY_INTERVAL) {
+        let received = if pending.is_empty() {
+            receive
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            receive.recv_timeout(CLEANUP_RETRY_INTERVAL)
+        };
+        match received {
             Ok(request) => pending.push_back(request),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(CLEANUP_RETRY_INTERVAL),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                for request in pending {
+                    retain_cleanup(request);
+                }
+                return;
+            }
         }
         while let Ok(request) = receive.try_recv() {
             pending.push_back(request);
@@ -458,6 +499,7 @@ fn run_cleanup_worker(receive: mpsc::Receiver<CleanupRequest>) {
                 break;
             };
             let retry = match &request {
+                CleanupRequest::Wake => false,
                 CleanupRequest::File(cleanup) => !cleanup.try_cleanup(),
                 CleanupRequest::Spill { directory, .. } => {
                     directory.retry_cleanup();
@@ -503,6 +545,7 @@ fn run_cleanup_worker(receive: mpsc::Receiver<CleanupRequest>) {
 /// lance_io::spill::prepare_owned_output_cleanup()?;
 /// # Ok::<(), lance_core::Error>(())
 /// ```
+#[doc(hidden)]
 pub fn prepare_owned_output_cleanup() -> Result<()> {
     cleanup_worker()?;
     Ok(())
@@ -519,6 +562,7 @@ pub fn prepare_owned_output_cleanup() -> Result<()> {
 /// lance_io::spill::cleanup_owned_output(path, owner);
 /// # }
 /// ```
+#[doc(hidden)]
 pub fn cleanup_owned_output(path: PathBuf, owner: Box<dyn Send + Sync>) {
     let request = CleanupRequest::Output {
         path,
@@ -552,13 +596,6 @@ fn dispatch_cleanup(request: CleanupRequest, worker: io::Result<&CleanupWorker>)
     }
 }
 
-/// Cooperative admission for buffers allocated by scratch I/O.
-///
-/// The returned owner must release its charge on drop. A backend retains it
-/// until the write buffer or the last slice of a returned read buffer is freed.
-/// Implementations must reserve before allocation and return contextual errors.
-pub use lance_core::utils::memory::MemoryReserver as SpillMemoryPool;
-
 /// A factory for scratch storage.
 ///
 /// The trait is object-safe and `Send + Sync` so it can be held behind an
@@ -566,13 +603,8 @@ pub use lance_core::utils::memory::MemoryReserver as SpillMemoryPool;
 /// backed by local files (e.g. in-memory buffers, remote object stores).
 #[async_trait]
 pub trait SpillStore: Send + Sync + 'static {
-    /// Create an independent usage scope while preserving this backend's quota.
-    /// Backends without diagnostics return `None`; resource limits remain mandatory.
-    fn with_usage_tracking(&self) -> Result<Option<Arc<dyn SpillStore>>> {
-        Ok(None)
-    }
-
     /// Obtain diagnostics without retaining storage, pending I/O, or a build grant.
+    #[doc(hidden)]
     fn statistics(&self) -> Option<SpillStatistics> {
         None
     }
@@ -588,7 +620,8 @@ pub trait SpillStore: Send + Sync + 'static {
     /// The default refuses accounting rather than ignoring a finite budget.
     /// Reapplying the identical `Arc` is idempotent for the local backend;
     /// replacing an already configured pool is rejected.
-    fn with_memory_pool(&self, _pool: Arc<dyn SpillMemoryPool>) -> Result<Arc<dyn SpillStore>> {
+    #[doc(hidden)]
+    fn with_memory_reserver(&self, _pool: Arc<dyn MemoryReserver>) -> Result<Arc<dyn SpillStore>> {
         Err(Error::not_supported(
             "spill store does not support memory accounting",
         ))
@@ -597,6 +630,7 @@ pub trait SpillStore: Send + Sync + 'static {
     /// Keep an opaque resource owner alive through files, detached I/O and
     /// deferred cleanup. Backends must implement this before participating in
     /// externally admitted operations; retaining only the store is insufficient.
+    #[doc(hidden)]
     fn with_resource_owner(
         &self,
         _owner: Arc<dyn std::fmt::Debug + Send + Sync>,
@@ -608,6 +642,7 @@ pub trait SpillStore: Send + Sync + 'static {
 
     /// Create an operation-scoped allowance on this storage backend. The default
     /// rejects a limit rather than letting a custom store silently ignore it.
+    #[doc(hidden)]
     fn with_spill_limit(&self, spill_limit_bytes: u64) -> Result<Arc<dyn SpillStore>> {
         Err(Error::not_supported(format!(
             "spill store does not support spill_limit_bytes={spill_limit_bytes}"
@@ -853,7 +888,7 @@ pub struct LocalSpillStore {
     /// directory.
     parent_dir: Option<PathBuf>,
     metrics: Arc<SpillMetrics>,
-    memory_pool: Option<Arc<dyn SpillMemoryPool>>,
+    memory_pool: Option<Arc<dyn MemoryReserver>>,
     _resource_owner: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
 }
 
@@ -958,7 +993,6 @@ impl LocalSpillStore {
     /// Create a store that returns [`lance_core::Error::DiskCapExceeded`] once
     /// total bytes written across all live handles would exceed `cap_bytes`.
     pub fn with_cap(cap_bytes: u64) -> Result<Self> {
-        cleanup_worker()?;
         Ok(Self {
             quota: Some(DiskQuota::new(cap_bytes)),
             ..Self::default()
@@ -1026,14 +1060,10 @@ impl Default for LocalSpillStore {
 
 #[async_trait]
 impl SpillStore for LocalSpillStore {
-    fn with_usage_tracking(&self) -> Result<Option<Arc<dyn SpillStore>>> {
-        self.with_spill_limit(u64::MAX).map(Some)
-    }
-
     fn statistics(&self) -> Option<SpillStatistics> {
         self.quota.as_ref().map(|quota| quota.statistics.clone())
     }
-    fn with_memory_pool(&self, pool: Arc<dyn SpillMemoryPool>) -> Result<Arc<dyn SpillStore>> {
+    fn with_memory_reserver(&self, pool: Arc<dyn MemoryReserver>) -> Result<Arc<dyn SpillStore>> {
         if let Some(existing) = &self.memory_pool
             && !Arc::ptr_eq(existing, &pool)
         {
@@ -1217,7 +1247,7 @@ impl AsyncWrite for LocalSpillWriter {
             Ok(reservation) => reservation,
             Err(error) => return Poll::Ready(Err(io::Error::other(error))),
         };
-        let buffer = SpillBuffer {
+        let buffer = crate::local::resources::OwnedIoBuffer {
             bytes: buf.to_vec(),
             _reservation: reservation,
         };
@@ -1226,9 +1256,9 @@ impl AsyncWrite for LocalSpillWriter {
         let write = move || {
             // The charge follows the actual blocking task, including when its
             // public writer and join future have already been dropped.
-            let mut handle = &file.file;
+            let handle = &file.file;
             let start = Instant::now();
-            let result = handle.write_all(buffer.as_ref());
+            let result = crate::local::resources::write_all(handle, buffer.as_ref());
             let elapsed = start.elapsed();
             file._backing
                 .metrics
@@ -1415,7 +1445,7 @@ struct SpillBacking {
     finished: AtomicBool,
     directory: Arc<SpillDirectory>,
     metrics: Arc<SpillMetrics>,
-    memory_pool: Option<Arc<dyn SpillMemoryPool>>,
+    memory_pool: Option<Arc<dyn MemoryReserver>>,
     _resource_owner: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
 }
 
@@ -1487,17 +1517,6 @@ impl Spill for LocalSpill {
     }
 }
 
-struct SpillBuffer {
-    bytes: Vec<u8>,
-    _reservation: Option<Box<dyn Send + Sync>>,
-}
-
-impl AsRef<[u8]> for SpillBuffer {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
 #[derive(Debug)]
 struct SpillReadFile {
     // Close the OS file before releasing its backing (required on Windows).
@@ -1511,26 +1530,12 @@ impl SpillReadFile {
         self: Arc<Self>,
         range: Range<usize>,
     ) -> BoxFuture<'static, object_store::Result<Bytes>> {
-        let reservation = range
-            .end
-            .checked_sub(range.start)
-            .ok_or_else(|| {
-                Error::invalid_input(format!("scratch read range is reversed: {range:?}"))
-            })
-            .and_then(|length| {
-                length.checked_add(SPILL_IO_CONTROL_BYTES).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "scratch read reservation size overflow: {range:?}"
-                    ))
-                })
-            })
-            .and_then(|bytes| {
-                self._backing
-                    .memory_pool
-                    .as_ref()
-                    .map(|pool| pool.reserve("scratch read buffer and task", bytes))
-                    .transpose()
-            });
+        let reservation = crate::local::resources::reserve_read(
+            self._backing.memory_pool.as_deref(),
+            &range,
+            "scratch read buffer and task",
+            SPILL_IO_CONTROL_BYTES,
+        );
         let pool = self._backing.memory_pool.clone();
         Box::pin(async move {
             let reservation = reservation?;
@@ -1539,11 +1544,11 @@ impl SpillReadFile {
                 // the actual blocking read after its outer future is dropped.
                 let mut bytes = vec![0; range.len()];
                 let start = Instant::now();
-                #[cfg(unix)]
-                let result = self.file.read_exact_at(&mut bytes, range.start as u64);
-                #[cfg(windows)]
-                let result =
-                    crate::local::read_exact_at(self.file.clone(), &mut bytes, range.start as u64);
+                let result = crate::local::resources::read_exact(
+                    self.file.clone(),
+                    &mut bytes,
+                    range.start as u64,
+                );
                 let elapsed = start.elapsed();
                 self._backing
                     .metrics
@@ -1559,7 +1564,7 @@ impl SpillReadFile {
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 #[cfg(feature = "metrics")]
                 metrics::counter!("lance_spill_read_bytes_total").increment(bytes.len() as u64);
-                Ok(Bytes::from_owner(SpillBuffer {
+                Ok(Bytes::from_owner(crate::local::resources::OwnedIoBuffer {
                     bytes,
                     _reservation: reservation,
                 }))
@@ -1605,7 +1610,7 @@ impl DeepSizeOf for SpillReader {
 }
 
 impl Reader for SpillReader {
-    fn memory_reserver(&self) -> Option<Arc<dyn SpillMemoryPool>> {
+    fn memory_reserver(&self) -> Option<Arc<dyn MemoryReserver>> {
         self.file._backing.memory_pool.clone()
     }
 
@@ -1657,6 +1662,27 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rstest::rstest;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn cleanup_worker_blocks_and_wakes_then_retires() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output");
+        std::fs::write(&path, b"data").unwrap();
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || run_cleanup_worker(receive));
+        send.send(CleanupRequest::Output {
+            path: path.clone(),
+            has_logged_failure: AtomicBool::new(false),
+            _owner: Box::new(owner),
+        })
+        .unwrap();
+        drop(send);
+        worker.join().unwrap();
+        assert!(!path.exists());
+        assert!(weak.upgrade().is_none());
+    }
 
     #[cfg(feature = "metrics")]
     #[rstest]
@@ -2799,13 +2825,88 @@ mod tests {
         assert_eq!(quota.used.load(Ordering::Relaxed), 0);
         assert_eq!(store.metrics.snapshot().charged_bytes, 0);
     }
+    #[derive(Debug)]
+    struct RefuseIoAdmission {
+        stage: &'static str,
+        refuse: AtomicBool,
+        tasks: Arc<lance_core::utils::tasks::ResourceTaskGroup>,
+    }
+
+    impl MemoryReserver for RefuseIoAdmission {
+        fn task_group(&self) -> Option<Arc<lance_core::utils::tasks::ResourceTaskGroup>> {
+            Some(self.tasks.clone())
+        }
+
+        fn reserve(&self, stage: &str, _bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            if stage == self.stage && self.refuse.swap(false, Ordering::Relaxed) {
+                return Err(Error::execution(format!(
+                    "injected admission denial: stage={stage}"
+                )));
+            }
+            Ok(Box::new(()))
+        }
+    }
+
+    #[rstest]
+    #[case::control("I/O completion driver control")]
+    #[case::driver("I/O completion future")]
+    #[case::await_future("I/O await future")]
+    #[tokio::test]
+    async fn test_spill_io_admission_failure_can_retry(#[case] stage: &'static str) {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage,
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
+        let store = LocalSpillStore::with_cap(4).unwrap();
+        let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+        let (mut writer, spill) = scoped.new_spill().await.unwrap();
+        pool.refuse.store(true, Ordering::Relaxed);
+        let error = writer.write_all(b"AAAA").await.unwrap_err();
+        let source = error.get_ref().unwrap().downcast_ref::<Error>().unwrap();
+        assert!(matches!(source, Error::Execution { .. }));
+        assert!(source.to_string().contains(stage));
+        // Drain any work that escaped the failed call before checking physical
+        // bytes. This exposes a rejected write even when dispatch races denial.
+        pool.tasks.wait().await;
+        let directory = store.ensure_temp_dir().unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path().join("spill_000000.bin"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(writer.tell().await.unwrap(), 0);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(store.metrics().snapshot().accepted_bytes, 0);
+        writer.write_all(b"BBBB").await.unwrap();
+        assert_eq!(Writer::shutdown(writer.as_mut()).await.unwrap().size, 4);
+        let reader = spill.reader().await.unwrap();
+        assert_eq!(reader.get_all().await.unwrap().as_ref(), b"BBBB");
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Relaxed),
+            4
+        );
+        assert_eq!(store.metrics().snapshot().accepted_bytes, 4);
+        drop(reader);
+        drop(writer);
+        drop(spill);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Relaxed),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn test_scoped_statistics_do_not_retain_storage() {
         let store = LocalSpillStore::with_cap(100).unwrap();
         let parent = store.statistics().unwrap();
-        let scoped = store.with_usage_tracking().unwrap().unwrap();
+        let scoped = store.with_spill_limit(u64::MAX).unwrap();
         let statistics = scoped.statistics().unwrap();
-        let other = store.with_usage_tracking().unwrap().unwrap();
+        let other = store.with_spill_limit(u64::MAX).unwrap();
         let (writer, spill) = scoped.new_spill().await.unwrap();
         finish_writer(writer, b"hello").await.unwrap();
         assert_eq!(statistics.snapshot().reserved_bytes, 5);
@@ -2814,7 +2915,7 @@ mod tests {
         assert_eq!(parent.snapshot().reserved_bytes, 5);
         assert_eq!(
             other.statistics().unwrap().snapshot(),
-            ResourceSpillUsage::default()
+            statistics::SpillUsage::default()
         );
         let reader = spill.reader().await.unwrap();
         drop(spill);

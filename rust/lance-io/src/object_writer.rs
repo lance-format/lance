@@ -41,6 +41,7 @@ pub(crate) use local_resources::ResourceLocalWriter;
 ///     fn published(&self) { self.0.store(true, Ordering::Release); }
 /// }
 /// ```
+#[doc(hidden)]
 pub trait OutputLifecycle: std::fmt::Debug + Send + Sync {
     /// Mark this file owned only after its no-replace publication succeeds.
     fn published(&self);

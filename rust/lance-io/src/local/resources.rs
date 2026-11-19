@@ -33,12 +33,12 @@ impl std::fmt::Debug for ReaderResources {
     }
 }
 
-struct ReadBytes {
-    bytes: Vec<u8>,
-    _owner: Box<dyn Send + Sync>,
+pub struct OwnedIoBuffer {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) _reservation: Option<Box<dyn Send + Sync>>,
 }
 
-impl AsRef<[u8]> for ReadBytes {
+impl AsRef<[u8]> for OwnedIoBuffer {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
     }
@@ -89,16 +89,12 @@ impl LocalObjectReader {
         pool: Arc<dyn MemoryReserver>,
         range: Range<usize>,
     ) -> BoxFuture<'static, object_store::Result<Bytes>> {
-        let admitted = range
-            .end
-            .checked_sub(range.start)
-            .ok_or_else(|| Error::invalid_input(format!("local read range is reversed: {range:?}")))
-            .and_then(|bytes| {
-                bytes.checked_add(1024).ok_or_else(|| {
-                    Error::invalid_input(format!("local read reservation size overflow: {range:?}"))
-                })
-            })
-            .and_then(|bytes| pool.reserve("local read buffer and task", bytes));
+        let admitted = reserve_read(
+            Some(pool.as_ref()),
+            &range,
+            "local read buffer and task",
+            1024,
+        );
         Box::pin(async move {
             let owner = admitted?;
             let length = range.end - range.start;
@@ -110,14 +106,11 @@ impl LocalObjectReader {
                 move || -> std::io::Result<Bytes> {
                     // The reservation moves into the actual blocking closure. Dropping
                     // its JoinHandle cannot return the allowance while it still runs.
-                    let mut data = ReadBytes {
+                    let mut data = OwnedIoBuffer {
                         bytes: vec![0; length],
-                        _owner: owner,
+                        _reservation: owner,
                     };
-                    #[cfg(unix)]
-                    file.read_exact_at(&mut data.bytes, offset)?;
-                    #[cfg(windows)]
-                    read_exact_at(file, &mut data.bytes, offset)?;
+                    read_exact(file, &mut data.bytes, offset)?;
                     Ok(Bytes::from_owner(data))
                 },
             )?
@@ -171,5 +164,103 @@ impl LocalObjectReader {
             }
         })
         .boxed()
+    }
+}
+
+pub fn reserve_read(
+    pool: Option<&dyn MemoryReserver>,
+    range: &Range<usize>,
+    stage: &str,
+    control_bytes: usize,
+) -> lance_core::Result<Option<Box<dyn Send + Sync>>> {
+    let bytes = range
+        .end
+        .checked_sub(range.start)
+        .ok_or_else(|| Error::invalid_input(format!("{stage}: read range is reversed: {range:?}")))?
+        .checked_add(control_bytes)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "{stage}: read reservation size overflow: {range:?}"
+            ))
+        })?;
+    pool.map(|pool| pool.reserve(stage, bytes)).transpose()
+}
+
+// These native operations are shared by scratch and destination I/O. Their
+// callers carry the admitted buffer and file owners into the completion task.
+pub fn write_all(mut writer: impl std::io::Write, mut bytes: &[u8]) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "local write made no progress",
+                ));
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+pub fn read_exact(file: Arc<File>, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.read_exact_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        read_exact_at(file, bytes, offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct PartialWriter {
+        interrupted: bool,
+        fail: Option<std::io::ErrorKind>,
+        bytes: Vec<u8>,
+    }
+    impl std::io::Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if let Some(kind) = self.fail {
+                return if kind == std::io::ErrorKind::WriteZero {
+                    Ok(0)
+                } else {
+                    Err(kind.into())
+                };
+            }
+            self.bytes.push(bytes[0]);
+            Ok(1)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[rstest::rstest]
+    #[case::short(None)]
+    #[case::zero(Some(std::io::ErrorKind::WriteZero))]
+    #[case::failure(Some(std::io::ErrorKind::PermissionDenied))]
+    #[test]
+    fn native_write_retries_and_errors(#[case] fail: Option<std::io::ErrorKind>) {
+        let mut writer = PartialWriter {
+            interrupted: false,
+            fail,
+            bytes: Vec::new(),
+        };
+        let result = write_all(&mut writer, b"abc");
+        if let Some(kind) = fail {
+            assert_eq!(result.unwrap_err().kind(), kind);
+        } else {
+            result.unwrap();
+            assert_eq!(writer.bytes, b"abc");
+        }
     }
 }
