@@ -588,7 +588,7 @@ def cast(
             return pa.FixedSizeListArray.from_arrays(values=values, list_size=list_size)
         # ``from_arrays(mask=...)`` needs PyArrow 15; build from buffers so the
         # validity bitmap is kept on every supported PyArrow version.
-        validity = pc.is_valid(arr).buffers()[1]
+        validity = arr.is_valid().buffers()[1]
         return pa.Array.from_buffers(
             pa.list_(values.type, list_size),
             len(arr),
