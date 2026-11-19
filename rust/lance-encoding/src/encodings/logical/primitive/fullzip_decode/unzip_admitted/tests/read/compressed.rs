@@ -305,11 +305,26 @@ async fn compressed_replay_failure_releases_unpublished_outputs(#[case] fault: u
 }
 
 #[rstest]
+#[case::zstd_invalid_magic(
+    CompressionScheme::Zstd,
+    vec![1, 2, 3],
+    "Unknown frame descriptor"
+)]
+#[case::zstd_truncated_header(
+    CompressionScheme::Zstd,
+    vec![0x28, 0xb5, 0x2f],
+    "Src size is incorrect"
+)]
+#[case::lz4_missing_prefix(CompressionScheme::Lz4, vec![1, 2, 3], "length prefix")]
 #[tokio::test]
 async fn compressed_frames_validate_without_output_credit(
-    #[values(CompressionScheme::Zstd, CompressionScheme::Lz4)] scheme: CompressionScheme,
+    #[case] scheme: CompressionScheme,
+    #[case] frame: Vec<u8>,
+    #[case] expected_error: &str,
 ) {
-    let mut f = fixture_with_values(64, false, "flat", vec![vec![1, 2, 3]]);
+    // Zstd inputs shorter than its length prefix are checked as raw frames:
+    // invalid magic and truncated valid magic have distinct codec errors.
+    let mut f = fixture_with_values(64, false, "flat", vec![frame]);
     Arc::get_mut(&mut f.scheduler.details)
         .unwrap()
         .value_decompressor = PerValueDecompressor::Variable(Arc::new(
@@ -332,7 +347,7 @@ async fn compressed_frames_validate_without_output_credit(
     assert_eq!(work.len(), 0);
     let error = input.decode_in(&mut work).unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("length prefix"));
+    assert!(error.to_string().contains(expected_error), "{error}");
     assert_eq!(work.len(), capacity);
     drop(work);
     assert_eq!(pool.reserved(), 0);
