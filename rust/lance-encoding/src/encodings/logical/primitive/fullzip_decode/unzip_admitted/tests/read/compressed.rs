@@ -277,9 +277,10 @@ async fn compressed_replay_failure_releases_unpublished_outputs(#[case] fault: u
     ));
     let source = source(&mut f);
     let scheduler = Arc::new(f.scheduler);
-    let pool = AllocationBudget::new(1024 * 1024);
+    let capacity = 1024 * 1024;
+    let pool = AllocationBudget::new(capacity);
     for _ in 0..2 {
-        let mut work = pool.try_reserve(pool.capacity()).unwrap();
+        let mut work = pool.try_reserve(capacity).unwrap();
         let input = scheduler
             .clone()
             .prepare_array_range_in(
@@ -345,8 +346,9 @@ async fn compressed_arrow_rejects_invalid_utf8(
     let f = fixture_with_values(32, false, "flat", vec![vec![0xff], b"valid".to_vec()]);
     let mut f = compress(f, scheme);
     let source = source(&mut f);
-    let pool = AllocationBudget::new(1024 * 1024);
-    let mut work = pool.try_reserve(pool.capacity()).unwrap();
+    let capacity = 1024 * 1024;
+    let pool = AllocationBudget::new(capacity);
+    let mut work = pool.try_reserve(capacity).unwrap();
     let input = Arc::new(f.scheduler)
         .prepare_array_range_in(
             0..2,
