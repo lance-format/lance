@@ -174,7 +174,9 @@ hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 icu_segmenter = { version = "2.2", default-features = false, features = ["compiled_data"] }
 io-uring = "0.7"
 itertools = "0.14"
-jieba-rs = { version = "0.10.0", default-features = false }
+# Pinned: newer releases segment text differently, so queries against existing
+# full-text indexes would miss rows. Upgrading needs an index compatibility plan.
+jieba-rs = { version = "=0.10.3", default-features = false }
 libm = "0.2.15"
 log = "0.4"
 metrics = { version = "0.24" }
