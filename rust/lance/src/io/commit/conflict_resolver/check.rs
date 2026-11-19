@@ -5,7 +5,9 @@ mod create_index;
 mod rewrite;
 
 use super::*;
-use lance_table::transaction::action::{FieldRef as ActionFieldRef, Footprint, Verdict, Window};
+use lance_table::transaction::action::{
+    FieldRef as ActionFieldRef, Footprint, Overlap, Verdict, Window,
+};
 use lance_table::transaction::coverage_repair::{CommittedSince, NewCoverage, stale_coverage};
 
 impl<'a> TransactionRebase<'a> {
@@ -249,7 +251,8 @@ impl<'a> TransactionRebase<'a> {
 
     /// Check this transaction against the change the commits being checked
     /// made, by the transactions whose footprints are `committed`,
-    /// the last of which is `last` at `last_version`.
+    /// the last of which is `last` at `last_version`; and rebase it past what
+    /// it overlaps.
     fn check_window(
         &mut self,
         committed: Vec<Footprint>,
@@ -275,14 +278,40 @@ impl<'a> TransactionRebase<'a> {
         }
         let verdict =
             Footprint::of(&self.transaction, &read).check(&Window::new(&since, &latest, committed));
-        if let Verdict::Conflict(reason) = verdict {
-            return Err(self.window_conflict_err(since.version, last_version, &reason));
-        }
+        let overlaps = match verdict {
+            Verdict::Compatible => Vec::new(),
+            Verdict::Rebase(overlaps) => overlaps,
+            Verdict::Conflict(reason) => {
+                return Err(self.window_conflict_err(since.version, last_version, &reason));
+            }
+        };
         // What the index coverage this transaction adds gives up is settled
         // once every committed transaction is checked, against the latest
         // manifest; see `repair_index_coverage`.
         self.footprint_basis.repairs_index_coverage = true;
-        Ok(())
+        if overlaps.is_empty() {
+            return Ok(());
+        }
+        for overlap in &overlaps {
+            if !self.flag_rows_to_check(overlap) {
+                return Err(self.retryable_conflict_err(last, last_version));
+            }
+        }
+        match &mut self.transaction.operation {
+            Operation::CompositeOperation(composite_operation) => {
+                composite_operation.rebase(&overlaps)
+            }
+            // Flagged above on the marks their own checks set, so `finish`
+            // settles them row by row as it does against a named operation.
+            Operation::Delete { .. } | Operation::Update { .. }
+                if overlaps
+                    .iter()
+                    .all(|overlap| matches!(overlap, Overlap::Deletions { .. })) =>
+            {
+                Ok(())
+            }
+            _ => Err(self.retryable_conflict_err(last, last_version)),
+        }
     }
 
     fn window_conflict_err(&self, since: u64, latest: u64, reason: &str) -> Error {
@@ -295,6 +324,42 @@ impl<'a> TransactionRebase<'a> {
             )
             .into(),
         )
+    }
+
+    /// Flag a fragment whose deletions `overlap` merges for `finish` to check
+    /// row by row, as the legacy checks flag one through `initial_fragments`.
+    /// A no-op for any other overlap.
+    ///
+    /// Returns false where the overlap cannot be resolved: this transaction
+    /// does not say which rows it deleted, or the fragment as it read it is
+    /// not known.
+    fn flag_rows_to_check(&mut self, overlap: &Overlap) -> bool {
+        let fragment = match overlap {
+            Overlap::Deletions { fragment } if self.affected_rows.is_some() => *fragment,
+            Overlap::Deletions { .. } => return false,
+        };
+        if let Some((_, flagged)) = self.initial_fragments.get_mut(&fragment) {
+            *flagged = true;
+            return true;
+        }
+        // The deletions this transaction's file was built on: those of the
+        // version it read, unless a previous attempt already merged the file
+        // with those at the start of this window. Never the handle this commit
+        // goes through, which may be newer.
+        let baseline = match self.merged_on_previous_attempt(fragment) {
+            true => self.footprint_basis.since.as_ref(),
+            false => self
+                .footprint_basis
+                .read
+                .as_ref()
+                .filter(|read| read.version == self.transaction.read_version),
+        };
+        let Some(initial) = baseline.and_then(|manifest| manifest.fragment_by_id(fragment)) else {
+            return false;
+        };
+        self.initial_fragments
+            .insert(fragment, (initial.clone(), true));
+        true
     }
 
     /// A committed fragment this transaction adds index coverage of that one
@@ -318,6 +383,23 @@ impl<'a> TransactionRebase<'a> {
                     && self
                         .moved_to(*fragment)
                         .is_some_and(|moved| moved.is_empty())
+            })
+    }
+
+    /// Whether this action set's deletion file for `fragment` is one a
+    /// previous attempt's rebase merged with the deletions at the start of
+    /// this window, which `settle_rows` writes stamped with that version.
+    fn merged_on_previous_attempt(&self, fragment: u64) -> bool {
+        let (Operation::CompositeOperation(composite_operation), Some(since)) =
+            (&self.transaction.operation, &self.footprint_basis.since)
+        else {
+            return false;
+        };
+        since.version != self.transaction.read_version
+            && composite_operation.iter_actions().any(|action| {
+                matches!(action, Action::SetDeletionFile(set)
+                    if set.fragment() == fragment
+                        && set.deletion_file().read_version == since.version)
             })
     }
 

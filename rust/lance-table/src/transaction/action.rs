@@ -130,7 +130,7 @@ pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use drop_index::DropIndex;
-pub use footprint::{ConfigMap, Footprint, Part, Verdict, Window};
+pub use footprint::{ConfigMap, Footprint, Overlap, Part, Verdict, Window};
 pub use refresh_row_version_metadata::RefreshRowVersionMetadata;
 pub use remove_fragment::RemoveFragment;
 pub use remove_index_segment::RemoveIndexSegment;
@@ -143,11 +143,13 @@ pub use tombstone_field_data::TombstoneFieldData;
 pub use trim_frag_reuse::TrimFragReuse;
 pub use update_compacted_sstables::UpdateCompactedSsTables;
 
+use crate::format::DeletionFile;
 use apply::ApplyState;
 use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
-    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, Result,
+    Error, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    Result,
 };
 use uuid::Uuid;
 
@@ -356,6 +358,23 @@ impl CompositeOperation {
         self.steps.iter().flat_map(|step| step.actions.iter())
     }
 
+    /// Rewrite this operation in place past `overlaps`, the ways it overlaps a
+    /// set that committed after it read, as a [`Verdict::Rebase`] named them.
+    pub fn rebase(&mut self, overlaps: &[Overlap]) -> Result<()> {
+        for overlap in overlaps {
+            match overlap {
+                // The merged deletion file depends on every deletion landed by
+                // the time this operation does, not just the one overlapping
+                // set's, so it is written once the latest version is known and
+                // installed through `set_merged_deletions`.
+                Overlap::Deletions { fragment } => {
+                    self.deletion_file_set_on(*fragment)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Stop binding, in the files of the fragments this operation mints, the
     /// fields `read` holds and `latest` dropped, dropping a file left binding
     /// nothing.
@@ -385,6 +404,45 @@ impl CompositeOperation {
                 _ => true,
             });
         }
+    }
+
+    /// Install `merged`, a deletion file holding the rows this operation
+    /// deletes from `fragment` and every row deleted from it since it read, in
+    /// place of the one it set. `None` means every row of the fragment is now
+    /// deleted, so the fragment is removed instead.
+    pub fn set_merged_deletions(
+        &mut self,
+        fragment: u64,
+        merged: Option<DeletionFile>,
+    ) -> Result<()> {
+        let action = self.deletion_file_set_on(fragment)?;
+        match merged {
+            Some(deletion_file) => {
+                if let Action::SetDeletionFile(set) = action {
+                    set.install_merged(deletion_file);
+                }
+            }
+            None => {
+                *action = Action::RemoveFragment(RemoveFragment::new(Ref::Committed(fragment)));
+            }
+        }
+        Ok(())
+    }
+
+    /// The action that sets `fragment`'s deletion file.
+    fn deletion_file_set_on(&mut self, fragment: u64) -> Result<&mut Action> {
+        self.steps
+            .iter_mut()
+            .flat_map(|step| step.actions.iter_mut())
+            .find(
+                |action| matches!(action, Action::SetDeletionFile(set) if set.fragment() == fragment),
+            )
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "an overlap names the deletions of fragment {fragment}, which this \
+                     operation does not set"
+                ))
+            })
     }
 
     /// Withdraw committed `fragment` from the coverage this operation gives

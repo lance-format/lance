@@ -2850,6 +2850,7 @@ mod composite {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{TryStreamExt, stream};
     use lance_core::datatypes::Field as LanceField;
+    use lance_core::utils::deletion::DeletionVector;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
@@ -3306,9 +3307,9 @@ mod composite {
     /// `SetDeletionFile` carries an absolute post-image -- the whole deletion
     /// file, computed against the read version -- and apply writes it in
     /// blindly. That is only safe because two sets touching the same fragment's
-    /// deletions collide on `Part::Deletions`: without the conflict, the
-    /// loser's deletions would be silently dropped rather than recomputed.
-    /// This pins that.
+    /// deletions collide on `Part::Deletions` unless both only add to it, and
+    /// are merged row by row: without that, the loser's deletions would be
+    /// silently dropped rather than recomputed. This pins that.
     #[tokio::test]
     async fn test_two_action_sets_setting_the_same_deletion_file_conflict() {
         let dataset = Arc::new(test_dataset(false).await);
@@ -5747,22 +5748,26 @@ mod composite {
     }
 
     /// A row-moving update deletes rows from the fragment and re-creates them
-    /// elsewhere from the base the overlay never modified.
+    /// elsewhere from the base the overlay never modified, so an overlay of a
+    /// moved row conflicts with it.
     #[tokio::test]
     async fn test_an_overlay_and_a_row_moving_update_conflict_in_either_order() {
-        let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
+        async fn moving_update(dataset: &Dataset, fragment: u64) -> Vec<Action> {
+            let deletion_file = lance_table::io::deletion::write_deletion_file(
+                &dataset.base,
+                fragment,
+                dataset.version().version,
+                &DeletionVector::from(RoaringBitmap::from_iter([0])),
+                dataset.object_store.as_ref(),
+                0,
+            )
+            .await
+            .unwrap();
             vec![
                 Action::SetDeletionFile(
                     SetDeletionFile::try_new_unchecked(
                         fragment,
-                        DeletionFile {
-                            read_version,
-                            id: 1,
-                            file_type: DeletionFileType::Array,
-                            num_deleted_rows: Some(1),
-                            base_id: None,
-                            inline: None,
-                        },
+                        deletion_file.expect("one of the fragment's rows stays"),
                         None,
                         true,
                     )
@@ -5787,25 +5792,17 @@ mod composite {
                     .unwrap(),
                 ),
             ]
-        };
+        }
 
         let original = test_dataset(false).await;
         let fragment = original.fragments()[0].id;
         let read_version = original.version().version;
+        let update = moving_update(&original, fragment).await;
         let overlaid = commit(original.clone(), vec![overlay_action(&original, fragment)]).await;
-        commit_expecting_conflict(
-            &overlaid,
-            read_version,
-            moving_update(&original, fragment, read_version),
-        )
-        .await;
+        commit_expecting_conflict(&overlaid, read_version, update).await;
 
         let original = test_dataset(false).await;
-        let updated = commit(
-            original.clone(),
-            moving_update(&original, fragment, read_version),
-        )
-        .await;
+        let updated = commit(original.clone(), moving_update(&original, fragment).await).await;
         commit_expecting_conflict(
             &updated,
             read_version,
