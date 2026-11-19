@@ -139,28 +139,10 @@ pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
 /// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
 /// sets `key_layout`.
 ///
-/// The segment's index version 2 keeps older readers from using it, but
-/// nothing keeps v12.0.0 and v13.0.0 writers from updating a table with stable
-/// row ids. Their update adds the fragment that receives the rewritten rows to
-/// the segment's `fragment_bitmap` without indexing those rows. v12.0.0
-/// through v14.0.0 refuse this bit, so they commit nothing to the table.
-///
-/// Writer-only. v10.0.0 and v11.0.0 check writer flags only on insert. Their
-/// update, delete, index creation, column addition, and compaction drop the
-/// segment and clear the bit. Their restore, shallow clone, and branch
-/// creation keep the segment and clear the bit. Their reads stay correct.
-///
-/// [`FLAG_ROW_ADDR_INDICES`] cannot stand in for this bit: writers that
-/// support [`FLAG_ROW_ADDR_INDICES`] but not key layouts recompute bit 18 from
-/// `index_version >= 1` on restore, clone, and commits without checking the
-/// source manifest's flags or dropping a damaged `key_layout` segment.
-///
-/// A writer that supports this bit sets it on every published manifest, clones
-/// and restores included, exactly when its index section has a segment with a
-/// `key_layout`, and derives and validates it the way
-/// [`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`] is. A segment with a `key_layout`
-/// from a manifest without the bit is unusable, and such a writer never
-/// carries it into a new manifest.
+/// Writer-only. The
+/// [key layout writer rules](https://lance.org/format/index/scalar/btree/#key-layout-writer-rules)
+/// say when a writer sets this bit and how it treats a `key_layout` segment
+/// from a manifest that lacks it.
 ///
 /// Reserved ahead of its implementation. This build masks the bit out in
 /// `supported_flags_when`, so it refuses to write a table that sets it.

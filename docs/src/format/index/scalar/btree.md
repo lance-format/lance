@@ -349,15 +349,47 @@ a `key_layout` as unusable when any of these is true:
 
 An engine skips an unusable index and scans the fragments that the index
 covers, as it does for any index segment it cannot use (see
-[Index Compatibility](../index.md#index-compatibility)). If the manifest lacks
-`FLAG_BTREE_KEY_LAYOUT`, a writer that supports key layouts drops the
-index (see
-[Compatibility With Released Versions](#compatibility-with-released-versions)).
-Otherwise the engine does not add rows or fragments to the index, and its
-compaction does not rewrite the fragments that the index covers. It still
-removes fragments from the index's `fragment_bitmap` when an update requires it
-(see
-[Creating and Updating Index Segments](../index.md#creating-and-updating-index-segments)).
+[Index Compatibility](../index.md#index-compatibility)). The
+[Key Layout Writer Rules](#key-layout-writer-rules) say how a writer maintains
+an unusable index.
+
+### Key Layout Writer Rules
+
+These rules apply to every writer that supports key layouts. Released versions
+do not support key layouts.
+[Compatibility With Released Versions](#compatibility-with-released-versions)
+explains how the index version and `FLAG_BTREE_KEY_LAYOUT` fence them.
+
+By default, a writer builds a single-column index without a `key_layout`.
+
+A writer must set `FLAG_BTREE_KEY_LAYOUT` (`2^20`) in the writer
+[feature flags](../../table/versioning.md#current-feature-flags) of every
+manifest it publishes, including by clone and restore, exactly when the
+manifest's index section has a segment with a `key_layout`. It must not set the
+bit in the reader feature flags.
+
+A writer must not carry a segment with a `key_layout` out of a manifest whose
+writer feature flags lack the bit. This rule covers the parent manifest that a
+commit builds on and the version that a restore, clone, or branch copies. The
+writer must drop such a segment before it computes the bit.
+
+A writer may keep a segment with a `key_layout` that the
+[Key Layout Reader Rules](#key-layout-reader-rules) make unusable to it. It must
+then maintain the segment as follows:
+
+- It must not add rows or fragments to the segment.
+- It must remove fragments from the segment's `fragment_bitmap` when an update
+  requires it (see
+  [Creating and Updating Index Segments](../index.md#creating-and-updating-index-segments)).
+- Its compaction may rewrite the fragments that the segment covers. The commit
+  that rewrites them must remove them from the segment's `fragment_bitmap`, as
+  an update does. Readers then scan the new fragments (see
+  [Compaction and remapping](../index.md#compaction-and-remapping)).
+- When compaction defers the remap to a
+  [fragment reuse index](../system/frag_reuse.md), the commit must still remove
+  the rewritten fragments from the segment's `fragment_bitmap`. The segment
+  then covers none of the fragments that the reuse index maps them to, so
+  readers scan those fragments.
 
 ### Encoding Stability
 
@@ -371,48 +403,18 @@ byte layout is a new encoding version, `arrow_row` version 2.
 
 ### Compatibility With Released Versions
 
-Index version 2 keeps released readers from using an index with a
-`key_layout`, but nothing in the index keeps v12.0.0 and v13.0.0 writers from
-updating a table with stable row IDs. Their update adds the fragment that
-receives the rewritten rows to the index's `fragment_bitmap`, although the
-index holds no row address in that fragment. A table with such an index
-therefore sets `FLAG_BTREE_KEY_LAYOUT` (`2^20`) in its writer
-[feature flags](../../table/versioning.md#current-feature-flags), and not in its
-reader feature flags. The index version fences readers from v10.0.0 on, and the
-flag fences writers from v12.0.0 on.
+Index version 2 fences released readers. Releases from v10.0.0 on do not use a
+BTree index of version 2, so they skip an index with a `key_layout` and answer
+queries from the table data.
 
-Releases v12.0.0 and v13.0.0 read BTree indices up to version 0, and release
-v14.0.0 reads them up to version 1, so these releases ignore an index with a
-`key_layout` and answer queries from the table data. Releases v10.0.0 and
-v11.0.0 also ignore it when they read. In all five releases, equality filters
-on key columns return the same rows as a full scan.
-
-Releases v12.0.0 through v14.0.0 commit no change to a table that sets
-`FLAG_BTREE_KEY_LAYOUT`. Their insert, update, delete, index creation, column
-addition, restore, shallow clone, and branch creation fail with an
-unsupported-feature error. Their index optimization and compaction either fail
-the same way or commit nothing.
-
-Releases v10.0.0 and v11.0.0 check writer feature flags only when they insert.
-Their update, delete, index creation, column addition, and compaction commit
-anyway. Each of these commits removes the index with a `key_layout` from the
-manifest and clears `FLAG_BTREE_KEY_LAYOUT`. Their index optimization does the
-same or commits nothing. Their restore, shallow clone, and branch creation
-clear the bit but keep the index. On a table with stable row IDs, a later
-update by v12.0.0 or v13.0.0 can then add fragments to the index's
-`fragment_bitmap`, and a later commit, clone, or restore by a writer that
-supports `FLAG_ROW_ADDR_INDICES` (`2^18`) but not key layouts sets
-`FLAG_ROW_ADDR_INDICES` again from `index_version >= 1` without repairing or
-dropping the segment. Their reads stay correct throughout.
-
-A reader therefore does not use an index with a `key_layout` from a manifest
-whose writer feature flags lack `FLAG_BTREE_KEY_LAYOUT` (see
-[Key Layout Reader Rules](#key-layout-reader-rules)).
-
-A writer that supports key layouts never carries an index with a `key_layout`
-out of a manifest whose writer feature flags lack the bit. That rule covers the
-manifest that a commit builds on and the version that a restore, clone, or
-branch copies. The writer drops such an index before it computes the bit.
-Every manifest it publishes, including by clone and restore, sets
-`FLAG_BTREE_KEY_LAYOUT` exactly when its index section has a segment with a
-`key_layout`. The bit covers only segments with a `key_layout`.
+`FLAG_BTREE_KEY_LAYOUT` fences released writers. Without it, an update by
+v12.0.0 or v13.0.0 on a table with stable row IDs would add the fragment that
+receives the rewritten rows to the index's `fragment_bitmap` without indexing
+those rows, because these releases do not check the index version before they
+update. Releases v12.0.0 through v14.0.0 refuse to write a table that sets the
+bit. Releases v10.0.0 and v11.0.0 check writer feature flags only when they
+insert, and their restore, shallow clone, and branch creation clear the bit but
+keep the index. For that reason, a reader does not use an index with a
+`key_layout` from a manifest that lacks the bit, and a writer drops such an
+index (see [Key Layout Reader Rules](#key-layout-reader-rules) and
+[Key Layout Writer Rules](#key-layout-writer-rules)).
