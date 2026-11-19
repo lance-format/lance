@@ -146,6 +146,7 @@ fn main() {
         upper_bound: None,
         dist_q_c: 0.0,
         use_acorn: false,
+        rq_graph_scoring: Default::default(),
     };
     let params_hi = HnswQueryParams {
         ef: EF_HI,

@@ -8,12 +8,26 @@
 use super::*;
 use crate::scalar::RowAddrTranslatorRef;
 use lance_arrow::deepcopy::deep_copy_batch_sliced;
-use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheLoadOrigin,
+};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 
+/// A heap pays for itself only when enough buckets have mostly distinct heads.
+/// The bounded sample delays heap construction until there are enough emitted
+/// candidates to estimate overlap. Every window is reconsidered so dense
+/// clusters cannot permanently disable the heap; the wider return threshold
+/// avoids bouncing between strategies.
+const HEAP_MIN_BUCKETS: usize = 32;
+const HEAP_SAMPLE_CANDIDATES: usize = 64;
+
+use arrow_array::BooleanArray;
+use arrow_select::filter::filter_record_batch;
 use futures::future::try_join_all;
+use smallvec::SmallVec;
 
 /// One logical page of `bands.lance`, cached per page.
 #[derive(Debug, DeepSizeOf)]
@@ -176,6 +190,10 @@ pub struct MinHashLshIndex {
     pub(super) window_pages: usize,
     cache: WeakLanceCache,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Whether this segment's stored row identifiers are physical row
+    /// addresses (format version [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`] or
+    /// later) or row ids (an older segment, still supported for reading).
+    results_are_row_addresses: bool,
 }
 
 impl std::fmt::Debug for MinHashLshIndex {
@@ -207,15 +225,24 @@ fn metadata_value<'a>(
 }
 
 /// Checks that `reader` is `file` of a segment built from `params`: the exact
-/// schema, the details repeated in the metadata and the layout version.
+/// schema, the details repeated in the metadata and a supported layout
+/// version. Returns the parsed version.
+///
+/// `expected_schema` takes whether the reader's own schema already has a
+/// `_rowaddr` field (vs `_rowid`) -- the signatures file's row-identifier
+/// field name depends on the segment's format version, but inspecting the
+/// schema directly sidesteps needing the version (from metadata, checked
+/// only after the schema itself) to pick which schema to check against.
 fn check_index_file(
     reader: &dyn IndexReader,
     file: &str,
-    expected: &Schema,
+    expected_schema: impl Fn(bool) -> SchemaRef,
     params: &MinHashLshIndexParams,
-) -> Result<()> {
+) -> Result<u32> {
     let corrupt = |message: String| Error::corrupt_file_named(file, message);
-    let expected = lance_core::datatypes::Schema::try_from(expected)?;
+    let row_addr_domain = reader.schema().field(ROW_ADDR).is_some();
+    let expected =
+        lance_core::datatypes::Schema::try_from(expected_schema(row_addr_domain).as_ref())?;
     reader
         .schema()
         .check_compatible(&expected, &SchemaCompareOptions::default())
@@ -236,7 +263,7 @@ fn check_index_file(
             "index file details {file_params:?} do not match index details {params:?}"
         )));
     }
-    Ok(())
+    Ok(index_version)
 }
 
 impl MinHashLshIndex {
@@ -252,13 +279,27 @@ impl MinHashLshIndex {
             store.open_index_file(SIGNATURES_FILENAME)
         )?;
 
-        check_index_file(bands.as_ref(), BANDS_FILENAME, &BANDS_SCHEMA, &params)?;
-        check_index_file(
-            signatures.as_ref(),
-            SIGNATURES_FILENAME,
-            &signatures_schema(params.num_hashes as i32),
+        let bands_version = check_index_file(
+            bands.as_ref(),
+            BANDS_FILENAME,
+            |_| BANDS_SCHEMA.clone(),
             &params,
         )?;
+        let signatures_version = check_index_file(
+            signatures.as_ref(),
+            SIGNATURES_FILENAME,
+            |row_addr_domain| signatures_schema(params.num_hashes as i32, row_addr_domain),
+            &params,
+        )?;
+        if bands_version != signatures_version {
+            return Err(Error::corrupt_file_named(
+                SIGNATURES_FILENAME,
+                format!(
+                    "format version {signatures_version} does not match {BANDS_FILENAME}'s version {bands_version}"
+                ),
+            ));
+        }
+        let results_are_row_addresses = signatures_version >= MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION;
 
         let metadata = &bands.schema().metadata;
         let corrupt = |message: String| Error::corrupt_file_named(BANDS_FILENAME, message);
@@ -320,6 +361,7 @@ impl MinHashLshIndex {
             window_pages: (rows_per_batch(BAND_ROW_BYTES) / page_rows).max(1),
             cache: WeakLanceCache::from(cache),
             frag_reuse_index,
+            results_are_row_addresses,
         }))
     }
 
@@ -330,6 +372,65 @@ impl MinHashLshIndex {
     /// Number of documents (rows with at least one token) in this segment.
     pub fn num_docs(&self) -> usize {
         self.num_docs
+    }
+
+    /// Stream the stored signatures selected by `mask`, without reading text.
+    ///
+    /// Batches contain a non-null [`ROW_ID`] column and [`SIGNATURE_COL`] as
+    /// `FixedSizeList<UInt16, num_hashes>`. Rows with no tokens were not indexed.
+    /// Deferred row-ID remapping is applied before the mask, as in similarity
+    /// search. The caller supplies a mask for its pinned dataset snapshot;
+    /// this segment does not discover later deletions or unindexed rows.
+    /// Reads and output batches are bounded independently of the segment size.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use futures::TryStreamExt;
+    /// # use lance_index::scalar::minhash_lsh::MinHashLshIndex;
+    /// # use lance_select::RowAddrMask;
+    /// # async fn example(index: &MinHashLshIndex, live: Arc<RowAddrMask>) -> lance_core::Result<()> {
+    /// let mut signatures = index.scan_signatures(live);
+    /// while let Some(batch) = signatures.try_next().await? {
+    ///     // Consume each batch before requesting the next one.
+    ///     assert!(batch.column_by_name("signature").is_some());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scan_signatures(
+        &self,
+        mask: Arc<RowAddrMask>,
+    ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> {
+        let num_hashes = self.params.num_hashes as usize;
+        let remapper = self.frag_reuse_index.clone();
+        scan_rows(
+            self.signatures.clone(),
+            0,
+            self.num_docs,
+            rows_per_batch(signature_row_bytes(num_hashes)),
+        )
+        .map(move |batch| {
+            let batch = batch?;
+            let id_col = signature_id_col(&batch)?;
+            let (stored_ids, _) = signature_columns(&batch, num_hashes)?;
+            let mut row_ids = Vec::with_capacity(batch.num_rows());
+            let selected = BooleanArray::from_iter(stored_ids.values().iter().map(|&stored| {
+                let row_id = match remapper.as_deref() {
+                    Some(remapper) => remapper.remap_row_id(stored),
+                    None => Some(stored),
+                };
+                let keep = row_id.filter(|&row_id| mask.selected(row_id));
+                if let Some(row_id) = keep {
+                    row_ids.push(row_id);
+                }
+                Some(keep.is_some())
+            }));
+            let filtered = filter_record_batch(&batch, &selected)?;
+            let mut columns = filtered.columns().to_vec();
+            columns[filtered.schema().index_of(id_col)?] = Arc::new(UInt64Array::from(row_ids));
+            Ok(RecordBatch::try_new(filtered.schema(), columns)?)
+        })
+        .boxed()
     }
 
     fn signature_source<'a>(&self, transform: RowIdTransform<'a>) -> SignatureSource<'a> {
@@ -344,6 +445,13 @@ impl MinHashLshIndex {
     fn created_index(&self, files: Vec<IndexFile>) -> Result<CreatedIndex> {
         Ok(CreatedIndex {
             index_details: self.params.details_any()?,
+            // `rebuild_from` (the sole writer behind remap/update/merge)
+            // always stamps the file itself with MINHASH_LSH_INDEX_VERSION,
+            // regardless of this segment's own domain -- unlike NGram/RTree,
+            // there is no legacy physical layout it can reproduce. Report
+            // that same version here instead of `self.results_are_row_addresses`'s
+            // (possibly stale, pre-rebuild) domain, so the manifest entry
+            // never disagrees with the file a loader actually reads.
             index_version: MINHASH_LSH_INDEX_VERSION,
             files,
         })
@@ -378,11 +486,45 @@ impl MinHashLshIndex {
 
     /// Like [`Self::search_text`] for a signature computed by
     /// [`Self::query_signature`] on any segment with the same parameters.
+    ///
+    /// The index stores physical row addresses, so `mask` selects addresses
+    /// and the hits report them.
     pub async fn search_signature(
         &self,
         query: &QuerySignature,
         limit: usize,
         mask: &RowAddrMask,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<MinHashHit>> {
+        self.search_signature_impl(query, limit, mask, None, metrics)
+            .await
+    }
+
+    /// Like [`Self::search_signature`] for a caller whose `mask` and results
+    /// are in the row-id domain (a dataset with stable row ids).
+    ///
+    /// `row_addr_to_row_id` translates each candidate's stored row address,
+    /// before `mask` is applied, into the row id it is filtered and reported
+    /// by; a candidate it translates to `None` (e.g. a deleted row) is
+    /// skipped, so it never displaces a live row from the top `limit`.
+    pub async fn search_signature_as_row_ids(
+        &self,
+        query: &QuerySignature,
+        limit: usize,
+        mask: &RowAddrMask,
+        row_addr_to_row_id: &RowAddrToRowId,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<MinHashHit>> {
+        self.search_signature_impl(query, limit, mask, Some(row_addr_to_row_id), metrics)
+            .await
+    }
+
+    async fn search_signature_impl(
+        &self,
+        query: &QuerySignature,
+        limit: usize,
+        mask: &RowAddrMask,
+        row_addr_to_row_id: Option<&RowAddrToRowId>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<MinHashHit>> {
         if query.signature.len() != self.params.num_hashes as usize {
@@ -399,8 +541,15 @@ impl MinHashLshIndex {
         if buckets.cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.refine(&mut buckets, &query.signature, limit, mask, metrics)
-            .await
+        self.refine(
+            &mut buckets,
+            &query.signature,
+            limit,
+            mask,
+            row_addr_to_row_id,
+            metrics,
+        )
+        .await
     }
 
     /// Locate the bucket of every band key and position a cursor at its
@@ -472,7 +621,7 @@ impl MinHashLshIndex {
                 });
             }
         }
-        Ok(BucketScan { cursors })
+        Ok(BucketScan::new(cursors))
     }
 
     /// Fetch pages through the cache; the pages missing from the cache are
@@ -578,12 +727,17 @@ impl MinHashLshIndex {
         scan: &mut BucketScan,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<(u32, u32)>> {
-        let live = |cursor: &BucketCursor| cursor.next < cursor.end;
-        let drained = |cursor: &BucketCursor| live(cursor) && cursor.window.as_slice().is_empty();
-        if scan.cursors.iter().any(drained) {
+        if scan.needs_refill() {
             // The page budget is shared by the buckets still being walked, so
             // a walk that outlives the others reads in full batches.
-            let live_cursors = scan.cursors.iter().filter(|cursor| live(cursor)).count();
+            let live_cursors = if scan.heap.is_some() {
+                scan.live_cursors
+            } else {
+                scan.cursors
+                    .iter()
+                    .filter(|cursor| cursor.next < cursor.end)
+                    .count()
+            };
             let pages = (self.window_pages / live_cursors.max(1)).max(1);
             let window_rows = pages * self.page_rows;
             // One round tops up every bucket that is running low, not only the
@@ -617,22 +771,11 @@ impl MinHashLshIndex {
                     cursor.window = held.into_iter();
                 }
             }
+            scan.refresh_heads();
         }
-        let mut min_doc = u32::MAX;
-        let mut shared = 0u32;
-        for cursor in &scan.cursors {
-            if let Some(&doc_id) = cursor.window.as_slice().first() {
-                if doc_id < min_doc {
-                    min_doc = doc_id;
-                    shared = 1;
-                } else if doc_id == min_doc {
-                    shared += 1;
-                }
-            }
-        }
-        if shared == 0 {
+        let Some((min_doc, shared)) = scan.pop_candidate() else {
             return Ok(None);
-        }
+        };
         if min_doc as usize >= self.num_docs {
             return Err(Error::corrupt_file_named(
                 BANDS_FILENAME,
@@ -641,12 +784,6 @@ impl MinHashLshIndex {
                     self.num_docs
                 ),
             ));
-        }
-        for cursor in &mut scan.cursors {
-            if cursor.window.as_slice().first() == Some(&min_doc) {
-                cursor.window.next();
-                cursor.next += 1;
-            }
         }
         Ok(Some((min_doc, shared)))
     }
@@ -732,6 +869,7 @@ impl MinHashLshIndex {
         query: &[SignatureValue],
         limit: usize,
         mask: &RowAddrMask,
+        row_addr_to_row_id: Option<&RowAddrToRowId>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<MinHashHit>> {
         let num_hashes = query.len();
@@ -742,6 +880,7 @@ impl MinHashLshIndex {
             query,
             mask,
             remapper: self.frag_reuse_index.as_deref(),
+            row_addr_to_row_id,
         };
         let mut levels = CandidateLevels::new(num_bands, cap);
         let missing = scorer.hits.missing();
@@ -1032,9 +1171,205 @@ struct BucketCursor {
 /// [`MinHashLshIndex::next_candidate`].
 struct BucketScan {
     cursors: Vec<BucketCursor>,
+    heap: Option<BinaryHeap<Reverse<(u32, usize)>>>,
+    strategy: SelectionStrategy,
+    sampled: usize,
+    shared_total: usize,
+    live_cursors: usize,
+    drained: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SelectionStrategy {
+    Sampling,
+    Heap,
+    Linear,
 }
 
 impl BucketScan {
+    fn new(cursors: Vec<BucketCursor>) -> Self {
+        let live_cursors = cursors
+            .iter()
+            .filter(|cursor| cursor.next < cursor.end)
+            .count();
+        Self {
+            cursors,
+            heap: None,
+            strategy: if live_cursors >= HEAP_MIN_BUCKETS {
+                SelectionStrategy::Sampling
+            } else {
+                SelectionStrategy::Linear
+            },
+            sampled: 0,
+            shared_total: 0,
+            live_cursors,
+            drained: false,
+        }
+    }
+
+    fn needs_refill(&self) -> bool {
+        match self.strategy {
+            SelectionStrategy::Heap => self.drained,
+            _ => self
+                .cursors
+                .iter()
+                .any(|cursor| cursor.next < cursor.end && cursor.window.as_slice().is_empty()),
+        }
+    }
+
+    fn refresh_heads(&mut self) {
+        self.drained = false;
+        if let Some(heap) = &mut self.heap {
+            let mut has_head = vec![false; self.cursors.len()];
+            for head in heap.iter() {
+                has_head[head.0.1] = true;
+            }
+            for (index, cursor) in self.cursors.iter().enumerate() {
+                if cursor.next < cursor.end && cursor.window.as_slice().is_empty() {
+                    self.drained = true;
+                }
+                // A refill only adds a head for cursors which had no window.
+                if !has_head[index]
+                    && let Some(&doc_id) = cursor.window.as_slice().first()
+                {
+                    heap.push(Reverse((doc_id, index)));
+                }
+            }
+        }
+    }
+
+    fn build_heap(&mut self) {
+        self.live_cursors = self
+            .cursors
+            .iter()
+            .filter(|cursor| cursor.next < cursor.end)
+            .count();
+        self.heap = Some(
+            self.cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cursor)| {
+                    cursor
+                        .window
+                        .as_slice()
+                        .first()
+                        .map(|&doc_id| Reverse((doc_id, index)))
+                })
+                .collect(),
+        );
+        self.drained = self
+            .cursors
+            .iter()
+            .any(|cursor| cursor.next < cursor.end && cursor.window.as_slice().is_empty());
+        self.strategy = SelectionStrategy::Heap;
+    }
+
+    fn advance(&mut self, index: usize) {
+        let cursor = &mut self.cursors[index];
+        cursor.window.next();
+        cursor.next += 1;
+        if cursor.next == cursor.end {
+            self.live_cursors -= 1;
+        } else if cursor.window.as_slice().is_empty() {
+            self.drained = true;
+        }
+    }
+
+    #[inline]
+    fn pop_candidate(&mut self) -> Option<(u32, u32)> {
+        if matches!(self.strategy, SelectionStrategy::Linear) {
+            return self.pop_linear_candidate();
+        }
+        let (doc_id, shared) = if let Some(heap) = &mut self.heap {
+            let Reverse((doc_id, index)) = heap.pop()?;
+            let mut indices = SmallVec::<[usize; 4]>::new();
+            indices.push(index);
+            while heap.peek().is_some_and(|head| head.0.0 == doc_id) {
+                let Reverse((_, index)) = heap.pop()?;
+                indices.push(index);
+            }
+            let shared = indices.len() as u32;
+            for index in indices {
+                self.advance(index);
+                if let Some(&next_doc) = self.cursors[index].window.as_slice().first() {
+                    self.heap.as_mut()?.push(Reverse((next_doc, index)));
+                }
+            }
+            (doc_id, shared)
+        } else {
+            self.pop_linear_candidate()?
+        };
+        if matches!(
+            self.strategy,
+            SelectionStrategy::Sampling | SelectionStrategy::Heap
+        ) {
+            self.sampled += 1;
+            self.shared_total += shared as usize;
+            if self.sampled == HEAP_SAMPLE_CANDIDATES {
+                let active_cursors = if self.heap.is_some() {
+                    self.live_cursors
+                } else {
+                    self.cursors
+                        .iter()
+                        .filter(|cursor| cursor.next < cursor.end)
+                        .count()
+                };
+                if active_cursors < HEAP_MIN_BUCKETS {
+                    // Cursors only become exhausted during a walk. Sampling
+                    // cannot lead to another heap until a seek resets it.
+                    self.heap = None;
+                    self.strategy = SelectionStrategy::Linear;
+                } else {
+                    match self.strategy {
+                        SelectionStrategy::Sampling
+                            if self.shared_total
+                                <= active_cursors * HEAP_SAMPLE_CANDIDATES / 32 =>
+                        {
+                            self.build_heap();
+                        }
+                        SelectionStrategy::Heap
+                            if self.shared_total >= active_cursors * HEAP_SAMPLE_CANDIDATES / 8 =>
+                        {
+                            self.heap = None;
+                            self.strategy = SelectionStrategy::Sampling;
+                        }
+                        _ => {}
+                    }
+                }
+                self.sampled = 0;
+                self.shared_total = 0;
+            }
+        }
+        Some((doc_id, shared))
+    }
+    // Low-bucket scans cannot use the heap. Keep their per-candidate path
+    // independent of heap dispatch and overlap sampling.
+    #[inline]
+    fn pop_linear_candidate(&mut self) -> Option<(u32, u32)> {
+        let mut doc_id = u32::MAX;
+        let mut shared = 0;
+        for cursor in &self.cursors {
+            if let Some(&head) = cursor.window.as_slice().first() {
+                if head < doc_id {
+                    doc_id = head;
+                    shared = 1;
+                } else if head == doc_id {
+                    shared += 1;
+                }
+            }
+        }
+        if shared == 0 {
+            return None;
+        }
+        for cursor in &mut self.cursors {
+            if cursor.window.as_slice().first() == Some(&doc_id) {
+                cursor.window.next();
+                cursor.next += 1;
+            }
+        }
+        Some((doc_id, shared))
+    }
+
     /// The absolute row each cursor stands at.
     fn positions(&self) -> Vec<usize> {
         self.cursors.iter().map(|cursor| cursor.next).collect()
@@ -1046,6 +1381,20 @@ impl BucketScan {
             cursor.next = row;
             cursor.window = Vec::new().into_iter();
         }
+        self.heap = None;
+        self.sampled = 0;
+        self.shared_total = 0;
+        self.live_cursors = self
+            .cursors
+            .iter()
+            .filter(|cursor| cursor.next < cursor.end)
+            .count();
+        self.strategy = if self.live_cursors >= HEAP_MIN_BUCKETS {
+            SelectionStrategy::Sampling
+        } else {
+            SelectionStrategy::Linear
+        };
+        self.drained = false;
     }
 }
 
@@ -1107,16 +1456,24 @@ struct Scorer<'a> {
     query: &'a [SignatureValue],
     mask: &'a RowAddrMask,
     remapper: Option<&'a dyn RowIdRemapper>,
+    row_addr_to_row_id: Option<&'a RowAddrToRowId>,
 }
 
 impl Scorer<'_> {
-    fn score(&mut self, row_id: u64, signature: &[SignatureValue]) {
-        let row_id = match self.remapper {
-            Some(remapper) => match remapper.remap_row_id(row_id) {
+    fn score(&mut self, row_addr: u64, signature: &[SignatureValue]) {
+        let row_addr = match self.remapper {
+            Some(remapper) => match remapper.remap_row_id(row_addr) {
+                Some(row_addr) => row_addr,
+                None => return,
+            },
+            None => row_addr,
+        };
+        let row_id = match self.row_addr_to_row_id {
+            Some(row_addr_to_row_id) => match row_addr_to_row_id(row_addr) {
                 Some(row_id) => row_id,
                 None => return,
             },
-            None => row_id,
+            None => row_addr,
         };
         if !self.mask.selected(row_id) {
             return;
@@ -1149,6 +1506,28 @@ fn doc_id_ranges(doc_ids: impl Iterator<Item = u32>) -> Vec<Range<usize>> {
 
 /// Extract the row id column and the flattened signature values of a batch
 /// read from `signatures.lance`.
+/// The row-identifier column of a `signatures.lance` batch: `_rowaddr` from
+/// format version 1 onward, `_rowid` for a segment persisted before it.
+/// Determined from the batch itself (each segment carries exactly one of the
+/// two), not from the caller, so every reader of a resident or cached batch
+/// uses the name that batch actually has.
+fn signature_id_col(batch: &RecordBatch) -> Result<&'static str> {
+    let corrupt = |message: String| Error::corrupt_file_named(SIGNATURES_FILENAME, message);
+    match (
+        batch.column_by_name(ROW_ADDR).is_some(),
+        batch.column_by_name(ROW_ID).is_some(),
+    ) {
+        (true, false) => Ok(ROW_ADDR),
+        (false, true) => Ok(ROW_ID),
+        (true, true) => Err(corrupt(format!(
+            "both {ROW_ADDR} and {ROW_ID} columns present"
+        ))),
+        (false, false) => Err(corrupt(format!(
+            "missing UInt64 column {ROW_ADDR} or {ROW_ID}"
+        ))),
+    }
+}
+
 pub(super) fn signature_columns(
     batch: &RecordBatch,
     num_hashes: usize,
@@ -1159,11 +1538,12 @@ pub(super) fn signature_columns(
             "num_hashes {num_hashes} is outside 1..={MAX_NUM_HASHES}"
         )));
     }
+    let id_col = signature_id_col(batch)?;
     let row_ids = batch
-        .column_by_name(ROW_ID)
+        .column_by_name(id_col)
         .and_then(|column| column.as_primitive_opt::<UInt64Type>())
         .filter(|row_ids| row_ids.null_count() == 0)
-        .ok_or_else(|| corrupt(format!("{ROW_ID} is not a non-null UInt64 column")))?;
+        .ok_or_else(|| corrupt(format!("{id_col} is not a non-null UInt64 column")))?;
     let signatures = batch
         .column_by_name(SIGNATURE_COL)
         .and_then(|column| column.as_fixed_size_list_opt())
@@ -1195,10 +1575,9 @@ pub(super) fn scan_rows(
     num_rows: usize,
     rows_per_read: usize,
 ) -> impl Stream<Item = Result<RecordBatch>> + Send {
-    let ranges: Vec<Range<usize>> = (first_row..num_rows)
+    let ranges = (first_row..num_rows)
         .step_by(rows_per_read.max(1))
-        .map(|start| start..(start + rows_per_read).min(num_rows))
-        .collect();
+        .map(move |start| start..(start + rows_per_read).min(num_rows));
     futures::stream::iter(ranges)
         .map(move |range| {
             let reader = reader.clone();
@@ -1236,6 +1615,7 @@ impl Index for MinHashLshIndex {
             }
             budget -= bytes;
             self.cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .get_or_insert_with_key(
                     SignatureChunkKey {
                         chunk: chunks_loaded as u32,
@@ -1261,6 +1641,7 @@ impl Index for MinHashLshIndex {
                     batch.slice(range.start - first_page * self.page_rows, range.len());
                 let band_page = Arc::new(BandPage::try_from_batch(&page_batch)?);
                 self.cache
+                    .with_load_origin(CacheLoadOrigin::Warm)
                     .insert_with_key(&BandPageKey { page: page as u32 }, band_page)
                     .await;
             }
@@ -1373,8 +1754,12 @@ impl ScalarIndex for MinHashLshIndex {
         self.created_index(files)
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        self.results_are_row_addresses
+    }
+
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -1385,6 +1770,14 @@ impl ScalarIndex for MinHashLshIndex {
 /// Merge segments into one new segment in `dest_store`, keeping only the rows
 /// each segment's filter selects. Every segment must have been built with the
 /// same parameters.
+///
+/// Like [`ScalarIndex::update`] and [`ScalarIndex::remap`], this always writes
+/// the current (row-address-domain) format and copies each source's stored
+/// identifiers as-is. A source persisted before
+/// [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`] stores row ids, which equal row
+/// addresses only on a dataset without stable row ids; on a dataset with
+/// stable row ids the caller must rebuild such a segment instead of passing it
+/// here, or its matches are silently lost.
 pub async fn merge_minhash_indices(
     sources: &[(&MinHashLshIndex, Option<&OldIndexDataFilter>)],
     dest_store: &dyn IndexStore,
@@ -1434,7 +1827,7 @@ mod cache_tests {
 
     fn signature_batch(row_ids: Vec<u64>, signatures: Vec<u16>, num_hashes: i32) -> RecordBatch {
         RecordBatch::try_new(
-            signatures_schema(num_hashes),
+            signatures_schema(num_hashes, true),
             vec![
                 Arc::new(UInt64Array::from(row_ids)),
                 Arc::new(FixedSizeListArray::new(
@@ -1599,7 +1992,7 @@ mod cache_tests {
     #[case::too_wide(MAX_NUM_HASHES as i32 + 1)]
     fn signature_chunk_cache_rejects_invalid_width(#[case] num_hashes: i32) {
         assert_invalid_batch::<SignatureChunk>(
-            RecordBatch::new_empty(signatures_schema(num_hashes)),
+            RecordBatch::new_empty(signatures_schema(num_hashes, true)),
             "num_hashes",
         );
     }
@@ -1661,5 +2054,310 @@ mod cache_tests {
             .serialize(&chunk, &mut writer)
             .unwrap();
         assert!(writer.0 < 100, "issued {} small writes", writer.0);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use arrow_array::StringArray;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use lance_core::utils::tempfile::TempObjDir;
+    use lance_io::object_store::ObjectStore;
+    use rstest::rstest;
+    use std::collections::{BTreeMap, HashSet};
+
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::lance_format::LanceIndexStore;
+
+    #[rstest]
+    #[case::sparse(0)]
+    #[case::dense(1)]
+    #[case::skewed(2)]
+    #[case::partial_overlap(3)]
+    #[case::sparse_then_dense(4)]
+    #[case::dense_prefix(5)]
+    #[case::dense_then_sparse(6)]
+    #[case::sparse_dense_sparse(7)]
+    fn test_bucket_selection_matches_all_postings_across_refills_and_seek(#[case] shape: usize) {
+        let buckets: Vec<Vec<u32>> = (0..64)
+            .map(|band| match shape {
+                0 => (0..128).map(|row| (row * 64 + band) as u32).collect(),
+                1 => (0..128).map(|row| row as u32).collect(),
+                2 if band == 0 => (0..512).map(|row| row as u32).collect(),
+                2 => (0..16).map(|row| (row * 64 + band) as u32).collect(),
+                4 => (0..64)
+                    .map(|row| (row * 64 + band) as u32)
+                    .chain(10_000..10_128)
+                    .collect(),
+                5 | 6 => (0..if shape == 5 { 8 } else { 128 })
+                    .chain((0..128).map(|row| 10_000 + row * 64 + band as u32))
+                    .collect(),
+                7 => (0..128)
+                    .map(|row| (row * 64 + band) as u32)
+                    .chain(10_000..10_128)
+                    .chain((0..128).map(|row| 20_000 + row * 64 + band as u32))
+                    .collect(),
+                _ => (0..128).map(|row| (row * 32 + band / 2) as u32).collect(),
+            })
+            .collect();
+        let expected: Vec<(u32, u32)> = {
+            let mut counts = BTreeMap::new();
+            for bucket in &buckets {
+                for &doc_id in bucket {
+                    *counts.entry(doc_id).or_insert(0) += 1;
+                }
+            }
+            counts.into_iter().collect()
+        };
+        let cursors = buckets
+            .iter()
+            .map(|bucket| {
+                let mut window = Vec::with_capacity(2);
+                window.extend_from_slice(&bucket[..bucket.len().min(2)]);
+                BucketCursor {
+                    next: 0,
+                    end: bucket.len(),
+                    window: window.into_iter(),
+                }
+            })
+            .collect();
+        let mut scan = BucketScan::new(cursors);
+        let mut actual = Vec::new();
+        let mut saved = None;
+        let mut has_heap_after_dense = false;
+        let mut has_sampling_after_heap = false;
+        loop {
+            if scan.needs_refill() {
+                for (cursor, bucket) in scan.cursors.iter_mut().zip(&buckets) {
+                    let held = cursor.window.as_slice().len();
+                    if held < 4 && cursor.next + held < cursor.end {
+                        let mut window = cursor.window.as_slice().to_vec();
+                        window.extend_from_slice(
+                            &bucket[cursor.next + held..(cursor.next + held + 2).min(cursor.end)],
+                        );
+                        cursor.window = window.into_iter();
+                    }
+                }
+                scan.refresh_heads();
+            }
+            let Some(candidate) = scan.pop_candidate() else {
+                break;
+            };
+            if (shape == 5 || shape == 6) && candidate.0 >= 10_000
+                || shape == 7 && candidate.0 >= 20_000
+            {
+                has_heap_after_dense |= matches!(scan.strategy, SelectionStrategy::Heap);
+            }
+            if shape == 7 && (10_000..10_128).contains(&candidate.0) {
+                has_sampling_after_heap |= matches!(scan.strategy, SelectionStrategy::Sampling);
+            }
+            actual.push(candidate);
+            if actual.len() == 80 {
+                assert_eq!(
+                    matches!(scan.strategy, SelectionStrategy::Heap),
+                    !matches!(shape, 1 | 5 | 6),
+                    "shape {shape} selected the wrong strategy"
+                );
+                saved = Some(scan.positions());
+            }
+        }
+        assert_eq!(actual, expected);
+        if matches!(shape, 5..=7) {
+            assert!(
+                has_heap_after_dense,
+                "shape {shape} did not return to heap merging"
+            );
+        }
+        if shape == 7 {
+            assert!(
+                has_sampling_after_heap,
+                "dense cluster did not leave heap merging"
+            );
+        }
+        if shape == 4 {
+            assert!(matches!(scan.strategy, SelectionStrategy::Linear));
+        }
+        let positions = saved.unwrap();
+        scan.seek(&positions);
+        let resumed = expected[80..].to_vec();
+        let mut actual = Vec::new();
+        while actual.len() < resumed.len() {
+            if scan.needs_refill() {
+                for (cursor, bucket) in scan.cursors.iter_mut().zip(&buckets) {
+                    let held = cursor.window.as_slice().len();
+                    if held < 4 && cursor.next + held < cursor.end {
+                        let mut window = cursor.window.as_slice().to_vec();
+                        window.extend_from_slice(
+                            &bucket[cursor.next + held..(cursor.next + held + 2).min(cursor.end)],
+                        );
+                        cursor.window = window.into_iter();
+                    }
+                }
+                scan.refresh_heads();
+            }
+            actual.push(scan.pop_candidate().unwrap());
+        }
+        assert_eq!(actual, resumed);
+    }
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::default(16)]
+    #[case::below_threshold(31)]
+    #[case::at_threshold(32)]
+    fn test_sampling_only_when_heap_is_possible(#[case] bands: usize) {
+        let cursors = (0..bands)
+            .map(|band| BucketCursor {
+                next: 0,
+                end: 128,
+                window: (0..128)
+                    .map(|row| (row * bands + band) as u32)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            })
+            .collect();
+        let mut scan = BucketScan::new(cursors);
+        for doc_id in 0..HEAP_SAMPLE_CANDIDATES {
+            if bands == 0 {
+                assert_eq!(scan.pop_candidate(), None);
+            } else {
+                assert_eq!(scan.pop_candidate(), Some((doc_id as u32, 1)));
+            }
+        }
+        assert_eq!(
+            matches!(scan.strategy, SelectionStrategy::Heap),
+            bands >= HEAP_MIN_BUCKETS
+        );
+        assert_eq!(scan.sampled, 0);
+        assert_eq!(scan.shared_total, 0);
+        scan.seek(&vec![0; bands]);
+        assert_eq!(
+            matches!(scan.strategy, SelectionStrategy::Sampling),
+            bands >= HEAP_MIN_BUCKETS
+        );
+        assert!(scan.heap.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_real_sparse_postings_enter_heap_and_refill_windows() {
+        let query = (0..40)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let texts: Vec<String> = (0..300)
+            .map(|row| {
+                (0..40)
+                    .map(|word| {
+                        if word < 4 {
+                            format!("word{}", (row % 37) + word)
+                        } else {
+                            format!("unique{row}_{word}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let params = MinHashLshIndexParams {
+            num_hashes: 256,
+            num_bands: 256,
+            ..Default::default()
+        };
+        let builder = MinHashLshIndexBuilder::try_new(params)
+            .unwrap()
+            .with_page_rows(1)
+            .unwrap();
+        let details = builder.params().details_any().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    texts.iter().map(String::as_str).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from_iter_values(0..texts.len() as u64)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let input = RecordBatchStreamAdapter::new(schema, futures::stream::iter([Ok(batch)]));
+        builder
+            .train(Box::pin(input), store.as_ref())
+            .await
+            .unwrap();
+
+        let cache = LanceCache::no_cache();
+        let mut loaded = MinHashLshIndex::load(store, &details, None, &cache)
+            .await
+            .unwrap();
+        // One row per page and one page per refill make every later row of a
+        // bucket prove that the production window path read another page.
+        Arc::get_mut(&mut loaded).unwrap().window_pages = 1;
+        let index = loaded;
+        let signature = index.query_signature(&query).unwrap();
+        let query_keys: HashSet<u64> = signature.band_keys.iter().copied().collect();
+        let expected = {
+            let batch = index
+                .bands
+                .read_range(0..index.bands.num_rows(), None)
+                .await
+                .unwrap();
+            let page = BandPage::try_from_batch(&batch).unwrap();
+            let (keys, doc_ids) = page.columns().unwrap();
+            let mut counts = BTreeMap::new();
+            for (&key, &doc_id) in keys.iter().zip(doc_ids) {
+                if query_keys.contains(&key) {
+                    *counts.entry(doc_id).or_insert(0u32) += 1;
+                }
+            }
+            counts.into_iter().collect::<Vec<_>>()
+        };
+
+        let mut scan = index
+            .open_buckets(&signature.band_keys, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(index.page_max_keys.len() > 1);
+        assert!(scan.cursors.len() >= HEAP_MIN_BUCKETS);
+        let initial = scan
+            .cursors
+            .iter()
+            .map(|cursor| (cursor.next, cursor.window.as_slice().len()))
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        let mut heap_admitted = false;
+        let mut refilled = false;
+        while let Some(candidate) = index
+            .next_candidate(&mut scan, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            actual.push(candidate);
+            if actual.len() == HEAP_SAMPLE_CANDIDATES {
+                assert!(
+                    matches!(scan.strategy, SelectionStrategy::Heap),
+                    "fixture did not admit the heap after {HEAP_SAMPLE_CANDIDATES} candidates"
+                );
+                heap_admitted = true;
+            }
+            refilled |= scan
+                .cursors
+                .iter()
+                .zip(&initial)
+                .any(|(cursor, &(start, initial_len))| cursor.next > start + initial_len);
+        }
+        assert!(heap_admitted);
+        assert!(refilled, "the scan never consumed a refilled window");
+        assert_eq!(actual, expected);
     }
 }

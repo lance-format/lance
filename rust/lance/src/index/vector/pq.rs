@@ -864,7 +864,6 @@ mod tests {
         assert_eq!(pq.num_bits, 8);
         assert_eq!(pq.dimension, DIM);
 
-        #[allow(clippy::redundant_clone)]
         let codebook = pq.codebook.clone();
         assert_eq!(codebook.len(), 256);
         codebook
@@ -1053,6 +1052,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
         let is_empty_threads = Arc::new(Mutex::new(Vec::new()));
         let pre_filter = Arc::new(TestPreFilter::with_thread_capture(

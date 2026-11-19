@@ -13,8 +13,11 @@ use std::sync::Arc;
 use axum::{
     Json, Router, ServiceExt,
     body::Bytes,
-    extract::{FromRequest, Path, Query, RawQuery, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::CONTENT_TYPE},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, RawQuery, Request, State},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
+        header::{CONTENT_TYPE, RETRY_AFTER},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -29,6 +32,11 @@ use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::*;
+
+/// Default [`RestAdapter::with_max_request_body_size`]: large enough for the
+/// Arrow IPC batches sent to the data-upload endpoints, while still bounding
+/// per-request memory.
+const DEFAULT_MAX_REQUEST_BODY_SIZE: usize = 512 * 1024 * 1024;
 
 /// Configuration for the REST server
 #[derive(Debug, Clone)]
@@ -52,12 +60,24 @@ impl Default for RestAdapterConfig {
 pub struct RestAdapter {
     backend: Arc<dyn LanceNamespace>,
     config: RestAdapterConfig,
+    max_request_body_size: usize,
 }
 
 impl RestAdapter {
     /// Create a new REST server with the given backend namespace
     pub fn new(backend: Arc<dyn LanceNamespace>, config: RestAdapterConfig) -> Self {
-        Self { backend, config }
+        Self {
+            backend,
+            config,
+            max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
+        }
+    }
+
+    /// Set the largest request body the server accepts, in bytes (512 MiB by
+    /// default). Larger requests are rejected before the backend runs.
+    pub fn with_max_request_body_size(mut self, max_request_body_size: usize) -> Self {
+        self.max_request_body_size = max_request_body_size;
+        self
     }
 
     /// Build the Axum router with all REST API routes
@@ -166,6 +186,9 @@ impl RestAdapter {
             .route("/v1/table", get(list_all_tables))
             .layer(axum::middleware::map_response(rejection_to_error_response))
             .layer(TraceLayer::new_for_http())
+            // axum caps request bodies at 2 MiB by default, which rejects the
+            // Arrow IPC payloads of the data-upload endpoints.
+            .layer(DefaultBodyLimit::max(self.max_request_body_size))
             .with_state(self.backend.clone())
     }
 
@@ -384,7 +407,13 @@ fn error_to_response(err: Error) -> Response {
                 let status = error_code_to_status(code);
                 let mut resp = ErrorResponse::new(code as i32);
                 resp.error = Some(ns_err.message().to_string());
-                (status, Json(resp)).into_response()
+                let mut response = (status, Json(resp)).into_response();
+                if let Some(retry_after) = ns_err.retry_after()
+                    && let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string())
+                {
+                    response.headers_mut().insert(RETRY_AFTER, value);
+                }
+                response
             } else {
                 let mut resp = ErrorResponse::new(18);
                 resp.error = Some(source.to_string());
@@ -1977,6 +2006,45 @@ mod tests {
             Bytes::from(buffer)
         }
 
+        /// Rows of payload created by [`create_large_arrow_data`].
+        const LARGE_TABLE_ROWS: usize = 48;
+
+        /// Helper to create Arrow IPC data larger than axum's 2 MiB default
+        /// body limit, as real dataset uploads through the data-upload
+        /// endpoints are.
+        fn create_large_arrow_data() -> Bytes {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::ipc::writer::StreamWriter;
+            use arrow::record_batch::RecordBatch;
+
+            let schema = Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("payload", DataType::Utf8, false),
+            ]);
+
+            let payload = "x".repeat(64 * 1024);
+            let batch = RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(Int32Array::from_iter(0..LARGE_TABLE_ROWS as i32)),
+                    Arc::new(StringArray::from_iter(
+                        (0..LARGE_TABLE_ROWS).map(|i| Some(format!("{i:05}-{payload}"))),
+                    )),
+                ],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            Bytes::from(buffer)
+        }
+
         /// Helper to create Arrow IPC data with vector column for testing vector index
         fn create_test_vector_data(num_rows: usize, dim: i32) -> Bytes {
             use arrow::array::{FixedSizeListArray, Float32Array, Int32Array};
@@ -2221,6 +2289,88 @@ mod tests {
                 Some(1),
                 "Initial table version should be 1"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_create_table_upload_exceeds_axum_default_body_limit() {
+            let fixture = RestServerFixture::new().await;
+            let table_data = create_large_arrow_data();
+            assert!(
+                table_data.len() > 2 * 1024 * 1024,
+                "fixture must exceed axum's 2 MiB default body limit, is {} bytes",
+                table_data.len()
+            );
+
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            let table_id = vec!["test_namespace".to_string(), "large_table".to_string()];
+            let create_table_req = CreateTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+
+            // The router must raise axum's 2 MiB default body limit: the
+            // data-upload endpoints exist to receive Arrow IPC payloads
+            // larger than that.
+            let result = fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await;
+            assert!(
+                result.is_ok(),
+                "upload over 2 MiB must be accepted: {:?}",
+                result.err()
+            );
+
+            // The uploaded table must be readable back through the same stack.
+            let count = fixture
+                .namespace
+                .count_table_rows(CountTableRowsRequest {
+                    id: Some(table_id),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, LARGE_TABLE_ROWS as i64);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_body_over_configured_limit_is_rejected() {
+            // A body over the configured limit is rejected before the
+            // backend runs.
+            let recorder = Arc::new(RecordingNamespace::default());
+            let config = RestAdapterConfig {
+                port: 0,
+                ..Default::default()
+            };
+            let server = RestAdapter::new(recorder.clone(), config).with_max_request_body_size(16);
+            let server_handle = server.start().await.unwrap();
+
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/test_namespace$test_table/create",
+                    server_handle.port()
+                ))
+                .header(CONTENT_TYPE, "application/vnd.apache.arrow.stream")
+                .body(create_test_arrow_data().to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(
+                recorder.received("create_table").is_null(),
+                "rejected upload must not reach the backend"
+            );
+            server_handle.shutdown();
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4642,5 +4792,31 @@ mod tests {
                 "Index column should be 'vector'"
             );
         }
+    }
+
+    #[test]
+    fn test_error_to_response_includes_retry_after_for_throttling() {
+        let response = error_to_response(
+            NamespaceError::Throttling {
+                message: "slow down".to_string(),
+                retry_after: Some(std::time::Duration::from_secs(3)),
+            }
+            .into(),
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "3");
+    }
+
+    #[test]
+    fn test_error_to_response_omits_retry_after_without_guidance() {
+        let response = error_to_response(
+            NamespaceError::Throttling {
+                message: "slow down".to_string(),
+                retry_after: None,
+            }
+            .into(),
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get(RETRY_AFTER).is_none());
     }
 }

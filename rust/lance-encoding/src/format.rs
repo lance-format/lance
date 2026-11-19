@@ -13,7 +13,7 @@ pub mod pb {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.encodings.rs"));
+    include!("pb/lance.encodings.rs");
 }
 
 /// Protobuf definitions for encodings21
@@ -29,13 +29,13 @@ pub mod pb21 {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.encodings21.rs"));
+    include!("pb/lance.encodings21.rs");
 }
 
 /// Metadata for the unstable 2.3 planar page format.
 pub mod pb23 {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/lance.encodings23.rs"));
+    include!("pb/lance.encodings23.rs");
 }
 
 pub mod metadata;
@@ -683,6 +683,16 @@ impl EncodingUtils {
         metadata::CompressiveEncoding {
             compression: Some(metadata::compressive_encoding::Compression::Alp(
                 metadata::Alp { bits_per_value },
+            )),
+        }
+    }
+
+    pub fn pcodec(values: metadata::CompressiveEncoding) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Pcodec(
+                Box::new(metadata::Pcodec {
+                    values: Some(Box::new(values)),
+                }),
             )),
         }
     }

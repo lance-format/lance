@@ -10,7 +10,7 @@ a stable Rust core with Python and Java bindings, it can be consumed from query 
 and catalog systems without copying or converting data.
 
 This page lists the integrations maintained by the Lance community. Some live in this repository as first-party
-Rust/Python APIs; others are maintained as dedicated subprojects under the [lance-format](https://github.com/lance-format)
+Rust, Python, and Java APIs; others are maintained as dedicated subprojects under the [lance-format](https://github.com/lance-format)
 GitHub organization.
 
 ## Query Engines and SQL

@@ -134,10 +134,10 @@ impl BatchRefineExec {
         let mut heaps = (0..self.query_count)
             .map(|_| BinaryHeap::<BatchKnnCandidate>::new())
             .collect::<Vec<_>>();
-        let projection = ProjectionRequest::from_columns(
+        let projection = ProjectionRequest::try_from_columns(
             [self.query.column.as_str(), ROW_ID],
             self.dataset.schema(),
-        );
+        )?;
         let mut peak_bytes = 0;
         while let Some(batch) = input.next().await {
             let batch = batch?;
@@ -504,6 +504,7 @@ mod tests {
             query_parallelism: 1,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
         let input = if scenario == "empty" {
             candidates.slice(0, 0)

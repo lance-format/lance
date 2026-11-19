@@ -6,7 +6,7 @@
 //!
 //! # What this covers that `conflict_resolver`'s own tests do not
 //!
-//! The matrix in `conflict_resolver::tests::test_conflicts` builds
+//! The matrix in `conflict_resolver::tests::conflicts::test_conflicts` builds
 //! [`TransactionRebase`](super::conflict_resolver::TransactionRebase) as a
 //! struct literal over bare `Fragment::new(0)` values, calls `check_txn`, and
 //! asserts the verdict. It never calls `finish`, so no manifest is ever built.

@@ -5,13 +5,11 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use datafusion::common::Result;
-use datafusion::execution::disk_manager::DiskManager;
+use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use futures::{StreamExt, stream};
 use lance_core::ROW_ID;
-use lance_datafusion::{
-    exec::provider_to_stream, spill::spilling_table_provider_with_job_disk_manager,
-};
+use lance_datafusion::exec::provider_to_stream;
 
 /// Put all updates before inserts without relying on join output order.
 ///
@@ -21,7 +19,7 @@ use lance_datafusion::{
 /// captured update IDs still align with their rows.
 pub(super) async fn updates_before_inserts(
     source: SendableRecordBatchStream,
-    disk_manager: Arc<DiskManager>,
+    session: &SessionContext,
 ) -> Result<SendableRecordBatchStream> {
     let schema = source.schema();
     let row_id_col = schema.index_of(ROW_ID)?;
@@ -32,7 +30,7 @@ pub(super) async fn updates_before_inserts(
 
     // Heap-buffered batches are outside the job pool's accounting. Spill from
     // the first batch, charging the same quota as replay and join sort files.
-    let staged = spilling_table_provider_with_job_disk_manager(source, 0, disk_manager).await?;
+    let staged = super::analysis::replay(source, 0, session).await?;
     let mut streams = Vec::with_capacity(2);
     for is_update in [true, false] {
         let replay = provider_to_stream(staged.clone()).await?;

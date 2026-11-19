@@ -269,6 +269,7 @@ impl<'a> InsertBuilder<'a> {
             self.inherited_field_ids,
             self.disable_dictionary_split,
             None,
+            None,
         ))
         .await?;
 

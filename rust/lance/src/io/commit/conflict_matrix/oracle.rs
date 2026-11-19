@@ -87,7 +87,8 @@ pub(super) async fn check(
         return;
     }
 
-    let Some(serial) = serial_execution(ours, theirs, footprint).await else {
+    // Boxed: this runs two commit sequences and would otherwise trip `clippy::large_futures`.
+    let Some(serial) = Box::pin(serial_execution(ours, theirs, footprint)).await else {
         // The pair cannot be run serially — `theirs` alone fails, or `ours`
         // cannot be staged against the result. That is not evidence about the
         // rebase, so there is nothing to compare.

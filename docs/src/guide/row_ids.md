@@ -12,30 +12,106 @@ Lance exposes two different row locators:
 
 Do not use `_rowaddr` as a durable external key. Enable stable row IDs when downstream systems need to retain row identity across physical rewrites.
 
+The workflows below cover the Python (`pylance`), Rust (`lance`), and Java (`org.lance:lance-core`) SDKs.
+
 ## Enable Stable Row IDs for a New Dataset
 
-Set `enable_stable_row_ids=True` when creating the dataset:
+Enable stable row IDs when creating the dataset:
 
-```python
-import lance
-import pyarrow as pa
+=== "Python"
 
-uri = "stable_rows.lance"
-table = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
-dataset = lance.write_dataset(table, uri, enable_stable_row_ids=True)
-assert dataset.has_stable_row_ids
-```
+    ```python
+    import lance
+    import pyarrow as pa
+
+    uri = "stable_rows.lance"
+    table = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    dataset = lance.write_dataset(table, uri, enable_stable_row_ids=True)
+    assert dataset.has_stable_row_ids
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::Dataset;
+
+    let write_params = WriteParams {
+        mode: WriteMode::Overwrite,
+        enable_stable_row_ids: true,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(reader, "stable_rows.lance", Some(write_params)).await?;
+    assert!(dataset.manifest.uses_stable_row_ids());
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.WriteParams;
+
+    try (Dataset dataset =
+        Dataset.write()
+            .allocator(allocator)
+            .reader(reader)
+            .uri("stable_rows.lance")
+            .mode(WriteParams.WriteMode.OVERWRITE)
+            .enableStableRowIds(true)
+            .execute()) {
+      assert dataset.hasStableRowIds();
+    }
+    ```
 
 Passing this option on later writes does not migrate an existing dataset. Migration is a separate operation, currently exposed in Rust as `Dataset::migrate_to_stable_row_ids`. Before migration, quiesce data writers and index builds, drop secondary indexes, and recreate them after migration. See the [Row ID and Lineage Specification](../format/table/row_id_lineage.md#enabling-stable-row-ids) for the complete migration protocol.
 
 ## Read Stable Row IDs
 
-Request `_rowid` explicitly with `with_row_id=True`:
+Request `_rowid` explicitly on the scan:
 
-```python
-result = dataset.to_table(columns=["id", "value"], with_row_id=True)
-print(result)
-```
+=== "Python"
+
+    ```python
+    result = dataset.to_table(columns=["id", "value"], with_row_id=True)
+    print(result)
+    ```
+
+=== "Rust"
+
+    ```rust
+    use arrow_array::RecordBatch;
+    use futures::TryStreamExt;
+
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .project(&["id", "value"])?
+        .with_row_id()
+        .try_into_stream()
+        .await?
+        .try_collect()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.apache.arrow.vector.ipc.ArrowReader;
+    import org.lance.ipc.LanceScanner;
+    import org.lance.ipc.ScanOptions;
+    import java.util.Arrays;
+
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(Arrays.asList("id", "value"))
+            .withRowId(true)
+            .build();
+    try (LanceScanner scanner = dataset.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        // reader.getVectorSchemaRoot() includes "_rowid"
+      }
+    }
+    ```
 
 Stable row IDs survive row updates and compaction:
 
@@ -65,11 +141,50 @@ Stable row IDs also enable two version columns:
 
 Request them as ordinary projected columns:
 
-```python
-lineage = dataset.to_table(
-    columns=["id", "_rowid", "_row_created_at_version", "_row_last_updated_at_version"]
-)
-```
+=== "Python"
+
+    ```python
+    lineage = dataset.to_table(
+        columns=["id", "_rowid", "_row_created_at_version", "_row_last_updated_at_version"]
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    let lineage: Vec<RecordBatch> = dataset
+        .scan()
+        .project(&[
+            "id",
+            "_rowid",
+            "_row_created_at_version",
+            "_row_last_updated_at_version",
+        ])?
+        .try_into_stream()
+        .await?
+        .try_collect()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    ScanOptions lineageOptions =
+        new ScanOptions.Builder()
+            .columns(
+                Arrays.asList(
+                    "id",
+                    "_rowid",
+                    "_row_created_at_version",
+                    "_row_last_updated_at_version"))
+            .build();
+    try (LanceScanner scanner = dataset.newScan(lineageOptions);
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        // process lineage columns
+      }
+    }
+    ```
 
 An update preserves `_rowid` and `_row_created_at_version`, while advancing `_row_last_updated_at_version`. Appending rows creates new IDs and sets both version columns to the append version. These values refer to Lance dataset versions, not wall-clock timestamps.
 

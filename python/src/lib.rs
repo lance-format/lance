@@ -37,15 +37,22 @@ use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
+use dataset::base_path::DatasetBasePath;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+    ExpireVersionsPlan, ExpireVersionsStats,
 };
 use dataset::io_stats::IoStats;
+use dataset::merge_insert::MergeInsertBuilder;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
+use dataset::optimize_indices::{
+    PyIndexSegmentResult, PyOptimizeIndexMerge, PyOptimizeIndexTask, PyOptimizeIndices,
+    PyOptimizeIndicesPlan,
+};
+use dataset::write::write_dataset;
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -56,7 +63,7 @@ use pyo3::exceptions::PyIOError;
 use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
-use scanner::ScanStatistics;
+use scanner::{PyFullTextQuery, PySearchFilter, ScanStatistics};
 use session::Session;
 use std::ptr::NonNull;
 
@@ -95,15 +102,16 @@ pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
-pub use dataset::serialize_row_addrs;
-pub use dataset::write_dataset;
 use fragment::{
-    FileFragment, FragmentAddColumnsCleanup, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta,
+    FileFragment, FragmentAddColumnsCleanup, OverlayWriter, PyDeletionFile,
+    PyRowDatasetVersionMeta, PyRowIdMeta,
 };
 pub use indices::register_indices;
 pub use reader::LanceReader;
 use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
+pub use scanner::serialize_row_addrs;
+use transaction::PyInsertedRowsFilter;
 
 use crate::blob::{
     PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
@@ -268,6 +276,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
+    m.add_class::<OverlayWriter>()?;
     m.add_class::<FragmentAddColumnsCleanup>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
@@ -292,6 +301,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<ExpireVersionsStats>()?;
+    m.add_class::<ExpireVersionsPlan>()?;
     m.add_class::<CleanupCandidateFile>()?;
     m.add_class::<CleanupReferencedBranch>()?;
     m.add_class::<CleanupExplanation>()?;
@@ -303,6 +314,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<PyOptimizeIndices>()?;
+    m.add_class::<PyOptimizeIndicesPlan>()?;
+    m.add_class::<PyOptimizeIndexTask>()?;
+    m.add_class::<PyOptimizeIndexMerge>()?;
+    m.add_class::<PyIndexSegmentResult>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<object_store::PyObjectStoreProvider>()?;
@@ -313,6 +329,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<bitmap::PyBitmap>()?;
     m.add_class::<bitmap::PyBitmapIter>()?;
+    m.add_class::<PyInsertedRowsFilter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
@@ -331,6 +348,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(dataset::blob::read_blob_files))?;
+    m.add_wrapped(wrap_pyfunction!(dataset::blob::read_blob_file_ranges))?;
     m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
@@ -348,6 +367,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(otel::register_lance_metrics_recorder))?;
     m.add_wrapped(wrap_pyfunction!(otel::lance_metrics_catalog))?;
     m.add_wrapped(wrap_pyfunction!(otel::snapshot_lance_metrics))?;
+    m.add_wrapped(wrap_pyfunction!(otel::set_memory_observation))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;

@@ -38,7 +38,7 @@ async fn distributed_deferred_compaction_merges_with_a_disjoint_concurrent_rewri
         .await
         .unwrap();
     // Tag the table: the sticky flag decides the entry's form.
-    let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+    let indices: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -88,7 +88,9 @@ async fn distributed_deferred_compaction_merges_with_a_disjoint_concurrent_rewri
 
     let committed = fresh(uri).await.unwrap();
     assert_eq!(committed.fragments().len(), 2);
-    let stored = crate::index::load_all_indices(&committed).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&committed)
+        .await
+        .unwrap();
     let entry = stored
         .iter()
         .find(|idx| idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
@@ -552,16 +554,16 @@ async fn test_commit_refuses_recording_mismatch_before_reserving_fragments(
         );
     }
     if matches!(mismatch, RecordingMismatch::IncompatibleIndexCreated) {
-        // NGram, not Bitmap: Bitmap now always creates an address-domain
-        // segment on a stable-row-id dataset (safe alongside the recorded
-        // moves by construction), so it can no longer illustrate this
-        // mismatch. NGram still stores row ids directly here.
+        // Inverted: the other scalar index types now always create an
+        // address-domain segment on a stable-row-id dataset (safe alongside
+        // the recorded moves by construction), so none of them can illustrate
+        // this mismatch. Inverted still stores row ids directly here.
         dataset
             .create_index(
                 &["cat"],
-                IndexType::NGram,
+                IndexType::Inverted,
                 Some("i_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
                 false,
             )
             .await

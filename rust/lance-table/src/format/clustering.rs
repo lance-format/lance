@@ -548,38 +548,6 @@ pub fn reset_removal_scan_visits() {
     LAST_REMOVAL_SCAN_VISITS.with(|cell| cell.set(0));
 }
 
-/// Add every definition of `other` that `target` lacks, keeping ids sorted.
-///
-/// A definition is immutable, so the same id must carry the same content on
-/// both sides; anything else is an error rather than an overwrite.
-pub fn merge_clustering_definitions(
-    target: &mut Vec<ClusteringDefinition>,
-    other: &[ClusteringDefinition],
-) -> Result<()> {
-    let mut positions: HashMap<u32, usize> = target
-        .iter()
-        .enumerate()
-        .map(|(index, definition)| (definition.id, index))
-        .collect();
-    for definition in other {
-        match positions.get(&definition.id) {
-            Some(&index) if target[index] == *definition => {}
-            Some(&index) => {
-                return Err(Error::invalid_input(format!(
-                    "clustering definition {} differs between manifests: {:?} versus {:?}",
-                    definition.id, target[index], definition
-                )));
-            }
-            None => {
-                positions.insert(definition.id, target.len());
-                target.push(definition.clone());
-            }
-        }
-    }
-    target.sort_by_key(|definition| definition.id);
-    Ok(())
-}
-
 impl From<&ClusteringDefinition> for pb::Clustering {
     fn from(definition: &ClusteringDefinition) -> Self {
         Self {
@@ -1254,22 +1222,5 @@ mod tests {
         segment.clustering_id = Some(7);
         let error = validate_clustering(&manifest, &[segment]).unwrap_err();
         assert!(error.to_string().contains("index segment"), "{error}");
-    }
-
-    #[test]
-    fn merges_definitions_by_id_and_rejects_conflicts() {
-        let mut target = vec![definition(2)];
-        merge_clustering_definitions(&mut target, &[definition(1), definition(2)]).unwrap();
-        assert_eq!(target, vec![definition(1), definition(2)]);
-
-        let conflicting = ClusteringDefinition {
-            provider: "org.example.other".into(),
-            ..definition(2)
-        };
-        let error = merge_clustering_definitions(&mut target, &[conflicting]).unwrap_err();
-        assert!(
-            error.to_string().contains("differs between manifests"),
-            "{error}"
-        );
     }
 }
