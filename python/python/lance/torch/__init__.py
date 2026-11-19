@@ -36,7 +36,10 @@ def _to_device(
 ) -> "torch.Tensor":
     """Move ``data`` to ``device``.
 
-    MPS has no float64, so float64 becomes float32 there.
+    MPS has no float64, so float64 becomes float32 there. Results computed on
+    such data, including ``ground_truth``, have float32 precision, so nearly tied
+    neighbours can change order. Use ``device="cpu"`` when double precision is
+    needed.
     """
     if torch.device(device).type == "mps" and data.dtype == torch.float64:
         data = data.type(torch.float32)
