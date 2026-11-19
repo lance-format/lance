@@ -492,14 +492,12 @@ impl Index for BloomFilterIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        let mut frag_ids = RoaringBitmap::new();
-
-        // Loop through zones and add unique fragment IDs to the bitmap
-        for block in &self.zones {
-            frag_ids.insert(block.bound.fragment_id as u32);
-        }
-
-        Ok(frag_ids)
+        super::zoned::zone_bounds_included_frags(
+            self.zones.iter().map(|block| &block.bound),
+            self.frag_reuse_index.as_deref(),
+            self.batch_remapper.as_deref(),
+        )
+        .await
     }
 }
 

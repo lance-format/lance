@@ -34,6 +34,7 @@ fn test_merged_covered_metadata_is_committable() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     let merged = IndexMetadata {

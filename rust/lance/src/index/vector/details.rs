@@ -951,6 +951,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -976,6 +977,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -999,6 +1001,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -1039,6 +1042,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 
@@ -1128,6 +1132,7 @@ mod tests {
                 files: None,
                 clustering_id: None,
                 metadata: Default::default(),
+                local_fragment_aliases: Default::default(),
             };
 
             let metric = metric_type_from_index_metadata(&index);

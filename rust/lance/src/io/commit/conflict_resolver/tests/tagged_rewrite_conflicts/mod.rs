@@ -2089,6 +2089,7 @@ async fn sp_rejects_mixed_fri_create_index() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let ours = Transaction::new(
         1,

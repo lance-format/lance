@@ -135,6 +135,7 @@ pub(in crate::index) async fn merge_segments(
         files: Some(index_files_to_table(created_index.files)),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
         ..segments[0].clone()
     })
 }

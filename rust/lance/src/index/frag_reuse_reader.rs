@@ -791,6 +791,7 @@ pub mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         indices.push(fri.clone());
         let manifest = Arc::make_mut(&mut dataset.manifest);
@@ -2020,6 +2021,7 @@ pub mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         // Installed by writing the manifest directly: the commit chokepoint
         // (correctly) refuses a hand-built tagged entry, and no writer of this

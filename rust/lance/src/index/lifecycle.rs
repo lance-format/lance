@@ -145,6 +145,7 @@ pub(super) async fn build_index_metadata_from_segments(
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
         .validate_covering_fields()?;
         if !segment.declares_same_fields(expected) {
@@ -207,6 +208,7 @@ pub(super) async fn build_index_metadata_from_segments(
                 files: None,
                 clustering_id,
                 metadata: metadata.clone(),
+                local_fragment_aliases: Default::default(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -230,6 +232,7 @@ pub(super) async fn build_index_metadata_from_segments(
             files: Some(files),
             clustering_id,
             metadata,
+            local_fragment_aliases: Default::default(),
         })
     }))
     .buffered(dataset.object_store.io_parallelism())

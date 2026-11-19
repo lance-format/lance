@@ -18,7 +18,10 @@ use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{ROW_ADDR, Result};
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
+use lance_index_core::scalar::RowIdRemapper;
 use lance_select::RowAddrTreeMap;
+use roaring::RoaringBitmap;
 
 /// Minimum number of scanned rows to dispatch to the CPU pool at once.
 ///
@@ -52,6 +55,65 @@ pub struct ZoneBound {
     // calculated as (last_row_offset - first_row_offset + 1). It is not the count
     // of physical rows, since deletions may create gaps within the span.
     pub length: usize,
+}
+
+/// Compute committed fragment coverage from zone bounds, applying the active
+/// sync or async remapper when present.
+pub(crate) async fn zone_bounds_included_frags<'a>(
+    bounds: impl IntoIterator<Item = &'a ZoneBound>,
+    fri: Option<&dyn RowIdRemapper>,
+    batch_remapper: Option<&dyn BatchRowIdRemapper>,
+) -> Result<RoaringBitmap> {
+    let mut frag_ids = RoaringBitmap::new();
+    let validate_frag = |fragment_id: u64| -> Result<u32> {
+        let frag_id = u32::try_from(fragment_id).map_err(|_| {
+            Error::index(format!("zone fragment id {fragment_id} exceeds u32::MAX"))
+        })?;
+        if frag_id == RowAddress::TOMBSTONE_FRAG {
+            return Err(Error::index(format!(
+                "zone fragment id {frag_id} is reserved"
+            )));
+        }
+        Ok(frag_id)
+    };
+
+    if fri.is_some() || batch_remapper.is_some() {
+        let mut raw = RowAddrTreeMap::new();
+        for bound in bounds {
+            let frag_id = validate_frag(bound.fragment_id)?;
+            let start = u32::try_from(bound.start).map_err(|_| {
+                Error::index(format!("zone start {} exceeds u32::MAX", bound.start))
+            })?;
+            let length = u64::try_from(bound.length).map_err(|_| {
+                Error::index(format!("zone length {} exceeds u64::MAX", bound.length))
+            })?;
+            let end = u64::from(start)
+                .checked_add(length)
+                .filter(|&end| end <= (u32::MAX as u64) + 1)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "zone range [{}, +{}) overflows fragment row offset bounds",
+                        bound.start, bound.length
+                    ))
+                })?;
+            let base = u64::from(frag_id) << 32;
+            raw.insert_range((base + u64::from(start))..(base + end));
+        }
+        let translated = if let Some(remapper) = fri {
+            remapper.remap_row_addrs_tree_map(&raw)
+        } else if let Some(remapper) = batch_remapper {
+            remap_row_addrs_tree_map_async(remapper, &raw).await?
+        } else {
+            raw
+        };
+        frag_ids.extend(translated.iter().map(|(&frag_id, _)| frag_id));
+        return Ok(frag_ids);
+    }
+
+    for bound in bounds {
+        frag_ids.insert(validate_frag(bound.fragment_id)?);
+    }
+    Ok(frag_ids)
 }
 
 /// Index-specific logic used while building zones.

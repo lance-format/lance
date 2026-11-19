@@ -6711,6 +6711,7 @@ mod test {
                 files: None,
                 clustering_id: None,
                 metadata: Default::default(),
+                local_fragment_aliases: Default::default(),
             };
             let metadata_key = IndexMetadataKey {
                 version: dataset.manifest.version,
