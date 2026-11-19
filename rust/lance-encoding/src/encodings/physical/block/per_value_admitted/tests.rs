@@ -159,13 +159,20 @@ fn mixed_zstd_frames_match_independent_decoder(
     #[values(32, 64)] bits: u8,
     #[values(0, 1)] displacement: usize,
 ) {
-    let expected: Vec<Vec<u8>> = [0, 1, 63, 64, 65, 32777, 0]
+    let expected: Vec<Vec<u8>> = [0, 1, 262_145, 63, 0, 131_073, 64, 65, 32777, 0]
         .into_iter()
-        .map(|len| (0..len).map(|i| ((i * 31) ^ (i >> 4)) as u8).collect())
+        .enumerate()
+        .map(|(frame, len)| {
+            (0..len)
+                .map(|i| ((i * (frame + 1) * 31) ^ (i >> (frame % 7))) as u8)
+                .collect()
+        })
         .collect();
     let mut frames = Vec::new();
     for (i, value) in expected.iter().enumerate() {
-        let compressed = ::zstd::bulk::compress(value, 0).unwrap();
+        // Vary frame sizes, entropy and compression levels across one context,
+        // including multi-block frames followed by small and empty frames.
+        let compressed = ::zstd::bulk::compress(value, if i % 2 == 0 { 1 } else { 7 }).unwrap();
         assert_eq!(
             ::zstd::bulk::decompress(&compressed, value.len()).unwrap(),
             *value
@@ -208,6 +215,53 @@ fn mixed_zstd_frames_match_independent_decoder(
     );
     assert_eq!(alias.as_ref(), &[last]);
     drop(alias);
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_frame_cannot_use_previous_output_as_dictionary() {
+    // A raw dictionary has no dictionary ID. Only independent frame state, not
+    // an ID mismatch, prevents this frame from referring to preceding output.
+    let mut state = 0x1234_5678_u32;
+    let dictionary: Vec<u8> = (0..32768)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let value = &dictionary[dictionary.len() - 8192..];
+    let mut compressor = ::zstd::bulk::Compressor::with_dictionary(3, &dictionary).unwrap();
+    let dependent = compressor.compress(value).unwrap();
+    assert!(::zstd::bulk::decompress(&dependent, value.len()).is_err());
+    let mut independent = ::zstd::bulk::Decompressor::with_dictionary(&dictionary).unwrap();
+    assert_eq!(
+        independent.decompress(&dependent, value.len()).unwrap(),
+        value
+    );
+
+    let preceding = ::zstd::bulk::compress(&dictionary, 1).unwrap();
+    let data = input(&[preceding, dependent], 64, 1);
+    let codec = codec(CompressionScheme::Zstd);
+    let plan = codec.plan_decode(&data).unwrap();
+    let pool = AllocationBudget::new(plan.workspace_bytes);
+    let mut work = pool.try_reserve(plan.workspace_bytes).unwrap();
+    let error = codec.try_decompress_in(&data, &mut work).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert_eq!(work.len(), plan.workspace_bytes);
+
+    // A subsequent independent attempt reinitializes its recycled storage.
+    let valid = input(&[::zstd::bulk::compress(value, 1).unwrap()], 64, 1);
+    let output = codec
+        .try_decompress_in(&valid, &mut work)
+        .unwrap()
+        .unwrap()
+        .as_variable_width()
+        .unwrap();
+    assert_eq!(output.data.as_ref(), value);
+    drop((output, work));
     assert_eq!(pool.reserved(), 0);
 }
 

@@ -5,6 +5,7 @@
 //!
 //! Raw copies and Zstd initialize output once. The writer publishes only complete
 //! output; partial decoder failures recycle its allocation into the same workspace.
+//! Zstd reuses one admitted context within a decode; frames remain independent.
 
 use arrow_buffer::Buffer;
 use lance_core::{
@@ -129,6 +130,7 @@ fn zstd_append(
     len: usize,
     output: &mut ReservedBufferWriter,
     context: &mut [u8],
+    initialized: &mut bool,
 ) -> Result<()> {
     use ::zstd::zstd_safe::zstd_sys;
     // SAFETY: Reservation supplies exclusive, 64-byte-aligned storage, sized by
@@ -137,13 +139,22 @@ fn zstd_append(
     // and returns its initialized length. Never form an uninitialized u8 slice.
     // Only an exact successful length advances the writer; errors leave the
     // private suffix unreadable. Static DCtx never allocates or resizes. No
-    // dictionary/streaming/legacy context is installed. The context is reinitialized
-    // before each value, so it cannot reuse any preceding output pointer.
+    // dictionary/streaming/legacy context is installed. decode_with supplies the
+    // same allocation on every call and initialized is local to that decode.
+    // ZSTD_decompressDCtx starts each frame with ZSTD_decompressBegin, which
+    // clears previousDstEnd, prefixStart, virtualStart and dictionary/entropy
+    // state before checking output continuity (pinned Zstd 1.5.7).
     unsafe {
-        let ctx = zstd_sys::ZSTD_initStaticDCtx(context.as_mut_ptr().cast(), context.len());
-        if ctx.is_null() {
-            return Err(Error::internal("Zstd rejected the admitted static context"));
-        }
+        let ctx = if *initialized {
+            context.as_mut_ptr().cast::<zstd_sys::ZSTD_DCtx>()
+        } else {
+            let ctx = zstd_sys::ZSTD_initStaticDCtx(context.as_mut_ptr().cast(), context.len());
+            if ctx.is_null() {
+                return Err(Error::internal("Zstd rejected the admitted static context"));
+            }
+            *initialized = true;
+            ctx
+        };
         output.try_extend_with(len, |target| {
             let written = zstd_sys::ZSTD_decompressDCtx(
                 ctx,
@@ -178,7 +189,12 @@ pub(super) fn decode(
             super::admitted::lz4_into(input, &mut output.initialized_mut()[start..])
         }),
         #[cfg(feature = "zstd")]
-        CompressionScheme::Zstd => decode_with(scheme, data, workspace, zstd_append),
+        CompressionScheme::Zstd => {
+            let mut initialized = false;
+            decode_with(scheme, data, workspace, |input, len, output, context| {
+                zstd_append(input, len, output, context, &mut initialized)
+            })
+        }
         _ => Err(Error::not_supported(
             "general per-value codec is not enabled",
         )),
