@@ -1889,7 +1889,7 @@ async fn test_merge_covers_shared_sources_only_through_kept_links(
 ) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
-    let saved = segment_saved_over_shared_sources(uri, index_type, trimmed).await;
+    let saved = Box::pin(segment_saved_over_shared_sources(uri, index_type, trimmed)).await;
     let covered = RoaringBitmap::from_iter(if trimmed { vec![7] } else { vec![4, 7, 8, 9] });
 
     let mut dataset = Dataset::open(uri).await.unwrap();
@@ -2026,7 +2026,8 @@ async fn test_merge_does_not_cover_an_output_beside_one_whose_chain_is_broken(
     #[values(Uncovered::Rewritten, Uncovered::Unclaimed)] uncovered: Uncovered,
 ) {
     let dir = TempStrDir::default();
-    let (mut dataset, saved, probes) = segment_beside_a_broken_chain(dir.as_str(), uncovered).await;
+    let (mut dataset, saved, probes) =
+        Box::pin(segment_beside_a_broken_chain(dir.as_str(), uncovered)).await;
 
     let merged = dataset.merge_existing_index_segments(saved).await.unwrap();
     let covered = RoaringBitmap::from_iter([7]);
