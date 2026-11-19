@@ -18,7 +18,7 @@ use crate::transaction::action::{
     SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables, UserStep,
 };
 use crate::transaction::test_support::{default_build_config, overlay_with_field};
-use crate::transaction::{Operation, Transaction, UpdateMapEntry};
+use crate::transaction::{Operation, RewriteGroup, Transaction, UpdateMapEntry, UpdateMode};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_core::datatypes::{Field, Schema};
 use lance_file::version::ConcreteFileVersion;
@@ -335,6 +335,48 @@ fn reset() -> Operation {
     set(vec![Action::ResetTable(ResetTable)])
 }
 
+fn legacy_update(updated: Vec<Fragment>, new: Vec<Fragment>) -> Operation {
+    Operation::Update {
+        removed_fragment_ids: vec![],
+        updated_fragments: updated,
+        new_fragments: new,
+        fields_modified: vec![],
+        compacted_sstables: vec![],
+        mem_wal_dir_id: None,
+        fields_for_preserving_frag_bitmap: vec![],
+        update_mode: Some(UpdateMode::RewriteRows),
+        inserted_rows_filter: None,
+        updated_fragment_offsets: None,
+    }
+}
+
+/// Fragment 0 of [`table`] with one row deleted, as a legacy delete
+/// restates it.
+fn restated_with_deletions() -> Fragment {
+    let mut fragment = table().fragments[0].clone();
+    fragment.deletion_file = Some(deletion_file(1));
+    fragment
+}
+
+fn legacy_delete() -> Operation {
+    Operation::Delete {
+        updated_fragments: vec![restated_with_deletions()],
+        deleted_fragment_ids: vec![],
+        predicate: "a = 0".into(),
+    }
+}
+
+fn legacy_rewrite(old: u64) -> Operation {
+    Operation::Rewrite {
+        groups: vec![RewriteGroup {
+            old_fragments: vec![table().fragments[old as usize].clone()],
+            new_fragments: vec![table().fragments[old as usize].clone()],
+        }],
+        rewritten_indices: vec![],
+        frag_reuse_index: None,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Outcome {
     Lands,
@@ -346,12 +388,19 @@ use Outcome::{Conflicts, Lands};
 /// read `read` too, has committed.
 fn outcome_at(read: &Manifest, ours: &Operation, theirs: &Operation) -> Outcome {
     let committed = Transaction::new(read.version, theirs.clone(), None);
-    let latest = committed
-        .build_manifest(Some(read), vec![], "tx.txn", &default_build_config())
-        .unwrap_or_else(|error| panic!("{theirs:?} does not apply: {error}"))
-        .0;
-    let pending = Footprint::of(&Transaction::new(read.version, ours.clone(), None));
-    let window = Window::new(read, &latest, vec![Footprint::of(&committed)]);
+    let latest = if matches!(theirs, Operation::Restore { .. }) {
+        // Built from the manifest it restores, which no test has.
+        let mut latest = read.clone();
+        latest.version += 1;
+        latest
+    } else {
+        committed
+            .build_manifest(Some(read), vec![], "tx.txn", &default_build_config())
+            .unwrap_or_else(|error| panic!("{theirs:?} does not apply: {error}"))
+            .0
+    };
+    let pending = Footprint::of(&Transaction::new(read.version, ours.clone(), None), read);
+    let window = Window::new(read, &latest, vec![Footprint::of(&committed, read)]);
     match pending.check(&window) {
         Verdict::Compatible => Outcome::Lands,
         Verdict::Conflict(_) => Outcome::Conflicts,
@@ -468,6 +517,38 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
 // second wins.
 #[case::a_reset_and_an_append(reset(), append(), Lands, Conflicts)]
 #[case::a_reset_and_a_rewrite(reset(), replace_c(0), Lands, Conflicts)]
+// Named operations: post-images are read whole.
+#[case::a_legacy_delete_and_a_delete(legacy_delete(), delete_rows(0), Conflicts, Conflicts)]
+#[case::a_legacy_delete_and_a_rewrite(legacy_delete(), replace_c(0), Conflicts, Lands)]
+#[case::a_legacy_update_and_a_rename(
+    legacy_update(vec![restated_with_deletions()], vec![]),
+    alter_c(|alter| alter.with_name("d")),
+    Lands,
+    Lands
+)]
+#[case::a_legacy_moving_update_and_a_rewrite(
+    legacy_update(vec![restated_with_deletions()], vec![table().fragments[0].clone()]),
+    replace_c(0),
+    Conflicts,
+    Conflicts
+)]
+// A compaction carries the indices over the rows it moves through a remap
+// computed when it read; a segment over them since is left stale.
+#[case::a_compaction_and_a_segment_over_it(legacy_rewrite(0), index_over(&[0]), Conflicts, Lands)]
+#[case::a_compaction_and_a_segment_elsewhere(legacy_rewrite(0), index_over(&[1]), Lands, Lands)]
+#[case::a_compaction_and_a_rewrite_of_it(legacy_rewrite(0), replace_c(0), Conflicts, Conflicts)]
+#[case::a_restore_and_a_schema_metadata_edit(
+    Operation::Restore { version: 1 },
+    schema_metadata("k"),
+    Conflicts,
+    Conflicts
+)]
+#[case::a_restore_and_a_table_metadata_edit(
+    Operation::Restore { version: 1 },
+    table_metadata("k"),
+    Conflicts,
+    Conflicts
+)]
 // A row-moving update re-creates the rows it moves elsewhere and only adds
 // deletions here, so the cells read show no change.
 #[case::cells_and_a_moving_update(assert_c_unchanged_in(0), moving_update(0), Conflicts, Lands)]
@@ -716,6 +797,89 @@ fn test_a_new_v1_file_conflicts_with_a_drop_of_a_field_it_backs() {
     assert_eq!(outcome(&v1_append, &drop_c()), Conflicts);
 }
 
+/// A file's path is relative to its base, so moving a column to another base
+/// with the same path and column replaces its values.
+#[test]
+fn test_a_column_replacement_over_a_replacement_moving_it_to_another_base() {
+    let mut read = table();
+    for id in [1, 2] {
+        read.base_paths.insert(
+            id,
+            crate::format::BasePath::new(id, format!("s3://example/base{id}"), None, false),
+        );
+    }
+    let mut fragments = read.fragments.as_ref().clone();
+    fragments[0].files[1].base_id = Some(1);
+    read.fragments = Arc::new(fragments);
+    let mut moved = read.fragments[0].files[1].clone();
+    moved.base_id = Some(2);
+    let replacement = Operation::DataReplacement {
+        replacements: vec![crate::transaction::DataReplacementGroup(0, moved)],
+        data_change: true,
+    };
+
+    assert_eq!(outcome_at(&read, &replace_c(0), &replacement), Conflicts);
+}
+
+/// Row ids a named operation's new fragments arrive carrying are claimed as
+/// an `AddFragment`'s are: two writers that spend the same reserved ids would
+/// leave one row id live in two fragments. Ids that do not decode claim
+/// everything.
+#[rstest]
+#[case::the_same_ids(10..15, Conflicts)]
+#[case::other_ids(15..20, Lands)]
+fn test_named_new_fragments_claim_their_row_ids(
+    #[values(false, true)] named_update: bool,
+    #[case] action_ids: std::ops::Range<u64>,
+    #[case] expected: Outcome,
+) {
+    use crate::format::RowIdMeta;
+    use crate::rowids::write_row_ids;
+
+    let inline = |ids: std::ops::Range<u64>| RowIdMeta::Inline(write_row_ids(&ids.into()).into());
+    let mut actions = append_actions();
+    actions[0] = Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+        id: Ref::Local(0),
+        physical_rows: 5,
+        row_id_meta: Some(inline(action_ids)),
+        last_updated_at_version_meta: None,
+        created_at_version_meta: None,
+        data_change: true,
+    }));
+    let action_set = set(actions);
+    let named = |row_id_meta: RowIdMeta| {
+        let mut fragment = table().fragments[0].clone();
+        fragment.id = 7;
+        fragment.row_id_meta = Some(row_id_meta);
+        if named_update {
+            legacy_update(vec![], vec![fragment])
+        } else {
+            Operation::Append {
+                fragments: vec![fragment],
+            }
+        }
+    };
+    let window_outcome = |ours: &Operation, theirs: &Operation| {
+        // Applying stable row ids needs a table that keeps them, so the
+        // window is the read manifest itself: only the footprints decide.
+        let read = table();
+        let pending = Footprint::of(&Transaction::new(read.version, ours.clone(), None), &read);
+        let committed = Footprint::of(&Transaction::new(read.version, theirs.clone(), None), &read);
+        match pending.check(&Window::new(&read, &read, vec![committed])) {
+            Verdict::Compatible => Lands,
+            Verdict::Conflict(_) => Conflicts,
+        }
+    };
+
+    let reserved = named(inline(10..15));
+    assert_eq!(window_outcome(&action_set, &reserved), expected);
+    assert_eq!(window_outcome(&reserved, &action_set), expected);
+
+    let undecodable = named(RowIdMeta::Inline(vec![0xff; 3].into()));
+    assert_eq!(window_outcome(&action_set, &undecodable), Conflicts);
+    assert_eq!(window_outcome(&undecodable, &action_set), Conflicts);
+}
+
 /// A fragment id reserved once and claimed by two writers collides; row ids
 /// supplied twice collide whatever fragments carry them.
 #[test]
@@ -757,6 +921,28 @@ fn test_reserved_ids_are_claimed_once() {
     ));
 }
 
+/// Deletions cleared since, which only a named operation restating the
+/// fragment can do, conflict with deletions added.
+#[test]
+fn test_cleared_deletions_do_not_merge() {
+    let mut read = table();
+    let mut fragments = read.fragments.as_ref().clone();
+    fragments[0].deletion_file = Some(deletion_file(1));
+    read.fragments = Arc::new(fragments);
+    let mut cleared = read.fragments[0].clone();
+    cleared.deletion_file = None;
+    let clear = Operation::Delete {
+        updated_fragments: vec![cleared],
+        deleted_fragment_ids: vec![],
+        predicate: String::new(),
+    };
+    let add = set(vec![Action::SetDeletionFile(
+        SetDeletionFile::try_new_unchecked(0, deletion_file(2), None, true).unwrap(),
+    )]);
+
+    assert_eq!(outcome_at(&read, &add, &clear), Conflicts);
+}
+
 /// The window is checked as one change of state: a pending transaction is
 /// held to what the last manifest differs in from the one it read, plus every
 /// committed transaction's facts, whatever order they landed in.
@@ -768,13 +954,17 @@ fn test_a_window_of_several_commits() {
         let (after, _) = transaction
             .build_manifest(Some(before), vec![], "tx.txn", &default_build_config())
             .unwrap();
-        (Footprint::of(&transaction), after)
+        (Footprint::of(&transaction, before), after)
     };
     let (rewrite, after_rewrite) = commit(&read, &replace_c(1));
     let (appended, latest) = commit(&after_rewrite, &append());
     let window = Window::new(&read, &latest, vec![rewrite, appended]);
     let pending = |operation: &Operation| {
-        Footprint::of(&Transaction::new(read.version, operation.clone(), None)).check(&window)
+        Footprint::of(
+            &Transaction::new(read.version, operation.clone(), None),
+            &read,
+        )
+        .check(&window)
     };
 
     assert!(matches!(pending(&replace_c(0)), Verdict::Compatible));
@@ -929,6 +1119,30 @@ fn test_facts(#[case] ours: Vec<Action>, #[case] theirs: Vec<Action>, #[case] co
     );
 }
 
+/// A compaction carries along the indices it finds at apply through a remap
+/// computed when it read. Only coverage added since is left stale; an index
+/// dropped or rewritten without new coverage leaves nothing stale to carry.
+#[rstest]
+#[case::a_segment_over_it(index_actions(&[0]), true)]
+#[case::a_segment_elsewhere(index_actions(&[1]), false)]
+#[case::an_index_dropped(vec![drop_index("idx")], false)]
+#[case::memwal_progress(vec![compacted_sstables()], false)]
+fn test_a_compaction_over_index_writes(#[case] theirs: Vec<Action>, #[case] conflicts: bool) {
+    let read = table();
+    let Operation::CompositeOperation(theirs) = set(theirs) else {
+        unreachable!()
+    };
+    let window = Window::new(&read, &read, vec![Footprint::from(&theirs)]);
+    let ours = Footprint::of(
+        &Transaction::new(read.version, legacy_rewrite(0), None),
+        &read,
+    );
+    assert_eq!(
+        matches!(ours.check(&window), Verdict::Conflict(_)),
+        conflicts
+    );
+}
+
 /// A struct made non-nullable holds only if no values were written for it or,
 /// through it, for a child, which may null the struct's rows. Values for an
 /// unrelated field leave it valid.
@@ -957,8 +1171,8 @@ fn test_a_struct_tightening_over_a_write(#[case] written: i32, #[case] expected:
 /// applied to [`table`] as it stands.
 fn by_footprints(ours: &Operation, theirs: &Operation) -> Outcome {
     let read = table();
-    let pending = Footprint::of(&Transaction::new(read.version, ours.clone(), None));
-    let committed = Footprint::of(&Transaction::new(read.version, theirs.clone(), None));
+    let pending = Footprint::of(&Transaction::new(read.version, ours.clone(), None), &read);
+    let committed = Footprint::of(&Transaction::new(read.version, theirs.clone(), None), &read);
     match pending.check(&Window::new(&read, &read, vec![committed])) {
         Verdict::Compatible => Lands,
         Verdict::Conflict(_) => Conflicts,
@@ -1082,6 +1296,15 @@ fn test_a_compaction_over_a_drop_of_an_overlaid_field() {
         false,
     ))]);
     assert_eq!(outcome_at(&read, &move_out, &drop_c()), Lands);
+}
+
+fn schema_metadata(key: &str) -> Operation {
+    set(vec![Action::ConfigUpdate(
+        ConfigUpdate::default().with_schema_metadata(UpdateMap {
+            update_entries: vec![UpdateMapEntry::from((key, Some("v")))],
+            replace: false,
+        }),
+    )])
 }
 
 fn table_metadata(key: &str) -> Operation {

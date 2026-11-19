@@ -64,8 +64,8 @@ enum Pending {
 }
 
 /// A pending action-set delete of one row in fragment 5 against
-/// `CONCURRENT_COMMITS` committed action-set appends, on a table of
-/// `fragments` fragments. Returns the seconds spent
+/// `CONCURRENT_COMMITS` committed appends, alternating legacy and action-set
+/// form, on a table of `fragments` fragments. Returns the seconds spent
 /// setting up the rebase and checking every committed transaction.
 async fn time_check(fragments: u64, pending: Pending) -> f64 {
     let dataset = test_dataset(10, 1).await;
@@ -85,13 +85,24 @@ async fn time_check(fragments: u64, pending: Pending) -> f64 {
     let mut committed = Vec::new();
     for i in 1..=CONCURRENT_COMMITS {
         let mut next = history.last().unwrap().fragments.as_ref().clone();
-        next.push(fragment(fragments + i));
+        let added = fragment(fragments + i);
+        next.push(added.clone());
         history.push(Arc::new(manifest_with_fragments(
             &read,
             next,
             read_version + i,
         )));
-        committed.push((read_version + i, action_append(read_version + i - 1)));
+        let transaction = if i % 2 == 0 {
+            action_append(read_version + i - 1)
+        } else {
+            Transaction::new_from_version(
+                read_version + i - 1,
+                Operation::Append {
+                    fragments: vec![added],
+                },
+            )
+        };
+        committed.push((read_version + i, transaction));
     }
 
     let mut dataset = dataset.clone();
@@ -145,6 +156,11 @@ async fn time_check(fragments: u64, pending: Pending) -> f64 {
     let mut rebase = TransactionRebase::try_new(&dataset, pending, None)
         .await
         .unwrap();
+    for (index, (version, transaction)) in committed.iter().enumerate() {
+        if rebase.needs_committed_manifests(transaction) {
+            rebase.record_committed(*version, transaction, &history[index]);
+        }
+    }
     if let (Some(since), Some(latest)) = (history.first(), history.last()) {
         rebase.record_window(since.clone(), latest.clone());
     }

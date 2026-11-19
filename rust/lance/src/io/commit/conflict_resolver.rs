@@ -31,6 +31,7 @@ use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::system_index::is_system_index;
 use lance_table::transaction::TaggedRewriteAssembly;
+use lance_table::transaction::action::Footprint;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -89,17 +90,34 @@ pub struct TransactionRebase<'a> {
     footprint_basis: Box<FootprintBasis>,
 }
 
-/// What a pending action set's footprint check keeps about the commits since
-/// it read: the manifests either side of them.
+/// What a pending transaction's footprint checks keep about the commits since
+/// it read: the manifest it read, the latest one, and the footprints of the
+/// named commits an action set passes. A named commit's footprint is read off
+/// the manifests either side of it, which are dropped once it is taken; an
+/// action set's comes from its actions.
 #[derive(Debug, Default)]
 struct FootprintBasis {
-    /// The manifest the commits being checked landed on: the one read on a
-    /// first attempt, the previous attempt's latest on a retry, which already
-    /// checked this transaction against what came before.
+    read: Option<Arc<Manifest>>,
+    /// The manifest the commits being checked landed on: `read` on a first
+    /// attempt, the previous attempt's latest on a retry, whose rebase already
+    /// moved this transaction past what came before.
     since: Option<Arc<Manifest>>,
     /// The latest manifest, recorded with the commits since `since`. A
     /// footprint is checked against the change from `since` to it.
     latest: Option<Arc<Manifest>>,
+    /// The footprints of the named commits since `read` that an action set
+    /// is checked against, by version. Each is read off the manifests either
+    /// side of its commit, which are dropped once it is taken.
+    committed: HashMap<u64, Footprint>,
+}
+
+impl FootprintBasis {
+    fn read_at(dataset: &Dataset) -> Box<Self> {
+        Box::new(Self {
+            read: Some(dataset.manifest.clone()),
+            ..Default::default()
+        })
+    }
 }
 
 /// The fragments a CreateIndex read, and the data files that replacements

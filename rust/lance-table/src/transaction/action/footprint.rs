@@ -23,8 +23,10 @@
 //! table.
 //!
 //! Which parts an action touches is decided by that action, in its own
-//! module; the comparison is in `window`.
+//! module. The named operations, which have no actions to ask, are in
+//! `legacy`; the comparison is in `window`.
 
+mod legacy;
 mod window;
 
 pub use window::Window;
@@ -33,7 +35,7 @@ use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::format::BasePath;
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
-use crate::transaction::{Operation, Transaction, UpdateMap};
+use crate::transaction::UpdateMap;
 use lance_core::datatypes::{Field, Schema};
 
 use roaring::RoaringTreemap;
@@ -179,6 +181,12 @@ enum Forbid {
     /// No rows were moved out of this fragment, whose files the transaction
     /// writes: the moved rows were copied without the write, in either order.
     RelocationFrom(u64),
+    /// No index coverage was added over these fragments, whose rows the
+    /// transaction moves while carrying the indices over them along, through
+    /// a remap computed at its read version. Dropping or replacing an index
+    /// without adding coverage is no conflict:
+    /// the remap finds nothing to carry along.
+    IndexOver(HashSet<u64>),
     /// No new fragment carries any of these row ids: one id names one row.
     RowIds(RoaringTreemap),
     /// No write into the same index that this one cannot coexist with; see
@@ -227,6 +235,12 @@ impl Forbid {
                 wrote_a_key_column || may_collide
             }
             Self::RelocationFrom(fragment) => theirs.relocated_rows_from.contains(fragment),
+            Self::IndexOver(fragments) => theirs.index_writes.iter().any(|write| {
+                write
+                    .adds
+                    .as_ref()
+                    .is_none_or(|added| !added.is_disjoint(fragments))
+            }),
             Self::RowIds(ours) => !ours.is_disjoint(&theirs.supplied_row_ids),
             Self::IndexWrite(ours) => theirs
                 .index_writes
@@ -248,6 +262,7 @@ impl Forbid {
             Self::RelocationFrom(fragment) => {
                 format!("rows were moved out of fragment {fragment}, whose files this one writes")
             }
+            Self::IndexOver(_) => "index coverage was added over rows this one moves".into(),
             Self::RowIds(_) => "a new fragment carries some of the same row ids".into(),
             Self::IndexWrite(write) => format!("index '{}' was written", write.name),
             Self::SegmentEdit(segment) => format!("index segment {segment} was edited"),
@@ -287,7 +302,8 @@ struct KeyAssertion {
 ///
 /// An index is the set of segments sharing a name, and the query path unions
 /// them, so two writers may extend one index at the same time -- what they may
-/// not do is describe the same rows twice, or disagree about what the index is.
+/// not do is describe the same rows twice, disagree about what the index is,
+/// or have one of them replace what the other adds to.
 #[derive(Debug, Clone, PartialEq)]
 struct IndexWrite {
     name: String,
@@ -295,9 +311,11 @@ struct IndexWrite {
     /// edits a segment without restating the index's definition.
     identity: Option<IndexIdentity>,
     /// The committed fragments it brings under the index, or `None` when that
-    /// is not stated -- what the system indices carry, and what a rewrite of
-    /// the whole index reaches.
+    /// is not stated -- what the system indices carry.
     adds: Option<HashSet<u64>>,
+    /// Whether it replaces or drops whatever segments the index holds, rather
+    /// than only adding one.
+    replaces: bool,
 }
 
 /// What an index is, for the purpose of deciding whether two writers are
@@ -327,6 +345,9 @@ impl IndexWrite {
         {
             return true;
         }
+        if self.replaces || other.replaces {
+            return true;
+        }
         match (&self.adds, &other.adds) {
             (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
             // An unstated reach could be any fragment, including one the other
@@ -346,20 +367,6 @@ pub enum Verdict {
 }
 
 impl Footprint {
-    /// What `transaction` reads and writes. An action set's footprint is its
-    /// actions'. A named operation has no actions to ask, so what it touches
-    /// cannot be stated: it is opaque, and conflicts with everything.
-    pub fn of(transaction: &Transaction) -> Self {
-        match &transaction.operation {
-            Operation::CompositeOperation(composite_operation) => Self::from(composite_operation),
-            _ => {
-                let mut footprint = Self::default();
-                footprint.mark_opaque();
-                footprint
-            }
-        }
-    }
-
     /// Record that this transaction needs `part` exactly as it read it.
     pub(super) fn read(&mut self, part: Part) {
         self.parts.insert(part);
@@ -545,16 +552,19 @@ impl Footprint {
             name,
             identity: Some(identity),
             adds: coverage.map(committed_fragments),
+            replaces: false,
         });
     }
 
     /// Record that this transaction replaces or drops the index `name`
-    /// wholesale, reaching whatever segments it holds when it applies.
+    /// wholesale, reaching whatever segments it holds when it applies, and
+    /// brings no committed fragment under it.
     pub(super) fn rewrite_index(&mut self, name: String) {
         self.write_index(IndexWrite {
             name,
             identity: None,
-            adds: None,
+            adds: Some(HashSet::new()),
+            replaces: true,
         });
     }
 
@@ -569,6 +579,7 @@ impl Footprint {
             name,
             identity: None,
             adds: Some(committed_fragments(fragments)),
+            replaces: false,
         });
     }
 
@@ -685,6 +696,14 @@ impl Footprint {
         self.read(Part::Overlays(fragment));
     }
 
+    /// Record that this transaction moves the rows of `fragments` while
+    /// carrying the indices over them along. See [`Forbid::IndexOver`].
+    fn remap_indices_over(&mut self, fragments: HashSet<u64>) {
+        if !fragments.is_empty() {
+            self.forbids.push(Forbid::IndexOver(fragments));
+        }
+    }
+
     /// Record a write into a logical index, which no concurrent write it
     /// conflicts with may have landed before.
     fn write_index(&mut self, write: IndexWrite) {
@@ -717,6 +736,15 @@ fn related_fields(schema: &Schema, field: i32) -> Vec<i32> {
         descendants.extend(descendant.children.iter());
     }
     related
+}
+
+/// The committed fields among `fields`. A negative id is a tombstone, which
+/// names no field.
+fn field_refs(fields: &[i32]) -> impl Iterator<Item = FieldRef> + '_ {
+    fields
+        .iter()
+        .filter(|field| **field >= 0)
+        .map(|field| FieldRef::Committed(*field))
 }
 
 fn committed_fragments(fragments: impl IntoIterator<Item = Ref>) -> HashSet<u64> {

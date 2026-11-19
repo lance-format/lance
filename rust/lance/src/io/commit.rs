@@ -1799,17 +1799,31 @@ pub(crate) async fn load_and_sort_new_transactions(
 }
 
 /// Record in `rebase` what its footprint checks need of `transactions`, which
-/// committed on top of `since`, in version order: the latest manifest. Only
-/// the manifests either side of the commits are needed, never one per
-/// version.
+/// committed on top of `since`, in version order: the latest manifest, and
+/// the footprints an action set takes from the manifests either side of a
+/// named commit.
+///
+/// Manifests are loaded a commit at a time, and each pair is reduced to its
+/// footprint before the next is loaded: a writer thousands of versions behind
+/// holds what each commit touched, never a manifest per version. A commit
+/// whose preceding manifest is gone is left unrecorded, and its check fails
+/// closed.
 pub(crate) async fn record_committed_history(
     rebase: &mut TransactionRebase<'_>,
     dataset: &Dataset,
     since: Arc<Manifest>,
     transactions: &[NewTransaction],
 ) -> Result<()> {
-    let Some((_, _, last_location)) = transactions.last() else {
+    let Some((last_version, _, last_location)) = transactions.last() else {
         return Ok(());
+    };
+    let load = |location| {
+        Dataset::get_manifest(
+            dataset.object_store.as_ref(),
+            location,
+            dataset.uri(),
+            dataset.session.as_ref(),
+        )
     };
     let committed: Vec<Arc<Transaction>> = transactions
         .iter()
@@ -1818,13 +1832,32 @@ pub(crate) async fn record_committed_history(
     if !rebase.checks_by_footprint(&committed) {
         return Ok(());
     }
-    let latest = Dataset::get_manifest(
-        dataset.object_store.as_ref(),
-        last_location,
-        dataset.uri(),
-        dataset.session.as_ref(),
-    )
-    .await?;
+    let mut previous = since.clone();
+    for (index, (version, transaction, location)) in transactions.iter().enumerate() {
+        if !rebase.needs_committed_manifests(transaction) {
+            continue;
+        }
+        let before = if previous.version + 1 == *version {
+            Some(previous)
+        } else {
+            match index.checked_sub(1).map(|index| &transactions[index]) {
+                Some((before_version, _, before_location)) if before_version + 1 == *version => {
+                    Some(load(before_location).await?)
+                }
+                _ => None,
+            }
+        };
+        let after = load(location).await?;
+        if let Some(before) = before {
+            rebase.record_committed(*version, transaction, &before);
+        }
+        previous = after;
+    }
+    let latest = if previous.version == *last_version {
+        previous
+    } else {
+        load(last_location).await?
+    };
     rebase.record_window(since, latest);
     Ok(())
 }
