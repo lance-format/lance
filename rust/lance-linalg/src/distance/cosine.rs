@@ -15,7 +15,7 @@ use num_traits::AsPrimitive;
 
 use super::{
     BatchKernel, Dot, Normalize, assert_batch_output_layout, assert_equal_lengths,
-    dot::dot,
+    dot::{dot, dot_scalar},
     norm_l2::{norm_l2, norm_l2_impl},
 };
 use crate::Result;
@@ -319,9 +319,11 @@ impl Cosine for f64 {
         COSINE_F64.get().call(x, x_norm, y)
     }
 
+    #[inline]
     fn cosine_with_norms(x: &[Self], x_norm: f32, y_norm: f32, y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        let xy = x.iter().zip(y).map(|(&a, &b)| a * b).sum::<Self>();
+        // Independent partial sums allow SIMD without narrowing the dot product.
+        let xy = dot_scalar::<Self, Self, 16>(x, y);
         if x_norm.is_normal() && y_norm.is_normal() && xy.is_finite() {
             (1.0 - xy / Self::from(x_norm) / Self::from(y_norm)) as f32
         } else {
@@ -1187,12 +1189,15 @@ fn cosine_f32_checked(
     xy: f32,
     distance: f32,
 ) -> f32 {
+    // Individual products may underflow even with normal squared norms. This
+    // bound keeps their combined error below half an f32 ulp at distance 1.
+    let is_safe_zero_dot =
+        xy == 0.0 && x_norm * y_norm > (8.0 * f32::MIN_POSITIVE) * x.len() as f32;
     // A normal norm can still come from a subnormal sum of squares. Check its
     // square too, since underflow there can already have lost significant bits.
     if (x_norm * x_norm).is_normal()
         && (y_norm * y_norm).is_normal()
-        && xy.is_normal()
-        && (xy / x_norm).is_normal()
+        && (is_safe_zero_dot || (xy.is_normal() && (xy / x_norm).is_normal()))
         && distance.is_finite()
     {
         distance
@@ -1471,6 +1476,29 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_cosine_f32_underflowing_dot(#[values(8, 16, 33, 128)] dimension: usize) {
+        let mut x = vec![1e-23_f32; dimension];
+        let mut y = x.clone();
+        x[0] = 1.1e-19;
+        x[1] = 0.0;
+        y[0] = 0.0;
+        y[1] = 1.1e-19;
+        let (x_norm, y_norm) = (norm_l2(&x), norm_l2(&y));
+        assert!((x_norm * x_norm).is_normal());
+        assert!((y_norm * y_norm).is_normal());
+        let x_f64: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+        let y_f64: Vec<f64> = y.iter().map(|&v| f64::from(v)).collect();
+        let expected = cosine_ref(&x_f64, &y_f64, 0.0).0;
+        assert!(expected < 1.0);
+        assert_eq!(f32::cosine_fast(&x, x_norm, &y), expected);
+        assert_eq!(f32::cosine_with_norms(&x, x_norm, y_norm, &y), expected);
+        let mut distances = [f32::NAN];
+        f32::cosine_batch_into(&x, &y, dimension, &mut distances);
+        assert_eq!(distances, [expected]);
+    }
+
+    #[rstest::rstest]
+    #[case::normal(1.0, 1.0)]
     #[case::overflow(1e20, 1e20)]
     #[case::sum_overflow(1e19, 1e19)]
     #[case::underflow(1e-30, 1e-30)]
@@ -1537,6 +1565,7 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::normal(1.0)]
     #[case::overflow(1e20)]
     #[case::underflow(1e-30)]
     #[case::smallest_f32(f32::from_bits(1) as f64)]
@@ -1545,7 +1574,10 @@ mod tests {
     #[case::underflow_f64(1e-300)]
     #[case::smallest_f64(f64::from_bits(1))]
     #[case::largest_f64(f64::MAX)]
-    fn test_cosine_f64_extreme_kernels(#[case] scale: f64, #[values(8, 16, 33)] dimension: usize) {
+    fn test_cosine_f64_extreme_kernels(
+        #[case] scale: f64,
+        #[values(7, 8, 16, 33)] dimension: usize,
+    ) {
         let x = vec![scale; dimension];
         let x_norm = norm_l2(&x);
         for y_scale in [1.0, scale] {
@@ -1667,6 +1699,13 @@ mod tests {
                 };
                 check_cosine(kernel.call(&x, x_norm, &y), want, candidate.name(), x.len())?;
             }
+            let y_norm = norm_l2(&y);
+            check_cosine(
+                f64::cosine_with_norms(&x, x_norm, y_norm, &y),
+                cosine_with_norms_scalar(&x, x_norm, y_norm, &y),
+                "with_norms",
+                x.len(),
+            )?;
             Ok(())
         });
     }
