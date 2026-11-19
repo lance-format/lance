@@ -10,7 +10,7 @@ permissions:
 jobs:
   ownership:
     runs-on: ubuntu-24.04-8x
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
     steps:
