@@ -470,21 +470,20 @@ impl<'a> CreateIndexBuilder<'a> {
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
-                let mut params = if let Some(provided_params) =
-                    self.params.as_any().downcast_ref::<ScalarIndexParams>()
+                let mut params = if let Some(params_json) = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .and_then(|provided_params| provided_params.params.as_deref())
                 {
-                    if let Some(params_json) = &provided_params.params {
-                        // Parse and apply the custom parameters
-                        if let Ok(json_value) =
-                            serde_json::from_str::<serde_json::Value>(params_json)
-                        {
-                            base_params.with_params(&json_value)
-                        } else {
-                            base_params
-                        }
-                    } else {
-                        base_params
-                    }
+                    let json_value = serde_json::from_str::<serde_json::Value>(params_json)
+                        .map_err(|e| {
+                            Error::invalid_input(format!(
+                                "Invalid JSON params for {} index: {e}",
+                                self.index_type
+                            ))
+                        })?;
+                    base_params.with_params(&json_value)
                 } else {
                     base_params
                 };
@@ -1070,8 +1069,15 @@ fn index_matches_type(
     if index_type == IndexType::Scalar
         && let Some(scalar_params) = params.as_any().downcast_ref::<ScalarIndexParams>()
     {
-        return scalar_params.index_type.to_lowercase()
-            == plugin_name_from_details_url(&d.type_url);
+        // "fts" is accepted as an alias of "inverted", the plugin name derived
+        // from the committed index's details type.
+        let requested = scalar_params.index_type.to_lowercase();
+        let requested = if requested == "fts" {
+            "inverted".to_string()
+        } else {
+            requested
+        };
+        return requested == plugin_name_from_details_url(&d.type_url);
     }
 
     index_type.matches_details(d)
@@ -1274,6 +1280,30 @@ mod tests {
         assert_eq!(resolved["remove_stop_words"], expected_word_filters);
     }
 
+    /// The Java binding passes the params string through unchanged, so a typo
+    /// there must fail the build instead of training with default parameters.
+    #[tokio::test]
+    async fn test_malformed_scalar_params_json_is_rejected() {
+        let mut dataset = gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams {
+            index_type: "bloomfilter".to_string(),
+            // Truncated JSON: parses as no valid JSON value.
+            params: Some(r#"{"fpp": 0.00"#.to_string()),
+        };
+        let err = dataset
+            .create_index(&["i"], IndexType::BloomFilter, None, &params, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("EOF while parsing"), "{err}");
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+    }
+
     #[test]
     fn test_default_index_name() {
         // Single field - preserved as-is
@@ -1442,6 +1472,51 @@ mod tests {
                 .contains("already exists, please specify a different name or use replace=True"),
             "{err2}"
         );
+    }
+
+    /// An "fts" build on a column that already has an inverted index must find
+    /// that index instead of committing a second one as "<column>_idx_2".
+    #[rstest]
+    #[case::fts_after_fts("fts", "fts")]
+    #[case::fts_after_inverted("inverted", "fts")]
+    #[tokio::test]
+    async fn test_fts_alias_repeated_build_collides_with_existing_inverted_index(
+        #[case] first: &str,
+        #[case] second: &str,
+    ) {
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(batches, "memory://", None).await.unwrap();
+
+        let params = ScalarIndexParams::new(first.to_string());
+        CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Scalar, &params)
+            .execute()
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::new(second.to_string());
+        let err = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Scalar, &params)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Index { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("already exists, please specify a different name or use replace=True"),
+            "{err}"
+        );
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+
+        CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Scalar, &params)
+            .replace(true)
+            .execute()
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "text_idx");
     }
 
     /// The same guard shape, duplicated in `execute_multi_segment_fmindex`
