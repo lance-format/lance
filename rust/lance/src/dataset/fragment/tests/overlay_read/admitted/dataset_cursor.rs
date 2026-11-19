@@ -13,6 +13,7 @@ use lance_encoding::{
 
 mod cancellation;
 mod dictionary;
+mod fragment_hint;
 mod prefetch;
 mod waiting;
 
@@ -370,8 +371,33 @@ async fn dataset_cursor_carries_prefix_hint_and_resets_for_replanning() {
     };
     assert_eq!(rows, accepted..accepted * 2);
     drop(batch);
+    let Outcome::Batch { rows, batch, .. } = scan.try_next().await.unwrap() else {
+        panic!("the fragment tail fits");
+    };
+    assert_eq!(rows, accepted * 2..7);
+    drop(batch);
+    // Preserve the successful hint even if the next fragment is opened by a
+    // cancelled admission wait. Repeating the workspace setting is not a reset.
+    let position = scan.position();
+    let held = budget.try_reserve(512).unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            scan.next_when_available(),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(scan.position(), position);
+    drop(held);
+    scan.set_workspace_bytes(64).unwrap();
+    let Outcome::Batch { rows, batch, .. } = scan.try_next().await.unwrap() else {
+        panic!("the next fragment reuses its bounded prefix");
+    };
+    assert_eq!(rows, 0..accepted);
+    drop(batch);
     scan.set_workspace_bytes(512).unwrap();
-    let mut delivered = accepted * 2;
+    let mut delivered = 7 + accepted;
     while let Outcome::Batch {
         fragment_id,
         rows,
@@ -380,9 +406,9 @@ async fn dataset_cursor_carries_prefix_hint_and_resets_for_replanning() {
     {
         assert_eq!(
             rows.end, 7,
-            "replanned or new fragment uses its full ceiling"
+            "replanned ceiling carries into later fragments"
         );
-        if fragment_id != 0 {
+        if fragment_id == 2 {
             assert_eq!(rows.start, 0);
         }
         assert_eq!(batch.num_rows() as u64, rows.end - rows.start);
@@ -538,7 +564,11 @@ async fn dataset_cursor_recovers_from_repeated_growth_refusals(
             recovered_before_boundary = true;
         }
         if delivered == 1024 {
-            assert_eq!(batch.num_rows(), 16, "new fragment resets the hint");
+            assert_eq!(
+                batch.num_rows(),
+                16,
+                "successful growth carries into the next fragment"
+            );
         }
         delivered += batch.num_rows();
         drop(batch);

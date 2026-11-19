@@ -45,7 +45,6 @@ pub enum AdmittedDatasetScanOutcome {
 struct ActiveFragment {
     reader: FragmentReader,
     end: u64,
-    row_limit: RowLimit,
 }
 
 /// Whether a caller can suspend while no attempted payload is held.
@@ -130,6 +129,7 @@ pub struct AdmittedDatasetScan {
     fragment_index: usize,
     row_offset: u64,
     active: Option<ActiveFragment>,
+    row_limit: RowLimit,
     max_rows: u32,
     workspace_bytes: usize,
     budget: Arc<AllocationBudget>,
@@ -143,11 +143,11 @@ impl Dataset {
     /// future-fragment read-ahead or whole-dataset selection. The per-batch row
     /// ceiling and workspace do not cap cumulative output. Decoder support and
     /// exclusions are those of [`FragmentReader::try_take_admitted_fullzip`].
-    /// Within each fragment, reuse successful prefix sizes and periodically probe
-    /// growth. Repeated failed growth probes back off, up to 64 accepted batches;
-    /// successful growth restores the initial interval. A new fragment or changed
-    /// workspace resets this hint. Every attempt still needs full admission and
-    /// complete decoding.
+    /// Reuse successful prefix sizes and growth backoff across fragment boundaries.
+    /// Repeated failed growth probes back off, up to 64 accepted batches; successful
+    /// growth restores the initial interval so narrower fragments can recover.
+    /// Changing the workspace resets this hint. It is not a capacity estimate:
+    /// every attempt still needs full admission and complete decoding.
     ///
     /// Each attempt reserves the same `workspace_bytes` from `budget`, including
     /// selection, dependent input, scratch and output. `NeedsCapacity` is not EOF:
@@ -218,6 +218,7 @@ impl Dataset {
             fragment_index: 0,
             row_offset: 0,
             active: None,
+            row_limit: RowLimit::new(max_rows),
             max_rows,
             workspace_bytes,
             budget,
@@ -285,9 +286,7 @@ impl AdmittedDatasetScan {
             ));
         }
         if self.workspace_bytes != workspace_bytes {
-            if let Some(active) = self.active.as_mut() {
-                active.row_limit = RowLimit::new(self.max_rows);
-            }
+            self.row_limit = RowLimit::new(self.max_rows);
             self.workspace_bytes = workspace_bytes;
         }
         Ok(())
@@ -373,15 +372,11 @@ impl AdmittedDatasetScan {
                 let reader = fragment
                     .open(&self.projection, self.read_config.clone())
                     .await?;
-                self.active = Some(ActiveFragment {
-                    reader,
-                    end,
-                    row_limit: RowLimit::new(self.max_rows),
-                });
+                self.active = Some(ActiveFragment { reader, end });
             }
             let active = self
                 .active
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| Error::internal("admitted dataset scan lost its active fragment"))?;
             let end = active.end;
             let mut scan = active.reader.try_scan_admitted_fullzip(
@@ -390,7 +385,7 @@ impl AdmittedDatasetScan {
                 self.workspace_bytes,
                 self.budget.clone(),
             )?;
-            scan.row_limit = active.row_limit;
+            scan.row_limit = self.row_limit;
             let result = scan.next_admitted(admission).await?;
             let row_limit = scan.row_limit;
             drop(scan);
@@ -399,7 +394,10 @@ impl AdmittedDatasetScan {
             };
             match result {
                 AdmittedFragmentScanOutcome::Batch { rows, batch } => {
-                    active.row_limit = row_limit;
+                    // Commit only with a complete batch. Fragment changes must
+                    // not restart the same failed growth probes; errors and
+                    // cancellation leave this scheduling history unchanged.
+                    self.row_limit = row_limit;
                     self.row_offset = rows.end;
                     if self.row_offset == end {
                         // Commit and release the old reader before the next open.
