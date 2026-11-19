@@ -24,12 +24,20 @@ import org.lance.compaction.CompactionTaskKind;
 import org.lance.compaction.RewriteResult;
 import org.lance.compaction.SourceBudgetMode;
 import org.lance.compaction.TaskData;
+import org.lance.file.LanceFileReader;
 import org.lance.schema.SqlExpressions;
 
+import com.google.protobuf.CodedInputStream;
+import com.google.protobuf.WireFormat;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.ByteArrayInputStream;
@@ -37,6 +45,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -53,6 +64,143 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Add test for distributed compaction. */
 public class CompactionTest {
+  @ParameterizedTest
+  @CsvSource({
+    "false, -1, 1",
+    "false, 0, 8",
+    "false, 1024, 8",
+    "true, -1, 1",
+    "true, 0, 8",
+    "true, 1024, 8"
+  })
+  public void testDataCacheBytes(
+      boolean distributed, long dataCacheBytes, int expectedPages, @TempDir Path tempDir)
+      throws Exception {
+    Path datasetPath = tempDir.resolve("cache");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath.toString());
+      fixture
+          .createDatasetWithWriteParams(
+              new WriteParams.Builder().withDataStorageVersion("2.2").build())
+          .close();
+      WriteParams writeParams = new WriteParams.Builder().withDataStorageVersion("2.2").build();
+      List<FragmentMetadata> fragments =
+          new ArrayList<>(fixture.createNewFragment(1024, writeParams));
+      fragments.addAll(fixture.createNewFragment(1024, writeParams));
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator,
+              datasetPath.toString(),
+              new FragmentOperation.Append(fragments),
+              Optional.of(1L))) {
+        assertEquals(2, dataset.getFragments().size());
+        CompactionOptions.Builder builder =
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(2048)
+                .withBatchSize(256)
+                .withCompactionMode(CompactionMode.REENCODE);
+        // -1 in this test matrix denotes an omitted option.
+        Optional<Long> expectedCacheBytes = Optional.empty();
+        if (dataCacheBytes >= 0) {
+          builder.withDataCacheBytes(dataCacheBytes);
+          expectedCacheBytes = Optional.of(dataCacheBytes);
+        }
+        CompactionOptions options = serializeAndDeserialize(builder.build());
+        assertEquals(expectedCacheBytes, options.getDataCacheBytes());
+        if (distributed) {
+          CompactionPlan plan = Compaction.planCompaction(dataset, options);
+          assertEquals(expectedCacheBytes, plan.getCompactionOptions().getDataCacheBytes());
+          assertEquals(1, plan.getCompactionTasks().size());
+          CompactionTask task = serializeAndDeserialize(plan.getCompactionTasks().get(0));
+          assertEquals(expectedCacheBytes, task.getCompactionOptions().getDataCacheBytes());
+          RewriteResult result = task.execute(dataset);
+          Compaction.commitCompaction(
+              dataset, Collections.singletonList(result), plan.getCompactionOptions());
+          dataset.checkoutLatest();
+        } else {
+          dataset.compact(options);
+        }
+        assertEquals(1, dataset.getFragments().size());
+        String file = dataset.getFragments().get(0).metadata().getFiles().get(0).getPath();
+        Path filePath = datasetPath.resolve("data").resolve(file);
+        // Each 256-row Int32 batch exceeds half of the 1 KiB budget shared by two columns.
+        assertEquals(expectedPages, countFirstColumnPages(filePath));
+        try (LanceFileReader reader = LanceFileReader.open(filePath.toString(), allocator);
+            ArrowReader batches = reader.readAll(null, null, 256)) {
+          assertEquals(fixture.getSchema(), reader.schema());
+          int row = 0;
+          while (batches.loadNextBatch()) {
+            VectorSchemaRoot root = batches.getVectorSchemaRoot();
+            IntVector ids = (IntVector) root.getVector("id");
+            VarCharVector names = (VarCharVector) root.getVector("name");
+            for (int i = 0; i < root.getRowCount(); i++, row++) {
+              assertEquals(row % 1024, ids.get(i));
+              assertEquals("Person " + row % 1024, names.getObject(i).toString());
+            }
+          }
+          assertEquals(2048, row);
+        }
+      }
+    }
+  }
+
+  private static int countFirstColumnPages(Path filePath) throws IOException {
+    // Java has no page metadata API. Read the v2.2 CMO table and ColumnMetadata.pages
+    // (field 2 in protos/file2.proto), using the existing protobuf dependency.
+    byte[] bytes = Files.readAllBytes(filePath);
+    ByteBuffer footer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+    int footerStart = bytes.length - 40;
+    assertEquals(2, footer.getShort(footerStart + 32));
+    assertEquals(2, footer.getShort(footerStart + 34));
+    int offsetsStart = Math.toIntExact(footer.getLong(footerStart + 8));
+    int columnStart = Math.toIntExact(footer.getLong(offsetsStart));
+    int columnLength = Math.toIntExact(footer.getLong(offsetsStart + 8));
+    CodedInputStream metadata = CodedInputStream.newInstance(bytes, columnStart, columnLength);
+    int pages = 0;
+    for (int tag = metadata.readTag(); tag != 0; tag = metadata.readTag()) {
+      if (WireFormat.getTagFieldNumber(tag) == 2
+          && WireFormat.getTagWireType(tag) == WireFormat.WIRETYPE_LENGTH_DELIMITED) {
+        pages++;
+      }
+      assertTrue(metadata.skipField(tag));
+    }
+    return pages;
+  }
+
+  @Test
+  public void testNegativeDataCacheBytes(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("negative").toString());
+      fixture.createEmptyDataset().close();
+      fixture.write(1, 2).close();
+      try (Dataset dataset = fixture.write(2, 2)) {
+        CompactionOptions options = CompactionOptions.builder().withDataCacheBytes(-1).build();
+        assertTrue(
+            assertThrows(IllegalArgumentException.class, () -> dataset.compact(options))
+                .getMessage()
+                .contains("data_cache_bytes"));
+        assertTrue(
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> Compaction.planCompaction(dataset, options))
+                .getMessage()
+                .contains("data_cache_bytes"));
+        CompactionTask planned =
+            Compaction.planCompaction(dataset, CompactionOptions.builder().build())
+                .getCompactionTasks()
+                .get(0);
+        CompactionTask invalid =
+            new CompactionTask(planned.getTaskData(), planned.getReadVersion(), options);
+        assertTrue(
+            assertThrows(IllegalArgumentException.class, () -> invalid.execute(dataset))
+                .getMessage()
+                .contains("data_cache_bytes"));
+      }
+    }
+  }
+
   @ParameterizedTest
   @EnumSource(DataStorageVersion.class)
   public void testBasicCompaction(DataStorageVersion version, @TempDir Path tempDir)
@@ -424,6 +572,7 @@ public class CompactionTest {
     assertEquals(Collections.emptyList(), options.getExcludedFragmentIds());
     assertEquals(Optional.empty(), options.getDataStorageVersion());
     assertEquals(Optional.empty(), options.getSourceBudgetMode());
+    assertEquals(Optional.empty(), options.getDataCacheBytes());
   }
 
   @Test
