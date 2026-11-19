@@ -576,6 +576,13 @@ impl MaybeF32 for Float64Type {}
 const L2_PREPARED_MAX_DIMENSION: usize = 16;
 const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
 
+/// Vector-centroid coordinate pairs one rayon job of a membership pass scores
+/// at least, about 50 µs of work. One job per vector would drown small
+/// centroid tables, such as the 16-centroid nodes of hierarchical training, in
+/// work-stealing overhead: on 96 threads most CPU time went to rayon's
+/// scheduler, and training slowed down as threads were added.
+const MIN_JOB_DISTANCE_TERMS: usize = 1 << 17;
+
 /// Centroid tables up to this size are summed with one partial table per data
 /// chunk ([`sum_members_single_pass`]); larger tables keep the centroid-split
 /// update, whose redundant passes over the data cost less than replicating the
@@ -780,6 +787,9 @@ where
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
         let biases =
             || cluster_sizes.map(|size| size.iter().map(|size| balance_factor * *size as f32));
+        // Large centroid tables keep one vector per job: a vector already
+        // carries enough work there.
+        let min_rows = MIN_JOB_DISTANCE_TERMS.div_ceil(centroids.len().max(1));
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -805,6 +815,7 @@ where
                     Some((centroids, data)) => {
                         let prepared = L2Prepared::new(centroids, dimension);
                         data.par_chunks(dimension)
+                            .with_min_len(min_rows)
                             .map_init(
                                 || vec![0f32; prepared.num_targets()],
                                 |dists, vec| {
@@ -817,6 +828,7 @@ where
                     }
                     None => data
                         .par_chunks(dimension)
+                        .with_min_len(min_rows)
                         .map_init(
                             || vec![0.0; centroids.len() / dimension],
                             |distances, vec| {
@@ -845,6 +857,7 @@ where
                     })
                     .unwrap_or_else(|| {
                         data.par_chunks(dimension)
+                            .with_min_len(min_rows)
                             .map_init(
                                 || vec![0.0; centroids.len() / dimension],
                                 |distances, vec| {
