@@ -21,6 +21,7 @@ fn test_conflicts() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let fragment0 = Fragment::new(0);
     let fragment1 = Fragment::new(1);
@@ -1306,6 +1307,7 @@ fn test_create_index_rebase_prunes_updated_field_coverage(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let mut rebase = TransactionRebase {
         transaction: Transaction::new(
@@ -1389,6 +1391,7 @@ impl CoveringShape {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 }
@@ -1458,6 +1461,7 @@ impl CoveringConflictSite {
                     files: None,
                     clustering_id: None,
                     metadata: Default::default(),
+                    local_fragment_aliases: Default::default(),
                 };
                 if matches!(self, Self::IndexOverCast) {
                     rebase.current_lineage = Some(TaggedLineage::new(&history, None));
@@ -1652,6 +1656,7 @@ fn index_on_fields(fields: Vec<i32>) -> IndexMetadata {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     }
 }
 
@@ -1940,6 +1945,7 @@ async fn test_conflicts_data_replacement() {
                     files: None,
                     clustering_id: None,
                     metadata: Default::default(),
+                    local_fragment_aliases: Default::default(),
                 }],
                 removed_indices: vec![],
             },

@@ -1005,6 +1005,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     // Spares the commit's history check from reading the file back.
     if let Some(Content::External(file)) = &proto.content {
@@ -1509,6 +1510,7 @@ pub async fn frag_reuse_entry_appending(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 
@@ -2266,6 +2268,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 
@@ -2707,6 +2710,7 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
             files: entry.files.clone(),
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         },
         spilled,
     ))
@@ -2912,6 +2916,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 
@@ -3799,6 +3804,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let error = dataset
             .apply_commit(
@@ -4260,6 +4266,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
             .with_detached(true)

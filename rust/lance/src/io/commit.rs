@@ -5329,6 +5329,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 
@@ -5377,6 +5378,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let transaction = Transaction::new(
             42,

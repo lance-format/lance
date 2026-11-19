@@ -48,6 +48,9 @@ class Index:
     metadata: Dict[str, str] = dataclasses.field(default_factory=dict)
     """Generic metadata attached to this segment. Preserved verbatim, including
     keys this library does not understand."""
+    local_fragment_aliases: Dict[int, int] = dataclasses.field(default_factory=dict)
+    """Fragment ids stored in the index files, mapped to the committed ids.
+    Empty when the files already store committed ids."""
 
 
 class IndexInformation(TypedDict):

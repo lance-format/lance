@@ -1203,6 +1203,12 @@ impl Dataset {
         purpose: frag_reuse::OpenPurpose,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
+        if !index_meta.local_fragment_aliases.is_empty() {
+            return Err(Error::not_supported(format!(
+                "Vector segment {} stores provisional fragment ids",
+                index_meta.uuid
+            )));
+        }
         let uuid = &index_meta.uuid;
         let object_store = self.object_store_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;

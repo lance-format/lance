@@ -3067,7 +3067,12 @@ impl Index for BTreeIndex {
         )
         .await?;
         while let Some((_, serialized)) = pages.try_next().await? {
-            let page = FlatIndex::try_new(serialized)?;
+            let page = if let Some(remapper) = self.batch_remapper.as_ref() {
+                let serialized = remap_record_batch_async(remapper.as_ref(), serialized, 1).await?;
+                FlatIndex::try_new(serialized)?
+            } else {
+                Self::decode_page(serialized, self.frag_reuse_index.as_deref())?
+            };
             frag_ids |= page.calculate_included_frags()?;
         }
 

@@ -930,6 +930,11 @@ impl Index for RTreeIndex {
         let mut frag_ids = RoaringBitmap::default();
 
         let mut reader_stream = self.clone().into_data_stream().await?;
+        if let Some(remapper) = self.frag_reuse_index.clone() {
+            reader_stream = remap_rtree_data(reader_stream, remapper);
+        } else if let Some(remapper) = self.batch_remapper.clone() {
+            reader_stream = remap_rtree_data_async(reader_stream, remapper);
+        }
         while let Some(page) = reader_stream.try_next().await? {
             let mut page_frag_ids = page
                 .column(1)
