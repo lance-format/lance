@@ -12,12 +12,14 @@ use lance_arrow::{
 use lance_core::{
     Error, Result,
     datatypes::{
-        Field, NullabilityComparison, OnMissing, OnTypeMismatch, Schema, SchemaCompareOptions,
+        Field, LogicalType, NullabilityComparison, OnMissing, OnTypeMismatch, Schema,
+        SchemaCompareOptions,
     },
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
 
+use super::file::writes_blob_v2;
 use super::{WriteMode, WriteParams};
 use crate::Table;
 use crate::blob::thresholds::{
@@ -102,13 +104,64 @@ pub fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
+pub(super) fn blob_write_comparison_schemas(
+    input: &Schema,
+    existing_schema: &Schema,
+    write_version: ConcreteFileVersion,
+) -> Result<(Schema, Schema)> {
+    fn has_blob_v2_item(field: &Field) -> bool {
+        matches!(
+            field.children.as_slice(),
+            [item] if item.logical_type.is_struct() && item.is_blob_v2()
+        )
+    }
+
+    fn normalize_list_types(input: &mut Field, target: &mut Field) -> Result<()> {
+        let same_list_kind = (input.logical_type.is_list() && target.logical_type.is_list())
+            || (input.logical_type.is_large_list() && target.logical_type.is_large_list());
+        // Blob promotion changes the item type, while the parent list can
+        // retain its original tag. Reconcile tags only when both items are
+        // Blob v2 after promotion and the two lists have the same offset width.
+        if input.logical_type != target.logical_type
+            && same_list_kind
+            && has_blob_v2_item(input)
+            && has_blob_v2_item(target)
+        {
+            let logical_type = LogicalType::try_from(&target.data_type())?;
+            input.logical_type = logical_type.clone();
+            target.logical_type = logical_type;
+        }
+        for input_child in &mut input.children {
+            if let Some(target_child) = target.child_mut(&input_child.name) {
+                normalize_list_types(input_child, target_child)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut input = promote_legacy_blob_schema(input)?;
+    let mut target = promote_legacy_blob_schema(existing_schema)?;
+    if writes_blob_v2(write_version) {
+        for input_field in &mut input.fields {
+            if let Some(target_field) = target
+                .fields
+                .iter_mut()
+                .find(|f| f.name == input_field.name)
+            {
+                normalize_list_types(input_field, target_field)?;
+            }
+        }
+    }
+    Ok((input, target))
+}
+
 use crate::commit::assign_new_table_field_ids;
 
 pub(super) fn prepare_write_schema(
     dataset: Option<&Table>,
     normalized_converted_schema: Schema,
     params: &WriteParams,
-    mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
+    version: ConcreteFileVersion,
     inherited_field_ids: bool,
 ) -> Result<Schema> {
     let schema = if dataset.is_none() {
@@ -118,6 +171,7 @@ pub(super) fn prepare_write_schema(
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
     {
+        let mut schema_compare_options = schema_compare_options(version);
         schema_compare_options.compare_nullability = NullabilityComparison::Ignore;
         schema_compare_options.allow_missing_if_nullable = true;
         schema_compare_options.ignore_field_order = true;
@@ -135,8 +189,8 @@ pub(super) fn prepare_write_schema(
                 OnTypeMismatch::Error,
             );
         }
-        let comparison_schema = promote_legacy_blob_schema(&normalized_converted_schema)?;
-        let dataset_schema = promote_legacy_blob_schema(dataset.schema())?;
+        let (comparison_schema, dataset_schema) =
+            blob_write_comparison_schemas(&normalized_converted_schema, dataset.schema(), version)?;
         comparison_schema.check_compatible(&dataset_schema, &schema_compare_options)?;
         let mut projected = dataset_schema.project_by_schema(
             &comparison_schema,

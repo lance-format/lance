@@ -27,9 +27,8 @@ use super::bases::blob_v2_external_base_resolver;
 use super::dictionary_budget::DictionaryValueBudget;
 use super::file::{GenericWriter, WriterOptions, open_writer};
 use super::schema::{
-    prepare_write_schema, promote_legacy_blob_schema, schema_compare_options,
-    split_row_lineage_fields, validate_blob_v2_write_schema, validate_legacy_blob_write_schema,
-    validate_row_limits,
+    prepare_write_schema, promote_legacy_blob_schema, split_row_lineage_fields,
+    validate_blob_v2_write_schema, validate_legacy_blob_write_schema, validate_row_limits,
 };
 use super::schema_adapter::SchemaAdapter;
 use super::seeds::{SeedCollector, WriteSeedHook};
@@ -673,7 +672,7 @@ pub async fn write_fragments(
         dataset,
         normalized_schema,
         &params,
-        schema_compare_options(version),
+        version,
         inherited_field_ids,
     )?;
     schema.fields.extend(lineage_fields);
