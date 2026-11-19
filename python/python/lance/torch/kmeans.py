@@ -273,7 +273,7 @@ class KMeans:
             )
             raise StopIteration("kmeans: converged")
 
-        if abs(total_dist - last_dist) / total_dist < self.tolerance:
+        if abs(total_dist - last_dist) / abs(total_dist) < self.tolerance:
             raise StopIteration("kmeans: converged")
 
         # cast to the type we get the data in
