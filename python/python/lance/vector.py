@@ -184,8 +184,9 @@ def train_pq_codebook_on_accelerator(
             # For cosine the residuals are computed from normalized vectors, and
             # the index treats the PQ codebook as an L2 codebook over them.
             # Training it with cosine would normalize the codewords and drop
-            # the residual norms.
-            metric="l2" if metric_type == "cosine" else metric_type,
+            # the residual norms. For dot the index trains an L2 codebook over
+            # the raw vectors (no residuals), so train L2 here as well.
+            metric="l2" if metric_type in ("cosine", "dot") else metric_type,
             device=accelerator,
             centroids=init_centroids_slice,
         )
@@ -548,7 +549,9 @@ def compute_partitions(
                     if kmeans.metric == "cosine":
                         # Match the index build: normalize before the residual.
                         residual_vecs = torch.nn.functional.normalize(residual_vecs)
-                    residual_vecs = residual_vecs - kmeans.centroids[partitions]
+                    if kmeans.metric != "dot":
+                        # The index only uses residuals for l2 and cosine.
+                        residual_vecs = residual_vecs - kmeans.centroids[partitions]
                     for i in range(num_sub_vectors):
                         subvector_tensor = residual_vecs[
                             :, i * subvector_size : (i + 1) * subvector_size
@@ -725,7 +728,11 @@ def one_pass_assign_ivf_pq_on_accelerator(
                     # Match the index build: normalize before the residual.
                     vecs = torch.nn.functional.normalize(vecs)
 
-                residual_vecs = vecs - ivf_kmeans.centroids[partitions]
+                if ivf_kmeans.metric == "dot":
+                    # The index only uses residuals for l2 and cosine.
+                    residual_vecs = vecs
+                else:
+                    residual_vecs = vecs - ivf_kmeans.centroids[partitions]
                 # cast centroids to the same dtype as vecs
                 if first_iter:
                     first_iter = False
