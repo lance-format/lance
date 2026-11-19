@@ -11,17 +11,20 @@
 //! A short final fragment or unsuitable page size can fail this check; that
 //! fixture is not qualified and is not overwritten on a retry. Both workloads
 //! use the same run/run-many commands; fixture validation is outside measured reads.
-//! `run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US`
+//! `run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US [ATTEMPT_BYTES]`
 //! drains it without collecting batches. MODE is `ordinary`, `admitted`, or
-//! `prefetched`. The last mode uses half of WORKSPACE_BYTES per attempt and a
-//! single queued batch; the original total payload pool and I/O budget remain
+//! `prefetched`. By default, the last mode uses half of WORKSPACE_BYTES per
+//! attempt and a single queued batch; the original payload pool and I/O budget remain
 //! unchanged. A smaller workspace may refuse a row that fits the sequential
 //! mode. This is an explicit overlap experiment, not an automatic fallback.
-//! `run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES`
+//! `run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES [ATTEMPT_BYTES]`
 //! runs finite independent complete drains against one immutable snapshot. Admitted
 //! requests share one payload pool, while each mode keeps the same per-request I/O
 //! budget. The configured I/O budget therefore scales with REQUESTS; the payload
 //! pool is not an RSS or total transport-memory bound. Each request owns one sink.
+//! Optional positive ATTEMPT_BYTES overrides the admitted/prefetched attempt only,
+//! leaving I/O and shared pool budgets unchanged. Omit it to retain the original
+//! mode defaults; ordinary mode rejects it because it has no payload admission.
 //! Per-request first-batch and completion times share the group start (including
 //! dataset open and admission delay). Credit samples include other active requests
 //! and workspace headroom, not just that batch and not an allocation peak trace.
@@ -70,6 +73,8 @@ use serde::Serialize;
 mod dictionary;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+const USAGE: &str = "usage: prepare|prepare-dictionary URI ROWS FRAME_BYTES FRAGMENT_ROWS | run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US [ATTEMPT_BYTES] | run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES [ATTEMPT_BYTES]";
 
 #[derive(Clone, Copy, Debug)]
 enum Fixture {
@@ -321,9 +326,61 @@ struct DrainConfig {
     mode: Mode,
     batch_rows: u32,
     workspace: usize,
+    // None retains the mode default; Some changes payload admission, never I/O.
+    attempt_workspace: Option<usize>,
     slow: Duration,
     requests: usize,
     pool_bytes: usize,
+}
+
+impl DrainConfig {
+    fn from_run_args(args: &[String]) -> Result<Self> {
+        let required = match args.first().map(String::as_str) {
+            Some("run") => 8,
+            Some("run-many") => 10,
+            _ => return Err(USAGE.into()),
+        };
+        if args.len() != required && args.len() != required + 1 {
+            return Err(USAGE.into());
+        }
+        let mode = match args[1].as_str() {
+            "ordinary" => Mode::Ordinary,
+            "admitted" => Mode::Admitted,
+            "prefetched" => Mode::Prefetched,
+            _ => return Err("mode must be ordinary, admitted or prefetched".into()),
+        };
+        let workspace = args[6].parse()?;
+        let config = Self {
+            mode,
+            workspace,
+            attempt_workspace: args.get(required).map(|value| value.parse()).transpose()?,
+            batch_rows: args[5].parse()?,
+            slow: Duration::from_micros(args[7].parse()?),
+            requests: if required == 10 { args[8].parse()? } else { 1 },
+            pool_bytes: if required == 10 {
+                args[9].parse()?
+            } else {
+                workspace
+            },
+        };
+        // Reject invalid experiment controls before opening the dataset.
+        config.attempt_bytes()?;
+        Ok(config)
+    }
+
+    fn attempt_bytes(&self) -> Result<usize> {
+        if matches!(self.mode, Mode::Ordinary) && self.attempt_workspace.is_some() {
+            return Err("ATTEMPT_BYTES requires admitted or prefetched mode".into());
+        }
+        let bytes = self.attempt_workspace.unwrap_or(match self.mode {
+            Mode::Prefetched => self.workspace / 2,
+            Mode::Ordinary | Mode::Admitted => self.workspace,
+        });
+        if bytes == 0 {
+            return Err("attempt workspace bytes must be positive".into());
+        }
+        Ok(bytes)
+    }
 }
 
 async fn drain(
@@ -342,6 +399,7 @@ async fn drain(
     if batch_rows == 0 || workspace == 0 {
         return Err("batch rows and workspace must be positive".into());
     }
+    let attempt_bytes = config.attempt_bytes()?;
     let mut sink = Sink::new(started);
     match mode {
         Mode::Ordinary => {
@@ -374,11 +432,7 @@ async fn drain(
                 dataset.schema().clone(),
                 read_config,
                 batch_rows,
-                if matches!(mode, Mode::Prefetched) {
-                    workspace / 2
-                } else {
-                    workspace
-                },
+                attempt_bytes,
                 budget.clone(),
             )?;
             if matches!(mode, Mode::Prefetched) {
@@ -415,7 +469,7 @@ async fn drain(
                     }
                     AdmittedDatasetScanOutcome::NeedsCapacity => {
                         return Err(format!(
-                            "incomplete at {:?}: a minimal attempt did not fit {workspace} bytes",
+                            "incomplete at {:?}: a minimal attempt did not fit {attempt_bytes} bytes",
                             scan.position()
                         )
                         .into());
@@ -484,40 +538,60 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("prepare" | "prepare-dictionary") if args.len() == 5 => {
-            let fixture = if args[0] == "prepare-dictionary" { Fixture::Dictionary } else { Fixture::FullZip };
-            let output = prepare(fixture, &args[1], args[2].parse()?, args[3].parse()?, args[4].parse()?).await?;
+            let fixture = if args[0] == "prepare-dictionary" {
+                Fixture::Dictionary
+            } else {
+                Fixture::FullZip
+            };
+            let output = prepare(
+                fixture,
+                &args[1],
+                args[2].parse()?,
+                args[3].parse()?,
+                args[4].parse()?,
+            )
+            .await?;
             serde_json::json!({"preparation":args[0],"fixture":args[1],"rows":output.rows,"frame_bytes":args[3],"fragment_rows":args[4],"expected":output})
         }
-        Some("run" | "run-many") if (args[0] == "run" && args.len() == 8) || (args[0] == "run-many" && args.len() == 10) => {
+        Some("run" | "run-many") => {
             let source_head = option_env!("T210_SOURCE_HEAD")
                 .filter(|value| value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()))
-                .ok_or("benchmark build requires T210_SOURCE_HEAD with the verified full source SHA")?;
-            let mode = match args[1].as_str() { "ordinary" => Mode::Ordinary, "admitted" => Mode::Admitted, "prefetched" => Mode::Prefetched, _ => return Err("mode must be ordinary, admitted or prefetched".into()) };
-            let workspace = args[6].parse()?;
-            let config = DrainConfig {
-                mode, workspace, batch_rows: args[5].parse()?, slow: Duration::from_micros(args[7].parse()?),
-                requests: if args[0] == "run-many" { args[8].parse()? } else { 1 },
-                pool_bytes: if args[0] == "run-many" { args[9].parse()? } else { workspace },
-            };
-            let io_total = workspace.checked_mul(config.requests).ok_or("configured I/O budgets overflow")?;
+                .ok_or(
+                    "benchmark build requires T210_SOURCE_HEAD with the verified full source SHA",
+                )?;
+            let config = DrainConfig::from_run_args(&args)?;
+            let workspace = config.workspace;
+            let io_total = workspace
+                .checked_mul(config.requests)
+                .ok_or("configured I/O budgets overflow")?;
             let budget = AllocationBudget::new(config.pool_bytes);
             let started = Instant::now();
             let dataset = Dataset::open(&args[2]).await?;
-            let mut outputs = drain_all(&dataset, &config, &budget, args[3].parse()?, &args[4], Some(started)).await?;
+            let mut outputs = drain_all(
+                &dataset,
+                &config,
+                &budget,
+                args[3].parse()?,
+                &args[4],
+                Some(started),
+            )
+            .await?;
             let mut result = serde_json::json!({"mode":args[1],"uri":args[2],"source_head":source_head,
                 "batch_rows":args[5],"workspace_bytes":workspace,"slow_us":args[7],
-                "attempt_workspace_bytes":if matches!(mode, Mode::Prefetched) { workspace / 2 } else { workspace },
+                "attempt_workspace_bytes":config.attempt_bytes()?,
+                "attempt_workspace_override_bytes":config.attempt_workspace,
                 "requests":config.requests,"shared_payload_budget_bytes":config.pool_bytes,
                 "io_budget_per_request_bytes":workspace,"io_budget_configured_sum_bytes":io_total,
                 "elapsed_seconds":started.elapsed().as_secs_f64(),"peak_rss_kib":peak_rss_kib()});
             if args[0] == "run" {
-                result["output"] = serde_json::to_value(outputs.pop().ok_or("missing complete drain result")?)?;
+                result["output"] =
+                    serde_json::to_value(outputs.pop().ok_or("missing complete drain result")?)?;
             } else {
                 result["outputs"] = serde_json::to_value(outputs)?;
             }
             result
         }
-        _ => return Err("usage: prepare|prepare-dictionary URI ROWS FRAME_BYTES FRAGMENT_ROWS | run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US | run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES".into()),
+        _ => return Err(USAGE.into()),
     };
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &result)?;
@@ -530,6 +604,120 @@ mod tests {
     use super::*;
     use arrow_array::LargeBinaryArray;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::ordinary("ordinary", 32768)]
+    #[case::admitted("admitted", 32768)]
+    #[case::prefetched("prefetched", 16384)]
+    fn original_commands_keep_their_budget_defaults(
+        #[case] mode: &str,
+        #[case] expected_attempt: usize,
+        #[values("run", "run-many")] command: &str,
+    ) {
+        let mut args = [command, mode, "unused", "17", "digest", "3", "32768", "0"]
+            .map(String::from)
+            .to_vec();
+        if command == "run-many" {
+            args.extend(["2".into(), "65536".into()]);
+        }
+        let config = DrainConfig::from_run_args(&args).unwrap();
+        assert_eq!(config.workspace, 32768);
+        assert_eq!(config.attempt_workspace, None);
+        assert_eq!(config.attempt_bytes().unwrap(), expected_attempt);
+        assert_eq!(config.requests, if command == "run-many" { 2 } else { 1 });
+        assert_eq!(config.pool_bytes, config.requests * 32768);
+    }
+
+    #[rstest]
+    #[case::zero("admitted", &["0"], "must be positive")]
+    #[case::ordinary("ordinary", &["16384"], "requires admitted or prefetched")]
+    #[case::negative("prefetched", &["-1"], "invalid digit")]
+    #[case::extra("admitted", &["16384", "16384"], "usage:")]
+    fn invalid_attempt_controls_fail_during_argument_parsing(
+        #[case] mode: &str,
+        #[case] extra: &[&str],
+        #[case] message: &str,
+        #[values("run", "run-many")] command: &str,
+    ) {
+        let mut args = [command, mode, "unused", "17", "digest", "3", "32768", "0"]
+            .map(String::from)
+            .to_vec();
+        if command == "run-many" {
+            args.extend(["2".into(), "65536".into()]);
+        }
+        args.extend(extra.iter().map(|value| (*value).to_string()));
+        let error = DrainConfig::from_run_args(&args).err().unwrap();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn explicit_attempt_keeps_io_and_pool_fixed_for_complete_drains(
+        #[values("admitted", "prefetched")] mode: &str,
+        #[values(16384, 32768)] attempt: usize,
+        #[values("run", "run-many")] command: &str,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
+        let expected = prepare(Fixture::FullZip, &uri, 25, 1024, 7).await.unwrap();
+        let mut args = [command, mode, &uri, "25", &expected.hash, "3", "32768", "0"]
+            .map(String::from)
+            .to_vec();
+        if command == "run-many" {
+            args.extend(["2".into(), "65536".into()]);
+        }
+        args.push(attempt.to_string());
+        let config = DrainConfig::from_run_args(&args).unwrap();
+        assert_eq!(config.workspace, 32768);
+        assert_eq!(
+            config.pool_bytes,
+            if command == "run-many" { 65536 } else { 32768 }
+        );
+        assert_eq!(config.attempt_bytes().unwrap(), attempt);
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let budget = AllocationBudget::new(config.pool_bytes);
+        let outputs = tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_all(
+                &dataset,
+                &config,
+                &budget,
+                expected.rows,
+                &expected.hash,
+                None,
+            ),
+        )
+        .await
+        .expect("finite equal-attempt drains must complete with one CPU worker")
+        .unwrap();
+        assert_eq!(outputs.len(), config.requests);
+        for output in outputs {
+            assert_eq!(output.payload_bytes, expected.payload_bytes);
+            assert_eq!(output.hash, expected.hash);
+            assert!(output.shared_reserved_bytes_on_batch_max <= config.pool_bytes);
+        }
+        assert_eq!(budget.reserved(), 0);
+
+        if mode == "admitted" {
+            // Enough I/O/pool credit must not silently replace the explicit attempt.
+            let config = DrainConfig {
+                attempt_workspace: Some(1),
+                ..config
+            };
+            let error = drain_all(
+                &dataset,
+                &config,
+                &budget,
+                expected.rows,
+                &expected.hash,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("did not fit 1 bytes"), "{error}");
+            assert_eq!(budget.reserved(), 0);
+        }
+    }
 
     #[rstest]
     #[case::short(55, 67, 7, 3)]
@@ -552,6 +740,7 @@ mod tests {
                 mode,
                 batch_rows,
                 workspace: 1024 * 1024,
+                attempt_workspace: None,
                 slow: Duration::ZERO,
                 requests: 1,
                 pool_bytes: 1024 * 1024,
@@ -585,6 +774,7 @@ mod tests {
             mode: Mode::Admitted,
             batch_rows: 3,
             workspace: 1,
+            attempt_workspace: None,
             slow: Duration::ZERO,
             requests: 2,
             pool_bytes: 1,
@@ -598,6 +788,7 @@ mod tests {
         let config = DrainConfig {
             mode: Mode::Ordinary,
             workspace: 65536,
+            attempt_workspace: None,
             pool_bytes: 65536,
             ..config
         };
@@ -682,6 +873,7 @@ mod tests {
                 mode,
                 batch_rows: 3,
                 workspace: 65536,
+                attempt_workspace: None,
                 slow: Duration::ZERO,
                 requests,
                 pool_bytes: workspace_slots * 65536,
@@ -725,6 +917,7 @@ mod tests {
             mode: Mode::Admitted,
             batch_rows: 2,
             workspace: 65536,
+            attempt_workspace: None,
             slow: Duration::ZERO,
             requests: 3,
             pool_bytes: 65536,
@@ -795,6 +988,7 @@ mod tests {
             mode: Mode::Admitted,
             batch_rows: 2,
             workspace,
+            attempt_workspace: None,
             slow: Duration::ZERO,
             requests,
             pool_bytes,
