@@ -69,6 +69,16 @@ def test_torch_kmeans_nans(tmp_path: Path):
             assert part_ids[idx] != -1
 
 
+def test_kmeans_transform_sliced_fixed_size_list():
+    data = np.arange(80, dtype=np.float32).reshape(10, 8)
+    fsl = pa.FixedSizeListArray.from_arrays(pa.array(data.reshape(-1)), 8)
+    kmeans = KMeans(3, centroids=torch.from_numpy(data[[0, 4, 8]]), device="cpu")
+
+    expected = kmeans.transform(torch.from_numpy(data[4:7]))
+    assert len(expected) == 3
+    assert torch.equal(kmeans.transform(fsl.slice(4, 3)), expected)
+
+
 def test_kmeans_random_init_is_seeded():
     data = torch.arange(64 * 4, dtype=torch.float32).reshape(64, 4)
 
