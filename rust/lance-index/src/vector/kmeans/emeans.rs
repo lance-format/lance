@@ -38,8 +38,8 @@ use rand::prelude::*;
 use rand::seq::index::sample;
 use rayon::prelude::*;
 
-use super::KMeans;
 use super::profile::{self, Phase, Work};
+use super::{KMeans, job_min_len};
 use assign::{Assignment, NearestCentroid};
 
 pub(super) mod assign;
@@ -62,6 +62,9 @@ const LARGE_DATASET_ROWS: usize = 2_000_000;
 /// about 20 µs of work, so per-task scheduling overhead stays negligible even
 /// for the 16-centroid nodes of hierarchical training.
 const MIN_TASK_DISTANCE_TERMS: usize = 1 << 16;
+/// Cap on the rows a task takes to fill a whole GEMM tile; see
+/// [`rows_per_task`].
+const MAX_TILE_TASK_ROWS: usize = 32;
 /// Upper bound on the parallel tasks one batch is split into, per pass.
 const MAX_BATCH_TASKS: usize = 64;
 /// Minimum vector components a parallel summation task adds, about 5 µs of
@@ -381,10 +384,16 @@ impl BatchStats {
 /// Rows of a batch per parallel assignment task: enough that a task scores at
 /// least `MIN_TASK_DISTANCE_TERMS` vector-centroid coordinate pairs, so the
 /// scheduling cost of a task stays small next to its work, and few enough that
-/// a batch yields at most `MAX_BATCH_TASKS` tasks.
-fn rows_per_task(batch_len: usize, k: usize, dimension: usize) -> usize {
+/// a batch yields at most `MAX_BATCH_TASKS` tasks. A task also fills one
+/// assignment tile of `tile_rows` rows, up to `MAX_TILE_TASK_ROWS`: at high
+/// dimension the work bound alone leaves a few rows per task, which run the
+/// GEMM micro-kernel mostly empty.
+fn rows_per_task(batch_len: usize, k: usize, dimension: usize, tile_rows: usize) -> usize {
     let min_rows = MIN_TASK_DISTANCE_TERMS.div_ceil(k * dimension);
-    min_rows.max(batch_len.div_ceil(MAX_BATCH_TASKS)).max(1)
+    min_rows
+        .max(batch_len.div_ceil(MAX_BATCH_TASKS))
+        .max(tile_rows.min(MAX_TILE_TASK_ROWS))
+        .max(1)
 }
 
 /// Clusters whose sums one parallel summation task owns: enough that a task
@@ -418,7 +427,13 @@ fn assign_batch<N: NearestCentroid>(
     let prepared = N::prepare_centroids(centroids, dimension);
     drop(prepare_busy);
     let assignments: Vec<Assignment> = batch
-        .par_chunks(rows_per_task(batch.len(), k, dimension))
+        .par_chunks(rows_per_task(
+            batch.len(),
+            k,
+            dimension,
+            N::tile_rows(k, dimension),
+        ))
+        .with_min_len(job_min_len(1))
         .flat_map_iter(|rows| {
             let _busy = profile::work(Work::Assign);
             let mut assignments = Vec::with_capacity(rows.len());
@@ -446,6 +461,7 @@ fn assign_batch<N: NearestCentroid>(
         .sums
         .par_chunks_mut(clusters_per_task * dimension)
         .enumerate()
+        .with_min_len(job_min_len(1))
         .for_each(|(task, sums)| {
             let _busy = profile::work(Work::Update);
             let first_cluster = task * clusters_per_task;
@@ -692,6 +708,22 @@ mod tests {
             FixedSizeListArray::try_new_from_values(Int32Array::from(vec![1; 64]), 4).unwrap();
         let err = train_emeans(&data, 2, &EMeansParams::default()).unwrap_err();
         assert!(err.to_string().contains("Int32"), "{err}");
+    }
+
+    /// A 16-centroid node's batch of 256 rows: at dimension 1,024 a task takes
+    /// a whole 15-row GEMM tile rather than the 4 rows its work bound allows;
+    /// lower dimensions keep their larger, work-bound tasks.
+    #[rstest]
+    #[case::one_tile(1024, 15, 15)]
+    #[case::tile_capped(256, 111, 32)]
+    #[case::work_bound(64, 495, 64)]
+    #[case::pairwise_types(1024, 1, 4)]
+    fn test_rows_per_task_fills_a_tile(
+        #[case] dimension: usize,
+        #[case] tile_rows: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(rows_per_task(256, 16, dimension, tile_rows), expected);
     }
 
     #[test]

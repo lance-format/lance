@@ -20,6 +20,9 @@ use num_traits::Float;
 /// Products issued from many rayon tasks at once would queue on that small
 /// pool, so every tile stays below the threshold and runs on its caller.
 const GEMM_TILE_MAX_ELEMENTS: usize = (1 << 15) - 1;
+/// Vectors a tile keeps at least when all centroids share one block: one
+/// 8-row panel of the GEMM micro-kernel.
+const MIN_TILE_ROWS: usize = 8;
 
 /// The nearest centroid of a vector and the squared L2 distance to it, or
 /// `None` when every distance is NaN.
@@ -33,6 +36,12 @@ pub(in crate::vector::kmeans) trait NearestCentroid:
     /// the same centroids. Empty unless an implementation needs it.
     fn prepare_centroids(_centroids: &[Self], _dimension: usize) -> Vec<f32> {
         Vec::new()
+    }
+
+    /// Vectors [`Self::assign_rows`] scores together against `k` centroids;
+    /// fewer rows per call leave its kernels partly idle.
+    fn tile_rows(_k: usize, _dimension: usize) -> usize {
+        1
     }
 
     /// Appends to `assignments` the [`Assignment`] of every row id of `rows`
@@ -60,6 +69,10 @@ impl NearestCentroid for f32 {
             .chunks_exact(dimension)
             .map(|centroid| dot(centroid, centroid))
             .collect()
+    }
+
+    fn tile_rows(k: usize, dimension: usize) -> usize {
+        GemmTiles::new(usize::MAX, k, dimension).map_or(1, |tiles| tiles.rows)
     }
 
     fn assign_rows(
@@ -115,7 +128,14 @@ impl GemmTiles {
         if vectors_per_tile < 2 || num_rows == 0 {
             return None;
         }
-        let centroids = k.min(vectors_per_tile / 2).max(1);
+        // A small table, such as a 16-centroid node of hierarchical training,
+        // stays in one block: split, its last block would be a GEMM of a few
+        // centroids that costs the packing of a full one.
+        let centroids = if k + MIN_TILE_ROWS <= vectors_per_tile {
+            k
+        } else {
+            k.min(vectors_per_tile / 2).max(1)
+        };
         let rows = (vectors_per_tile - centroids).min(num_rows);
         Some(Self { rows, centroids })
     }
@@ -271,5 +291,9 @@ mod tests {
             assert!(tiles.centroids >= 1 && tiles.centroids <= k);
         }
         assert!(GemmTiles::new(10, 4, 1 << 15).is_none());
+        // A hierarchy node keeps its 16 centroids in one block even at
+        // dimension 1,024, where a tile holds 31 vectors in all.
+        let tiles = GemmTiles::new(4096, 16, 1024).unwrap();
+        assert_eq!((tiles.rows, tiles.centroids), (15, 16));
     }
 }

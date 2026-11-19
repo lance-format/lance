@@ -11,6 +11,7 @@
 //!
 
 use core::f32;
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
@@ -576,6 +577,38 @@ impl MaybeF32 for Float64Type {}
 const L2_PREPARED_MAX_DIMENSION: usize = 16;
 const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
 
+thread_local! {
+    /// Set while this thread trains one node of the hierarchy by itself; see
+    /// [`train_on_this_thread`].
+    static TRAINS_ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The `with_min_len` of a k-means rayon loop that would otherwise use `min`:
+/// `usize::MAX` while [`train_on_this_thread`] runs, so the loop is a single
+/// job that runs inline.
+fn job_min_len(min: usize) -> usize {
+    if TRAINS_ON_THIS_THREAD.get() {
+        usize::MAX
+    } else {
+        min
+    }
+}
+
+/// Runs `train` with every k-means rayon loop on this thread as one inline
+/// job: no fork, no join, no work stealing. Hierarchical training uses it once
+/// sibling nodes alone outnumber the threads, where splitting a node's small
+/// loops across threads only spends time in rayon's scheduler. Results are the
+/// same either way: chunk boundaries, and with them summation order, do not
+/// depend on how chunks are grouped into jobs.
+fn train_on_this_thread<R>(train: impl FnOnce() -> R) -> R {
+    // Restore rather than clear: a loop outside this module may still split
+    // and join, and the job this thread steals meanwhile sets its own state.
+    let previous = TRAINS_ON_THIS_THREAD.replace(true);
+    let result = train();
+    TRAINS_ON_THIS_THREAD.set(previous);
+    result
+}
+
 /// Vector-centroid coordinate pairs one rayon job of a membership pass scores
 /// at least, about 50 µs of work. One job per vector would drown small
 /// centroid tables, such as the 16-centroid nodes of hierarchical training, in
@@ -606,6 +639,7 @@ fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
     let partial_sums = data
         .par_chunks(rows_per_chunk * dimension)
         .zip(membership.par_chunks(rows_per_chunk))
+        .with_min_len(job_min_len(1))
         .map(|(vectors, members)| {
             let _busy = profile::work(Work::Update);
             let mut sums = vec![N::zero(); k * dimension];
@@ -729,6 +763,7 @@ fn dot_membership_amx_f16(
 
     Some(
         data.par_chunks(block_rows * dimension)
+            .with_min_len(job_min_len(1))
             .map_init(
                 || (vec![0f32; block_rows * n_padded], vec![0f32; k]),
                 |(scores, distances), block| {
@@ -815,7 +850,7 @@ where
                     Some((centroids, data)) => {
                         let prepared = L2Prepared::new(centroids, dimension);
                         data.par_chunks(dimension)
-                            .with_min_len(min_rows)
+                            .with_min_len(job_min_len(min_rows))
                             .map_init(
                                 || vec![0f32; prepared.num_targets()],
                                 |dists, vec| {
@@ -828,7 +863,7 @@ where
                     }
                     None => data
                         .par_chunks(dimension)
-                        .with_min_len(min_rows)
+                        .with_min_len(job_min_len(min_rows))
                         .map_init(
                             || vec![0.0; centroids.len() / dimension],
                             |distances, vec| {
@@ -857,7 +892,7 @@ where
                     })
                     .unwrap_or_else(|| {
                         data.par_chunks(dimension)
-                            .with_min_len(min_rows)
+                            .with_min_len(job_min_len(min_rows))
                             .map_init(
                                 || vec![0.0; centroids.len() / dimension],
                                 |distances, vec| {
@@ -926,6 +961,7 @@ where
         centroids
             .par_chunks_mut(dimension)
             .zip(cluster_sizes.par_iter())
+            .with_min_len(job_min_len(1))
             .for_each(|(centroid, &cnt)| {
                 let _busy = profile::work(Work::Update);
                 if cnt > 0 {
@@ -1657,9 +1693,9 @@ impl KMeans {
             Self::create_array_from_indices::<T>(training_indices, data_values, dimension)?;
         drop(sample_phase);
         let train_phase = profile::phase(Phase::NodeTrain);
-        let kmeans = match &params.hierarchical_node_algorithm {
+        let train = || match &params.hierarchical_node_algorithm {
             HierarchicalNodeAlgorithm::Lloyd => {
-                Self::train_kmeans::<T, Algo>(&training, k, &node_params)?
+                Self::train_kmeans::<T, Algo>(&training, k, &node_params)
             }
             HierarchicalNodeAlgorithm::EMeans(emeans_params) => {
                 let emeans_params = EMeansParams {
@@ -1667,8 +1703,17 @@ impl KMeans {
                     ..emeans_params.clone()
                 };
                 train_emeans(&training, k, &emeans_params)
-                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))?
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))
             }
+        };
+        // Once this node holds at most 1/threads of the vectors, its siblings
+        // alone can keep every thread busy, so it trains on one thread. Nodes
+        // nearer the root split their training across the pool.
+        let total_rows = data_values.len() / dimension;
+        let kmeans = if n.saturating_mul(rayon::current_num_threads()) <= total_rows {
+            train_on_this_thread(train)?
+        } else {
+            train()?
         };
         drop(train_phase);
         drop(training);
@@ -2753,6 +2798,43 @@ mod tests {
                 "row {row}: centroid {gemm} at {a} is not tied with {gathered} at {b}"
             );
         }
+    }
+
+    /// Training a node on this thread only regroups chunks into jobs, so it
+    /// yields the very centroids that training across the pool does.
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    fn test_training_on_this_thread_matches_pool(#[case] algorithm: HierarchicalNodeAlgorithm) {
+        let data = generate_random_array_with_seed::<Float32Type>(64 * 4096, [3; 32]);
+        let data = FixedSizeListArray::try_new_from_values(data, 64).unwrap();
+        let train = || match &algorithm {
+            HierarchicalNodeAlgorithm::Lloyd => {
+                let params = KMeansParams {
+                    seed: Some(5),
+                    ..Default::default()
+                };
+                KMeans::new_with_params(&data, 16, &params).unwrap()
+            }
+            HierarchicalNodeAlgorithm::EMeans(params) => {
+                let params = EMeansParams {
+                    seed: Some(5),
+                    ..params.clone()
+                };
+                train_emeans(&data, 16, &params).unwrap()
+            }
+        };
+
+        let pooled = train();
+        let alone = train_on_this_thread(|| {
+            assert_eq!(job_min_len(4), usize::MAX);
+            train()
+        });
+        assert_eq!(job_min_len(4), 4, "the scope must not outlive the call");
+        assert_eq!(
+            pooled.centroids.as_primitive::<Float32Type>().values(),
+            alone.centroids.as_primitive::<Float32Type>().values()
+        );
     }
 
     /// The SoA path and the per-centroid fallback must pick the centroids the
