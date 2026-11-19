@@ -3047,6 +3047,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cloud_paths() {
+        crate::testing::install_crypto_provider();
         let uri = "s3://bucket/foo.lance";
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
         assert_eq!(store.scheme, "s3");
@@ -3077,6 +3078,7 @@ mod tests {
         storage_options: Option<HashMap<String, String>>,
         default_expected_block_size: usize,
     ) {
+        crate::testing::install_crypto_provider();
         // Test the default
         let registry = Arc::new(ObjectStoreRegistry::default());
         let accessor = storage_options

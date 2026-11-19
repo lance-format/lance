@@ -542,6 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_account_application_credentials() {
+        crate::testing::install_crypto_provider();
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -595,6 +596,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_external_account_respects_client_timeout() {
+        crate::testing::install_crypto_provider();
         // Keep virtual time stationary while real file and socket I/O completes.
         // Dropping the sender also releases the blocking task if an assertion panics.
         let (release_clock, clock_inhibited) = std::sync::mpsc::channel::<()>();

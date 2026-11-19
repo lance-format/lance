@@ -57,10 +57,14 @@ impl<T> NamespaceCredentialsProvider<T> {
         }
     }
 
+    // Public through the `aws` alias `DynamicStorageOptionsCredentialProvider`.
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
     pub fn from_provider(provider: Arc<dyn StorageOptionsProvider>) -> Self {
         Self::new(Arc::new(StorageOptionsAccessor::with_provider(provider)))
     }
 
+    // Public through the `aws` alias `DynamicStorageOptionsCredentialProvider`.
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
     pub fn from_provider_with_initial(
         provider: Arc<dyn StorageOptionsProvider>,
         initial_options: HashMap<String, String>,

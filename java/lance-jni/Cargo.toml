@@ -79,3 +79,27 @@ strip = true
 
 [lints.clippy]
 disallowed_macros = "deny"
+
+# TODO: drop this patch once opendal 0.59.6 is released, and bump opendal to it.
+# opendal <= 0.59.5 installs the default reqwest transport only with
+# `http-transport-reqwest`, which links aws-lc-rs. Fixed in
+# https://github.com/apache/opendal/pull/8408. Every opendal crate is patched,
+# so the graph keeps a single opendal-core.
+[patch.crates-io]
+opendal = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-core = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-http-transport-reqwest = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-concurrent-limit = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-logging = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-retry = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-timeout = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-azblob = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-azdls = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-azure-common = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-cos = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-gcs = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-goosefs = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-hf = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-oss = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-s3 = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-tos = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }

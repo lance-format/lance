@@ -188,9 +188,9 @@ object_store = { version = "0.14.2" }
 # Keep OpenDAL's default capabilities without auto-register-services. Its
 # process constructor emits a __text_startup trampoline that can exceed the
 # ARM64 branch range in large dynamic libraries.
+# Also omit http-transport-reqwest: it aliases the aws-lc-rs rustls transport; lance-io's tls-* features pick the transport.
 opendal = { version = "0.59.2", default-features = false, features = [
     "executors-tokio",
-    "http-transport-reqwest",
     "layers-concurrent-limit",
     "layers-logging",
     "layers-retry",
@@ -300,3 +300,27 @@ multiple-crate-versions = "allow"
 single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
+
+# TODO: drop this patch once opendal 0.59.6 is released, and bump opendal to it.
+# opendal <= 0.59.5 installs the default reqwest transport only with
+# `http-transport-reqwest`, which links aws-lc-rs. Fixed in
+# https://github.com/apache/opendal/pull/8408. Every opendal crate is patched,
+# so the graph keeps a single opendal-core.
+[patch.crates-io]
+opendal = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-core = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-http-transport-reqwest = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-concurrent-limit = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-logging = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-retry = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-layer-timeout = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-azblob = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-azdls = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-azure-common = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-cos = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-gcs = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-goosefs = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-hf = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-oss = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-s3 = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
+opendal-service-tos = { git = "https://github.com/apache/opendal", rev = "00e82f1c56e029fe1134fa487b68d2bb8b7605cc" }
