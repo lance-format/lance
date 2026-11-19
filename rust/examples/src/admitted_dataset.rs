@@ -25,6 +25,11 @@
 //! Optional positive ATTEMPT_BYTES overrides the admitted/prefetched attempt only,
 //! leaving I/O and shared pool budgets unchanged. Omit it to retain the original
 //! mode defaults; ordinary mode rejects it because it has no payload admission.
+//! Prefix either drain command with `on-worker` to execute the entire request
+//! group in one Tokio worker task instead of the runtime's root future. This
+//! changes consumer placement only, not request concurrency or batch processing.
+//! Compare both placements with the same binary and controls; worker placement
+//! is a diagnostic, not a substitute for the original command's acceptance.
 //! Per-request first-batch and completion times share the group start (including
 //! dataset open and admission delay). Credit samples include other active requests
 //! and workspace headroom, not just that batch and not an allocation peak trace.
@@ -48,6 +53,7 @@
 use std::{
     collections::HashMap,
     error::Error,
+    future::Future,
     io::Write,
     sync::Arc,
     time::{Duration, Instant},
@@ -74,7 +80,43 @@ mod dictionary;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-const USAGE: &str = "usage: prepare|prepare-dictionary URI ROWS FRAME_BYTES FRAGMENT_ROWS | run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US [ATTEMPT_BYTES] | run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES [ATTEMPT_BYTES]";
+const USAGE: &str = "usage: prepare|prepare-dictionary URI ROWS FRAME_BYTES FRAGMENT_ROWS | [on-worker] run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US [ATTEMPT_BYTES] | [on-worker] run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES [ATTEMPT_BYTES]";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConsumerExecutor {
+    Caller,
+    Worker,
+}
+
+impl ConsumerExecutor {
+    fn parse(args: &mut Vec<String>) -> Result<Self> {
+        if args.first().is_none_or(|arg| arg != "on-worker") {
+            return Ok(Self::Caller);
+        }
+        args.remove(0);
+        if !matches!(args.first().map(String::as_str), Some("run" | "run-many")) {
+            return Err("on-worker requires run or run-many".into());
+        }
+        Ok(Self::Worker)
+    }
+
+    async fn run<T: Send + 'static>(
+        self,
+        future: impl Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<T> {
+        match self {
+            Self::Caller => future.await,
+            Self::Worker => {
+                // JoinSet aborts the drain if its caller drops while waiting.
+                // A detached drain would invalidate cancellation and credit checks.
+                let mut tasks = tokio::task::JoinSet::new();
+                tasks.spawn(future);
+                tasks.join_next().await.ok_or("missing consumer task")??
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Fixture {
@@ -322,6 +364,7 @@ async fn prepare(
     Ok(expected.finish())
 }
 
+#[derive(Clone)]
 struct DrainConfig {
     mode: Mode,
     batch_rows: u32,
@@ -533,9 +576,7 @@ fn peak_rss_kib() -> Option<u64> {
         .ok()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+async fn run_command(args: Vec<String>) -> Result<serde_json::Value> {
     let result = match args.first().map(String::as_str) {
         Some("prepare" | "prepare-dictionary") if args.len() == 5 => {
             let fixture = if args[0] == "prepare-dictionary" {
@@ -593,6 +634,18 @@ async fn main() -> Result<()> {
         }
         _ => return Err(USAGE.into()),
     };
+    Ok(result)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let executor = ConsumerExecutor::parse(&mut args)?;
+    let is_drain = matches!(args.first().map(String::as_str), Some("run" | "run-many"));
+    let mut result = executor.run(run_command(args)).await?;
+    if is_drain {
+        result["consumer_executor"] = serde_json::to_value(executor)?;
+    }
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &result)?;
     writeln!(stdout)?;
@@ -604,6 +657,92 @@ mod tests {
     use super::*;
     use arrow_array::LargeBinaryArray;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::caller(false, ConsumerExecutor::Caller)]
+    #[case::worker(true, ConsumerExecutor::Worker)]
+    fn executor_prefix_preserves_the_drain_arguments(
+        #[case] on_worker: bool,
+        #[case] expected: ConsumerExecutor,
+        #[values("run", "run-many")] command: &str,
+    ) {
+        let original = [
+            command,
+            "prefetched",
+            "uri",
+            "17",
+            "hash",
+            "3",
+            "32768",
+            "0",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut args = original.clone();
+        if on_worker {
+            args.insert(0, "on-worker".into());
+        }
+        assert_eq!(ConsumerExecutor::parse(&mut args).unwrap(), expected);
+        assert_eq!(args, original);
+    }
+
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::prepare(&["prepare"])]
+    #[case::nested(&["on-worker", "run"])]
+    fn worker_prefix_rejects_non_drain_commands(#[case] suffix: &[&str]) {
+        let mut args = vec!["on-worker".into()];
+        args.extend(suffix.iter().map(|value| (*value).to_string()));
+        assert!(
+            ConsumerExecutor::parse(&mut args)
+                .unwrap_err()
+                .to_string()
+                .contains("on-worker requires run or run-many")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executor_places_the_consumer_and_preserves_errors() {
+        let caller = std::thread::current().id();
+        for executor in [ConsumerExecutor::Caller, ConsumerExecutor::Worker] {
+            let actual = executor
+                .run(async { Ok(std::thread::current().id()) })
+                .await
+                .unwrap();
+            assert_eq!(actual == caller, executor == ConsumerExecutor::Caller);
+            let error = executor
+                .run::<()>(async { Err("injected drain failure".into()) })
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "injected drain failure");
+        }
+        let error = ConsumerExecutor::Worker
+            .run::<()>(async { panic!("injected worker panic") })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected worker panic"));
+    }
+
+    #[tokio::test]
+    async fn dropping_worker_executor_releases_the_running_attempt() {
+        let budget = AllocationBudget::new(128);
+        let held = budget.try_reserve(128).unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut pending = Box::pin(ConsumerExecutor::Worker.run(async move {
+            let _held = held;
+            started.send(()).unwrap();
+            std::future::pending::<Result<()>>().await
+        }));
+        assert!(futures::poll!(&mut pending).is_pending());
+        ready.await.unwrap();
+        assert_eq!(budget.reserved(), 128);
+        drop(pending);
+        tokio::time::timeout(Duration::from_secs(5), budget.wait_for_capacity(128))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+    }
 
     #[rstest]
     #[case::ordinary("ordinary", 32768)]
@@ -863,6 +1002,7 @@ mod tests {
     async fn concurrent_complete_drains_keep_independent_order_and_hash(
         #[case] requests: usize,
         #[case] workspace_slots: usize,
+        #[values(ConsumerExecutor::Caller, ConsumerExecutor::Worker)] executor: ConsumerExecutor,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
@@ -879,16 +1019,24 @@ mod tests {
                 pool_bytes: workspace_slots * 65536,
             };
             let budget = AllocationBudget::new(config.pool_bytes);
+            let task_dataset = dataset.clone();
+            let task_config = config.clone();
+            let task_budget = budget.clone();
+            let task_hash = expected.hash.clone();
+            let expected_rows = expected.rows;
             let outputs = tokio::time::timeout(
                 Duration::from_secs(5),
-                drain_all(
-                    &dataset,
-                    &config,
-                    &budget,
-                    expected.rows,
-                    &expected.hash,
-                    None,
-                ),
+                executor.run(async move {
+                    drain_all(
+                        &task_dataset,
+                        &task_config,
+                        &task_budget,
+                        expected_rows,
+                        &task_hash,
+                        None,
+                    )
+                    .await
+                }),
             )
             .await
             .expect("finite requests must complete even with one workspace and CPU worker")
