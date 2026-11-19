@@ -23,8 +23,8 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::Manifest;
-use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
+use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
@@ -405,8 +405,12 @@ impl<'a> TransactionRebase<'a> {
 /// used to test whether a concurrent row-moving Update actually invalidates the
 /// overlay.
 fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
+    overlays_coverage(&group.overlays)
+}
+
+fn overlays_coverage(overlays: &[DataOverlayFile]) -> RoaringBitmap {
     let mut union = RoaringBitmap::new();
-    for overlay in &group.overlays {
+    for overlay in overlays {
         match &overlay.coverage {
             OverlayCoverage::Shared(bitmap) => union |= bitmap.as_ref(),
             OverlayCoverage::PerField(bitmaps) => {
@@ -475,6 +479,29 @@ fn keeps_every_field_identity(
                 && other.parent_id == field.parent_id
         })
     })
+}
+
+/// The physical offsets of `fragment` that the overlays `operation` adds to it
+/// cover, or `None` when it adds none there.
+fn overlay_coverage(operation: &Operation, fragment: u64) -> Option<RoaringBitmap> {
+    let coverage: Vec<RoaringBitmap> = match operation {
+        Operation::DataOverlay { groups } => groups
+            .iter()
+            .filter(|group| group.fragment_id == fragment)
+            .map(overlay_group_coverage)
+            .collect(),
+        Operation::CompositeOperation(composite_operation) => composite_operation
+            .iter_actions()
+            .filter_map(|action| match action {
+                Action::AddOverlays(add) if add.fragment() == ActionRef::Committed(fragment) => {
+                    Some(overlays_coverage(add.overlays()))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    coverage.into_iter().reduce(|union, more| union | more)
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {

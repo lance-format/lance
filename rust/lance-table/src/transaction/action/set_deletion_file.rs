@@ -20,11 +20,6 @@ use lance_core::{Error, Result};
 /// missing them. A deletion file therefore cannot be cleared, and a
 /// replacement known to delete fewer rows than the one it replaces is
 /// rejected.
-///
-/// TODO: derive the newly-deleted rows by diffing against the read version, so
-/// rebase and conflict detection can merge two deletes on one fragment. Until
-/// then the whole fragment's deletions are one part, and two deletes on the
-/// same fragment always conflict.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct SetDeletionFile {
     fragment: u64,
@@ -127,6 +122,14 @@ impl SetDeletionFile {
         Ok(())
     }
 
+    /// Replace the deletion file with `merged`, written to the dataset's own
+    /// directory by the rebase, holding this action's deletions and every one
+    /// committed to the fragment since it read.
+    pub(super) fn install_merged(&mut self, merged: DeletionFile) {
+        self.deletion_file = merged;
+        self.base = None;
+    }
+
     /// Whether a reader sees rows leave.
     pub fn is_data_change(&self) -> bool {
         self.data_change
@@ -134,6 +137,11 @@ impl SetDeletionFile {
 
     /// The fragment's deletions, which are a distinct part from the data of
     /// any field in it: deleting rows and re-encoding a column commute.
+    ///
+    /// A deletion file cannot be cleared, so a new one only adds deletions,
+    /// which merge with another set's row by row (see
+    /// [`Overlap::Deletions`](super::Overlap::Deletions)); the rebase reads
+    /// both files and refuses one that dropped a deletion.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.add_deletions(self.fragment);
     }

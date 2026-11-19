@@ -67,6 +67,10 @@ pub enum Part {
     RowVersions(u64),
     /// One fragment's deletion file.
     Deletions(u64),
+    /// One fragment's deletion file, which may have gained deletions: they
+    /// merge with the transaction's own row by row ([`Overlap::Deletions`]).
+    /// Any other change to it is a conflict.
+    MergedDeletions(u64),
     /// The data file and column backing one field in one fragment.
     FieldData { fragment: u64, field: i32 },
     /// What a reader sees of one field in one fragment: its data and the
@@ -377,8 +381,22 @@ impl IndexWrite {
 pub enum Verdict {
     /// Nothing it depends on changed; it lands as it is.
     Compatible,
+    /// What changed can be rebased past; each [`Overlap`] names one place,
+    /// and [`CompositeOperation::rebase`] rewrites the pending set past it.
+    Rebase(Vec<Overlap>),
     /// It has to be planned again. Says what changed.
     Conflict(String),
+}
+
+/// A change the pending transaction can be rewritten around.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Overlap {
+    /// Both sides only added deletions to `fragment`. They merge where the
+    /// rows they delete differ: the pending deletion file is rewritten to hold
+    /// its own rows and every row deleted by the time it lands. Which rows
+    /// each side deleted is not in a manifest, so the caller checks them while
+    /// rewriting the file.
+    Deletions { fragment: u64 },
 }
 
 impl Footprint {
@@ -507,10 +525,11 @@ impl Footprint {
     }
 
     /// Record that this transaction adds deletions to `fragment` and removes
-    /// none, and needs the rest of the fragment only to still be there.
+    /// none, and needs the rest of the fragment only to still be there. See
+    /// [`Overlap::Deletions`].
     pub(super) fn add_deletions(&mut self, fragment: u64) {
         self.require_fragment(fragment);
-        self.read(Part::Deletions(fragment));
+        self.read(Part::MergedDeletions(fragment));
     }
 
     /// Record that this transaction removes `fragment` outright, deleting its
