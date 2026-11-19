@@ -729,7 +729,8 @@ fn sample_training_data_scan(
 /// set through `drawn_offsets` so their samples never repeat a row; the stream
 /// stops drawing once the set holds `max_drawn` offsets, nulls included.
 /// Each draw takes the unseen rows of one aligned run of `block_rows` rows, so
-/// `1` draws independent rows.
+/// `1` draws independent rows. A round draws single rows once it needs fewer
+/// than `block_rows` more.
 #[allow(clippy::too_many_arguments)]
 fn sample_training_data_scan_by_indices(
     dataset: &Dataset,
@@ -790,12 +791,20 @@ fn sample_training_data_scan_by_indices(
                 unseen_indices
             } else {
                 let mut sampled_offsets = Vec::with_capacity(target);
-                let num_blocks = num_rows.div_ceil(block_rows) as u64;
                 while sampled_offsets.len() < target {
-                    let start = rng.random_range(0..num_blocks) * block_rows as u64;
-                    let end = (start + block_rows as u64).min(num_rows as u64);
+                    // A partial run would take the first rows of its run. A null
+                    // refill shorter than a null run prefix would then read only
+                    // such prefixes, so the tail of a round draws single rows.
+                    let run_rows = if target - sampled_offsets.len() < block_rows {
+                        1
+                    } else {
+                        block_rows as u64
+                    };
+                    let start =
+                        rng.random_range(0..(num_rows as u64).div_ceil(run_rows)) * run_rows;
+                    let end = (start + run_rows).min(num_rows as u64);
                     for offset in start..end {
-                        if sampled_offsets.len() < target && seen_offsets.insert(offset) {
+                        if seen_offsets.insert(offset) {
                             sampled_offsets.push(offset);
                         }
                     }
@@ -1644,6 +1653,75 @@ mod tests {
         assert_eq!(ids.len(), SAMPLE_ROWS as u64, "sample contains duplicates");
         let blocks: roaring::RoaringBitmap = ids.iter().map(|id| id / BLOCK_ROWS as u32).collect();
         assert_eq!(blocks.len(), (SAMPLE_ROWS / BLOCK_ROWS) as u64);
+    }
+
+    #[tokio::test]
+    async fn test_block_sampling_refills_past_null_run_prefixes() {
+        // Every run of 64 rows starts with four or five nulls. A refill smaller
+        // than that prefix must not keep reading the null starts of new runs.
+        const ROWS: usize = 16384;
+        const SAMPLE_ROWS: usize = 1024;
+        const BLOCK_ROWS: usize = 64;
+        let vectors = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            2,
+            Arc::new(Float32Array::from_iter_values(
+                (0..ROWS * 2).map(|i| (i / 2) as f32),
+            )),
+            Some(NullBuffer::from(
+                (0..ROWS)
+                    .map(|i| i % BLOCK_ROWS >= 4 + (i / BLOCK_ROWS) % 2)
+                    .collect::<Vec<_>>(),
+            )),
+        );
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "vec",
+            vectors.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let still_needed = Arc::new(AtomicUsize::new(SAMPLE_ROWS));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let round_count = rounds.clone();
+        // One batch per round, so batches count the sequential refill rounds.
+        let scan = sample_training_data_scan_by_indices(
+            &dataset,
+            "vec",
+            ROWS,
+            SAMPLE_ROWS,
+            1,
+            None,
+            still_needed.clone(),
+            None,
+            None,
+            BLOCK_ROWS,
+        )
+        .unwrap()
+        .inspect_ok(move |_| {
+            round_count.fetch_add(1, Ordering::Relaxed);
+        });
+        let sample = sample_nullable_fsl(
+            "vec",
+            SAMPLE_ROWS,
+            2 * 4,
+            dataset.schema().field("vec").unwrap(),
+            Box::pin(scan),
+            Some(still_needed),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sample.len(), SAMPLE_ROWS);
+        assert_eq!(sample.null_count(), 0);
+        let rounds = rounds.load(Ordering::Relaxed);
+        assert!(rounds <= 8, "sampling took {rounds} refill rounds");
     }
 
     #[rstest::rstest]
