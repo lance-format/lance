@@ -544,11 +544,20 @@ impl LanceExecutionOptions {
 ///
 /// This ignores [`LanceExecutionOptions::batch_size`], which applies to one
 /// execution rather than to a session.
+/// Session-config extension marking that `target_partitions` holds DataFusion's
+/// default because [`LanceExecutionOptions::target_partition`] was not set.
+///
+/// The default equals the core count, so the value alone cannot tell an
+/// implicit default from an explicit limit of that size.
+#[derive(Debug)]
+pub struct DefaultTargetPartitions;
+
 pub fn new_session_config(options: &LanceExecutionOptions) -> SessionConfig {
     let mut session_config = SessionConfig::new();
-    if let Some(target_partition) = options.target_partition {
-        session_config = session_config.with_target_partitions(target_partition);
-    }
+    session_config = match options.target_partition {
+        Some(target_partition) => session_config.with_target_partitions(target_partition),
+        None => session_config.with_extension(Arc::new(DefaultTargetPartitions)),
+    };
     if options.use_spilling() {
         // Reserve sort/merge headroom for each spillable sort, using up to 40 MiB
         // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
@@ -1404,6 +1413,17 @@ mod tests {
         ));
         // The batch size applies to one execution, not to the session config.
         assert_ne!(new_session_config(&options).batch_size(), 17);
+        // Only a session whose target_partitions nobody set is marked as default.
+        assert!(
+            new_session_config(&options)
+                .get_extension::<DefaultTargetPartitions>()
+                .is_none()
+        );
+        assert!(
+            new_session_config(&LanceExecutionOptions::default())
+                .get_extension::<DefaultTargetPartitions>()
+                .is_some()
+        );
 
         let zero_batch_size = LanceExecutionOptions {
             batch_size: Some(0),
