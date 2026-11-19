@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Staged transactions for atomic append and index publication.
+//! Staged transactions.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,13 +12,13 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::{IndexParams, IndexType};
 use lance_table::format::{
-    DataFile, Fragment, IndexMetadata, Manifest, RowIdMeta, is_detached_version,
+    BasePath, DataFile, Fragment, IndexMetadata, Manifest, RowIdMeta, is_detached_version,
 };
 use lance_table::io::commit::{CommitHandler, ManifestLocation};
 use lance_table::rowids::read_row_ids;
 use lance_table::transaction::action::{
-    Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
-    ApplyState, CompositeOperation, FieldRef, Ref, UserStep,
+    Action, AddBase, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment,
+    AddIndexSegmentParts, ApplyState, CompositeOperation, FieldRef, Ref, UserStep,
 };
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -49,6 +49,7 @@ pub const STAGED_VERSION: u64 = u64::MAX;
 /// An experimental staged transaction committed as one dataset version.
 ///
 /// Each step sees the base plus the steps before it:
+/// - [`Self::add_bases`] registers new storage bases.
 /// - [`Self::append`] / [`Self::append_stream`] stage new fragments.
 /// - [`Self::create_index`] builds a new index over all visible fragments
 ///   (committed and staged).
@@ -186,9 +187,10 @@ struct StagedState {
     /// snapshot.
     append_base: Arc<Dataset>,
     /// The next append must write against a rebuilt snapshot because a staged
-    /// 2.2 or newer data file promoted a legacy blob field.
+    /// 2.2 or newer data file promoted a legacy blob field or a base was added.
     append_context_dirty: bool,
     next_local_fragment_id: u32,
+    next_local_base_id: u32,
     /// Scan already handed out row ids, or a step cannot be replayed onto a
     /// newer version.
     requires_original_version: bool,
@@ -266,6 +268,7 @@ impl Dataset {
                 append_base: base.clone(),
                 append_context_dirty: false,
                 next_local_fragment_id: 0,
+                next_local_base_id: 0,
                 requires_original_version: false,
             },
             base,
@@ -335,9 +338,11 @@ impl StagedTransaction {
     ///
     /// `commit_handler`, `auto_cleanup`, `transaction_properties`, `session`,
     /// `base_store_params`, and `initial_bases` must stay unset. `target_bases`
-    /// routes files to committed bases. `enable_v2_manifest_paths` and
-    /// `skip_auto_cleanup` must stay at their defaults. Publication is
-    /// [`Self::commit`]. A rejected setting leaves the previous snapshot intact.
+    /// routes files to committed bases, while `target_base_names_or_paths` and
+    /// `target_all_bases` can also route to bases added earlier in the same
+    /// transaction. `enable_v2_manifest_paths` and `skip_auto_cleanup` must
+    /// stay at their defaults. Publication is [`Self::commit`]. A rejected
+    /// setting leaves the previous snapshot intact.
     pub async fn append_with_params(
         &mut self,
         batches: Vec<RecordBatch>,
@@ -423,13 +428,14 @@ impl StagedTransaction {
             return Ok(());
         }
         let start = self.state.next_local_fragment_id;
-        let next_local_fragment_id = local_fragment_id(start, fragments.len())?;
+        let next_local_fragment_id = next_local_id("fragment", start, fragments.len())?;
         let mut actions = Vec::new();
         for (offset, fragment) in fragments.into_iter().enumerate() {
-            let local_id = local_fragment_id(start, offset)?;
+            let local_id = next_local_id("fragment", start, offset)?;
             actions.extend(actions_for_appended_fragment(
                 Ref::Local(local_id),
                 fragment,
+                |base_id| self.base_reference(base_id),
             )?);
         }
         let step = UserStep::new("append", actions);
@@ -444,6 +450,73 @@ impl StagedTransaction {
         self.state.next_local_fragment_id = next_local_fragment_id;
         self.state.requires_original_version |= pins_base_version;
         Ok(())
+    }
+
+    /// Add new storage bases in this transaction.
+    ///
+    /// Later appends in the same transaction can write to these bases using
+    /// `WriteParams::target_base_names_or_paths` or
+    /// `WriteParams::target_all_bases`, and staged indexes can cover fragments
+    /// stored in them. Each base must have `id == 0`, and its final base id is
+    /// assigned on commit. Per base store credentials are not yet supported on
+    /// staged appends because `WriteParams::base_store_params` must stay unset.
+    pub fn add_bases(&mut self, new_bases: Vec<BasePath>) -> Result<()> {
+        if new_bases.is_empty() {
+            return Ok(());
+        }
+        let start = self.state.next_local_base_id;
+        let next_local_base_id = next_local_id("base", start, new_bases.len())?;
+        let mut actions = Vec::with_capacity(new_bases.len());
+        for (offset, base) in new_bases.into_iter().enumerate() {
+            if base.id != 0 {
+                return Err(Error::invalid_input(format!(
+                    "Staged base registration requires id 0, got {} for '{}'",
+                    base.id, base.path
+                )));
+            }
+            let local = next_local_id("base", start, offset)?;
+            actions.push(Action::AddBase(AddBase::new(local, base)));
+        }
+        let step = UserStep::new("add_bases", actions);
+        let next_working = self.state.working.apply_step_checked(&step)?;
+        self.state.working = next_working;
+        self.state.steps.push(step);
+        self.state.staged_dataset = None;
+        self.state.append_context_dirty = true;
+        self.state.next_local_base_id = next_local_base_id;
+        Ok(())
+    }
+
+    fn base_reference(&self, base_id: u32) -> Result<Ref> {
+        if self.base.manifest.base_paths.contains_key(&base_id) {
+            return Ok(Ref::Committed(u64::from(base_id)));
+        }
+        let base = self
+            .state
+            .append_base
+            .manifest
+            .base_paths
+            .get(&base_id)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Prepared file references unknown storage base {base_id}"
+                ))
+            })?;
+        self.state
+            .steps
+            .iter()
+            .flat_map(|step| &step.actions)
+            .find_map(|action| match action {
+                Action::AddBase(added) if added.base().path == base.path => {
+                    Some(Ref::Local(added.local()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Storage base {base_id} has no staged AddBase action"
+                ))
+            })
     }
 
     /// Build a new index over all fragments visible in this transaction
@@ -725,7 +798,7 @@ impl StagedTransaction {
         }
     }
 
-    /// Publish every staged step (appends and index builds) as one version.
+    /// Publish every staged step as one version.
     ///
     /// The transaction is consumed on failure. A transaction with no staged
     /// steps returns the original snapshot, including after a scan or a
@@ -762,15 +835,15 @@ fn append_params() -> WriteParams {
     }
 }
 
-fn local_fragment_id(start: u32, added_fragments: usize) -> Result<u32> {
-    let added = u32::try_from(added_fragments).map_err(|_| {
+fn next_local_id(kind: &str, start: u32, count: usize) -> Result<u32> {
+    let added = u32::try_from(count).map_err(|_| {
         Error::invalid_input(format!(
-            "Staged append adds {added_fragments} fragments, which does not fit in a local fragment id"
+            "Staged step adds {count} {kind}s, which does not fit in a local {kind} id"
         ))
     })?;
     start.checked_add(added).ok_or_else(|| {
         Error::invalid_input(format!(
-            "Staged append already holds {start} local fragment ids and this step adds {added_fragments}"
+            "Staged transaction already holds {start} local {kind} ids and this step adds {count}"
         ))
     })
 }
@@ -779,7 +852,11 @@ fn local_fragment_id(start: u32, added_fragments: usize) -> Result<u32> {
 ///
 /// The fragment is taken apart field by field. A new field fails to compile
 /// until it is carried onto [`AddFragment`] or refused here.
-fn actions_for_appended_fragment(id: Ref, fragment: Fragment) -> Result<Vec<Action>> {
+fn actions_for_appended_fragment(
+    id: Ref,
+    fragment: Fragment,
+    resolve_base: impl Fn(u32) -> Result<Ref>,
+) -> Result<Vec<Action>> {
     let Fragment {
         id: _,
         files,
@@ -826,7 +903,11 @@ fn actions_for_appended_fragment(id: Ref, fragment: Fragment) -> Result<Vec<Acti
         },
     ))];
     for file in files {
-        actions.push(Action::AddDataFile(data_file_action(id, file)?));
+        actions.push(Action::AddDataFile(data_file_action(
+            id,
+            file,
+            &resolve_base,
+        )?));
     }
     Ok(actions)
 }
@@ -837,16 +918,18 @@ fn unstageable_fragment(part: &str, first_path: &str) -> Error {
     ))
 }
 
-fn data_file_action(fragment: Ref, file: DataFile) -> Result<AddDataFile> {
+fn data_file_action(
+    fragment: Ref,
+    file: DataFile,
+    resolve_base: &impl Fn(u32) -> Result<Ref>,
+) -> Result<AddDataFile> {
     let field_ids = file
         .fields
         .iter()
         .copied()
         .map(FieldRef::Committed)
         .collect();
-    let base = file
-        .base_id
-        .map(|base_id| Ref::Committed(u64::from(base_id)));
+    let base = file.base_id.map(resolve_base).transpose()?;
     let file = DataFile {
         fields: Arc::<[i32]>::from([]),
         base_id: None,
@@ -4105,5 +4188,788 @@ mod tests {
         let mut scan = committed.scan();
         scan.filter("value >= 0").unwrap();
         assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 15);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_staged_add_bases_with_append_and_scan_publishes_together(
+        #[values(false, true)] stable: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let first = TempStrDir::default();
+        let second = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                enable_stable_row_ids: stable,
+                initial_bases: Some(vec![BasePath::new(
+                    7,
+                    existing.to_string(),
+                    Some("existing".into()),
+                    true,
+                )]),
+                ..Default::default()
+            })
+            .execute(vec![id_batch([0, 1])])
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            first.to_string(),
+            Some("first".into()),
+            true,
+        )])
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([2, 3])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["first".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+        let early_reader = tx.scan().unwrap();
+
+        // Register an unnamed second base and append a stream targeting it by path.
+        tx.add_bases(vec![BasePath::new(0, second.to_string(), None, true)])
+            .unwrap();
+        let stream_batch = id_batch([4, 5]);
+        let stream = RecordBatchStreamAdapter::new(
+            stream_batch.schema(),
+            futures::stream::iter(vec![Ok(stream_batch)]),
+        );
+        tx.append_stream_with_params(
+            Box::pin(stream) as SendableRecordBatchStream,
+            &WriteParams {
+                target_base_names_or_paths: Some(vec![second.to_string()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Append into the pre-existing committed base as well.
+        tx.append_with_params(
+            vec![id_batch([6])],
+            &WriteParams {
+                target_bases: Some(vec![7]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(early_reader.try_into_batch().await.unwrap().num_rows(), 4);
+        assert_eq!(
+            ids(&tx.staged_dataset().unwrap()).await,
+            [0, 1, 2, 3, 4, 5, 6]
+        );
+
+        let committed = tx.commit().await.unwrap();
+        assert_eq!(committed.version_id(), dataset.version_id() + 1);
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(ids(&reopened).await, [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(reopened.manifest.base_paths.len(), 3);
+        let first_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("first"))
+            .unwrap()
+            .id;
+        let second_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.path == second.as_str())
+            .unwrap()
+            .id;
+        let base_ids: Vec<Option<u32>> = reopened
+            .manifest
+            .fragments
+            .iter()
+            .map(|f| f.files[0].base_id)
+            .collect();
+        assert_eq!(base_ids, [None, Some(first_id), Some(second_id), Some(7)]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_staged_add_bases_with_append_and_index_commits_and_queries(
+        #[values(false, true)] stable: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let secondary = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                enable_stable_row_ids: stable,
+                ..Default::default()
+            })
+            .execute(vec![id_batch([0, 1])])
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            secondary.to_string(),
+            Some("secondary".into()),
+            true,
+        )])
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([10, 11, 12])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["secondary".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+        tx.append(vec![id_batch([20, 21])]).await.unwrap();
+        tx.create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("by_id".into()),
+            &lance_index::scalar::ScalarIndexParams::default(),
+        )
+        .await
+        .unwrap();
+
+        // Staged scan sees both the secondary base and primary rows through the staged index.
+        let staged_filtered = tx
+            .scan()
+            .unwrap()
+            .filter("id >= 10")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(staged_filtered.num_rows(), 5);
+
+        let committed = tx.commit().await.unwrap();
+        assert_eq!(committed.version_id(), dataset.version_id() + 1);
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(ids(&reopened).await, [0, 1, 10, 11, 12, 20, 21]);
+        let secondary_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("secondary"))
+            .unwrap()
+            .id;
+        assert_eq!(
+            reopened.manifest.fragments[1].files[0].base_id,
+            Some(secondary_id)
+        );
+        assert_eq!(reopened.manifest.fragments[2].files[0].base_id, None);
+        assert_eq!(
+            reopened
+                .count_indexed_rows("by_id", "id >= 10", None, None)
+                .await
+                .unwrap(),
+            5
+        );
+        let mut scan = reopened.scan();
+        scan.filter("id = 11 OR id = 21").unwrap();
+        let rows = scan.try_into_batch().await.unwrap();
+        let mut got = rows["id"].as_primitive::<Int32Type>().values().to_vec();
+        got.sort_unstable();
+        assert_eq!(got, [11, 21]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_staged_add_bases_with_append_and_index_rebases_over_concurrent_writes(
+        #[values(false, true)] stable: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let our_base = TempStrDir::default();
+        let racer_base = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                enable_stable_row_ids: stable,
+                ..Default::default()
+            })
+            .execute(vec![id_batch([0, 1])])
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            our_base.to_string(),
+            Some("ours".into()),
+            true,
+        )])
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([10, 11, 12])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["ours".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+        tx.create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("by_id".into()),
+            &lance_index::scalar::ScalarIndexParams::default(),
+        )
+        .await
+        .unwrap();
+
+        // A concurrent transaction registers a disjoint base and appends into it.
+        let mut racer = dataset.begin_transaction().await.unwrap();
+        racer
+            .add_bases(vec![BasePath::new(
+                0,
+                racer_base.to_string(),
+                Some("theirs".into()),
+                true,
+            )])
+            .unwrap();
+        racer
+            .append_with_params(
+                vec![id_batch([2, 3])],
+                &WriteParams {
+                    target_base_names_or_paths: Some(vec!["theirs".into()]),
+                    ..append_params()
+                },
+            )
+            .await
+            .unwrap();
+        let after_racer = racer.commit().await.unwrap();
+        let racer_base_id = after_racer
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("theirs"))
+            .unwrap()
+            .id;
+
+        // Our transaction rebases both its base_id and its fragment_id + index aliases.
+        let committed = tx.commit().await.unwrap();
+        assert_eq!(committed.version_id(), after_racer.version_id() + 1);
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(ids(&reopened).await, [0, 1, 2, 3, 10, 11, 12]);
+        let our_base_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("ours"))
+            .unwrap()
+            .id;
+        assert_ne!(our_base_id, racer_base_id);
+        assert_eq!(reopened.manifest.fragments.len(), 3);
+        assert_eq!(
+            reopened.manifest.fragments[1].files[0].base_id,
+            Some(racer_base_id)
+        );
+        assert_eq!(
+            reopened.manifest.fragments[2].files[0].base_id,
+            Some(our_base_id)
+        );
+        let committed_frag_id = reopened.manifest.fragments[2].id as u32;
+        assert_eq!(committed_frag_id, 2);
+        let indices = load_all_indices(&reopened).await.unwrap();
+        let by_id: Vec<_> = indices.iter().filter(|idx| idx.name == "by_id").collect();
+        assert_eq!(by_id.len(), 2);
+        let local_seg = by_id
+            .iter()
+            .find(|idx| !idx.local_fragment_aliases.is_empty())
+            .expect("local segment");
+        assert_eq!(
+            local_seg
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![committed_frag_id]
+        );
+        assert_eq!(
+            reopened
+                .count_indexed_rows("by_id", "id >= 10", None, Some(&[committed_frag_id]))
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[rstest]
+    #[case::same_name(true)]
+    #[case::same_path(false)]
+    #[tokio::test]
+    async fn test_staged_add_bases_conflicts_with_concurrent_same_name_or_path(
+        #[case] collide_name: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let path_a = TempStrDir::default();
+        let path_b = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .execute(vec![id_batch([0])])
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            path_a.to_string(),
+            Some("shared".into()),
+            true,
+        )])
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([1])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["shared".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut racer = dataset.begin_transaction().await.unwrap();
+        let racer_base = if collide_name {
+            BasePath::new(0, path_b.to_string(), Some("shared".into()), true)
+        } else {
+            BasePath::new(0, path_a.to_string(), Some("other".into()), true)
+        };
+        racer.add_bases(vec![racer_base]).unwrap();
+        racer.commit().await.unwrap();
+
+        let error = tx.commit().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::RetryableCommitConflict { .. } | Error::CommitConflict { .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::nonzero_id(5, "fresh", true, "id 0")]
+    #[case::duplicate_committed_name(0, "existing", true, "already exists")]
+    #[case::duplicate_committed_path(0, "fresh", false, "already exists")]
+    #[tokio::test]
+    async fn test_staged_add_bases_validation_preserves_previous_snapshot(
+        #[case] base_id: u32,
+        #[case] name: &str,
+        #[case] fresh_path: bool,
+        #[case] expected_msg: &str,
+    ) {
+        let dir = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let fresh = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                initial_bases: Some(vec![BasePath::new(
+                    7,
+                    existing.to_string(),
+                    Some("existing".into()),
+                    true,
+                )]),
+                ..Default::default()
+            })
+            .execute(vec![id_batch([0])])
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.append(vec![id_batch([1])]).await.unwrap();
+        let before = tx.staged_dataset().unwrap();
+
+        let path = if fresh_path {
+            fresh.to_string()
+        } else {
+            existing.to_string()
+        };
+        let error = tx
+            .add_bases(vec![BasePath::new(base_id, path, Some(name.into()), true)])
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(expected_msg), "{error}");
+        assert!(Arc::ptr_eq(&tx.staged_dataset().unwrap(), &before));
+
+        let committed = tx.commit().await.unwrap();
+        assert_eq!(ids(&committed).await, [0, 1]);
+        assert_eq!(committed.manifest.base_paths.len(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_staged_add_bases_with_index_survives_compaction_and_optimize(
+        #[values(false, true)] stable: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let secondary = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                enable_stable_row_ids: stable,
+                ..Default::default()
+            })
+            .execute(vec![id_batch([0, 1])])
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            secondary.to_string(),
+            Some("secondary".into()),
+            true,
+        )])
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([10, 11, 12])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["secondary".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+        tx.create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("by_id".into()),
+            &lance_index::scalar::ScalarIndexParams::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut committed = tx.commit().await.unwrap();
+        compact_files(&mut committed, merge_small_fragments(), None)
+            .await
+            .unwrap();
+        committed
+            .optimize_indices(&lance_index::optimize::OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(ids(&reopened).await, [0, 1, 10, 11, 12]);
+        let indices = load_all_indices(&reopened).await.unwrap();
+        let by_id: Vec<_> = indices.iter().filter(|idx| idx.name == "by_id").collect();
+        assert_eq!(by_id.len(), 1);
+        assert!(by_id[0].local_fragment_aliases.is_empty());
+        assert_eq!(
+            reopened
+                .count_indexed_rows("by_id", "id >= 10", None, None)
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_staged_add_bases_with_extend_index_and_concurrent_rebase(
+        #[values(false, true)] stable: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let our_base = TempStrDir::default();
+        let racer_base = TempStrDir::default();
+        let mut dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                enable_stable_row_ids: stable,
+                ..Default::default()
+            })
+            .execute(vec![id_batch([0, 1])])
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["id"], IndexType::BTree, None, &params, false)
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            our_base.to_string(),
+            Some("ours".into()),
+            true,
+        )])
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([10, 11, 12])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["ours".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+        tx.extend_index("id_idx").await.unwrap();
+
+        // Racer commits a disjoint base and fragment first so our base_id and
+        // fragment_id both shift on retry.
+        let mut racer = dataset.begin_transaction().await.unwrap();
+        racer
+            .add_bases(vec![BasePath::new(
+                0,
+                racer_base.to_string(),
+                Some("theirs".into()),
+                true,
+            )])
+            .unwrap();
+        racer
+            .append_with_params(
+                vec![id_batch([2, 3])],
+                &WriteParams {
+                    target_base_names_or_paths: Some(vec!["theirs".into()]),
+                    ..append_params()
+                },
+            )
+            .await
+            .unwrap();
+        racer.commit().await.unwrap();
+
+        tx.commit().await.unwrap();
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(ids(&reopened).await, [0, 1, 2, 3, 10, 11, 12]);
+        let our_base_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("ours"))
+            .unwrap()
+            .id;
+        assert_eq!(
+            reopened.manifest.fragments[2].files[0].base_id,
+            Some(our_base_id)
+        );
+        let segs = reopened.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(segs.len(), 2);
+        let local_seg = segs
+            .iter()
+            .find(|s| !s.local_fragment_aliases.is_empty())
+            .expect("extended local segment");
+        assert_eq!(local_seg.local_fragment_aliases.get(&0), Some(&2));
+        assert_eq!(
+            reopened
+                .count_indexed_rows("id_idx", "id >= 10", None, Some(&[2]))
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_staged_add_bases_alone_target_all_duplicate_and_abort() {
+        let dir = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let base_c = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .execute(vec![id_batch([0])])
+            .await
+            .unwrap();
+
+        // Empty add_bases is a no-op and does not create a new version.
+        let mut empty_tx = dataset.begin_transaction().await.unwrap();
+        empty_tx.add_bases(Vec::new()).unwrap();
+        let unchanged = empty_tx.commit().await.unwrap();
+        assert_eq!(unchanged.version_id(), dataset.version_id());
+
+        // Abort drops staged bases without modifying the dataset.
+        let mut abort_tx = dataset.begin_transaction().await.unwrap();
+        abort_tx
+            .add_bases(vec![BasePath::new(
+                0,
+                base_a.to_string(),
+                Some("aborted".into()),
+                true,
+            )])
+            .unwrap();
+        abort_tx.abort();
+        assert!(
+            Dataset::open(dir.as_str())
+                .await
+                .unwrap()
+                .manifest
+                .base_paths
+                .is_empty()
+        );
+
+        // Base-only commit persists the base with no appends or indexes.
+        let mut base_only_tx = dataset.begin_transaction().await.unwrap();
+        base_only_tx
+            .add_bases(vec![BasePath::new(
+                0,
+                base_a.to_string(),
+                Some("base_a".into()),
+                true,
+            )])
+            .unwrap();
+        let after_base_only = base_only_tx.commit().await.unwrap();
+        assert_eq!(after_base_only.version_id(), dataset.version_id() + 1);
+        assert_eq!(after_base_only.manifest.base_paths.len(), 1);
+
+        // Duplicate name or path across two add_bases calls in the same tx fails
+        // while keeping the first base usable with target_all_bases.
+        let mut tx = after_base_only.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            base_b.to_string(),
+            Some("base_b".into()),
+            true,
+        )])
+        .unwrap();
+        let dup_name = tx
+            .add_bases(vec![BasePath::new(
+                0,
+                base_c.to_string(),
+                Some("base_b".into()),
+                true,
+            )])
+            .unwrap_err();
+        assert!(matches!(dup_name, Error::InvalidInput { .. }), "{dup_name}");
+        let dup_path = tx
+            .add_bases(vec![BasePath::new(
+                0,
+                base_b.to_string(),
+                Some("base_c".into()),
+                true,
+            )])
+            .unwrap_err();
+        assert!(matches!(dup_path, Error::InvalidInput { .. }), "{dup_path}");
+
+        tx.append_with_params(
+            vec![id_batch([1, 2, 3, 4])],
+            &WriteParams {
+                max_rows_per_file: 2,
+                target_all_bases: Some(false),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+        let committed = tx.commit().await.unwrap();
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(ids(&reopened).await, [0, 1, 2, 3, 4]);
+        assert_eq!(reopened.manifest.base_paths.len(), 2);
+        let base_ids: std::collections::BTreeSet<u32> = reopened.manifest.fragments[1..]
+            .iter()
+            .map(|f| f.files[0].base_id.expect("expected secondary base_id"))
+            .collect();
+        let registered_ids: std::collections::BTreeSet<u32> =
+            reopened.manifest.base_paths.keys().copied().collect();
+        assert!(
+            base_ids.is_subset(&registered_ids) && !base_ids.is_empty(),
+            "target_all_bases=Some(false) should route fragments to registered bases"
+        );
+        assert_eq!(committed.version_id(), after_base_only.version_id() + 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_staged_add_bases_batch_and_concurrent_rebase(
+        #[values(false, true)] stable: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let racer_base = TempStrDir::default();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                enable_stable_row_ids: stable,
+                ..Default::default()
+            })
+            .execute(vec![id_batch([0])])
+            .await
+            .unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![
+            BasePath::new(0, base_a.to_string(), Some("base_a".into()), true),
+            BasePath::new(0, base_b.to_string(), Some("base_b".into()), true),
+        ])
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([1, 2])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["base_a".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+        tx.append_with_params(
+            vec![id_batch([3, 4])],
+            &WriteParams {
+                target_base_names_or_paths: Some(vec!["base_b".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut racer = dataset.begin_transaction().await.unwrap();
+        racer
+            .add_bases(vec![BasePath::new(
+                0,
+                racer_base.to_string(),
+                Some("racer".into()),
+                true,
+            )])
+            .unwrap();
+        racer
+            .append_with_params(
+                vec![id_batch([5])],
+                &WriteParams {
+                    target_base_names_or_paths: Some(vec!["racer".into()]),
+                    ..append_params()
+                },
+            )
+            .await
+            .unwrap();
+        let after_racer = racer.commit().await.unwrap();
+        let racer_id = after_racer
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("racer"))
+            .unwrap()
+            .id;
+
+        let committed = tx.commit().await.unwrap();
+        assert_eq!(committed.version_id(), after_racer.version_id() + 1);
+
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(ids(&reopened).await, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(reopened.manifest.base_paths.len(), 3);
+        let a_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("base_a"))
+            .unwrap()
+            .id;
+        let b_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("base_b"))
+            .unwrap()
+            .id;
+        assert_ne!(a_id, b_id);
+        assert_ne!(a_id, racer_id);
+        assert_ne!(b_id, racer_id);
+        let base_ids: Vec<Option<u32>> = reopened
+            .manifest
+            .fragments
+            .iter()
+            .map(|f| f.files[0].base_id)
+            .collect();
+        assert_eq!(base_ids, [None, Some(racer_id), Some(a_id), Some(b_id)]);
     }
 }
