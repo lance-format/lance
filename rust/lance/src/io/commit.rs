@@ -1807,7 +1807,9 @@ pub(crate) async fn load_and_sort_new_transactions(
 /// footprint before the next is loaded: a writer thousands of versions behind
 /// holds what each commit touched, never a manifest per version. A commit
 /// whose preceding manifest is gone is left unrecorded, and its check fails
-/// closed.
+/// closed. The one exception is a transaction adding index coverage over
+/// committed fragments, whose repair walks every manifest since it read (see
+/// [`TransactionRebase::needs_committed_history`]).
 pub(crate) async fn record_committed_history(
     rebase: &mut TransactionRebase<'_>,
     dataset: &Dataset,
@@ -1829,27 +1831,34 @@ pub(crate) async fn record_committed_history(
         .iter()
         .map(|(_, transaction, _)| transaction.clone())
         .collect();
-    if !rebase.checks_by_footprint(&committed) {
+    let keeps_history = rebase.needs_committed_history(&committed);
+    if !keeps_history && !rebase.checks_by_footprint(&committed) {
         return Ok(());
     }
     let mut previous = since.clone();
     for (index, (version, transaction, location)) in transactions.iter().enumerate() {
-        if !rebase.needs_committed_manifests(transaction) {
+        let needs_before = rebase.needs_committed_manifests(transaction);
+        if !needs_before && !keeps_history {
             continue;
         }
         let before = if previous.version + 1 == *version {
             Some(previous)
         } else {
             match index.checked_sub(1).map(|index| &transactions[index]) {
-                Some((before_version, _, before_location)) if before_version + 1 == *version => {
+                Some((before_version, _, before_location))
+                    if needs_before && before_version + 1 == *version =>
+                {
                     Some(load(before_location).await?)
                 }
                 _ => None,
             }
         };
         let after = load(location).await?;
-        if let Some(before) = before {
+        if needs_before && let Some(before) = before {
             rebase.record_committed(*version, transaction, &before);
+        }
+        if keeps_history {
+            rebase.record_history(after.clone());
         }
         previous = after;
     }

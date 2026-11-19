@@ -30,6 +30,9 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 };
 use lance_table::system_index::frag_reuse::FragDigest;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
+use lance_table::transaction::action::{
+    Action as TxnAction, CompositeOperation, FieldRef, Ref as ActionRef, UserStep,
+};
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 

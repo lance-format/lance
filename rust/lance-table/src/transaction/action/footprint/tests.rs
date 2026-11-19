@@ -586,7 +586,9 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
     Lands
 )]
 // A compaction carries the indices over the rows it moves through a remap
-// computed when it read; a segment over them since is left stale.
+// computed when it read; a segment over them since is left stale. One built
+// before it follows a recorded move, repaired after the check; whether the
+// move was recorded only the resolver can tell (`compacted_fragments`).
 #[case::a_compaction_and_a_segment_over_it(legacy_rewrite(0), index_over(&[0]), Conflicts, Lands)]
 #[case::a_compaction_and_a_segment_elsewhere(legacy_rewrite(0), index_over(&[1]), Lands, Lands)]
 #[case::a_compaction_and_a_rewrite_of_it(legacy_rewrite(0), replace_c(0), Conflicts, Conflicts)]
@@ -718,15 +720,16 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
 #[case::cells_and_a_removal(assert_c_unchanged_in(0), remove(0), Conflicts, Lands)]
 #[case::cells_and_a_drop(assert_c_unchanged_in(0), drop_c(), Conflicts, Lands)]
 #[case::cells_and_a_rewrite_of_another_field(assert_c_unchanged_in(0), replace(A, 0), Lands, Lands)]
-// Indices: a segment landing after a rewrite of what it indexes would describe
-// values it never saw; landing first, the rewrite prunes it as it applies.
-// Removals and overlays leave a trace a reader can act on.
-#[case::a_segment_and_a_rewrite_of_its_column(index_over(&[0]), replace(A, 0), Conflicts, Lands)]
-#[case::a_segment_and_a_reencode_of_its_column(index_over(&[0]), reencode(A, 0), Conflicts, Lands)]
+// Indices: a segment landing after a rewrite of what it indexes gives up the
+// rewritten fragments after the check (`coverage_repair`); landing first, the
+// rewrite prunes it as it applies. Removals and overlays leave a trace a
+// reader can act on.
+#[case::a_segment_and_a_rewrite_of_its_column(index_over(&[0]), replace(A, 0), Lands, Lands)]
+#[case::a_segment_and_a_reencode_of_its_column(index_over(&[0]), reencode(A, 0), Lands, Lands)]
 #[case::a_segment_and_a_rewrite_of_a_column_it_carries(
     index_of(segment_parts("idx", &[A], &[C], &[0])),
     replace_c(0),
-    Conflicts,
+    Lands,
     Lands
 )]
 #[case::a_segment_and_a_rewrite_beside_a_removal(
@@ -735,13 +738,13 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
         Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
         Action::TombstoneFieldData(TombstoneFieldData::new(Ref::Committed(0), vec![FieldRef::Committed(A)])),
     ]),
-    Conflicts,
+    Lands,
     Lands
 )]
 #[case::a_segment_over_a_struct_and_a_write_of_its_child(
     index_of(segment_parts("idx", &[S], &[], &[1])),
     write_into(1, S + 1),
-    Conflicts,
+    Lands,
     Lands
 )]
 #[case::a_segment_and_a_drop_of_its_column(
@@ -1232,6 +1235,26 @@ fn test_a_compaction_over_index_writes(#[case] theirs: Vec<Action>, #[case] conf
     );
 }
 
+/// A widened segment follows the rows a compaction moves, as a new segment
+/// does: whether it still describes them, or the move was recorded at all, is
+/// settled by the resolver.
+#[test]
+fn test_a_widening_lands_over_a_compaction() {
+    let widen = set(vec![widening(&[A], &[], 0)]);
+    assert_eq!(outcome(&widen, &legacy_rewrite(0)), Lands);
+}
+
+/// A compaction states the fragments it moved, recorded or not.
+#[test]
+fn test_a_compaction_states_the_fragments_it_moved() {
+    let read = table();
+    let compaction = Footprint::of(
+        &Transaction::new(read.version, legacy_rewrite(0), None),
+        &read,
+    );
+    assert_eq!(compaction.compacted_fragments(), &HashSet::from([0]));
+}
+
 /// A struct made non-nullable holds only if no values were written for it or,
 /// through it, for a child, which may null the struct's rows. Values for an
 /// unrelated field leave it valid.
@@ -1364,26 +1387,6 @@ fn test_interleaved_row_ids_do_not_collide() {
         supplying(&[20, 40]).check(&window),
         Verdict::Compatible
     ));
-}
-
-/// A widening holds only while the columns it covers are the ones its remap
-/// was planned against, so it cannot land after a rewrite of a keyed or
-/// carried column, nor over a fragment removed since; an overlay is masked by
-/// the read path instead. Landing first, a widening leaves the manifest's
-/// fragments as they were.
-#[rstest]
-#[case::a_keyed_column_rewritten(replace(A, 0), Conflicts)]
-#[case::a_carried_column_rewritten(replace_c(0), Conflicts)]
-#[case::an_unrelated_column_rewritten(replace(A, 1), Lands)]
-#[case::the_fragment_removed(remove(0), Conflicts)]
-#[case::an_overlay(overlay(0), Lands)]
-fn test_a_widening_over_a_change_to_what_it_covers(
-    #[case] theirs: Operation,
-    #[case] expected: Outcome,
-) {
-    let widen = set(vec![widening(&[A], &[C], 0)]);
-    assert_eq!(outcome(&widen, &theirs), expected);
-    assert_eq!(by_footprints(&theirs, &widen), Lands);
 }
 
 /// A child made non-nullable holds only if no values were written for it or

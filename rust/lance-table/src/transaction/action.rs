@@ -149,6 +149,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, Result,
 };
+use uuid::Uuid;
 
 /// A reference to a counter-allocated fragment id or base id that may not have
 /// been assigned yet. Field ids use [`FieldRef`].
@@ -383,6 +384,27 @@ impl CompositeOperation {
                 }
                 _ => true,
             });
+        }
+    }
+
+    /// Withdraw committed `fragment` from the coverage this operation gives
+    /// segment `uuid`, whether it adds the segment or widens an existing one.
+    /// Coverage loss is always legal: a reader scans the rows instead.
+    pub fn withdraw_index_coverage(&mut self, uuid: Uuid, fragment: u64) {
+        for action in self
+            .steps
+            .iter_mut()
+            .flat_map(|step| step.actions.iter_mut())
+        {
+            match action {
+                Action::AddIndexSegment(segment) if segment.parts().uuid == uuid => {
+                    segment.forget_covered_fragment(fragment);
+                }
+                Action::AdjustIndexCoverage(adjust) if adjust.parts().uuid == uuid => {
+                    adjust.forget_added_fragment(fragment);
+                }
+                _ => {}
+            }
         }
     }
 }
