@@ -364,19 +364,46 @@ async fn sparse_take_cancel_error_and_retry(#[values(false, true)] lite: bool) {
 }
 
 #[rstest]
+#[case::v2_2_zstd(
+    ConcreteFileVersion::V2_2,
+    "zstd",
+    CompressionScheme::CompressionAlgorithmZstd
+)]
+#[case::v2_2_lz4_hint_stores_zstd(
+    ConcreteFileVersion::V2_2,
+    "lz4",
+    CompressionScheme::CompressionAlgorithmZstd
+)]
+#[case::v2_3_zstd(
+    ConcreteFileVersion::V2_3,
+    "zstd",
+    CompressionScheme::CompressionAlgorithmZstd
+)]
+#[case::v2_3_lz4(
+    ConcreteFileVersion::V2_3,
+    "lz4",
+    CompressionScheme::CompressionAlgorithmLz4
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn compressed_cross_page_take_reuses_unzip_workspace(
-    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[case] version: ConcreteFileVersion,
+    #[case] compression_hint: &str,
+    #[case] stored_compression: CompressionScheme,
     #[values(false, true)] lite: bool,
     #[values(false, true)] nested: bool,
-    #[values("zstd", "lz4")] compression: &str,
 ) {
+    // V2_2 keeps nullable FullZip pages readable by released readers by ignoring
+    // LZ4 hints and using Zstd. V2_3 honors both codecs. Check the stored codec
+    // independently of the hint before attributing the read to either decoder.
     let metadata = HashMap::from([
         (
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             STRUCTURAL_ENCODING_FULLZIP.to_string(),
         ),
-        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
+        (
+            COMPRESSION_META_KEY.to_string(),
+            compression_hint.to_string(),
+        ),
     ]);
     // Independent deterministic bytes keep compressed input comparable to output.
     // Repeated strings would conceal the intermediate ownership cost.
@@ -454,11 +481,7 @@ async fn compressed_cross_page_take_reuses_unzip_workspace(
         };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),
-            if compression == "zstd" {
-                CompressionScheme::CompressionAlgorithmZstd
-            } else {
-                CompressionScheme::CompressionAlgorithmLz4
-            }
+            stored_compression
         );
     }
     let indices = (0..expected.len() as u32).collect::<Vec<_>>();
