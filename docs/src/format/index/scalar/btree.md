@@ -92,13 +92,15 @@ A BTree index with a `key_layout` has one or more keys and stores them in the
 composite index. With one key it is a single-column index whose direction and
 null placement are set explicitly.
 
-The index orders rows by the tuple of their key values, compared one key at a
-time. Each key keeps its own order inside the tuple order, once its direction
-and null placement are applied. When two tuples have equal values for every
-earlier key, they compare as their values of the next key compare. Each page
-key is one byte string that encodes the whole tuple, and byte order equals
-tuple order, so the page lookup above finds pages by comparing encoded keys as
-bytes. Nulls are part of the encoded tuple, so the null handling in
+The index sorts rows lexicographically by their tuple of key values: compare
+the first key, and if the values are equal, compare the second key, and so on.
+Each comparison uses that key's direction and null placement.
+
+Each page key is a single byte string that encodes the whole tuple, such that
+comparing two encoded keys as bytes gives the same result as comparing their
+tuples. The page lookup above therefore works unchanged on encoded keys.
+
+Because nulls are encoded as part of the tuple, the null handling in
 [Accelerated Queries](#accelerated-queries) does not apply to an index with a
 `key_layout`.
 
