@@ -221,10 +221,14 @@ impl Footprint {
     }
 
     /// A fragment a `Delete` or `Update` restates whole from its read version,
-    /// with deletions added. Any change to it since conflicts, a concurrent
-    /// deletion included.
+    /// with deletions added. Legacy merges a concurrent deletion into the
+    /// restatement row by row, so the deletions are taken as an addition.
     fn restate_with_deletions_added(&mut self, fragment: u64) {
-        self.read_whole_fragment(fragment);
+        self.read(Part::FragmentExists(fragment));
+        self.read(Part::DataFiles(fragment));
+        self.read(Part::Overlays(fragment));
+        self.read(Part::RowVersions(fragment));
+        self.read(Part::MergedDeletions(fragment));
     }
 
     /// Fragments added with rows that were not in the dataset before. Their

@@ -395,6 +395,7 @@ fn legacy_rewrite(old: u64) -> Operation {
 #[derive(Debug, PartialEq)]
 enum Outcome {
     Lands,
+    Rebases(Vec<Overlap>),
     Conflicts,
 }
 use Outcome::{Conflicts, Lands};
@@ -418,12 +419,17 @@ fn outcome_at(read: &Manifest, ours: &Operation, theirs: &Operation) -> Outcome 
     let window = Window::new(read, &latest, vec![Footprint::of(&committed, read)]);
     match pending.check(&window) {
         Verdict::Compatible => Outcome::Lands,
+        Verdict::Rebase(overlaps) => Outcome::Rebases(overlaps),
         Verdict::Conflict(_) => Outcome::Conflicts,
     }
 }
 
 fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
     outcome_at(&table(), ours, theirs)
+}
+
+fn deletions_merge(fragment: u64) -> Outcome {
+    Outcome::Rebases(vec![Overlap::Deletions { fragment }])
 }
 
 /// Each pair in both orders: `ours` landing after `theirs`, then `theirs`
@@ -436,10 +442,14 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
 #[case::a_rewrite_and_a_delete(replace_c(0), delete_rows(0), Lands, Lands)]
 #[case::a_rewrite_and_an_append(replace_c(0), append(), Lands, Lands)]
 #[case::two_appends(append(), append(), Lands, Lands)]
-// Deletions added on both sides conflict: the fragment's deletions are read
-// whole.
-#[case::two_deletes(delete_rows(0), delete_rows(0), Conflicts, Conflicts)]
-#[case::a_delete_and_a_moving_update(delete_rows(0), moving_update(0), Conflicts, Conflicts)]
+// Deletions added on both sides merge row by row.
+#[case::two_deletes(delete_rows(0), delete_rows(0), deletions_merge(0), deletions_merge(0))]
+#[case::a_delete_and_a_moving_update(
+    delete_rows(0),
+    moving_update(0),
+    deletions_merge(0),
+    deletions_merge(0)
+)]
 // A row-moving update copies the values it read; a write of the fragment's
 // files is lost on the moved rows, in either order.
 #[case::a_moving_update_and_a_rewrite(moving_update(0), replace_c(0), Conflicts, Conflicts)]
@@ -539,7 +549,12 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
 #[case::a_reset_and_an_append(reset(), append(), Lands, Conflicts)]
 #[case::a_reset_and_a_rewrite(reset(), replace_c(0), Lands, Conflicts)]
 // Named operations: post-images are read whole.
-#[case::a_legacy_delete_and_a_delete(legacy_delete(), delete_rows(0), Conflicts, Conflicts)]
+#[case::a_legacy_delete_and_a_delete(
+    legacy_delete(),
+    delete_rows(0),
+    deletions_merge(0),
+    deletions_merge(0)
+)]
 #[case::a_legacy_delete_and_a_rewrite(legacy_delete(), replace_c(0), Conflicts, Lands)]
 #[case::a_legacy_update_and_a_rename(
     legacy_update(vec![restated_with_deletions()], vec![]),
@@ -959,6 +974,7 @@ fn test_named_new_fragments_claim_their_row_ids(
         let committed = Footprint::of(&Transaction::new(read.version, theirs.clone(), None), &read);
         match pending.check(&Window::new(&read, &read, vec![committed])) {
             Verdict::Compatible => Lands,
+            Verdict::Rebase(overlaps) => Outcome::Rebases(overlaps),
             Verdict::Conflict(_) => Conflicts,
         }
     };
@@ -1308,6 +1324,7 @@ fn by_footprints(ours: &Operation, theirs: &Operation) -> Outcome {
     let committed = Footprint::of(&Transaction::new(read.version, theirs.clone(), None), &read);
     match pending.check(&Window::new(&read, &read, vec![committed])) {
         Verdict::Compatible => Lands,
+        Verdict::Rebase(overlaps) => Outcome::Rebases(overlaps),
         Verdict::Conflict(_) => Conflicts,
     }
 }

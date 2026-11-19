@@ -4,7 +4,7 @@
 //! The commits that landed after a pending transaction read, seen as one
 //! change of state, and the check of a pending [`Footprint`] against it.
 
-use super::{ConfigMap, Footprint, Part, Verdict};
+use super::{ConfigMap, Footprint, Overlap, Part, Verdict};
 use crate::format::overlay::DataOverlayFile;
 use crate::format::{DataFile, DeletionFile, Fragment, Manifest, RowDatasetVersionMeta, RowIdMeta};
 use lance_core::datatypes::{Field, LogicalType};
@@ -47,6 +47,32 @@ impl<'a> Window<'a> {
         self.fragment_lookups.get()
     }
 
+    /// Whether `part` changed, and if it changed in a way that can be rebased
+    /// past, how.
+    fn admits(&self, part: &Part) -> Result<Option<Overlap>, String> {
+        let conflict = || Err(format!("{part:?} changed"));
+        if let Part::MergedDeletions(id) = part {
+            let (Some(read), Some(latest)) = (
+                self.fragment(self.read, *id),
+                self.fragment(self.latest, *id),
+            ) else {
+                return conflict();
+            };
+            return if read.deletion_file == latest.deletion_file {
+                Ok(None)
+            } else if adds_deletions(read, latest) {
+                Ok(Some(Overlap::Deletions { fragment: *id }))
+            } else {
+                conflict()
+            };
+        }
+        if self.changed(part) {
+            conflict()
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Whether `part` differs between the read and the latest manifest.
     fn changed(&self, part: &Part) -> bool {
         let (read, latest) = (self.read, self.latest);
@@ -57,7 +83,8 @@ impl<'a> Window<'a> {
             Part::DataFiles(id)
             | Part::Overlays(id)
             | Part::RowVersions(id)
-            | Part::Deletions(id) => self.piece_changed(*id, part),
+            | Part::Deletions(id)
+            | Part::MergedDeletions(id) => self.piece_changed(*id, part),
             Part::FieldData { fragment, field } => {
                 self.fragment(read, *fragment).map(|f| backing(f, *field))
                     != self.fragment(latest, *fragment).map(|f| backing(f, *field))
@@ -166,7 +193,7 @@ impl<'a> Window<'a> {
             Part::DataFiles(_) => read.data_files != latest.data_files,
             Part::Overlays(_) => read.overlays != latest.overlays,
             Part::RowVersions(_) => read.row_versions != latest.row_versions,
-            Part::Deletions(_) => read.deletions != latest.deletions,
+            Part::Deletions(_) | Part::MergedDeletions(_) => read.deletions != latest.deletions,
             _ => unreachable!("{part:?} is not a piece of a fragment"),
         }
     }
@@ -222,14 +249,16 @@ impl Footprint {
     /// What it takes for this transaction, pending, to land at the end of
     /// `window`.
     pub fn check(&self, window: &Window<'_>) -> Verdict {
-        match self.conflict_in(window) {
-            Ok(()) => Verdict::Compatible,
+        match self.overlaps_in(window) {
+            Ok(overlaps) if overlaps.is_empty() => Verdict::Compatible,
+            Ok(overlaps) => Verdict::Rebase(overlaps),
             Err(reason) => Verdict::Conflict(reason),
         }
     }
 
-    /// Why this transaction cannot land at the end of `window`, if it cannot.
-    fn conflict_in(&self, window: &Window<'_>) -> Result<(), String> {
+    /// The changes in `window` this transaction can be rebased past, or why
+    /// it cannot land at all.
+    fn overlaps_in(&self, window: &Window<'_>) -> Result<Vec<Overlap>, String> {
         if self.did.opaque {
             return Err("what this transaction touches cannot be stated".into());
         }
@@ -243,9 +272,11 @@ impl Footprint {
             }
         }
 
-        if let Some(part) = self.parts.iter().find(|part| window.changed(part)) {
-            return Err(format!("{part:?} changed"));
+        let mut overlaps = Vec::new();
+        for part in &self.parts {
+            overlaps.extend(window.admits(part)?);
         }
+        overlaps.sort_unstable();
 
         for theirs in committed {
             if let Some(forbid) = self
@@ -256,7 +287,7 @@ impl Footprint {
                 return Err(forbid.describe());
             }
         }
-        Ok(())
+        Ok(overlaps)
     }
 }
 
@@ -306,5 +337,22 @@ fn map_of<'m>(manifest: &'m Manifest, map: &ConfigMap) -> Option<&'m HashMap<Str
             .schema
             .field_by_id(*id)
             .map(|field| &field.metadata),
+    }
+}
+
+/// Whether `latest`'s deletions can only have added to `read`'s, as far as
+/// the manifests tell: there is a deletion file, and it counts no fewer rows.
+/// The rebase that merges them reads both files to make sure.
+fn adds_deletions(read: &Fragment, latest: &Fragment) -> bool {
+    let deleted = |fragment: &Fragment| {
+        fragment
+            .deletion_file
+            .as_ref()
+            .map(|file| file.num_deleted_rows)
+    };
+    match (deleted(read), deleted(latest)) {
+        (_, None) => false,
+        (Some(Some(read)), Some(Some(latest))) => latest >= read,
+        _ => true,
     }
 }

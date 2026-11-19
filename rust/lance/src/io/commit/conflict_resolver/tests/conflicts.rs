@@ -1292,6 +1292,165 @@ async fn test_data_overlay_finish_conflicts_with_row_moving_update(
     }
 }
 
+/// Which form a side of [`test_overlay_against_a_row_moving_update_across_forms`]
+/// takes, and whether it is the one committing over the other.
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    LegacyOverlay,
+    ActionOverlay,
+    LegacyUpdate,
+    ActionUpdate,
+}
+
+/// The mixed-form counterparts of
+/// `test_data_overlay_finish_conflicts_with_row_moving_update`: an overlay
+/// and an update that moves row 0 of fragment 0 out to a new fragment
+/// collide whichever side is an action set and whichever commits first.
+/// Unlike two named operations, which rows moved is not checked against the
+/// overlay's coverage: any move out of an overlaid fragment conflicts.
+#[tokio::test]
+#[rstest::rstest]
+async fn test_overlay_against_a_row_moving_update_across_forms(
+    #[values(
+        (Side::LegacyOverlay, Side::ActionUpdate),
+        (Side::ActionOverlay, Side::LegacyUpdate),
+        (Side::ActionOverlay, Side::ActionUpdate),
+        (Side::ActionUpdate, Side::LegacyOverlay),
+        (Side::ActionUpdate, Side::ActionOverlay)
+    )]
+    sides: (Side, Side),
+    #[values((vec![0u32], true), (vec![3u32], true))] coverage: (Vec<u32>, bool),
+) {
+    use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use lance_table::transaction::action::{
+        Action as TxnAction, AddDataFile, AddFragment, AddFragmentParts, AddOverlays,
+        CompositeOperation, FieldRef, Ref as ActionRef, SetDeletionFile, UserStep,
+    };
+
+    let (ours, theirs) = sides;
+    let (coverage, expect_conflict) = coverage;
+    let dataset = test_dataset(5, 1).await;
+    let mut fragment = dataset.fragments().as_slice()[0].clone();
+    let deleted = apply_deletion(&[0], &mut fragment, &dataset).await;
+    let data_file = |path: &str| {
+        Fragment::new(0)
+            .with_file(
+                path,
+                vec![0],
+                vec![0],
+                LanceFileVersion::Stable.resolve(),
+                NonZero::new(10),
+            )
+            .files
+            .remove(0)
+    };
+    let moved_file = data_file("moved.lance");
+    let overlay = DataOverlayFile {
+        data_file: data_file("overlay.lance"),
+        coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(coverage)),
+        committed_version: 0,
+    };
+
+    let stage = |side: Side| {
+        let operation = match side {
+            Side::LegacyOverlay => Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id: 0,
+                    overlays: vec![overlay.clone()],
+                }],
+            },
+            Side::ActionOverlay => {
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "overlay",
+                    vec![TxnAction::AddOverlays(AddOverlays::new_unchecked(
+                        ActionRef::Committed(0),
+                        vec![overlay.clone()],
+                    ))],
+                )]))
+            }
+            Side::LegacyUpdate => Operation::Update {
+                updated_fragments: vec![deleted.clone()],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![{
+                    let mut moved = Fragment::new(0).with_physical_rows(1);
+                    moved.files.push(moved_file.clone());
+                    moved
+                }],
+                fields_modified: vec![],
+                compacted_sstables: Vec::new(),
+                mem_wal_dir_id: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            Side::ActionUpdate => {
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "update",
+                    vec![
+                        TxnAction::SetDeletionFile(
+                            SetDeletionFile::try_new_unchecked(
+                                0,
+                                deleted.deletion_file.clone().expect("row 0 is deleted"),
+                                None,
+                                true,
+                            )
+                            .unwrap(),
+                        ),
+                        TxnAction::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+                            id: ActionRef::Local(0),
+                            physical_rows: 1,
+                            row_id_meta: None,
+                            last_updated_at_version_meta: None,
+                            created_at_version_meta: None,
+                            data_change: true,
+                        })),
+                        TxnAction::AddDataFile(
+                            AddDataFile::try_new_unchecked(
+                                ActionRef::Local(0),
+                                DataFile {
+                                    fields: Default::default(),
+                                    ..moved_file.clone()
+                                },
+                                vec![FieldRef::Committed(0)],
+                                None,
+                                true,
+                            )
+                            .unwrap(),
+                        ),
+                    ],
+                )]))
+            }
+        };
+        Transaction::new_from_version(dataset.manifest.version, operation)
+    };
+    let commit = |dataset: &Dataset, side: Side, transaction: Transaction| {
+        let mut builder = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true);
+        if matches!(side, Side::LegacyUpdate | Side::ActionUpdate) {
+            builder = builder.with_affected_rows(RowAddrTreeMap::from_iter([0u64]));
+        }
+        builder.execute(transaction)
+    };
+
+    commit(&dataset, theirs, stage(theirs)).await.unwrap();
+    let result = commit(&dataset, ours, stage(ours)).await;
+    if expect_conflict {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{ours:?} over {theirs:?}: an overlay covering the moved row conflicts, got \
+             {result:?}"
+        );
+    } else {
+        assert!(
+            result.is_ok(),
+            "{ours:?} over {theirs:?}: an overlay disjoint from the moved row lands, got \
+             {result:?}"
+        );
+    }
+}
+
 #[rstest::rstest]
 #[test]
 #[case::indexed_field_updated(0, vec![0])]
@@ -2141,4 +2300,95 @@ async fn test_conflicts_data_replacement() {
             }
         }
     }
+}
+
+/// A deletion file a rebase merged on one attempt is what the next attempt
+/// merges onto: a retry meeting another concurrent deletion of the same
+/// fragment merges that one too, rather than finding its file adds rows it
+/// did not delete.
+#[tokio::test]
+async fn test_an_action_delete_merges_deletions_again_on_a_retry() {
+    use lance_table::transaction::action::{
+        Action as TxnAction, CompositeOperation, SetDeletionFile, UserStep,
+    };
+
+    let read = test_dataset(5, 1).await;
+    let delete_legacy = |dataset: Dataset, row: u32| async move {
+        let mut fragment = dataset.fragments()[0].clone();
+        let updated = apply_deletion(&[row], &mut fragment, &dataset).await;
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(Transaction::new_from_version(
+                dataset.manifest.version,
+                Operation::Delete {
+                    updated_fragments: vec![updated],
+                    deleted_fragment_ids: vec![],
+                    predicate: format!("a = {row}"),
+                },
+            ))
+            .await
+            .unwrap()
+    };
+    let mut ours_fragment = read.fragments()[0].clone();
+    let ours_deleted = apply_deletion(&[0], &mut ours_fragment, &read).await;
+    let mut ours = Transaction::new_from_version(
+        read.manifest.version,
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "delete",
+            vec![TxnAction::SetDeletionFile(
+                SetDeletionFile::try_new_unchecked(
+                    0,
+                    ours_deleted.deletion_file.clone().unwrap(),
+                    None,
+                    true,
+                )
+                .unwrap(),
+            )],
+        )])),
+    );
+    let affected = RowAddrTreeMap::from_iter([0u64]);
+
+    let mut checked_since = read.clone();
+    for row in [1, 2] {
+        let latest = delete_legacy(checked_since.clone(), row).await;
+        let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(&checked_since)
+            .await
+            .unwrap();
+        let mut rebase = TransactionRebase::try_new(&read, ours, Some(&affected))
+            .await
+            .unwrap()
+            .with_read_version_dataset(&read);
+        crate::io::commit::record_committed_history(
+            &mut rebase,
+            &latest,
+            checked_since.manifest.clone(),
+            &transactions,
+        )
+        .await
+        .unwrap();
+        let committed: Vec<(u64, &Transaction)> = transactions
+            .iter()
+            .map(|(version, transaction, _)| (*version, transaction.as_ref()))
+            .collect();
+        rebase.check_txns(&committed).unwrap();
+        ours = rebase
+            .finish(&latest)
+            .await
+            .unwrap_or_else(|error| panic!("attempt merging row {row}'s deletion: {error}"));
+        checked_since = latest;
+    }
+
+    let Operation::CompositeOperation(composite_operation) = &ours.operation else {
+        unreachable!()
+    };
+    let Some(TxnAction::SetDeletionFile(set)) = composite_operation.iter_actions().next() else {
+        panic!("expected the merged deletion file")
+    };
+    let merged =
+        crate::io::deletion::read_dataset_deletion_file(&checked_since, 0, set.deletion_file())
+            .await
+            .unwrap();
+    assert_eq!(
+        RoaringBitmap::from(merged.as_ref()),
+        RoaringBitmap::from_iter([0u32, 1, 2])
+    );
 }
