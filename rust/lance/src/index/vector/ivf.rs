@@ -429,6 +429,14 @@ pub(crate) fn select_steady_state_rebalance(
     let mut join_threshold = None;
 
     for (metadata, index) in logical_index.segments() {
+        // The legacy writer keeps the partitions it is given, so rebalancing a
+        // legacy segment would rewrite the same file on every optimize.
+        // An index with a legacy segment never joins either: its segments do
+        // not share a storage format, or all are legacy and leave no join
+        // threshold.
+        if index.as_any().is::<IVFIndex>() {
+            continue;
+        }
         let index_type = index_type_for_segmented_optimize(index.as_ref())?;
         let target_partition_size = metadata
             .index_details
@@ -1033,6 +1041,33 @@ pub(crate) async fn optimize_vector_indices(
         .await;
     }
 
+    let first_idx = existing_indices[0]
+        .as_any()
+        .downcast_ref::<IVFIndex>()
+        .ok_or(Error::index(
+            "optimizing vector index: the first index isn't IVF".to_string(),
+        ))?;
+    let legacy_sub_index = first_idx.sub_index.as_any();
+    if !legacy_sub_index.is::<PQIndex>() && !legacy_sub_index.is::<HNSWIndex<ScalarQuantizer>>() {
+        let (sub_index_type, quantization_type) = first_idx.sub_index.sub_index_type();
+        return Err(Error::not_supported(format!(
+            "optimizing vector index: a legacy-format {} index cannot be optimized \
+             incrementally; set retrain to rebuild it in the current format",
+            index_type_string(sub_index_type, quantization_type)
+        )));
+    }
+    // The legacy writers keep every posting of the segments they merge. With
+    // stable row ids an updated row keeps its id in its new fragment, so its
+    // old entry would stay in the index next to the new one.
+    if dataset.manifest.uses_stable_row_ids() && options.num_indices_to_merge != Some(0) {
+        return Err(Error::not_supported(
+            "optimizing vector index: a legacy-format vector index cannot merge segments on a \
+             table with stable row ids; set num_indices_to_merge to 0 to append a segment, or \
+             set retrain to rebuild the index in the current format"
+                .to_string(),
+        ));
+    }
+
     let new_uuid = Uuid::new_v4();
     let object_store = dataset.object_store.as_ref();
     let index_file = dataset
@@ -1040,13 +1075,6 @@ pub(crate) async fn optimize_vector_indices(
         .join(new_uuid.to_string())
         .join(INDEX_FILE_NAME);
     let writer = object_store.create(&index_file).await?;
-
-    let first_idx = existing_indices[0]
-        .as_any()
-        .downcast_ref::<IVFIndex>()
-        .ok_or(Error::index(
-            "optimizing vector index: the first index isn't IVF".to_string(),
-        ))?;
 
     let (merged, files) =
         if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
@@ -1085,8 +1113,8 @@ pub(crate) async fn optimize_vector_indices(
             )
             .await?
         } else {
-            return Err(Error::index(
-                "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
+            return Err(Error::internal(
+                "optimizing vector index: the legacy sub index was checked above".to_string(),
             ));
         };
 
@@ -1294,6 +1322,27 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .await?
             }
         }
+        // IVF_HNSW_FLAT (binary vectors)
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                derive_hnsw_params(reference_index.as_ref()),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_index_sources(existing_indices.clone())
+            .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
+            .shuffle_data_input(unindexed)
+            .build()
+            .await?
+        }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
@@ -1356,13 +1405,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .shuffle_data_input(unindexed)
             .build()
             .await?
-        }
-        (sub_index_type, quantization_type) => {
-            unimplemented!(
-                "unsupported index type: {}, {}",
-                sub_index_type,
-                quantization_type
-            )
         }
     };
 
@@ -1915,7 +1957,9 @@ impl VectorIndex for IVFIndex {
     }
 
     fn quantizer(&self) -> Quantizer {
-        unimplemented!("only for v2 IVFIndex")
+        // A legacy index keeps its quantizer on the sub-index. The shared-model
+        // check in `optimize_vector_indices` reads it before the v1/v2 dispatch.
+        self.sub_index.quantizer()
     }
 
     fn partition_size(&self, part_id: usize) -> usize {
@@ -1924,7 +1968,7 @@ impl VectorIndex for IVFIndex {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
-        unimplemented!("only for v2 IVFIndex")
+        self.sub_index.sub_index_type()
     }
 
     fn metric_type(&self) -> MetricType {
