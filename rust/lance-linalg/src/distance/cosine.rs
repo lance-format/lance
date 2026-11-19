@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
+use num_traits::AsPrimitive;
 
 use super::{
     BatchKernel, Dot, Normalize, assert_batch_output_layout, assert_equal_lengths,
@@ -317,6 +318,16 @@ impl Cosine for f64 {
         assert_equal_lengths(x.len(), y.len());
         COSINE_F64.get().call(x, x_norm, y)
     }
+
+    fn cosine_with_norms(x: &[Self], x_norm: f32, y_norm: f32, y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
+        let xy = x.iter().zip(y).map(|(&a, &b)| a * b).sum::<Self>();
+        if x_norm.is_normal() && y_norm.is_normal() && xy.is_finite() {
+            (1.0 - xy / Self::from(x_norm) / Self::from(y_norm)) as f32
+        } else {
+            cosine_scaled(x, y)
+        }
+    }
 }
 
 lance_core::dispatch! {
@@ -401,7 +412,7 @@ lance_core::target_kernel! {
     #[candidate(COSINE_F32_PORTABLE: CosineKernel<f32>)]
     #[inline]
     fn cosine_f32_portable(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        cosine_scalar(x, x_norm, y)
+        cosine_f32_scalar(x, x_norm, y)
     }
 }
 
@@ -411,7 +422,8 @@ lance_core::target_kernel! {
     #[candidate(COSINE_WITH_NORMS_F32_PORTABLE: CosineWithNormsKernel)]
     #[inline]
     fn cosine_with_norms_f32_portable(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-        cosine_scalar_fast(x, x_norm, y, y_norm)
+        let xy = dot(x, y);
+        cosine_f32_checked(x, x_norm, y, y_norm, xy, 1.0 - xy / (x_norm * y_norm))
     }
 }
 
@@ -429,7 +441,7 @@ lance_core::target_kernel! {
         {
             let key = x86::Sse8::new(key);
             for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                *distance = key.cosine(x_norm, y);
+                *distance = key.cosine(x, x_norm, y);
             }
         } else if dimension == 16
             && let Ok(key) = <&[f32; 16]>::try_from(x)
@@ -439,11 +451,11 @@ lance_core::target_kernel! {
                     .iter()
                     .zip(y)
                     .fold((0.0f32, 0.0f32), |(xy, y2), (&a, &b)| (xy + a * b, y2 + b * b));
-                *distance = 1.0 - xy / x_norm / y2.sqrt();
+                *distance = cosine_f32_from_sums(x, x_norm, y, y2, xy);
             }
         } else {
             for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = cosine_scalar(x, x_norm, y);
+                *distance = cosine_f32_scalar(x, x_norm, y);
             }
         }
     }
@@ -455,7 +467,9 @@ lance_core::target_kernel! {
     #[candidate(COSINE_F64_PORTABLE: CosineKernel<f64>)]
     #[inline]
     fn cosine_f64_portable(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-        cosine_scalar(x, x_norm, y)
+        let yy = y.iter().map(|&v| v * v).sum();
+        let xy = x.iter().zip(y).map(|(&a, &b)| a * b).sum();
+        cosine_f64_from_sums(x, x_norm, y, yy, xy)
     }
 }
 
@@ -463,7 +477,10 @@ lance_core::target_kernel! {
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::{CosineKernel, CosineWithNormsKernel, dot, norm_l2, norm_l2_impl};
+    use super::{
+        CosineKernel, CosineWithNormsKernel, cosine_f32_checked, cosine_f32_from_sums,
+        cosine_f64_from_sums, dot, norm_l2, norm_l2_impl,
+    };
     use crate::distance::BatchKernel;
     use crate::simd::f32::{f32x8, f32x16};
     use crate::simd::f64::{f64x4, f64x8};
@@ -492,14 +509,14 @@ mod x86 {
         }
 
         #[inline]
-        pub(super) fn cosine(&self, key_norm: f32, y: &[f32; 8]) -> f32 {
+        pub(super) fn cosine(&self, x: &[f32], key_norm: f32, y: &[f32; 8]) -> f32 {
             // SAFETY: both loads read within the eight-element array, and
             // x86_64 guarantees SSE.
             unsafe {
                 let (lo, hi) = (_mm_loadu_ps(y.as_ptr()), _mm_loadu_ps(y.as_ptr().add(4)));
                 let xy = _mm_add_ps(_mm_mul_ps(self.lo, lo), _mm_mul_ps(self.hi, hi));
                 let y2 = _mm_add_ps(_mm_mul_ps(lo, lo), _mm_mul_ps(hi, hi));
-                1.0 - hsum128_ps(xy) / key_norm / hsum128_ps(y2).sqrt()
+                cosine_f32_from_sums(x, key_norm, y, hsum128_ps(y2), hsum128_ps(xy))
             }
         }
     }
@@ -535,7 +552,7 @@ mod x86 {
             // keeps every candidate bit-identical.
             let key = Sse8::new(key);
             for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                *distance = key.cosine(x_norm, y);
+                *distance = key.cosine(x, x_norm, y);
             }
             true
         } else if dimension == 16
@@ -545,10 +562,10 @@ mod x86 {
             let key = unsafe { f32x16::load_unaligned(key.as_ptr()) };
             for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
                 // SAFETY: the load reads within the sixteen-element array.
-                let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
-                let xy = key * y;
-                let y2 = y * y;
-                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
+                let yv = unsafe { f32x16::load_unaligned(y.as_ptr()) };
+                let xy = key * yv;
+                let y2 = yv * yv;
+                *distance = cosine_f32_from_sums(x, x_norm, y, y2.reduce_sum(), xy.reduce_sum());
             }
             true
         } else {
@@ -642,7 +659,7 @@ mod x86 {
                 yy += other[i] * other[i];
             }
 
-            1.0 - xy / x_norm / yy.sqrt()
+            cosine_f32_from_sums(x, x_norm, other, yy, xy)
         }
     }
 
@@ -692,7 +709,7 @@ mod x86 {
             let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
             let xy =
                 xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
-            1.0 - xy / x_norm / y_norm.sqrt()
+            cosine_f32_from_sums(x, x_norm, other, y_norm, xy)
         }
     }
 
@@ -727,7 +744,7 @@ mod x86 {
             let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
             let y_norm = yy_main + tail_norm.powi(2);
             let xy = xy_main + dot(&x[aligned_len..], &other[aligned_len..]);
-            1.0 - xy / x_norm / y_norm.sqrt()
+            cosine_f32_from_sums(x, x_norm, other, y_norm, xy)
         }
     }
 
@@ -763,7 +780,7 @@ mod x86 {
                 xy += x[i] * y[i];
             }
 
-            1.0 - xy / x_norm / y_norm
+            cosine_f32_checked(x, x_norm, y, y_norm, xy, 1.0 - xy / x_norm / y_norm)
         }
     }
 
@@ -806,7 +823,7 @@ mod x86 {
             }
             let xy =
                 xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
-            1.0 - xy / x_norm / y_norm
+            cosine_f32_checked(x, x_norm, y, y_norm, xy, 1.0 - xy / x_norm / y_norm)
         }
     }
 
@@ -840,7 +857,7 @@ mod x86 {
             // SAFETY: AVX is enabled for this function.
             let xy_main = unsafe { hsum256_ps(acc) };
             let xy = xy_main + dot(&x[aligned_len..], &y[aligned_len..]);
-            1.0 - xy / x_norm / y_norm
+            cosine_f32_checked(x, x_norm, y, y_norm, xy, 1.0 - xy / x_norm / y_norm)
         }
     }
 
@@ -875,9 +892,7 @@ mod x86 {
                 yy += y[i] * y[i];
             }
 
-            let y_norm_sq = yy as f32;
-            let xy_f32 = xy as f32;
-            1.0 - xy_f32 / x_norm / y_norm_sq.sqrt()
+            cosine_f64_from_sums(x, x_norm, y, yy, xy)
         }
     }
 
@@ -924,9 +939,9 @@ mod x86 {
                 .map(|(&a, &b)| a * b)
                 .sum();
 
-            let y_norm_sq = (y_norm8.reduce_sum() + y_norm4.reduce_sum() + tail_y_norm) as f32;
-            let xy = (xy8.reduce_sum() + xy4.reduce_sum() + tail_xy) as f32;
-            1.0 - xy / x_norm / y_norm_sq.sqrt()
+            let y_norm_sq = y_norm8.reduce_sum() + y_norm4.reduce_sum() + tail_y_norm;
+            let xy = xy8.reduce_sum() + xy4.reduce_sum() + tail_xy;
+            cosine_f64_from_sums(x, x_norm, y, y_norm_sq, xy)
         }
     }
 
@@ -964,9 +979,9 @@ mod x86 {
                 .map(|(&a, &b)| a * b)
                 .sum();
 
-            let y_norm_sq = (yy_main + tail_y_norm) as f32;
-            let xy = (xy_main + tail_xy) as f32;
-            1.0 - xy / x_norm / y_norm_sq.sqrt()
+            let y_norm_sq = yy_main + tail_y_norm;
+            let xy = xy_main + tail_xy;
+            cosine_f64_from_sums(x, x_norm, y, y_norm_sq, xy)
         }
     }
 }
@@ -1013,7 +1028,7 @@ lance_core::target_kernel! {
         let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
         let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
         let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
-        1.0 - xy / x_norm / y_norm.sqrt()
+        cosine_f32_from_sums(x, x_norm, other, y_norm, xy)
     }
 }
 
@@ -1051,7 +1066,7 @@ lance_core::target_kernel! {
             xy8.multiply_add(xv, yv);
         }
         let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
-        1.0 - xy / x_norm / y_norm
+        cosine_f32_checked(x, x_norm, y, y_norm, xy, 1.0 - xy / x_norm / y_norm)
     }
 }
 
@@ -1069,10 +1084,10 @@ lance_core::target_kernel! {
             let key = unsafe { f32x8::load_unaligned(key.as_ptr()) };
             for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
                 // SAFETY: the load reads within the eight-element array.
-                let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
-                let xy = key * y;
-                let y2 = y * y;
-                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
+                let yv = unsafe { f32x8::load_unaligned(y.as_ptr()) };
+                let xy = key * yv;
+                let y2 = yv * yv;
+                *distance = cosine_f32_from_sums(x, x_norm, y, y2.reduce_sum(), xy.reduce_sum());
             }
         } else if dimension == 16
             && let Ok(key) = <&[f32; 16]>::try_from(x)
@@ -1081,10 +1096,10 @@ lance_core::target_kernel! {
             let key = unsafe { f32x16::load_unaligned(key.as_ptr()) };
             for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
                 // SAFETY: the load reads within the sixteen-element array.
-                let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
-                let xy = key * y;
-                let y2 = y * y;
-                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
+                let yv = unsafe { f32x16::load_unaligned(y.as_ptr()) };
+                let xy = key * yv;
+                let y2 = yv * yv;
+                *distance = cosine_f32_from_sums(x, x_norm, y, y2.reduce_sum(), xy.reduce_sum());
             }
         } else {
             for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
@@ -1140,9 +1155,71 @@ lance_core::target_kernel! {
             .map(|(&a, &b)| a * b)
             .sum();
 
-        let y_norm_sq = (y_norm8.reduce_sum() + y_norm4.reduce_sum() + tail_y_norm) as f32;
-        let xy = (xy8.reduce_sum() + xy4.reduce_sum() + tail_xy) as f32;
-        1.0 - xy / x_norm / y_norm_sq.sqrt()
+        let y_norm_sq = y_norm8.reduce_sum() + y_norm4.reduce_sum() + tail_y_norm;
+        let xy = xy8.reduce_sum() + xy4.reduce_sum() + tail_xy;
+        cosine_f64_from_sums(x, x_norm, y, y_norm_sq, xy)
+    }
+}
+
+// Rescale before multiplying so even the full finite f64 range is safe. This
+// path is cold: ordinary f32 inputs retain each kernel's original arithmetic.
+#[cold]
+fn cosine_scaled<T: Copy + AsPrimitive<f64>>(x: &[T], y: &[T]) -> f32 {
+    let x_scale = x.iter().fold(0.0_f64, |scale, &v| scale.max(v.as_().abs()));
+    let y_scale = y.iter().fold(0.0_f64, |scale, &v| scale.max(v.as_().abs()));
+    let (xx, yy, xy) = x
+        .iter()
+        .zip(y)
+        .fold((0.0, 0.0, 0.0), |(xx, yy, xy), (&a, &b)| {
+            let a = a.as_() / x_scale;
+            let b = b.as_() / y_scale;
+            (xx + a * a, yy + b * b, xy + a * b)
+        });
+    (1.0 - xy / xx.sqrt() / yy.sqrt()) as f32
+}
+
+#[inline]
+fn cosine_f32_checked(
+    x: &[f32],
+    x_norm: f32,
+    y: &[f32],
+    y_norm: f32,
+    xy: f32,
+    distance: f32,
+) -> f32 {
+    // A normal norm can still come from a subnormal sum of squares. Check its
+    // square too, since underflow there can already have lost significant bits.
+    if (x_norm * x_norm).is_normal()
+        && (y_norm * y_norm).is_normal()
+        && xy.is_normal()
+        && (xy / x_norm).is_normal()
+        && distance.is_finite()
+    {
+        distance
+    } else {
+        cosine_scaled(x, y)
+    }
+}
+
+#[inline]
+fn cosine_f32_from_sums(x: &[f32], x_norm: f32, y: &[f32], yy: f32, xy: f32) -> f32 {
+    let y_norm = yy.sqrt();
+    cosine_f32_checked(x, x_norm, y, y_norm, xy, 1.0 - xy / x_norm / y_norm)
+}
+
+#[inline]
+fn cosine_f32_scalar(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+    let y_norm = dot(y, y).sqrt();
+    let xy = dot(x, y);
+    cosine_f32_checked(x, x_norm, y, y_norm, xy, 1.0 - xy / (x_norm * y_norm))
+}
+
+#[inline]
+fn cosine_f64_from_sums(x: &[f64], x_norm: f32, y: &[f64], yy: f64, xy: f64) -> f32 {
+    if x_norm.is_normal() && yy.is_normal() && xy.is_finite() {
+        (1.0 - xy / f64::from(x_norm) / yy.sqrt()) as f32
+    } else {
+        cosine_scaled(x, y)
     }
 }
 
@@ -1206,13 +1283,12 @@ pub fn cosine_distance_arrow_batch(
 
 /// Portable scalar reference cosine over f64 inputs. Used by tests to compare
 /// against every cosine kernel candidate. Computes
-/// `1 - xy / (x_norm * y_norm_sq.sqrt())` in f64 then casts to f32, matching
-/// the reduction order of the dispatched kernels.
+/// `1 - xy / x_norm / y_norm_sq.sqrt()` in f64 then casts to f32.
 #[cfg(test)]
 fn cosine_fast_scalar(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
     let xy: f64 = x.iter().zip(y.iter()).map(|(&a, &b)| a * b).sum();
     let y_norm_sq: f64 = y.iter().map(|&v| v * v).sum();
-    1.0 - (xy as f32) / x_norm / (y_norm_sq as f32).sqrt()
+    (1.0 - xy / f64::from(x_norm) / y_norm_sq.sqrt()) as f32
 }
 
 /// Portable scalar reference cosine when both norms are known. Mirrors
@@ -1220,7 +1296,7 @@ fn cosine_fast_scalar(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
 #[cfg(test)]
 fn cosine_with_norms_scalar(x: &[f64], x_norm: f32, y_norm: f32, y: &[f64]) -> f32 {
     let xy: f64 = x.iter().zip(y.iter()).map(|(&a, &b)| a * b).sum();
-    1.0 - (xy as f32) / x_norm / y_norm
+    (1.0 - xy / f64::from(x_norm) / f64::from(y_norm)) as f32
 }
 
 #[cfg(test)]
@@ -1392,6 +1468,115 @@ mod tests {
             "{kernel} at dim {dimension}: {got} != {want}"
         );
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::overflow(1e20, 1e20)]
+    #[case::sum_overflow(1e19, 1e19)]
+    #[case::underflow(1e-30, 1e-30)]
+    #[case::subnormal_square(1e-20, 1e-20)]
+    #[case::smallest(f32::from_bits(1), f32::from_bits(1))]
+    #[case::largest(3e38, 3e38)]
+    #[case::large_candidate(1.0, 1e20)]
+    #[case::small_candidate(1.0, 1e-30)]
+    #[case::mixed(3e38, f32::from_bits(1))]
+    fn test_cosine_f32_extreme_kernels(
+        #[case] x_scale: f32,
+        #[case] y_scale: f32,
+        #[values(8, 16, 33, 128)] dimension: usize,
+    ) {
+        let x = vec![x_scale; dimension];
+        let x_norm = norm_l2(&x);
+        let aligned = vec![y_scale; dimension];
+        let mut oblique = vec![0.0; dimension];
+        oblique[0] = y_scale;
+        let opposite = vec![-y_scale; dimension];
+        let cancellation: Vec<f32> = (0..dimension)
+            .map(|i| if i % 2 == 0 { y_scale } else { -y_scale })
+            .collect();
+        let batch = [aligned.as_slice(), &oblique, &opposite, &cancellation].concat();
+        let expected = [
+            0.0,
+            (1.0 - 1.0 / (dimension as f64).sqrt()) as f32,
+            2.0,
+            1.0 - (dimension % 2) as f32 / dimension as f32,
+        ];
+        for (y, &want) in batch.chunks_exact(dimension).zip(&expected) {
+            for candidate in COSINE_F32.candidates() {
+                if let Some(kernel) = candidate.kernel() {
+                    check_cosine(
+                        kernel.call(&x, x_norm, y),
+                        want,
+                        candidate.name(),
+                        dimension,
+                    )
+                    .unwrap();
+                }
+            }
+            for candidate in COSINE_WITH_NORMS_F32.candidates() {
+                if let Some(kernel) = candidate.kernel() {
+                    check_cosine(
+                        kernel.call(&x, x_norm, norm_l2(y), y),
+                        want,
+                        candidate.name(),
+                        dimension,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        for candidate in COSINE_F32_BATCH.candidates() {
+            if let Some(kernel) = candidate.kernel() {
+                let mut got = [f32::NAN; 4];
+                kernel.call(&x, &batch, dimension, &mut got);
+                for (got, want) in got.into_iter().zip(expected) {
+                    check_cosine(got, want, candidate.name(), dimension).unwrap();
+                }
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::overflow(1e20)]
+    #[case::underflow(1e-30)]
+    #[case::smallest_f32(f32::from_bits(1) as f64)]
+    #[case::largest_f32(3e38)]
+    #[case::overflow_f64(1e300)]
+    #[case::underflow_f64(1e-300)]
+    #[case::smallest_f64(f64::from_bits(1))]
+    #[case::largest_f64(f64::MAX)]
+    fn test_cosine_f64_extreme_kernels(#[case] scale: f64, #[values(8, 16, 33)] dimension: usize) {
+        let x = vec![scale; dimension];
+        let x_norm = norm_l2(&x);
+        for y_scale in [1.0, scale] {
+            let mut y = vec![0.0; dimension];
+            y[0] = y_scale;
+            let want = (1.0 - 1.0 / (dimension as f64).sqrt()) as f32;
+            for (y, want) in [
+                (y, want),
+                (vec![y_scale; dimension], 0.0),
+                (vec![-y_scale; dimension], 2.0),
+            ] {
+                for candidate in COSINE_F64.candidates() {
+                    if let Some(kernel) = candidate.kernel() {
+                        check_cosine(
+                            kernel.call(&x, x_norm, &y),
+                            want,
+                            candidate.name(),
+                            dimension,
+                        )
+                        .unwrap();
+                    }
+                }
+                check_cosine(
+                    f64::cosine_with_norms(&x, x_norm, norm_l2(&y), &y),
+                    want,
+                    "with_norms",
+                    dimension,
+                )
+                .unwrap();
+            }
+        }
     }
 
     /// Every host-supported f32 kernel, single-pair and batch, must agree with
