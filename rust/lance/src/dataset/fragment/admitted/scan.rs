@@ -163,17 +163,20 @@ impl AdmittedFragmentScan<'_> {
             .min((self.workspace_bytes / size_of::<u32>()).max(1) as u64);
         let first_attempt = count;
         loop {
-            let mut workspace = loop {
-                if let Some(workspace) = self.budget.try_reserve(self.workspace_bytes) {
-                    break workspace;
+            let mut workspace = match admission {
+                AdmissionMode::Try => {
+                    let Some(workspace) = self.budget.try_reserve(self.workspace_bytes) else {
+                        return Ok(None);
+                    };
+                    workspace
                 }
-                if matches!(admission, AdmissionMode::Try) {
-                    return Ok(None);
+                AdmissionMode::Wait => {
+                    // A refused attempt releases its input/output before joining
+                    // the admission queue again. Keep only the reduced row count.
+                    self.budget
+                        .reserve_when_available(self.workspace_bytes)
+                        .await?
                 }
-                // A refused attempt has released all its input/output before
-                // this wait. Keep only its reduced count, so contention cannot
-                // restart an expensive prefix already known not to fit.
-                self.budget.wait_for_capacity(self.workspace_bytes).await?;
             };
             let bytes = usize::try_from(count)
                 .ok()

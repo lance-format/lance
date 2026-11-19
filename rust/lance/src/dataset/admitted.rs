@@ -325,8 +325,10 @@ impl AdmittedDatasetScan {
     ///
     /// Drop previously returned output before awaiting this method, or arrange an
     /// independent consumer to drain it. Waiting while retaining the only data
-    /// that can release this pool would deadlock. Competing scans share capacity,
-    /// but admission order and fairness are not guaranteed. Cancellation consumes
+    /// that can release this pool would deadlock. Waiting attempts acquire their
+    /// complete workspace in registration order, before dependent I/O or decode.
+    /// Nonblocking callers can still compete for credit; completion order and
+    /// general scan fairness are not guaranteed. Cancellation consumes
     /// no uncommitted rows; any already-dispatched work owns credit until it ends.
     /// Exhausted snapshots return `Finished` even when the pool is occupied.
     ///

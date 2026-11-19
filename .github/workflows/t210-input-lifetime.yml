@@ -37,6 +37,12 @@ jobs:
           print(io[0])
           print("lance-examples benchmark has no lance-io/test-util feature")
           PYFEATURES
+      - name: Verify ordered workspace admission and physical-owner accounting
+        env:
+          LANCE_CPU_THREADS: 1
+        run: |
+          cargo test --profile ci --locked -p lance-core --lib utils::allocation:: -- --nocapture
+          cargo test --profile ci --locked -p lance-core --doc reserve_when_available -- --nocapture
       - name: Verify overlapping read order, disjoint progress and cancellation
         env:
           LANCE_CPU_THREADS: 1
@@ -65,4 +71,4 @@ jobs:
         run: cargo clippy --profile ci --locked -p lance-examples --example admitted_dataset --no-deps -- -D warnings
       - name: Lint owned I/O and Lance composition
         if: ${{ !cancelled() }}
-        run: cargo clippy --profile ci --locked -p lance-io -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings
+        run: cargo clippy --profile ci --locked -p lance-core -p lance-io -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings

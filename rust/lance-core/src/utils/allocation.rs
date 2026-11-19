@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_buffer::{MutableBuffer, alloc::ALIGNMENT};
 use bytes::Bytes;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
 use crate::{Error, Result};
 
@@ -37,6 +37,7 @@ pub struct AllocationBudget {
     limit: usize,
     reserved: AtomicUsize,
     released: Notify,
+    admission: Mutex<()>,
 }
 
 impl AllocationBudget {
@@ -46,6 +47,7 @@ impl AllocationBudget {
             limit,
             reserved: AtomicUsize::new(0),
             released: Notify::new(),
+            admission: Mutex::new(()),
         })
     }
 
@@ -95,6 +97,53 @@ impl AllocationBudget {
                 return Ok(());
             }
             released.await;
+        }
+    }
+
+    /// Wait for and reserve a complete workspace in registration order.
+    ///
+    /// Positive calls register with the admission queue when polled. A later
+    /// smaller request cannot bypass an earlier registered larger one. The queue
+    /// protects admission only: it is released before the caller receives its
+    /// [`Reservation`], so admitted I/O and decoding can proceed concurrently.
+    /// Zero-byte requests return immediately; requests above the pool limit fail.
+    ///
+    /// Cancelling a queued call removes it without reserving credit. This does
+    /// not order nonblocking [`Self::try_reserve`] or [`Self::try_reserve_up_to`]
+    /// callers, nor guarantee completion order or general scan fairness. Use
+    /// only before an operation, after dropping failed inputs and workspace;
+    /// consumer output must have an independent drain path. Never wait to grow
+    /// an admitted workspace that already holds dependent input.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{Result, utils::allocation::{AllocationBudget, Reservation}};
+    /// async fn admit(budget: &Arc<AllocationBudget>, bytes: usize) -> Result<Reservation> {
+    ///     // No retained input/output depends on this admission to be released.
+    ///     budget.reserve_when_available(bytes).await
+    /// }
+    /// ```
+    pub async fn reserve_when_available(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
+        if bytes > self.limit {
+            return Err(Error::invalid_input(format!(
+                "requested capacity {bytes} exceeds allocation budget {}",
+                self.limit
+            )));
+        }
+        if bytes == 0 {
+            return Ok(Reservation {
+                budget: self.clone(),
+                bytes: 0,
+            });
+        }
+        // Keep the turn until credit is actually owned. A wake alone would let
+        // a recently completed scan overtake an already waiting scan.
+        let _turn = self.admission.lock().await;
+        loop {
+            if let Some(workspace) = self.try_reserve(bytes) {
+                return Ok(workspace);
+            }
+            self.wait_for_capacity(bytes).await?;
         }
     }
 
@@ -308,6 +357,8 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use rstest::rstest;
+
+    mod admission;
 
     #[rstest]
     #[case::zero(0, true)]

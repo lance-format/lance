@@ -225,6 +225,73 @@ enum WaitExit {
     Error,
 }
 
+#[tokio::test]
+async fn waiting_cursors_do_not_overtake_registered_admission() {
+    let reader = null_reader(2).await;
+    let budget = AllocationBudget::new(64);
+    let held = budget.try_reserve(64).unwrap();
+    let mut first = reader
+        .try_scan_admitted_fullzip(0..2, 2, 64, budget.clone())
+        .unwrap();
+    let mut later = reader
+        .try_scan_admitted_fullzip(0..2, 2, 64, budget.clone())
+        .unwrap();
+    let attempts = RefCell::new(Vec::new());
+    let run = |name| {
+        let attempts = &attempts;
+        let reader = &reader;
+        move |indices: UInt32Array, workspace| {
+            attempts.borrow_mut().push(name);
+            async move { reader.try_take_admitted_fullzip(&indices, workspace).await }
+        }
+    };
+    let mut earlier = Box::pin(first.next_with(AdmissionMode::Wait, run("first")));
+    let mut following = Box::pin(later.next_with(AdmissionMode::Wait, run("later")));
+    assert!(matches!(futures::poll!(earlier.as_mut()), Poll::Pending));
+    assert!(matches!(futures::poll!(following.as_mut()), Poll::Pending));
+    assert!(attempts.borrow().is_empty());
+    drop(held);
+    assert!(matches!(futures::poll!(following.as_mut()), Poll::Pending));
+    assert!(
+        attempts.borrow().is_empty(),
+        "later cursor cannot claim the refund first"
+    );
+    let Some(Outcome::Batch { rows, batch }) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), earlier)
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("earlier cursor must consume its complete prefix");
+    };
+    assert_eq!(rows, 0..2);
+    assert_eq!(
+        batch["late"].as_ref(),
+        arrow_array::new_null_array(&DataType::LargeBinary, 2).as_ref()
+    );
+    assert_eq!(attempts.borrow().as_slice(), &["first"]);
+    assert!(matches!(futures::poll!(following.as_mut()), Poll::Pending));
+    drop(batch);
+    let Some(Outcome::Batch { rows, batch }) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), following)
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("later cursor must consume its original prefix after credit returns");
+    };
+    assert_eq!(rows, 0..2);
+    assert_eq!(
+        batch["late"].as_ref(),
+        arrow_array::new_null_array(&DataType::LargeBinary, 2).as_ref()
+    );
+    assert_eq!(attempts.borrow().as_slice(), &["first", "later"]);
+    drop(batch);
+    assert_eq!(first.position(), 2);
+    assert_eq!(later.position(), 2);
+    assert_eq!(budget.reserved(), 0);
+}
+
 #[rstest]
 #[case::complete(WaitExit::Complete)]
 #[case::cancel(WaitExit::Cancel)]
