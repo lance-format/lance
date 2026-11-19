@@ -217,6 +217,9 @@ impl ScalarQuantizationStorage {
     /// We did not check out of range in this call. But the out of range will
     /// panic once you access the data in the last [SQStorageChunk].
     fn chunk(&self, id: u32) -> (u32, &SQStorageChunk) {
+        if let [chunk] = self.chunks.as_slice() {
+            return (0, chunk);
+        }
         match self.offsets.binary_search(&id) {
             Ok(o) => (self.offsets[o], &self.chunks[o]),
             Err(o) => (self.offsets[o - 1], &self.chunks[o - 1]),

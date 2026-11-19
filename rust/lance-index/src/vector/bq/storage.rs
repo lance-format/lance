@@ -6,13 +6,14 @@ use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
-use std::ops::Sub;
+use std::ops::{Add, Sub};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 
 use arrow::array::AsArray;
+use arrow::buffer::{MutableBuffer, ScalarBuffer};
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt8Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
@@ -60,11 +61,13 @@ use crate::vector::bq::prune::{PRUNE_LANES, ScaledLowerBoundTerms, scaled_prune_
 use crate::vector::bq::rotation::{
     apply_fast_rotation, apply_fast_rotation_in_place, fast_rotation_signs_len,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::vector::bq::sign_unpack::{SIGN_BYTES_512, unpack_512_blocks};
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
     SCALE_FACTORS_COLUMN,
 };
-use crate::vector::bq::walk::{OneBitWalk, sign_words};
+use crate::vector::bq::walk::OneBitWalk;
 use crate::vector::bq::{
     RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
     validate_rq_num_bits,
@@ -612,8 +615,9 @@ pub struct RabitQuantizationStorage {
     packed_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
-    /// [`sign_words`] for the 1-bit walk, set by [`VectorStore::for_graph_search`].
-    walk_signs: Option<UInt64Array>,
+    /// The 1-bit walk signs, with each row padded to a word boundary. On
+    /// little-endian hosts, whole-word rows also back the batch's sign column.
+    walk_signs: Option<ScalarBuffer<u64>>,
     /// Rows staged by [`VectorStore::with_centroid`] for the [`RQPairScorer`].
     pairs: Option<Arc<(RQPairScorer, RecordBatch)>>,
 }
@@ -627,9 +631,10 @@ impl DeepSizeOf for RabitQuantizationStorage {
                 .as_ref()
                 .map(|codes| (codes as &dyn Array).deep_size_of_children(context))
                 .unwrap_or_default()
-            + self.walk_signs.as_ref().map_or(0, |signs| {
-                (signs as &dyn Array).deep_size_of_children(context)
-            })
+            + self
+                .walk_signs
+                .as_ref()
+                .map_or(0, |signs| signs.deep_size_of_children(context))
             + self
                 .pairs
                 .as_ref()
@@ -640,6 +645,10 @@ impl DeepSizeOf for RabitQuantizationStorage {
 impl RabitQuantizationStorage {
     fn code_dim(&self) -> usize {
         self.metadata.code_dim()
+    }
+
+    fn has_row_major_codes(&self) -> bool {
+        self.walk_signs.is_some() && can_share_walk_signs(&self.codes)
     }
 
     fn residual_query_factor(&self, dist_q_c: f32) -> f32 {
@@ -792,6 +801,7 @@ impl RabitQuantizationStorage {
         );
         calculator.add_factor_scale = query_factors.add_scale;
         calculator.add_factor_offset = query_factors.add_offset;
+        calculator.has_row_major_codes = self.has_row_major_codes();
         if self.ex_codes.is_none() && self.metadata.num_bits > 1 {
             calculator.sign_row_ids = Some(self.row_ids.values());
         }
@@ -1014,8 +1024,9 @@ pub struct RabitDistCalculator<'a> {
     dim: usize,
     num_bits: u8,
     query_estimator: RabitQueryEstimator,
-    // n * d / 8 binary-code bytes
+    // n * d / 8 binary-code bytes, in row-major order when shared with the walk
     codes: &'a [u8],
+    has_row_major_codes: bool,
     // per-row ex codes in the blocked kernel layout
     ex_codes: Option<&'a [u8]>,
     // bytes per ex-code row; legacy rows for layout-compatible widths may be
@@ -1082,6 +1093,7 @@ impl<'a> RabitDistCalculator<'a> {
             num_bits,
             query_estimator,
             codes,
+            has_row_major_codes: false,
             ex_codes,
             ex_code_len,
             dist_table,
@@ -1136,13 +1148,7 @@ impl<'a> RabitDistCalculator<'a> {
             .iter_mut()
             .enumerate()
             .for_each(|(id, dist)| {
-                dist.write(compute_single_rq_distance(
-                    self.codes,
-                    id,
-                    n,
-                    code_len,
-                    &self.dist_table,
-                ));
+                dist.write(self.binary_ip(id, code_len));
             });
         // Every reserved slot was initialized above.
         unsafe { dists.set_len(n) };
@@ -1197,8 +1203,16 @@ impl<'a> RabitDistCalculator<'a> {
         let simd_len = n - remainder;
         // Past `SAFE_U16_CODE_LEN` a full-range LUT overflows the `u16`
         // accumulator; the wide sum is what the narrow one would have produced.
-        let is_wide = code_len > simd::dist_table::SAFE_U16_CODE_LEN;
-        if is_wide {
+        let is_wide = code_len > simd::dist_table::SAFE_U16_CODE_LEN || self.has_row_major_codes;
+        if self.has_row_major_codes {
+            hacc_quantized_dists.clear();
+            hacc_quantized_dists.extend(
+                self.codes
+                    .chunks_exact(code_len)
+                    .take(simd_len)
+                    .map(|row| row_major_rq_ip::<_, u32>(row, dist_table)),
+            );
+        } else if is_wide {
             hacc_quantized_dists.clear();
             hacc_quantized_dists.reserve(simd_len);
             simd::dist_table::sum_4bit_dist_table_u32_uninit(
@@ -1249,24 +1263,22 @@ impl<'a> RabitDistCalculator<'a> {
             .iter_mut()
             .enumerate()
             .for_each(|(id, dist)| {
-                dist.write(compute_single_rq_distance(
-                    self.codes,
-                    simd_len + id,
-                    n,
-                    code_len,
-                    &self.dist_table,
-                ));
+                dist.write(self.binary_ip(simd_len + id, code_len));
             });
         // Both the SIMD reconstruction and scalar remainder initialized their slots.
         unsafe { dists.set_len(n) };
         self.adjust_remapped_binary_tail(n, code_len, dists, |id| {
-            let sum: u32 = get_rq_code(self.codes, id, n, code_len)
-                .enumerate()
-                .map(|(byte, code)| {
-                    u32::from(dist_table[byte * 32 + usize::from(code & 15)])
-                        + u32::from(dist_table[byte * 32 + 16 + usize::from(code >> 4)])
-                })
-                .sum();
+            let sum: u32 = if self.has_row_major_codes {
+                row_major_rq_ip(self.row_major_code(id, code_len), dist_table)
+            } else {
+                get_rq_code(self.codes, id, n, code_len)
+                    .enumerate()
+                    .map(|(byte, code)| {
+                        u32::from(dist_table[byte * 32 + usize::from(code & 15)])
+                            + u32::from(dist_table[byte * 32 + 16 + usize::from(code >> 4)])
+                    })
+                    .sum()
+            };
             sum as f32 * range + sum_min
         });
         simd_len
@@ -1309,16 +1321,25 @@ impl<'a> RabitDistCalculator<'a> {
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
         quantized_dists.clear();
-        quantized_dists.reserve(simd_len);
-        simd::dist_table::sum_4bit_hacc_dist_table_uninit(
-            simd_len,
-            code_len,
-            self.codes,
-            hacc_dist_table,
-            &mut quantized_dists.spare_capacity_mut()[..simd_len],
-        );
-        // SAFETY: the high-accuracy kernel initialized every SIMD output slot.
-        unsafe { quantized_dists.set_len(simd_len) };
+        if self.has_row_major_codes {
+            quantized_dists.extend(
+                self.codes
+                    .chunks_exact(code_len)
+                    .take(simd_len)
+                    .map(|row| hacc_rq_ip(row.iter().copied(), hacc_dist_table)),
+            );
+        } else {
+            quantized_dists.reserve(simd_len);
+            simd::dist_table::sum_4bit_hacc_dist_table_uninit(
+                simd_len,
+                code_len,
+                self.codes,
+                hacc_dist_table,
+                &mut quantized_dists.spare_capacity_mut()[..simd_len],
+            );
+            // SAFETY: the high-accuracy kernel initialized every SIMD output slot.
+            unsafe { quantized_dists.set_len(simd_len) };
+        }
 
         let range = (qmax - qmin) / u16::MAX as f32;
         let sum_min = num_tables as f32 * qmin;
@@ -1336,31 +1357,19 @@ impl<'a> RabitDistCalculator<'a> {
             .iter_mut()
             .enumerate()
             .for_each(|(id, dist)| {
-                dist.write(compute_single_rq_distance(
-                    self.codes,
-                    simd_len + id,
-                    n,
-                    code_len,
-                    &self.dist_table,
-                ));
+                dist.write(self.binary_ip(simd_len + id, code_len));
             });
         // Both the SIMD reconstruction and scalar remainder initialized their slots.
         unsafe { dists.set_len(n) };
         self.adjust_remapped_binary_tail(n, code_len, dists, |id| {
-            let sum: u32 = get_rq_code(self.codes, id, n, code_len)
-                .enumerate()
-                .map(|(byte, code)| {
-                    let low = byte * 64 + usize::from(code & 15);
-                    let high = byte * 64 + 16 + usize::from(code >> 4);
-                    u32::from(u16::from_le_bytes([
-                        hacc_dist_table[low],
-                        hacc_dist_table[low + 32],
-                    ])) + u32::from(u16::from_le_bytes([
-                        hacc_dist_table[high],
-                        hacc_dist_table[high + 32],
-                    ]))
-                })
-                .sum();
+            let sum = if self.has_row_major_codes {
+                hacc_rq_ip(
+                    self.row_major_code(id, code_len).iter().copied(),
+                    hacc_dist_table,
+                )
+            } else {
+                hacc_rq_ip(get_rq_code(self.codes, id, n, code_len), hacc_dist_table)
+            };
             sum as f32 * range + sum_min
         });
         simd_len
@@ -1397,7 +1406,7 @@ impl<'a> RabitDistCalculator<'a> {
                 dists[offset] = if live_position < live_simd {
                     quantized(offset)
                 } else {
-                    compute_single_rq_distance(self.codes, offset, n, code_len, &self.dist_table)
+                    self.binary_ip(offset, code_len)
                 };
             }
             live_position += 1;
@@ -2088,14 +2097,27 @@ pub(crate) fn load_blocked_ex_codes(
 }
 
 impl RabitDistCalculator<'_> {
+    #[inline]
+    fn row_major_code(&self, id: usize, code_len: usize) -> &[u8] {
+        &self.codes[id * code_len..(id + 1) * code_len]
+    }
+
+    #[inline]
+    fn binary_ip(&self, id: usize, code_len: usize) -> f32 {
+        if self.has_row_major_codes {
+            row_major_rq_ip(self.row_major_code(id, code_len), &self.dist_table)
+        } else {
+            let num_vectors = self.codes.len() / code_len;
+            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table)
+        }
+    }
+
     /// The score of `id` from its full codes, as [`VectorStore::rerank`] assigns.
     #[inline(always)]
     fn code_distance(&self, id: u32) -> f32 {
         let id = id as usize;
         let code_len = rabit_binary_code_bytes(self.dim);
-        let num_vectors = self.codes.len() / code_len;
-        let dist =
-            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
+        let dist = self.binary_ip(id, code_len);
 
         match self.query_estimator {
             RabitQueryEstimator::ResidualQuery => {
@@ -2431,7 +2453,22 @@ impl VectorStore for RabitQuantizationStorage {
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send> {
-        Ok(std::iter::once(self.batch.clone()))
+        // On disk and in the partition cache codec, the sign column uses
+        // FastScan's packed layout.
+        let batch = if self.has_row_major_codes() {
+            let (field, size, _, nulls) = self.codes.clone().into_parts();
+            let packed = FixedSizeListArray::try_new(
+                field,
+                size,
+                Arc::new(pack_code_values(&self.codes)),
+                nulls,
+            )?;
+            self.batch
+                .replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(packed))?
+        } else {
+            self.batch.clone()
+        };
+        Ok(std::iter::once(batch))
     }
 
     fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
@@ -2631,18 +2668,37 @@ impl VectorStore for RabitQuantizationStorage {
     ) -> Self::DistanceCalculator<'_> {
         let mut calc = self.dist_calculator(query, dist_q_c);
         if let Some(signs) = &self.walk_signs {
-            calc.walk = Some(OneBitWalk::new(signs.values(), &calc.ex_query[..calc.dim]));
+            calc.walk = Some(OneBitWalk::new(signs, &calc.ex_query[..calc.dim]));
         }
         calc
     }
 
     fn for_graph_search(mut self) -> Self {
         // The walk wraps its inner products with the raw-query factors.
-        if self.metadata.query_estimator == RabitQueryEstimator::RawQuery {
-            let codes = unpack_codes(&self.codes);
-            let code_len = codes.value_length() as usize;
-            let codes = codes.values().as_primitive::<UInt8Type>().values();
-            self.walk_signs = Some(UInt64Array::from(sign_words(codes, code_len)));
+        if self.metadata.query_estimator == RabitQueryEstimator::RawQuery
+            && self.walk_signs.is_none()
+        {
+            let code_len = self.codes.value_length() as usize;
+            let row_stride = code_len.next_multiple_of(size_of::<u64>());
+            let mut signs = MutableBuffer::from_len_zeroed(self.codes.len() * row_stride);
+            unpack_code_bytes(&self.codes, row_stride, &mut signs);
+            #[cfg(target_endian = "big")]
+            for word in signs.typed_data_mut::<u64>() {
+                *word = u64::from_le(*word);
+            }
+
+            let signs = ScalarBuffer::<u64>::from(signs);
+            if can_share_walk_signs(&self.codes) {
+                let codes = UInt8Array::new(ScalarBuffer::from(signs.inner().clone()), None);
+                let (field, size, _, nulls) = self.codes.into_parts();
+                self.codes = FixedSizeListArray::try_new(field, size, Arc::new(codes), nulls)
+                    .expect("unpacked signs preserve the code column type and length");
+                self.batch = self
+                    .batch
+                    .replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(self.codes.clone()))
+                    .expect("the unpacked sign column matches the original schema");
+            }
+            self.walk_signs = Some(signs);
         }
         self
     }
@@ -2664,8 +2720,10 @@ impl VectorStore for RabitQuantizationStorage {
     }
 
     fn with_centroid(mut self, centroid: &dyn Array) -> Result<Self> {
+        let mut metadata = self.metadata.clone();
+        metadata.packed = !self.has_row_major_codes();
         let rq: RabitQuantizer =
-            RabitQuantizer::from_metadata(&self.metadata, self.distance_type)?.try_into()?;
+            RabitQuantizer::from_metadata(&metadata, self.distance_type)?.try_into()?;
         let scorer = RQPairScorer::new(&rq, make_array(centroid.to_data()), self.distance_type)?;
         let rows = RecordBatch::try_from_iter(
             scorer
@@ -2702,6 +2760,10 @@ fn get_column(
 }
 
 pub fn pack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
+    FixedSizeListArray::try_new_from_values(pack_code_values(codes), codes.value_length()).unwrap()
+}
+
+fn pack_code_values(codes: &FixedSizeListArray) -> UInt8Array {
     let code_len = codes.value_length() as usize;
 
     // round up num of vectors to multiple of batch size (32)
@@ -2767,29 +2829,75 @@ pub fn pack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
     }
 
     assert_eq!(blocks.len(), codes.values().len());
-    FixedSizeListArray::try_new_from_values(UInt8Array::from(blocks), code_len as i32).unwrap()
+    UInt8Array::from(blocks)
 }
 
 // Inverse of pack_codes
 pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
+    let code_len = codes.value_length();
+    let mut unpacked = vec![0u8; codes.values().len()];
+    unpack_code_bytes(codes, code_len as usize, &mut unpacked);
+
+    FixedSizeListArray::try_new_from_values(UInt8Array::from(unpacked), code_len).unwrap()
+}
+
+fn can_share_walk_signs(codes: &FixedSizeListArray) -> bool {
+    // The packed column's child validity is in FastScan order.
+    cfg!(target_endian = "little")
+        && (codes.value_length() as usize).is_multiple_of(size_of::<u64>())
+        && codes.values().null_count() == 0
+}
+
+/// Decode FastScan's packed signs directly into the caller's row-major buffer.
+/// Rows may include zero padding for a native word view.
+fn unpack_code_bytes(codes: &FixedSizeListArray, row_stride: usize, unpacked: &mut [u8]) {
     let code_len = codes.value_length() as usize;
     let num_vectors = codes.len();
-
-    // Calculate number of complete batches
-    let num_blocks = num_vectors / BATCH_SIZE;
-    let num_packed_vectors = num_blocks * BATCH_SIZE;
-
-    let mut unpacked = vec![0u8; codes.values().len()];
-
+    let num_packed_vectors = num_vectors / BATCH_SIZE * BATCH_SIZE;
     let codes_values = codes.values().as_primitive::<UInt8Type>().values();
+    let (packed, tail) = codes_values.split_at(num_packed_vectors * code_len);
+    let (rows, tail_rows) = unpacked.split_at_mut(num_packed_vectors * row_stride);
 
-    // Unpack complete batches
-    for batch_idx in 0..num_blocks {
+    unpack_code_blocks(packed, code_len, row_stride, rows);
+
+    // Transpose the column-major remainder back to row-major order.
+    let remainder = num_vectors - num_packed_vectors;
+    for row in 0..remainder {
+        for col in 0..code_len {
+            tail_rows[row * row_stride + col] = tail[col * remainder + row];
+        }
+    }
+}
+
+fn unpack_code_blocks(packed: &[u8], code_len: usize, row_stride: usize, unpacked: &mut [u8]) {
+    if packed.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if code_len == SIGN_BYTES_512
+        && row_stride == SIGN_BYTES_512
+        && is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: the gate verifies AVX2, and the caller split both slices
+        // after the same number of full batches.
+        unsafe { unpack_512_blocks(packed, unpacked) };
+        return;
+    }
+    unpack_code_blocks_scalar(packed, code_len, row_stride, unpacked);
+}
+
+fn unpack_code_blocks_scalar(
+    packed: &[u8],
+    code_len: usize,
+    row_stride: usize,
+    unpacked: &mut [u8],
+) {
+    for batch_idx in 0..packed.len() / (code_len * BATCH_SIZE) {
         let block_start = batch_idx * code_len * BATCH_SIZE;
 
         for i in 0..code_len {
             let block_offset = block_start + i * BATCH_SIZE;
-            let block = &codes_values[block_offset..block_offset + BATCH_SIZE];
+            let block = &packed[block_offset..block_offset + BATCH_SIZE];
 
             // Reverse the permutation
             for j in 0..16 {
@@ -2804,27 +2912,11 @@ pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
                 let vec_idx_0 = batch_idx * BATCH_SIZE + PERM0[j];
                 let vec_idx_1 = batch_idx * BATCH_SIZE + PERM0[j] + 16;
 
-                unpacked[vec_idx_0 * code_len + i] = low_0 | (low_1 << 4);
-                unpacked[vec_idx_1 * code_len + i] = high_0 | (high_1 << 4);
+                unpacked[vec_idx_0 * row_stride + i] = low_0 | (low_1 << 4);
+                unpacked[vec_idx_1 * row_stride + i] = high_0 | (high_1 << 4);
             }
         }
     }
-
-    // Transpose back the remainder
-    if num_packed_vectors < num_vectors {
-        let remainder = num_vectors - num_packed_vectors;
-        let offset = num_packed_vectors * code_len;
-        let transposed_data = &codes_values[offset..];
-
-        // Transpose from column-major back to row-major
-        for row in 0..remainder {
-            for col in 0..code_len {
-                unpacked[offset + row * code_len + col] = transposed_data[col * remainder + row];
-            }
-        }
-    }
-
-    FixedSizeListArray::try_new_from_values(UInt8Array::from(unpacked), code_len as i32).unwrap()
 }
 
 /// Build a row-id remapping for the rows present in this partition from a
@@ -3056,20 +3148,17 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let mut new_row_ids = Vec::with_capacity(num_vectors);
         let mut new_codes = Vec::with_capacity(codes.len());
 
-        let row_ids = self.row_ids.values();
-        for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(*row_id) {
-                Some(Some(new_id)) => {
-                    indices.push(i as u32);
-                    new_row_ids.push(new_id);
-                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
-                }
-                Some(None) => {}
-                None => {
-                    indices.push(i as u32);
-                    new_row_ids.push(*row_id);
-                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
-                }
+        let has_row_major_codes = self.has_row_major_codes();
+        for (i, &row_id) in self.row_ids.values().iter().enumerate() {
+            let Some(new_id) = mapping.get(row_id).unwrap_or(Some(row_id)) else {
+                continue;
+            };
+            indices.push(i as u32);
+            new_row_ids.push(new_id);
+            if has_row_major_codes {
+                new_codes.extend_from_slice(&codes[i * num_code_bytes..(i + 1) * num_code_bytes]);
+            } else {
+                new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
             }
         }
 
@@ -3133,6 +3222,43 @@ impl QuantizerStorage for RabitQuantizationStorage {
             pairs: None,
         })
     }
+}
+
+/// Sum one sign row through either the floating-point or quantized LUT.
+#[inline]
+fn row_major_rq_ip<T: Copy, Sum: Add<Output = Sum> + Default + From<T>>(
+    row: &[u8],
+    dist_table: &[T],
+) -> Sum {
+    let tables = dist_table.as_chunks::<{ 2 * SEGMENT_NUM_CODES }>().0;
+    row.iter()
+        .zip(tables)
+        .fold(Sum::default(), |sum, (&signs, table)| {
+            // Keep the two nibble lookups paired to match packed f32 reranking.
+            let low = Sum::from(table[(signs & 0xF) as usize]);
+            let high = Sum::from(table[SEGMENT_NUM_CODES + (signs >> 4) as usize]);
+            sum + (low + high)
+        })
+}
+
+/// Sum one sign row using the transferred Accurate LUT, with low and high
+/// bytes of the two nibble tables stored separately.
+#[inline]
+fn hacc_rq_ip(row: impl Iterator<Item = u8>, dist_table: &[u8]) -> u32 {
+    let tables = dist_table.as_chunks::<{ 4 * SEGMENT_NUM_CODES }>().0;
+    row.zip(tables)
+        .map(|(code, table)| {
+            let low = usize::from(code & 15);
+            let high = SEGMENT_NUM_CODES + usize::from(code >> 4);
+            let lookup = |offset| {
+                u32::from(u16::from_le_bytes([
+                    table[offset],
+                    table[offset + 2 * SEGMENT_NUM_CODES],
+                ]))
+            };
+            lookup(low) + lookup(high)
+        })
+        .sum()
 }
 
 /// Compute the raw distance for a single vector without allocating.
@@ -3418,25 +3544,17 @@ mod tests {
         assert_eq!(calc.distance_all(0), expected);
     }
 
-    #[test]
-    fn test_pack_unpack_codes() {
+    #[rstest]
+    #[case::small(8)]
+    #[case::dim_512(64)]
+    fn test_pack_unpack_codes(#[case] code_len: i32) {
+        let mut rng = SmallRng::seed_from_u64(19);
         // Test with multiple batch sizes to cover both packed and transposed sections
         for num_vectors in [10, 32, 50, 64, 100] {
-            let code_len = 8;
-
-            // Create test data with known pattern
-            let mut codes_data = Vec::new();
-            for i in 0..num_vectors {
-                for j in 0..code_len {
-                    codes_data.push((i * code_len + j) as u8);
-                }
-            }
-
-            let original_codes = FixedSizeListArray::try_new_from_values(
-                UInt8Array::from(codes_data.clone()),
-                code_len,
-            )
-            .unwrap();
+            let codes_data: Vec<u8> = (0..num_vectors * code_len).map(|_| rng.random()).collect();
+            let original_codes =
+                FixedSizeListArray::try_new_from_values(UInt8Array::from(codes_data), code_len)
+                    .unwrap();
 
             // Pack and then unpack
             let packed = pack_codes(&original_codes);
@@ -3454,6 +3572,18 @@ mod tests {
                 "Mismatch for num_vectors={}",
                 num_vectors
             );
+
+            let code_len = code_len as usize;
+            let packed_len = num_vectors as usize / BATCH_SIZE * BATCH_SIZE * code_len;
+            let packed_values = packed.values().as_primitive::<UInt8Type>().values();
+            let mut scalar = vec![0; packed_len];
+            unpack_code_blocks_scalar(
+                &packed_values[..packed_len],
+                code_len,
+                code_len,
+                &mut scalar,
+            );
+            assert_eq!(&unpacked_values[..packed_len], scalar);
         }
     }
 
@@ -3486,6 +3616,141 @@ mod tests {
             .unwrap()
             .as_fixed_size_list()
             .clone()
+    }
+
+    #[rstest]
+    #[case::empty(512, 0, 1)]
+    #[case::tail_only(512, 7, 1)]
+    #[case::full_and_tail(512, 67, 5)]
+    #[case::partial_word(200, 67, 1)]
+    fn test_graph_sign_storage_preserves_packed_scores(
+        #[case] dim: usize,
+        #[case] rows: usize,
+        #[case] num_bits: u8,
+    ) {
+        let sign_codes = make_test_codes(rows, dim as i32);
+        let batch = if num_bits == 1 {
+            make_test_batch(sign_codes.clone())
+        } else {
+            make_test_batch_with_ex(sign_codes.clone(), make_test_ex_codes(rows, dim, num_bits))
+        };
+        let mut metadata = make_test_metadata(dim);
+        metadata.num_bits = num_bits;
+        let packed =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+        let serialized = packed.to_batches().unwrap().next().unwrap();
+        let graph = RabitQuantizationStorage::try_from_batch(
+            serialized.clone(),
+            packed.metadata(),
+            DistanceType::L2,
+            None,
+        )
+        .unwrap()
+        .for_graph_search()
+        .for_graph_search();
+
+        let words = graph.walk_signs.as_ref().unwrap();
+        let code_len = dim / 8;
+        assert_eq!(words.len(), rows * code_len.div_ceil(8));
+        let original = sign_codes.values().as_primitive::<UInt8Type>().values();
+        for (decoded, expected) in words
+            .chunks_exact(code_len.div_ceil(8))
+            .zip(original.chunks_exact(code_len))
+        {
+            let decoded: Vec<u8> = decoded.iter().flat_map(|word| word.to_le_bytes()).collect();
+            assert_eq!(&decoded[..code_len], expected);
+            assert!(decoded[code_len..].iter().all(|byte| *byte == 0));
+        }
+        if can_share_walk_signs(&packed.codes) {
+            let signs = graph.codes.values().as_primitive::<UInt8Type>().values();
+            assert_eq!(words.inner().as_ptr(), signs.as_ptr());
+            assert_eq!(graph.deep_size_of(), packed.deep_size_of());
+        }
+        assert_eq!(graph.to_batches().unwrap().next().unwrap(), serialized);
+
+        let (query, dist_q_c) = residual_query_array(dim);
+        let raw_query = metadata.prepare_raw_query_context(query.as_ref()).unwrap();
+        let prepared = QueryResidual::RabitRawQuery {
+            rotated_centroid: None,
+            query: Some(&raw_query),
+        };
+        for residual in [None, Some(prepared)] {
+            for mode in [ApproxMode::Normal, ApproxMode::Fast, ApproxMode::Accurate] {
+                let mut before_scratch = Vec::new();
+                let mut after_scratch = Vec::new();
+                let options = DistanceCalculatorOptions { approx_mode: mode };
+                let before = packed.dist_calculator_with_scratch(
+                    query.clone(),
+                    dist_q_c,
+                    residual,
+                    &mut before_scratch,
+                    options,
+                );
+                let after = graph.dist_calculator_with_scratch(
+                    query.clone(),
+                    dist_q_c,
+                    residual,
+                    &mut after_scratch,
+                    options,
+                );
+                for row in 0..rows as u32 {
+                    assert_eq!(
+                        after.distance(row).to_bits(),
+                        before.distance(row).to_bits()
+                    );
+                }
+                assert!(
+                    after
+                        .distance_all(0)
+                        .iter()
+                        .map(|d| d.to_bits())
+                        .eq(before.distance_all(0).iter().map(|d| d.to_bits()))
+                );
+            }
+        }
+
+        let mapping = RowAddrRemap::direct(HashMap::from([
+            (0, None),
+            (rows.saturating_sub(1) as u64, Some(900)),
+        ]));
+        let remapped = |store: &RabitQuantizationStorage| {
+            store
+                .remap(&mapping)
+                .unwrap()
+                .to_batches()
+                .unwrap()
+                .next()
+                .unwrap()
+        };
+        assert_eq!(remapped(&packed), remapped(&graph));
+    }
+
+    #[test]
+    fn test_graph_sign_storage_preserves_packed_child_nulls() {
+        let dim = 512;
+        let codes = pack_codes(&make_test_codes(35, dim));
+        let (field, size, child, nulls) = codes.into_parts();
+        let values = child.as_primitive::<UInt8Type>().values().clone();
+        let validity = (0..values.len()).map(|i| i != 17).collect::<Vec<_>>();
+        let child = UInt8Array::new(values, Some(arrow::buffer::NullBuffer::from(validity)));
+        let codes = FixedSizeListArray::try_new(field, size, Arc::new(child), nulls).unwrap();
+        let input = make_test_batch(codes);
+        let mut metadata = make_test_metadata(dim as usize);
+        metadata.packed = true;
+        let graph = RabitQuantizationStorage::try_from_batch(
+            input.clone(),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap()
+        .for_graph_search();
+
+        assert!(graph.walk_signs.is_some());
+        assert!(!graph.has_row_major_codes());
+        assert_eq!(graph.to_batches().unwrap().next().unwrap(), input);
+        assert!(graph.codes.values().is_null(17));
     }
 
     fn make_test_metadata(code_dim: usize) -> RabitQuantizationMetadata {
@@ -3574,7 +3839,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         ));
         let raw = metadata.prepare_raw_query_context(query.as_ref()).unwrap();
-        let prepare = |storage: &RabitQuantizationStorage| {
+        let prepare = |storage: &RabitQuantizationStorage, scalar| {
             let mut scratch = Vec::new();
             let calc = storage.dist_calculator_with_scratch(
                 query.clone(),
@@ -3587,28 +3852,52 @@ mod tests {
                 DistanceCalculatorOptions { approx_mode: mode },
             );
             let mut stage = SignStage::default();
-            calc.full_sign_stage_with_scratch(
-                &mut stage,
-                &mut Vec::new(),
-                &mut Vec::new(),
-                &mut Vec::new(),
-            )
+            if scalar {
+                calc.filtered_partition_sign_stage_with_scratch(
+                    &mut stage,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+            } else {
+                calc.full_sign_stage_with_scratch(
+                    &mut stage,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+            }
             .unwrap();
             stage
         };
-        let actual = prepare(&sign);
-        let expected = prepare(&eager);
-        for (position, &original_offset) in eager.row_ids.values().iter().enumerate() {
-            assert_eq!(
-                actual.binary_ips[original_offset as usize].to_bits(),
-                expected.binary_ips[position].to_bits(),
-                "row {original_offset}"
-            );
-            assert_eq!(
-                actual.lower_bounds[original_offset as usize].to_bits(),
-                expected.lower_bounds[position].to_bits(),
-                "row {original_offset}"
-            );
+        let graph = sign.clone().for_graph_search();
+        for scalar in [false, true] {
+            let actual = prepare(&sign, scalar);
+            let graph_stage = prepare(&graph, scalar);
+            let expected = prepare(&eager, scalar);
+            for (position, &original_offset) in eager.row_ids.values().iter().enumerate() {
+                let offset = original_offset as usize;
+                assert_eq!(
+                    actual.binary_ips[offset].to_bits(),
+                    expected.binary_ips[position].to_bits(),
+                    "row {original_offset}"
+                );
+                assert_eq!(
+                    actual.lower_bounds[offset].to_bits(),
+                    expected.lower_bounds[position].to_bits(),
+                    "row {original_offset}"
+                );
+                assert_eq!(
+                    graph_stage.binary_ips[offset].to_bits(),
+                    actual.binary_ips[offset].to_bits(),
+                    "row {original_offset}"
+                );
+                assert_eq!(
+                    graph_stage.lower_bounds[offset].to_bits(),
+                    actual.lower_bounds[offset].to_bits(),
+                    "row {original_offset}"
+                );
+            }
         }
     }
 

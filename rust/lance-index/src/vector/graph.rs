@@ -183,13 +183,21 @@ pub struct Visited<'a> {
 
 impl Visited<'_> {
     pub fn insert(&mut self, node_id: u32) {
+        self.insert_if_new(node_id);
+    }
+
+    #[inline]
+    fn insert_if_new(&mut self, node_id: u32) -> bool {
         let node_id_usize = node_id as usize;
         let word_index = node_id_usize / WORD_BITS;
         let mask = 1usize << (node_id_usize % WORD_BITS);
-        if self.visited[word_index] & mask == 0 {
-            self.visited[word_index] |= mask;
-            self.recently_visited.push(node_id);
+        let word = &mut self.visited[word_index];
+        if *word & mask != 0 {
+            return false;
         }
+        *word |= mask;
+        self.recently_visited.push(node_id);
+        true
     }
 
     pub fn contains(&self, node_id: u32) -> bool {
@@ -278,6 +286,50 @@ fn process_neighbors_with_look_ahead<F>(
     }
 }
 
+fn process_unvisited_neighbors(
+    neighbors: &[u32],
+    visited: &mut Visited,
+    mut process_neighbor: impl FnMut(u32),
+    look_ahead: Option<usize>,
+    dist_calc: &impl DistCalculator,
+) {
+    if look_ahead != Some(2) {
+        process_neighbors_with_look_ahead(
+            neighbors,
+            |id| {
+                if visited.insert_if_new(id) {
+                    process_neighbor(id);
+                }
+            },
+            look_ahead,
+            dist_calc,
+        );
+        return;
+    }
+
+    // Hold the next two unvisited IDs in registers. The adjacency list often
+    // points back into the explored graph, especially late in the beam.
+    let mut unseen = neighbors
+        .iter()
+        .copied()
+        .filter(|&id| visited.insert_if_new(id));
+    let Some(mut first) = unseen.next() else {
+        return;
+    };
+    let Some(mut second) = unseen.next() else {
+        process_neighbor(first);
+        return;
+    };
+    for next in unseen {
+        dist_calc.prefetch(next);
+        process_neighbor(first);
+        first = second;
+        second = next;
+    }
+    process_neighbor(first);
+    process_neighbor(second);
+}
+
 #[inline]
 fn furthest_distance(results: &BinaryHeap<OrderedNode>) -> OrderedFloat {
     results
@@ -300,35 +352,28 @@ macro_rules! beam_search_loop {
     (
         $candidates:ident,
         $results:ident,
-        $visited:ident,
         $k:expr,
         $dist_calc:expr,
         $accepts_result:expr,
         $comparisons:ident,
         |$current:ident, $process_neighbor:ident| $visit_neighbors:block
     ) => {{
-        while !$candidates.is_empty() {
-            let $current = $candidates.pop().expect("candidates is empty").0;
-            let furthest = furthest_distance(&$results);
-
+        let mut furthest = furthest_distance(&$results);
+        let mut is_full = $results.len() >= $k;
+        while let Some(Reverse($current)) = $candidates.pop() {
             if $current.dist > furthest && $results.len() == $k {
                 break;
             }
 
             let $process_neighbor = |neighbor: u32| {
-                if $visited.contains(neighbor) {
-                    return;
-                }
-                $visited.insert(neighbor);
                 let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
                 $comparisons += 1;
-                // Algorithm 2 refreshes the furthest result after every
-                // update to W, including updates made by an earlier neighbor
-                // of this same expanded node.
-                let furthest = furthest_distance(&$results);
-                if dist <= furthest || $results.len() < $k {
+                if !is_full || dist <= furthest {
                     if $accepts_result(neighbor, dist) {
                         push_result(&mut $results, (dist, neighbor).into(), $k);
+                        // A later neighbor of this same node must see the new bound.
+                        furthest = furthest_distance(&$results);
+                        is_full = $results.len() >= $k;
                     }
                     $candidates.push(Reverse((dist, neighbor).into()));
                 }
@@ -417,15 +462,15 @@ pub fn beam_search(
         beam_search_loop!(
             candidates,
             results,
-            visited,
             k,
             dist_calc,
             accepts_result,
             comparisons,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
-                process_neighbors_with_look_ahead(
+                process_unvisited_neighbors(
                     &neighbors,
+                    visited,
                     process_neighbor,
                     prefetch_distance,
                     dist_calc,
@@ -456,15 +501,15 @@ pub fn beam_search(
     beam_search_loop!(
         candidates,
         results,
-        visited,
         k,
         dist_calc,
         accepts_result,
         comparisons,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
-            process_neighbors_with_look_ahead(
+            process_unvisited_neighbors(
                 &neighbors,
+                visited,
                 process_neighbor,
                 prefetch_distance,
                 dist_calc,
@@ -518,15 +563,15 @@ pub fn beam_search_borrowed(
         beam_search_loop!(
             candidates,
             results,
-            visited,
             k,
             dist_calc,
             accepts_result,
             comparisons,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
-                process_neighbors_with_look_ahead(
+                process_unvisited_neighbors(
                     neighbors,
+                    visited,
                     process_neighbor,
                     prefetch_distance,
                     dist_calc,
@@ -551,15 +596,15 @@ pub fn beam_search_borrowed(
     beam_search_loop!(
         candidates,
         results,
-        visited,
         k,
         dist_calc,
         accepts_result,
         comparisons,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
-            process_neighbors_with_look_ahead(
+            process_unvisited_neighbors(
                 neighbors,
+                visited,
                 process_neighbor,
                 prefetch_distance,
                 dist_calc,
@@ -621,10 +666,9 @@ pub fn beam_search_acorn(
     let stride = (passing_total / ACORN_SEED_COUNT).max(1);
     for seed in bitset.iter_ones().step_by(stride).take(ACORN_SEED_COUNT) {
         let seed = seed as u32;
-        if visited.contains(seed) {
+        if !visited.insert_if_new(seed) {
             continue;
         }
-        visited.insert(seed);
         let dist: OrderedFloat = dist_calc.distance(seed).into();
         comparisons += 1;
         if in_range(seed, dist) {
@@ -652,8 +696,7 @@ pub fn beam_search_acorn(
                 bridge_budget -= 1;
                 for &neighbor in graph.neighbors(waypoint) {
                     if bitset.contains(neighbor) {
-                        if !visited.contains(neighbor) {
-                            visited.insert(neighbor);
+                        if visited.insert_if_new(neighbor) {
                             let dist: OrderedFloat = dist_calc.distance(neighbor).into();
                             comparisons += 1;
                             if in_range(neighbor, dist) {
@@ -682,16 +725,14 @@ pub fn beam_search_acorn(
         passing.clear();
         for &neighbor in graph.neighbors(current.id) {
             if bitset.contains(neighbor) {
-                if !visited.contains(neighbor) {
-                    visited.insert(neighbor);
+                if visited.insert_if_new(neighbor) {
                     passing.push(neighbor);
                 }
             } else if !expanded.contains(neighbor) {
                 expanded.insert(neighbor);
                 for &second_hop in graph.neighbors(neighbor) {
                     if bitset.contains(second_hop) {
-                        if !visited.contains(second_hop) {
-                            visited.insert(second_hop);
+                        if visited.insert_if_new(second_hop) {
                             passing.push(second_hop);
                         }
                     } else if !expanded.contains(second_hop) {
@@ -829,6 +870,7 @@ mod tests {
     struct CountingDistCalculator<'a> {
         distances: &'a [f32],
         computations: Cell<usize>,
+        prefetched: Cell<Option<u32>>,
     }
 
     impl DistCalculator for CountingDistCalculator<'_> {
@@ -840,6 +882,10 @@ mod tests {
         fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
             self.distances.to_vec()
         }
+
+        fn prefetch(&self, id: u32) {
+            assert_eq!(self.prefetched.replace(Some(id)), None);
+        }
     }
 
     #[test]
@@ -849,12 +895,13 @@ mod tests {
         // next neighbor must be compared with that new bound so it can enter
         // the candidate queue and lead the search to node 4.
         let graph = ChainGraph {
-            neighbors: vec![vec![1, 2, 3], vec![], vec![], vec![4], vec![]],
+            neighbors: vec![vec![1, 0, 1, 2, 3, 2], vec![], vec![], vec![4], vec![]],
         };
         let distances = [1.0, 10.0, 9.0, 8.0, 7.0];
         let dist_calc = CountingDistCalculator {
             distances: &distances,
             computations: Cell::new(0),
+            prefetched: Cell::new(None),
         };
         let params = HnswQueryParams {
             ef: 3,
@@ -867,13 +914,13 @@ mod tests {
         let entry = OrderedNode::new(0, distances[0].into());
         let mut visited_generator = VisitedGenerator::new(graph.len());
 
-        let (results, _) = beam_search_borrowed(
+        let (results, comparisons) = beam_search_borrowed(
             &graph,
             &entry,
             &params,
             &dist_calc,
             None,
-            None,
+            Some(2),
             &mut visited_generator.generate(graph.len()),
         );
 
@@ -882,6 +929,8 @@ mod tests {
             vec![0, 4, 3]
         );
         assert_eq!(dist_calc.computations.get(), 4);
+        assert_eq!(comparisons, 4);
+        assert_eq!(dist_calc.prefetched.get(), Some(3));
     }
 
     /// Passing components joined only through chains of two masked nodes
