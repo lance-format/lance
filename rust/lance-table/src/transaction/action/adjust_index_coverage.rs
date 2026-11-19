@@ -159,6 +159,13 @@ impl AdjustIndexCoverage {
         Ok(())
     }
 
+    /// Stop bringing committed `fragment` into the coverage.
+    pub(super) fn forget_added_fragment(&mut self, fragment: u64) {
+        self.parts
+            .add_fragments
+            .retain(|added| *added != Ref::Committed(fragment));
+    }
+
     fn coverage_id(&self, fragment: u64) -> Result<u32> {
         u32::try_from(fragment).map_err(|_| {
             Error::invalid_input(format!(
@@ -178,18 +185,15 @@ impl AdjustIndexCoverage {
 
     /// The segment, by uuid, plus a claim on the fragments this brings under
     /// the index. The claim is what stops one writer widening a segment onto a
-    /// fragment another writer is covering with a segment of its own. Those
-    /// fragments are also required to still be there: coverage of a fragment a
-    /// concurrent set removed describes rows the dataset no longer has.
+    /// fragment another writer is covering with a segment of its own.
     ///
-    /// Each committed fragment brought in also records the data of every
-    /// keyed and carried field, as a new segment over it does: the widening
-    /// holds only while those columns are the ones the remap was planned
-    /// against, so a rewrite committing first conflicts (see
-    /// [`Part::IndexedFieldData`](super::Part::IndexedFieldData)); one
-    /// committing second prunes the fragment from the coverage as it applies.
-    /// Overlays need nothing, since a read masks an overlay newer than the
-    /// segment's `dataset_version`.
+    /// Whether the widened fragments still hold what the segment describes is
+    /// settled after the conflict check, by `transaction::coverage_repair`, as
+    /// for a new segment: a fragment whose keyed or carried columns were
+    /// rewritten since is withdrawn from the widening, and one a compaction
+    /// moved stays covered, its rows reached through the fragment reuse
+    /// history. Overlays need nothing, since a read masks an overlay newer
+    /// than the segment's `dataset_version`.
     ///
     /// Removals claim nothing: coverage the index gives up cannot collide with
     /// coverage another writer takes on.
@@ -199,20 +203,6 @@ impl AdjustIndexCoverage {
             self.parts.name.clone(),
             self.parts.add_fragments.iter().copied(),
         );
-        let dependencies = self
-            .parts
-            .fields
-            .iter()
-            .chain(self.parts.covering_fields.iter());
-        for fragment in self
-            .parts
-            .add_fragments
-            .iter()
-            .filter_map(|fragment| fragment.committed())
-        {
-            footprint.require_fragment(fragment);
-            footprint.require_indexed_field_data(fragment, dependencies.clone().copied());
-        }
     }
 }
 

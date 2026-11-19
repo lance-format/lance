@@ -25,12 +25,14 @@
 //! index_maintenance  how that narrows or drops index metadata
 //! row_version        how it assigns row ids and per-row version metadata
 //! conflicts          whether two operations collide, for the commit retry path
+//! coverage_repair    what new index coverage gives up to land on a newer version
 //! proto              the persisted protobuf encoding of all of the above
 //! ```
 
 pub mod action;
 mod builder;
 mod conflicts;
+pub mod coverage_repair;
 mod index_maintenance;
 mod manifest_build;
 mod operation;

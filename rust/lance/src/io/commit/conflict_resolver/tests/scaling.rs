@@ -59,7 +59,8 @@ fn action_append(read_version: u64) -> Transaction {
 enum Pending {
     /// A delete of one row in fragment 5.
     Delete,
-    /// An index segment covering every fragment.
+    /// An index segment covering every fragment, whose coverage is repaired
+    /// against the appends after the checks.
     IndexEveryFragment,
 }
 
@@ -161,6 +162,9 @@ async fn time_check(fragments: u64, pending: Pending) -> f64 {
             rebase.record_committed(*version, transaction, &history[index]);
         }
     }
+    for manifest in &history {
+        rebase.record_history(manifest.clone());
+    }
     if let (Some(since), Some(latest)) = (history.first(), history.last()) {
         rebase.record_window(since.clone(), latest.clone());
     }
@@ -169,6 +173,7 @@ async fn time_check(fragments: u64, pending: Pending) -> f64 {
         .map(|(version, transaction)| (*version, transaction))
         .collect();
     rebase.check_txns(&committed).unwrap();
+    rebase.repair_index_coverage();
     start.elapsed().as_secs_f64()
 }
 

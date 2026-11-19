@@ -6,7 +6,6 @@
 
 use super::{ConfigMap, Footprint, Part, Verdict};
 use crate::format::overlay::DataOverlayFile;
-use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{DataFile, DeletionFile, Fragment, Manifest, RowDatasetVersionMeta, RowIdMeta};
 use lance_core::datatypes::{Field, LogicalType};
 use std::collections::HashMap;
@@ -53,20 +52,6 @@ impl<'a> Window<'a> {
                     != latest
                         .fragment_by_id(*fragment)
                         .map(|f| (backing(f, *field), overlays_over(f, *field)))
-            }
-            Part::IndexedFieldData { fragment, field } => {
-                let (Some(was), Some(now)) = (
-                    read.fragment_by_id(*fragment).map(|f| self.live(f)),
-                    latest.fragment_by_id(*fragment).map(|f| self.live(f)),
-                ) else {
-                    return false;
-                };
-                [&read.schema, &latest.schema].into_iter().any(|schema| {
-                    schema
-                        .fields_pre_order()
-                        .filter(|related| field_affects_index(related.id, &[*field], schema))
-                        .any(|related| backing(&was, related.id) != backing(&now, related.id))
-                })
             }
             Part::FieldExists(id) => {
                 read.schema.field_by_id(*id).is_some() != latest.schema.field_by_id(*id).is_some()

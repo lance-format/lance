@@ -31,7 +31,7 @@ use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::system_index::is_system_index;
 use lance_table::transaction::TaggedRewriteAssembly;
-use lance_table::transaction::action::Footprint;
+use lance_table::transaction::action::{Action, Footprint, Ref as ActionRef};
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -94,7 +94,8 @@ pub struct TransactionRebase<'a> {
 /// it read: the manifest it read, the latest one, and the footprints of the
 /// named commits an action set passes. A named commit's footprint is read off
 /// the manifests either side of it, which are dropped once it is taken; an
-/// action set's comes from its actions.
+/// action set's comes from its actions. A manifest per version is kept only
+/// for the index coverage repair, and only when there is coverage to repair.
 #[derive(Debug, Default)]
 struct FootprintBasis {
     read: Option<Arc<Manifest>>,
@@ -109,6 +110,23 @@ struct FootprintBasis {
     /// is checked against, by version. Each is read off the manifests either
     /// side of its commit, which are dropped once it is taken.
     committed: HashMap<u64, Footprint>,
+    /// Set once a committed transaction was compared with this one by
+    /// footprint, so the index coverage it adds is repaired against the
+    /// latest manifest before it lands (`repair_index_coverage`). Always the
+    /// case for an action set that commits over anything; for a legacy
+    /// `CreateIndex`, only once an action set committed underneath it, since
+    /// its own checks settle what a named operation did. Kept here rather than
+    /// on the rebase, which the commit loop holds across awaits.
+    repairs_index_coverage: bool,
+    /// The segments the action set widens that are NGram segments in the
+    /// latest manifest, which cannot follow moved rows. An
+    /// `AdjustIndexCoverage` carries no index details of its own, so they are
+    /// looked up by [`TransactionRebase::load_current_lineage`].
+    ngram_segments: HashSet<uuid::Uuid>,
+    /// Every manifest committed since `read`, by version, for the coverage
+    /// repair to walk. Recorded only for a transaction that adds index
+    /// coverage over committed fragments; empty otherwise.
+    history: HashMap<u64, Arc<Manifest>>,
 }
 
 impl FootprintBasis {
@@ -483,6 +501,22 @@ impl UntaggedReuse {
                 self.groups
                     .contains(sorted_ids(group.old_fragments.iter().map(|f| f.id)).as_slice())
             })
+    }
+
+    /// Every fragment a recorded group moved `fragment`'s rows into, through
+    /// later groups that compacted those in turn.
+    fn moved_to(&self, fragment: u32) -> Vec<u32> {
+        let mut reached = Vec::new();
+        let mut pending = vec![fragment];
+        while let Some(id) = pending.pop() {
+            for (output, sources) in &self.sources {
+                if sources.contains(&u64::from(id)) && !reached.contains(output) {
+                    reached.push(*output);
+                    pending.push(*output);
+                }
+            }
+        }
+        reached
     }
 
     fn compacted_from(&self, fragment: u32) -> RoaringBitmap {

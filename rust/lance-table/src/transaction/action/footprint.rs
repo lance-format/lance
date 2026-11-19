@@ -69,16 +69,6 @@ pub enum Part {
     Deletions(u64),
     /// The data file and column backing one field in one fragment.
     FieldData { fragment: u64, field: i32 },
-    /// The data an index segment was built from: what backs, in one
-    /// fragment, every field that is, contains, or is nested in one field the
-    /// index keys or carries. A fragment removed since is no change: a
-    /// segment naming a removed fragment reaches its rows through the
-    /// fragment reuse history or loses that coverage.
-    ///
-    /// TODO: a stand-in until index coverage is repaired after the check
-    /// instead, which withdraws the rewritten fragments rather than
-    /// conflicting.
-    IndexedFieldData { fragment: u64, field: i32 },
     /// What a reader sees of one field in one fragment: its data and the
     /// overlays over it.
     Cells { fragment: u64, field: i32 },
@@ -154,6 +144,12 @@ struct Did {
     /// its own, as a cast does. A writer that bound the old id in a fragment
     /// of its own wrote values the new field would read back as null.
     replaced_fields: HashSet<i32>,
+    /// Committed fragments a compaction moved the rows of into fragments of
+    /// its own. Whether a fragment reuse index records where they went is not
+    /// in the transaction, so the resolver, which can read it, decides what
+    /// index coverage added over them since gives up (see
+    /// [`Footprint::compacted_fragments`]).
+    compacted_fragments: HashSet<u64>,
     /// Rewrote the table wholesale. Landing first, it preempts everything
     /// that read before it; landing second, it wins over what landed in
     /// between, and only its parts and forbids are checked.
@@ -191,8 +187,9 @@ enum Forbid {
     RelocationFrom(u64),
     /// No index coverage was added over these fragments, whose rows the
     /// transaction moves while carrying the indices over them along, through
-    /// a remap computed at its read version. Dropping or replacing an index
-    /// without adding coverage is no conflict:
+    /// a remap computed at its read version. An index built before the move
+    /// is repaired after the check instead, by `transaction::coverage_repair`.
+    /// Dropping or replacing an index without adding coverage is no conflict:
     /// the remap finds nothing to carry along.
     IndexOver(HashSet<u64>),
     /// No new fragment carries any of these row ids: one id names one row.
@@ -385,6 +382,12 @@ pub enum Verdict {
 }
 
 impl Footprint {
+    /// The committed fragments this transaction, committed, compacted: moved
+    /// the rows of into fragments of its own, recording the move or not.
+    pub fn compacted_fragments(&self) -> &HashSet<u64> {
+        &self.did.compacted_fragments
+    }
+
     /// Record that this transaction needs `part` exactly as it read it.
     pub(super) fn read(&mut self, part: Part) {
         self.parts.insert(part);
@@ -601,20 +604,6 @@ impl Footprint {
             adds: Some(committed_fragments(fragments)),
             replaces: false,
         });
-    }
-
-    /// Record that this transaction brings committed `fragment` under an
-    /// index built from the data of `fields` as it read it: a segment over
-    /// it would describe values a rewrite since replaced, and a reader has no
-    /// way to tell. See [`Part::IndexedFieldData`].
-    pub(super) fn require_indexed_field_data(
-        &mut self,
-        fragment: u64,
-        fields: impl IntoIterator<Item = FieldRef>,
-    ) {
-        for field in fields.into_iter().filter_map(committed_field) {
-            self.read(Part::IndexedFieldData { fragment, field });
-        }
     }
 
     /// Record that this transaction removes or edits the segment `uuid`.

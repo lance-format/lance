@@ -3,8 +3,8 @@
 
 use super::*;
 use lance_table::transaction::action::{
-    Action as TxnAction, CompositeOperation, FieldRef, Ref as ActionRef, TombstoneFieldData,
-    UserStep,
+    Action as TxnAction, AddFragment, AddFragmentParts, CompositeOperation, FieldRef,
+    Ref as ActionRef, RemoveFragment, TombstoneFieldData, UserStep,
 };
 
 #[test]
@@ -959,28 +959,86 @@ fn create_index_txn(fragments: impl IntoIterator<Item = u32>) -> Transaction {
 }
 
 /// A legacy index build landing over an action set that rewrote an indexed
-/// column in a fragment it covers conflicts; a rewrite of another column
-/// leaves it be.
-///
-/// TODO: a stand-in until the build gives up the rewritten fragment
-/// instead, as it does over a legacy `Update` in
-/// `test_create_index_rebase_prunes_updated_field_coverage`.
+/// column gives up the rewritten fragment, as it does over a legacy
+/// `Update` in `test_create_index_rebase_prunes_updated_field_coverage`.
 #[rstest::rstest]
-#[case::indexed_field_rewritten(0, true)]
-#[case::other_field_rewritten(1, false)]
+#[case::indexed_field_rewritten(0, vec![1])]
+#[case::other_field_rewritten(1, vec![0, 1])]
 #[tokio::test]
-async fn test_a_legacy_index_build_over_a_column_an_action_set_rewrote(
+async fn test_a_legacy_index_build_prunes_a_column_an_action_set_rewrote(
     #[case] field: i32,
-    #[case] expected: bool,
+    #[case] expected_fragment_ids: Vec<u32>,
 ) {
     let dataset = test_dataset(10, 2).await;
-    assert_retryable_or_ok(
-        &dataset,
-        create_index_txn([0, 1]),
-        &tombstone_txn(0, field),
-        expected,
-    )
-    .await;
+    let mut committed = dataset.manifest.as_ref().clone();
+    committed.version = 2;
+    let mut fragments = committed.fragments.as_ref().clone();
+    for file in &mut fragments[0].files {
+        file.fields = file
+            .fields
+            .iter()
+            .map(|id| if *id == field { -2 } else { *id })
+            .collect();
+    }
+    committed.fragments = Arc::new(fragments);
+    let mut rebase = TransactionRebase::try_new(&dataset, create_index_txn([0, 1]), None)
+        .await
+        .unwrap();
+    let rewrite = tombstone_txn(0, field);
+    rebase.record_commit(2, &rewrite, &dataset.manifest, Arc::new(committed));
+
+    rebase.check_txn(&rewrite, 2).unwrap();
+    rebase.repair_index_coverage();
+
+    let Operation::CreateIndex { new_indices, .. } = &rebase.transaction.operation else {
+        panic!("expected CreateIndex operation");
+    };
+    assert_eq!(
+        new_indices[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter(expected_fragment_ids)
+    );
+}
+
+/// An action set moving a covered fragment's rows records no fragment
+/// reuse index, so nothing translates the build's coverage of it. Unlike
+/// over an eager legacy compaction, the build still lands: it keeps naming
+/// the removed fragment, which a reader drops, and the moved rows are
+/// scanned.
+#[tokio::test]
+async fn test_a_legacy_index_build_lands_over_an_action_compaction() {
+    let dataset = test_dataset(10, 2).await;
+    let compaction = action_txn(vec![
+        TxnAction::RemoveFragment(RemoveFragment::new_unchecked(
+            ActionRef::Committed(0),
+            false,
+        )),
+        TxnAction::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+            id: ActionRef::Local(0),
+            physical_rows: 5,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: false,
+        })),
+    ]);
+
+    let mut committed = dataset.manifest.as_ref().clone();
+    committed.version = 2;
+    committed.fragments = Arc::new(committed.fragments[1..].to_vec());
+    let mut rebase = TransactionRebase::try_new(&dataset, create_index_txn([0]), None)
+        .await
+        .unwrap();
+    rebase.record_commit(2, &compaction, &dataset.manifest, Arc::new(committed));
+    rebase.check_txn(&compaction, 2).unwrap();
+    rebase.repair_index_coverage();
+
+    let Operation::CreateIndex { new_indices, .. } = &rebase.transaction.operation else {
+        panic!("expected CreateIndex operation");
+    };
+    assert_eq!(
+        new_indices[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0])
+    );
 }
 
 /// Without the manifests either side of the concurrent commit there is

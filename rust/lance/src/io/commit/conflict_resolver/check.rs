@@ -5,7 +5,8 @@ mod create_index;
 mod rewrite;
 
 use super::*;
-use lance_table::transaction::action::{Footprint, Verdict, Window};
+use lance_table::transaction::action::{FieldRef as ActionFieldRef, Footprint, Verdict, Window};
+use lance_table::transaction::coverage_repair::{CommittedSince, NewCoverage, stale_coverage};
 
 impl<'a> TransactionRebase<'a> {
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -128,6 +129,20 @@ impl<'a> TransactionRebase<'a> {
                 .any(|transaction| is_action_set(transaction))
     }
 
+    /// Whether this transaction, catching up on `committed`, needs every
+    /// manifest committed since it read: only to repair the index coverage it
+    /// adds over committed fragments, and for a named `CreateIndex` only once
+    /// an action set committed underneath it (see `repair_index_coverage`).
+    pub fn needs_committed_history(&self, committed: &[Arc<Transaction>]) -> bool {
+        if new_coverage(&self.transaction, &HashSet::new()).is_empty() {
+            return false;
+        }
+        matches!(self.transaction.operation, Operation::CompositeOperation(_))
+            || committed.iter().any(|transaction| {
+                matches!(transaction.operation, Operation::CompositeOperation(_))
+            })
+    }
+
     /// Record the footprint of `transaction`, which committed on top of
     /// `before` as `version`. Only the footprint is kept.
     pub fn record_committed(&mut self, version: u64, transaction: &Transaction, before: &Manifest) {
@@ -140,6 +155,14 @@ impl<'a> TransactionRebase<'a> {
     pub fn record_window(&mut self, since: Arc<Manifest>, latest: Arc<Manifest>) {
         self.footprint_basis.since = Some(since);
         self.footprint_basis.latest = Some(latest);
+    }
+
+    /// Record `manifest`, committed since this transaction read, for the
+    /// coverage repair to walk. See [`Self::needs_committed_history`].
+    pub fn record_history(&mut self, manifest: Arc<Manifest>) {
+        self.footprint_basis
+            .history
+            .insert(manifest.version, manifest);
     }
 
     /// Record what the catch-up records of one commit: `transaction`,
@@ -155,6 +178,7 @@ impl<'a> TransactionRebase<'a> {
         if self.needs_committed_manifests(transaction) {
             self.record_committed(version, transaction, before);
         }
+        self.record_history(after.clone());
         self.record_window(Arc::new(before.clone()), after);
     }
 
@@ -239,14 +263,26 @@ impl<'a> TransactionRebase<'a> {
         ) else {
             return Err(self.retryable_conflict_err(last, last_version));
         };
+        if let Some(fragment) = self.unrecorded_move_under_new_coverage(&committed) {
+            return Err(self.window_conflict_err(
+                since.version,
+                last_version,
+                &format!(
+                    "fragment {fragment}, which this one adds index coverage of, was compacted \
+                     without the move being recorded"
+                ),
+            ));
+        }
         let verdict =
             Footprint::of(&self.transaction, &read).check(&Window::new(&since, &latest, committed));
-        match verdict {
-            Verdict::Compatible => Ok(()),
-            Verdict::Conflict(reason) => {
-                Err(self.window_conflict_err(since.version, last_version, &reason))
-            }
+        if let Verdict::Conflict(reason) = verdict {
+            return Err(self.window_conflict_err(since.version, last_version, &reason));
         }
+        // What the index coverage this transaction adds gives up is settled
+        // once every committed transaction is checked, against the latest
+        // manifest; see `repair_index_coverage`.
+        self.footprint_basis.repairs_index_coverage = true;
+        Ok(())
     }
 
     fn window_conflict_err(&self, since: u64, latest: u64, reason: &str) -> Error {
@@ -259,6 +295,55 @@ impl<'a> TransactionRebase<'a> {
             )
             .into(),
         )
+    }
+
+    /// A committed fragment this transaction adds index coverage of that one
+    /// of `committed` compacted without the fragment reuse history recording
+    /// where the rows went. Coverage of a recorded move is followed by the
+    /// repair; of an unrecorded one it names rows that are gone, which legacy
+    /// `CreateIndex` retries over an eager compaction too.
+    fn unrecorded_move_under_new_coverage(&self, committed: &[Footprint]) -> Option<u64> {
+        let compacted: HashSet<u64> = committed
+            .iter()
+            .flat_map(|footprint| footprint.compacted_fragments().iter().copied())
+            .collect();
+        if compacted.is_empty() {
+            return None;
+        }
+        new_coverage(&self.transaction, &self.footprint_basis.ngram_segments)
+            .iter()
+            .flat_map(|coverage| coverage.fragments.iter().copied())
+            .find(|fragment| {
+                compacted.contains(fragment)
+                    && self
+                        .moved_to(*fragment)
+                        .is_some_and(|moved| moved.is_empty())
+            })
+    }
+
+    /// The fragments the latest fragment reuse index records `fragment`'s
+    /// rows as moved into, following one compaction after another: empty
+    /// when it records no move of `fragment`, and `None` when a tagged
+    /// history has it on its lineage but cannot be walked.
+    ///
+    /// Only a move out of `fragment` counts, never one into it, so a
+    /// compaction of a fragment some recorded move produced, which recorded
+    /// nothing itself, is not taken for a recorded one.
+    fn moved_to(&self, fragment: u64) -> Option<Vec<u64>> {
+        let Ok(fragment) = u32::try_from(fragment) else {
+            return Some(Vec::new());
+        };
+        let moved = if let Some(lineage) = &self.current_lineage {
+            if !lineage.contains(fragment) {
+                return Some(Vec::new());
+            }
+            lineage.destinations_of(fragment)?
+        } else if let Some(reuse) = &self.untagged_reuse {
+            reuse.moved_to(fragment)
+        } else {
+            Vec::new()
+        };
+        Some(moved.into_iter().map(u64::from).collect())
     }
 
     fn check_delete_txn(
@@ -1460,5 +1545,139 @@ impl<'a> TransactionRebase<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Withdraw, from the index coverage this transaction adds or widens,
+    /// whatever the commits since it read invalidated: a column rewritten
+    /// under it, rows moved somewhere rewritten since, an overlay a
+    /// compaction folded in. A no-op unless an action set was checked against
+    /// it (`repairs_index_coverage`). See
+    /// [`lance_table::transaction::coverage_repair`].
+    pub(super) fn repair_index_coverage(&mut self) {
+        if !self.footprint_basis.repairs_index_coverage {
+            return;
+        }
+        let Some(read) = self.footprint_basis.read.clone() else {
+            return;
+        };
+        let mut committed: Vec<Arc<Manifest>> =
+            self.footprint_basis.history.values().cloned().collect();
+        if let Some(latest) = &self.footprint_basis.latest
+            && !self.footprint_basis.history.contains_key(&latest.version)
+        {
+            committed.push(latest.clone());
+        }
+        committed.sort_by_key(|manifest| manifest.version);
+        let moved_to = |fragment| self.moved_to(fragment);
+        let since = CommittedSince {
+            read: &read,
+            committed: committed.iter().map(|manifest| manifest.as_ref()).collect(),
+            moved_to: &moved_to,
+        };
+        let withdrawals: Vec<(uuid::Uuid, Vec<u64>)> =
+            new_coverage(&self.transaction, &self.footprint_basis.ngram_segments)
+                .into_iter()
+                .map(|coverage| (coverage.segment, stale_coverage(&since, &coverage)))
+                .filter(|(_, stale)| !stale.is_empty())
+                .collect();
+        for (segment, stale) in withdrawals {
+            match &mut self.transaction.operation {
+                Operation::CompositeOperation(composite_operation) => {
+                    for fragment in stale {
+                        composite_operation.withdraw_index_coverage(segment, fragment);
+                    }
+                }
+                Operation::CreateIndex { new_indices, .. } => {
+                    if let Some(bitmap) = new_indices
+                        .iter_mut()
+                        .find(|index| index.uuid == segment)
+                        .and_then(|index| index.fragment_bitmap.as_mut())
+                    {
+                        for fragment in stale {
+                            if let Ok(fragment) = u32::try_from(fragment) {
+                                bitmap.remove(fragment);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Whether index details describe an NGram index, whose segments cannot
+/// reach rows through the fragment reuse history.
+pub(super) fn is_ngram(details: Option<&Arc<prost_types::Any>>) -> bool {
+    details.is_some_and(|details| details.type_url.ends_with("NGramIndexDetails"))
+}
+
+/// Every index segment `transaction` adds or widens over committed fragments,
+/// where `ngram_segments` are the widened segments that are NGram segments.
+/// System indices cover no rows a commit could rewrite.
+fn new_coverage(
+    transaction: &Transaction,
+    ngram_segments: &HashSet<uuid::Uuid>,
+) -> Vec<NewCoverage> {
+    let committed_fields = |fields: &[ActionFieldRef], covering: &[ActionFieldRef]| {
+        fields
+            .iter()
+            .chain(covering)
+            .filter_map(|field| field.committed())
+            .filter(|field| *field >= 0)
+            .collect::<Vec<i32>>()
+    };
+    let committed_fragments = |fragments: &[ActionRef]| {
+        fragments
+            .iter()
+            .filter_map(|fragment| fragment.committed())
+            .collect::<Vec<u64>>()
+    };
+    match &transaction.operation {
+        Operation::CreateIndex { new_indices, .. } => new_indices
+            .iter()
+            .filter(|index| !is_system_index(index))
+            .filter_map(|index| {
+                Some(NewCoverage {
+                    segment: index.uuid,
+                    fields: index.dependency_fields().into_owned(),
+                    fragments: index
+                        .fragment_bitmap
+                        .as_ref()?
+                        .iter()
+                        .map(u64::from)
+                        .collect(),
+                    built_at: index.dataset_version,
+                    cannot_follow_moves: is_ngram(index.index_details.as_ref()),
+                })
+            })
+            .collect(),
+        Operation::CompositeOperation(composite_operation) => composite_operation
+            .iter_actions()
+            .filter_map(|action| match action {
+                Action::AddIndexSegment(segment) => {
+                    let parts = segment.parts();
+                    Some(NewCoverage {
+                        segment: parts.uuid,
+                        fields: committed_fields(&parts.fields, &parts.covering_fields),
+                        fragments: committed_fragments(parts.covered_fragments.as_deref()?),
+                        built_at: transaction.read_version,
+                        cannot_follow_moves: is_ngram(parts.index_details.as_ref()),
+                    })
+                }
+                Action::AdjustIndexCoverage(adjust) => {
+                    let parts = adjust.parts();
+                    Some(NewCoverage {
+                        segment: parts.uuid,
+                        fields: committed_fields(&parts.fields, &parts.covering_fields),
+                        fragments: committed_fragments(&parts.add_fragments),
+                        built_at: transaction.read_version,
+                        cannot_follow_moves: ngram_segments.contains(&parts.uuid),
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
