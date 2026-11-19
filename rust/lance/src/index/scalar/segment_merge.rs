@@ -18,11 +18,14 @@ use lance_core::ROW_ADDR;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table};
+use lance_index::scalar::{
+    CreatedIndex, OldIndexDataFilter, ScalarIndex, TrainingCriteria, index_files_to_table,
+};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use super::{TrainingScanOptions, scan_training_data};
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::index::frag_reuse::{OpenPurpose, SegmentRemappingPlan, StagedRemappingPlans};
 use crate::{Dataset, Error, Result};
@@ -63,16 +66,11 @@ impl<'a> SegmentMerge<'a> {
                 )));
             }
         }
-        let dataset_version = segments
-            .iter()
-            .map(|segment| segment.dataset_version)
-            .min()
-            .unwrap_or(dataset.manifest.version);
         Ok(Self {
             segments: segment_refs,
             field_id,
             field_path,
-            dataset_version,
+            dataset_version: dataset.manifest.version,
         })
     }
 
@@ -86,12 +84,6 @@ impl<'a> SegmentMerge<'a> {
 
     pub(in crate::index) fn field_path(&self) -> &str {
         &self.field_path
-    }
-
-    /// The oldest source version: the merged payload still describes the table
-    /// as it was when its oldest content was indexed.
-    pub(in crate::index) fn dataset_version(&self) -> u64 {
-        self.dataset_version
     }
 
     /// Refuse a pre-migration segment on a stable-row-id table. Without stable
@@ -120,20 +112,41 @@ impl<'a> SegmentMerge<'a> {
         Ok(())
     }
 
-    /// One old-data filter per source, and the live coverage they keep.
-    pub(in crate::index) async fn per_segment_filters(
+    /// Staged coverage has already been projected and checked by the merge entry point.
+    pub(in crate::index) async fn staged_row_inputs(
         &self,
         dataset: &Dataset,
-        staged: Option<&StagedRemappingPlans>,
-        address_domain: bool,
-    ) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
-        crate::index::append::build_per_segment_filters(
-            dataset,
-            &self.segments,
-            staged,
-            address_domain,
-        )
-        .await
+        refresh: &super::merge::MergeRefresh,
+        criteria: TrainingCriteria,
+    ) -> Result<(
+        RoaringBitmap,
+        Vec<Option<OldIndexDataFilter>>,
+        Option<SendableRecordBatchStream>,
+    )> {
+        let (coverage, filters, selection) = refresh
+            .row_merge_inputs(
+                dataset,
+                self.segments(),
+                None,
+                &[],
+                criteria.needs_row_addrs,
+            )
+            .await?;
+        let stream = if refresh.is_empty() {
+            None
+        } else {
+            Some(
+                scan_training_data(
+                    dataset,
+                    self.field_path(),
+                    &criteria,
+                    Some(selection),
+                    TrainingScanOptions::default(),
+                )
+                .await?,
+            )
+        };
+        Ok((coverage, filters, stream))
     }
 
     /// Union of the sources' stored coverage, requiring each source to record it.
@@ -150,25 +163,6 @@ impl<'a> SegmentMerge<'a> {
         Ok(coverage)
     }
 
-    /// Union of the sources' live and retired coverage.
-    pub(in crate::index) fn coverage_union(
-        &self,
-        dataset: &Dataset,
-    ) -> Result<(RoaringBitmap, RoaringBitmap)> {
-        for segment in &self.segments {
-            if segment.fragment_bitmap.is_none() {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: segment {} is missing fragment coverage",
-                    segment.uuid
-                )));
-            }
-        }
-        Ok(crate::index::append::split_segment_coverage(
-            dataset,
-            self.segments.iter().copied(),
-        ))
-    }
-
     pub(in crate::index) fn new_store(&self, dataset: &Dataset) -> Result<(Uuid, LanceIndexStore)> {
         let uuid = Uuid::new_v4();
         let store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
@@ -180,7 +174,6 @@ impl<'a> SegmentMerge<'a> {
     pub(in crate::index) fn build_metadata(
         &self,
         uuid: Uuid,
-        dataset_version: u64,
         fragment_bitmap: RoaringBitmap,
         created_index: CreatedIndex,
     ) -> IndexMetadata {
@@ -190,7 +183,7 @@ impl<'a> SegmentMerge<'a> {
             name: template.name.clone(),
             fields: template.fields.clone(),
             covering_fields: template.covering_fields.clone(),
-            dataset_version,
+            dataset_version: self.dataset_version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(Arc::new(created_index.index_details)),
             index_version: created_index.index_version as i32,
@@ -241,6 +234,27 @@ pub(in crate::index) async fn open_dyn_sources(
         );
     }
     Ok(sources)
+}
+
+/// The live fragments of each segment's coverage, the zones a merge keeps.
+pub(in crate::index) fn effective_coverage(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> Result<Vec<RoaringBitmap>> {
+    let dataset_fragments = dataset.table_state.fragment_bitmap.as_ref();
+    segments
+        .iter()
+        .map(|segment| {
+            segment
+                .effective_fragment_bitmap(dataset_fragments)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "CreateIndex: segment {} is missing fragment coverage",
+                        segment.uuid
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// One opened source as its concrete type.

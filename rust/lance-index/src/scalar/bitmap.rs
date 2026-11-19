@@ -2482,7 +2482,7 @@ impl<'a> SequentialBitmapReader<'a> {
 }
 
 /// Merge loaded bitmap indexes into `writer` without materializing all source
-/// bitmap payloads at once, applying the same `old_data_filter` to every source.
+/// bitmap payloads at once. Each source's filter applies only to its own rows.
 /// See [`OldSegments`] for the merge itself.
 ///
 /// Null keys live outside `index_map`, in each source's `null_map`, so they are
@@ -2495,12 +2495,10 @@ impl<'a> SequentialBitmapReader<'a> {
 /// or reached exactly. Entries have both, and are the unit the merge's cost is
 /// actually in, since it loads one bitmap per entry.
 ///
-/// A key whose merged bitmap comes out empty (every one of its rows retired by
-/// `old_data_filter`) is not written, the rule [`BitmapBatchWriter::emit`]
-/// applies to every path.
+/// As in every [`BitmapBatchWriter::emit`] path, a key with no remaining rows is omitted.
 pub(crate) async fn merge_index_maps(
     sources: &[Arc<BitmapIndex>],
-    old_data_filter: Option<&super::OldIndexDataFilter>,
+    filters: &[Option<&super::OldIndexDataFilter>],
     writer: &mut BitmapBatchWriter,
     progress: Option<(&dyn IndexBuildProgress, &str)>,
 ) -> Result<()> {
@@ -2514,9 +2512,10 @@ pub(crate) async fn merge_index_maps(
     let mut old = OldSegments::new(
         sources
             .iter()
-            .map(|source| OldSegment {
+            .zip(filters)
+            .map(|(source, filter)| OldSegment {
                 index: source.as_ref(),
-                filter: old_data_filter,
+                filter: *filter,
             })
             .collect(),
     )

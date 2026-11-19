@@ -6,6 +6,7 @@ use lance_index::scalar::label_list::{
     BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION, LabelListIndex,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use lance_table::format::IndexMetadata;
 
 use super::segment_merge::{SegmentMerge, open_source};
@@ -60,31 +61,20 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "LabelList", &segments)?;
     merge.reject_legacy_segments_on_stable(dataset, "LabelList")?;
     let field_id = merge.field_id();
 
-    let (effective_old_frags, deleted_old_frags) = merge.coverage_union(dataset)?;
-    let fragment_bitmap = effective_old_frags.clone();
-    // A live fragment can have deleted rows even when no whole fragment was
-    // retired. Clean both value postings and list-null rows in that case too.
-    let has_partial_deletions = effective_old_frags.iter().any(|id| {
-        dataset
-            .find_fragment(u64::from(id))
-            .is_some_and(|fragment| fragment.deletion_file.is_some())
-    });
-    let old_data_filter = if deleted_old_frags.is_empty() && !has_partial_deletions {
-        None
+    let criteria = TrainingCriteria::new(TrainingOrdering::None);
+    let criteria = if segments[0].results_are_row_addrs() {
+        criteria.with_row_addr()
     } else {
-        crate::index::append::build_old_data_filter(
-            dataset,
-            &effective_old_frags,
-            &deleted_old_frags,
-            true,
-        )
-        .await?
+        criteria.with_row_id()
     };
+    let (fragment_bitmap, filters, new_data) =
+        merge.staged_row_inputs(dataset, refresh, criteria).await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
     for segment in merge.segments() {
@@ -102,18 +92,14 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let (new_uuid, new_store) = merge.new_store(dataset)?;
-    let created_index = lance_index::scalar::label_list::merge_label_list_indices(
+    let created_index = lance_index::scalar::label_list::merge_label_list_indices_with_new_data(
         &source_indices,
+        new_data,
         &new_store,
-        old_data_filter,
+        &filters.iter().map(Option::as_ref).collect::<Vec<_>>(),
         lance_index::progress::noop_progress(),
     )
     .await?;
 
-    Ok(merge.build_metadata(
-        new_uuid,
-        dataset.manifest.version,
-        fragment_bitmap,
-        created_index,
-    ))
+    Ok(merge.build_metadata(new_uuid, fragment_bitmap, created_index))
 }

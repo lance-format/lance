@@ -9,6 +9,7 @@ use lance_index::pbold::BTreeIndexDetails;
 use lance_index::scalar::btree::BTreeIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use lance_table::format::IndexMetadata;
 
 use super::segment_merge::{SegmentMerge, empty_value_row_id_stream, open_sources};
@@ -33,20 +34,27 @@ pub(crate) async fn open_and_merge_segments(
 
 /// Merge one caller-defined group of source BTree segments into a single
 /// physical segment.
-pub(crate) async fn merge_segments(
+pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "BTree", &segments)?;
     merge.reject_legacy_segments_on_stable(dataset, "BTree")?;
-    let (fragment_bitmap, old_data_filters) =
-        merge.per_segment_filters(dataset, staged, true).await?;
+    let (fragment_bitmap, old_data_filters, new_data) = merge
+        .staged_row_inputs(
+            dataset,
+            refresh,
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+        )
+        .await?;
 
     let (output_uuid, new_store) = merge.new_store(dataset)?;
-    // Pure segment consolidation: no dataset scan, so `new_data` is an empty
-    // stream and the merge is driven entirely by the source page data.
-    let new_data = empty_value_row_id_stream(dataset, merge.field_id())?;
+    let new_data = match new_data {
+        Some(data) => data,
+        None => empty_value_row_id_stream(dataset, merge.field_id())?,
+    };
     let created_index = open_and_merge_segments(
         dataset,
         merge.field_path(),
@@ -73,10 +81,5 @@ pub(crate) async fn merge_segments(
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap(),
     );
 
-    Ok(merge.build_metadata(
-        output_uuid,
-        dataset.manifest.version,
-        fragment_bitmap,
-        created_index,
-    ))
+    Ok(merge.build_metadata(output_uuid, fragment_bitmap, created_index))
 }

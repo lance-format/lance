@@ -7,6 +7,7 @@ use lance_index::progress::noop_progress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::minhash_lsh::MinHashLshIndex;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use lance_table::format::IndexMetadata;
 
 use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_source};
@@ -15,13 +16,12 @@ use crate::{Dataset, Result};
 
 /// Merge one caller-defined group of MinHash LSH segments into a single segment.
 ///
-/// Rows of fragments that no longer exist are dropped through per-segment
-/// filters; the merged segment is rebuilt from the stored signatures without
-/// tokenizing the column again.
+/// Retain existing signatures and recompute signatures for rows selected for refresh.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "MinHash LSH", &segments)?;
     // The merged segment is always written in the current (row-address)
@@ -30,26 +30,27 @@ pub(in crate::index) async fn merge_segments(
     merge.reject_legacy_segments_on_stable(dataset, "MinHash LSH")?;
     // Current segments store addresses. A legacy segment can only reach here
     // without stable row IDs, where its IDs are also physical addresses.
-    let (fragment_bitmap, filters) = merge.per_segment_filters(dataset, staged, true).await?;
+    let (fragment_bitmap, filters, new_data) = merge
+        .staged_row_inputs(
+            dataset,
+            refresh,
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+        )
+        .await?;
 
     let (new_uuid, new_store) = merge.new_store(dataset)?;
     let created_index = open_and_merge_segments(
         dataset,
         merge.field_path(),
         merge.segments(),
-        None,
+        new_data,
         &new_store,
         &filters,
         staged,
     )
     .await?;
 
-    Ok(merge.build_metadata(
-        new_uuid,
-        merge.dataset_version(),
-        fragment_bitmap,
-        created_index,
-    ))
+    Ok(merge.build_metadata(new_uuid, fragment_bitmap, created_index))
 }
 
 pub(in crate::index) async fn open_and_merge_segments(

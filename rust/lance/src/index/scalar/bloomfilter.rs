@@ -12,61 +12,64 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 
-use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_sources};
+use super::segment_merge::{SegmentMerge, downcast_sources, effective_coverage, open_dyn_sources};
 use crate::index::frag_reuse::StagedRemappingPlans;
-use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
+use crate::{Dataset, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source BloomFilter segments into a single segment.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "BloomFilter", &segments)?;
-    let fragment_filters = effective_coverage(dataset, merge.segments())?;
+    let mut fragment_filters = effective_coverage(dataset, merge.segments())?;
+    let refreshed = refresh.fragments();
     let fragment_bitmap = fragment_filters
         .iter()
-        .fold(RoaringBitmap::new(), |acc, effective| acc | effective);
+        .fold(refreshed.clone(), |acc, effective| acc | effective);
 
+    let new_data = if refreshed.is_empty() {
+        None
+    } else {
+        for filter in &mut fragment_filters {
+            *filter -= &refreshed;
+        }
+        let fragments = dataset
+            .fragments()
+            .iter()
+            .filter(|fragment| refreshed.contains(fragment.id as u32))
+            .cloned()
+            .collect();
+        let criteria = lance_index::scalar::TrainingCriteria::new(
+            lance_index::scalar::TrainingOrdering::Addresses,
+        )
+        .with_row_addr();
+        Some(
+            super::scan_training_data(
+                dataset,
+                merge.field_path(),
+                &criteria,
+                Some(super::TrainingRows::Fragments(fragments)),
+                super::TrainingScanOptions::default(),
+            )
+            .await?,
+        )
+    };
     let (new_uuid, new_store) = merge.new_store(dataset)?;
     let created_index = open_and_merge_segments(
         dataset,
         merge.field_path(),
         merge.segments(),
-        None,
+        new_data,
         &new_store,
         &fragment_filters,
         staged,
     )
     .await?;
 
-    Ok(merge.build_metadata(
-        new_uuid,
-        merge.dataset_version(),
-        fragment_bitmap,
-        created_index,
-    ))
-}
-
-/// The live fragments of each segment's coverage, the zones a merge keeps.
-pub(in crate::index) fn effective_coverage(
-    dataset: &Dataset,
-    segments: &[&IndexMetadata],
-) -> Result<Vec<RoaringBitmap>> {
-    let dataset_fragments = dataset.table_state.fragment_bitmap.as_ref();
-    segments
-        .iter()
-        .map(|segment| {
-            segment
-                .effective_fragment_bitmap(dataset_fragments)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "CreateIndex: segment {} is missing fragment coverage",
-                        segment.uuid
-                    ))
-                })
-        })
-        .collect()
+    Ok(merge.build_metadata(new_uuid, fragment_bitmap, created_index))
 }
 
 /// Merge the zones `segments` hold over `fragment_filters`, and the zones

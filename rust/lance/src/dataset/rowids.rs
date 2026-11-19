@@ -146,6 +146,27 @@ pub(crate) async fn row_id_index_for_translation(
     })
 }
 
+/// The fragment's live row ids: its persisted row-id sequence minus the rows
+/// its deletion vector marks gone. A persisted sequence covers every row the
+/// fragment ever held, so a row whose old copy was deleted (e.g. rewritten by an
+/// update under the same stable row id) would otherwise be retained as a stale
+/// old-index entry.
+pub(crate) async fn live_row_ids(
+    fragment: &super::fragment::FileFragment,
+    seq: &RowIdSequence,
+) -> Result<RowAddrTreeMap> {
+    let deletion_vector = fragment.get_deletion_vector().await?;
+    Ok(match deletion_vector {
+        Some(dv) => seq
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| !dv.contains(*offset as u32))
+            .map(|(_, row_id)| row_id)
+            .collect(),
+        None => RowAddrTreeMap::from(seq),
+    })
+}
+
 /// Map a set of physical row addresses to their stable row ids
 ///
 /// A fragment's [`RowIdSequence`] holds one id per physical row in offset order;
@@ -172,8 +193,7 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
 
         match selection {
             RowAddrSelection::Full => {
-                // The whole fragment is selected: every live row's id qualifies.
-                row_ids |= RowAddrTreeMap::from(sequence.as_ref());
+                row_ids |= live_row_ids(&file_fragment, &sequence).await?;
             }
             RowAddrSelection::Partial(offsets) => {
                 let deletion_vector = file_fragment.get_deletion_vector().await?;

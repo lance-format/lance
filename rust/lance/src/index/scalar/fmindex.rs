@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use roaring::RoaringBitmap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -28,25 +27,12 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     is_rebuild_required: bool,
-    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "FM-Index", &segments)?;
     let column = merge.field_path();
-    let mut fragment_bitmap = merge.stored_coverage_union()?;
-
-    // Intersect with the dataset's current live fragments to drop retired/compacted
-    // fragments, mirroring the btree merge behavior. Under a tagged history the
-    // segments' stored bitmaps are provenance; the FM merge rebuilds from the
-    // dataset, so it rebuilds over the live coverage the tagged reader derives
-    // for them instead.
-    match crate::index::append::tagged_segment_coverage(dataset, merge.segments(), staged).await? {
-        Some(coverage) => {
-            fragment_bitmap = coverage
-                .values()
-                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
-        }
-        None => fragment_bitmap &= dataset.table_state.fragment_bitmap.as_ref(),
-    }
+    let mut fragment_bitmap = merge.stored_coverage_union()? | refresh.fragments();
+    fragment_bitmap &= dataset.table_state.fragment_bitmap.as_ref();
 
     if fragment_bitmap.is_empty() {
         // All covered fragments have been retired; produce an empty index.
@@ -65,15 +51,11 @@ pub(in crate::index) async fn merge_segments(
         )
         .await?;
 
-        return Ok(merge.build_metadata(
-            new_uuid,
-            dataset.manifest.version,
-            fragment_bitmap,
-            created_index,
-        ));
+        return Ok(merge.build_metadata(new_uuid, fragment_bitmap, created_index));
     }
 
     if !is_rebuild_required
+        && refresh.is_empty()
         && segments.len() == 1
         && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap)
     {
@@ -97,10 +79,5 @@ pub(in crate::index) async fn merge_segments(
     )
     .await?;
 
-    Ok(merge.build_metadata(
-        new_uuid,
-        dataset.manifest.version,
-        fragment_bitmap,
-        created_index,
-    ))
+    Ok(merge.build_metadata(new_uuid, fragment_bitmap, created_index))
 }
