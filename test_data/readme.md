@@ -8,6 +8,10 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 
 ## List of datasets
 
+* `v14.0.3/blobs/promoted_lists.lance`: A 2.2 table created by promoting
+  legacy Blob items inside `List` and `LargeList`. Its manifest retains the
+  original list tags alongside the promoted Blob v2 items.
+
 * `v14.0.2/stable_row_id_*.lance`: Seven datasets written by Lance 14.0.2 with
   stable row IDs enabled. They cover a contiguous `Range`, sparse
   `RangeWithHoles`, dense `RangeWithBitmap`, `SortedArray` with both 16-bit and

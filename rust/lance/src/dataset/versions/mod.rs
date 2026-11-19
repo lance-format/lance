@@ -158,7 +158,7 @@ pub(in crate::dataset) async fn write_fragments(
         dataset,
         normalized_schema,
         &params,
-        schema_compare_options(version),
+        version,
         inherited_field_ids,
     )?;
     schema.fields.extend(lineage_fields);
