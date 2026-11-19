@@ -86,7 +86,7 @@ impl ::prost::Name for ZoneMapIndexDetails {
         "/lance.table.ZoneMapIndexDetails".into()
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Eq, Hash, Clone, PartialEq, ::prost::Message)]
 pub struct InvertedIndexDetails {
     /// Lexical tokenizer used after document-level text extraction. This is an
     /// implementation component such as "simple", "icu", "ngram", or "code".
@@ -138,6 +138,11 @@ pub struct InvertedIndexDetails {
     /// which identifies the overall inverted-index layout.
     #[prost(uint32, optional, tag = "15")]
     pub posting_format_version: ::core::option::Option<u32>,
+    /// Per-segment overlay exceptions, as in RankedIndexOverlayDetails.
+    #[prost(message, optional, tag = "32")]
+    #[cfg(any())]
+    pub overlay_freshness:
+        ::core::option::Option<::lance_table::format::pb::IndexOverlayFreshnessList>,
 }
 /// Nested message and enum types in `InvertedIndexDetails`.
 pub mod inverted_index_details {

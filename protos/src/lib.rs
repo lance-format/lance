@@ -38,6 +38,7 @@ mod tests {
             "fragment_metadata.proto",
             "index.proto",
             "index_old.proto",
+            "index_overlay.proto",
             "table.proto",
             "table_identifier.proto",
         ] {

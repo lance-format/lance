@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.table;
+
+/* The overlay fields shared by VectorIndexDetails and InvertedIndexDetails.
+ * Table maintenance can project this field from either message without
+ * interpreting index configuration. Its wire number and type must match.
+ */
+message RankedIndexOverlayDetails {
+  IndexOverlayFreshnessList overlay_freshness = 32;
+}
+
+/* Keeping the entries in a single length-delimited field lets readers skip
+ * the entire list when they need only the index configuration.
+ */
+message IndexOverlayFreshnessList {
+  repeated IndexOverlayFreshness entries = 1;
+  /* A local snapshot at which the merge verified coverage inherited from
+   * another dataset. Used to validate base files, deletions and overlay
+   * identities on later publication. It does not date the row addresses or
+   * establish that every overlay at this snapshot was indexed.
+   */
+  optional uint64 validation_version = 2;
+}
+
+/* Physical sources and incorporated overlays for one index fragment. Each
+ * fragment and each overlay within it occur at most once.
+ */
+message IndexOverlayFreshness {
+  uint32 fragment_id = 1;
+  /* Actual build snapshots for the contributing entries. Repeated merges
+   * retain the original snapshots. Empty means the source history is
+   * unavailable in this dataset, for example after a clone.
+   */
+  repeated uint64 source_versions = 2;
+  repeated IndexedDataOverlay overlays = 3;
+}
+
+// An incorporated file newer than the segment-wide dataset_version.
+message IndexedDataOverlay {
+  uint64 committed_version = 1;
+  string path = 2;
+  /* An absent base identifies the base of the index segment. A shallow clone
+   * can therefore resolve the same file after assigning that base an id.
+   */
+  optional uint32 base_id = 3;
+}

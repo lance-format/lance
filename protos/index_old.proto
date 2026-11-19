@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package lance.table;
 
+import "index_overlay.proto";
+
 /* NOTE: Do *NOT* add new index details here.  Add them to the index.proto file instead.
  * This file is in the lance.table package namespace while the index.proto file is in the
  * lance.index package namespace.
@@ -115,4 +117,6 @@ message InvertedIndexDetails {
    * which identifies the overall inverted-index layout.
    */
   optional uint32 posting_format_version = 15;
+  // Per-segment overlay exceptions, as in RankedIndexOverlayDetails.
+  IndexOverlayFreshnessList overlay_freshness = 32;
 }

@@ -135,6 +135,7 @@ fn generate_table(
             proto_dir.join("table.proto"),
             proto_dir.join("transaction/transaction.proto"),
             proto_dir.join("rowids.proto"),
+            proto_dir.join("index_overlay.proto"),
         ],
         &[&proto_dir],
     )?;
@@ -167,6 +168,37 @@ fn generate_index(
     let cache_proto_dir = repo_root.join("rust/lance-index/protos-cache");
     let mut config = config(&out_dir)?;
     config.enable_type_names();
+    config.extern_path(
+        ".lance.table.IndexOverlayFreshnessList",
+        "::lance_table::format::pb::IndexOverlayFreshnessList",
+    );
+    config.extern_path(
+        ".lance.table.IndexOverlayFreshness",
+        "::lance_table::format::pb::IndexOverlayFreshness",
+    );
+    config.extern_path(
+        ".lance.table.IndexedDataOverlay",
+        "::lance_table::format::pb::IndexedDataOverlay",
+    );
+    config.extern_path(
+        ".lance.table.RankedIndexOverlayDetails",
+        "::lance_table::format::pb::RankedIndexOverlayDetails",
+    );
+    // These public Rust configuration views skip the per-segment block. The wire
+    // schema retains it for other generators and for RankedIndexOverlayDetails.
+    for field in [
+        ".lance.table.InvertedIndexDetails.overlay_freshness",
+        ".lance.index.pb.VectorIndexDetails.overlay_freshness",
+    ] {
+        config.field_attribute(field, "#[cfg(any())]");
+    }
+    // Prost infers traits from the full descriptor before Rust removes the field.
+    // Suffix matchers select the messages themselves without matching nested types.
+    config.message_attribute("lance.table.InvertedIndexDetails", "#[derive(Eq, Hash)]");
+    config.message_attribute(
+        "lance.index.pb.MinHashLshIndexDetails",
+        "#[derive(Eq, Hash)]",
+    );
     config.compile_protos(&[proto_dir.join("index_old.proto")], &[&proto_dir])?;
     config.extern_path(".lance.table", "crate::pbold");
     config.compile_protos(
