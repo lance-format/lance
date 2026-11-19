@@ -42,7 +42,7 @@ use super::KMeans;
 use super::profile::{self, Phase, Work};
 use assign::{Assignment, NearestCentroid};
 
-mod assign;
+pub(super) mod assign;
 
 /// Count that every cluster starts with. It makes `S_j / N_j` return the
 /// initial centroid exactly while giving it almost no weight against the

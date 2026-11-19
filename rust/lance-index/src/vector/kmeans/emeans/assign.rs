@@ -23,10 +23,12 @@ const GEMM_TILE_MAX_ELEMENTS: usize = (1 << 15) - 1;
 
 /// The nearest centroid of a vector and the squared L2 distance to it, or
 /// `None` when every distance is NaN.
-pub(super) type Assignment = Option<(u32, f32)>;
+pub(in crate::vector::kmeans) type Assignment = Option<(u32, f32)>;
 
 /// Assigns vectors to their nearest centroid under squared L2 distance.
-pub(super) trait NearestCentroid: Float + L2 + Send + Sync {
+pub(in crate::vector::kmeans) trait NearestCentroid:
+    Float + L2 + Send + Sync
+{
     /// Per-centroid data that [`Self::assign_rows`] reuses across calls with
     /// the same centroids. Empty unless an implementation needs it.
     fn prepare_centroids(_centroids: &[Self], _dimension: usize) -> Vec<f32> {

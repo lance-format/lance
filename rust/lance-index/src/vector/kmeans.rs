@@ -56,6 +56,7 @@ use lance_core::{Error, Result};
 pub mod emeans;
 pub mod profile;
 
+use emeans::assign::NearestCentroid;
 use emeans::{EMeansParams, train_emeans};
 use profile::{Phase, Work};
 
@@ -441,6 +442,23 @@ pub trait KMeansAlgo<T: Num> {
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>);
 
+    /// Nearest centroid of every row of `data` named by `indices`, without
+    /// balancing: how hierarchical training hands a node's vectors to its
+    /// sub-clusters. `None` for a row whose distances are all NaN.
+    fn membership_of_rows(
+        centroids: &[T],
+        data: &[T],
+        dimension: usize,
+        indices: &[usize],
+        distance_type: DistanceType,
+    ) -> Vec<Option<u32>>
+    where
+        T: Clone + Send + Sync,
+        Self: Sized,
+    {
+        gathered_membership_of_rows::<T, Self>(centroids, data, dimension, indices, distance_type)
+    }
+
     /// Construct a new KMeans model.
     fn to_kmeans(
         data: &[T],
@@ -451,6 +469,68 @@ pub trait KMeansAlgo<T: Num> {
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans;
+}
+
+/// [`KMeansAlgo::membership_of_rows`] by gathering the rows in chunks and
+/// running [`KMeansAlgo::compute_membership_and_dist`] on each, so that no copy
+/// of the whole node is ever held.
+fn gathered_membership_of_rows<T: Num + Clone + Send + Sync, Algo: KMeansAlgo<T>>(
+    centroids: &[T],
+    data: &[T],
+    dimension: usize,
+    indices: &[usize],
+    distance_type: DistanceType,
+) -> Vec<Option<u32>> {
+    let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<T>())).max(1);
+    indices
+        .par_chunks(chunk_rows)
+        .flat_map_iter(|chunk| {
+            let gather_busy = profile::work(Work::Gather);
+            let mut rows = Vec::with_capacity(chunk.len() * dimension);
+            for &idx in chunk {
+                rows.extend_from_slice(&data[idx * dimension..(idx + 1) * dimension]);
+            }
+            drop(gather_busy);
+            let (membership, _) = Algo::compute_membership_and_dist(
+                centroids,
+                &rows,
+                dimension,
+                distance_type,
+                0.0,
+                None,
+                None,
+            );
+            membership
+        })
+        .collect()
+}
+
+/// [`KMeansAlgo::membership_of_rows`] for `f32` vectors under L2: every task
+/// scores its rows against all centroids with the tiled GEMM of e-means
+/// assignment, reading the rows in place. Tasks are sequential inside, so the
+/// parallelism comes from the many chunks of a large node and from sibling
+/// nodes, never from rayon jobs per vector.
+fn gemm_membership_of_rows(
+    centroids: &[f32],
+    data: &[f32],
+    dimension: usize,
+    indices: &[usize],
+) -> Vec<Option<u32>> {
+    let norms = f32::prepare_centroids(centroids, dimension);
+    let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<f32>()))
+        .min(indices.len().div_ceil(MEMBERSHIP_MIN_TASKS))
+        .max(MEMBERSHIP_MIN_TASK_ROWS);
+    indices
+        .par_chunks(chunk_rows)
+        .flat_map_iter(|rows| {
+            let _busy = profile::work(Work::Assign);
+            let mut assignments = Vec::with_capacity(rows.len());
+            f32::assign_rows(data, dimension, centroids, &norms, rows, &mut assignments);
+            assignments
+                .into_iter()
+                .map(|assignment| assignment.map(|(centroid, _)| centroid))
+        })
+        .collect()
 }
 
 /// Reads a `T::Native` slice as `f16` when — and only when — that is what it is.
@@ -792,6 +872,27 @@ where
         cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
+    fn membership_of_rows(
+        centroids: &[T::Native],
+        data: &[T::Native],
+        dimension: usize,
+        indices: &[usize],
+        distance_type: DistanceType,
+    ) -> Vec<Option<u32>> {
+        match (T::as_f32_slice(centroids), T::as_f32_slice(data)) {
+            (Some(centroids), Some(data)) if distance_type == DistanceType::L2 => {
+                gemm_membership_of_rows(centroids, data, dimension, indices)
+            }
+            _ => gathered_membership_of_rows::<T::Native, Self>(
+                centroids,
+                data,
+                dimension,
+                indices,
+                distance_type,
+            ),
+        }
+    }
+
     fn to_kmeans(
         data: &[T::Native],
         dimension: usize,
@@ -967,6 +1068,13 @@ const TRAINING_ROWS_PER_CENTROID: usize = 512;
 /// bytes rather than rows: a row-count budget would hold a multiple of it on
 /// high-dimensional data.
 const MEMBERSHIP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// A node's rows are split into at least this many GEMM membership tasks,
+/// unless that would leave fewer than [`MEMBERSHIP_MIN_TASK_ROWS`] per task, so
+/// nodes with few siblings still spread across the pool.
+const MEMBERSHIP_MIN_TASKS: usize = 64;
+/// Rows below which a GEMM membership task would spend more on scheduling than
+/// on scoring.
+const MEMBERSHIP_MIN_TASK_ROWS: usize = 256;
 
 /// One leaf of the proportional hierarchy: a centroid and the training vectors
 /// it was fitted on.
@@ -1372,42 +1480,6 @@ impl KMeans {
     }
 
     /// Helper function to create a FixedSizeListArray from indices
-    /// Nearest centroid of every row in `indices`, computed over gathered chunks
-    /// so that no copy of the whole node is ever held.
-    fn membership_of_rows<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
-        centroids: &[T::Native],
-        data_values: &[T::Native],
-        dimension: usize,
-        indices: &[usize],
-        distance_type: DistanceType,
-    ) -> Vec<Option<u32>>
-    where
-        T::Native: Num,
-    {
-        let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<T::Native>())).max(1);
-        indices
-            .par_chunks(chunk_rows)
-            .flat_map_iter(|chunk| {
-                let gather_busy = profile::work(Work::Gather);
-                let mut rows = Vec::with_capacity(chunk.len() * dimension);
-                for &idx in chunk {
-                    rows.extend_from_slice(&data_values[idx * dimension..(idx + 1) * dimension]);
-                }
-                drop(gather_busy);
-                let (membership, _) = Algo::compute_membership_and_dist(
-                    centroids,
-                    &rows,
-                    dimension,
-                    distance_type,
-                    0.0,
-                    None,
-                    None,
-                );
-                membership
-            })
-            .collect()
-    }
-
     fn create_array_from_indices<T: ArrowNumericType>(
         indices: &[usize],
         data_values: &[T::Native],
@@ -1588,7 +1660,7 @@ impl KMeans {
         drop(train_phase);
         drop(training);
         let membership_phase = profile::phase(Phase::Membership);
-        let membership = Self::membership_of_rows::<T, Algo>(
+        let membership = Algo::membership_of_rows(
             kmeans.centroids.as_primitive::<T>().values(),
             data_values,
             dimension,
@@ -2605,6 +2677,69 @@ mod tests {
         let err =
             kmeans_find_partitions_binary(&centroids, &[], 1, DistanceType::Hamming).unwrap_err();
         assert!(err.to_string().contains("empty query"), "{err}");
+    }
+
+    /// The GEMM membership of hierarchical nodes picks the child the gathered
+    /// per-vector path picks for every row, up to rounding on exact ties, and
+    /// leaves NaN rows unassigned.
+    #[rstest]
+    #[case::small_node(100, 16, 64)]
+    #[case::many_tasks(20_000, 16, 128)]
+    #[case::high_dimension(600, 16, 1024)]
+    #[case::many_centroids(3_000, 300, 32)]
+    fn test_gemm_membership_matches_gathered_path(
+        #[case] num_rows: usize,
+        #[case] k: usize,
+        #[case] dimension: usize,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(11);
+        let mut data: Vec<f32> = (0..2 * num_rows * dimension)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        data[dimension..2 * dimension].fill(f32::NAN);
+        let centroids: Vec<f32> = data[..k * dimension]
+            .iter()
+            .map(|value| value + 0.1)
+            .collect();
+        // A shuffled subset of the rows, as a node of the hierarchy holds.
+        let mut indices: Vec<usize> = (0..2 * num_rows).collect();
+        indices.shuffle(&mut rng);
+        indices.truncate(num_rows - 1);
+        indices.push(1);
+
+        let gemm = KMeansAlgoFloat::<Float32Type>::membership_of_rows(
+            &centroids,
+            &data,
+            dimension,
+            &indices,
+            DistanceType::L2,
+        );
+        let gathered = gathered_membership_of_rows::<f32, KMeansAlgoFloat<Float32Type>>(
+            &centroids,
+            &data,
+            dimension,
+            &indices,
+            DistanceType::L2,
+        );
+
+        assert_eq!(gemm.len(), indices.len());
+        assert_eq!(gemm[num_rows - 1], None);
+        for ((&row, gemm), gathered) in indices.iter().zip(&gemm).zip(&gathered) {
+            if gemm == gathered {
+                continue;
+            }
+            let (Some(gemm), Some(gathered)) = (gemm, gathered) else {
+                panic!("row {row}: {gemm:?} vs {gathered:?}");
+            };
+            let vector = &data[row * dimension..(row + 1) * dimension];
+            let distance =
+                |c: &u32| l2::l2(vector, &centroids[*c as usize * dimension..][..dimension]);
+            let (a, b) = (distance(gemm), distance(gathered));
+            assert!(
+                (a - b).abs() <= 1e-4 * b.max(1.0),
+                "row {row}: centroid {gemm} at {a} is not tied with {gathered} at {b}"
+            );
+        }
     }
 
     /// The SoA path and the per-centroid fallback must pick the centroids the
