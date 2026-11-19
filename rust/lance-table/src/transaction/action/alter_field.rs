@@ -20,12 +20,48 @@ use lance_core::{Error, Result};
 /// [`AddField`](super::AddField) under the same name, and the data.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AlterField {
-    pub field: FieldRef,
-    pub name: Option<String>,
-    pub nullable: Option<bool>,
+    field: FieldRef,
+    name: Option<String>,
+    nullable: Option<bool>,
 }
 
 impl AlterField {
+    /// Alter `field`, changing nothing until a facet is set.
+    pub fn new(field: FieldRef) -> Self {
+        Self {
+            field,
+            name: None,
+            nullable: None,
+        }
+    }
+
+    /// Rename the field.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Change whether the field is nullable.
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = Some(nullable);
+        self
+    }
+
+    /// The field altered.
+    pub fn field(&self) -> FieldRef {
+        self.field
+    }
+
+    /// The new name, or `None` to keep it.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The new nullability, or `None` to keep it.
+    pub fn nullable(&self) -> Option<bool> {
+        self.nullable
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let field_id = state.resolve_schema_field(self.field, "AlterField")?;
         let missing = || {
@@ -95,11 +131,14 @@ impl TryFrom<pb_actions::AlterField> for AlterField {
     type Error = Error;
 
     fn try_from(message: pb_actions::AlterField) -> Result<Self> {
-        Ok(Self {
-            field: required(message.field, "AlterField.field")?.try_into()?,
-            name: message.name,
-            nullable: message.nullable,
-        })
+        let mut alter = Self::new(required(message.field, "AlterField.field")?.try_into()?);
+        if let Some(name) = message.name {
+            alter = alter.with_name(name);
+        }
+        if let Some(nullable) = message.nullable {
+            alter = alter.with_nullable(nullable);
+        }
+        Ok(alter)
     }
 }
 
@@ -110,7 +149,7 @@ mod tests {
     use crate::transaction::action::test_support::{
         added_field, apply, apply_with_indices, backed_manifest,
     };
-    use crate::transaction::action::{Action, AddField, ConfigUpdate, FieldMetadataUpdate};
+    use crate::transaction::action::{Action, AddField, ConfigUpdate};
     use crate::transaction::test_support::sample_index_metadata;
     use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 
@@ -118,11 +157,11 @@ mod tests {
     fn test_alter_field_renames_without_touching_indices() {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
-            vec![Action::AlterField(AlterField {
-                field: FieldRef::Committed(0),
-                name: Some("renamed".into()),
-                nullable: Some(true),
-            })],
+            vec![Action::AlterField(
+                AlterField::new(FieldRef::Committed(0))
+                    .with_name("renamed")
+                    .with_nullable(true),
+            )],
             vec![sample_index_metadata("idx")],
         )
         .unwrap();
@@ -140,16 +179,15 @@ mod tests {
         manifest.schema.field_by_id_mut(0).unwrap().nullable = false;
         let keyed = apply(
             &manifest,
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Committed(0),
-                    updates: UpdateMap {
+            vec![Action::ConfigUpdate(
+                ConfigUpdate::default().with_field_metadata(
+                    FieldRef::Committed(0),
+                    UpdateMap {
                         update_entries: vec![(LANCE_UNENFORCED_PRIMARY_KEY, Some("true")).into()],
                         replace: false,
                     },
-                }],
-                ..Default::default()
-            })],
+                ),
+            )],
         )
         .unwrap();
 
@@ -173,11 +211,9 @@ mod tests {
     fn test_alter_field_rejects_a_missing_field() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::AlterField(AlterField {
-                field: FieldRef::Committed(7),
-                name: Some("nope".into()),
-                nullable: None,
-            })],
+            vec![Action::AlterField(
+                AlterField::new(FieldRef::Committed(7)).with_name("nope"),
+            )],
         )
         .unwrap_err();
 
@@ -187,17 +223,9 @@ mod tests {
 
     #[test]
     fn test_alter_field_rejects_renaming_onto_a_sibling() {
-        let taken = Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: added_field("taken"),
-        });
+        let taken = Action::AddField(AddField::new(0, added_field("taken")));
         let rename = |name: &str| {
-            Action::AlterField(AlterField {
-                field: FieldRef::Committed(0),
-                name: Some(name.into()),
-                nullable: None,
-            })
+            Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name(name))
         };
 
         let error = apply(&backed_manifest(), vec![taken.clone(), rename("taken")]).unwrap_err();
@@ -219,16 +247,8 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("before"),
-                }),
-                Action::AlterField(AlterField {
-                    field: FieldRef::Local(0),
-                    name: Some("after".into()),
-                    nullable: None,
-                }),
+                Action::AddField(AddField::new(0, added_field("before"))),
+                Action::AlterField(AlterField::new(FieldRef::Local(0)).with_name("after")),
             ],
         )
         .unwrap();
