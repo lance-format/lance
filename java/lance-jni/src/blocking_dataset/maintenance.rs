@@ -218,6 +218,14 @@ fn convert_java_compaction_options_to_rust(
     let scope = env
         .call_method(&java_options, "getScope", "()Ljava/util/Optional;", &[])?
         .l()?;
+    let data_cache_bytes = env
+        .call_method(
+            &java_options,
+            "getDataCacheBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     let mut options = build_compaction_options(
         env,
@@ -238,6 +246,7 @@ fn convert_java_compaction_options_to_rust(
         &excluded_fragment_ids,
         &data_storage_version,
         Some(&source_budget_mode),
+        &data_cache_bytes,
         config,
     )?;
     apply_repack_options(env, &mut options, &max_data_files_per_fragment, &scope)?;

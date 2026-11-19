@@ -46,6 +46,7 @@ class DatasetOptimizer:
         data_storage_version: Optional[str] = None,
         max_data_files_per_fragment: Optional[int] = None,
         scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]] = None,
+        data_cache_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -195,6 +196,14 @@ class DatasetOptimizer:
             config, and refuses the ``"force_binary_copy"`` mode. A run that
             does both commits the rewrites and the repacks separately; if the
             repack commit fails, the dataset is left at the rewrite's version.
+        data_cache_bytes: int, optional
+            Total budget in bytes for buffering column data in each output
+            file writer during re-encoding. Divided evenly among cache-owning
+            field encoders, including nested fields. Defaults to the Rust
+            writer's 8 MiB per cache owner when omitted or None. Must be
+            non-negative; zero is allowed. Does not affect binary copy or the
+            input scanner's buffers.
+            For example, ``compact_files(data_cache_bytes=4 * 1024 * 1024)``.
 
         Returns
         -------
@@ -227,6 +236,7 @@ class DatasetOptimizer:
                 data_storage_version=data_storage_version,
                 max_data_files_per_fragment=max_data_files_per_fragment,
                 scope=scope,
+                data_cache_bytes=data_cache_bytes,
             ).items()
             if v is not None
         }
