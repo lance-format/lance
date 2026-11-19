@@ -179,6 +179,47 @@ def test_lance_log_filters_trace_event_targets(tmp_path):
 
 
 @pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="memory observation reads /proc, so it works on Linux only",
+)
+def test_lance_log_records_memory_events(tmp_path):
+    log_file = tmp_path / "lance_rust.log"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import lance; import pyarrow as pa; "
+            "ds = lance.write_dataset(pa.table({'x': range(10)}), 'memory://test'); "
+            "ds.create_scalar_index('x', 'BTREE')",
+        ],
+        capture_output=True,
+        env={
+            "LANCE_MEMORY_OBSERVE": "1",
+            "LANCE_LOG": "warn,lance::events::memory=info",
+            "LANCE_LOG_FILE": str(log_file),
+        },
+    )
+
+    assert result.returncode == 0, f"Command failed: {result.stderr.decode()}"
+
+    log_content = log_file.read_text()
+    memory_lines = [
+        line for line in log_content.splitlines() if "lance::events::memory" in line
+    ]
+    for event in [
+        "operation_start",
+        "stage_start",
+        "stage_complete",
+        "operation_complete",
+    ]:
+        assert any(f'event="{event}"' in line for line in memory_lines), log_content
+    assert all("operation_id=" in line for line in memory_lines), log_content
+    assert all('index_type="btree"' in line for line in memory_lines), log_content
+    assert "lance::events::dataset_events" not in log_content
+
+
+@pytest.mark.skipif(
     sys.platform == "win32",
     reason="subprocess does not work correctly in CI on Windows",
 )

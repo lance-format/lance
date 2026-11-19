@@ -27,6 +27,37 @@ pub mod vector;
 
 pub use crate::traits::*;
 
+/// Declares a [`lance_core::dispatch!`] whose candidates depend on the target
+/// architecture. Each architecture's kernels come first, best first, followed
+/// by the portable kernel; an architecture without a list gets only the
+/// portable kernel, so callers need no `cfg` of their own.
+macro_rules! arch_dispatch {
+    ($(
+        $vis:vis static $name:ident: Dispatch<$kernel_type:ty> =
+            x86_64[$($x86:expr),* $(,)?]
+            $(, aarch64[$($aarch64:expr),* $(,)?])?
+            , portable $portable:expr;
+    )*) => {$(
+        lance_core::dispatch! {
+            $vis static $name: Dispatch<$kernel_type> = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    &[$($x86,)* $portable]
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    &[$($($aarch64,)*)? $portable]
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    &[$portable]
+                }
+            };
+        }
+    )*};
+}
+pub(crate) use arch_dispatch;
+
 // Re-export core traits from lance-index-core
 pub use lance_index_core::{Index, IndexParams, IndexType};
 

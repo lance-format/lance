@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! The envelope around the per-action protobuf encodings.
+//!
+//! Each action encodes itself, in its own module; this module carries the
+//! [`Ref`], [`FieldRef`], [`CompositeOperation`], and [`UserStep`] wrappers, the dispatch over
+//! the `oneof`, and the helpers the per-action conversions share.
+//!
+//! Reading is fail-closed: an action this build does not recognize is an error,
+//! never a silently skipped element. The commit path collects concurrent
+//! transactions with `try_collect`, so a transaction carrying an unknown action
+//! must abort the commit rather than be treated as a no-op. Every specified action
+//! is implemented, so an unrecognized one can only come from a newer Lance --
+//! which protobuf decodes as no variant at all, since it drops the field it does
+//! not know.
+
+use super::{Action, CompositeOperation, FieldRef, Ref, UserStep};
+use crate::format::pb_actions;
+use lance_core::{Error, Result};
+
+pub(super) fn required<T>(value: Option<T>, what: &str) -> Result<T> {
+    value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
+}
+
+/// A required string field. Protobuf gives an unset string the empty value, so
+/// the two cases cannot be told apart and neither is usable.
+pub(super) fn non_empty(value: String, what: &str) -> Result<String> {
+    if value.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "{what} is required but was empty"
+        )));
+    }
+    Ok(value)
+}
+
+impl From<Ref> for pb_actions::Ref {
+    fn from(value: Ref) -> Self {
+        let kind = match value {
+            Ref::Committed(id) => pb_actions::r#ref::Kind::Committed(id),
+            Ref::Local(token) => pb_actions::r#ref::Kind::Local(token),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+impl TryFrom<pb_actions::Ref> for Ref {
+    type Error = Error;
+
+    fn try_from(message: pb_actions::Ref) -> Result<Self> {
+        match message.kind {
+            Some(pb_actions::r#ref::Kind::Committed(id)) => Ok(Self::Committed(id)),
+            Some(pb_actions::r#ref::Kind::Local(token)) => Ok(Self::Local(token)),
+            None => Err(Error::invalid_input(
+                "a Ref in an action was empty; it must be either committed or local",
+            )),
+        }
+    }
+}
+
+impl From<FieldRef> for pb_actions::FieldRef {
+    fn from(value: FieldRef) -> Self {
+        let kind = match value {
+            FieldRef::Committed(id) => pb_actions::field_ref::Kind::Committed(id),
+            FieldRef::Local(token) => pb_actions::field_ref::Kind::Local(token),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+impl TryFrom<pb_actions::FieldRef> for FieldRef {
+    type Error = Error;
+
+    fn try_from(message: pb_actions::FieldRef) -> Result<Self> {
+        match message.kind {
+            Some(pb_actions::field_ref::Kind::Committed(id)) => Ok(Self::Committed(id)),
+            Some(pb_actions::field_ref::Kind::Local(token)) => Ok(Self::Local(token)),
+            None => Err(Error::invalid_input(
+                "a FieldRef in an action was empty; it must be either committed or local",
+            )),
+        }
+    }
+}
+
+impl From<&CompositeOperation> for pb_actions::CompositeOperation {
+    fn from(value: &CompositeOperation) -> Self {
+        Self {
+            steps: value.steps.iter().map(pb_actions::UserStep::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<pb_actions::CompositeOperation> for CompositeOperation {
+    type Error = Error;
+
+    fn try_from(message: pb_actions::CompositeOperation) -> Result<Self> {
+        Ok(Self {
+            steps: message
+                .steps
+                .into_iter()
+                .map(UserStep::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
+impl From<&UserStep> for pb_actions::UserStep {
+    fn from(value: &UserStep) -> Self {
+        Self {
+            description: value.description.clone(),
+            actions: value.actions.iter().map(pb_actions::Action::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<pb_actions::UserStep> for UserStep {
+    type Error = Error;
+
+    fn try_from(message: pb_actions::UserStep) -> Result<Self> {
+        Ok(Self {
+            description: message.description,
+            actions: message
+                .actions
+                .into_iter()
+                .map(Action::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
+macro_rules! define_action_proto {
+    ($($variant:ident,)*) => {
+        impl From<&Action> for pb_actions::Action {
+            fn from(value: &Action) -> Self {
+                let action = match value {
+                    $(Action::$variant(action) => pb_actions::action::Action::$variant(action.into()),)*
+                };
+                Self {
+                    action: Some(action),
+                }
+            }
+        }
+
+        impl TryFrom<pb_actions::Action> for Action {
+            type Error = Error;
+
+            fn try_from(message: pb_actions::Action) -> Result<Self> {
+                match message.action {
+                    $(Some(pb_actions::action::Action::$variant(action)) => {
+                        Ok(Self::$variant(action.try_into()?))
+                    })*
+                    // An action written by a newer Lance decodes to no known
+                    // variant, because protobuf drops the field it does not
+                    // know. Reject rather than skip: silently dropping an
+                    // action would apply a partial transaction.
+                    None => Err(Error::not_supported(
+                        "an Action in a CompositeOperation carried no change this version of \
+                         Lance understands; it was either empty or written by a newer version",
+                    )),
+                }
+            }
+        }
+    };
+}
+
+for_each_action!(define_action_proto);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::key_existence::{FilterType, KeyExistenceFilter};
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
+    use crate::rowids::version::RowDatasetVersionMeta;
+    use crate::system_index::mem_wal::CompactedSsTable;
+    use crate::transaction::UpdateMap;
+    use crate::transaction::action::{
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
+        DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
+        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+    };
+    use arrow_schema::{DataType, Field as ArrowField};
+    use chrono::DateTime;
+    use lance_core::datatypes::Field;
+    use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
+    use rstest::rstest;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn sample_data_file() -> DataFile {
+        DataFile::new_unstarted("data/1.lance", ConcreteFileVersion::V2_0)
+    }
+
+    fn all_actions() -> Vec<Action> {
+        vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 10,
+                row_id_meta: Some(RowIdMeta::Inline(vec![1, 2, 3].into())),
+                last_updated_at_version_meta: Some(RowDatasetVersionMeta::Inline(Arc::from(
+                    [4u8, 5].as_slice(),
+                ))),
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: sample_data_file(),
+                field_ids: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                data_change: false,
+                base: Some(Ref::Local(1)),
+            }),
+            Action::AddField(AddField {
+                local: 3,
+                parent: Some(FieldRef::Committed(1)),
+                def: Field::try_from(ArrowField::new("added", DataType::Int32, true)).unwrap(),
+            }),
+            Action::AddBase(AddBase {
+                local: 1,
+                base: BasePath::new(0, "s3://bucket/x".into(), Some("other".into()), false),
+            }),
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(4),
+                field_ids: vec![FieldRef::Committed(7), FieldRef::Committed(8)],
+                data_change: true,
+            }),
+            Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(5),
+                data_change: true,
+            }),
+            Action::SetDeletionFile(SetDeletionFile {
+                fragment: 6,
+                deletion_file: DeletionFile {
+                    read_version: 3,
+                    id: 9,
+                    file_type: DeletionFileType::Bitmap,
+                    num_deleted_rows: Some(4),
+                    base_id: None,
+                    inline: None,
+                },
+                data_change: true,
+                base: Some(Ref::Committed(2)),
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Committed(6),
+                overlays: vec![DataOverlayFile {
+                    data_file: sample_data_file(),
+                    coverage: OverlayCoverage::PerField(vec![Arc::new(
+                        [1u32, 4].into_iter().collect::<RoaringBitmap>(),
+                    )]),
+                    committed_version: 11,
+                }],
+                data_change: true,
+            }),
+            Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 6,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([0u32, 2])),
+                    },
+                ],
+            }),
+            Action::AlterField(AlterField {
+                field: FieldRef::Committed(2),
+                name: Some("renamed".into()),
+                nullable: Some(false),
+            }),
+            Action::DropField(DropField {
+                field: FieldRef::Committed(3),
+            }),
+            Action::AddIndexSegment(AddIndexSegment {
+                uuid: Uuid::from_u128(7),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                covering_fields: vec![FieldRef::Local(3)],
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
+                    value: vec![1, 2, 3],
+                })),
+                index_version: 2,
+                covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
+                files: vec![IndexFile {
+                    path: "index.idx".into(),
+                    size_bytes: 512,
+                    file_metadata_size_bytes: std::num::NonZero::new(128),
+                }],
+                base: Some(Ref::Local(1)),
+                created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
+                dataset_version: Some(3),
+                data_change: false,
+            }),
+            Action::RemoveIndexSegment(RemoveIndexSegment {
+                uuid: Uuid::from_u128(8),
+                name: "by_a".into(),
+                data_change: true,
+            }),
+            Action::DropIndex(DropIndex {
+                name: "by_c".into(),
+            }),
+            Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid: Uuid::from_u128(9),
+                name: "by_b".into(),
+                add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
+                remove_fragments: vec![2, 3],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: vec![FieldRef::Committed(1)],
+            }),
+            Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(Uuid::from_u128(10), 2),
+                    CompactedSsTable::new(Uuid::from_u128(11), 5),
+                ],
+            }),
+            Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
+                },
+            }),
+            Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(1)],
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 5,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
+                    },
+                ],
+            }),
+            Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
+            Action::ReserveRowIds(ReserveRowIds { count: 40 }),
+            Action::ResetTable(ResetTable),
+            Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![("a", "1").into(), ("b", None).into()],
+                    replace: false,
+                }),
+                table_metadata: None,
+                schema_metadata: Some(UpdateMap {
+                    update_entries: vec![("c", "2").into()],
+                    replace: true,
+                }),
+                field_metadata: vec![FieldMetadataUpdate {
+                    field: FieldRef::Local(3),
+                    updates: UpdateMap {
+                        update_entries: vec![("d", "3").into()],
+                        replace: false,
+                    },
+                }],
+            }),
+        ]
+    }
+
+    #[test]
+    fn test_composite_operation_round_trips() {
+        let operation = CompositeOperation::new(vec![
+            UserStep::new("everything", all_actions()),
+            UserStep::new("nothing", vec![]),
+        ]);
+
+        let message = pb_actions::CompositeOperation::from(&operation);
+        let round_tripped = CompositeOperation::try_from(message).unwrap();
+
+        assert_eq!(round_tripped, operation);
+    }
+
+    #[test]
+    fn test_omitted_data_unchanged_reads_as_a_data_change() {
+        // The wire default is the conservative reading: a writer that omits the
+        // flag claims a data change, and the common case costs no bytes.
+        let message = pb_actions::RemoveFragment::from(&RemoveFragment {
+            fragment: Ref::Committed(1),
+            data_change: true,
+        });
+        assert!(!message.data_unchanged);
+        assert!(RemoveFragment::try_from(message).unwrap().data_change);
+
+        let rearrangement = pb_actions::RemoveFragment::from(&RemoveFragment {
+            fragment: Ref::Committed(1),
+            data_change: false,
+        });
+        assert!(rearrangement.data_unchanged);
+        assert!(!RemoveFragment::try_from(rearrangement).unwrap().data_change);
+    }
+
+    #[test]
+    fn test_an_unrecognized_action_is_rejected() {
+        // An empty action and one a newer Lance wrote decode the same way:
+        // protobuf drops the field this build does not know.
+        let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
+        assert!(
+            matches!(error, Error::NotSupported { .. }),
+            "expected NotSupported, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("written by a newer version"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::addition(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AddIndexSegment(pb_actions::AddIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            ..Default::default()
+        })),
+    }, "AddIndexSegment.name")]
+    #[case::removal(pb_actions::Action {
+        action: Some(pb_actions::action::Action::RemoveIndexSegment(pb_actions::RemoveIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            data_unchanged: false,
+        })),
+    }, "RemoveIndexSegment.name")]
+    #[case::coverage(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AdjustIndexCoverage(pb_actions::AdjustIndexCoverage {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            add_fragments: Vec::new(),
+            remove_fragments: Vec::new(),
+            fields: Vec::new(),
+            covering_fields: Vec::new(),
+        })),
+    }, "AdjustIndexCoverage.name")]
+    fn test_an_index_action_without_a_name_is_rejected(
+        #[case] message: pb_actions::Action,
+        #[case] expected: &str,
+    ) {
+        // Protobuf cannot tell an unset string from an empty one, and an index
+        // action that does not say which index it edits cannot be checked for
+        // conflicts.
+        let error = Action::try_from(message).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn test_empty_ref_is_rejected() {
+        let error = Ref::try_from(pb_actions::Ref { kind: None }).unwrap_err();
+        assert!(
+            error.to_string().contains("committed or local"),
+            "unexpected message: {error}"
+        );
+        let error = FieldRef::try_from(pb_actions::FieldRef { kind: None }).unwrap_err();
+        assert!(
+            error.to_string().contains("committed or local"),
+            "unexpected message: {error}"
+        );
+    }
+}

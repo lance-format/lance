@@ -33,7 +33,9 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::minhash_lsh::MinHashQuery;
-use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query};
+use lance_index::vector::{
+    ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query, RqGraphScoring,
+};
 use lance_linalg::distance::MetricType;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
@@ -81,6 +83,7 @@ impl Scanner {
             nearest_refine: None,
             probe_params: ProbeParams::default(),
             quantized_refine_factor: None,
+            warp_imputation_rank: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -938,6 +941,7 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         });
         self.quantized_refine_factor = None;
         self.nearest_refine = None;
@@ -1257,6 +1261,15 @@ impl Scanner {
     /// When a distance range is set, the selected partitions use Accurate RQ search
     /// directly so the range applies before top-k truncation.
     ///
+    /// Completed partition results may be reused for identical queries in the
+    /// same snapshot, within the session index-cache budget. This memory-only
+    /// cache accepts fully indexed single-vector queries without filters,
+    /// fragment subsets, external masks, or stale vector overlays, and requires
+    /// a proven manifest identity. It stores row IDs and quantized distances;
+    /// exact refinement and projections still run independently. Immutable RQ
+    /// index data is cached separately and can remain reusable across queries
+    /// and snapshots even when completed results cannot be reused.
+    ///
     /// ```
     /// # use arrow_array::Float32Array;
     /// # use lance::{Dataset, Result};
@@ -1272,6 +1285,50 @@ impl Scanner {
     /// ```
     pub fn quantized_refine(&mut self, factor: u32) -> &mut Self {
         self.quantized_refine_factor = Some(factor);
+        self
+    }
+
+    /// Set WARP's imputation rank `t'`; most callers should leave it unset.
+    ///
+    /// Indexed multivector search uses WARP (<https://arxiv.org/abs/2501.17788>)
+    /// when every index segment is IVF with a FLAT sub-index (IVF_FLAT, IVF_PQ,
+    /// IVF_SQ or IVF_RQ, but not the legacy IVF_PQ format), and XTR otherwise,
+    /// which ignores this setting.
+    ///
+    /// When none of a document's tokens is in the partitions a query token
+    /// probed, WARP cannot compute that token's similarity to the document,
+    /// so it imputes the similarity of roughly the `t'`-th most similar token
+    /// in the whole index, estimated from the centroids and partition sizes.
+    /// A `t'` of 0 imputes 0. The default follows the WARP reference
+    /// implementation; see
+    /// [`lance_index::vector::warp::default_imputation_rank`]. It is not a
+    /// latency knob: it reads no extra data. Larger values impute lower
+    /// similarities, so documents that only some query tokens observe rank
+    /// lower. Prefer more partitions to raise recall.
+    ///
+    /// WARP probes a fixed number of partitions per query token and segment,
+    /// [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`] by default. As for
+    /// IVF search, [`Self::nprobes`], [`Self::minimum_nprobes`],
+    /// [`Self::maximum_nprobes`] and [`Self::search_effort`] change it, except
+    /// that a maximum set alone is the count WARP probes, since it never
+    /// expands its search.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// // Two query tokens of dimension 128, flattened.
+    /// let query = Float32Array::from(vec![0.0_f32; 256]);
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .nearest("multivector", &query, 10)?
+    ///     .nprobes(32)
+    ///     .warp_imputation_rank(1000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn warp_imputation_rank(&mut self, imputation_rank: usize) -> &mut Self {
+        self.warp_imputation_rank = Some(imputation_rank);
         self
     }
 
@@ -1333,6 +1390,39 @@ impl Scanner {
             q.approx_mode = approx_mode;
         } else {
             log::warn!("approx_mode is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configure how an `IVF_HNSW_RQ` graph search scores the nodes it visits.
+    ///
+    /// [`RqGraphScoring::MultiBit`], the default, scores every visited node with
+    /// the full multi-bit RQ codes. [`RqGraphScoring::OneBitRerank`] walks the
+    /// graph with the 1-bit sign codes and rescores only the `ef` finalists,
+    /// trading some recall at a given `ef` for faster queries. Other index types
+    /// ignore this setting.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::vector::RqGraphScoring;
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// let query = Float32Array::from(vec![0.0f32; 128]);
+    /// let results = dataset
+    ///     .scan()
+    ///     .nearest("vector", &query, 10)?
+    ///     .ef(64)
+    ///     .rq_graph_scoring(RqGraphScoring::OneBitRerank)
+    ///     .try_into_batch()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn rq_graph_scoring(&mut self, rq_graph_scoring: RqGraphScoring) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.rq_graph_scoring = rq_graph_scoring;
+        } else {
+            log::warn!("rq_graph_scoring is not set because nearest has not been called yet");
         }
         self
     }

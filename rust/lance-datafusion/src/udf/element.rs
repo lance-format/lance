@@ -60,7 +60,8 @@ mod lambda;
 
 pub use lambda::rewrite_element_lambdas;
 
-const ANY_ELEMENT: &str = "any_element";
+/// The name `any_element` is registered under.
+pub const ANY_ELEMENT: &str = "any_element";
 
 /// Compiled predicates kept per process; the cache is cleared when it is full.
 const MAX_COMPILED: usize = 1024;
@@ -128,6 +129,25 @@ fn first_non_immutable_function(expr: &Expr) -> Result<Option<String>> {
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(found)
+}
+
+/// The predicate of an `any_element` call, given its second argument: the
+/// string literal, or `None` when the argument is anything else.
+pub fn any_element_predicate(arg: &Expr) -> Option<&str> {
+    match arg {
+        Expr::Literal(value, _) => predicate_str(value),
+        _ => None,
+    }
+}
+
+/// Parse and optimize `predicate` over the elements of `list_type` exactly as
+/// `any_element` does before evaluating it, so an index can plan the same
+/// expression the scan evaluates.
+///
+/// Fails, with the error `any_element` reports, when `list_type` is not a list
+/// of structs or the predicate does not plan over the element fields.
+pub fn plan_element_predicate(list_type: &DataType, predicate: &str) -> Result<Expr> {
+    parse_element_predicate(&Planner::new(element_schema(list_type)?), predicate)
 }
 
 fn predicate_str(value: &ScalarValue) -> Option<&str> {

@@ -11,8 +11,8 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
-    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
     ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
     validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
@@ -25,8 +25,8 @@ use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 thread_local! {
     static LAST_CLUSTERING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+use crate::format::overlay::OverlayCoverage;
 use crate::format::overlay::staleness::field_affects_index;
-use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
@@ -94,6 +94,32 @@ fn range_segments_enabled(manifest: &Manifest) -> bool {
         .is_some_and(|value| str_is_truthy(value))
 }
 
+/// Reject a Blob v2 field nested in a Map or FixedSizeList, which readers
+/// cannot scan. A field `parent` already nested this way may stay, e.g. to be
+/// dropped; `parent` is `None` when `manifest` defines a new table.
+pub(super) fn check_blob_nesting(manifest: &Manifest, parent: Option<&Manifest>) -> Result<()> {
+    let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
+        field.is_blob_v2()
+            || matches!(
+                manifest.data_storage_format.lance_file_format(),
+                ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+            )
+    };
+    let already_nested: HashSet<i32> = parent
+        .map(|parent| {
+            parent
+                .schema
+                .nested_blob_fields()
+                .filter(|prior| unsupported(parent, prior))
+                .map(|prior| prior.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    manifest.schema.check_blob_nesting(|field| {
+        unsupported(manifest, field) && !already_nested.contains(&field.id)
+    })
+}
+
 fn changes_auto_cleanup_config(operation: &Operation) -> bool {
     let is_auto_cleanup_key = |key: &str| key.starts_with("lance.auto_cleanup.");
     match operation {
@@ -122,7 +148,7 @@ fn changes_auto_cleanup_config(operation: &Operation) -> bool {
 /// (their inline bytes are the very same allocation), so a commit pays only
 /// for the fragments it changed; enabling the key re-encodes every fragment
 /// once.
-fn apply_range_segments(
+pub(super) fn apply_range_segments(
     manifest: &mut Manifest,
     current_manifest: Option<&Manifest>,
 ) -> Result<()> {
@@ -561,9 +587,9 @@ impl Transaction {
     /// before anything is derived, keeps `current_indices` as the original
     /// list, and derives the prepared list: on an in-place column rewrite
     /// (an update with `fields_modified`, a merge swapping a column's data
-    /// file, a data replacement) the coverage it invalidates is withdrawn
-    /// along a tagged fragment reuse history or pruned by fragment id on any
-    /// other table (`withdraw_in_place_rewrites`). Every other operation
+    /// file, a data replacement that changes data) the coverage it invalidates
+    /// is withdrawn along a tagged fragment reuse history or pruned by fragment
+    /// id on any other table (`withdraw_in_place_rewrites`). Every other operation
     /// prepares the list unchanged; `Restore` never reaches the builder and
     /// restores its snapshot's list whole.
     ///
@@ -782,6 +808,24 @@ impl Transaction {
             config.migration_next_row_id,
         )?;
         let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
+        if let Operation::CompositeOperation(composite_operation) = &self.operation {
+            let current_manifest = current_manifest.ok_or_else(|| {
+                Error::invalid_input(
+                    "an action-based transaction describes a change to an existing dataset; \
+                     it cannot create one",
+                )
+            })?;
+            return self.build_manifest_from_actions(
+                composite_operation,
+                current_manifest,
+                original_indices,
+                transaction_file_path,
+                config,
+                read_version_state,
+                &frag_reuse,
+            );
+        }
+
         if config.use_stable_row_ids
             && config.migration_next_row_id.is_none()
             && current_manifest
@@ -846,7 +890,7 @@ impl Transaction {
         }
 
         // Get the schema and the final fragment list
-        let mut schema = match self.operation {
+        let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
             Operation::Project { ref schema, .. } => schema.clone(),
@@ -1568,174 +1612,32 @@ impl Transaction {
             Operation::Restore { .. } => {
                 unreachable!()
             }
-            Operation::DataReplacement { replacements } => {
-                let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
-                    .iter()
-                    .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
-                    .unzip();
-
-                // 1. make sure the new files all have the same fields / or empty
-                // NOTE: arguably this requirement could be relaxed in the future
-                // for the sake of simplicity, we require the new files to have the same fields
-                if new_datafiles
-                    .iter()
-                    .map(|f| f.fields.clone())
-                    .collect::<HashSet<_>>()
-                    .len()
-                    > 1
-                {
-                    let field_info = new_datafiles
-                        .iter()
-                        .enumerate()
-                        .map(|(id, f)| (id, f.fields.clone()))
-                        .fold("".to_string(), |acc, (id, fields)| {
-                            format!("{}File {}: {:?}\n", acc, id, fields)
-                        });
-
-                    return Err(Error::invalid_input(format!(
-                        "All new data files must have the same fields, but found different fields:\n{field_info}"
-                    )));
-                }
-
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            } => {
                 let existing_fragments = maybe_existing_fragments?;
 
-                // Collect replaced field IDs before consuming new_datafiles
-                let replaced_fields: Vec<u32> = new_datafiles
-                    .first()
-                    .map(|f| {
-                        f.schema(&schema)
-                            .field_ids()
-                            .iter()
-                            .chain(f.fields.iter())
-                            .filter(|&&id| id >= 0)
-                            .map(|&id| id as u32)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // Several groups may name the same fragment (one new file
+                // each); they apply to it in order.
+                let mut new_files_by_fragment: BTreeMap<u64, Vec<DataFile>> = BTreeMap::new();
+                for DataReplacementGroup(fragment_id, new_file) in replacements {
+                    new_files_by_fragment
+                        .entry(*fragment_id)
+                        .or_default()
+                        .push(new_file.clone());
+                }
 
-                // 2. check that the fragments being modified have isomorphic layouts along the columns being replaced
-                // 3. add modified fragments to final_fragments
-                for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
+                for (frag_id, new_files) in &new_files_by_fragment {
                     let frag = existing_fragments
                         .iter()
-                        .find(|f| f.id == **frag_id)
+                        .find(|f| f.id == *frag_id)
                         .ok_or_else(|| {
                             Error::invalid_input(
                                 "Fragment being replaced not found in existing fragments",
                             )
                         })?;
-                    let mut new_frag = frag.clone();
-
-                    // Physical mappings differ across V2 encodings (a nested
-                    // parent may have no column of its own). Replacement and
-                    // tombstoning operate on the logical field coverage.
-                    let replacement_ids = new_file
-                        .schema(&schema)
-                        .field_ids()
-                        .into_iter()
-                        .chain(new_file.fields.iter().copied())
-                        .collect::<HashSet<_>>();
-
-                    // TODO(rmeng): check new file and fragment are the same length
-
-                    let mut columns_covered = HashSet::new();
-                    // Set when an existing file covers exactly the replaced
-                    // fields, so the whole file swaps rather than part of it.
-                    let mut replaced_in_place = false;
-                    for file in &mut new_frag.files {
-                        if file.fields == new_file.fields
-                            && file.file_major_version == new_file.file_major_version
-                            && file.file_minor_version == new_file.file_minor_version
-                        {
-                            // assign the new file path / size / metadata size / base to the fragment
-                            file.path = new_file.path.clone();
-                            file.file_size_bytes = new_file.file_size_bytes.clone();
-                            file.file_metadata_size_bytes = new_file.file_metadata_size_bytes;
-                            file.base_id = new_file.base_id;
-                            replaced_in_place = true;
-                        }
-                        columns_covered.extend(file.schema(&schema).field_ids());
-                        columns_covered.extend(file.fields.iter().copied());
-                    }
-                    // Reject a file whose version does not decode before any
-                    // arm publishes it.
-                    new_file.file_version()?;
-
-                    // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
-                    // Then it means it's a all-NULL column that is being replaced with real data
-                    // just add it to the final fragments. Push the DataFile as
-                    // given so every field (including base_id) is preserved.
-                    if columns_covered.is_disjoint(&replacement_ids) {
-                        new_frag.files.push(new_file.clone());
-                    } else if !replaced_in_place
-                        && replacement_ids.is_subset(&columns_covered)
-                        && new_frag.files.iter().all(|file| {
-                            file.file_version()
-                                .is_ok_and(|version| version != ConcreteFileVersion::V1)
-                                || file
-                                    .fields
-                                    .iter()
-                                    .all(|field| !replacement_ids.contains(field))
-                        })
-                    {
-                        // Tombstone the replaced fields where they live and
-                        // append the new file to answer for them, the idiom
-                        // `update_columns` uses. Compaction decides that layout,
-                        // so the fields may sit in one wider file or span
-                        // several.
-                        //
-                        // Legacy V1 is excluded: its reader derives the page table
-                        // offset from the first field in the metadata, so
-                        // tombstoning one field leaves its siblings decoding from
-                        // the wrong pages. A field a V1 file covers keeps
-                        // exact-match replacement.
-                        for file in &mut new_frag.files {
-                            // Same reason as the guard above.
-                            if file.file_version()? == ConcreteFileVersion::V1 {
-                                continue;
-                            }
-                            file.fields = file
-                                .fields
-                                .iter()
-                                .map(|field| {
-                                    if replacement_ids.contains(field) {
-                                        TOMBSTONE_FIELD_ID
-                                    } else {
-                                        *field
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .into();
-                        }
-                        // Every data file must share at least one field with
-                        // the dataset schema: a file kept alive only by
-                        // tombstones or by ids the schema no longer defines is
-                        // unreachable to readers, uncollectable by cleanup,
-                        // and reported corrupt by validate(). The exception is
-                        // a file carrying one of the fragment's spilled row
-                        // lineage sequences: their reserved ids are never in
-                        // the schema, the file holds their only copy, and the
-                        // replaced user columns in it are dead space until
-                        // compaction.
-                        let live_ids = schema
-                            .fields_pre_order()
-                            .map(|field| field.id)
-                            .collect::<HashSet<i32>>();
-                        let spilled = new_frag.spilled_row_lineage_field_ids();
-                        new_frag.files.retain(|file| {
-                            file.fields
-                                .iter()
-                                .any(|f| live_ids.contains(f) || spilled.contains(f))
-                        });
-                        new_frag.files.push(new_file.clone());
-                    }
-
-                    // Nothing changed in the current fragment, which is not expected -- error out
-                    if &new_frag == frag {
-                        return Err(Error::invalid_input(
-                            "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
-                        ));
-                    }
+                    let mut new_frag = frag.replace_files(&schema, new_files)?;
 
                     // New base values supersede any overlay still shadowing
                     // them, so tombstone the overlaid fields. An overlay
@@ -1743,27 +1645,35 @@ impl Transaction {
                     // value though -- the conflict resolver rebases these two
                     // precisely because the overlay wins -- so it stays, and
                     // being newer it stays last, preserving the ordering.
-                    let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
-                        .overlays
-                        .drain(..)
-                        .partition(|overlay| overlay.committed_version <= self.read_version);
-                    crate::format::overlay::tombstone_overlay_fields(
-                        &mut superseded,
-                        &replaced_fields,
-                    );
-                    superseded.extend(newer);
-                    new_frag.overlays = superseded;
+                    // Values that only moved supersede nothing.
+                    if *data_change {
+                        let replaced_fields: Vec<u32> = new_files
+                            .iter()
+                            .flat_map(|new_file| new_file.covered_field_ids(&schema))
+                            .filter(|&id| id >= 0)
+                            .map(|id| id as u32)
+                            .collect();
+                        let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
+                            .overlays
+                            .drain(..)
+                            .partition(|overlay| overlay.committed_version <= self.read_version);
+                        crate::format::overlay::tombstone_overlay_fields(
+                            &mut superseded,
+                            &replaced_fields,
+                        );
+                        superseded.extend(newer);
+                        new_frag.overlays = superseded;
+                    }
 
                     final_fragments.push(new_frag);
                 }
 
-                let fragments_changed = old_fragment_ids
-                    .iter()
-                    .cloned()
-                    .cloned()
+                let fragments_changed = new_files_by_fragment
+                    .keys()
+                    .copied()
                     .collect::<HashSet<_>>();
 
-                // 4. push fragments that didn't change back to final_fragments
+                // Push fragments that didn't change back to final_fragments
                 let unmodified_fragments = existing_fragments
                     .iter()
                     .filter(|f| !fragments_changed.contains(&f.id))
@@ -1772,10 +1682,10 @@ impl Transaction {
 
                 final_fragments.extend(unmodified_fragments);
 
-                // A replacement changes what its rows read as, so stamp them
-                // updated. Without this, get_updated_rows never reports them and
+                // A replacement that changes data changes what its rows read
+                // as, so stamp them updated. Without this, get_updated_rows never reports them and
                 // an incremental consumer skips them for good.
-                if next_row_id.is_some() {
+                if next_row_id.is_some() && *data_change {
                     let new_version = current_manifest.map_or(1, |m| m.version + 1);
                     for fragment in final_fragments
                         .iter_mut()
@@ -1788,8 +1698,8 @@ impl Transaction {
                     }
                 }
 
-                // The replaced fields' coverage of the modified fragments was
-                // withdrawn by `prepare_indices`.
+                // When the data changed, the replaced fields' coverage of the
+                // modified fragments was withdrawn by `prepare_indices`.
             }
             Operation::DataOverlay { groups } => {
                 // Stamp each overlay with the version this commit is producing.
@@ -1889,6 +1799,12 @@ impl Transaction {
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            Operation::CompositeOperation(_) => {
+                // Handled by build_manifest_from_actions before this match.
+                return Err(Error::internal(
+                    "an action-based operation reached the legacy manifest build".to_string(),
+                ));
+            }
         };
 
         // A removed fragment can remain in a stored index bitmap. Reusing its
@@ -1922,42 +1838,16 @@ impl Transaction {
         }
         drop(original_indices);
 
-        // If a fragment was reserved then it may not belong at the end of the fragments list.
-        final_fragments.sort_by_key(|frag| frag.id);
-
-        // Clean up data files that only contain tombstoned fields
-        let cleaned_fragment_ids = Self::remove_tombstoned_data_files(&mut final_fragments);
+        let cleaned_fragment_ids = Self::normalize_fragments(&mut final_fragments)?;
         let changed_fragment_ids = self.changed_fragment_ids().map(|mut ids| {
             ids.extend(cleaned_fragment_ids);
             ids
         });
 
-        // Enforce the newest-last overlay ordering invariant at the write
-        // boundary. Load normalizes with a sort; this rejects any commit path
-        // that assembled a fragment's overlays out of order.
-        for fragment in &final_fragments {
-            if !fragment.overlays.is_empty() {
-                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
-            }
-        }
-
-        // A spilled row lineage sequence lives only in its carrier file. An
-        // operation that dropped or duplicated that file would otherwise go
-        // unnoticed until the next read, by which time cleanup may have
-        // deleted the only copy. Every fragment is checked, not only the ones
-        // this operation touched: the check reads metadata only, skips
-        // fragments that spill nothing, and also refuses to build on a
-        // manifest that already lost a carrier.
-        for fragment in &final_fragments {
-            fragment.validate_row_lineage_carriers()?;
-        }
-
-        let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
-            (None, Some(true)) => Some(ConcreteFileVersion::V1),
-            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
-            (None, None) => None,
-        };
+        // If this is an overwrite operation and the user has requested a specific
+        // version then overwrite with that version. Otherwise, if the user didn't
+        // request a specific version, then keep whatever version we had before.
+        let overwrite_storage_format = matches!(self.operation, Operation::Overwrite { .. });
 
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm
@@ -1971,136 +1861,20 @@ impl Transaction {
             )?;
         }
 
-        // Blob is one logical column across file versions. Publishing its first
-        // 2.2+ file also publishes the logical v2 view, without replacing older files.
-        // Blob children are not independent physical columns; retain the root ID
-        // and allocate logical child IDs against the current manifest on commit.
-        let legacy_blob_ids = schema
-            .fields_pre_order()
-            .filter(|field| field.is_blob() && !field.is_blob_v2())
-            .map(|field| field.id)
-            .collect::<HashSet<_>>();
-        if !legacy_blob_ids.is_empty() {
-            let mut blob_v2_fields = std::collections::BTreeSet::new();
-            for file in final_fragments
-                .iter()
-                .flat_map(|fragment| fragment.referenced_lance_files())
-            {
-                if matches!(
-                    file.file_version()?,
-                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                ) {
-                    blob_v2_fields.extend(
-                        file.fields
-                            .iter()
-                            .copied()
-                            .filter(|id| legacy_blob_ids.contains(id)),
-                    );
-                }
-            }
-            let mut next_field_id = current_manifest
-                .map(|manifest| manifest.max_field_id())
-                .unwrap_or(-1)
-                .max(schema.max_field_id().unwrap_or(-1))
-                + 1;
-            for id in blob_v2_fields {
-                if let Some(field) = schema.mut_field_by_id(id) {
-                    field.promote_blob_v2()?;
-                    field.set_id(field.parent_id, &mut next_field_id);
-                }
-            }
-        }
-
-        let mut manifest = if let Some(current_manifest) = current_manifest {
-            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
-            // So we always use new_from_previous which preserves base_paths
-            let mut prev_manifest =
-                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
-            // A later `Arc::make_mut` of the fragment list (range segment
-            // re-encoding) moves it and so drops what is carried over here.
-            if let Some(changed_fragment_ids) = &changed_fragment_ids {
-                prev_manifest.reuse_encoded_fragments(current_manifest, changed_fragment_ids);
-            }
-
-            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
-                (user_requested_version, &self.operation)
-            {
-                // If this is an overwrite operation and the user has requested a specific version
-                // then overwrite with that version.  Otherwise, if the user didn't request a specific
-                // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
-            }
-
-            prev_manifest
-        } else {
-            let data_storage_format =
-                Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            warn_if_legacy_storage_version(data_storage_format.lance_file_format());
-            Manifest::new(
-                schema,
-                Arc::new(final_fragments),
-                data_storage_format,
-                reference_paths,
-            )
-        };
-
-        if config.activate_non_reusable_field_ids {
-            let already_active = current_manifest
-                .map(|manifest| manifest.uses_non_reusable_field_ids())
-                .unwrap_or(false);
-            if !already_active {
-                manifest.activate_non_reusable_field_ids();
-                manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
-            }
-        }
-
-        manifest.tag.clone_from(&self.tag);
-
-        if config.auto_set_feature_flags {
-            // Internal operations (e.g. CreateIndex) build with the default config,
-            // which has use_stable_row_ids = false. Without inheriting from the previous
-            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
-            let inherited = current_manifest
-                .map(|m| m.uses_stable_row_ids())
-                .unwrap_or(false);
-            let use_stable_row_ids = config.use_stable_row_ids || inherited;
-            apply_feature_flags(
-                &mut manifest,
-                use_stable_row_ids,
-                config.disable_transaction_file,
-            )?;
-        }
-        // Set after apply_feature_flags, which resets both flag words -- and a
-        // `Manifest` only points at its index section, so the flag cannot be
-        // derived there.
-        //
-        // Derived fresh from `final_indices` on every commit, never inherited.
-        // Every manifest this reaches starts without the covering bit, so there
-        // is no stale bit to clear. Dropping the last covering index lifts the
-        // fence by simply not setting it again. Inheriting it from the previous
-        // manifest instead would make the fence permanent.
-        //
-        // Both words: a reader that selects a vector index by membership of
-        // `fields` would answer a query on a merely-carried column with an index
-        // keyed on another one, and a writer that treats every entry of `fields`
-        // as keyed would mismaintain it.
-        if final_indices
-            .iter()
-            .any(|index| !index.covering_fields.is_empty())
-        {
-            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-        }
-        apply_row_addr_index_feature_flag(&mut manifest, &final_indices);
+        let mut manifest = self.assemble_manifest(
+            current_manifest,
+            schema,
+            final_fragments,
+            &final_indices,
+            reference_paths,
+            overwrite_storage_format,
+            changed_fragment_ids.as_deref(),
+            config,
+        )?;
 
         if let Some(current_manifest) = current_manifest {
             inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         }
-
-        manifest.set_timestamp(config.timestamp_nanos);
-
-        manifest.update_max_fragment_id();
-        manifest.update_max_field_id();
 
         match &self.operation {
             Operation::Overwrite {
@@ -2276,27 +2050,10 @@ impl Transaction {
         // Every schema change lands here: the Blob v2 promotion and the field
         // metadata updates above, which can turn a nested field into a blob.
         // An Overwrite defines a new table, so its schema is checked in full.
-        // Otherwise a field the parent schema already nested this way may stay,
-        // e.g. to be dropped.
-        let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
-            field.is_blob_v2()
-                || matches!(
-                    manifest.data_storage_format.lance_file_format(),
-                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                )
-        };
-        let already_nested: HashSet<i32> = match current_manifest {
-            Some(current) if !matches!(self.operation, Operation::Overwrite { .. }) => current
-                .schema
-                .nested_blob_fields()
-                .filter(|prior| unsupported(current, prior))
-                .map(|prior| prior.id)
-                .collect(),
-            _ => HashSet::new(),
-        };
-        manifest.schema.check_blob_nesting(|field| {
-            unsupported(&manifest, field) && !already_nested.contains(&field.id)
-        })?;
+        check_blob_nesting(
+            &manifest,
+            current_manifest.filter(|_| !matches!(self.operation, Operation::Overwrite { .. })),
+        )?;
 
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;
@@ -2412,6 +2169,220 @@ impl Transaction {
         None
     }
 
+    /// Put an assembled fragment list into the shape the manifest requires:
+    /// ordered by id, with no data file left holding only tombstoned fields,
+    /// with each fragment's overlays in oldest-to-newest order, and with every
+    /// spilled row lineage sequence still in its carrier file. Returns the ids
+    /// of the fragments that lost a data file.
+    pub(super) fn normalize_fragments(fragments: &mut [Fragment]) -> Result<Vec<u64>> {
+        // If a fragment was reserved then it may not belong at the end of the list.
+        fragments.sort_by_key(|frag| frag.id);
+
+        let cleaned_fragment_ids = Self::remove_tombstoned_data_files(fragments);
+
+        // Enforce the newest-last overlay ordering invariant at the write
+        // boundary. Load normalizes with a sort; this rejects any commit path
+        // that assembled a fragment's overlays out of order.
+        for fragment in fragments.iter() {
+            if !fragment.overlays.is_empty() {
+                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
+            }
+        }
+
+        // A spilled row lineage sequence lives only in its carrier file. An
+        // operation that dropped or duplicated that file would otherwise go
+        // unnoticed until the next read, by which time cleanup may have
+        // deleted the only copy. Every fragment is checked, not only the ones
+        // this operation touched: the check reads metadata only, skips
+        // fragments that spill nothing, and also refuses to build on a
+        // manifest that already lost a carrier.
+        for fragment in fragments.iter() {
+            fragment.validate_row_lineage_carriers()?;
+        }
+        Ok(cleaned_fragment_ids)
+    }
+
+    fn user_requested_version(config: &ManifestBuildConfig) -> Option<ConcreteFileVersion> {
+        match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
+            (None, Some(true)) => Some(ConcreteFileVersion::V1),
+            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
+            (None, None) => None,
+        }
+    }
+
+    /// Build the manifest itself from an already-decided schema and fragment
+    /// list, and apply the settings that every operation shares: blob v2
+    /// promotion, the tag, feature flags, timestamp, and the fragment and field
+    /// id watermarks.
+    ///
+    /// `indices` is the index list this commit publishes, which the covered
+    /// index fence is derived from. A `Manifest` only points at its index
+    /// section, so the list cannot be read back off the manifest and is passed
+    /// alongside the schema and fragments.
+    ///
+    /// `overwrite_storage_format` replaces the inherited storage format with the
+    /// user-requested one, for operations that rewrite the whole dataset.
+    ///
+    /// `changed_fragment_ids` names every fragment that may differ from
+    /// `current_manifest`'s; the others reuse their encoded bytes. `None`
+    /// re-encodes every fragment.
+    // The manifest simply has this many inputs, and threading them through a
+    // parameter struct would only move the list.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn assemble_manifest(
+        &self,
+        current_manifest: Option<&Manifest>,
+        mut schema: lance_core::datatypes::Schema,
+        fragments: Vec<Fragment>,
+        indices: &[IndexMetadata],
+        reference_paths: HashMap<u32, crate::format::BasePath>,
+        overwrite_storage_format: bool,
+        changed_fragment_ids: Option<&[u64]>,
+        config: &ManifestBuildConfig,
+    ) -> Result<Manifest> {
+        let user_requested_version = Self::user_requested_version(config);
+
+        // Blob is one logical column across file versions. Publishing its first
+        // 2.2+ file also publishes the logical v2 view, without replacing older files.
+        // Blob children are not independent physical columns; retain the root ID
+        // and allocate logical child IDs against the current manifest on commit.
+        let legacy_blob_ids = schema
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        if !legacy_blob_ids.is_empty() {
+            let mut blob_v2_fields = std::collections::BTreeSet::new();
+            for file in fragments
+                .iter()
+                .flat_map(|fragment| fragment.referenced_lance_files())
+            {
+                if matches!(
+                    file.file_version()?,
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                ) {
+                    blob_v2_fields.extend(
+                        file.fields
+                            .iter()
+                            .copied()
+                            .filter(|id| legacy_blob_ids.contains(id)),
+                    );
+                }
+            }
+            let mut next_field_id = current_manifest
+                .map(|manifest| manifest.max_field_id())
+                .unwrap_or(-1)
+                .max(schema.max_field_id().unwrap_or(-1))
+                + 1;
+            for id in blob_v2_fields {
+                if let Some(field) = schema.mut_field_by_id(id) {
+                    field.promote_blob_v2()?;
+                    field.set_id(field.parent_id, &mut next_field_id);
+                }
+            }
+        }
+
+        let mut manifest = if let Some(current_manifest) = current_manifest {
+            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
+            // So we always use new_from_previous which preserves base_paths
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(fragments));
+            // A later `Arc::make_mut` of the fragment list (range segment
+            // re-encoding) moves it and so drops what is carried over here.
+            if let Some(changed_fragment_ids) = changed_fragment_ids {
+                prev_manifest.reuse_encoded_fragments(current_manifest, changed_fragment_ids);
+            }
+
+            if let (true, Some(user_requested_version)) =
+                (overwrite_storage_format, user_requested_version)
+            {
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+            }
+
+            prev_manifest
+        } else {
+            let data_storage_format =
+                Self::data_storage_format_from_files(&fragments, user_requested_version)?;
+            warn_if_legacy_storage_version(data_storage_format.lance_file_format());
+            Manifest::new(
+                schema,
+                Arc::new(fragments),
+                data_storage_format,
+                reference_paths,
+            )
+        };
+
+        if config.activate_non_reusable_field_ids {
+            let already_active = current_manifest
+                .map(|manifest| manifest.uses_non_reusable_field_ids())
+                .unwrap_or(false);
+            if !already_active {
+                manifest.activate_non_reusable_field_ids();
+                manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+            }
+        }
+
+        manifest.tag.clone_from(&self.tag);
+
+        if config.auto_set_feature_flags {
+            // Internal operations (e.g. CreateIndex) build with the default config,
+            // which has use_stable_row_ids = false. Without inheriting from the previous
+            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
+            let inherited = current_manifest
+                .map(|m| m.uses_stable_row_ids())
+                .unwrap_or(false);
+            let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            apply_feature_flags(
+                &mut manifest,
+                use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
+        }
+
+        // Set after apply_feature_flags, which resets both flag words -- and a
+        // `Manifest` only points at its index section, so the flag cannot be
+        // derived there.
+        //
+        // Derived fresh from the published indices on every commit, never
+        // inherited. Every manifest this reaches starts without the covering
+        // bit, so there is no stale bit to clear. Dropping the last covering
+        // index lifts the fence by simply not setting it again. Inheriting it
+        // from the previous manifest instead would make the fence permanent.
+        //
+        // Both words: a reader that selects a vector index by membership of
+        // `fields` would answer a query on a merely-carried column with an index
+        // keyed on another one, and a writer that treats every entry of `fields`
+        // as keyed would mismaintain it.
+        if indices
+            .iter()
+            .any(|index| !index.covering_fields.is_empty())
+        {
+            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+        // Derived the same way. Leaving it unset is the atomic reverse
+        // conversion the format asks for: every entry left is in the suffix
+        // layout, and the manifest writer stores them all that way. A
+        // single-key entry the bit once normalized reads back keys-only, so the
+        // bit stays until that entry goes too.
+        if indices
+            .iter()
+            .any(IndexMetadata::requires_independent_contract)
+        {
+            manifest.reader_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
+            manifest.writer_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
+        }
+        apply_row_addr_index_feature_flag(&mut manifest, indices);
+
+        manifest.set_timestamp(config.timestamp_nanos);
+
+        manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
+
+        Ok(manifest)
+    }
+
     /// Remove data files whose fields are all tombstoned (-2); they hold no
     /// live data. Returns the ids of the fragments that lost a file.
     fn remove_tombstoned_data_files(fragments: &mut [Fragment]) -> Vec<u64> {
@@ -2482,7 +2453,7 @@ impl Transaction {
                     })
                     .collect(),
             ),
-            Operation::DataReplacement { replacements } => Some(
+            Operation::DataReplacement { replacements, .. } => Some(
                 replacements
                     .iter()
                     .map(|DataReplacementGroup(fragment_id, _)| *fragment_id)
@@ -2501,6 +2472,7 @@ impl Transaction {
             | Operation::Project { .. }
             | Operation::Restore { .. }
             | Operation::Clone { .. }
+            | Operation::CompositeOperation(_)
             | Operation::Unknown { .. } => None,
         }
     }
@@ -2535,7 +2507,7 @@ impl Transaction {
 mod tests {
     use super::*;
     use crate::feature_flags::FLAG_OBJECT_METADATA;
-    use crate::format::overlay::OverlayCoverage;
+    use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::pb;
     use crate::format::{
         DeletionFile, DeletionFileType, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
@@ -2755,6 +2727,7 @@ mod tests {
                         None,
                     ),
                 )],
+                data_change: true,
             },
             _ => unreachable!(),
         }
@@ -3803,6 +3776,33 @@ mod tests {
         );
     }
 
+    /// A replacement whose values only moved to new files keeps every index's
+    /// coverage of the replaced fragment.
+    #[test]
+    fn prepare_indices_keeps_coverage_for_moved_values() {
+        let mut manifest = manifest_with_file("a.lance");
+        manifest.reader_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
+        let mut segment = sample_index_metadata("id_idx");
+        segment.fragment_bitmap = Some([0u32, 3].into_iter().collect());
+        let mut operation = in_place_rewrite("data_replacement", &manifest, vec![0]);
+        let Operation::DataReplacement { data_change, .. } = &mut operation else {
+            unreachable!()
+        };
+        *data_change = false;
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let prepared = transaction
+            .prepare_indices(
+                Some(&manifest),
+                vec![segment.clone()],
+                &default_build_config(),
+                None,
+                FragReuseUpdate::None,
+            )
+            .unwrap();
+        assert_eq!(prepared.prepared(), &[segment]);
+    }
+
     /// Operations that rewrite no column in place, `Restore` included,
     /// prepare the list unchanged.
     #[test]
@@ -4242,6 +4242,98 @@ mod tests {
             activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
             0
         );
+    }
+
+    fn covered_index(name: &str, fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
+        IndexMetadata {
+            fields,
+            covering_fields,
+            ..sample_index_metadata(name)
+        }
+    }
+
+    /// The commit derives both covering bits from the index list it commits.
+    /// A suffix-layout entry needs only the covering bit, so a table with only
+    /// those stays readable by builds without the independent layout.
+    #[rstest]
+    #[case::uncovered(vec![], 0)]
+    #[case::suffix_only(vec![(vec![0, 1], vec![1])], FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(vec![(vec![0], vec![0, 1])], FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::mixed(vec![(vec![0, 1], vec![1]), (vec![0], vec![1])], FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    fn build_manifest_derives_the_covering_bits(
+        #[case] declarations: Vec<(Vec<i32>, Vec<i32>)>,
+        #[case] expected: u64,
+    ) {
+        let manifest = sample_manifest();
+        let new_indices = declarations
+            .into_iter()
+            .enumerate()
+            .map(|(i, (fields, covering_fields))| {
+                covered_index(&format!("idx_{i}"), fields, covering_fields)
+            })
+            .collect();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let (built, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let covering_flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        assert_eq!(built.reader_feature_flags & covering_flags, expected);
+        assert_eq!(built.writer_feature_flags & covering_flags, expected);
+    }
+
+    /// Dropping the last entry that needs the independent layout clears its
+    /// bit, and the covering bit with it unless a covered entry remains. The
+    /// remaining entries have the shapes a reader decodes from the manifest:
+    /// a single-key suffix entry the flag normalized reads back keys-only and
+    /// keeps the bit, while a composite one reads back in the suffix layout.
+    #[rstest]
+    #[case::last_covered_index(None, 0)]
+    #[case::normalized_entry_remains(Some((vec![0], vec![1])), FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::composite_suffix_entry_remains(Some((vec![0, 1, 1], vec![1])), FLAG_COVERED_INDEX_METADATA)]
+    fn dropping_the_last_independent_entry_clears_its_bit(
+        #[case] remaining: Option<(Vec<i32>, Vec<i32>)>,
+        #[case] expected: u64,
+    ) {
+        let covering_flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= covering_flags;
+        manifest.writer_feature_flags |= covering_flags;
+        let independent = covered_index("independent", vec![0], vec![0, 1]);
+        let keep_remaining = remaining.is_some();
+        let mut current_indices = vec![independent.clone()];
+        if let Some((fields, covering_fields)) = remaining {
+            current_indices.push(covered_index("remaining", fields, covering_fields));
+        }
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![independent],
+            },
+            None,
+        );
+
+        let (built, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                current_indices,
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+
+        assert_eq!(built.reader_feature_flags & covering_flags, expected);
+        assert_eq!(built.writer_feature_flags & covering_flags, expected);
+        assert_eq!(final_indices.len(), usize::from(keep_remaining));
     }
 
     #[test]
@@ -5961,6 +6053,7 @@ mod tests {
                     0,
                     DataFile::new_legacy_from_fields("f5-new.lance", vec![5], None),
                 )],
+                data_change: true,
             },
             None,
         );
@@ -5978,6 +6071,109 @@ mod tests {
         // overlay is dropped.
         assert_eq!(frag.overlays.len(), 1);
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
+    }
+
+    #[test]
+    fn test_data_replacement_without_data_change_keeps_overlays() {
+        // Values that only moved to a new file supersede no overlay: both
+        // overlays keep shadowing the replaced field.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new_legacy_from_fields("f3.lance", vec![3], None),
+            DataFile::new_legacy_from_fields("f5.lance", vec![5], None),
+        ];
+        let overlay = |path: &str, fields: Vec<i32>| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields(path, fields, None),
+            coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+            committed_version: 1,
+        };
+        fragment.overlays = vec![overlay("o3.lance", vec![3]), overlay("o5.lance", vec![5])];
+        let overlays = fragment.overlays.clone();
+
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![fragment]),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("f5-new.lance", vec![5], None),
+                )],
+                data_change: false,
+            },
+            None,
+        );
+        let (result, _) = txn
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let frag = &result.fragments[0];
+        assert!(frag.files.iter().any(|f| f.path == "f5-new.lance"));
+        assert_eq!(frag.overlays, overlays);
+    }
+
+    #[test]
+    fn test_data_replacement_applies_several_groups_to_one_fragment() {
+        // Two groups repack four single-field files of one fragment into two
+        // files. Each group applies to the fragment as the previous one left
+        // it, and the files left holding no schema field are dropped.
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let lance_schema = LanceSchema::try_from(&schema).unwrap();
+        let ids: Vec<i32> = lance_schema.fields.iter().map(|field| field.id).collect();
+        let file = |path: &str, fields: Vec<i32>| {
+            let indices = (0..fields.len() as i32).collect();
+            DataFile::new(path, fields, indices, ConcreteFileVersion::V2_0, None, None)
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = ids
+            .iter()
+            .map(|id| file(&format!("f{id}.lance"), vec![*id]))
+            .collect();
+        let manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment, Fragment::new(1)]),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![
+                    DataReplacementGroup(0, file("g0.lance", vec![ids[0], ids[1]])),
+                    DataReplacementGroup(0, file("g1.lance", vec![ids[2], ids[3]])),
+                ],
+                data_change: false,
+            },
+            None,
+        );
+        let (result, _) = txn
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(result.fragments.len(), 2, "the untouched fragment stays");
+        let layout: Vec<(&str, Vec<i32>)> = result.fragments[0]
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.fields.to_vec()))
+            .collect();
+        assert_eq!(
+            layout,
+            vec![
+                ("g0.lance", vec![ids[0], ids[1]]),
+                ("g1.lance", vec![ids[2], ids[3]]),
+            ]
+        );
     }
 
     #[rstest]
@@ -6011,6 +6207,7 @@ mod tests {
             manifest.version,
             Operation::DataReplacement {
                 replacements: vec![DataReplacementGroup(0, data_file("v-new.lance", new_hint))],
+                data_change: true,
             },
             None,
         );
@@ -6068,6 +6265,7 @@ mod tests {
                         None,
                     ),
                 )],
+                data_change: true,
             },
             None,
         );
@@ -7215,6 +7413,7 @@ mod tests {
                         None,
                     ),
                 )],
+                data_change: true,
             },
             "data_overlay" => Operation::DataOverlay {
                 groups: vec![DataOverlayGroup {
@@ -7379,6 +7578,7 @@ mod tests {
                         0,
                         DataFile::new_legacy_from_fields("f-new.lance", vec![0], None),
                     )],
+                    data_change: true,
                 },
                 None,
             );

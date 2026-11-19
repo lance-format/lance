@@ -18,6 +18,7 @@ use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
 use lance_index::vector::{
     ivf::{IvfBuildParams, storage::IvfModel},
     pq::{PQBuildParams, ProductQuantizer},
+    quantizer::QuantizerBuildParams,
 };
 use lance_linalg::distance::DistanceType;
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
@@ -292,7 +293,8 @@ async fn do_train_pq_model(
         dimension,
         distance_type,
         &params,
-        Some(&ivf_model),
+        // Dot builds encode raw vectors, so train on residuals only when the build does.
+        PQBuildParams::use_residual(distance_type).then_some(&ivf_model),
         fragment_ids.as_deref(),
     )
     .await
@@ -696,8 +698,7 @@ pub struct PyIndexSegmentDescription {
     /// The id of the dataset base path that stores this segment
     /// (None when the segment is stored in the dataset's default base path)
     pub base_id: Option<i64>,
-    /// The ids of the fields whose values this segment carries but is not keyed on.
-    /// Always the trailing entries of the segment's fields.
+    /// The ids of the fields whose values this segment carries.
     pub covering_fields: Vec<i32>,
 }
 

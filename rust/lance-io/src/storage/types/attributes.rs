@@ -48,7 +48,7 @@ pub enum Attribute {
     ///
     /// See [AWS](https://aws.amazon.com/s3/storage-classes/),
     /// [GCP](https://cloud.google.com/storage/docs/storage-classes), and
-    /// [Azure](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tier).  
+    /// [Azure](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tier).
     /// `StorageClass` is used as the name for this attribute because 2 of the 3 storage providers
     /// use that name
     StorageClass,

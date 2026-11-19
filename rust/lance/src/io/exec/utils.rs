@@ -15,7 +15,7 @@ use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -360,7 +360,7 @@ fn shared_prefilter_future(
                                 }
                             }
                             .await;
-                            CloneableResult::from(result.map(Arc::new))
+                            CloneableResult::from(result)
                         }
                         .boxed()
                         .shared()
@@ -439,12 +439,9 @@ fn prefilter_mask_future(
     };
     if let Some(shared_filter) = shared_filter {
         let shared_filter = match external_mask {
-            Some(mask) => async move {
-                Ok(Arc::new(
-                    mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
-                ))
+            Some(mask) => {
+                async move { Ok(Arc::new(mask.intersect_ref(&*shared_filter.await?))) }.boxed()
             }
-            .boxed(),
             None => shared_filter,
         };
         return Ok(Some(shared_filter));
@@ -455,11 +452,7 @@ fn prefilter_mask_future(
         }
         None => prefilter_loader,
     };
-    Ok(prefilter_loader.map(|loader| {
-        async move { loader.load().await.map(Arc::new) }
-            .in_current_span()
-            .boxed()
-    }))
+    Ok(prefilter_loader.map(|loader| loader.load().in_current_span().boxed()))
 }
 
 pub(crate) fn build_prefilter(
@@ -557,7 +550,7 @@ impl FilteredRowIdsToPrefilter {
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+    async fn load(mut self: Box<Self>) -> Result<Arc<RowAddrMask>> {
         let metrics = self.metrics.as_ref();
         let _load_timer = metrics.map(|m| m.load_time.timer());
         if let Some(metrics) = metrics {
@@ -593,7 +586,7 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
         {
             metrics.row_ids.add(row_ids as usize);
         }
-        Ok(mask)
+        Ok(Arc::new(mask))
     }
 }
 
@@ -602,7 +595,7 @@ pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+    async fn load(mut self: Box<Self>) -> Result<Arc<RowAddrMask>> {
         let batch = self.0.try_next().await?.ok_or_else(|| {
             Error::internal("Selection vector source for prefilter did not yield any batches")
         })?;
@@ -615,7 +608,7 @@ impl FilterLoader for SelectionVectorToPrefilter {
         // support both the TwoMask and the legacy ThreeVariant wire formats
         // that ScalarIndexExec may emit.
         let (result, _) = IndexExprResult::deserialize(&batch)?;
-        Ok(result.upper)
+        Ok(Arc::new(result.upper))
     }
 }
 
@@ -1026,6 +1019,7 @@ impl IoMetrics {
 
 #[derive(Clone)]
 pub struct IndexMetrics {
+    selected_segments: Option<Arc<Mutex<BTreeSet<String>>>>,
     timings: [Time; IndexTiming::ALL.len()],
     indices_loaded: Count,
     parts_loaded: Count,
@@ -1044,6 +1038,7 @@ impl IndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             timings: IndexTiming::ALL.map(|stage| metrics.new_time(stage.name(), partition)),
+            selected_segments: None,
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
@@ -1061,9 +1056,26 @@ impl IndexMetrics {
     pub fn flush_io(&self) {
         self.io_metrics.record_stats(self.io_stats.snapshot());
     }
+
+    pub(crate) fn with_segment_tracking(mut self, segments: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.selected_segments = Some(segments);
+        self
+    }
 }
 
 impl MetricsCollector for IndexMetrics {
+    fn records_index_segments(&self) -> bool {
+        self.selected_segments.is_some()
+    }
+
+    fn record_index_segments(&self, segments: &[String]) {
+        if let Some(selected) = &self.selected_segments {
+            selected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(segments.iter().cloned());
+        }
+    }
     fn record_timing(&self, stage: IndexTiming, duration: std::time::Duration) {
         self.timings[stage as usize].add_duration(duration);
     }
