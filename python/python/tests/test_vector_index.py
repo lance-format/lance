@@ -4821,6 +4821,45 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
         assert np.allclose(a, b, atol=1e-6)
 
 
+def test_distributed_ivf_pq_dot_with_prepared_codebook(tmp_path):
+    # Dot IVF_PQ encodes raw vectors with their nearest (L2) codewords, so a
+    # prepared codebook must be trained without IVF residuals and applied with L2.
+    # Data away from the origin makes either mistake drop recall far below the
+    # single-node build.
+    rng = np.random.default_rng(0)
+    data = rng.uniform(0.5, 1.5, (4000, 8)).astype(np.float32)
+    queries = rng.uniform(-0.5, 0.5, (20, 8)).astype(np.float32)
+    table = pa.table(
+        {
+            "id": np.arange(len(data)),
+            "vector": pa.FixedSizeListArray.from_arrays(pa.array(data.ravel()), 8),
+        }
+    )
+    params = {"metric": "dot", "num_partitions": 4, "num_sub_vectors": 4}
+
+    single = lance.write_dataset(table, tmp_path / "single", max_rows_per_file=1000)
+    single.create_index("vector", "IVF_PQ", **params)
+
+    dist = lance.write_dataset(table, tmp_path / "dist", max_rows_per_file=1000)
+    pre = IndicesBuilder(dist, "vector").prepare_global_ivf_pq(
+        4, 4, distance_type="dot", sample_rate=15
+    )
+    dist = build_distributed_vector_index(dist, "vector", **pre, **params)
+
+    def recall(ds):
+        hits = 0
+        for q in queries:
+            nearest = {"column": "vector", "q": q, "k": 10, "nprobes": 4}
+            ids = ds.to_table(columns=["id"], nearest=nearest)["id"].to_numpy()
+            hits += np.isin(ids, np.argsort(-(data @ q))[:10]).sum()
+        return hits / (10 * len(queries))
+
+    single_recall, dist_recall = recall(single), recall(dist)
+    assert dist_recall >= max(0.5, single_recall - 0.1), (
+        f"distributed recall {dist_recall:.3f} vs single-node {single_recall:.3f}"
+    )
+
+
 @pytest.mark.parametrize("prefilter", [True, False])
 @pytest.mark.parametrize(
     "index_metric,metric,use_index,expected_ids",
