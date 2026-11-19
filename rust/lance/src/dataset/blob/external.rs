@@ -328,8 +328,10 @@ pub(super) fn normalize_external_absolute_uri(uri: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    use lance_io::read_budget::{QueryId, ReadMemoryBudget};
+
     use crate::dataset::blob::materialize::{
-        BlobMaterializationContext, materialize_blob_v2_binary_batch_with_context,
+        BlobMaterializationContext, materialize_blob_v2_binary_batch_with_admission,
     };
     use crate::{
         Dataset,
@@ -488,14 +490,20 @@ mod tests {
         let descriptor_bytes =
             u64::try_from(descriptor_batch.get_array_memory_size()).unwrap_or(u64::MAX);
         let context = BlobMaterializationContext::new(None, Some(1));
-        let materialized = materialize_blob_v2_binary_batch_with_context(
+        let read_budget = Arc::new(ReadMemoryBudget::new(1 << 30));
+        let payloads = read_budget.reader(QueryId::unique()).admission();
+        let materialized = materialize_blob_v2_binary_batch_with_admission(
             &dataset,
             &output_schema,
             descriptor_batch,
             &context,
+            context.admission(Some(payloads)),
         )
         .await
         .unwrap();
+        let payload_bytes = b"outside".len() as u64 + 2 * std::mem::size_of::<i64>() as u64;
+        // The caller charges the input batch; the read budget takes only payloads.
+        assert_eq!(read_budget.reserved_bytes(), payload_bytes);
         let reserved = context
             .budget
             .as_ref()
@@ -504,10 +512,7 @@ mod tests {
             .lock()
             .unwrap()
             .reserved;
-        assert_eq!(
-            reserved,
-            descriptor_bytes + b"outside".len() as u64 + 2 * std::mem::size_of::<i64>() as u64
-        );
+        assert_eq!(reserved, descriptor_bytes + payload_bytes);
         assert_eq!(
             materialized
                 .batch()
@@ -529,6 +534,7 @@ mod tests {
                 .reserved,
             0
         );
+        assert_eq!(read_budget.reserved_bytes(), 0);
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);

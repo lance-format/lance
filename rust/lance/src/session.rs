@@ -14,6 +14,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::read_budget::ReadMemoryBudget;
 use lance_io::spill::{LocalSpillStore, SpillStore};
 
 pub use lance_index::vector::storage::{OriginLatencyClass, ResidentColumnsSetting};
@@ -128,6 +129,8 @@ pub struct Session {
 
     /// See [`Self::with_datafusion_session`].
     datafusion_session: Option<SessionContext>,
+    /// Bounds the memory that reads hold; see [`Self::with_read_memory_limit`].
+    read_budget: Option<Arc<ReadMemoryBudget>>,
 }
 
 impl DeepSizeOf for Session {
@@ -207,6 +210,7 @@ impl Session {
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
             datafusion_session: None,
+            read_budget: None,
         }
     }
 
@@ -237,6 +241,7 @@ impl Session {
             rabit_scan_factory: None,
             datafusion_session: None,
             unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
+            read_budget: None,
         }
     }
 
@@ -396,6 +401,33 @@ impl Session {
         self.datafusion_session.as_ref()
     }
 
+    /// Bounds the memory that data reads of this session's datasets hold to
+    /// `limit_bytes`. The index and metadata caches are bounded by their own
+    /// capacities and are not counted.
+    ///
+    /// Each read reserves the bytes it is about to load and waits while read
+    /// ahead would exceed the limit. A read that holds nothing still proceeds
+    /// when its next unit does not fit, one query at a time, so the limit can
+    /// be exceeded by what that query needs at once. [`Dataset::take`] is
+    /// charged without waiting, since its caller may hold a paused scan.
+    ///
+    /// [`Dataset::take`]: crate::Dataset::take
+    pub fn with_read_memory_limit(self, limit_bytes: u64) -> Self {
+        self.with_read_memory_budget(ReadMemoryBudget::new(limit_bytes))
+    }
+
+    /// [`Self::with_read_memory_limit`] with a budget configured beyond its
+    /// limit, such as its chunk size.
+    pub fn with_read_memory_budget(mut self, budget: ReadMemoryBudget) -> Self {
+        self.read_budget = Some(Arc::new(budget));
+        self
+    }
+
+    /// The budget bounding the memory of this session's reads, if any.
+    pub fn read_budget(&self) -> Option<&Arc<ReadMemoryBudget>> {
+        self.read_budget.as_ref()
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
@@ -462,6 +494,7 @@ impl Session {
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
             datafusion_session: None,
+            read_budget: None,
         }
     }
 

@@ -18,6 +18,7 @@ pub mod local;
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
+pub mod read_budget;
 pub mod scheduler;
 pub mod spill;
 pub mod stream;

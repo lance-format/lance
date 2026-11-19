@@ -35,6 +35,10 @@ impl EncodingsIo for LanceEncodingsIo {
         Some(self.scheduler.io_buffer_size())
     }
 
+    fn coalesce_gap(&self) -> u64 {
+        self.scheduler.block_size()
+    }
+
     fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
         Some(Arc::new(Self {
             scheduler: self.scheduler.with_bypass_backpressure(),
