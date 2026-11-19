@@ -834,7 +834,10 @@ async fn test_a_legacy_operation_against_an_action_txn(
 
 /// Operations whose verdict depends on the order. A reset that landed
 /// first conflicts with the action set, and one landing second wins over
-/// it.
+/// it. A committed merge or projection is judged by what it changed, which
+/// here is nothing. A pending merge restates the fragments it read; a
+/// pending projection prunes files as they are at commit, so a column
+/// rewrite landed first is kept.
 #[rstest::rstest]
 #[case::overwrite(
     Operation::Overwrite {
@@ -847,6 +850,23 @@ async fn test_a_legacy_operation_against_an_action_txn(
     false
 )]
 #[case::restore(Operation::Restore { version: 1 }, true, false)]
+#[case::merge(
+    Operation::Merge {
+        fragments: vec![],
+        schema: lance_core::datatypes::Schema::default(),
+        preserves_nullability: true,
+    },
+    false,
+    true
+)]
+#[case::project(
+    Operation::Project {
+        schema: lance_core::datatypes::Schema::default(),
+        preserves_nullability: true,
+    },
+    false,
+    false
+)]
 #[tokio::test]
 async fn test_a_legacy_operation_against_an_action_txn_by_order(
     #[case] legacy: Operation,

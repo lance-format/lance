@@ -144,6 +144,7 @@ pub use trim_frag_reuse::TrimFragReuse;
 pub use update_compacted_sstables::UpdateCompactedSsTables;
 
 use apply::ApplyState;
+use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, Result,
@@ -352,6 +353,37 @@ impl CompositeOperation {
     /// Every action in every step, in application order.
     pub fn iter_actions(&self) -> impl Iterator<Item = &Action> {
         self.steps.iter().flat_map(|step| step.actions.iter())
+    }
+
+    /// Stop binding, in the files of the fragments this operation mints, the
+    /// fields `read` holds and `latest` dropped, dropping a file left binding
+    /// nothing.
+    ///
+    /// A drop tombstones the field out of every fragment it finds, so the new
+    /// fragments end up as the drop would have left them, and as a legacy
+    /// `Append` landing over a `Project` leaves them. The column written for
+    /// the field stays in the file, unread. Fields dropped from committed
+    /// fragments are no concern of this: writing one conflicts.
+    pub fn forget_dropped_fields(&mut self, read: &Schema, latest: &Schema) {
+        let dropped = |field: &FieldRef| {
+            field.committed().is_some_and(|id| {
+                read.field_by_id(id).is_some() && latest.field_by_id(id).is_none()
+            })
+        };
+        for step in &mut self.steps {
+            step.actions.retain_mut(|action| match action {
+                // A V1 file's reader places columns by field position, so
+                // its footprint required every field it backs instead.
+                Action::AddDataFile(file)
+                    if file.fragment().committed().is_none() && !file.is_v1() =>
+                {
+                    let fields: Vec<FieldRef> =
+                        file.field_ids().iter().copied().filter(dropped).collect();
+                    fields.into_iter().all(|field| file.forget_field(field))
+                }
+                _ => true,
+            });
+        }
     }
 }
 
