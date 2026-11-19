@@ -52,7 +52,7 @@ use crate::scalar::{
         SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
         ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedWriter, ZoneMapSegmentBase,
         build_zonemap_segment, merge_seeds_for_binary_copy, merge_zonemap_indices,
-        parse_seed_for_binary_copy, place_records, remap_zone,
+        merge_zonemap_indices_with_scan, parse_seed_for_binary_copy, place_records, remap_zone,
     },
 };
 use arrow_array::Int32Array;
@@ -6457,6 +6457,130 @@ async fn test_index_without_null_bitmap_keeps_that_setting() {
     let legacy = train_and_load::<arrow::datatypes::Int32Type>(vec![vec![Some(1)]]).await;
     assert!(legacy.store_null_bitmap());
     assert!(legacy.has_null_bitmap());
+}
+
+#[rstest::rstest]
+#[case::kept_and_scanned(true, true)]
+#[case::scan_without_positions(true, false)]
+#[case::replaced_source_without_positions(false, true)]
+#[tokio::test]
+async fn test_merge_tracks_nulls_in_replacement_zones(
+    #[case] retain_source: bool,
+    #[case] track_positions: bool,
+) {
+    let mut source = train_and_load::<Int32Type>(vec![vec![None, Some(10)]]).await;
+    let mut retained = RoaringBitmap::new();
+    if retain_source {
+        retained.insert(0);
+    } else {
+        Arc::get_mut(&mut source).unwrap().null_rows = None;
+    }
+    let scanned_fragment = u32::from(retain_source);
+    let first = u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+        scanned_fragment,
+        0,
+    ));
+    let batch = record_batch!(
+        ("value", Int32, [Some(20), None, Some(30), Some(10)]),
+        ("_rowaddr", UInt64, [first, first + 1, first + 2, first + 3])
+    )
+    .unwrap();
+    // Each scan sees one row. Without a physical row count its zone ends at that row.
+    let mut scanned = super::ScannedZones::default();
+    for offset in 0..batch.num_rows() {
+        let rows = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter([Ok(batch.slice(offset, 1))]),
+        ));
+        let piece = super::train_zonemap_scan(
+            &DataType::Int32,
+            source.rows_per_zone(),
+            track_positions,
+            HashMap::new(),
+            rows,
+        )
+        .await
+        .unwrap();
+        scanned.merge(piece);
+    }
+    let dest = TempObjDir::default();
+    let store = local_store(&dest);
+    merge_zonemap_indices_with_scan(
+        &[(&source, &retained)],
+        store.as_ref(),
+        &[scanned_fragment].into_iter().collect(),
+        scanned,
+    )
+    .await
+    .unwrap();
+    let index = ZoneMapIndex::load(
+        store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    let [mixed, values] = &index.zones[usize::from(retain_source)..] else {
+        panic!("expected two replacement zones");
+    };
+    assert_eq!((mixed.bound.length, mixed.null_count), (2, 1));
+    assert_eq!(values.bound.length, 2);
+    assert_eq!(values.min, ScalarValue::Int32(Some(10)));
+    assert_eq!(values.max, ScalarValue::Int32(Some(30)));
+    let hits = index
+        .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(hits.is_exact(), track_positions);
+    let expected = if !retain_source {
+        vec![first + 1]
+    } else if track_positions {
+        vec![0, first + 1]
+    } else {
+        vec![0, 1, first, first + 1]
+    };
+    assert_eq!(
+        hits.row_addrs().selected_rows(),
+        &expected.into_iter().collect::<RowAddrTreeMap>()
+    );
+}
+
+#[rstest::rstest]
+#[case::overlap(&[0], true, "both retained and replaced")]
+#[case::empty_replacement(&[0], false, "both retained and replaced")]
+#[case::undeclared_scan(&[], true, "outside the replacement set")]
+#[tokio::test]
+async fn test_merge_rejects_invalid_replacement_coverage(
+    #[case] replaced: &[u32],
+    #[case] has_live_rows: bool,
+    #[case] message: &str,
+) {
+    let source = train_and_load::<Int32Type>(vec![vec![None]]).await;
+    let scanned = if has_live_rows {
+        let updated = train_and_load::<Int32Type>(vec![vec![Some(7)]]).await;
+        super::ScannedZones {
+            zones: updated.zones.clone(),
+            null_rows: updated.null_rows.clone(),
+        }
+    } else {
+        super::ScannedZones::default()
+    };
+    let dest = TempObjDir::default();
+    let store = local_store(&dest);
+    let error = merge_zonemap_indices_with_scan(
+        &[(&source, &[0].into_iter().collect())],
+        store.as_ref(),
+        &replaced.iter().copied().collect(),
+        scanned,
+    )
+    .await
+    .err()
+    .expect("invalid replacement coverage must fail");
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message), "{error}");
+    assert!(store.list_files_with_sizes().await.unwrap().is_empty());
 }
 
 #[tokio::test]

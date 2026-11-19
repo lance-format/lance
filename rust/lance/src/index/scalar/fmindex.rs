@@ -3,7 +3,6 @@
 
 use lance_index::scalar::index_files_to_table;
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -27,7 +26,7 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     is_rebuild_required: bool,
-    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -41,7 +40,7 @@ pub(in crate::index) async fn merge_segments(
     })?;
     let column = dataset.schema().field_path(field_id)?;
 
-    let mut fragment_bitmap = RoaringBitmap::new();
+    let mut fragment_bitmap = refresh.fragments();
     for segment in &segments {
         fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
             Error::invalid_input(format!(
@@ -51,20 +50,8 @@ pub(in crate::index) async fn merge_segments(
         })?;
     }
 
-    // Intersect with the dataset's current live fragments to drop retired/compacted
-    // fragments, mirroring the btree merge behavior. Under a tagged history the
-    // segments' stored bitmaps are provenance; the FM merge rebuilds from the
-    // dataset, so it rebuilds over the live coverage the tagged reader derives
-    // for them instead.
-    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    match crate::index::append::tagged_segment_coverage(dataset, &segment_refs, staged).await? {
-        Some(coverage) => {
-            fragment_bitmap = coverage
-                .values()
-                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
-        }
-        None => fragment_bitmap &= dataset.fragment_bitmap.as_ref(),
-    }
+    // The merge entry already resolved staged provenance and verified live coverage.
+    fragment_bitmap &= dataset.fragment_bitmap.as_ref();
 
     if fragment_bitmap.is_empty() {
         // All covered fragments have been retired; produce an empty index.
@@ -99,6 +86,7 @@ pub(in crate::index) async fn merge_segments(
     }
 
     if !is_rebuild_required
+        && refresh.is_empty()
         && segments.len() == 1
         && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap)
     {

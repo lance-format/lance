@@ -404,6 +404,15 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
     type Error = Error;
 
     fn try_from(params: &InvertedIndexParams) -> Result<Self> {
+        Self::from_params(params, params.resolved_format_version())
+    }
+}
+
+impl pbold::InvertedIndexDetails {
+    pub(super) fn from_params(
+        params: &InvertedIndexParams,
+        format_version: InvertedListFormatVersion,
+    ) -> Result<Self> {
         Ok(Self {
             base_tokenizer: Some(params.base_tokenizer.clone()),
             language: serde_json::to_string(&params.language)?,
@@ -426,7 +435,7 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
                 },
             ),
             document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
-            posting_format_version: Some(params.resolved_format_version().index_version()),
+            posting_format_version: Some(format_version.index_version()),
         })
     }
 }
@@ -741,7 +750,13 @@ impl InvertedIndexParams {
     /// (`with_position`, `block_size`, worker/memory/format settings) are ignored:
     /// two columns can differ there yet still be safe to combine in a
     /// `combined_fields` (BM25F) query. Used by cross-field FTS validation.
-    pub(crate) fn same_tokenization(&self, other: &Self) -> bool {
+    ///
+    /// ```
+    /// use lance_index::scalar::inverted::InvertedIndexParams;
+    /// let params = InvertedIndexParams::default();
+    /// assert!(params.same_tokenization(&params.clone().with_position(true)));
+    /// ```
+    pub fn same_tokenization(&self, other: &Self) -> bool {
         // Destructure exhaustively so that adding a new field forces an explicit
         // decision here about whether it affects tokenization.
         let Self {

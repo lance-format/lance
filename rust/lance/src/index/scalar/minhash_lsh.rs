@@ -9,23 +9,23 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::progress::noop_progress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::minhash_lsh::MinHashLshIndex;
-use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, index_files_to_table};
+use lance_index::scalar::{
+    CreatedIndex, OldIndexDataFilter, TrainingCriteria, TrainingOrdering, index_files_to_table,
+};
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
-use crate::index::append::build_per_segment_filters;
 use crate::index::frag_reuse::{OpenPurpose, StagedRemappingPlans};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of MinHash LSH segments into a single segment.
 ///
-/// Rows of fragments that no longer exist are dropped through per-segment
-/// filters; the merged segment is rebuilt from the stored signatures without
-/// tokenizing the column again.
+/// Copy retained signatures and recompute signatures for rows selected for refresh.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -38,11 +38,6 @@ pub(in crate::index) async fn merge_segments(
         ))
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
-    let dataset_version = segments
-        .iter()
-        .map(|segment| segment.dataset_version)
-        .min()
-        .unwrap_or(dataset.manifest.version);
     // The merged segment is always written in the current (row-address)
     // format with each source's identifiers copied as-is, so a pre-migration
     // segment's row ids would be misread as addresses wherever the two differ.
@@ -61,8 +56,13 @@ pub(in crate::index) async fn merge_segments(
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     // Current segments store addresses. A legacy segment can only reach here
     // without stable row IDs, where its IDs are also physical addresses.
-    let (fragment_bitmap, filters) =
-        build_per_segment_filters(dataset, &segment_refs, staged, true).await?;
+    let (fragment_bitmap, filters, new_data) = refresh
+        .staged_row_inputs(
+            dataset,
+            &segment_refs,
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+        )
+        .await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
@@ -70,7 +70,7 @@ pub(in crate::index) async fn merge_segments(
         dataset,
         &field_path,
         &segment_refs,
-        None,
+        new_data,
         &new_store,
         &filters,
         staged,
@@ -79,7 +79,7 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        dataset_version,
+        dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,

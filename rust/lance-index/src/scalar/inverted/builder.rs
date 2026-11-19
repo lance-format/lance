@@ -386,6 +386,12 @@ impl InvertedIndexBuilder {
         let mut merged: Option<InnerBuilder> = None;
         let mut files = Vec::new();
         for (index, old_data_filter) in old_segments.iter().zip(old_data_filters) {
+            if old_data_filter
+                .as_ref()
+                .is_some_and(OldIndexDataFilter::has_empty_allowlist)
+            {
+                continue;
+            }
             if old_data_filter.is_none() {
                 self.deleted_fragments
                     .extend(index.deleted_fragments().iter());
@@ -2867,14 +2873,15 @@ async fn list_index_files(object_store: &ObjectStore, index_dir: &Path) -> Resul
     Ok(index_files)
 }
 
+pub(super) fn is_staged_metadata(path: &str) -> bool {
+    path.strip_prefix(STAGED_PARTITION_DIR)
+        .is_some_and(|name| name.starts_with("/part_") && name.ends_with("_metadata.lance"))
+}
+
 fn metadata_files(index_files: &[IndexFile]) -> Vec<String> {
     index_files
         .iter()
-        .filter(|file| {
-            file.path
-                .starts_with(&format!("{}/part_", STAGED_PARTITION_DIR))
-                && file.path.ends_with("_metadata.lance")
-        })
+        .filter(|file| is_staged_metadata(&file.path))
         .map(|file| file.path.clone())
         .collect()
 }

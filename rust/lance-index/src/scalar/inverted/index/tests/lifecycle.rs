@@ -390,6 +390,13 @@ async fn test_merge_segments_preserves_format_version(
     let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(merged.format_version(), format_version);
     assert_eq!(merged.index_version(), format_version.index_version());
+    let details = created
+        .index_details
+        .to_msg::<pbold::InvertedIndexDetails>()?;
+    assert_eq!(
+        details.posting_format_version,
+        Some(merged.format_version().index_version())
+    );
 
     Ok(())
 }

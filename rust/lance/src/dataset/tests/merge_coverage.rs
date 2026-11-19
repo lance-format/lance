@@ -37,8 +37,10 @@ use crate::dataset::{
     WriteDestination, WriteParams,
 };
 use crate::index::{
-    CreateIndexBuilder, DatasetIndexExt, IntoIndexSegment, provenance::fresh_fragments,
-    provenance::prune_stale_segment_coverage, vector::details::vector_index_details_default,
+    CreateIndexBuilder, DatasetIndexExt, IntoIndexSegment,
+    provenance::fresh_fragments,
+    provenance::{StagedCoverageMode, prune_stale_segment_coverage},
+    vector::details::vector_index_details_default,
 };
 use crate::utils::test::compact_into_two;
 #[cfg(feature = "geo")]
@@ -444,8 +446,8 @@ enum OverlayTiming {
     BetweenCompactions,
 }
 
-/// Segments built before an overlay hold stale values: wherever it lands, the
-/// merge covers nothing.
+/// A final overlay is refreshable. Once folded into a compaction it can no longer
+/// identify the rows to replace.
 #[cfg(feature = "geo")]
 #[rstest]
 #[case::after_compaction(OverlayTiming::AfterCompaction)]
@@ -453,7 +455,9 @@ enum OverlayTiming {
 #[case::before_two_compactions(OverlayTiming::BeforeTwoCompactions)]
 #[case::between_compactions(OverlayTiming::BetweenCompactions)]
 #[tokio::test]
-async fn test_rtree_merge_drops_coverage_an_overlay_reaches(#[case] timing: OverlayTiming) {
+async fn test_rtree_merge_coverage_depends_on_whether_compaction_folded_the_overlay(
+    #[case] timing: OverlayTiming,
+) {
     let dir = TempStrDir::default();
     let fragments = match timing {
         OverlayTiming::AfterCompaction | OverlayTiming::BeforeCompaction => 3,
@@ -496,12 +500,97 @@ async fn test_rtree_merge_drops_coverage_an_overlay_reaches(#[case] timing: Over
         }
     }
 
+    if matches!(timing, OverlayTiming::AfterCompaction) {
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+        assert_eq!(
+            merged.fragment_bitmap,
+            Some(fragment_ids(&dataset).into_iter().collect())
+        );
+        dataset
+            .commit_existing_index_segments("geometry_idx", "geometry", vec![merged])
+            .await
+            .unwrap();
+        assert_rtree_overlay_entries(&dataset).await;
+        return;
+    }
     assert_merge_covers_nothing(
         &dataset,
         staged,
         &format!("an overlay reached ({timing:?})"),
     )
     .await;
+}
+
+/// Inspect the physical tree through its spatial search, bypassing the scanner's
+/// exact geometry recheck and overlay compensation.
+#[cfg(feature = "geo")]
+async fn assert_rtree_overlay_entries(dataset: &Dataset) {
+    use super::dataset_overlay_index_masking::scalar_index_hits;
+    use lance_geo::query::{GeoQuery, RelationQuery};
+
+    for (x, count) in [(-1, 0), (9_999, 1)] {
+        let geometry = geo::line_strings(x, 1);
+        let query = GeoQuery::IntersectQuery(RelationQuery {
+            value: datafusion::scalar::ScalarValue::try_from_array(&geometry, 0).unwrap(),
+            field: arrow_schema::Field::from(dataset.schema().field("geometry").unwrap()),
+        });
+        assert_eq!(
+            scalar_index_hits(dataset, "geometry", "geometry_idx", &query).await,
+            count,
+            "query at {x}"
+        );
+    }
+}
+
+#[cfg(feature = "geo")]
+#[rstest]
+#[case::explicit(None)]
+#[case::optimize(Some(false))]
+#[case::distributed_optimize(Some(true))]
+#[tokio::test]
+async fn test_rtree_merge_refreshes_overlay_and_keeps_coverage(#[case] optimize: Option<bool>) {
+    use lance_index::optimize::OptimizeOptions;
+
+    let dir = TempStrDir::default();
+    let (dataset, staged, field) = rtree_staged(&dir, 2).await;
+    let mut dataset = rtree_overlay_geometry(dataset, field, 0).await;
+    if let Some(bounded) = optimize {
+        dataset
+            .commit_existing_index_segments("geometry_idx", "geometry", staged)
+            .await
+            .unwrap();
+        let options = OptimizeOptions::merge(2).max_rows_per_task(bounded.then_some(10));
+        if bounded {
+            use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
+            let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+            let mut tasks = Vec::new();
+            for task in &plan.tasks {
+                tasks.extend(task.execute(&dataset).await.unwrap());
+            }
+            let mut merged = Vec::new();
+            for group in &plan.merges {
+                merged.extend(group.execute(&dataset, &tasks).await.unwrap());
+            }
+            commit_optimize_indices(&mut dataset, merged, &options)
+                .await
+                .unwrap();
+        } else {
+            dataset.optimize_indices(&options).await.unwrap();
+        }
+    } else {
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+        dataset
+            .commit_existing_index_segments("geometry_idx", "geometry", vec![merged])
+            .await
+            .unwrap();
+    }
+    let segments = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].fragment_bitmap,
+        Some([0, 1].into_iter().collect())
+    );
+    assert_rtree_overlay_entries(&dataset).await;
 }
 
 /// An overlay folded into one group does not cost coverage of another group.
@@ -681,12 +770,12 @@ async fn test_btree_merge_drops_a_fragment_updated_in_place_since_the_compaction
     assert!(!covered.contains(rewritten as u32));
 }
 
-/// An overlay on the compaction's output drops coverage (BTree).
+/// An overlay on the compaction's output is refreshed from the current values (BTree).
 #[tokio::test]
-async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
+async fn test_btree_merge_refreshes_a_fragment_overlaid_since_compaction() {
     let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
 
-    let dataset = commit_overlay(
+    let mut dataset = commit_overlay(
         dataset,
         "age_overlay",
         rewritten,
@@ -697,11 +786,16 @@ async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
     .await;
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-    assert!(
-        merged.fragment_bitmap.as_ref().unwrap().is_empty(),
-        "the merged index claimed a fragment an overlay has changed since the \
-         compaction produced it"
+    assert_eq!(
+        merged.fragment_bitmap,
+        Some([rewritten as u32].into_iter().collect())
     );
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![0]);
+    assert!(ids_matching(&dataset, "age = 0").await.is_empty());
 }
 
 /// A data replacement on a source before the compaction drops coverage.
@@ -1261,8 +1355,7 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
     index.fragment_bitmap.unwrap()
 }
 
-/// Older inputs and a later segment directly covering their output can index
-/// different values. Every contribution must be fresh before keeping coverage.
+/// Prefer a valid direct source; after a restore, the original sources may still cover the destination.
 #[rstest]
 #[case::partial_unchanged(false, false, false)]
 #[case::partial_updated(false, true, false)]
@@ -1271,7 +1364,7 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
 #[case::full_updated(true, true, false)]
 #[case::full_restored(true, true, true)]
 #[tokio::test]
-async fn test_merge_validates_every_output_contribution(
+async fn test_merge_validates_the_source_serving_each_output(
     #[case] full_input_coverage: bool,
     #[case] update: bool,
     #[case] restore: bool,
@@ -1323,7 +1416,7 @@ async fn test_merge_validates_every_output_contribution(
     if full_input_coverage {
         covered.insert(outputs[0] as u32);
     }
-    if !update {
+    if !restore || full_input_coverage {
         covered.insert(directly_covered);
     }
     dataset
@@ -1335,11 +1428,41 @@ async fn test_merge_validates_every_output_contribution(
     assert_eq!(val_idx_coverage(&dataset).await, covered);
 }
 
-/// A group compacted while an overlay lands on a fragment outside it: only the
-/// overlaid fragment is left out of the merged coverage, and lookups stay
-/// right even though the merged index is stamped current, past the overlay.
+/// A direct replacement remains authoritative when another compaction combines it
+/// with a fragment from a different segment.
 #[tokio::test]
-async fn test_btree_merge_leaves_out_only_an_overlaid_fragment() {
+async fn test_merge_keeps_the_direct_source_through_a_later_shared_destination() {
+    let mut dataset = val_table("memory://", 3).await;
+    let mut sources = stage_val(&dataset, vec![0, 1, 2]).await;
+    let val = dataset.schema().field("val").unwrap().id;
+    dataset = commit_overlay(
+        dataset,
+        "new_value",
+        0,
+        &[val],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    let first = compact_deferred(&mut dataset, &[0, 1]).await;
+    sources.extend(stage_val(&dataset, vec![first]).await);
+    let last = compact_deferred(&mut dataset, &[first, 2]).await;
+    let merged = dataset
+        .merge_existing_index_segments(sources)
+        .await
+        .unwrap();
+    assert_eq!(merged.fragment_bitmap, Some([last].into_iter().collect()));
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_uses_val_idx(&dataset, "val = 999").await;
+    assert_val_lookups_match_scan(&dataset, [0, 120, 999], "two compactions").await;
+}
+
+/// Refreshing a live fragment beside a compaction preserves coverage of both groups.
+#[tokio::test]
+async fn test_btree_merge_refreshes_an_overlaid_fragment_beside_a_compaction() {
     let dir = TempStrDir::default();
     let dataset = val_table(dir.as_str(), 3).await;
     let staged = stage_val(&dataset, vec![0, 1, 2]).await;
@@ -1375,7 +1498,7 @@ async fn test_btree_merge_leaves_out_only_an_overlaid_fragment() {
     assert_val_lookups_match_scan(&dataset, probes, "").await;
     assert_eq!(
         val_idx_coverage(&dataset).await,
-        RoaringBitmap::from_iter([compacted])
+        RoaringBitmap::from_iter([2, compacted])
     );
 }
 
@@ -1465,6 +1588,34 @@ async fn clean_up(dataset: &Dataset, versions: Vec<u64>) {
         .unwrap()
         .build();
     dataset.cleanup_with_policy(policy).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_merge_after_cleanup_only_trusts_registered_input_coverage() {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table(dir.as_str(), 2).await;
+    let build_version = dataset.manifest.version;
+    let mut staged = stage_val(&dataset, vec![0, 1]).await;
+    let uncommitted = staged.pop().unwrap();
+    dataset
+        .commit_existing_index_segments("val_idx", "val", staged)
+        .await
+        .unwrap();
+    clean_up(&dataset, vec![build_version]).await;
+
+    let mut sources = dataset.load_indices_by_name("val_idx").await.unwrap();
+    sources.push(uncommitted);
+    let merged = dataset
+        .merge_existing_index_segments(sources)
+        .await
+        .unwrap();
+    assert_eq!(merged.fragment_bitmap, Some([0].into_iter().collect()));
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_uses_val_idx(&dataset, "val = 0").await;
+    assert_val_lookups_match_scan(&dataset, [0, ROWS * 10], "").await;
 }
 
 /// Segments staged at two versions, one of which is cleaned up before the
@@ -2099,9 +2250,8 @@ impl SegmentFreshnessCheck {
                 prune_stale_segment_coverage(
                     dataset,
                     &mut segments,
-                    false,
                     &RoaringBitmap::new(),
-                    false,
+                    StagedCoverageMode::Commit,
                 )
                 .await
                 .unwrap();
@@ -2113,10 +2263,12 @@ impl SegmentFreshnessCheck {
                     FragReuseIndexDetails { versions: vec![] },
                 )
                 .unwrap();
-                !fresh_fragments(dataset, &no_compactions, &[segment])
-                    .await
-                    .unwrap()
-                    .contains(0)
+                let candidates = RoaringBitmap::from_iter([0]);
+                let (retained, _) =
+                    fresh_fragments(dataset, &no_compactions, &[segment], &candidates)
+                        .await
+                        .unwrap();
+                !retained[0].contains(0)
             }
         }
     }

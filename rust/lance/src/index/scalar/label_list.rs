@@ -8,8 +8,8 @@ use lance_index::scalar::label_list::{
     BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION, LabelListIndex,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -76,6 +76,7 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -113,44 +114,16 @@ pub(in crate::index) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
-    let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    let mut effective_old_frags = RoaringBitmap::new();
-    let mut deleted_old_frags = RoaringBitmap::new();
-    for segment in &segments {
-        if segment.fragment_bitmap.is_none() {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            )));
-        }
-        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
-            effective_old_frags |= effective;
-        }
-        if let Some(deleted) = segment.deleted_fragment_bitmap(dataset_fragments) {
-            deleted_old_frags |= deleted;
-        }
-    }
-
-    let fragment_bitmap = effective_old_frags.clone();
-    // A live fragment can have deleted rows even when no whole fragment was
-    // retired. Clean both value postings and list-null rows in that case too.
-    let has_partial_deletions = effective_old_frags.iter().any(|id| {
-        dataset
-            .find_fragment(u64::from(id))
-            .is_some_and(|fragment| fragment.deletion_file.is_some())
-    });
-    let old_data_filter = if deleted_old_frags.is_empty() && !has_partial_deletions {
-        None
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let criteria = TrainingCriteria::new(TrainingOrdering::None);
+    let criteria = if segments[0].results_are_row_addrs() {
+        criteria.with_row_addr()
     } else {
-        crate::index::append::build_old_data_filter(
-            dataset,
-            &effective_old_frags,
-            &deleted_old_frags,
-            true,
-        )
-        .await?
+        criteria.with_row_id()
     };
-
+    let (fragment_bitmap, filters, new_data) = refresh
+        .staged_row_inputs(dataset, &segment_refs, criteria)
+        .await?;
     let mut source_indices = Vec::with_capacity(segments.len());
     for segment in &segments {
         validate_nullable_segment_for_merge(dataset, field_id, segment).await?;
@@ -178,10 +151,11 @@ pub(in crate::index) async fn merge_segments(
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = lance_index::scalar::label_list::merge_label_list_indices(
+    let created_index = lance_index::scalar::label_list::merge_label_list_indices_with_new_data(
         &source_indices,
+        new_data,
         &new_store,
-        old_data_filter,
+        &filters.iter().map(Option::as_ref).collect::<Vec<_>>(),
         lance_index::progress::noop_progress(),
     )
     .await?;

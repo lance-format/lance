@@ -17,7 +17,7 @@ use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::deletion::DeletionVector;
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseVersion};
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
+use lance_table::format::overlay::staleness::field_affects_index;
 use lance_table::format::{DataFile, DeletionFile, Fragment, IndexMetadata, Manifest};
 use roaring::RoaringBitmap;
 
@@ -29,26 +29,26 @@ use crate::index::loading::{DatasetIndexInternalExt, load_all_indices};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{Error, Result, dataset::Dataset};
 
+/// Changes to a merge's coverage that cannot be read off a source's retained bitmap.
+#[derive(Default)]
+pub(super) struct CoverageRemap {
+    pub introduced: RoaringBitmap,
+    pub rescan: RoaringBitmap,
+}
+
 /// Move a caller-defined segment group's coverage into the current fragment space.
 ///
 /// A deferred compaction can combine several independently built segments into one
 /// new fragment. Remapping each segment bitmap separately would treat every segment
 /// as only partially covering the rewrite group and drop the new fragment. The
-/// merge owns the whole caller-defined group, so remap its union and use that
-/// representable group coverage while materializing every source.
-///
-/// Returns the fragments the remap added beyond the segments' own coverage (on
-/// a tagged history, beyond their provenance), or `None` when the coverage was
-/// left as staged. Coverage only moves with the row addresses the reuse index
-/// maps, and is kept only on fragments whose indexed data is shown unchanged
-/// since the segments were built, compacted or not; other rows fall back to a
-/// flat scan.
+/// merge can claim the verified union, but an opened source may also contain
+/// entries outside its stored bitmap. Keep its read filter specific to that source.
 pub(super) async fn remap_merged_segment_coverage(
     dataset: &Dataset,
     index_name: &str,
     segments: &mut [IndexMetadata],
     staged: Option<&frag_reuse::StagedRemappingPlans>,
-) -> Result<Option<RoaringBitmap>> {
+) -> Result<Option<CoverageRemap>> {
     // Under a tagged history the merge opens each source through the
     // translating loader with its staged plan, so the merged files hold live
     // addresses; the coverage moves with them to the live fragments the group
@@ -89,7 +89,10 @@ pub(super) async fn remap_merged_segment_coverage(
                  claimed and those rows stay on the scan path. Rebuild the index to cover them."
             );
         }
-        return Ok(Some(&claimed - &provenance));
+        return Ok(Some(CoverageRemap {
+            introduced: &claimed - &provenance,
+            rescan: RoaringBitmap::new(),
+        }));
     }
     let staged_coverage = segments
         .iter()
@@ -132,35 +135,27 @@ pub(super) async fn remap_merged_segment_coverage(
         return Ok(None);
     };
 
-    let merged_coverage = carry_coverage(
-        dataset,
-        index_name,
-        &frag_reuse_index,
-        segments,
-        &staged_coverage,
-    )
-    .await?;
-
-    // Fragments the remap added: compaction created them after the segments were built.
-    let introduced = &merged_coverage - &staged_coverage;
-
-    for segment in segments {
-        segment.fragment_bitmap = Some(merged_coverage.clone());
-    }
-    Ok(Some(introduced))
+    Ok(Some(
+        carry_coverage(
+            dataset,
+            index_name,
+            &frag_reuse_index,
+            segments,
+            &staged_coverage,
+        )
+        .await?,
+    ))
 }
 
 /// `staged_coverage` moved through `frag_reuse_index` onto `dataset`'s
-/// fragments. Coverage is kept, through compactions or not, only on fragments
-/// whose indexed data is shown unchanged since the segments were built.
+/// fragments. Verify the entries of the source chosen for each destination.
 async fn carry_coverage<T: TableVersion>(
     dataset: &T,
     index_name: &str,
     frag_reuse_index: &CompactFragReuseIndex,
-    segments: &[IndexMetadata],
+    segments: &mut [IndexMetadata],
     staged_coverage: &RoaringBitmap,
-) -> Result<RoaringBitmap> {
-    let fresh = fresh_fragments(dataset, frag_reuse_index, segments).await?;
+) -> Result<CoverageRemap> {
     let live = dataset
         .manifest()
         .fragments
@@ -188,18 +183,22 @@ async fn carry_coverage<T: TableVersion>(
 
     merged_coverage &= &live;
 
-    let unverified = &merged_coverage - &fresh;
+    let (retained, rescan) =
+        fresh_fragments(dataset, frag_reuse_index, segments, &merged_coverage).await?;
+    let mut verified = rescan.clone();
+    for (segment, retained) in segments.iter_mut().zip(retained) {
+        verified |= &retained;
+        segment.fragment_bitmap = Some(retained);
+    }
+    let unverified = &merged_coverage - &verified;
     if !unverified.is_empty() {
-        merged_coverage -= &unverified;
         tracing::warn!(
             index_name,
             unverified_fragments = unverified.len(),
-            "Merged index will not cover fragments whose indexed data changed since the \
-             segments were built, or whose history to show otherwise has been cleaned up: \
-             those rows fall back to a flat scan. Rebuild the index to cover them."
+            "Merged index omits fragments whose source entries could not be verified"
         );
     }
-    if merged_coverage.is_empty() {
+    if verified.is_empty() {
         tracing::warn!(
             index_name,
             staged_fragments = staged_coverage.len(),
@@ -209,7 +208,10 @@ async fn carry_coverage<T: TableVersion>(
         );
     }
 
-    Ok(merged_coverage)
+    Ok(CoverageRemap {
+        introduced: &verified - staged_coverage,
+        rescan,
+    })
 }
 
 fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
@@ -290,20 +292,6 @@ fn fragment_field_files<'a>(
                 })
         })
         .collect()
-}
-
-/// Whether `fragment` has an overlay on an `indexed` field committed after `version`.
-fn has_overlay_newer_than(
-    fragment: &Fragment,
-    version: u64,
-    indexed: &HashSet<i32>,
-    schema: &LanceSchema,
-) -> bool {
-    let indexed = indexed.iter().copied().collect::<Vec<_>>();
-    fragment
-        .overlays
-        .iter()
-        .any(|overlay| overlay_affects_index(overlay, &indexed, version, schema))
 }
 
 /// One version of the table, as the coverage check reads it. A [`Dataset`]
@@ -410,6 +398,7 @@ struct History<'a, T> {
     /// Every version the table still lists, ascending.
     retained: Vec<u64>,
     snapshots: HashMap<u64, Arc<Snapshot<T>>>,
+    rewrites: HashMap<u64, Option<HashSet<u32>>>,
 }
 
 impl<'a, T: TableVersion> History<'a, T> {
@@ -425,6 +414,7 @@ impl<'a, T: TableVersion> History<'a, T> {
             table,
             retained,
             snapshots,
+            rewrites: HashMap::new(),
         })
     }
 
@@ -456,20 +446,20 @@ impl<'a, T: TableVersion> History<'a, T> {
     /// `produced`. The commit is `recorded + 1` because conflict resolution
     /// restamps the record on every attempt; a record that was not restamped
     /// fails the check and costs only coverage.
-    async fn rewrite_commit(
-        &self,
-        recorded: u64,
-        mut produced: impl Iterator<Item = u32>,
-    ) -> Result<Option<u64>> {
+    async fn rewrite_commit(&mut self, recorded: u64, produced: &[u32]) -> Result<Option<u64>> {
         let committed = recorded + 1;
         if self.retained.binary_search(&committed).is_err() {
             return Ok(None);
         }
-        let Some(written) = self.table.rewrite_outputs(committed).await? else {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.rewrites.entry(committed) {
+            entry.insert(self.table.rewrite_outputs(committed).await?);
+        }
+        let Some(written) = &self.rewrites[&committed] else {
             return Ok(None);
         };
         Ok(produced
-            .all(|fragment| written.contains(&fragment))
+            .iter()
+            .all(|fragment| written.contains(fragment))
             .then_some(committed))
     }
 }
@@ -501,6 +491,25 @@ fn indexed_overlays<'a>(
         .collect()
 }
 
+/// A merge can substitute the current values of overlays newer than the source
+/// snapshot. A restore can remove an old overlay or bring back one predating the
+/// source: neither change is enumerated by its forward-only rescan.
+fn overlays_need_rebuild(
+    then: &Fragment,
+    now: &Fragment,
+    indexed: &HashSet<i32>,
+    schema: &LanceSchema,
+    version: u64,
+) -> bool {
+    if then.overlays.is_empty() && now.overlays.is_empty() {
+        return false;
+    }
+    let old = indexed_overlays(then, indexed, schema);
+    let mut current = indexed_overlays(now, indexed, schema);
+    current.retain(|(committed, _, _)| *committed <= version);
+    old != current
+}
+
 /// Whether a row deleted in `before` is live again in `after` (only a restore
 /// does this; an index built in between never saw the row).
 pub(crate) async fn revives_rows<T: TableVersion>(
@@ -530,15 +539,22 @@ async fn indexed_data_differs<T: TableVersion>(
     after: &Snapshot<T>,
     fragment: u32,
     indexed: &HashSet<i32>,
+    can_refresh_overlays: bool,
 ) -> Result<bool> {
     let (Some(then), Some(now)) = (before.fragment(fragment), after.fragment(fragment)) else {
         return Ok(true);
     };
     let files_then = fragment_field_files(before.manifest(), then, indexed);
     let schema = &after.manifest().schema;
+    // Intermediate overlays may have been materialized by the next compaction.
+    let overlays_changed = if can_refresh_overlays {
+        overlays_need_rebuild(then, now, indexed, schema, before.manifest().version)
+    } else {
+        indexed_overlays(then, indexed, schema) != indexed_overlays(now, indexed, schema)
+    };
     if files_then.is_none()
         || files_then != fragment_field_files(after.manifest(), now, indexed)
-        || indexed_overlays(then, indexed, schema) != indexed_overlays(now, indexed, schema)
+        || overlays_changed
     {
         return Ok(true);
     }
@@ -587,176 +603,204 @@ fn sources_at_build(
     Some(sources)
 }
 
-/// The versions each covered fragment's index entries describe: its segments'
-/// versions, or for a fragment compactions produced after the build, the
-/// fragments of the segment's version that they rewrote into it, through every
-/// recorded rewrite in between ([`sources_at_build`]). Every contributing build
-/// must be checked, since they may have indexed different data. `None` records
-/// a contribution whose build version has been cleaned up, or whose chain of
-/// rewrites is not fully recorded.
-async fn build_provenance<T: TableVersion>(
-    history: &mut History<'_, T>,
-    frag_reuse_index: &CompactFragReuseIndex,
-    segments: &[IndexMetadata],
-) -> Result<HashMap<u32, Vec<Option<u64>>>> {
-    let mut provenance = HashMap::new();
-    for segment in segments {
-        let version = segment.dataset_version;
-        let built_at = history.at(version).await?;
-        for fragment in segment.fragment_bitmap.iter().flatten() {
-            let Some(built_at) = &built_at else {
-                provenance
-                    .entry(fragment)
-                    .or_insert_with(|| Vec::with_capacity(1))
-                    .push(None);
-                continue;
-            };
-            let sources = sources_at_build(
-                &frag_reuse_index.details.versions,
-                version,
-                fragment,
-                |id| built_at.fragment(id).is_some(),
-            );
-            match sources {
-                Some(sources) => {
-                    for source in sources {
-                        provenance
-                            .entry(source)
-                            .or_insert_with(|| Vec::with_capacity(1))
-                            .push(Some(version));
-                    }
-                }
-                None => {
-                    provenance
-                        .entry(fragment)
-                        .or_insert_with(|| Vec::with_capacity(1))
-                        .push(None);
-                }
-            }
-        }
-    }
-    for versions in provenance.values_mut() {
-        versions.sort_unstable();
-        versions.dedup();
-    }
-    Ok(provenance)
+#[derive(Clone, Copy)]
+struct FragmentClaim {
+    /// One source file can serve the fragment. A shared destination must be rescanned.
+    source: Option<usize>,
+    /// Snapshot at which these entries were verified.
+    verified_at: u64,
 }
 
-/// The current fragments holding rows the segments indexed whose indexed data
-/// is shown unchanged since, following each covered fragment through the
-/// compactions that rewrote it. A compaction's inputs and the final fragments
-/// must each match the version their entries describe
-/// ([`indexed_data_differs`]). A changed input, or a manifest the comparison
-/// needs that was cleaned up, leaves out every fragment its group produced.
-pub(crate) async fn fresh_fragments<T: TableVersion>(
-    dataset: &T,
-    frag_reuse_index: &CompactFragReuseIndex,
-    segments: &[IndexMetadata],
-) -> Result<RoaringBitmap> {
-    let mut indexed = HashSet::new();
-    for segment in segments {
-        indexed.extend(indexed_field_ids(
-            &dataset.manifest().schema,
-            &segment.fields,
-            &segment.covering_fields,
-        )?);
+/// A destination can be indexed directly and also be reached through a rewrite.
+/// A restore can invalidate either source independently of the other.
+#[derive(Default)]
+struct FragmentClaims {
+    direct: Option<FragmentClaim>,
+    inherited: Option<FragmentClaim>,
+}
+
+impl FragmentClaims {
+    async fn verified<T: TableVersion>(
+        &self,
+        history: &mut History<'_, T>,
+        snapshot: &Snapshot<T>,
+        fragment: u32,
+        indexed: &HashSet<i32>,
+        can_refresh_overlays: bool,
+    ) -> Result<Option<FragmentClaim>> {
+        for claim in [self.direct, self.inherited].into_iter().flatten() {
+            if let Some(against) = history.at(claim.verified_at).await?
+                && !indexed_data_differs(
+                    &against,
+                    snapshot,
+                    fragment,
+                    indexed,
+                    can_refresh_overlays,
+                )
+                .await?
+            {
+                return Ok(Some(claim));
+            }
+        }
+        Ok(None)
     }
-    let mut history = History::new(dataset).await?;
-    // Every followed fragment's contributing versions; a `None` contribution
-    // prevents it from being shown fresh.
-    let mut following = build_provenance(&mut history, frag_reuse_index, segments).await?;
+}
 
-    let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
-    versions.sort_by_key(|version| version.dataset_version);
-
-    for version in versions {
-        let ours = version
+/// Carry one verified contribution per input through each complete rewrite group.
+async fn follow_rewrites<T: TableVersion>(
+    history: &mut History<'_, T>,
+    versions: &[FragReuseVersion],
+    order: &[usize],
+    indexed: &HashSet<i32>,
+    claims: &mut HashMap<u32, FragmentClaims>,
+) -> Result<()> {
+    for &position in order {
+        let version = &versions[position];
+        let groups = version
             .groups
             .iter()
             .filter(|group| {
                 group
                     .old_frags
                     .iter()
-                    .any(|fragment| following.contains_key(&(fragment.id as u32)))
+                    .all(|f| claims.contains_key(&(f.id as u32)))
             })
             .collect::<Vec<_>>();
-        if ours.is_empty() {
+        if groups.is_empty() {
             continue;
         }
-        let before_commit = history.at(version.dataset_version).await?;
-        let produced = ours
-            .iter()
-            .flat_map(|group| group.new_frags.iter())
-            .map(|fragment| fragment.id as u32);
-        let committed = match before_commit {
-            Some(_) => {
-                history
-                    .rewrite_commit(version.dataset_version, produced)
-                    .await?
-            }
-            None => None,
+        let Some(before) = history.at(version.dataset_version).await? else {
+            continue;
         };
-        for group in ours {
-            let mut stale = committed.is_none();
-            for old in &group.old_frags {
-                let old = old.id as u32;
-                let (Some(recorded_versions), Some(before_commit)) =
-                    (following.remove(&old), &before_commit)
-                else {
-                    continue;
-                };
-                for recorded in recorded_versions {
-                    stale |= match recorded {
-                        None => true,
-                        Some(recorded) => match history.at(recorded).await? {
-                            None => true,
-                            Some(against) => {
-                                indexed_data_differs(&against, before_commit, old, &indexed).await?
-                            }
-                        },
-                    };
-                }
-            }
-            for new in &group.new_frags {
-                let new = new.id as u32;
-                // The merge can retain both directly indexed entries and entries
-                // remapped from older inputs. Neither contribution can vouch for
-                // the other's freshness, including when either is undated.
-                let recorded = committed.filter(|_| !stale);
-                let recorded_versions = following
-                    .entry(new)
-                    .or_insert_with(|| Vec::with_capacity(1));
-                if !recorded_versions.contains(&recorded) {
-                    recorded_versions.push(recorded);
-                }
-            }
-        }
-    }
-
-    let current = history.current();
-    let mut fresh = RoaringBitmap::new();
-    for (fragment, recorded_versions) in following {
-        // A fragment no longer in the manifest is dropped from coverage anyway.
-        if current.fragment(fragment).is_none() {
+        let produced: Vec<_> = groups
+            .iter()
+            .flat_map(|g| g.new_frags.iter().map(|f| f.id as u32))
+            .collect();
+        let Some(verified_at) = history
+            .rewrite_commit(version.dataset_version, &produced)
+            .await?
+        else {
             continue;
-        }
-        let mut differs = false;
-        for recorded in recorded_versions {
-            differs |= match recorded {
-                None => true,
-                Some(recorded) => match history.at(recorded).await? {
-                    None => true,
-                    Some(against) => {
-                        indexed_data_differs(&against, &current, fragment, &indexed).await?
-                    }
-                },
-            };
-        }
-        if !differs {
-            fresh.insert(fragment);
+        };
+        'groups: for group in groups {
+            let mut source = None;
+            for (position, input) in group.old_frags.iter().enumerate() {
+                let id = input.id as u32;
+                let Some(claim) = claims[&id]
+                    .verified(history, &before, id, indexed, false)
+                    .await?
+                else {
+                    continue 'groups;
+                };
+                if position == 0 {
+                    source = claim.source;
+                } else if source != claim.source {
+                    source = None;
+                }
+            }
+            for dest in &group.new_frags {
+                claims.entry(dest.id as u32).or_default().inherited = Some(FragmentClaim {
+                    source,
+                    verified_at,
+                });
+            }
         }
     }
-    Ok(fresh)
+    Ok(())
+}
+
+/// Establish what snapshot each stored fragment actually represents. A v0 manifest
+/// may already name a destination that did not exist at the file's build version.
+/// Verify those claims from their build ancestors before using them as merge inputs.
+pub(crate) async fn fresh_fragments<T: TableVersion>(
+    dataset: &T,
+    frag_reuse_index: &CompactFragReuseIndex,
+    segments: &[IndexMetadata],
+    candidates: &RoaringBitmap,
+) -> Result<(Vec<RoaringBitmap>, RoaringBitmap)> {
+    let indexed = indexed_field_ids(
+        &dataset.manifest().schema,
+        &segments[0].fields,
+        &segments[0].covering_fields,
+    )?;
+    let mut history = History::new(dataset).await?;
+    let versions = &frag_reuse_index.details.versions;
+    let mut order = (0..versions.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&i| versions[i].dataset_version);
+    let mut claims = HashMap::<u32, FragmentClaims>::new();
+    let mut projected = BTreeMap::<u64, (RoaringBitmap, Vec<(u32, usize)>)>::new();
+    for (source, segment) in segments.iter().enumerate() {
+        let version = segment.dataset_version;
+        let Some(built) = history.at(version).await? else {
+            continue;
+        };
+        for fragment in segment.fragment_bitmap.iter().flatten() {
+            if built.fragment(fragment).is_some() {
+                claims.entry(fragment).or_default().direct = Some(FragmentClaim {
+                    source: Some(source),
+                    verified_at: version,
+                });
+            } else if let Some(ancestors) = sources_at_build(versions, version, fragment, |id| {
+                built.fragment(id).is_some()
+            }) {
+                let (roots, destinations) = projected.entry(version).or_default();
+                roots.extend(ancestors);
+                destinations.push((fragment, source));
+            }
+        }
+    }
+    for (version, (roots, destinations)) in projected {
+        let mut lineage = roots
+            .iter()
+            .map(|id| {
+                (
+                    id,
+                    FragmentClaims {
+                        direct: Some(FragmentClaim {
+                            source: None,
+                            verified_at: version,
+                        }),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let start = order.partition_point(|&i| versions[i].dataset_version < version);
+        follow_rewrites(
+            &mut history,
+            versions,
+            &order[start..],
+            &indexed,
+            &mut lineage,
+        )
+        .await?;
+        for (id, source) in destinations {
+            if let Some(claim) = lineage.get(&id).and_then(|claims| claims.inherited) {
+                claims.entry(id).or_default().direct = Some(FragmentClaim {
+                    source: Some(source),
+                    ..claim
+                });
+            }
+        }
+    }
+    follow_rewrites(&mut history, versions, &order, &indexed, &mut claims).await?;
+    let current = history.current();
+    let mut retained = vec![RoaringBitmap::new(); segments.len()];
+    let mut rescan = RoaringBitmap::new();
+    for id in candidates {
+        if let Some(candidates) = claims.get(&id)
+            && let Some(claim) = candidates
+                .verified(&mut history, &current, id, &indexed, true)
+                .await?
+        {
+            if let Some(source) = claim.source {
+                retained[source].insert(id);
+            } else {
+                rescan.insert(id);
+            }
+        }
+    }
+    Ok((retained, rescan))
 }
 
 /// Resolve the field ids a segment's staleness check must consider: the subtree of
@@ -782,6 +826,16 @@ fn indexed_field_ids(
     Ok(indexed_field_ids)
 }
 
+/// What happens to newer overlay values when publishing these segments.
+#[derive(Clone, Copy)]
+pub(crate) enum StagedCoverageMode {
+    /// Keep the source stamp for newer overlays. A scalar file cannot be published after
+    /// an indexed overlay it incorporated was rolled back.
+    Commit,
+    /// Refresh current overlays, withdrawing coverage if a restore removed an indexed overlay.
+    Merge,
+}
+
 /// Drops from each segment's coverage the fragments whose indexed data changed
 /// since it was built. `historically_missing_exempt` names fragments compaction
 /// created after the segments were built, whose absence from a segment's
@@ -789,9 +843,8 @@ fn indexed_field_ids(
 pub(crate) async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
-    prune_historically_missing: bool,
     historically_missing_exempt: &RoaringBitmap,
-    prune_newer_overlays: bool,
+    mode: StagedCoverageMode,
 ) -> Result<()> {
     let current_fragments = dataset
         .fragments()
@@ -852,13 +905,18 @@ pub(crate) async fn prune_stale_segment_coverage(
                 segment.fields(),
                 segment.covering_fields(),
             )?;
+            let check_overlays = matches!(mode, StagedCoverageMode::Merge)
+                || !segment
+                    .index_details()
+                    .type_url
+                    .ends_with("VectorIndexDetails");
             let mut stale_fragments = Vec::new();
             for fragment_id in segment.fragment_bitmap().iter() {
                 let historical_fragment = historical_fragments.get(&fragment_id);
                 if historical_fragment.is_none()
                     && !historically_missing_exempt.contains(fragment_id)
                 {
-                    if prune_historically_missing {
+                    if !matches!(mode, StagedCoverageMode::Commit) {
                         stale_fragments.push(fragment_id);
                     }
                     continue;
@@ -887,13 +945,23 @@ pub(crate) async fn prune_stale_segment_coverage(
                     );
                     historical_files.is_none() || historical_files != current_files
                 });
-                let changed_overlays = prune_newer_overlays
-                    && has_overlay_newer_than(
-                        current_fragment,
-                        version,
-                        &indexed_field_ids,
-                        dataset.schema(),
-                    );
+                let changed_overlays = check_overlays
+                    && historical_fragment.is_some_and(|then| {
+                        overlays_need_rebuild(
+                            then,
+                            current_fragment,
+                            &indexed_field_ids,
+                            dataset.schema(),
+                            version,
+                        )
+                    });
+                if changed_overlays && matches!(mode, StagedCoverageMode::Commit) {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: segment {} built at dataset version {version} includes a different overlay history for fragment {fragment_id} at version {}. Rebuild the segment before committing",
+                        segment.uuid(),
+                        dataset.manifest.version
+                    )));
+                }
                 if changed_files || changed_overlays {
                     stale_fragments.push(fragment_id);
                     continue;

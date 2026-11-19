@@ -7,6 +7,7 @@ use lance_index::scalar::bitmap::BitmapIndex;
 use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use lance_table::format::IndexMetadata;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -67,6 +68,7 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -105,19 +107,25 @@ pub(in crate::index) async fn merge_segments(
     let field_path = dataset.schema().field_path(field_id)?;
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
-            .await?;
+    let (fragment_bitmap, old_data_filters, new_data) = refresh
+        .staged_row_inputs(
+            dataset,
+            &segment_refs,
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+        )
+        .await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    // Pure segment consolidation: no dataset scan, so `new_data` is an empty stream.
-    let empty_new_data = super::btree::empty_value_row_id_stream(dataset, field_id)?;
+    let new_data = match new_data {
+        Some(data) => data,
+        None => super::btree::empty_value_row_id_stream(dataset, field_id)?,
+    };
     let created_index = open_and_merge_segments(
         dataset,
         &field_path,
         &segment_refs,
-        empty_new_data,
+        new_data,
         &new_store,
         &old_data_filters,
         staged,

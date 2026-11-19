@@ -9,7 +9,6 @@ use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use itertools::Itertools;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -23,11 +22,12 @@ use lance_index::scalar::{
 };
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
-use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::index::append::SeedHarvester;
-use crate::index::scalar::{TrainingRows, TrainingScanOptions, scan_training_data};
+use crate::index::scalar::{
+    TrainingRows, TrainingScanOptions, fragments_by_id, scan_training_data,
+};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source ZoneMap segments into a single segment.
@@ -35,6 +35,7 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -49,7 +50,8 @@ pub(in crate::index) async fn merge_segments(
     let field_path = dataset.schema().field_path(field_id)?;
 
     let mut scalar_indices = Vec::with_capacity(segments.len());
-    let mut fragment_bitmap = RoaringBitmap::new();
+    let refreshed = refresh.fragments();
+    let mut fragment_bitmap = refreshed.clone();
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
     for segment in &segments {
         let effective = segment
@@ -60,7 +62,7 @@ pub(in crate::index) async fn merge_segments(
                     segment.uuid
                 ))
             })?;
-        fragment_bitmap |= effective;
+        fragment_bitmap |= &effective;
         let scalar_index = super::open_scalar_index_with_plan(
             dataset,
             &field_path,
@@ -70,11 +72,11 @@ pub(in crate::index) async fn merge_segments(
             &NoOpMetricsCollector,
         )
         .await?;
-        scalar_indices.push((segment.uuid, scalar_index));
+        scalar_indices.push((segment.uuid, scalar_index, effective - &refreshed));
     }
 
     let mut source_indices = Vec::with_capacity(scalar_indices.len());
-    for (segment_uuid, scalar_index) in &scalar_indices {
+    for (segment_uuid, scalar_index, retained_fragments) in &scalar_indices {
         let zonemap_index = scalar_index
             .as_any()
             .downcast_ref::<ZoneMapIndex>()
@@ -85,15 +87,41 @@ pub(in crate::index) async fn merge_segments(
                     scalar_index.index_type()
                 ))
             })?;
-        source_indices.push(zonemap_index);
+        source_indices.push((zonemap_index, retained_fragments));
     }
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
+    let (reference, _) = source_indices[0];
+    let mut scanned = ScannedZones::default();
+    if !refreshed.is_empty() {
+        let fragments = fragments_by_id(dataset, refreshed.iter().collect())?;
+        let mut counts = HashMap::with_capacity(fragments.len());
+        for fragment in &fragments {
+            counts.insert(fragment.id, physical_rows(dataset, fragment).await?);
+        }
+        let data = scan_training_data(
+            dataset,
+            &field_path,
+            &reference.update_criteria().data_criteria,
+            Some(TrainingRows::Fragments(fragments)),
+            TrainingScanOptions::default(),
+        )
+        .await?;
+        scanned = train_zonemap_scan(
+            reference.value_type(),
+            reference.rows_per_zone(),
+            reference.store_null_bitmap(),
+            counts,
+            data,
+        )
+        .await?;
+    }
+    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices_with_scan(
         &source_indices,
         &new_store,
-        &fragment_bitmap,
+        &refreshed,
+        scanned,
     )
     .await?;
 
@@ -348,7 +376,7 @@ fn scan_batch<'a>(
                     masked = true;
                 }
             }
-            fragments.push(plan.fragment.clone());
+            fragments.push(plan.fragment);
             physical_rows.insert(plan.fragment.id, plan.physical_rows);
             batch_rows += plan.scanned_rows;
         }
@@ -366,9 +394,12 @@ fn scan_batch<'a>(
             dataset,
             column,
             criteria,
-            Some(TrainingRows::Fragments(fragments)),
+            Some(if masked {
+                TrainingRows::RowAddrs(mask)
+            } else {
+                TrainingRows::Fragments(fragments.into_iter().cloned().collect())
+            }),
             TrainingScanOptions {
-                physical_rows: masked.then_some(mask),
                 expected_rows: Some(batch_rows),
                 ..Default::default()
             },
@@ -514,19 +545,6 @@ async fn assemble_segment(
         write_zonemap_segment(base, data_type, reused, scanned, &refreshed, store).await?;
     progress.stage_complete("write_zonemap_index").await?;
     Ok(created)
-}
-
-/// The fragments with these ids, in id order, erroring on an unknown id.
-fn fragments_by_id(dataset: &Dataset, ids: Vec<u32>) -> Result<Vec<Fragment>> {
-    let ids: Vec<u32> = ids.into_iter().sorted().dedup().collect();
-    ids.iter()
-        .zip(dataset.get_frags_from_ordered_ids(&ids))
-        .map(|(id, fragment)| {
-            fragment.map(|f| f.metadata().clone()).ok_or_else(|| {
-                Error::invalid_input_source(format!("No fragment with id {}", id).into())
-            })
-        })
-        .collect()
 }
 
 /// Train a new ZoneMap segment over `fragment_ids` (all fragments when
