@@ -723,17 +723,36 @@ mod tests {
         });
         let store = ObjectStore::local();
         let resource = store.with_memory_reserver(pool.clone()).unwrap();
-        assert_eq!(
-            store.exists(&path).await.unwrap(),
-            resource.exists(&path).await.unwrap()
-        );
-        let ordinary = store.size(&path).await;
-        let charged = resource.size(&path).await;
-        if kind == "file" {
-            assert_eq!(ordinary.unwrap(), charged.unwrap());
+        let error_kind = |error: Error| {
+            if error.is_not_found() {
+                return std::io::ErrorKind::NotFound;
+            }
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+            let mut source: &(dyn std::error::Error + 'static) = &error;
+            loop {
+                if let Some(error) = source.downcast_ref::<std::io::Error>() {
+                    break error.kind();
+                }
+                source = source.source().expect("I/O error must retain its cause");
+            }
+        };
+        let ordinary_exists = store.exists(&path).await.map_err(&error_kind);
+        let charged_exists = resource.exists(&path).await.map_err(&error_kind);
+        let ordinary_size = store.size(&path).await.map_err(&error_kind);
+        let charged_size = resource.size(&path).await.map_err(&error_kind);
+        assert_eq!(ordinary_exists, charged_exists);
+        assert_eq!(ordinary_size, charged_size);
+        // Windows rejects opening a directory before the backend can inspect
+        // its metadata. Unix opens it and then classifies it as not found.
+        if kind == "directory" && cfg!(windows) {
+            assert_eq!(ordinary_exists, Err(std::io::ErrorKind::PermissionDenied));
+            assert_eq!(ordinary_size, Err(std::io::ErrorKind::PermissionDenied));
+        } else if kind == "file" {
+            assert_eq!(ordinary_exists, Ok(true));
+            assert_eq!(ordinary_size, Ok(4));
         } else {
-            assert!(ordinary.unwrap_err().is_not_found());
-            assert!(charged.unwrap_err().is_not_found());
+            assert_eq!(ordinary_exists, Ok(false));
+            assert_eq!(ordinary_size, Err(std::io::ErrorKind::NotFound));
         }
         drop(resource);
         assert_eq!(pool.used.load(Ordering::Acquire), 0);
