@@ -44,12 +44,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::UpdateBases { .. }
-            // An action set needs no rewriting to move to a newer version: its
-            // minted ids are allocated when the actions are applied, against
-            // whichever manifest they land on, and its committed references
-            // name coordinates that do not move.
-            | Operation::CompositeOperation(_) => Ok(self.transaction),
+            | Operation::UpdateBases { .. } => Ok(self.transaction),
+            Operation::CompositeOperation(_) => self.finish_action_set(dataset).await,
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be committed by this version",
@@ -219,6 +215,20 @@ impl<'a> TransactionRebase<'a> {
                 ..self.transaction
             })
         }
+    }
+
+    /// Adapt the set to what landed since it read: fields dropped since are
+    /// left out of the fragments it mints. Otherwise an action set needs no
+    /// rewriting to move to a newer version: its minted ids are allocated when
+    /// the actions are applied, against whichever manifest they land on, and
+    /// its committed references name coordinates that do not move.
+    async fn finish_action_set(mut self, dataset: &Dataset) -> Result<Transaction> {
+        if let (Operation::CompositeOperation(composite_operation), Some(read)) =
+            (&mut self.transaction.operation, &self.footprint_basis.read)
+        {
+            composite_operation.forget_dropped_fields(&read.schema, dataset.schema());
+        }
+        Ok(self.transaction)
     }
 
     /// Verify no concurrent row-moving Update dropped the values of any cell

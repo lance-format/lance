@@ -169,6 +169,21 @@ fn replace(field: i32, fragment: u64) -> Operation {
     ])
 }
 
+/// A legacy merge that rebinds `c` in fragment 0 to a file of its own.
+fn merge_rewriting_c() -> Operation {
+    let mut fragments = table().fragments.as_ref().clone();
+    for file in &mut fragments[0].files {
+        if file.fields.as_ref() == [C] {
+            *file = field_file("c-merged-0", C);
+        }
+    }
+    Operation::Merge {
+        fragments,
+        schema: table().schema,
+        preserves_nullability: true,
+    }
+}
+
 fn deletion_file(deleted: u64) -> DeletionFile {
     DeletionFile {
         read_version: 2,
@@ -450,8 +465,8 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
 #[case::an_overlay_and_a_rewrite_elsewhere(overlay(0), replace_c(1), Lands, Lands)]
 #[case::an_overlay_and_a_reencode(overlay(0), reencode_c(0), Lands, Lands)]
 // A drop tombstones the field out of every fragment it finds; data written
-// for it into new fragments needs it to still be there.
-#[case::a_drop_and_an_append(drop_c(), append(), Lands, Conflicts)]
+// for it into new fragments is left out after the check.
+#[case::a_drop_and_an_append(drop_c(), append(), Lands, Lands)]
 #[case::a_drop_and_a_rewrite(drop_c(), replace_c(0), Lands, Conflicts)]
 #[case::a_drop_and_an_overlay(drop_c(), overlay(0), Lands, Conflicts)]
 #[case::a_drop_and_a_rename(drop_c(), alter_c(|alter| alter.with_name("d")), Conflicts, Conflicts)]
@@ -481,6 +496,12 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
     alter_c(|alter| alter.with_nullable(false)),
     replace(A, 0),
     Lands,
+    Conflicts
+)]
+#[case::a_tightening_and_a_merge_rewriting_it(
+    alter_c(|alter| alter.with_nullable(false)),
+    merge_rewriting_c(),
+    Conflicts,
     Conflicts
 )]
 #[case::a_tightening_and_a_delete(
@@ -532,6 +553,38 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
     Conflicts,
     Conflicts
 )]
+#[case::a_projection_and_an_append(
+    Operation::Project { schema: table().schema.project(&["a", "s"]).unwrap(), preserves_nullability: true },
+    append(),
+    Lands,
+    Lands
+)]
+#[case::a_projection_and_a_schema_metadata_edit(
+    Operation::Project { schema: table().schema.project(&["a", "s"]).unwrap(), preserves_nullability: true },
+    schema_metadata("k"),
+    Conflicts,
+    Lands
+)]
+#[case::a_merge_and_an_append(
+    Operation::Merge {
+        fragments: table().fragments.as_ref().clone(),
+        schema: table().schema,
+        preserves_nullability: true,
+    },
+    append(),
+    Conflicts,
+    Lands
+)]
+#[case::a_merge_and_an_index(
+    Operation::Merge {
+        fragments: table().fragments.as_ref().clone(),
+        schema: table().schema,
+        preserves_nullability: true,
+    },
+    index_over(&[0]),
+    Lands,
+    Lands
+)]
 // A compaction carries the indices over the rows it moves through a remap
 // computed when it read; a segment over them since is left stale.
 #[case::a_compaction_and_a_segment_over_it(legacy_rewrite(0), index_over(&[0]), Conflicts, Lands)]
@@ -562,7 +615,7 @@ fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
 #[case::a_drop_and_a_rewrite_of_another_field(drop_c(), replace(A, 0), Lands, Lands)]
 #[case::a_drop_and_a_delete(drop_c(), delete_rows(0), Lands, Lands)]
 #[case::a_drop_and_an_append_without_it(drop_c(), append_of(&[A]), Lands, Lands)]
-#[case::a_drop_and_an_append_of_a_child(drop_s(), append_of(&[S + 1]), Lands, Conflicts)]
+#[case::a_drop_and_an_append_of_a_child(drop_s(), append_of(&[S + 1]), Lands, Lands)]
 #[case::a_struct_drop_and_a_field_added_elsewhere(
     drop_s(),
     set(vec![Action::AddField(AddField::new(0, added_field("y", true)))]),
@@ -819,6 +872,42 @@ fn test_a_column_replacement_over_a_replacement_moving_it_to_another_base() {
     };
 
     assert_eq!(outcome_at(&read, &replace_c(0), &replacement), Conflicts);
+}
+
+/// A stale append may write a struct packed without a child a merge added
+/// under it since, whatever the child's nullability, and the rows would not
+/// decode. A nullable column added at the top level leaves the rows' existing
+/// columns as they were.
+#[rstest]
+#[case::a_nullable_child_under_the_struct(true, Conflicts)]
+#[case::a_nullable_top_level_column(false, Lands)]
+fn test_an_append_over_a_merge_adding_a_nullable_field(
+    #[case] under_the_struct: bool,
+    #[case] expected: Outcome,
+) {
+    let read = table();
+    let added = ArrowField::new("y", DataType::Int32, true);
+    let struct_children = std::iter::once(ArrowField::new("x", DataType::Int32, true))
+        .chain(under_the_struct.then(|| added.clone()))
+        .collect::<Vec<_>>();
+    let mut fields = vec![
+        ArrowField::new("a", DataType::Int32, true),
+        ArrowField::new("c", DataType::Int32, true),
+        ArrowField::new("s", DataType::Struct(Fields::from(struct_children)), true),
+    ];
+    if !under_the_struct {
+        fields.push(added);
+    }
+    // Ids are assigned in pre-order, so the committed fields keep theirs and
+    // `y` is minted after them.
+    let schema = Schema::try_from(&ArrowSchema::new(fields)).unwrap();
+    let merge = Operation::Merge {
+        fragments: read.fragments.as_ref().clone(),
+        schema,
+        preserves_nullability: true,
+    };
+
+    assert_eq!(outcome(&append(), &merge), expected);
 }
 
 /// Row ids a named operation's new fragments arrive carrying are claimed as
@@ -1179,11 +1268,59 @@ fn by_footprints(ours: &Operation, theirs: &Operation) -> Outcome {
     }
 }
 
+/// A cast replaces a field by one of the same name with a new id. A writer
+/// that bound the old id in a fragment of its own would have its values read
+/// back as null under the new one, so it conflicts rather than being adapted
+/// as it is to a plain drop, whichever form the cast and the write take.
+#[rstest]
+#[case::an_action_append_over_a_legacy_cast(append(), legacy_cast_c(), Conflicts)]
+#[case::an_action_append_over_an_action_cast(append(), action_cast_c(), Conflicts)]
+#[case::a_named_append_over_an_action_cast(named_append(), action_cast_c(), Conflicts)]
+#[case::an_action_append_over_a_drop(append(), drop_c(), Lands)]
+fn test_a_write_into_a_new_fragment_over_a_cast(
+    #[case] ours: Operation,
+    #[case] theirs: Operation,
+    #[case] expected: Outcome,
+) {
+    assert_eq!(outcome(&ours, &theirs), expected);
+}
+
+/// `c` replaced by a nullable field of the same name and a new id, as a
+/// legacy merge casting it installs.
+fn legacy_cast_c() -> Operation {
+    let read = table();
+    let mut schema = read.schema.clone();
+    schema.mut_field_by_id(C).unwrap().id = read.schema.max_field_id().unwrap() + 1;
+    let fragments = read
+        .fragments
+        .iter()
+        .map(|fragment| {
+            let mut fragment = fragment.clone();
+            fragment.files.retain(|file| file.fields.as_ref() != [C]);
+            fragment
+        })
+        .collect();
+    Operation::Merge {
+        fragments,
+        schema,
+        preserves_nullability: true,
+    }
+}
+
 fn action_cast_c() -> Operation {
     set(vec![
         Action::DropField(DropField::new(FieldRef::Committed(C))),
         Action::AddField(AddField::new(0, added_field("c", true))),
     ])
+}
+
+/// A named append of one fragment backing `a` and `c`.
+fn named_append() -> Operation {
+    let mut fragment = table().fragments[0].clone();
+    fragment.id = 7;
+    Operation::Append {
+        fragments: vec![fragment],
+    }
 }
 
 fn compacted_sstables() -> Action {
