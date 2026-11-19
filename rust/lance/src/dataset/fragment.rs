@@ -2338,7 +2338,32 @@ impl FileFragment {
     ///
     /// This will always return the same number of rows as the input indices.
     /// If indices are out-of-bounds, this will return an error.
+    ///
+    /// The projection may include the `_rowid` and `_rowaddr` system columns
+    /// (for example from [`Schema::project_preserve_system_columns`]). They
+    /// are returned in the order they appear in the projection.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
+        // System columns are produced by the reader rather than read from data files.
+        let mut with_row_id = false;
+        let mut with_row_address = false;
+        let mut data_fields = Vec::with_capacity(projection.fields.len());
+        for field in &projection.fields {
+            match field.name.as_str() {
+                ROW_ID => with_row_id = true,
+                ROW_ADDR => with_row_address = true,
+                name if lance_core::is_system_column(name) => {
+                    return Err(Error::invalid_input(format!(
+                        "System column {name} is not supported by fragment take"
+                    )));
+                }
+                _ => data_fields.push(field.clone()),
+            }
+        }
+        let data_projection = Schema {
+            fields: data_fields,
+            metadata: projection.metadata.clone(),
+        };
+
         // Re-map the indices to row ids using the deletion vector
         let deletion_vector = self.get_deletion_vector().await?;
         let row_ids = if let Some(deletion_vector) = deletion_vector {
@@ -2358,13 +2383,25 @@ impl FileFragment {
             Cow::Borrowed(indices)
         };
 
-        // Then call take rows
-        let read_config = FragReadConfig::default().with_row_address(projection.fields.is_empty());
-        let batch = self.take_rows(&row_ids, projection, read_config).await?;
+        // Then call take rows. Keep an internal address for empty projections
+        // so the batch retains its row count.
+        let read_config = FragReadConfig::default()
+            .with_row_id(with_row_id)
+            .with_row_address(with_row_address || data_projection.fields.is_empty());
+        let batch = self
+            .take_rows(&row_ids, &data_projection, read_config)
+            .await?;
 
+        // Restore the requested column order and drop any internal address.
+        let batch_schema = batch.schema();
+        let column_indices = projection
+            .fields
+            .iter()
+            .map(|field| batch_schema.index_of(&field.name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = batch.project(&column_indices)?;
         if projection.fields.is_empty() {
-            // Drop the internal address after selection and duplicate restoration.
-            return Ok(batch.project(&[])?);
+            return Ok(batch);
         }
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
@@ -6527,6 +6564,84 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("Invalid read params"), "{error}");
+    }
+
+    #[rstest]
+    #[case::contiguous(&[0, 1], &[3, 4])]
+    #[case::unsorted_duplicates(&[1, 0, 1], &[4, 3, 4])]
+    #[tokio::test]
+    async fn test_take_system_columns(
+        #[case] indices: &[u32],
+        #[case] dataset_offsets: &[u64],
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(
+            &["_rowaddr", "i", "_rowid"][..],
+            &["_rowid"][..],
+            &["_rowaddr"][..],
+            &["_rowid", "_rowaddr"][..]
+        )]
+        columns: &[&str],
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Shift the fragment offsets away from the physical offsets.
+        dataset.delete("i = 3").await.unwrap();
+        let fragment = dataset.get_fragment(1).unwrap();
+
+        let projection = dataset
+            .schema()
+            .project_preserve_system_columns(columns)
+            .unwrap();
+        let batch = fragment.take(indices, &projection).await.unwrap();
+        let expected = dataset
+            .take(
+                dataset_offsets,
+                crate::dataset::ProjectionRequest::from_columns(
+                    columns.iter().copied(),
+                    dataset.schema(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch, expected);
+
+        let field_names = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(field_names, columns);
+        let expected_addrs = indices
+            .iter()
+            .map(|offset| u64::from(RowAddress::new_from_parts(1, offset + 1)))
+            .collect::<Vec<_>>();
+        if let Some(addrs) = batch.column_by_name(ROW_ADDR) {
+            assert_eq!(addrs.as_primitive::<UInt64Type>().values(), &expected_addrs);
+        }
+
+        let row_offset_projection = dataset
+            .schema()
+            .project_preserve_system_columns(&["i", "_rowoffset"])
+            .unwrap();
+        let error = fragment
+            .take(indices, &row_offset_projection)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 
     /// A fragment with one data file per column group reads only the files

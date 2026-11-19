@@ -45,6 +45,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -81,6 +82,106 @@ public class FragmentTest {
     assertArrayEquals(inlineBytes, inline.getInline());
     assertNull(inline.getRelativePath(5));
     assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+
+    String explicitPath = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin";
+    DeletionFile explicit =
+        new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, null, explicitPath);
+    assertEquals(explicitPath, explicit.getRelativePath(5));
+    assertEquals(explicitPath, explicit.getRelativePath(99));
+    assertEquals(Optional.of(explicitPath), explicit.getPath());
+    assertEquals(Optional.empty(), bitmap.getPath());
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, inlineBytes, explicitPath));
+  }
+
+  @Test
+  void testExplicitDeletionPathRoundTrip(@TempDir Path tempDir) throws Exception {
+    Path datasetDir = tempDir.resolve("explicit_deletion_round_trip");
+    String datasetPath = datasetDir.toString();
+    String explicitRelPath = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.arrow";
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.delete("id = 1");
+        assertEquals(4, dataset.countRows());
+
+        FragmentMetadata derivedMeta = dataset.getFragments().get(0).metadata();
+        DeletionFile derivedDel = derivedMeta.getDeletionFile();
+        assertNotNull(derivedDel);
+        assertEquals(Optional.empty(), derivedDel.getPath());
+        String derivedRelPath = derivedDel.getRelativePath(derivedMeta.getId());
+        assertNotNull(derivedRelPath);
+
+        Files.move(datasetDir.resolve(derivedRelPath), datasetDir.resolve(explicitRelPath));
+
+        DeletionFile explicitDel =
+            new DeletionFile(
+                derivedDel.getId(),
+                derivedDel.getReadVersion(),
+                derivedDel.getNumDeletedRows(),
+                derivedDel.getFileType(),
+                derivedDel.getBaseId().orElse(null),
+                null,
+                explicitRelPath);
+        FragmentMetadata withExplicit =
+            new FragmentMetadata(
+                derivedMeta.getId(),
+                derivedMeta.getFiles(),
+                derivedMeta.getPhysicalRows(),
+                explicitDel,
+                derivedMeta.getRowIdMeta(),
+                derivedMeta.getCreatedAtVersionMeta(),
+                derivedMeta.getLastUpdatedAtVersionMeta(),
+                derivedMeta.getReferencedLanceFiles(),
+                derivedMeta.getClusteringId(),
+                derivedMeta.getMetadata());
+
+        Update setExplicit =
+            Update.builder()
+                .updatedFragments(Collections.singletonList(withExplicit))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
+        try (Transaction tx1 =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(setExplicit)
+                    .build();
+            Dataset v3 = new CommitBuilder(dataset).execute(tx1)) {
+          FragmentMetadata v3Meta = v3.getFragments().get(0).metadata();
+          DeletionFile v3Del = v3Meta.getDeletionFile();
+          assertNotNull(v3Del);
+          assertEquals(Optional.of(explicitRelPath), v3Del.getPath());
+          assertEquals(explicitRelPath, v3Del.getRelativePath(v3Meta.getId()));
+          assertEquals(explicitRelPath, v3Del.getRelativePath(99));
+
+          Update roundTrip =
+              Update.builder()
+                  .updatedFragments(Collections.singletonList(v3Meta))
+                  .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                  .build();
+          try (Transaction tx2 =
+                  new Transaction.Builder().readVersion(v3.version()).operation(roundTrip).build();
+              Dataset v4 = new CommitBuilder(v3).execute(tx2)) {
+            FragmentMetadata v4Meta = v4.getFragments().get(0).metadata();
+            assertEquals(Optional.of(explicitRelPath), v4Meta.getDeletionFile().getPath());
+            assertEquals(4, v4.countRows());
+            assertEquals(0, v4.countRows("id = 1"));
+          }
+        }
+      }
+    }
+
+    try (Dataset reopened = Dataset.open(datasetPath)) {
+      FragmentMetadata reopenedMeta = reopened.getFragments().get(0).metadata();
+      assertEquals(Optional.of(explicitRelPath), reopenedMeta.getDeletionFile().getPath());
+      assertEquals(4, reopened.countRows());
+      assertEquals(0, reopened.countRows("id = 1"));
+    }
   }
 
   @Test

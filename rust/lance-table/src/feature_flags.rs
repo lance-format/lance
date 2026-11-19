@@ -136,6 +136,15 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
+/// Reserved for local fragment aliases (`IndexMetadata.local_fragment_aliases`).
+/// Both reader and writer bits are required while any retained index segment
+/// has aliases. The flag is non-sticky and unsupported until reader and
+/// index maintenance support lands.
+pub const FLAG_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
+/// Some fragment sets `DeletionFile.path` instead of deriving the path from `fragment_id`.
+/// The reader bit is set while any fragment sets `path`, and the writer bit remains set
+/// on subsequent versions so cleanup preserves files referenced by retained versions.
+pub const FLAG_DELETION_FILE_PATHS: u64 = 1 << 21;
 /// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
 /// sets `key_layout`.
 ///
@@ -146,9 +155,9 @@ pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
 ///
 /// Reserved ahead of its implementation. This build masks the bit out in
 /// `supported_flags_when`, so it refuses to write a table that sets it.
-pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 20;
+pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 22;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 21;
+pub const FLAG_UNKNOWN: u64 = 1 << 23;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -169,6 +178,10 @@ const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_LOCAL_FRAGMENT_ALIASES < FLAG_DELETION_FILE_PATHS);
+// Released builds refuse bit 20 and above, so they cannot read this format.
+const _: () = assert!(FLAG_DELETION_FILE_PATHS >= 1 << 20);
+const _: () = assert!(FLAG_DELETION_FILE_PATHS < FLAG_UNKNOWN);
 // Same fence for this bit: v15.0.0-beta.7 refuses bit 19 and up.
 const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 19);
 const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
@@ -178,7 +191,8 @@ pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_MANAGED_BLOBS
     | FLAG_ZONE_WRITE_SEEDS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
-pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
+pub(crate) const STICKY_WRITER_FLAGS: u64 =
+    STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS | FLAG_DELETION_FILE_PATHS;
 pub(crate) const COVERING_FLAGS: u64 =
     FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
 
@@ -309,6 +323,7 @@ pub fn apply_feature_flags(
     // Same carry for the index section's clustering references and generic
     // metadata, which `build_manifest` derives from the index list.
     let object_metadata = manifest.writer_feature_flags & FLAG_OBJECT_METADATA;
+    let deletion_file_paths_writer = manifest.writer_feature_flags & FLAG_DELETION_FILE_PATHS;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
     let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
     if non_reusable_field_ids {
@@ -336,6 +351,16 @@ pub fn apply_feature_flags(
         manifest.reader_feature_flags |= FLAG_INLINE_DELETIONS;
         manifest.writer_feature_flags |= FLAG_INLINE_DELETIONS;
     }
+    let has_deletion_file_paths = manifest.fragments.iter().any(|frag| {
+        frag.deletion_file
+            .as_ref()
+            .is_some_and(|deletion_file| deletion_file.path.is_some())
+    });
+    if has_deletion_file_paths {
+        manifest.reader_feature_flags |= FLAG_DELETION_FILE_PATHS;
+        manifest.writer_feature_flags |= FLAG_DELETION_FILE_PATHS;
+    }
+    manifest.writer_feature_flags |= deletion_file_paths_writer;
 
     // If any fragment has row ids, they must all have row ids.
     let has_row_ids = manifest
@@ -469,8 +494,8 @@ pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifes
     let sticky_flags = validated_sticky_paired_flags(source)?;
     validate_non_reusable_field_id_flags(source)?;
     destination.reader_feature_flags |= sticky_flags;
-    destination.writer_feature_flags |=
-        sticky_flags | (source.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS);
+    destination.writer_feature_flags |= sticky_flags
+        | (source.writer_feature_flags & (FLAG_NON_REUSABLE_FIELD_IDS | FLAG_DELETION_FILE_PATHS));
     Ok(())
 }
 
@@ -580,6 +605,7 @@ fn supported_flags_when(
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
+    mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
     mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
@@ -674,6 +700,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
         (FLAG_ZONE_WRITE_SEEDS, "zone write seed"),
+        (FLAG_LOCAL_FRAGMENT_ALIASES, "local fragment aliases"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -685,6 +712,14 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
                 ),
             ));
         }
+    }
+    if manifest.reader_feature_flags & FLAG_DELETION_FILE_PATHS != 0
+        && manifest.writer_feature_flags & FLAG_DELETION_FILE_PATHS == 0
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Manifest has the deletion file paths reader feature bit set without the writer feature bit",
+        ));
     }
     Ok(())
 }
@@ -721,7 +756,7 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::BasePath;
+    use crate::format::{BasePath, DeletionFile, DeletionFileType, Fragment};
 
     #[rstest::rstest]
     #[case::missing(None, "requires a cleanup policy")]
@@ -884,7 +919,7 @@ mod tests {
         assert!(error.to_string().contains("cannot be written"));
         assert!(!can_read_dataset(FLAG_BTREE_KEY_LAYOUT));
         assert!(!can_write_dataset(FLAG_BTREE_KEY_LAYOUT));
-        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 20);
+        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 22);
     }
 
     #[test]
@@ -895,7 +930,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 21);
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -991,6 +1026,62 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("zone write seed"));
         }
+    }
+
+    #[test]
+    fn test_local_fragment_aliases_are_paired_and_not_sticky() {
+        assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
+        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert_eq!(STICKY_PAIRED_FLAGS & FLAG_LOCAL_FRAGMENT_ALIASES, 0);
+
+        for (reader, writer) in [
+            (FLAG_LOCAL_FRAGMENT_ALIASES, 0),
+            (0, FLAG_LOCAL_FRAGMENT_ALIASES),
+        ] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = reader;
+            manifest.writer_feature_flags = writer;
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("local fragment aliases"),
+                "{error}"
+            );
+        }
+
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        manifest.writer_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        validate_paired_feature_flags(&manifest).unwrap();
+        let error = ensure_can_read_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+
+        let mut source = empty_manifest();
+        source.reader_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        source.writer_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+        assert_eq!(
+            destination.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        assert_eq!(
+            destination.writer_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
     }
 
     #[test]
@@ -1578,5 +1669,109 @@ mod tests {
         assert!(can_write_dataset(FLAG_MANAGED_BLOBS));
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_deletion_file_paths_flag() {
+        assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
+        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
+        assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
+        assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_deletion_file_paths_reader_is_conditional_and_writer_is_sticky() {
+        let deletion_file = |stored_path| DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: stored_path,
+            inline: None,
+        };
+        let manifest_with = |stored_path| {
+            let mut fragment = Fragment::new(1);
+            fragment.deletion_file = Some(deletion_file(stored_path));
+            let mut manifest = empty_manifest();
+            manifest.fragments = std::sync::Arc::new(vec![fragment]);
+            manifest
+        };
+
+        let mut v10 = manifest_with(None);
+        apply_feature_flags(&mut v10, false, false).unwrap();
+        assert_eq!(v10.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(v10.writer_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+
+        let mut v11 = Manifest::new_from_previous(
+            &v10,
+            v10.schema.clone(),
+            manifest_with(Some("_deletions/ab/file.bin".to_string())).fragments,
+        );
+        apply_feature_flags(&mut v11, false, false).unwrap();
+        assert_eq!(
+            v11.reader_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        assert_eq!(
+            v11.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        ensure_can_read_manifest(&v11).unwrap();
+        ensure_can_write_manifest(&v11).unwrap();
+
+        let mut v13 =
+            Manifest::new_from_previous(&v11, v11.schema.clone(), manifest_with(None).fragments);
+        apply_feature_flags(&mut v13, false, false).unwrap();
+        assert_eq!(v13.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            v13.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        ensure_can_read_manifest(&v13).unwrap();
+        ensure_can_write_manifest(&v13).unwrap();
+
+        let mut v14 =
+            Manifest::new_from_previous(&v13, v13.schema.clone(), std::sync::Arc::new(vec![]));
+        apply_feature_flags(&mut v14, false, false).unwrap();
+        assert_eq!(v14.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            v14.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        let mut restored = v10.clone();
+        inherit_sticky_feature_flags(&mut restored, &v13).unwrap();
+        apply_feature_flags(&mut restored, false, false).unwrap();
+        assert_eq!(restored.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            restored.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        let mut cloned = v13.shallow_clone(
+            Some("main".to_string()),
+            "file:///source".to_string(),
+            1,
+            None,
+            "tx.txn".to_string(),
+        );
+        apply_feature_flags(&mut cloned, false, false).unwrap();
+        assert_eq!(cloned.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            cloned.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        let mut invalid = empty_manifest();
+        invalid.reader_feature_flags = FLAG_DELETION_FILE_PATHS;
+        let error = validate_paired_feature_flags(&invalid).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(error.to_string().contains("deletion file paths"), "{error}");
     }
 }

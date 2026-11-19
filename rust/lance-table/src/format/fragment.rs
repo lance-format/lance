@@ -19,6 +19,7 @@ use super::row_ids::{
     RowIdMeta,
 };
 use crate::format::pb;
+use crate::io::deletion::DELETIONS_DIR;
 
 use crate::rowids::version::{
     RowDatasetVersionMeta, created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb,
@@ -516,7 +517,7 @@ impl DeletionFileType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, DeepSizeOf)]
 pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
@@ -524,6 +525,10 @@ pub struct DeletionFile {
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
+    /// Path under `_deletions/`, relative to the dataset root selected by `base_id`.
+    /// When `None`, the path is derived via [`deletion_file_path`](crate::io::deletion::deletion_file_path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// The serialized Roaring bitmap of deleted row offsets, when the deletion
     /// vector is stored in the manifest rather than in a file. `Bytes`, so the
     /// many clones of a fragment share it instead of copying it.
@@ -533,6 +538,38 @@ pub struct DeletionFile {
         with = "inline_deletion_bytes"
     )]
     pub inline: Option<Bytes>,
+}
+
+impl<'de> Deserialize<'de> for DeletionFile {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct DeletionFileHelper {
+            read_version: u64,
+            id: u64,
+            file_type: DeletionFileType,
+            num_deleted_rows: Option<usize>,
+            base_id: Option<u32>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default, with = "inline_deletion_bytes")]
+            inline: Option<Bytes>,
+        }
+
+        let helper = DeletionFileHelper::deserialize(deserializer)?;
+        let deletion_file = Self {
+            read_version: helper.read_version,
+            id: helper.id,
+            file_type: helper.file_type,
+            num_deleted_rows: helper.num_deleted_rows,
+            base_id: helper.base_id,
+            path: helper.path,
+            inline: helper.inline,
+        };
+        deletion_file
+            .check_location()
+            .map_err(serde::de::Error::custom)?;
+        Ok(deletion_file)
+    }
 }
 
 /// `Option<Bytes>` as serde sees a byte sequence, without the `serde` feature of `bytes`.
@@ -561,6 +598,48 @@ impl DeletionFile {
     pub fn is_inline(&self) -> bool {
         self.inline.is_some()
     }
+
+    pub fn validate_location(&self) -> Result<()> {
+        self.check_location().map_err(Error::invalid_input)
+    }
+
+    fn check_location(&self) -> std::result::Result<(), String> {
+        if self.path.is_some() && self.inline.is_some() {
+            return Err("a deletion file cannot set both path and inline".to_string());
+        }
+        if let Some(path) = &self.path {
+            check_deletion_path(path, &self.file_type)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validates that `path` is a normalized relative object path under `_deletions/`
+/// (no leading/trailing `/`, `.`, `..`, or empty segments) and ends with `.{file_type.suffix()}`.
+fn check_deletion_path(
+    path: &str,
+    file_type: &DeletionFileType,
+) -> std::result::Result<(), String> {
+    if path.is_empty() {
+        return Err("deletion file path is empty".to_string());
+    }
+    if !path.starts_with(&format!("{DELETIONS_DIR}/")) {
+        return Err(format!(
+            "deletion file path {path:?} must be under {DELETIONS_DIR}/"
+        ));
+    }
+    let suffix = file_type.suffix();
+    if !path.ends_with(&format!(".{suffix}")) {
+        return Err(format!(
+            "deletion file path {path:?} must end with .{suffix}"
+        ));
+    }
+    match Path::parse(path) {
+        Ok(parsed) if parsed.as_ref() == path => Ok(()),
+        _ => Err(format!(
+            "deletion file path {path:?} is not a relative object path"
+        )),
+    }
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -581,14 +660,19 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
         } else {
             Some(value.num_deleted_rows as usize)
         };
-        Ok(Self {
+        let deletion_file = Self {
             read_version: value.read_version,
             id: value.id,
             file_type,
             num_deleted_rows,
             base_id: value.base_id,
+            path: value.path,
             inline: value.inline,
-        })
+        };
+        deletion_file
+            .check_location()
+            .map_err(|message| Error::corrupt_file_named("table metadata", message))?;
+        Ok(deletion_file)
     }
 }
 
@@ -604,6 +688,7 @@ impl From<&DeletionFile> for pb::DeletionFile {
             file_type: file_type.into(),
             num_deleted_rows: value.num_deleted_rows.unwrap_or_default() as u64,
             base_id: value.base_id,
+            path: value.path.clone(),
             inline: value.inline.clone(),
         }
     }
@@ -1147,6 +1232,7 @@ impl From<&Fragment> for pb::DataFragment {
 mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
+    use crate::io::deletion::relative_deletion_file_path;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
@@ -1291,6 +1377,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
             inline: None,
         });
 
@@ -1473,6 +1560,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
             inline: None,
         });
 
@@ -1504,6 +1592,165 @@ mod tests {
             .remove("file_metadata_size_bytes");
         let frag3: Fragment = serde_json::from_value(value).unwrap();
         assert_eq!(frag3.files[0].file_metadata_size_bytes, None);
+    }
+
+    #[test]
+    fn test_deletion_file_derived_path() {
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 77,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: None,
+            inline: None,
+        };
+        let mut fragment = Fragment::new(9);
+        fragment.deletion_file = Some(deletion_file.clone());
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert!(proto.deletion_file.as_ref().unwrap().path.is_none());
+        assert_eq!(Fragment::try_from(proto).unwrap(), fragment);
+        assert_eq!(
+            relative_deletion_file_path(9, &deletion_file),
+            "_deletions/9-3-77.arrow"
+        );
+
+        let json = serde_json::to_value(&deletion_file).unwrap();
+        assert!(json.get("path").is_none());
+        assert_eq!(
+            serde_json::from_value::<DeletionFile>(json).unwrap(),
+            deletion_file
+        );
+    }
+
+    #[test]
+    fn test_deletion_file_path_round_trips() {
+        let deletion_file = DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(10),
+            base_id: Some(3),
+            path: Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
+            inline: None,
+        };
+        let mut fragment = Fragment::new(42);
+        fragment.deletion_file = Some(deletion_file.clone());
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert_eq!(
+            proto.deletion_file.as_ref().unwrap().path.as_deref(),
+            Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin")
+        );
+        assert_eq!(Fragment::try_from(proto.clone()).unwrap(), fragment);
+        assert_eq!(
+            DataFileFieldInterner::default()
+                .intern_fragment(proto)
+                .unwrap(),
+            fragment
+        );
+        let filename = relative_deletion_file_path(42, &deletion_file);
+        assert_eq!(
+            filename,
+            "_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin"
+        );
+        assert_eq!(filename, relative_deletion_file_path(99, &deletion_file));
+
+        let json = serde_json::to_value(&deletion_file).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DeletionFile>(json).unwrap(),
+            deletion_file
+        );
+    }
+
+    #[test]
+    fn test_deletion_file_rejects_bad_path_and_inline_conflict() {
+        let bad_paths = [
+            "",
+            "/_deletions/file.bin",
+            "_deletions/file.bin/",
+            "_deletions/..",
+            "_deletions/../file.bin",
+            "_deletions/a/../b.bin",
+            "_deletions/.",
+            "_deletions/a/./b.bin",
+            "_deletions/a//b.bin",
+            "_deletions/file.lance",
+            "_deletions/file.arrow",
+            "ab/file.bin",
+            "_indices/file.bin",
+        ];
+        for path in bad_paths {
+            let deletion_file = DeletionFile {
+                read_version: 1,
+                id: 2,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(1),
+                base_id: None,
+                path: Some(path.to_string()),
+                inline: None,
+            };
+            let err = deletion_file.validate_location().unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{path}: {err:?}");
+
+            let proto = pb::DeletionFile {
+                read_version: 1,
+                id: 2,
+                file_type: pb::deletion_file::DeletionFileType::Bitmap as i32,
+                num_deleted_rows: 1,
+                base_id: None,
+                path: Some(path.to_string()),
+                inline: None,
+            };
+            let err = DeletionFile::try_from(proto).unwrap_err();
+            assert!(matches!(err, Error::CorruptFile { .. }), "{path}: {err:?}");
+            if path.is_empty() {
+                assert!(err.to_string().contains("empty"), "{err}");
+            } else {
+                assert!(err.to_string().contains(path), "{path}: {err}");
+            }
+
+            let json = serde_json::json!({
+                "read_version": 1,
+                "id": 2,
+                "file_type": "bitmap",
+                "num_deleted_rows": 1,
+                "base_id": null,
+                "path": path,
+            });
+            let err = serde_json::from_value::<DeletionFile>(json).unwrap_err();
+            if path.is_empty() {
+                assert!(err.to_string().contains("empty"), "{err}");
+            } else {
+                assert!(err.to_string().contains(path), "{path}: {err}");
+            }
+        }
+
+        let proto = pb::DeletionFile {
+            read_version: 1,
+            id: 2,
+            file_type: pb::deletion_file::DeletionFileType::Bitmap as i32,
+            num_deleted_rows: 1,
+            base_id: None,
+            path: Some("_deletions/file.bin".to_string()),
+            inline: Some(bytes::Bytes::from_static(&[1, 2, 3])),
+        };
+        let err = DeletionFile::try_from(proto).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("both path and inline"), "{err}");
+
+        let json = serde_json::json!({
+            "read_version": 1,
+            "id": 2,
+            "file_type": "bitmap",
+            "num_deleted_rows": 1,
+            "base_id": null,
+            "path": "_deletions/file.bin",
+            "inline": [1, 2, 3],
+        });
+        let err = serde_json::from_value::<DeletionFile>(json).unwrap_err();
+        assert!(err.to_string().contains("both path and inline"), "{err}");
     }
 
     #[test]

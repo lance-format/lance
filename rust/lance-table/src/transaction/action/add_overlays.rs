@@ -755,7 +755,7 @@ mod tests {
     fn test_an_overlay_conflicts_with_a_deletion_of_the_same_fragment() {
         let delete = |fragment: u64| {
             footprint(vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment,
+                fragment: Ref::Committed(fragment),
                 deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
@@ -783,7 +783,7 @@ mod tests {
             add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
         ]);
         let delete = footprint(vec![Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
+            fragment: Ref::Committed(0),
             deletion_file: any_deletion_file(),
             data_change: true,
             base: None,

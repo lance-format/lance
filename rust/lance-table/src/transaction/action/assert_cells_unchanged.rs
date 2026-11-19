@@ -245,7 +245,7 @@ mod tests {
     #[case::rewrote_another_field_there(rewrite(0, 2), false)]
     #[case::deleted_rows_there(
         vec![Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
+            fragment: Ref::Committed(0),
             deletion_file: any_deletion_file(),
             data_change: true,
             base: None,
