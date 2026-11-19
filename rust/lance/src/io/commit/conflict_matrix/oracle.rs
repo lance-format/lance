@@ -44,7 +44,7 @@ use std::sync::Arc;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 
 use super::Isolation;
-use super::scenarios::{Footprint, Scenario, fixture};
+use super::scenarios::{Placement, Scenario, fixture};
 use crate::Dataset;
 
 /// Ordered pairs where a correct rebase legitimately differs from serial
@@ -73,7 +73,7 @@ pub(super) async fn check(
     isolation: Isolation,
     ours: Scenario,
     theirs: Scenario,
-    footprint: Footprint,
+    placement: Placement,
     rebased: &Dataset,
     context: &str,
 ) {
@@ -88,7 +88,7 @@ pub(super) async fn check(
     }
 
     // Boxed: this runs two commit sequences and would otherwise trip `clippy::large_futures`.
-    let Some(serial) = Box::pin(serial_execution(ours, theirs, footprint)).await else {
+    let Some(serial) = Box::pin(serial_execution(ours, theirs, placement)).await else {
         // The pair cannot be run serially — `theirs` alone fails, or `ours`
         // cannot be staged against the result. That is not evidence about the
         // rebase, so there is nothing to compare.
@@ -109,17 +109,17 @@ pub(super) async fn check(
 /// Commit `theirs`, then stage and commit `ours` on top of the result, so
 /// nothing ever rebases.
 ///
-/// `theirs` is staged at the same footprint the rebased run used; staging it
+/// `theirs` is staged at the same placement the rebased run used; staging it
 /// anywhere else would compare two different pairs of operations.
 async fn serial_execution(
     ours: Scenario,
     theirs: Scenario,
-    footprint: Footprint,
+    placement: Placement,
 ) -> Option<Dataset> {
     let base = fixture().await;
     let after_theirs = Arc::new(
         theirs
-            .stage_with(&base, footprint)
+            .stage_with(&base, placement)
             .await
             .ok()?
             .commit(&base)
@@ -171,6 +171,7 @@ async fn content(dataset: &Dataset) -> Vec<String> {
 
     let mut rows = Vec::with_capacity(batch.num_rows() + 1);
     rows.push(format!("schema: {header}"));
+    rows.push(format!("metadata: {}", metadata_lines(dataset).join(" | ")));
     for row in 0..batch.num_rows() {
         let cells = formatters
             .iter()
@@ -182,4 +183,41 @@ async fn content(dataset: &Dataset) -> Vec<String> {
     // with a data row.
     rows[1..].sort();
     rows
+}
+
+/// What a reader sees of the table besides its rows: each field's name, type,
+/// nullability and metadata, the schema metadata, the dataset config, the
+/// table metadata, and which indices exist over which fields. Index coverage
+/// is left out on purpose: a rebased build legitimately covers less than a
+/// serial one, and coverage loss only costs a scan.
+fn metadata_lines(dataset: &Dataset) -> Vec<String> {
+    let sorted = |map: &std::collections::HashMap<String, String>| {
+        let mut entries: Vec<String> = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        entries.sort();
+        entries.join(",")
+    };
+    let manifest = dataset.manifest();
+    let mut lines: Vec<String> = manifest
+        .schema
+        .fields_pre_order()
+        .map(|field| {
+            format!(
+                "field {} {} nullable={} {{{}}}",
+                field.name,
+                field.data_type(),
+                field.nullable,
+                sorted(&field.metadata)
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "schema_metadata {{{}}}",
+        sorted(&manifest.schema.metadata)
+    ));
+    lines.push(format!("config {{{}}}", sorted(&manifest.config)));
+    lines.push(format!(
+        "table_metadata {{{}}}",
+        sorted(&manifest.table_metadata)
+    ));
+    lines
 }
