@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, FieldRef, Footprint};
+use super::{FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -94,25 +94,22 @@ impl AlterField {
         false
     }
 
-    /// The field's definition, and the name a rename takes -- a name is a
-    /// coordinate whether a field is added under it or moved to it.
+    /// The field's definition, which no concurrent writer may change; a name
+    /// taken since fails the apply, which is a retryable conflict.
     ///
     /// Tightening to non-nullable is only valid against the values it read,
     /// and applying it does not look at any. Values written since, or rows
     /// added that leave the field unset, may hold nulls -- in this field or,
-    /// through a struct, in an ancestor or descendant, which the footprint
-    /// cannot tell apart from any other field. Landing first, it
-    /// makes the field required like a non-nullable add does, which fences a
-    /// stale append whether or not that append names the field -- including a
-    /// field minted in this set, which no other writer can name.
+    /// through a struct, in an ancestor or descendant, so it holds only if no
+    /// values were written for any of those and no rows were inserted. Values
+    /// written for unrelated fields leave it valid. Landing first, it changes
+    /// [`Part::NewRowSchema`](super::Part::NewRowSchema), which fences a stale
+    /// writer of values whether or not that writer names the field.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write_field_definition(self.field);
         if self.nullable == Some(false) {
             footprint.require_no_values_written(self.field);
             footprint.add_required_column();
-        }
-        if let Some(name) = &self.name {
-            footprint.write(Coordinate::FieldName(name.clone()));
         }
     }
 }

@@ -96,20 +96,21 @@ impl AssertCellsUnchanged {
         false
     }
 
-    /// A precondition on what a concurrent set wrote, at fragment granularity:
-    /// the declared fields in the selected fragments. A minted field names
-    /// nothing a concurrent set could write, and apply rejects it anyway.
+    /// The cells of the declared fields in the selected fragments, at fragment
+    /// granularity. A minted field names nothing a concurrent set could write,
+    /// and apply rejects it anyway.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.assert_cells_unchanged(
-            self.fields
-                .iter()
-                .filter_map(|field| field.committed())
-                .collect(),
-            self.rows
-                .iter()
-                .map(|selection| u64::from(selection.fragment_id))
-                .collect(),
-        );
+        let fields: Vec<i32> = self
+            .fields
+            .iter()
+            .filter_map(|field| field.committed())
+            .collect();
+        let fragments: Vec<u64> = self
+            .rows
+            .iter()
+            .map(|selection| u64::from(selection.fragment_id))
+            .collect();
+        footprint.assert_cells_unchanged(&fields, &fragments);
     }
 }
 
@@ -160,19 +161,12 @@ impl TryFrom<pb_actions::AssertCellsUnchanged> for AssertCellsUnchanged {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::DataFile;
-    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+
     use crate::transaction::action::SelectedRows;
-    use crate::transaction::action::test_support::{
-        added_field, any_deletion_file, apply, backed_manifest, footprint,
-    };
-    use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddOverlays, AlterField, DropField, Ref, RemoveFragment,
-        SetDeletionFile, TombstoneFieldData,
-    };
+    use crate::transaction::action::test_support::{added_field, apply, backed_manifest};
+    use crate::transaction::action::{Action, AddField};
     use arrow_schema::{DataType, Field as ArrowField, Fields};
-    use lance_file::version::ConcreteFileVersion;
-    use roaring::RoaringBitmap;
+
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -190,106 +184,6 @@ mod tests {
             )
             .unwrap(),
         )
-    }
-
-    fn rewrite(fragment: u64, field: i32) -> Vec<Action> {
-        vec![
-            Action::TombstoneFieldData(TombstoneFieldData::new(
-                Ref::Committed(fragment),
-                vec![FieldRef::Committed(field)],
-            )),
-            Action::AddDataFile(
-                AddDataFile::try_new_unchecked(
-                    Ref::Committed(fragment),
-                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                    vec![FieldRef::Committed(field)],
-                    None,
-                    true,
-                )
-                .unwrap(),
-            ),
-        ]
-    }
-
-    /// `UPDATE t SET a = b`: read b, write a.
-    fn set_from(written: i32, read_field: i32) -> Vec<Action> {
-        let mut actions = rewrite(0, written);
-        actions.push(read(&[read_field], &[0]));
-        actions
-    }
-
-    fn overlay(fragment: u64, field: i32) -> Action {
-        let mut data_file =
-            DataFile::new_unstarted("data/overlay.lance", ConcreteFileVersion::V2_0);
-        data_file.fields = vec![field].into();
-        data_file.column_indices = vec![0].into();
-        Action::AddOverlays(AddOverlays::new_unchecked(
-            Ref::Committed(fragment),
-            vec![DataOverlayFile {
-                data_file,
-                coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0u32]))),
-                committed_version: 0,
-            }],
-        ))
-    }
-
-    /// `a = b` and `b = a` from one snapshot write disjoint columns, so
-    /// without the assertions both commit and swap the columns, which neither
-    /// serial order does. Each read the column the other wrote, so whichever
-    /// lands second conflicts.
-    #[test]
-    fn test_swapping_two_columns_concurrently_conflicts() {
-        let a_from_b = footprint(set_from(0, 1));
-        let b_from_a = footprint(set_from(1, 0));
-
-        assert!(b_from_a.conflicts_with(&a_from_b));
-        assert!(a_from_b.conflicts_with(&b_from_a));
-
-        // Without the reads, the same writes commute.
-        assert!(!footprint(rewrite(0, 1)).conflicts_with(&footprint(rewrite(0, 0))));
-    }
-
-    /// What a committed set may have done to the cells the asserting set read.
-    /// The assertion reads field 1 in fragment 0.
-    #[rstest]
-    #[case::rewrote_the_field_there(rewrite(0, 1), true)]
-    #[case::overlaid_the_field_there(vec![overlay(0, 1)], true)]
-    #[case::removed_the_fragment(
-        vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(0)))],
-        true
-    )]
-    #[case::dropped_the_field(
-        vec![Action::DropField(DropField::new(FieldRef::Committed(1)))],
-        true
-    )]
-    #[case::redefined_the_field(
-        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_nullable(true))],
-        true
-    )]
-    #[case::rewrote_the_field_elsewhere(rewrite(1, 1), false)]
-    #[case::rewrote_another_field_there(rewrite(0, 2), false)]
-    #[case::deleted_rows_there(
-        vec![Action::SetDeletionFile(
-            SetDeletionFile::try_new_unchecked(0, any_deletion_file(), None, true).unwrap(),
-        )],
-        false
-    )]
-    fn test_an_assertion_conflicts_with_a_change_to_its_cells(
-        #[case] committed: Vec<Action>,
-        #[case] expected: bool,
-    ) {
-        let asserting = footprint(vec![read(&[1], &[0])]);
-
-        assert_eq!(asserting.conflicts_with(&footprint(committed)), expected);
-    }
-
-    /// The assertion is a precondition on the set that carries it: a set that
-    /// landed first was valid when it landed, whatever it read.
-    #[test]
-    fn test_an_assertion_constrains_only_the_set_that_carries_it() {
-        let asserting = footprint(vec![read(&[1], &[0])]);
-
-        assert!(!footprint(rewrite(0, 1)).conflicts_with(&asserting));
     }
 
     fn nested_manifest() -> crate::format::Manifest {

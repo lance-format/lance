@@ -159,12 +159,16 @@ impl TombstoneFieldData {
     }
 
     /// The data of each named field in this fragment, and nothing else: another
-    /// field's data in the same fragment is untouched.
+    /// field's data in the same fragment is untouched. New values also
+    /// supersede the fields' overlays; see [`Footprint::supersede_overlays`].
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        footprint.write_field_data(
+            self.fragment,
+            self.field_ids.iter().copied(),
+            self.data_change,
+        );
         if self.data_change {
-            footprint.write_field_data(self.fragment, self.field_ids.iter().copied());
-        } else {
-            footprint.move_field_data(self.fragment, self.field_ids.iter().copied());
+            footprint.supersede_overlays(self.fragment, self.field_ids.iter().copied());
         }
     }
 }

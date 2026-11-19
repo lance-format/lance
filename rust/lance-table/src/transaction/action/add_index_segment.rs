@@ -301,8 +301,8 @@ impl AddIndexSegment {
     }
 
     /// A claim on the logical index -- this is what the index is, and these are
-    /// the fragments the new segment describes -- plus a requirement on the
-    /// data the segment was built from.
+    /// the fragments the new segment describes -- plus a record of the data
+    /// the segment was built from.
     ///
     /// An index is derived state whose segments the query path unions, so two
     /// writers may extend the same index at once. What they may not do is
@@ -315,12 +315,13 @@ impl AddIndexSegment {
     /// arriving *after* the rewrite prunes nothing, and the format gives a
     /// reader no way to catch it -- an in-place column rewrite "cannot be
     /// detected just by examining metadata", so a reader trusts
-    /// `fragment_bitmap` as it finds it. Requiring the data keeps that trust
-    /// earned. Deletions, overlays and the removal of a whole fragment are
-    /// excluded on purpose: each leaves a trace a reader can act on, so each
-    /// may still run alongside a build. A segment naming a removed fragment
-    /// reaches its rows through the fragment reuse history or loses that
-    /// coverage.
+    /// `fragment_bitmap` as it finds it. So the build records the data it read,
+    /// and a segment landing after a rewrite of it conflicts (see
+    /// [`Part::IndexedFieldData`](super::Part::IndexedFieldData)). Deletions,
+    /// overlays and the removal of a whole fragment are excluded on purpose:
+    /// each leaves a trace a reader can act on, so each may still run
+    /// alongside a build. A segment naming a removed fragment reaches its rows
+    /// through the fragment reuse history or loses that coverage.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.claim_index_segment(
             self.parts.name.clone(),
@@ -344,17 +345,18 @@ impl AddIndexSegment {
             .collect();
         // A drop landing first would leave the segment over a field the
         // manifest no longer has. Landing second, it discards the segment as it
-        // applies, so the definition is only required, not written.
+        // applies.
         for field in dependencies.iter().copied() {
-            footprint.require_field_definition(field);
+            footprint.require_field(field);
         }
-        let Some(covered) = &self.parts.covered_fragments else {
-            // Unstated reach. The claim already collides with every other claim
-            // on the index; there is no fragment list to require.
-            return;
-        };
-        for fragment in covered.iter().filter_map(|fragment| fragment.committed()) {
-            footprint.require_field_data_unless_removed(fragment, dependencies.iter().copied());
+        for fragment in self
+            .parts
+            .covered_fragments
+            .iter()
+            .flatten()
+            .filter_map(|fragment| fragment.committed())
+        {
+            footprint.require_indexed_field_data(fragment, dependencies.iter().copied());
         }
     }
 }
@@ -495,13 +497,12 @@ mod tests {
     use super::*;
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::test_support::{
-        added_field, apply_with_indices, backed_manifest, footprint, nested_schema,
-        replace_field_data,
+        added_field, apply_with_indices, backed_manifest,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AdjustIndexCoverage,
-        AdjustIndexCoverageParts, CompositeOperation, DropField, Footprint, RemoveFragment,
-        RemoveIndexSegment, ResetTable, TombstoneFieldData, UserStep,
+        AdjustIndexCoverageParts, CompositeOperation, DropField, RemoveIndexSegment, ResetTable,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, ReadVersionState, Transaction};
@@ -831,8 +832,6 @@ mod tests {
             value,
         }))
     }
-
-    const VECTOR_DETAILS: &str = "type.googleapis.com/lance.index.pb.VectorIndexDetails";
 
     /// The query path unions a logical index's segments, so they have to agree
     /// on what the index is and not describe a fragment twice.
@@ -1380,125 +1379,10 @@ mod tests {
         assert!(indices.is_empty());
     }
 
-    /// Two builds over one column do not collide: a requirement is a claim
-    /// that nothing moved, not a claim on the column.
+    /// A struct is dropped children first; landing after a segment over a
+    /// child, the drop discards the segment as it applies.
     #[test]
-    fn test_two_indices_over_one_column_and_fragment_do_not_conflict() {
-        let ours = index_footprint(covering("by_a", Some(vec![0])));
-        let theirs = index_footprint(covering("by_b", Some(vec![0])));
-
-        assert!(!ours.conflicts_with(&theirs));
-        assert!(!theirs.conflicts_with(&ours));
-    }
-
-    /// The direction is the whole point, so it gets its own test.
-    ///
-    /// A segment requires the data it describes; a rewrite of that data writes
-    /// it. Arriving after the rewrite, the segment would publish coverage of
-    /// values it never saw and a reader has no way to detect that, so it must
-    /// be rejected. Arriving before, the rewrite prunes the segment's coverage
-    /// as it applies, so rejecting it would be a conflict over nothing.
-    #[test]
-    fn test_a_build_loses_to_a_committed_rewrite_but_not_the_reverse() {
-        let build = index_footprint(covering("by_a", Some(vec![0])));
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
-            Ref::Committed(0),
-            vec![FieldRef::Committed(0)],
-        ))]);
-
-        assert!(
-            build.conflicts_with(&rewrite),
-            "a segment cannot describe values a committed rewrite replaced"
-        );
-        assert!(
-            !rewrite.conflicts_with(&build),
-            "the rewrite prunes the committed segment's coverage as it applies"
-        );
-    }
-
-    /// A re-encode with `data_change` false moves the values the segment
-    /// describes without changing any, so the segment still describes them,
-    /// whichever lands first.
-    #[test]
-    fn test_a_build_does_not_conflict_with_a_reencode() {
-        let build = index_footprint(covering("by_a", Some(vec![0])));
-        let reencode = footprint(vec![
-            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
-                Ref::Committed(0),
-                vec![FieldRef::Committed(0)],
-                false,
-            )),
-            Action::AddDataFile(
-                AddDataFile::try_new_unchecked(
-                    Ref::Committed(0),
-                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                    vec![FieldRef::Committed(0)],
-                    None,
-                    false,
-                )
-                .unwrap(),
-            ),
-        ]);
-
-        assert!(!build.conflicts_with(&reencode));
-        assert!(!reencode.conflicts_with(&build));
-    }
-
-    /// A rewrite of a column the segment merely carries invalidates it just as
-    /// a keyed one does -- the segment would answer from an obsolete carried
-    /// value. `covering_fields` is independent of `fields`, so the requirement
-    /// is over the union.
-    #[test]
-    fn test_a_build_requires_the_columns_it_carries_too() {
-        let mut segment = covering("by_a", Some(vec![0]));
-        segment.covering_fields = vec![FieldRef::Committed(1)];
-        let build = index_footprint(segment);
-
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
-            Ref::Committed(0),
-            vec![FieldRef::Committed(1)],
-        ))]);
-
-        assert!(build.conflicts_with(&rewrite));
-    }
-
-    /// A drop landing first leaves the segment over a field the manifest no
-    /// longer has; a drop landing second discards the segment as it applies.
-    /// Same shape as the rewrite case above, one level up: the definition
-    /// rather than the data.
-    #[test]
-    fn test_a_build_loses_to_a_committed_drop_but_not_the_reverse() {
-        let build = index_footprint(covering("by_a", Some(vec![0])));
-        let drop = footprint(vec![Action::DropField(DropField::new(
-            FieldRef::Committed(0),
-        ))]);
-
-        assert!(build.conflicts_with(&drop));
-        assert!(!drop.conflicts_with(&build));
-
-        // A segment of unstated reach depends on the definition just the same.
-        assert!(index_footprint(covering(MEM_WAL_INDEX_NAME, None)).conflicts_with(&drop));
-    }
-
-    /// A struct is dropped children first, so a build over a child loses to
-    /// the child's own drop rather than slipping past the parent's. Landing
-    /// second, the drop discards the segment as it applies.
-    #[test]
-    fn test_a_build_over_a_child_loses_to_a_committed_struct_drop() {
-        let build = index_footprint(AddIndexSegmentParts {
-            fields: vec![FieldRef::Committed(2)],
-            ..covering("by_a", Some(vec![0]))
-        });
-        let drop = footprint(
-            [2, 1]
-                .into_iter()
-                .map(|field| Action::DropField(DropField::new(FieldRef::Committed(field))))
-                .collect(),
-        );
-
-        assert!(build.conflicts_with(&drop));
-        assert!(!drop.conflicts_with(&build));
-
+    fn test_a_struct_drop_discards_a_segment_over_its_child() {
         let mut manifest = backed_manifest();
         manifest.schema =
             lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
@@ -1531,210 +1415,5 @@ mod tests {
         )
         .unwrap();
         assert!(indices.is_empty(), "{indices:?}");
-    }
-
-    /// Removal isn't staleness: a removed fragment is visible in the
-    /// metadata, so a segment naming one either reaches its rows through the
-    /// fragment reuse history or loses that coverage. Neither a compaction
-    /// nor a deletion of the whole fragment conflicts with the build, in
-    /// either order.
-    #[rstest]
-    #[case::compaction(false)]
-    #[case::whole_fragment_deletion(true)]
-    fn test_a_build_does_not_conflict_with_removing_a_covered_fragment(#[case] data_change: bool) {
-        let build = index_footprint(covering("by_a", Some(vec![0])));
-        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment::new_unchecked(
-            Ref::Committed(0),
-            data_change,
-        ))]);
-
-        assert!(!build.conflicts_with(&removal));
-        assert!(!removal.conflicts_with(&build));
-    }
-
-    /// The exemption is for removal only: replacing the covered values in
-    /// place still conflicts, even in the set that also removes another
-    /// fragment.
-    #[test]
-    fn test_a_build_still_conflicts_with_an_in_place_write_beside_a_removal() {
-        let build = index_footprint(covering("by_a", Some(vec![0])));
-        let write = footprint(vec![
-            Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
-            Action::TombstoneFieldData(TombstoneFieldData::new(
-                Ref::Committed(0),
-                vec![FieldRef::Committed(0)],
-            )),
-        ]);
-
-        assert!(build.conflicts_with(&write));
-    }
-
-    /// A packed struct is stored, and rewritten, under the parent's id while an
-    /// index on a child records the child's, so a build depends on the data of
-    /// every field its keyed or carried fields are nested in or contain. In
-    /// `nested_schema`, `s` is 1 and holds `x` (2) and `y` (3); `id` is 0.
-    ///
-    /// Landing second, the rewrite prunes the segment's coverage as it applies,
-    /// walking the same nesting, so that order needs no conflict.
-    #[rstest]
-    #[case::keyed_child_under_a_rewritten_parent(vec![2], vec![], 1, true)]
-    #[case::keyed_parent_over_a_rewritten_child(vec![1], vec![], 2, true)]
-    #[case::carried_child_under_a_rewritten_parent(vec![0], vec![2], 1, true)]
-    #[case::carried_parent_over_a_rewritten_child(vec![0], vec![1], 3, true)]
-    #[case::keyed_child_beside_a_rewritten_sibling(vec![2], vec![], 3, false)]
-    #[case::keyed_child_beside_an_unrelated_rewrite(vec![2], vec![], 0, false)]
-    fn test_a_build_loses_to_a_committed_rewrite_of_a_containing_or_nested_field(
-        #[case] fields: Vec<i32>,
-        #[case] covering_fields: Vec<i32>,
-        #[case] rewritten: i32,
-        #[case] expected: bool,
-    ) {
-        let schema = nested_schema();
-        let build = index_footprint(AddIndexSegmentParts {
-            fields: fields.into_iter().map(FieldRef::Committed).collect(),
-            covering_fields: covering_fields
-                .into_iter()
-                .map(FieldRef::Committed)
-                .collect(),
-            ..covering("by_a", Some(vec![0]))
-        })
-        .with_field_ancestry(&schema);
-        let rewrite =
-            footprint(replace_field_data(0, rewritten, true)).with_field_ancestry(&schema);
-
-        assert_eq!(build.conflicts_with(&rewrite), expected);
-        assert!(!rewrite.conflicts_with(&build));
-    }
-
-    /// Relating a build to the parent of its field does not make it collide
-    /// with what it tolerates on its own field: a re-encode of the parent
-    /// leaves every value where the segment found it, and a removal of the
-    /// fragment is visible in the metadata.
-    #[rstest]
-    #[case::reencode_of_the_parent(replace_field_data(0, 1, false))]
-    #[case::removal_of_the_fragment(vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(0)))])]
-    fn test_a_build_over_a_child_tolerates_moving_its_parent_or_removing_the_fragment(
-        #[case] other: Vec<Action>,
-    ) {
-        let schema = nested_schema();
-        let build = index_footprint(AddIndexSegmentParts {
-            fields: vec![FieldRef::Committed(2)],
-            ..covering("by_a", Some(vec![0]))
-        })
-        .with_field_ancestry(&schema);
-        let other = footprint(other).with_field_ancestry(&schema);
-
-        assert!(!build.conflicts_with(&other));
-        assert!(!other.conflicts_with(&build));
-    }
-
-    fn index_footprint(parts: AddIndexSegmentParts) -> Footprint {
-        footprint(vec![Action::AddIndexSegment(
-            AddIndexSegment::try_new_unchecked(parts).unwrap(),
-        )])
-    }
-
-    fn covering(name: &str, fragments: Option<Vec<u64>>) -> AddIndexSegmentParts {
-        AddIndexSegmentParts {
-            covered_fragments: fragments
-                .map(|ids| ids.into_iter().map(Ref::Committed).collect::<Vec<_>>()),
-            ..segment(name, vec![FieldRef::Committed(0)]).into_parts()
-        }
-    }
-
-    #[rstest]
-    #[case::disjoint_coverage_of_one_index(
-        covering("by_a", Some(vec![0, 1])),
-        covering("by_a", Some(vec![2, 3])),
-        false,
-    )]
-    #[case::overlapping_coverage_of_one_index(
-        covering("by_a", Some(vec![0, 1])),
-        covering("by_a", Some(vec![1, 2])),
-        true,
-    )]
-    #[case::different_indices(
-        covering("by_a", Some(vec![0, 1])),
-        covering("by_b", Some(vec![0, 1])),
-        false,
-    )]
-    #[case::unstated_coverage_reaches_everywhere(
-        covering(MEM_WAL_INDEX_NAME, None),
-        covering(MEM_WAL_INDEX_NAME, Some(vec![7])),
-        true,
-    )]
-    #[case::two_segments_of_unstated_coverage(
-        covering(MEM_WAL_INDEX_NAME, None),
-        covering(MEM_WAL_INDEX_NAME, None),
-        true
-    )]
-    #[case::disagreeing_about_which_fields_the_index_is_over(
-        AddIndexSegmentParts {
-            fields: vec![FieldRef::Committed(1)],
-            ..covering("by_a", Some(vec![0]))
-        },
-        covering("by_a", Some(vec![2])),
-        true,
-    )]
-    #[case::disagreeing_about_the_index_type(
-        AddIndexSegmentParts {
-            index_details: type_url("btree.Details"),
-            ..covering("by_a", Some(vec![0]))
-        },
-        AddIndexSegmentParts {
-            index_details: type_url("bitmap.Details"),
-            ..covering("by_a", Some(vec![2]))
-        },
-        true,
-    )]
-    // Only the bytes are compared: a training knob is as much a disagreement
-    // as the metric, since `lance-table` cannot tell which details matter.
-    #[case::details_differing_in_any_byte(
-        AddIndexSegmentParts {
-            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]),
-            ..covering("by_a", Some(vec![0]))
-        },
-        AddIndexSegmentParts {
-            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 2]),
-            ..covering("by_a", Some(vec![2]))
-        },
-        true,
-    )]
-    // A newer library may write segments of the same index.
-    #[case::differing_only_in_index_version(
-        AddIndexSegmentParts {
-            index_version: 2,
-            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]),
-            ..covering("by_a", Some(vec![0]))
-        },
-        AddIndexSegmentParts {
-            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]),
-            ..covering("by_a", Some(vec![2]))
-        },
-        false,
-    )]
-    fn test_two_writers_extending_one_index(
-        #[case] ours: AddIndexSegmentParts,
-        #[case] theirs: AddIndexSegmentParts,
-        #[case] expected: bool,
-    ) {
-        let ours = index_footprint(ours);
-        let theirs = index_footprint(theirs);
-        assert_eq!(ours.conflicts_with(&theirs), expected);
-        assert_eq!(theirs.conflicts_with(&ours), expected);
-    }
-
-    #[test]
-    fn test_two_writers_indexing_what_they_each_just_wrote_do_not_conflict() {
-        // Neither segment names a committed fragment, and the fragments they do
-        // name get distinct ids once both commits are ordered.
-        let local = AddIndexSegmentParts {
-            covered_fragments: Some(vec![Ref::Local(0)]),
-            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
-        };
-
-        let ours = index_footprint(local.clone());
-        let theirs = index_footprint(local);
-        assert!(!ours.conflicts_with(&theirs));
     }
 }

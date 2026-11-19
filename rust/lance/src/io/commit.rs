@@ -59,8 +59,8 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    ManifestWriteConfig, NewTransaction, NewTransactionResult, TRANSACTIONS_DIR,
+    load_new_transactions, write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
     ReadSnapshot, validate_frag_reuse_history,
@@ -1787,15 +1787,46 @@ async fn prepare_attempt(
 
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
-) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
+) -> Result<(Dataset, Vec<NewTransaction>)> {
     let NewTransactionResult {
         dataset: new_ds,
         new_transactions,
     } = load_new_transactions(dataset);
     let new_transactions = new_transactions.try_collect::<Vec<_>>();
     let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
-    txns.sort_by_key(|(version, _)| *version);
+    txns.sort_by_key(|(version, _, _)| *version);
     Ok((new_ds, txns))
+}
+
+/// Record in `rebase` what its footprint checks need of `transactions`, which
+/// committed on top of `since`, in version order: the latest manifest. Only
+/// the manifests either side of the commits are needed, never one per
+/// version.
+pub(crate) async fn record_committed_history(
+    rebase: &mut TransactionRebase<'_>,
+    dataset: &Dataset,
+    since: Arc<Manifest>,
+    transactions: &[NewTransaction],
+) -> Result<()> {
+    let Some((_, _, last_location)) = transactions.last() else {
+        return Ok(());
+    };
+    let committed: Vec<Arc<Transaction>> = transactions
+        .iter()
+        .map(|(_, transaction, _)| transaction.clone())
+        .collect();
+    if !rebase.checks_by_footprint(&committed) {
+        return Ok(());
+    }
+    let latest = Dataset::get_manifest(
+        dataset.object_store.as_ref(),
+        last_location,
+        dataset.uri(),
+        dataset.session.as_ref(),
+    )
+    .await?;
+    rebase.record_window(since, latest);
+    Ok(())
 }
 
 /// Success-path bookkeeping shared by the direct-success and
@@ -1971,7 +2002,7 @@ pub(crate) async fn commit_transaction(
                 ));
             }
         } else if !strict_overwrite {
-            let checked_since = dataset.manifest.version;
+            let checked_since = dataset.manifest.clone();
             let (loaded_dataset, other_transactions) =
                 load_and_sort_new_transactions(&dataset).await?;
             dataset = loaded_dataset;
@@ -1988,11 +2019,18 @@ pub(crate) async fn commit_transaction(
                     .await?
                     .with_read_version_dataset(&read_version_dataset);
             rebase.load_current_lineage(&dataset).await?;
+            record_committed_history(
+                &mut rebase,
+                &dataset,
+                checked_since.clone(),
+                &other_transactions,
+            )
+            .await?;
             let seen = other_transactions
                 .iter()
-                .map(|(version, _)| *version)
+                .map(|(version, _, _)| *version)
                 .collect::<HashSet<_>>();
-            let missing = (checked_since + 1..=dataset.manifest.version)
+            let missing = (checked_since.version + 1..=dataset.manifest.version)
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
             rebase.check_missing_versions(
@@ -2003,7 +2041,7 @@ pub(crate) async fn commit_transaction(
             )?;
             // A retry's window starts after its previous attempt, so it would
             // miss the moves recorded there; not tracking only costs coverage.
-            if checked_since == read_version && missing.is_empty() {
+            if checked_since.version == read_version && missing.is_empty() {
                 rebase.track_moved_files();
             }
             // A cleaned-up version may have replaced a key field; an identity
@@ -2020,16 +2058,20 @@ pub(crate) async fn commit_transaction(
                 ));
             }
 
-            for (other_version, other_transaction) in other_transactions.iter() {
-                if let Some(read_schema) = &identity_fence {
+            if let Some(read_schema) = &identity_fence {
+                for (other_version, other_transaction, _) in other_transactions.iter() {
                     conflict_resolver::refuse_field_identity_change(
                         read_schema,
                         other_transaction,
                         *other_version,
                     )?;
                 }
-                rebase.check_txn(other_transaction, *other_version)?;
             }
+            let committed: Vec<(u64, &Transaction)> = other_transactions
+                .iter()
+                .map(|(version, transaction, _)| (*version, transaction.as_ref()))
+                .collect();
+            rebase.check_txns(&committed)?;
 
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
@@ -3803,7 +3845,7 @@ mod tests {
         let (_, transactions) = load_and_sort_new_transactions(&dataset_v1).await.unwrap();
 
         // Verify transactions are sorted by version
-        let versions: Vec<u64> = transactions.iter().map(|(v, _)| *v).collect();
+        let versions: Vec<u64> = transactions.iter().map(|(v, _, _)| *v).collect();
         for i in 1..versions.len() {
             assert!(
                 versions[i] > versions[i - 1],

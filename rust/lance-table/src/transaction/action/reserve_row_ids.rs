@@ -77,9 +77,7 @@ mod tests {
     use super::*;
     use crate::format::{Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, read_row_ids, write_row_ids};
-    use crate::transaction::action::test_support::{
-        apply, apply_after_reading, backed_manifest, footprint,
-    };
+    use crate::transaction::action::test_support::{apply, apply_after_reading, backed_manifest};
     use crate::transaction::action::{Action, AddFragment, AddFragmentParts, Ref};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use rstest::rstest;
@@ -279,25 +277,6 @@ mod tests {
                 assert!(error.to_string().contains(message), "{error}");
             }
         }
-    }
-
-    /// Two concurrent writers spending the same reserved row ids collide.
-    /// The claim is the exact set each supplies, not its min..max range, so
-    /// two compactions whose rows interleave in id order do not.
-    #[rstest]
-    #[case::the_same_ids(vec![1000, 1001], vec![1001, 1002], true)]
-    #[case::disjoint_ranges(vec![1000, 1001], vec![1002, 1003], false)]
-    #[case::interleaved_but_disjoint(vec![10, 30], vec![20, 40], false)]
-    fn test_supplied_row_ids_conflict_only_where_they_overlap(
-        #[case] ours: Vec<u64>,
-        #[case] theirs: Vec<u64>,
-        #[case] expected: bool,
-    ) {
-        let ours = footprint(vec![supplied(0, ours)]);
-        let theirs = footprint(vec![supplied(0, theirs)]);
-
-        assert_eq!(ours.conflicts_with(&theirs), expected);
-        assert_eq!(theirs.conflicts_with(&ours), expected);
     }
 
     /// Ids are reserved as of the version the writer read. A concurrent

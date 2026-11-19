@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::row_selection::{reject_repeated_fragments, row_selections_from_proto};
-use super::{Coordinate, Footprint, Ref, RowSelection, SelectedRows};
+use super::{Footprint, Ref, RowSelection, SelectedRows};
 use crate::format::pb_actions;
 use crate::rowids::version::{
     refresh_row_latest_update_meta_for_full_frag_rewrite_cols,
@@ -138,26 +138,14 @@ impl RefreshRowVersionMetadata {
         false
     }
 
-    /// Each selected fragment's version sequence, whole, whatever rows the
-    /// selection names. The sequence is one value per fragment, rewritten at
-    /// once, so two sets refreshing the same fragment collide even when they
-    /// select disjoint rows, or the column rewrites that prompted them touched
-    /// different fields. Over-strict, and cheap: the alternative is a
-    /// sequence that records which columns each row's version speaks for.
-    ///
-    /// An [`AddOverlays`](super::AddOverlays) restamps the same sequence
-    /// without claiming it, so the two do not collide: the overlay sets only
-    /// the rows it covers and keeps whatever the rest hold when it applies,
-    /// which composes with a refresh in either order. Two refreshes would
-    /// compose too -- each stamps only its own rows, and the later version
-    /// wins where they overlap -- so their conflict is part of the same
-    /// over-strictness, tracked in
-    /// <https://github.com/lance-format/lance/issues/10189>.
+    /// Each selected fragment, which must still be there. The refresh
+    /// restamps the rows it selects with the version its commit produces, at
+    /// apply, against the sequence the fragment holds then, so it composes
+    /// with any other change to the fragment: every row ends up stamped with
+    /// the later commit that selected it, which is when it last changed.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for selection in &self.rows {
-            footprint.write(Coordinate::FragmentRowVersions(u64::from(
-                selection.fragment_id,
-            )));
+            footprint.require_fragment(u64::from(selection.fragment_id));
         }
     }
 }
@@ -192,9 +180,9 @@ mod tests {
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::action::test_support::{
-        apply, backed_manifest, footprint, last_updated_versions, refresh, refresh_rows,
+        apply, backed_manifest, last_updated_versions, refresh, refresh_rows,
     };
-    use crate::transaction::action::{Action, CompositeOperation, Ref, RemoveFragment, UserStep};
+    use crate::transaction::action::{Action, CompositeOperation, UserStep};
     use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
     use crate::transaction::{Operation, Transaction};
     use lance_file::version::ConcreteFileVersion;
@@ -471,42 +459,5 @@ mod tests {
             error.to_string().contains(expected),
             "unexpected error: {error}"
         );
-    }
-
-    /// The whole sequence is claimed whatever the selection, so even disjoint
-    /// rows of one fragment collide.
-    #[rstest]
-    #[case::full_and_full(refresh(&[0]), refresh(&[0, 1]), true)]
-    #[case::full_and_rows(refresh(&[0]), refresh_rows(0, &[1]), true)]
-    #[case::disjoint_rows(refresh_rows(0, &[0]), refresh_rows(0, &[1]), true)]
-    #[case::other_fragment_full(refresh(&[0]), refresh(&[1]), false)]
-    #[case::other_fragment_rows(refresh_rows(0, &[0]), refresh_rows(1, &[0]), false)]
-    fn test_two_writers_refreshing_the_same_fragment_conflict(
-        #[case] ours: Action,
-        #[case] theirs: Action,
-        #[case] is_conflict: bool,
-    ) {
-        let ours = footprint(vec![ours]);
-        let theirs = footprint(vec![theirs]);
-
-        assert_eq!(ours.conflicts_with(&theirs), is_conflict);
-        assert_eq!(theirs.conflicts_with(&ours), is_conflict);
-    }
-
-    /// The version sequence lives in the fragment, so a concurrent removal of
-    /// it leaves nothing to restamp, in either order.
-    #[test]
-    fn test_refreshing_a_fragment_a_concurrent_writer_removes_conflicts() {
-        let ours = footprint(vec![refresh_rows(0, &[1])]);
-        let removal = |fragment: u64| {
-            footprint(vec![Action::RemoveFragment(RemoveFragment::new(
-                Ref::Committed(fragment),
-            ))])
-        };
-
-        assert!(ours.conflicts_with(&removal(0)));
-        assert!(removal(0).conflicts_with(&ours));
-        assert!(!ours.conflicts_with(&removal(1)));
-        assert!(!removal(1).conflicts_with(&ours));
     }
 }

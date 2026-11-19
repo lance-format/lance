@@ -5,7 +5,7 @@
 
 use super::apply::{ApplyState, reject_frag_reuse_history};
 use super::proto::{non_empty, required};
-use super::{AddIndexSegment, Coordinate, FieldRef, Footprint, Ref};
+use super::{AddIndexSegment, FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
@@ -182,18 +182,19 @@ impl AdjustIndexCoverage {
     /// fragments are also required to still be there: coverage of a fragment a
     /// concurrent set removed describes rows the dataset no longer has.
     ///
-    /// Each committed fragment brought in also requires the data of every
-    /// keyed and carried field, as a new segment over it would: the widening
+    /// Each committed fragment brought in also records the data of every
+    /// keyed and carried field, as a new segment over it does: the widening
     /// holds only while those columns are the ones the remap was planned
-    /// against. A rewrite committing first conflicts; one committing second
-    /// prunes the fragment from the coverage as it applies. Overlays need no
-    /// claim, since a read masks an overlay newer than the segment's
-    /// `dataset_version`.
+    /// against, so a rewrite committing first conflicts (see
+    /// [`Part::IndexedFieldData`](super::Part::IndexedFieldData)); one
+    /// committing second prunes the fragment from the coverage as it applies.
+    /// Overlays need nothing, since a read masks an overlay newer than the
+    /// segment's `dataset_version`.
     ///
     /// Removals claim nothing: coverage the index gives up cannot collide with
     /// coverage another writer takes on.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::IndexSegment(self.parts.uuid));
+        footprint.write_segment(self.parts.uuid);
         footprint.extend_index_coverage(
             self.parts.name.clone(),
             self.parts.add_fragments.iter().copied(),
@@ -210,7 +211,7 @@ impl AdjustIndexCoverage {
             .filter_map(|fragment| fragment.committed())
         {
             footprint.require_fragment(fragment);
-            footprint.require_field_data_unless_removed(fragment, dependencies.clone().copied());
+            footprint.require_indexed_field_data(fragment, dependencies.clone().copied());
         }
     }
 }
@@ -287,12 +288,9 @@ impl TryFrom<pb_actions::AdjustIndexCoverage> for AdjustIndexCoverage {
 mod tests {
     use super::*;
     use crate::format::{DataFile, IndexMetadata, Manifest};
-    use crate::transaction::action::test_support::{
-        apply_with_indices, backed_manifest, footprint, nested_schema,
-    };
+    use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
-        FieldRef, RemoveFragment, TombstoneFieldData,
+        Action, AddDataFile, AddFragment, AddFragmentParts, FieldRef, TombstoneFieldData,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use lance_file::version::ConcreteFileVersion;
@@ -490,26 +488,6 @@ mod tests {
         );
     }
 
-    fn build(name: &str, fragment: u64) -> Action {
-        Action::AddIndexSegment(
-            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
-                uuid: Uuid::new_v4(),
-                name: name.into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: Some(vec![Ref::Committed(fragment)]),
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change: false,
-            })
-            .unwrap(),
-        )
-    }
-
     #[test]
     fn test_adjusting_a_segment_of_another_index_is_rejected() {
         let segment = covering("by_a", [0]);
@@ -530,62 +508,6 @@ mod tests {
             error.to_string().contains("belongs to index 'by_a'"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn test_two_writers_adjusting_the_same_segment_conflict() {
-        let uuid = Uuid::from_u128(1);
-        let ours = footprint(vec![adjust(uuid, "by_a", vec![Ref::Committed(1)], vec![])]);
-        let same = footprint(vec![adjust(uuid, "by_a", vec![], vec![2])]);
-        let other = footprint(vec![adjust(Uuid::from_u128(2), "by_a", vec![], vec![2])]);
-
-        assert!(ours.conflicts_with(&same));
-        assert!(!ours.conflicts_with(&other));
-    }
-
-    #[test]
-    fn test_widening_onto_a_fragment_a_concurrent_segment_covers_conflicts() {
-        let widen = footprint(vec![adjust(
-            Uuid::from_u128(1),
-            "by_a",
-            vec![Ref::Committed(7)],
-            vec![],
-        )]);
-
-        assert!(widen.conflicts_with(&footprint(vec![build("by_a", 7)])));
-        assert!(!widen.conflicts_with(&footprint(vec![build("by_a", 8)])));
-        assert!(!widen.conflicts_with(&footprint(vec![build("by_b", 7)])));
-    }
-
-    #[test]
-    fn test_widening_onto_a_fragment_a_concurrent_set_removes_conflicts() {
-        let widen = footprint(vec![adjust(
-            Uuid::from_u128(1),
-            "by_a",
-            vec![Ref::Committed(7)],
-            vec![],
-        )]);
-        let remove = |fragment: u64| {
-            footprint(vec![Action::RemoveFragment(RemoveFragment::new_unchecked(
-                Ref::Committed(fragment),
-                false,
-            ))])
-        };
-
-        // Either order: coverage of a fragment that is gone describes rows the
-        // dataset no longer has.
-        assert!(widen.conflicts_with(&remove(7)));
-        assert!(remove(7).conflicts_with(&widen));
-        assert!(!widen.conflicts_with(&remove(8)));
-    }
-
-    #[test]
-    fn test_giving_up_coverage_claims_nothing() {
-        // Coverage an index drops cannot collide with coverage another writer
-        // takes on, so a removal-only adjustment leaves the index free.
-        let narrow = footprint(vec![adjust(Uuid::from_u128(1), "by_a", vec![], vec![7])]);
-
-        assert!(!narrow.conflicts_with(&footprint(vec![build("by_a", 7)])));
     }
 
     fn widen_declaring(fields: Vec<i32>, covering_fields: Vec<i32>, onto: u64) -> Action {
@@ -622,49 +544,6 @@ mod tests {
                 .unwrap(),
             ),
         ]
-    }
-
-    /// Widening is a claim that the segment's files already describe the
-    /// fragment's rows, which only holds while the indexed columns there are
-    /// the ones the remap was planned against. A rewrite of a keyed or carried
-    /// column that commits first breaks that, the same as it would for a new
-    /// segment over the fragment. One that commits second needs no conflict:
-    /// it prunes the fragment from the widened coverage as it applies.
-    #[rstest]
-    #[case::keyed_column_rewritten_first(vec![0], vec![1], 0, true, true)]
-    #[case::carried_column_rewritten_first(vec![0], vec![1], 1, true, true)]
-    #[case::other_column_rewritten_first(vec![0], vec![1], 2, true, false)]
-    #[case::keyed_column_rewritten_second(vec![0], vec![1], 0, false, false)]
-    fn test_widening_requires_the_data_it_covers(
-        #[case] fields: Vec<i32>,
-        #[case] covering_fields: Vec<i32>,
-        #[case] rewritten: i32,
-        #[case] rewrite_commits_first: bool,
-        #[case] expected: bool,
-    ) {
-        let widen = footprint(vec![widen_declaring(fields, covering_fields, 7)]);
-        let rewrite = footprint(rewrite(7, rewritten));
-
-        let conflicts = if rewrite_commits_first {
-            widen.conflicts_with(&rewrite)
-        } else {
-            rewrite.conflicts_with(&widen)
-        };
-        assert_eq!(conflicts, expected);
-    }
-
-    /// A widening over a child depends on its parent's data too, since a
-    /// packed struct is rewritten under the parent's id. In `nested_schema`,
-    /// `s` is 1 and holds `x` (2).
-    #[test]
-    fn test_widening_over_a_child_loses_to_a_committed_rewrite_of_its_parent() {
-        let schema = nested_schema();
-        let widen =
-            footprint(vec![widen_declaring(vec![2], Vec::new(), 7)]).with_field_ancestry(&schema);
-        let rewrite = footprint(rewrite(7, 1)).with_field_ancestry(&schema);
-
-        assert!(widen.conflicts_with(&rewrite));
-        assert!(!rewrite.conflicts_with(&widen));
     }
 
     /// The order the footprint lets through: the rewrite lands on a version

@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, Footprint, Ref};
+use super::{Footprint, Part, Ref};
 use crate::format::{Fragment, RowIdMeta, pb, pb_actions};
 use crate::rowids::read_row_ids;
 use crate::rowids::version::RowDatasetVersionMeta;
@@ -163,38 +163,34 @@ impl AddFragment {
         self.parts.data_change
     }
 
-    /// No coordinate for a local token: the fragment does not exist in the read
+    /// Nothing for a local token: the fragment does not exist in the read
     /// version, so no concurrent writer can be naming it.
     ///
-    /// A committed id does write one. A reservation is meant to be one writer's
+    /// A committed id is a fragment that must still be absent. A reservation is meant to be one writer's
     /// alone, but nothing in the format enforces that, so two operations handed
     /// the same range would otherwise each add a fragment at the same id and
     /// the second commit would silently win.
     ///
     /// Row ids the fragment arrives carrying are claimed as an exact set, so
     /// two operations spending one reservation collide. A sequence that does
-    /// not decode takes the table exclusively: apply rejects it anyway, and a
+    /// not decode makes the footprint opaque: apply rejects it anyway, and a
     /// footprint must not under-report. A spilled sequence lives in a file
     /// this cannot read, and goes unclaimed.
     ///
-    /// Either form records that rows arrive, which is the one thing about an
-    /// added fragment a concurrent
-    /// [`AssertUniqueKeys`](super::AssertUniqueKeys) has to know. A fragment
-    /// that is not a data change holds rows that were already in the dataset --
-    /// a compaction rewrite -- and brings in no new key.
+    /// A data change records that new rows arrive, which is what a concurrent
+    /// [`AssertUniqueKeys`](super::AssertUniqueKeys) or a column made
+    /// required has to know. A fragment that is not a data change holds rows
+    /// that were already in the dataset -- a compaction rewrite.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add_rows();
+        footprint.add_rows(self.parts.data_change);
         if let Some(id) = self.parts.id.committed() {
-            footprint.write(Coordinate::FragmentExistence(id));
+            footprint.read(Part::FragmentExists(id));
         }
         if let Some(RowIdMeta::Inline(data)) = &self.parts.row_id_meta {
             match read_row_ids(data) {
                 Ok(sequence) => footprint.supply_row_ids(&sequence.to_treemap()),
-                Err(_) => footprint.take_exclusive(),
+                Err(_) => footprint.mark_opaque(),
             }
-        }
-        if self.parts.data_change {
-            footprint.insert_rows();
         }
     }
 }

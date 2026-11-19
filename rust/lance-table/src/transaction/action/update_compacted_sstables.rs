@@ -106,12 +106,8 @@ mod tests {
     use crate::system_index::mem_wal::{
         MemWalIndexDetails, load_mem_wal_index_details, new_mem_wal_index_meta,
     };
-    use crate::transaction::action::test_support::{
-        apply_with_indices, backed_manifest, footprint,
-    };
-    use crate::transaction::action::{
-        Action, AddIndexSegment, AddIndexSegmentParts, FieldRef, Ref,
-    };
+    use crate::transaction::action::Action;
+    use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::test_support::sample_index_metadata;
     use uuid::Uuid;
 
@@ -233,66 +229,5 @@ mod tests {
         .unwrap();
 
         assert!(indices.iter().any(|index| index.uuid == kept.uuid));
-    }
-
-    #[test]
-    fn test_two_writers_recording_progress_conflict() {
-        let ours = footprint(vec![update(vec![(1, 3)])]);
-        let theirs = footprint(vec![update(vec![(2, 5)])]);
-
-        assert!(ours.conflicts_with(&theirs));
-    }
-
-    #[test]
-    fn test_recording_progress_conflicts_with_rebuilding_the_memwal_index() {
-        // Recording progress rewrites the whole MemWAL entry, so it collides
-        // with a concurrent writer replacing that entry -- unlike a regular
-        // index, where two writers may hold disjoint segments.
-        let progress = footprint(vec![update(vec![(1, 3)])]);
-        let rebuild = footprint(vec![Action::AddIndexSegment(
-            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
-                uuid: Uuid::from_u128(20),
-                name: MEM_WAL_INDEX_NAME.into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: None,
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change: true,
-            })
-            .unwrap(),
-        )]);
-
-        assert!(progress.conflicts_with(&rebuild));
-        assert!(rebuild.conflicts_with(&progress));
-    }
-
-    #[test]
-    fn test_recording_progress_does_not_conflict_with_an_ordinary_index() {
-        let progress = footprint(vec![update(vec![(1, 3)])]);
-        let segment = footprint(vec![Action::AddIndexSegment(
-            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
-                uuid: Uuid::from_u128(21),
-                name: "by_a".into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: Some(vec![Ref::Committed(0)]),
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change: false,
-            })
-            .unwrap(),
-        )]);
-
-        assert!(!progress.conflicts_with(&segment));
-        assert!(!segment.conflicts_with(&progress));
     }
 }

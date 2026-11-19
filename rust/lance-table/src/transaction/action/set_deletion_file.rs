@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, Footprint, Ref};
+use super::{Footprint, Ref};
 use crate::format::{DeletionFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -23,8 +23,8 @@ use lance_core::{Error, Result};
 ///
 /// TODO: derive the newly-deleted rows by diffing against the read version, so
 /// rebase and conflict detection can merge two deletes on one fragment. Until
-/// then the whole fragment's deletions are one coordinate, and two deletes on
-/// the same fragment always conflict.
+/// then the whole fragment's deletions are one part, and two deletes on the
+/// same fragment always conflict.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct SetDeletionFile {
     fragment: u64,
@@ -132,10 +132,10 @@ impl SetDeletionFile {
         self.data_change
     }
 
-    /// The fragment's deletions, which is a distinct coordinate from the data of
+    /// The fragment's deletions, which are a distinct part from the data of
     /// any field in it: deleting rows and re-encoding a column commute.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::FragmentDeletions(self.fragment));
+        footprint.add_deletions(self.fragment);
     }
 }
 

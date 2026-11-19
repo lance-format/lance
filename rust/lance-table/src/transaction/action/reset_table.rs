@@ -44,11 +44,11 @@ impl ResetTable {
         true
     }
 
-    /// Everything. A reset writes every coordinate there is, including ones a
-    /// concurrent set would only mint, so it takes the table exclusively rather
-    /// than enumerating them.
+    /// Everything. A reset replaces every part there is, including ones a
+    /// concurrent set would only mint, so it is a flag rather than a list of
+    /// parts, and one that wins over what landed before it.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.take_exclusive();
+        footprint.reset_table();
     }
 }
 
@@ -71,11 +71,10 @@ mod tests {
     use super::*;
     use crate::feature_flags::FLAG_NON_REUSABLE_FIELD_IDS;
     use crate::transaction::action::test_support::{
-        added_field, apply, apply_with_indices, backed_manifest, footprint, one_column_file,
+        added_field, apply, apply_with_indices, backed_manifest, one_column_file,
     };
     use crate::transaction::action::{
         Action, AddDataFile, AddField, AddFragment, AddFragmentParts, FieldRef, Ref,
-        ReserveFragmentIds,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
@@ -244,59 +243,5 @@ mod tests {
 
         assert_eq!(next.max_fragment_id(), Some(fragment_mark));
         assert_eq!(next.max_field_id(), field_mark);
-    }
-
-    #[test]
-    fn test_reset_conflicts_with_everything() {
-        let reset = footprint(vec![reset()]);
-        // Even a pure append, which writes no committed coordinate at all, is
-        // preempted: its rows would either vanish or survive the reset
-        // depending on which commit landed first.
-        let append = footprint(vec![Action::AddFragment(AddFragment::new_unchecked(
-            AddFragmentParts {
-                id: Ref::Local(0),
-                physical_rows: 4,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            },
-        ))]);
-
-        assert!(reset.conflicts_with(&append));
-        assert!(append.conflicts_with(&reset));
-        assert!(reset.conflicts_with(&reset.clone()));
-        assert!(!append.conflicts_with(&append.clone()));
-
-        // Nor does a set have to write anything: one that only requires a
-        // coordinate (a compaction-shaped set, which is not even an insert),
-        // or records nothing at all, still cannot land on either side of a
-        // reset.
-        let requires_only = footprint(vec![
-            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
-                id: Ref::Local(0),
-                physical_rows: 4,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: false,
-            })),
-            Action::AddDataFile(
-                AddDataFile::try_new_unchecked(
-                    Ref::Local(0),
-                    one_column_file("data/compacted.lance"),
-                    vec![FieldRef::Committed(0)],
-                    None,
-                    false,
-                )
-                .unwrap(),
-            ),
-        ]);
-        let records_nothing =
-            footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(3))]);
-        for other in [requires_only, records_nothing] {
-            assert!(reset.conflicts_with(&other));
-            assert!(other.conflicts_with(&reset));
-        }
     }
 }

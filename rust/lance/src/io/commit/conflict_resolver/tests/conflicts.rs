@@ -473,6 +473,7 @@ fn test_conflicts() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
 
         let result = rebase.check_txn(&unknown, 1);
@@ -720,6 +721,7 @@ fn test_data_overlay_conflicts() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let other_txn = Transaction::new(0, other.clone(), None);
         let result = rebase.check_txn(&other_txn, 1);
@@ -787,6 +789,7 @@ fn test_rewrite_conflicts_with_data_overlay() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let other_txn = Transaction::new(0, other.clone(), None);
         let result = rebase.check_txn(&other_txn, 1);
@@ -937,6 +940,7 @@ fn test_update_conflicts_with_data_overlay() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let other_txn = Transaction::new(0, other.clone(), None);
         let result = rebase.check_txn(&other_txn, 1);
@@ -1014,6 +1018,7 @@ fn test_schema_change_blocks_stale_append(
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let result = append_rebase.check_txn(&Transaction::new(0, schema_change.clone(), None), 1);
         assert_eq!(
@@ -1037,6 +1042,7 @@ fn test_schema_change_blocks_stale_append(
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let result = schema_rebase.check_txn(&Transaction::new(0, append, None), 1);
         assert_eq!(
@@ -1128,6 +1134,7 @@ fn test_non_null_claim_barrier() {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    footprint_basis: Default::default(),
                 };
                 let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                 assert_eq!(
@@ -1187,6 +1194,7 @@ fn test_column_rewrite_conflicts_with_a_projection_that_dropped_its_field(
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
     let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
     assert_eq!(
@@ -1329,6 +1337,7 @@ fn test_create_index_rebase_prunes_updated_field_coverage(
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
     let update = Transaction::new(
         1,
@@ -1429,6 +1438,7 @@ impl CoveringConflictSite {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let create_index = Operation::CreateIndex {
             new_indices: vec![index],
@@ -1611,6 +1621,7 @@ fn test_update_config_conflicts_with_restore(
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
         if conflicts {
@@ -2097,6 +2108,7 @@ async fn test_conflicts_data_replacement() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
 
         let result = rebase.check_txn(&txn2, 1);

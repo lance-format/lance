@@ -173,11 +173,11 @@ mod tests {
     use crate::feature_flags::{FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata, Manifest};
+    use crate::transaction::action::test_support::apply_with_indices;
     use crate::transaction::action::test_support::frag_reuse::{
         ROWS, compaction, digest, history, ordered, read_history, recorded, stable_partition,
         survivors, table, transition,
     };
-    use crate::transaction::action::test_support::{apply_with_indices, footprint};
     use crate::transaction::action::{
         Action, AddDataFile, AddFragment, AddFragmentParts, AddOverlays, RemoveFragment,
         SetDeletionFile,
@@ -603,23 +603,6 @@ mod tests {
         assert!(read_history(&indices).is_none());
         assert!(next.fragments.iter().all(|fragment| fragment.id != 0));
         assert!(indices.iter().any(|index| index.uuid == segment.uuid));
-    }
-
-    /// The sources' `RemoveFragment`s carry the conflict: two compactions of
-    /// one fragment collide, and compactions of disjoint fragments commute.
-    #[rstest]
-    #[case::disjoint_sources(&[0], &[1], false)]
-    #[case::shared_source(&[0, 1], &[1, 2], true)]
-    fn test_two_compactions_recording_transitions(
-        #[case] ours: &[u64],
-        #[case] theirs: &[u64],
-        #[case] expected: bool,
-    ) {
-        let mapping = |sources: &[u64]| Some(ordered(survivors(sources, &[])));
-        let ours = footprint(compaction(ours, 0, false, mapping(ours)));
-        let theirs = footprint(compaction(theirs, 0, false, mapping(theirs)));
-        assert_eq!(ours.conflicts_with(&theirs), expected);
-        assert_eq!(theirs.conflicts_with(&ours), expected);
     }
 
     #[test]

@@ -3305,9 +3305,9 @@ mod composite {
     /// `SetDeletionFile` carries an absolute post-image -- the whole deletion
     /// file, computed against the read version -- and apply writes it in
     /// blindly. That is only safe because two sets touching the same fragment's
-    /// deletions collide on `Coordinate::FragmentDeletions`: without the
-    /// conflict, the loser's deletions would be silently dropped rather than
-    /// recomputed. This pins that.
+    /// deletions collide on `Part::Deletions`: without the conflict, the
+    /// loser's deletions would be silently dropped rather than recomputed.
+    /// This pins that.
     #[tokio::test]
     async fn test_two_action_sets_setting_the_same_deletion_file_conflict() {
         let dataset = Arc::new(test_dataset(false).await);
@@ -4799,13 +4799,17 @@ mod composite {
     /// Apply-time pruning only discharges that obligation when the rewrite is
     /// the later commit, as the control above shows. A segment built before the
     /// rewrite but committed after it carries no rebind of its own, so nothing
-    /// prunes it. Its footprint has to catch it instead: the segment requires
-    /// the `FieldData` coordinates the rewrite writes.
+    /// prunes it. Its footprint has to catch it instead: the segment records
+    /// the data it was built from, which the rewrite replaced.
     #[tokio::test]
     async fn test_an_index_segment_staged_before_a_rewrite_conflicts_with_it() {
         let dataset = test_dataset(false).await;
         let stale = Arc::new(dataset.clone());
-        let file = existing_data_file(&dataset, 0);
+        // A rewrite writes a new file. Rebinding the very file it read leaves
+        // the field's backing as it was, so nothing tells the check it was
+        // rewritten.
+        let mut file = existing_data_file(&dataset, 0);
+        file.path = format!("rewritten-{}", file.path);
 
         // The rewrite wins the race.
         commit(dataset, rewrite_field_zero(file)).await;
@@ -5421,7 +5425,7 @@ mod composite {
     #[rstest::rstest]
     #[case::overlapping_keys(Some(&[2, 3][..]), true)]
     #[case::disjoint_keys(Some(&[3, 4][..]), false)]
-    #[case::unqualified_append(None, true)]
+    #[case::unqualified_append(None, false)]
     #[tokio::test]
     async fn test_a_concurrent_insert_is_checked_against_a_key_assertion(
         #[case] stale_key_hashes: Option<&'static [u64]>,
