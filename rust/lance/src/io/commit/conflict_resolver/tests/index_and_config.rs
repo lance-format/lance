@@ -685,6 +685,9 @@ async fn assert_conflict(dataset: &Dataset, a: Transaction, b: Transaction, expe
 
 /// Assert whether `a` conflicts when it rebases over `b`, and whether `b`
 /// does over `a`, the committed one having committed version 2.
+///
+/// A committed named operation leaves the read manifest restamped, so it is
+/// held only to what its operation says beyond the manifests.
 async fn assert_conflict_each_way(
     dataset: &Dataset,
     a: Transaction,
@@ -696,7 +699,12 @@ async fn assert_conflict_each_way(
         let mut rebase = TransactionRebase::try_new(dataset, ours, None)
             .await
             .unwrap();
-        rebase.record_commit(&dataset.manifest, committed_manifest(dataset, &theirs));
+        rebase.record_commit(
+            2,
+            &theirs,
+            &dataset.manifest,
+            committed_manifest(dataset, &theirs),
+        );
         assert_eq!(rebase.check_txn(&theirs, 2).is_err(), expected);
     }
 }
@@ -714,111 +722,261 @@ async fn test_action_txns_writing_the_same_field_data_conflict() {
     assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 0), true).await;
 }
 
-/// A named operation on the other side conflicts whatever it names, even
-/// when it plainly touches nothing the action set does. Footprints are only
-/// defined over actions, so there is nothing to compare a post-image
-/// against; the pair fails closed rather than guessing.
+/// A named operation is compared with an action set by footprint, in
+/// either order, so it conflicts only where it touches what the set does.
 #[rstest::rstest]
-#[case::append(Operation::Append {
-    fragments: vec![{
-        let mut fragment = Fragment::new(0);
-        fragment.physical_rows = Some(5);
-        fragment
-    }],
-})]
-#[case::delete(Operation::Delete {
-    updated_fragments: vec![],
-    deleted_fragment_ids: vec![7],
-    predicate: "a > 5".into(),
-})]
-#[case::update_config(Operation::UpdateConfig {
-    config_updates: None,
-    table_metadata_updates: None,
-    schema_metadata_updates: None,
-    field_metadata_updates: HashMap::new(),
-})]
-// The two operations whose checkers would otherwise answer Ok without
-// inspecting the other side: UpdateBases, which treats every named operation
-// as compatible, and Clone, which has no checker of its own.
-#[case::update_bases(Operation::UpdateBases {
-    new_bases: vec![lance_table::format::BasePath {
-        id: 1,
-        path: "s3://bucket/base".to_string(),
-        name: Some("base".to_string()),
-        is_dataset_root: false,
-    }],
-})]
-#[case::clone(Operation::Clone {
-    is_shallow: true,
-    ref_name: None,
-    ref_version: 1,
-    ref_path: "memory://source".to_string(),
-    branch_name: None,
-})]
-#[case::update(Operation::Update {
-    removed_fragment_ids: vec![],
-    updated_fragments: vec![],
-    new_fragments: vec![],
-    fields_modified: vec![],
-    compacted_sstables: vec![],
-    mem_wal_dir_id: None,
-    fields_for_preserving_frag_bitmap: vec![],
-    update_mode: None,
-    inserted_rows_filter: None,
-    updated_fragment_offsets: None,
-})]
-#[case::create_index(Operation::CreateIndex {
-    new_indices: vec![],
-    removed_indices: vec![],
-})]
-#[case::rewrite(Operation::Rewrite {
-    groups: vec![],
-    rewritten_indices: vec![],
-    frag_reuse_index: None,
-})]
-#[case::overwrite(Operation::Overwrite {
-    fragments: vec![],
-    schema: lance_core::datatypes::Schema::default(),
-    config_upsert_values: None,
-    initial_bases: None,
-})]
-#[case::data_replacement(Operation::DataReplacement { replacements: vec![], data_change: true })]
-#[case::data_overlay(Operation::DataOverlay { groups: vec![] })]
-#[case::merge(Operation::Merge {
-    fragments: vec![],
-    schema: lance_core::datatypes::Schema::default(),
-    preserves_nullability: true,
-})]
-#[case::restore(Operation::Restore { version: 1 })]
-#[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 1 })]
-#[case::project(Operation::Project {
-    schema: lance_core::datatypes::Schema::default(),
-    preserves_nullability: true,
-})]
-#[case::update_mem_wal_state(Operation::UpdateMemWalState {
-    compacted_sstables: vec![],
-    dir_id: String::new(),
-})]
+#[case::append(
+    Operation::Append {
+        fragments: vec![{
+            let mut fragment = Fragment::new(0);
+            fragment.physical_rows = Some(5);
+            fragment
+        }],
+    },
+    false
+)]
+#[case::delete_elsewhere(
+    Operation::Delete {
+        updated_fragments: vec![],
+        deleted_fragment_ids: vec![7],
+        predicate: "a > 5".into(),
+    },
+    false
+)]
+#[case::update_config(
+    Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        schema_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+    },
+    false
+)]
+// The two operations whose checkers answer Ok without inspecting the other
+// side: UpdateBases matched with a wildcard, and Clone has no checker at
+// all. Both have to reach the comparison from either side.
+#[case::update_bases(
+    Operation::UpdateBases {
+        new_bases: vec![lance_table::format::BasePath {
+            id: 1,
+            path: "s3://bucket/base".to_string(),
+            name: Some("base".to_string()),
+            is_dataset_root: false,
+        }],
+    },
+    false
+)]
+#[case::clone(
+    Operation::Clone {
+        is_shallow: true,
+        ref_name: None,
+        ref_version: 1,
+        ref_path: "memory://source".to_string(),
+        branch_name: None,
+    },
+    false
+)]
+#[case::update(
+    Operation::Update {
+        removed_fragment_ids: vec![],
+        updated_fragments: vec![],
+        new_fragments: vec![],
+        fields_modified: vec![],
+        compacted_sstables: vec![],
+        mem_wal_dir_id: None,
+        fields_for_preserving_frag_bitmap: vec![],
+        update_mode: None,
+        inserted_rows_filter: None,
+        updated_fragment_offsets: None,
+    },
+    false
+)]
+#[case::create_index(
+    Operation::CreateIndex {
+        new_indices: vec![],
+        removed_indices: vec![],
+    },
+    false
+)]
+#[case::rewrite(
+    Operation::Rewrite {
+        groups: vec![],
+        rewritten_indices: vec![],
+        frag_reuse_index: None,
+    },
+    false
+)]
+#[case::data_replacement(Operation::DataReplacement { replacements: vec![], data_change: true }, false)]
+#[case::data_overlay(Operation::DataOverlay { groups: vec![] }, false)]
+#[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 1 }, false)]
+// Opaque: its post-image is the MemWAL state, which no coordinates
+// describe yet.
+#[case::update_mem_wal_state(
+    Operation::UpdateMemWalState {
+        compacted_sstables: vec![],
+        dir_id: String::new(),
+    },
+    true
+)]
 #[tokio::test]
-async fn test_a_legacy_operation_conflicts_with_an_action_txn(#[case] legacy: Operation) {
+async fn test_a_legacy_operation_against_an_action_txn(
+    #[case] legacy: Operation,
+    #[case] expected: bool,
+) {
     let dataset = test_dataset(10, 2).await;
     let legacy = Transaction::new_from_version(1, legacy);
     let action = tombstone_txn(0, 0);
 
-    // Retryable, not incompatible: the mixed pair may well commute, so the
-    // loser re-runs against the winner rather than giving up.
     for (ours, theirs) in [(action.clone(), legacy.clone()), (legacy, action)] {
-        let ours_name = ours.operation.to_string();
-        let mut rebase = TransactionRebase::try_new(&dataset, ours, None)
-            .await
-            .unwrap();
-        let result = rebase.check_txn(&theirs, 2);
+        assert_retryable_or_ok(&dataset, ours, &theirs, expected).await;
+    }
+}
+
+/// Operations whose verdict depends on the order. A reset that landed
+/// first conflicts with the action set, and one landing second wins over
+/// it.
+#[rstest::rstest]
+#[case::overwrite(
+    Operation::Overwrite {
+        fragments: vec![],
+        schema: lance_core::datatypes::Schema::default(),
+        config_upsert_values: None,
+        initial_bases: None,
+    },
+    true,
+    false
+)]
+#[case::restore(Operation::Restore { version: 1 }, true, false)]
+#[tokio::test]
+async fn test_a_legacy_operation_against_an_action_txn_by_order(
+    #[case] legacy: Operation,
+    #[case] action_over_legacy: bool,
+    #[case] legacy_over_action: bool,
+) {
+    let dataset = test_dataset(10, 2).await;
+    let legacy = Transaction::new_from_version(1, legacy);
+    let action = tombstone_txn(0, 0);
+
+    assert_retryable_or_ok(&dataset, action.clone(), &legacy, action_over_legacy).await;
+    assert_retryable_or_ok(&dataset, legacy, &action, legacy_over_action).await;
+}
+
+/// Check `ours` against `theirs`, committed as version 2. A conflict must be
+/// retryable, not incompatible: the loser re-runs against the winner rather
+/// than giving up.
+async fn assert_retryable_or_ok(
+    dataset: &Dataset,
+    ours: Transaction,
+    theirs: &Transaction,
+    expected: bool,
+) {
+    let ours_name = ours.operation.to_string();
+    let mut rebase = TransactionRebase::try_new(dataset, ours, None)
+        .await
+        .unwrap();
+    rebase.record_commit(
+        2,
+        theirs,
+        &dataset.manifest,
+        committed_manifest(dataset, theirs),
+    );
+    let result = rebase.check_txn(theirs, 2);
+    if expected {
         assert!(
             matches!(result, Err(Error::RetryableCommitConflict { .. })),
             "{ours_name} against {}: expected a retryable conflict, got {result:?}",
             theirs.operation
         );
+    } else {
+        assert!(
+            result.is_ok(),
+            "{ours_name} against {}: expected no conflict, got {result:?}",
+            theirs.operation
+        );
     }
+}
+
+/// Pending, a delete installs its post-image of fragment 0 and would put
+/// back the tombstoned data. Committed, it is held to what it changed,
+/// which here is nothing the tombstone touches.
+#[tokio::test]
+async fn test_a_legacy_delete_restating_a_tombstoned_fragment() {
+    let dataset = test_dataset(10, 2).await;
+    let delete = Transaction::new_from_version(
+        1,
+        Operation::Delete {
+            updated_fragments: vec![Fragment::new(0)],
+            deleted_fragment_ids: vec![],
+            predicate: "a > 5".into(),
+        },
+    );
+
+    assert_conflict_each_way(&dataset, tombstone_txn(0, 0), delete, false, true).await;
+}
+
+fn create_index_txn(fragments: impl IntoIterator<Item = u32>) -> Transaction {
+    Transaction::new_from_version(
+        1,
+        Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "by_i".to_string(),
+                fields: vec![0],
+                covering_fields: vec![],
+                dataset_version: 1,
+                fragment_bitmap: Some(RoaringBitmap::from_iter(fragments)),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: HashMap::new(),
+            }],
+            removed_indices: vec![],
+        },
+    )
+}
+
+/// A legacy index build landing over an action set that rewrote an indexed
+/// column in a fragment it covers conflicts; a rewrite of another column
+/// leaves it be.
+///
+/// TODO: a stand-in until the build gives up the rewritten fragment
+/// instead, as it does over a legacy `Update` in
+/// `test_create_index_rebase_prunes_updated_field_coverage`.
+#[rstest::rstest]
+#[case::indexed_field_rewritten(0, true)]
+#[case::other_field_rewritten(1, false)]
+#[tokio::test]
+async fn test_a_legacy_index_build_over_a_column_an_action_set_rewrote(
+    #[case] field: i32,
+    #[case] expected: bool,
+) {
+    let dataset = test_dataset(10, 2).await;
+    assert_retryable_or_ok(
+        &dataset,
+        create_index_txn([0, 1]),
+        &tombstone_txn(0, field),
+        expected,
+    )
+    .await;
+}
+
+/// Without the manifests either side of the concurrent commit there is
+/// nothing to take its footprint against, so the pair fails closed.
+#[tokio::test]
+async fn test_a_pair_without_its_manifests_fails_closed() {
+    let dataset = test_dataset(10, 2).await;
+    let mut rebase = TransactionRebase::try_new(&dataset, tombstone_txn(0, 0), None)
+        .await
+        .unwrap();
+
+    let result = rebase.check_txn(&named_table_metadata_txn(1, "a"), 2);
+    assert!(
+        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+        "expected a retryable conflict, got {result:?}",
+    );
 }
 
 /// Commit each transaction in turn on top of `dataset`, each read at the
@@ -840,6 +998,18 @@ fn table_metadata_update(key: &str) -> UpdateMap {
         update_entries: vec![(key, Some("v")).into()],
         replace: false,
     }
+}
+
+fn named_table_metadata_txn(read_version: u64, key: &str) -> Transaction {
+    Transaction::new_from_version(
+        read_version,
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: Some(table_metadata_update(key)),
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        },
+    )
 }
 
 fn action_table_metadata_txn(read_version: u64, key: &str) -> Transaction {
@@ -895,6 +1065,98 @@ async fn test_an_action_catch_up_is_checked_against_every_commit(
     .await
     .unwrap();
 
+    let committed: Vec<(u64, &Transaction)> = transactions
+        .iter()
+        .map(|(version, transaction, _)| (*version, transaction.as_ref()))
+        .collect();
+    let result = rebase.check_txns(&committed);
+    if conflicts {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "expected a retryable conflict on the shared key, got {result:?}",
+        );
+    } else {
+        result.unwrap();
+    }
+}
+
+/// Catch up `ours`, read at `read`, on the versions committed since, the way
+/// the commit loop does.
+async fn caught_up_rebase(
+    read: &Dataset,
+    ours: Transaction,
+) -> (TransactionRebase<'_>, Vec<crate::dataset::NewTransaction>) {
+    let (latest, transactions) = crate::io::commit::load_and_sort_new_transactions(read)
+        .await
+        .unwrap();
+    let mut rebase = TransactionRebase::try_new(read, ours, None).await.unwrap();
+    crate::io::commit::record_committed_history(
+        &mut rebase,
+        &latest,
+        read.manifest.clone(),
+        &transactions,
+    )
+    .await
+    .unwrap();
+    (rebase, transactions)
+}
+
+/// Neither side of a named pair is compared by footprint, and an action
+/// set's footprint comes from its actions, so a named transaction catching
+/// up keeps nothing from the manifests it passes: a writer thousands of
+/// versions behind must not hold one per version.
+#[tokio::test]
+async fn test_a_named_catch_up_records_no_manifests() {
+    let read = test_dataset(10, 2).await;
+    commit_each(
+        &read,
+        vec![
+            |version| named_table_metadata_txn(version, "b"),
+            |version| action_table_metadata_txn(version, "c"),
+        ],
+    )
+    .await;
+
+    let (mut rebase, transactions) =
+        caught_up_rebase(&read, named_table_metadata_txn(read.manifest.version, "a")).await;
+
+    assert_eq!(rebase.recorded_versions(), Vec::<u64>::new());
+    for (version, transaction, _) in &transactions {
+        rebase.check_txn(transaction, *version).unwrap();
+    }
+}
+
+/// An action set catching up records only the named commits it passes, the
+/// ones whose footprint is read off the manifests either side, and is checked
+/// once against every commit since it read: compatible where they touch other
+/// keys, conflicting where one touches its own.
+#[rstest::rstest]
+#[case::one_touches_its_key(|version| named_table_metadata_txn(version, "a"), true)]
+#[case::all_touch_other_keys(|version| named_table_metadata_txn(version, "d"), false)]
+#[tokio::test]
+async fn test_an_action_catch_up_records_only_named_commits(
+    #[case] third: fn(u64) -> Transaction,
+    #[case] conflicts: bool,
+) {
+    let read = test_dataset(10, 2).await;
+    commit_each(
+        &read,
+        vec![
+            |version| named_table_metadata_txn(version, "b"),
+            |version| action_table_metadata_txn(version, "c"),
+            third,
+        ],
+    )
+    .await;
+    let read_version = read.manifest.version;
+
+    let (mut rebase, transactions) =
+        caught_up_rebase(&read, action_table_metadata_txn(read_version, "a")).await;
+
+    assert_eq!(
+        rebase.recorded_versions(),
+        vec![read_version + 1, read_version + 3]
+    );
     let committed: Vec<(u64, &Transaction)> = transactions
         .iter()
         .map(|(version, transaction, _)| (*version, transaction.as_ref()))

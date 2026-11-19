@@ -57,7 +57,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema,
                     reuse: Default::default(),
                     staged_replay: false,
-                    footprint_basis: Box::default(),
+                    footprint_basis: FootprintBasis::read_at(dataset),
                 })
             }
             Operation::Delete {
@@ -95,7 +95,7 @@ impl<'a> TransactionRebase<'a> {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
-                        footprint_basis: Box::default(),
+                        footprint_basis: FootprintBasis::read_at(dataset),
                     });
                 }
 
@@ -117,7 +117,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
-                    footprint_basis: Box::default(),
+                    footprint_basis: FootprintBasis::read_at(dataset),
                 })
             }
             Operation::Rewrite {
@@ -157,7 +157,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse,
                     staged_replay: false,
-                    footprint_basis: Box::default(),
+                    footprint_basis: FootprintBasis::read_at(dataset),
                 })
             }
             Operation::DataReplacement { replacements, .. } => {
@@ -181,7 +181,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
-                    footprint_basis: Box::default(),
+                    footprint_basis: FootprintBasis::read_at(dataset),
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -205,7 +205,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
-                    footprint_basis: Box::default(),
+                    footprint_basis: FootprintBasis::read_at(dataset),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -228,7 +228,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
-                    footprint_basis: Box::default(),
+                    footprint_basis: FootprintBasis::read_at(dataset),
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.
@@ -258,10 +258,12 @@ impl<'a> TransactionRebase<'a> {
         self
     }
 
-    /// Use the transaction's read snapshot for every CreateIndex check. The
-    /// submitting handle may already be newer, hiding rewritten columns or
-    /// removed fields when compared with the latest version.
+    /// Use the transaction's read snapshot for every CreateIndex check, and for
+    /// the footprints of a pair where either side is an action set. The submitting handle may already be newer,
+    /// hiding rewritten columns or removed fields when compared with the latest
+    /// version.
     pub(crate) fn with_read_version_dataset(mut self, dataset: &Dataset) -> Self {
+        self.footprint_basis.read = Some(dataset.manifest.clone());
         match self.transaction.operation {
             Operation::CreateIndex { .. } => {
                 self.read_fragments = Some(ReadFragments {
