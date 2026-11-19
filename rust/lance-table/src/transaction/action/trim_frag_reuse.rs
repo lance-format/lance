@@ -58,9 +58,7 @@ mod tests {
     use crate::transaction::action::test_support::frag_reuse::{
         compaction, history, ordered, read_history, recorded, survivors, table,
     };
-    use crate::transaction::action::test_support::{
-        apply_with_indices, footprint, one_column_file,
-    };
+    use crate::transaction::action::test_support::{apply_with_indices, one_column_file};
     use crate::transaction::action::{
         Action, AddDataFile, AddOverlays, FieldRef, Ref, TombstoneFieldData,
     };
@@ -131,20 +129,17 @@ mod tests {
 
     /// The trim is judged on the history it lands on: a transition a
     /// concurrent compaction appended, still needed, survives a trim planned
-    /// before it existed. Neither names anything the other claims.
+    /// before it existed.
     #[test]
     fn test_a_trim_keeps_a_transition_appended_concurrently() {
         let appended = compaction(&[0], 0, false, Some(ordered(survivors(&[0], &[]))));
         let (landed, indices) =
-            apply_with_indices(&table(3, false), appended.clone(), vec![segment("a", &[0])])
-                .unwrap();
+            apply_with_indices(&table(3, false), appended, vec![segment("a", &[0])]).unwrap();
 
         let (_, indices) = apply_with_indices(&landed, vec![trim()], indices).unwrap();
 
         let (_, _, transitions) = read_history(&indices).unwrap();
         assert_eq!(sources(&transitions), vec![vec![0]]);
-        assert!(!footprint(vec![trim()]).conflicts_with(&footprint(appended.clone())));
-        assert!(!footprint(appended).conflicts_with(&footprint(vec![trim()])));
     }
 
     /// An in-place rewrite of a fragment that a segment reaches through the

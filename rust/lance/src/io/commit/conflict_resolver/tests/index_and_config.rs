@@ -65,6 +65,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let result = rebase.check_txn(&merge, 1);
         assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -94,6 +95,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
     let result = rebase.check_txn(&install, 1);
     assert!(
@@ -148,6 +150,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let same_name = Transaction::new(
@@ -213,6 +216,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
     let different_name_result = rebase.check_txn(&different_name, 1);
     assert!(
@@ -281,6 +285,7 @@ fn test_create_index_conflicts_with_concurrent_drop(
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
     let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -331,6 +336,7 @@ fn test_concurrent_index_drops_are_compatible() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -383,6 +389,7 @@ fn test_index_replacement_compatible_with_removing_disjoint_segment() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -464,6 +471,7 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            footprint_basis: Default::default(),
         };
         let result = rebase.check_txn(&rewrite, 2);
         if expect_conflict {
@@ -552,6 +560,8 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
             reuse: Default::default(),
 
             staged_replay: false,
+
+            footprint_basis: Default::default(),
         };
         // Disjoint from the rewritten fragment, so this only exercises the
         // stable-row-ids check and not the group-straddling check below it.
@@ -634,12 +644,59 @@ fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
     )])
 }
 
-/// Assert the verdict holds whichever transaction is the one rebasing.
+/// The manifest `committed` leaves on `dataset`'s as version 2: the fields a
+/// tombstone set names tombstoned, and nothing else changed.
+fn committed_manifest(dataset: &Dataset, committed: &Transaction) -> Arc<Manifest> {
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.version = 2;
+    if let Operation::CompositeOperation(set) = &committed.operation {
+        let mut fragments = manifest.fragments.as_ref().clone();
+        for action in set.iter_actions() {
+            let TxnAction::TombstoneFieldData(tombstone) = action else {
+                continue;
+            };
+            let fragment = fragments
+                .iter_mut()
+                .find(|fragment| Some(fragment.id) == tombstone.fragment().committed())
+                .unwrap();
+            let tombstoned: Vec<i32> = tombstone
+                .field_ids()
+                .iter()
+                .filter_map(|field| field.committed())
+                .collect();
+            for file in &mut fragment.files {
+                file.fields = file
+                    .fields
+                    .iter()
+                    .map(|id| if tombstoned.contains(id) { -2 } else { *id })
+                    .collect();
+            }
+        }
+        manifest.fragments = Arc::new(fragments);
+    }
+    Arc::new(manifest)
+}
+
+/// Assert the verdict holds whichever transaction is the one rebasing, the
+/// other having committed version 2.
 async fn assert_conflict(dataset: &Dataset, a: Transaction, b: Transaction, expected: bool) {
-    for (ours, theirs) in [(a.clone(), b.clone()), (b, a)] {
+    assert_conflict_each_way(dataset, a, b, expected, expected).await;
+}
+
+/// Assert whether `a` conflicts when it rebases over `b`, and whether `b`
+/// does over `a`, the committed one having committed version 2.
+async fn assert_conflict_each_way(
+    dataset: &Dataset,
+    a: Transaction,
+    b: Transaction,
+    a_over_b: bool,
+    b_over_a: bool,
+) {
+    for (ours, theirs, expected) in [(a.clone(), b.clone(), a_over_b), (b, a, b_over_a)] {
         let mut rebase = TransactionRebase::try_new(dataset, ours, None)
             .await
             .unwrap();
+        rebase.record_commit(&dataset.manifest, committed_manifest(dataset, &theirs));
         assert_eq!(rebase.check_txn(&theirs, 2).is_err(), expected);
     }
 }
@@ -761,6 +818,95 @@ async fn test_a_legacy_operation_conflicts_with_an_action_txn(#[case] legacy: Op
             "{ours_name} against {}: expected a retryable conflict, got {result:?}",
             theirs.operation
         );
+    }
+}
+
+/// Commit each transaction in turn on top of `dataset`, each read at the
+/// version before it. Returns the latest dataset.
+async fn commit_each(dataset: &Dataset, transactions: Vec<fn(u64) -> Transaction>) -> Dataset {
+    let mut current = dataset.clone();
+    for transaction in transactions {
+        current = CommitBuilder::new(Arc::new(current.clone()))
+            .with_experimental_composite_operations(true)
+            .execute(transaction(current.manifest.version))
+            .await
+            .unwrap();
+    }
+    current
+}
+
+fn table_metadata_update(key: &str) -> UpdateMap {
+    UpdateMap {
+        update_entries: vec![(key, Some("v")).into()],
+        replace: false,
+    }
+}
+
+fn action_table_metadata_txn(read_version: u64, key: &str) -> Transaction {
+    Transaction::new_from_version(
+        read_version,
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "step",
+            vec![TxnAction::ConfigUpdate(
+                lance_table::transaction::action::ConfigUpdate::default()
+                    .with_table_metadata(table_metadata_update(key)),
+            )],
+        )])),
+    )
+}
+
+/// An action set catching up is checked once against every commit since it
+/// read, the way the commit loop does: compatible where they touch other
+/// keys, conflicting where one touches its own.
+#[rstest::rstest]
+#[case::one_touches_its_key(|version| action_table_metadata_txn(version, "a"), true)]
+#[case::all_touch_other_keys(|version| action_table_metadata_txn(version, "d"), false)]
+#[tokio::test]
+async fn test_an_action_catch_up_is_checked_against_every_commit(
+    #[case] third: fn(u64) -> Transaction,
+    #[case] conflicts: bool,
+) {
+    let read = test_dataset(10, 2).await;
+    commit_each(
+        &read,
+        vec![
+            |version| action_table_metadata_txn(version, "b"),
+            |version| action_table_metadata_txn(version, "c"),
+            third,
+        ],
+    )
+    .await;
+    let (latest, transactions) = crate::io::commit::load_and_sort_new_transactions(&read)
+        .await
+        .unwrap();
+    let mut rebase = TransactionRebase::try_new(
+        &read,
+        action_table_metadata_txn(read.manifest.version, "a"),
+        None,
+    )
+    .await
+    .unwrap();
+    crate::io::commit::record_committed_history(
+        &mut rebase,
+        &latest,
+        read.manifest.clone(),
+        &transactions,
+    )
+    .await
+    .unwrap();
+
+    let committed: Vec<(u64, &Transaction)> = transactions
+        .iter()
+        .map(|(version, transaction, _)| (*version, transaction.as_ref()))
+        .collect();
+    let result = rebase.check_txns(&committed);
+    if conflicts {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "expected a retryable conflict on the shared key, got {result:?}",
+        );
+    } else {
+        result.unwrap();
     }
 }
 
@@ -1099,6 +1245,7 @@ fn test_compacted_sstables_conflict_lower_generation_fails() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1147,6 +1294,7 @@ fn test_compacted_sstables_conflict_equal_generation_fails() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1196,6 +1344,7 @@ fn test_compacted_sstables_conflict_higher_generation_retryable() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1245,6 +1394,7 @@ fn test_compacted_sstables_different_shards_ok() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1304,6 +1454,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1338,6 +1489,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -1393,6 +1545,7 @@ fn test_create_index_vs_update_mem_wal_state_rebase() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        footprint_basis: Default::default(),
     };
 
     // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState

@@ -4,7 +4,7 @@
 //! Fixtures shared by the per-action test modules.
 
 use super::{
-    Action, CompositeOperation, FieldRef, Footprint, Ref, RefreshRowVersionMetadata, RowSelection,
+    Action, CompositeOperation, FieldRef, Ref, RefreshRowVersionMetadata, RowSelection,
     SelectedRows, UserStep,
 };
 use crate::format::{
@@ -12,9 +12,9 @@ use crate::format::{
 };
 use crate::transaction::test_support::{default_build_config, sample_manifest};
 use crate::transaction::{Operation, ReadVersionState, Transaction};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField};
 use lance_core::Result;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::Field;
 use lance_file::version::ConcreteFileVersion;
 use std::sync::Arc;
 
@@ -64,15 +64,6 @@ pub(super) fn apply_after_reading(
     .map(|(manifest, _)| manifest)
 }
 
-/// The footprint of one action set, for pair tests. Every conflict test in the
-/// action modules builds its two sides with this, so a pair reads as two lists
-/// of actions and an expected answer.
-pub(super) fn footprint(actions: Vec<Action>) -> Footprint {
-    Footprint::from(&CompositeOperation::new(vec![UserStep::new(
-        "step", actions,
-    )]))
-}
-
 pub(super) fn added_field(name: &str) -> Field {
     Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap()
 }
@@ -114,28 +105,6 @@ pub(super) fn manifest_with_base() -> Manifest {
         BasePath::new(1, "s3://bucket/other".into(), Some("other".into()), false),
     );
     manifest
-}
-
-/// `id`, then a struct `s` holding `x` and `y`: field ids 0, 1, 2, 3. For
-/// tests relating a field to the fields it is nested in or contains.
-pub(super) fn nested_schema() -> Schema {
-    let schema = Schema::try_from(&ArrowSchema::new(vec![
-        ArrowField::new("id", DataType::Int32, false),
-        ArrowField::new(
-            "s",
-            DataType::Struct(
-                vec![
-                    ArrowField::new("x", DataType::Int32, true),
-                    ArrowField::new("y", DataType::Int32, true),
-                ]
-                .into(),
-            ),
-            true,
-        ),
-    ]))
-    .unwrap();
-    assert_eq!(schema.field_ids(), vec![0, 1, 2, 3]);
-    schema
 }
 
 /// Tombstone `field` in `fragment` and bind a new file for it, both carrying

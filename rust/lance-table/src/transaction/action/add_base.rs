@@ -3,9 +3,9 @@
 
 //! Mint a new base path.
 
+use super::Footprint;
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, Footprint};
 use crate::format::{BasePath, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -70,14 +70,10 @@ impl AddBase {
         false
     }
 
-    /// The base id is minted, but the name and location are not: both must be
-    /// unique, so two operations claiming either collide. An unset name claims
-    /// nothing -- it is an optional alias, not a name to share.
+    /// The base id is minted, but the name and location are not: both must
+    /// still be free. An unset name is an optional alias, not a name to share.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        if let Some(name) = &self.base.name {
-            footprint.write(Coordinate::BaseName(name.clone()));
-        }
-        footprint.write(Coordinate::BaseLocation(self.base.path.clone()));
+        footprint.add_base(&self.base);
     }
 }
 

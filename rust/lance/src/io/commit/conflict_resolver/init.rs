@@ -22,19 +22,16 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::UpdateBases { .. }
             // An action set can modify fragments, but conflicts against it are
-            // settled by comparing footprints, which are derived from the
-            // actions rather than from collected rebase state.
+            // settled by checking its footprint against the manifests, not
+            // from collected rebase state.
             | Operation::CompositeOperation(_) => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
-                let is_composite =
-                    matches!(transaction.operation, Operation::CompositeOperation(_));
                 let read_fragments = is_create_index.then(|| ReadFragments {
                     fragments: dataset.fragments().clone(),
                     moved_files: None,
                 });
-                let read_schema =
-                    (is_create_index || is_composite).then(|| dataset.schema().clone());
+                let read_schema = is_create_index.then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
                         if new_indices
@@ -60,6 +57,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema,
                     reuse: Default::default(),
                     staged_replay: false,
+                    footprint_basis: Box::default(),
                 })
             }
             Operation::Delete {
@@ -97,6 +95,7 @@ impl<'a> TransactionRebase<'a> {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        footprint_basis: Box::default(),
                     });
                 }
 
@@ -118,6 +117,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    footprint_basis: Box::default(),
                 })
             }
             Operation::Rewrite {
@@ -157,6 +157,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse,
                     staged_replay: false,
+                    footprint_basis: Box::default(),
                 })
             }
             Operation::DataReplacement { replacements, .. } => {
@@ -180,6 +181,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    footprint_basis: Box::default(),
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -203,6 +205,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    footprint_basis: Box::default(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -225,6 +228,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    footprint_basis: Box::default(),
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.
@@ -254,10 +258,9 @@ impl<'a> TransactionRebase<'a> {
         self
     }
 
-    /// Use the transaction's read snapshot for every CreateIndex check, and for
-    /// an action set's footprints. The submitting handle may already be newer,
-    /// hiding rewritten columns or removed fields when compared with the latest
-    /// version.
+    /// Use the transaction's read snapshot for every CreateIndex check. The
+    /// submitting handle may already be newer, hiding rewritten columns or
+    /// removed fields when compared with the latest version.
     pub(crate) fn with_read_version_dataset(mut self, dataset: &Dataset) -> Self {
         match self.transaction.operation {
             Operation::CreateIndex { .. } => {
@@ -276,10 +279,6 @@ impl<'a> TransactionRebase<'a> {
     }
 
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
-        if matches!(self.transaction.operation, Operation::CompositeOperation(_)) {
-            self.current_schema = Some(dataset.schema().clone());
-            return Ok(());
-        }
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }
@@ -373,8 +372,8 @@ impl<'a> TransactionRebase<'a> {
         // the same keys without touching any shared fragment. Neither conflict
         // check can establish safety across a gap.
         //
-        // An action set is checked by comparing footprints, which needs every
-        // transaction in the window: replay re-validates only what still
+        // An action set is checked against every transaction in the window,
+        // whose facts the manifests do not show: replay re-validates only what still
         // exists, not that a read, key, or definition it depends on is
         // unchanged. Nearly every action set depends on one, so refuse them all.
         if !self.modified_fragment_ids.is_empty()

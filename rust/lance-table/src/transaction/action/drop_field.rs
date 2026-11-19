@@ -115,22 +115,17 @@ impl DropField {
         true
     }
 
-    /// The field's definition, and nothing else. Anything that depends on the
-    /// field -- data written for it, its metadata, a child added under it --
-    /// requires that definition, so it collides with the drop as `Requires`
-    /// against `Writes`.
+    /// The field's definition. Anything that names the field in the schema or
+    /// a committed fragment -- data written for it there, its metadata, a
+    /// child added under it -- needs the field to still be there, so it
+    /// collides with the drop landing first.
     ///
-    /// That is complete for a struct too, because apply only drops a field
-    /// with no children left: the children were each dropped by their own
-    /// `DropField` in the same operation, which writes their definitions.
-    ///
-    /// Except for a child a concurrent set added after this one read: the
-    /// drop does not name it, and apply would reject the drop for leaving it
-    /// behind. The drop therefore requires that no child was added under the
-    /// field since, so that order is a retryable conflict instead.
+    /// Landing second, the drop tombstones the field out of every fragment,
+    /// so data written for it concurrently is unread rather than wrong. A
+    /// child added under it since would be left without a parent, which the
+    /// definition catches.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write_field_definition(self.field);
-        footprint.require_children_unchanged(self.field);
     }
 }
 

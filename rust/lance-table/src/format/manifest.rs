@@ -544,6 +544,15 @@ impl Manifest {
         }
     }
 
+    /// The fragment with id `id`, found by binary search over the fragment
+    /// list, which is kept sorted by id.
+    pub fn fragment_by_id(&self, id: u64) -> Option<&Fragment> {
+        self.fragments
+            .binary_search_by_key(&id, |fragment| fragment.id)
+            .ok()
+            .map(|index| &self.fragments[index])
+    }
+
     /// Get the highest field ID that may not be allocated again.
     ///
     /// This is different than [Schema::max_field_id] because it also considers

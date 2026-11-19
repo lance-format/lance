@@ -130,45 +130,30 @@ impl AddOverlays {
         true
     }
 
-    /// A partial write of each overlaid field's data in the fragment, a
-    /// requirement on each of those fields' definitions, and a partial write of
-    /// the fragment's deletions.
+    /// The fragment, which must still be there with its rows where they were,
+    /// and each overlaid field, which must still exist.
     ///
-    /// Partial, because two concurrent overlays over the same cells both land
-    /// and the newer `committed_version` decides which value wins. A full
-    /// rewrite of the same column is another matter: it replaces every cell
-    /// from a snapshot that never saw this overlay, and
-    /// [`TombstoneFieldData`](super::TombstoneFieldData) tombstones the overlay
-    /// as it applies, so the overlay's values would be lost without a trace.
-    /// That pair conflicts in either order, as the legacy Update-vs-DataOverlay
-    /// check already does.
+    /// Nothing else, because two concurrent overlays over the same cells both
+    /// land and the newer `committed_version` decides which value wins. A
+    /// re-encode of the column commutes with it too, since it changes no
+    /// value. A data-changing rewrite of the same column does not: its new
+    /// base values tombstone every overlay on the column as they land, so the
+    /// two conflict in either order (see
+    /// [`Footprint::supersede_overlays`](super::Footprint::supersede_overlays)).
     ///
-    /// The definition is required for the same reason a data file requires it:
-    /// the overlay's values are encoded in the type the schema names, and a
-    /// concurrent drop landing first would leave them over a field the manifest
-    /// no longer has. A fragment this operation mints still requires it, since
-    /// the overlay may supply a field the fragment's base files do not.
+    /// A concurrent drop landing first would leave the values over a field the
+    /// manifest no longer has. A fragment this operation mints still requires
+    /// the field, since the overlay may supply one the base files do not.
     ///
-    /// The overlay leaves the fragment's deletions alone, but marks them as a
-    /// conflict point (see [`Footprint::write_part_of_deletions`]): the marker
-    /// collides with any full deletion write on the fragment, in either order,
-    /// and commutes with other overlays. It exists for the row-moving update
-    /// race. An update deletes rows from the fragment and re-adds them in a new
-    /// fragment built from the pre-overlay base, so the overlay's values for
-    /// those rows are lost whichever commits first. A plain delete conflicts
-    /// too, because the footprint cannot tell it from a row-moving update.
+    /// A plain delete of overlaid rows leaves the overlay inert over them, so
+    /// the two commute. A concurrent row-moving update does not: it re-creates
+    /// the rows it moves in another fragment, from the base the overlay never
+    /// touched, losing the overlay's values for them. Which rows moved is not
+    /// checked here, so any move out of the fragment conflicts.
     ///
-    /// TODO(https://github.com/lance-format/lance/issues/10189): that is an
-    /// over-conflict next to the legacy resolver's row-level check of moved
-    /// rows against overlay coverage; restore it as part of conflict parity.
-    ///
-    /// A fragment this operation mints has no cells or deletions a concurrent
-    /// writer can name.
-    ///
-    /// The rows' last-updated versions are restamped without a claim on
-    /// [`Coordinate::FragmentRowVersions`](super::Coordinate::FragmentRowVersions);
-    /// see [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)'s
-    /// footprint for why.
+    /// The rows' last-updated versions are restamped at apply, setting only
+    /// the rows the overlay covers, which composes with a refresh in either
+    /// order.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         let fields = self
             .overlays
@@ -178,10 +163,7 @@ impl AddOverlays {
             // which holds no values a reader sees.
             .filter(|field| *field >= 0)
             .map(FieldRef::Committed);
-        footprint.write_partial_field_data(self.fragment, fields);
-        if let Some(fragment) = self.fragment.committed() {
-            footprint.write_part_of_deletions(fragment);
-        }
+        footprint.write_overlays(self.fragment, fields);
     }
 }
 
@@ -233,13 +215,9 @@ mod tests {
         refresh_row_latest_update_meta_for_full_frag_rewrite_cols,
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
-    use crate::transaction::action::test_support::{
-        added_field, any_deletion_file, apply, backed_manifest, footprint,
-    };
+    use crate::transaction::action::test_support::{apply, backed_manifest};
     use crate::transaction::action::{
-        Action, AddField, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
-        AdjustIndexCoverage, AdjustIndexCoverageParts, AlterField, CompositeOperation, DropField,
-        FieldRef, RemoveFragment, SetDeletionFile, TombstoneFieldData, UserStep,
+        Action, AddFragment, AddFragmentParts, CompositeOperation, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
     use crate::transaction::{Operation, Transaction};
@@ -392,121 +370,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_two_writers_overlaying_the_same_fragment_do_not_conflict() {
-        let ours = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let theirs = footprint(vec![add(Ref::Committed(0), vec![overlay("b.lance", &[0])])]);
-
-        assert!(!ours.conflicts_with(&theirs));
-    }
-
-    /// A full rewrite of the overlaid column replaces every cell from a
-    /// snapshot that never saw the overlay, and tombstones the overlay as it
-    /// applies; the overlay's values would be gone without a trace. Either
-    /// order loses, so the pair is symmetric. A re-encode (`data_change`
-    /// false) keeps the overlay and every row's offset, so the overlay still
-    /// wins its cells whichever lands first.
-    #[rstest::rstest]
-    #[case::rewrite(true)]
-    #[case::reencode(false)]
-    fn test_an_overlay_conflicts_with_a_rewrite_of_its_column_but_not_a_reencode(
-        #[case] data_change: bool,
-    ) {
-        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(
-                TombstoneFieldData::new_unchecked(
-                    Ref::Committed(0),
-                    vec![FieldRef::Committed(field)],
-                    data_change,
-                ),
-            )])
-        };
-
-        assert_eq!(overlaid.conflicts_with(&rewrite(0)), data_change);
-        assert_eq!(rewrite(0).conflicts_with(&overlaid), data_change);
-        // Another column of the same fragment is not touched by the overlay.
-        assert!(!overlaid.conflicts_with(&rewrite(1)));
-        assert!(!rewrite(1).conflicts_with(&overlaid));
-    }
-
-    /// An overlay landing after its field was altered or dropped would carry
-    /// values checked against a definition the schema no longer holds, or for
-    /// a field that is gone. Landing first, the alter covers the overlay's
-    /// values like any others and the drop tombstones the overlay, so those
-    /// orders are fine.
-    #[test]
-    fn test_an_overlay_needs_its_field_defined_as_it_was() {
-        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let altered = footprint(vec![Action::AlterField(
-            AlterField::new(FieldRef::Committed(0)).with_name("renamed"),
-        )]);
-        let dropped = footprint(vec![Action::DropField(DropField::new(
-            FieldRef::Committed(0),
-        ))]);
-
-        assert!(overlaid.conflicts_with(&altered));
-        assert!(!altered.conflicts_with(&overlaid));
-        assert!(overlaid.conflicts_with(&dropped));
-        assert!(!dropped.conflicts_with(&overlaid));
-    }
-
-    /// An index built over a column an overlay landed on first is accepted:
-    /// the segment is stamped with the version it read, the overlay carries
-    /// the later version it committed at, and the read path masks the
-    /// overlaid cells out of any segment older than the overlay
-    /// (`collect_overlay_stale_frags`). A requirement therefore does not
-    /// collide with a committed partial write, only with a full one.
-    #[test]
-    fn test_an_index_may_be_built_over_a_committed_overlay() {
-        let build = footprint(vec![Action::AddIndexSegment(
-            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
-                uuid: uuid::Uuid::from_u128(1),
-                name: "by_a".into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: Some(vec![Ref::Committed(0)]),
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change: false,
-            })
-            .unwrap(),
-        )]);
-        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-
-        assert!(!build.conflicts_with(&overlaid));
-        assert!(!overlaid.conflicts_with(&build));
-    }
-
-    /// One set may overlay a cell and then rewrite the whole column in the
-    /// same operation (an overlay being materialized). The full write is what
-    /// a concurrent set sees: another overlay of the column no longer
-    /// commutes with it, while a rewrite of a different column still does.
-    #[test]
-    fn test_a_full_write_in_the_same_set_dominates_a_partial_one() {
-        let materialize = footprint(vec![
-            add(Ref::Committed(0), vec![overlay("a.lance", &[0])]),
-            Action::TombstoneFieldData(TombstoneFieldData::new(
-                Ref::Committed(0),
-                vec![FieldRef::Committed(0)],
-            )),
-        ]);
-        let other_overlay = footprint(vec![add(Ref::Committed(0), vec![overlay("b.lance", &[0])])]);
-        let other_column = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
-            Ref::Committed(0),
-            vec![FieldRef::Committed(1)],
-        ))]);
-
-        assert!(materialize.conflicts_with(&other_overlay));
-        assert!(other_overlay.conflicts_with(&materialize));
-        assert!(!materialize.conflicts_with(&other_column));
-        assert!(!other_column.conflicts_with(&materialize));
-    }
-
     /// Overlaid cells have changed since the version a consumer last read, so
     /// the rows' last-updated versions have to say so, leaving every row the
     /// overlay does not cover at the version it already had. A fragment with no
@@ -650,33 +513,6 @@ mod tests {
         }
     }
 
-    /// A negative id marks a tombstoned column in the overlay's file. It holds
-    /// nothing a reader sees, so it claims nothing: only the live column
-    /// collides with a rewrite.
-    #[test]
-    fn test_a_tombstoned_column_in_an_overlay_claims_nothing() {
-        let mut partly_tombstoned = overlay("a.lance", &[0]);
-        partly_tombstoned.data_file.fields = vec![-1, 1].into();
-        partly_tombstoned.data_file.column_indices = vec![0, 1].into();
-        let overlaid = footprint(vec![add(Ref::Committed(0), vec![partly_tombstoned])]);
-        let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
-                Ref::Committed(0),
-                vec![FieldRef::Committed(field)],
-            ))])
-        };
-        let drop_field_zero = footprint(vec![Action::DropField(DropField::new(
-            FieldRef::Committed(0),
-        ))]);
-
-        assert!(overlaid.conflicts_with(&rewrite(1)));
-        assert!(rewrite(1).conflicts_with(&overlaid));
-        for other in [rewrite(0), drop_field_zero] {
-            assert!(!overlaid.conflicts_with(&other));
-            assert!(!other.conflicts_with(&overlaid));
-        }
-    }
-
     /// An overlay covering a row past the end of its fragment supplies values
     /// for a row that does not exist, whatever the dataset and whether the
     /// fragment is committed or minted in the same operation.
@@ -723,149 +559,5 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("data_change"), "{error}");
-    }
-
-    /// The overlay's values are encoded in the type the schema names, whether or
-    /// not the fragment it lands in is one this operation minted: a stale append
-    /// carrying an overlay for a field a concurrent set dropped would leave
-    /// values for a field the schema no longer has.
-    ///
-    /// Landing second, a drop tombstones the field out of the new fragment, but
-    /// a replacement (a cast) is only valid against the rows it read.
-    #[rstest::rstest]
-    #[case::replacement(
-        vec![
-            Action::DropField(DropField::new(FieldRef::Committed(0))),
-            Action::AddField(AddField::new(0, added_field("id"))),
-        ],
-        true,
-    )]
-    #[case::drop(vec![Action::DropField(DropField::new(FieldRef::Committed(0)))], false)]
-    fn test_an_overlay_on_a_minted_fragment_needs_its_field_defined_as_it_was(
-        #[case] schema_change: Vec<Action>,
-        #[case] schema_change_conflicts_landing_second: bool,
-    ) {
-        let overlaid = footprint(vec![
-            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
-                id: Ref::Local(0),
-                physical_rows: 4,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })),
-            add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
-        ]);
-        let schema_change = footprint(schema_change);
-
-        assert!(overlaid.conflicts_with(&schema_change));
-        assert_eq!(
-            schema_change.conflicts_with(&overlaid),
-            schema_change_conflicts_landing_second
-        );
-    }
-
-    /// A concurrent row-moving update deletes rows from the fragment and
-    /// re-creates them in a new one built from the pre-overlay base, so the
-    /// overlay's values for them would be lost. The footprint cannot tell a
-    /// move from a plain delete, so any deletion-file change on the fragment
-    /// collides, in both orders -- not a requirement, because the update
-    /// landing second is the lossy order. Two overlays still commute.
-    #[test]
-    fn test_an_overlay_conflicts_with_a_deletion_of_the_same_fragment() {
-        let delete = |fragment: u64| {
-            footprint(vec![Action::SetDeletionFile(
-                SetDeletionFile::try_new_unchecked(fragment, any_deletion_file(), None, true)
-                    .unwrap(),
-            )])
-        };
-        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-
-        assert!(overlaid.conflicts_with(&delete(0)));
-        assert!(delete(0).conflicts_with(&overlaid));
-        assert!(!overlaid.conflicts_with(&delete(1)));
-        assert!(!delete(1).conflicts_with(&overlaid));
-    }
-
-    #[test]
-    fn test_an_overlay_on_a_minted_fragment_does_not_conflict_with_a_deletion() {
-        let overlaid = footprint(vec![
-            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
-                id: Ref::Local(0),
-                physical_rows: 4,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })),
-            add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
-        ]);
-        let delete = footprint(vec![Action::SetDeletionFile(
-            SetDeletionFile::try_new_unchecked(0, any_deletion_file(), None, true).unwrap(),
-        )]);
-
-        assert!(!overlaid.conflicts_with(&delete));
-        assert!(!delete.conflicts_with(&overlaid));
-    }
-
-    /// An overlay writes values for its field, on any fragment, so a set that
-    /// is valid only while the field holds no new values cannot land after it.
-    #[rstest::rstest]
-    #[case::committed_fragment(Ref::Committed(0))]
-    #[case::minted_fragment(Ref::Local(0))]
-    fn test_a_tightening_cannot_land_after_an_overlay_of_its_field(#[case] fragment: Ref) {
-        let mut actions = Vec::new();
-        if fragment.committed().is_none() {
-            actions.push(Action::AddFragment(AddFragment::new_unchecked(
-                AddFragmentParts {
-                    id: fragment,
-                    physical_rows: 4,
-                    row_id_meta: None,
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                    data_change: true,
-                },
-            )));
-        }
-        actions.push(add(fragment, vec![overlay("a.lance", &[0])]));
-        let overlaid = footprint(actions);
-        let tighten = footprint(vec![Action::AlterField(
-            AlterField::new(FieldRef::Committed(0)).with_nullable(false),
-        )]);
-
-        assert!(tighten.conflicts_with(&overlaid));
-    }
-
-    #[test]
-    fn test_overlaying_a_fragment_a_concurrent_writer_removes_conflicts() {
-        let ours = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let theirs = footprint(vec![Action::RemoveFragment(RemoveFragment::new(
-            Ref::Committed(0),
-        ))]);
-
-        assert!(ours.conflicts_with(&theirs));
-        assert!(theirs.conflicts_with(&ours));
-    }
-
-    /// Unlike a rewrite, an overlay does not invalidate a widened segment: a
-    /// read masks an overlay committed after the segment's `dataset_version`,
-    /// so the index never answers from the values it replaced.
-    #[test]
-    fn test_an_overlay_does_not_conflict_with_a_widening_onto_its_fragment() {
-        let widen = footprint(vec![Action::AdjustIndexCoverage(
-            AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
-                uuid: uuid::Uuid::from_u128(1),
-                name: "by_a".into(),
-                add_fragments: vec![Ref::Committed(7)],
-                remove_fragments: Vec::new(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-            })
-            .unwrap(),
-        )]);
-        let overlay = footprint(vec![add(Ref::Committed(7), vec![overlay("a.lance", &[0])])]);
-
-        assert!(!widen.conflicts_with(&overlay));
-        assert!(!overlay.conflicts_with(&widen));
     }
 }

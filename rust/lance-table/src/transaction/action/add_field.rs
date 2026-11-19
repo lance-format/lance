@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, FieldRef, Footprint};
+use super::{FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
@@ -100,31 +100,23 @@ impl AddField {
         false
     }
 
-    /// The field does not exist in the read version, so its definition is not
-    /// a coordinate. Its name is: two writers adding a column by the same name
-    /// would otherwise both land. Attaching it under a committed parent does
-    /// not rewrite the parent's definition, but it does need the parent to
+    /// The field does not exist in the read version, so nothing concurrent can
+    /// touch it; a name taken since fails the apply, which is a retryable
+    /// conflict. Attaching it under a committed parent needs the parent to
     /// still be there.
     ///
     /// A non-nullable field is also a promise about rows: each must carry a
     /// value for it. Its data only covers the fragments the writer saw, so
-    /// rows added by a concurrent writer, in either order, would break it.
-    ///
-    /// A child under a committed parent changes the shape of the parent's
-    /// rows, and a stale writer may write the parent packed without the child,
-    /// so it fences new rows too. This is coarse: it does not ask whether the
-    /// parent is packed.
+    /// rows inserted concurrently break it. Landing first, it changes
+    /// [`Part::NewRowSchema`](super::Part::NewRowSchema), which stale writers
+    /// of rows read; so does a child under a committed parent, which a stale
+    /// writer may write packed without it.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::FieldName(self.def.name.clone()));
         if !self.def.nullable {
             footprint.add_required_column();
         }
         if let Some(parent) = self.parent {
-            footprint.require_field_definition(parent);
-            footprint.add_child(parent);
-            if parent.committed().is_some() {
-                footprint.write(Coordinate::NewRowSchema);
-            }
+            footprint.require_field(parent);
         }
     }
 }

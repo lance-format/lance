@@ -4,9 +4,9 @@
 //! Apply config and metadata updates.
 
 use super::apply::ApplyState;
-use super::footprint::UnenforcedKey;
+
 use super::proto::required;
-use super::{ConfigMap, Coordinate, FieldRef, Footprint};
+use super::{ConfigMap, FieldRef, Footprint};
 use crate::format::pb_actions;
 use crate::transaction::UpdateMap;
 use crate::transaction::update_map::apply_update_map;
@@ -201,21 +201,12 @@ impl ConfigUpdate {
             // there, and is lost with it if the field is dropped afterwards.
             if let Some(id) = update.field.committed() {
                 footprint.write_map_update(ConfigMap::Field(id), &update.updates);
-                footprint.require_field_definition(update.field);
+                footprint.require_field(update.field);
             }
         }
-        // The reserved keys are declared per field but held once per table, so
-        // two writers declaring one on different fields collide on the key
-        // itself, not on either field's metadata.
-        if self.writes_any(&[
-            LANCE_UNENFORCED_PRIMARY_KEY,
-            LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
-        ]) {
-            footprint.write(Coordinate::UnenforcedKey(UnenforcedKey::Primary));
-        }
-        if self.writes_any(&[LANCE_UNENFORCED_CLUSTERING_KEY_POSITION]) {
-            footprint.write(Coordinate::UnenforcedKey(UnenforcedKey::Clustering));
-        }
+        // The reserved keys are declared per field but held once per table.
+        // Apply refuses to change one once set, so two writers declaring one
+        // on different fields is a retryable conflict when the second applies.
     }
 
     fn writes_any(&self, keys: &[&str]) -> bool {
@@ -344,10 +335,8 @@ impl TryFrom<pb_actions::ConfigUpdate> for ConfigUpdate {
 mod tests {
     use super::*;
     use crate::format::Manifest;
-    use crate::transaction::action::test_support::{
-        added_field, apply, backed_manifest, footprint,
-    };
-    use crate::transaction::action::{Action, AddField, DropField};
+    use crate::transaction::action::test_support::{added_field, apply, backed_manifest};
+    use crate::transaction::action::{Action, AddField};
     use crate::transaction::update_map::UpdateMapEntry;
     use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
     use lance_core::datatypes::Schema;
@@ -664,85 +653,5 @@ mod tests {
         assert!(crate::feature_flags::validate_auto_cleanup_config(&manifest).is_err());
 
         apply(&manifest, vec![set_config(&[("unrelated", Some("1"))])]).unwrap();
-    }
-
-    #[test]
-    fn test_edits_to_different_keys_commute() {
-        let update = |key: &str| {
-            vec![Action::ConfigUpdate(
-                ConfigUpdate::default().with_config(merge(&[(key, Some("1"))])),
-            )]
-        };
-
-        assert!(!footprint(update("a")).conflicts_with(&footprint(update("b"))));
-        assert!(footprint(update("a")).conflicts_with(&footprint(update("a"))));
-    }
-
-    #[test]
-    fn test_a_replacement_collides_with_any_edit_to_the_same_map() {
-        let replaced = footprint(vec![Action::ConfigUpdate(
-            ConfigUpdate::default().with_config(replace(&[("a", "1")])),
-        )]);
-        let merged = footprint(vec![Action::ConfigUpdate(
-            ConfigUpdate::default().with_config(merge(&[("untouched-by-name", Some("1"))])),
-        )]);
-        let other_map = footprint(vec![Action::ConfigUpdate(
-            ConfigUpdate::default().with_table_metadata(merge(&[("a", Some("1"))])),
-        )]);
-
-        assert!(replaced.conflicts_with(&merged));
-        // Two clears of the same map name no key at all, and still collide.
-        assert!(replaced.conflicts_with(&replaced.clone()));
-        // A different map is a different coordinate space.
-        assert!(!replaced.conflicts_with(&other_map));
-    }
-
-    #[test]
-    fn test_dropping_a_field_collides_with_updating_its_metadata() {
-        let metadata = footprint(vec![Action::ConfigUpdate(
-            ConfigUpdate::default()
-                .with_field_metadata(FieldRef::Committed(1), merge(&[("comment", Some("x"))])),
-        )]);
-        let dropped = footprint(vec![Action::DropField(DropField::new(
-            FieldRef::Committed(1),
-        ))]);
-        let other = footprint(vec![Action::DropField(DropField::new(
-            FieldRef::Committed(2),
-        ))]);
-
-        // Metadata landing after the drop names a field that is gone; the
-        // drop landing after the metadata takes the metadata with the field.
-        assert!(metadata.conflicts_with(&dropped));
-        assert!(!dropped.conflicts_with(&metadata));
-        assert!(!other.conflicts_with(&metadata));
-        assert!(!metadata.conflicts_with(&other));
-    }
-
-    #[test]
-    fn test_declaring_the_primary_key_on_different_fields_collides() {
-        let primary_key = |field: i32| {
-            footprint(vec![Action::ConfigUpdate(
-                ConfigUpdate::default().with_field_metadata(
-                    FieldRef::Committed(field),
-                    merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
-                ),
-            )])
-        };
-        let clustering_key = footprint(vec![Action::ConfigUpdate(
-            ConfigUpdate::default().with_field_metadata(
-                FieldRef::Committed(3),
-                merge(&[(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, Some("0"))]),
-            ),
-        )]);
-        let comment = footprint(vec![Action::ConfigUpdate(
-            ConfigUpdate::default()
-                .with_field_metadata(FieldRef::Committed(3), merge(&[("comment", Some("x"))])),
-        )]);
-
-        // The key is one per table, so the fields being different is no help.
-        assert!(primary_key(1).conflicts_with(&primary_key(2)));
-        // A different reserved key, or plain metadata, is a different thing.
-        assert!(!primary_key(1).conflicts_with(&clustering_key));
-        assert!(!primary_key(1).conflicts_with(&comment));
     }
 }

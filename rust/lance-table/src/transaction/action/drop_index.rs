@@ -85,68 +85,16 @@ impl TryFrom<pb_actions::DropIndex> for DropIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{DataFile, IndexMetadata};
-    use crate::transaction::action::test_support::{
-        apply_with_indices, backed_manifest, footprint,
-    };
-    use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
-        CompositeOperation, FieldRef, Ref, RemoveIndexSegment, UserStep,
-    };
+    use crate::format::IndexMetadata;
+    use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
+    use crate::transaction::action::{Action, CompositeOperation, UserStep};
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, ReadVersionState, Transaction};
-    use lance_file::version::ConcreteFileVersion;
+
     use rstest::rstest;
-    use uuid::Uuid;
 
     fn drop_index(name: &str) -> Action {
         Action::DropIndex(DropIndex::try_new(name).unwrap())
-    }
-
-    fn add_segment(name: &str, covered: Vec<Ref>) -> Action {
-        Action::AddIndexSegment(
-            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
-                uuid: Uuid::new_v4(),
-                name: name.into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: Some(covered),
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change: false,
-            })
-            .unwrap(),
-        )
-    }
-
-    /// An append that indexes what it appended: the shape a concurrent writer
-    /// keeping an index current takes.
-    fn append_and_index(name: &str) -> Vec<Action> {
-        vec![
-            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
-                id: Ref::Local(0),
-                physical_rows: 10,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })),
-            Action::AddDataFile(
-                AddDataFile::try_new_unchecked(
-                    Ref::Local(0),
-                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                    vec![FieldRef::Committed(0)],
-                    None,
-                    true,
-                )
-                .unwrap(),
-            ),
-            add_segment(name, vec![Ref::Local(0)]),
-        ]
     }
 
     fn segment_covering(name: &str, fragments: impl IntoIterator<Item = u32>) -> IndexMetadata {
@@ -220,47 +168,6 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("'by_a'"), "{error}");
-    }
-
-    /// A drop and a concurrent segment under the same name cannot both land:
-    /// either the new segment resurrects the index, or the drop discards a
-    /// segment its writer never saw. Both orders conflict, so the loser
-    /// retries against the other's result.
-    #[rstest]
-    #[case::append_and_index_after_the_drop(append_and_index("by_a"), vec![drop_index("by_a")], true)]
-    #[case::drop_after_append_and_index(vec![drop_index("by_a")], append_and_index("by_a"), true)]
-    #[case::two_drops(vec![drop_index("by_a")], vec![drop_index("by_a")], true)]
-    #[case::another_index(vec![drop_index("by_a")], append_and_index("by_b"), false)]
-    #[case::unrelated_append(
-        vec![drop_index("by_a")],
-        append_and_index("by_b")[..2].to_vec(),
-        false
-    )]
-    fn test_drop_index_conflicts(
-        #[case] ours: Vec<Action>,
-        #[case] committed: Vec<Action>,
-        #[case] expected: bool,
-    ) {
-        assert_eq!(
-            footprint(ours).conflicts_with(&footprint(committed)),
-            expected
-        );
-    }
-
-    /// An optimize replacing a segment is segment-level maintenance, and keeps
-    /// committing alongside a writer that indexes what it appends.
-    #[test]
-    fn test_an_optimize_and_a_concurrent_append_and_index_do_not_conflict() {
-        let optimize = footprint(vec![
-            Action::RemoveIndexSegment(
-                RemoveIndexSegment::try_new_unchecked(Uuid::from_u128(1), "by_a", false).unwrap(),
-            ),
-            add_segment("by_a", vec![Ref::Committed(0)]),
-        ]);
-        let append = footprint(append_and_index("by_a"));
-
-        assert!(!optimize.conflicts_with(&append));
-        assert!(!append.conflicts_with(&optimize));
     }
 
     /// Mirrors [`RemoveIndexSegment`]: an index is derived state, except the

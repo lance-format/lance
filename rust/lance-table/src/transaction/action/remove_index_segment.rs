@@ -3,9 +3,9 @@
 
 //! Remove an index segment.
 
+use super::Footprint;
 use super::apply::{ApplyState, reject_frag_reuse_history};
 use super::proto::{non_empty, required};
-use super::{Coordinate, Footprint};
 use crate::format::pb_actions;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
@@ -91,7 +91,7 @@ impl RemoveIndexSegment {
     /// a segment of its own, which this removal leaves alone, and one that
     /// rebuilds what this segment covered leaves the index no worse off.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::IndexSegment(self.uuid));
+        footprint.write_segment(self.uuid);
     }
 }
 
@@ -129,8 +129,7 @@ mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::action::{
-        Action, AddIndexSegment, AddIndexSegmentParts, CompositeOperation, FieldRef, Footprint,
-        Ref, UserStep,
+        Action, AddIndexSegment, AddIndexSegmentParts, FieldRef, Ref,
     };
     use crate::transaction::test_support::sample_index_metadata;
 
@@ -238,55 +237,5 @@ mod tests {
             error.to_string().contains("belongs to index 'by_a'"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn test_removing_a_segment_leaves_a_concurrent_build_of_its_index_alone() {
-        // Dropping a stale segment while someone else builds a fresh one is the
-        // normal shape of index maintenance; the index ends up with the new
-        // segment and without the old one either way round.
-        let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
-                "step", actions,
-            )]))
-        };
-        let ours = footprint(vec![remove(Uuid::from_u128(1), "by_a")]);
-        let theirs = footprint(vec![Action::AddIndexSegment(
-            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
-                uuid: Uuid::from_u128(2),
-                name: "by_a".into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: Some(vec![Ref::Committed(0)]),
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change: false,
-            })
-            .unwrap(),
-        )]);
-
-        assert!(!ours.conflicts_with(&theirs));
-        assert!(!theirs.conflicts_with(&ours));
-    }
-
-    #[test]
-    fn test_two_writers_removing_the_same_segment_conflict() {
-        let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
-                "step", actions,
-            )]))
-        };
-
-        let uuid = Uuid::from_u128(1);
-        let ours = footprint(vec![remove(uuid, "by_a")]);
-        let same = footprint(vec![remove(uuid, "by_a")]);
-        let other = footprint(vec![remove(Uuid::from_u128(2), "by_a")]);
-
-        assert!(ours.conflicts_with(&same));
-        assert!(!ours.conflicts_with(&other));
     }
 }

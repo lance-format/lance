@@ -22,6 +22,7 @@ use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
+use lance_table::format::Manifest;
 use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
@@ -65,8 +66,7 @@ pub struct TransactionRebase<'a> {
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
     /// struct is rewritten whole while an index on a child records the
-    /// child's id). Also loaded for an action set, whose footprints relate
-    /// fields through it.
+    /// child's id).
     current_schema: Option<lance_core::datatypes::Schema>,
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// to detect in-place column rewrites even after transaction cleanup,
@@ -84,6 +84,22 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+    /// What the footprints of a pair with an action set on either side are
+    /// taken from. Boxed: the commit loop holds the rebase across awaits.
+    footprint_basis: Box<FootprintBasis>,
+}
+
+/// What a pending action set's footprint check keeps about the commits since
+/// it read: the manifests either side of them.
+#[derive(Debug, Default)]
+struct FootprintBasis {
+    /// The manifest the commits being checked landed on: the one read on a
+    /// first attempt, the previous attempt's latest on a retry, which already
+    /// checked this transaction against what came before.
+    since: Option<Arc<Manifest>>,
+    /// The latest manifest, recorded with the commits since `since`. A
+    /// footprint is checked against the change from `since` to it.
+    latest: Option<Arc<Manifest>>,
 }
 
 /// The fragments a CreateIndex read, and the data files that replacements
