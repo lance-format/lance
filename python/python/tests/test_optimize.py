@@ -1535,6 +1535,33 @@ def test_min_bytes_per_file(tmp_path: Path, min_bytes):
         assert metrics.fragments_removed == 2
 
 
+def test_optimize_indices_rejects_unknown_options(tmp_path: Path):
+    """An option name optimize_indices does not know must raise. Ignored, a
+    misspelled ``index_names`` runs the default optimize over every index."""
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(pa.table({"id": range(64)}), uri)
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    dataset = lance.write_dataset(pa.table({"id": range(64, 128)}), uri, mode="append")
+    version = dataset.version
+
+    with pytest.raises(TypeError, match="index_name"):
+        dataset.optimize.optimize_indices(index_name=["id_idx"])
+    with pytest.raises(ValueError, match="Invalid optimize_indices option: index_name"):
+        dataset._ds.optimize_indices(index_name=["id_idx"])
+    with pytest.raises(ValueError, match="Invalid optimize_indices option: index_name"):
+        OptimizeIndices.plan(dataset, {"index_name": ["id_idx"]})
+    with pytest.raises(ValueError, match="Invalid optimize_indices option: index_name"):
+        OptimizeIndices.commit(dataset, [], {"index_name": ["id_idx"]})
+    assert dataset.version == version
+    assert lance.dataset(uri).version == version
+
+    # A known option set to None is unset, in every entry point alike.
+    plan = OptimizeIndices.plan(dataset, {"index_names": None, "retrain": None})
+    assert [task.index_name for task in plan.tasks] == ["id_idx"]
+    dataset.optimize.optimize_indices(index_names=["id_idx"], retrain=None)
+    assert dataset.version == version + 1
+
+
 def test_optimize_indices_distributed(tmp_path: Path):
     """The plan's tasks and merges travel to worker processes by pickle and
     their results travel back, while the table keeps taking writes."""
