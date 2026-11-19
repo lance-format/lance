@@ -7,7 +7,7 @@ use lance_core::Result;
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_message;
 use lance_table::feature_flags::{
-    FLAG_BASE_PATHS, FLAG_COVERED_INDEX_METADATA, FLAG_DELETION_FILES,
+    FLAG_BASE_PATHS, FLAG_COVERED_INDEX_METADATA, FLAG_DELETION_FILE_PATHS, FLAG_DELETION_FILES,
     FLAG_DISABLE_TRANSACTION_FILE, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX,
     FLAG_FRAGMENT_TREE, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_INLINE_DELETIONS,
     FLAG_LOCAL_FRAGMENT_ALIASES, FLAG_MANAGED_BLOBS, FLAG_MIXED_DATA_FILE_VERSIONS,
@@ -1348,6 +1348,7 @@ fn format_feature_flags(flags: u64) -> String {
         (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
         (FLAG_INLINE_DELETIONS, "inline_deletions"),
         (FLAG_LOCAL_FRAGMENT_ALIASES, "local_fragment_aliases"),
+        (FLAG_DELETION_FILE_PATHS, "deletion_file_paths"),
     ];
     let mut names = known_flags
         .iter()
@@ -1625,6 +1626,7 @@ mod tests {
             (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
             (FLAG_INLINE_DELETIONS, "inline_deletions"),
             (FLAG_LOCAL_FRAGMENT_ALIASES, "local_fragment_aliases"),
+            (FLAG_DELETION_FILE_PATHS, "deletion_file_paths"),
         ];
         let rendered = format_feature_flags(FLAG_UNKNOWN - 1);
         for (_, name) in known_flags {

@@ -875,7 +875,7 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
-    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None))]
+    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None, path=None))]
     fn new(
         read_version: u64,
         id: u64,
@@ -883,6 +883,7 @@ impl PyDeletionFile {
         num_deleted_rows: usize,
         base_id: Option<u32>,
         inline: Option<Vec<u8>>,
+        path: Option<String>,
     ) -> PyResult<Self> {
         let inline = inline.map(bytes::Bytes::from);
         let file_type = match file_type {
@@ -895,14 +896,19 @@ impl PyDeletionFile {
                 )));
             }
         };
-        Ok(Self(DeletionFile {
+        let deletion_file = DeletionFile {
             read_version,
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            path,
             inline,
-        }))
+        };
+        deletion_file
+            .validate_location()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(Self(deletion_file))
     }
 
     fn asdict(slf: PyRef<'_, Self>) -> PyResult<Bound<'_, PyDict>> {
@@ -916,6 +922,7 @@ impl PyDeletionFile {
             slf.0.num_deleted_rows,
         )?;
         dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
+        dict.set_item(intern!(slf.py(), "path"), &slf.0.path)?;
         // A list of ints rather than bytes, so the dict stays JSON-serializable.
         let inline = match &slf.0.inline {
             Some(bytes) => PyList::new(slf.py(), bytes.iter().copied())?
@@ -964,6 +971,12 @@ impl PyDeletionFile {
     #[getter]
     fn base_id(&self) -> &Option<u32> {
         &self.0.base_id
+    }
+
+    /// The stored relative deletion file path when explicitly set, else None.
+    #[getter]
+    fn stored_path(&self) -> Option<&str> {
+        self.0.path.as_deref()
     }
 
     /// The serialized deletion bitmap when it is stored in the manifest, else None.
