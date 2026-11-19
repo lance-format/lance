@@ -1417,7 +1417,13 @@ impl<'py> IntoPyObject<'py> for PyLance<&RewrittenIndex> {
         let new_details_type_url = self.0.new_index_details.type_url.clone();
         let new_details_value = PyBytes::new(py, &self.0.new_index_details.value);
         let new_index_version = self.0.new_index_version;
-        cls.call1((old_id, new_id, new_details_type_url, new_details_value, new_index_version))
+        cls.call1((
+            old_id,
+            new_id,
+            new_details_type_url,
+            new_details_value,
+            new_index_version,
+        ))
     }
 }
 
