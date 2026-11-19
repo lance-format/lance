@@ -32,6 +32,8 @@ use crate::object_writer::WriteResult;
 use crate::traits::{ByteStream, Reader, Writer};
 use crate::utils::tracking_store::IOTracker;
 
+mod admitted_read;
+
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
 pub fn to_local_path(path: &Path) -> String {
     if cfg!(windows) {
@@ -241,6 +243,9 @@ pub struct LocalObjectReader {
     /// File handler.
     file: Arc<File>,
 
+    /// Lazy coordination for owned reads; ordinary reads bypass it.
+    admitted_read: admitted_read::ReadGate,
+
     /// Fie path.
     path: Path,
 
@@ -303,6 +308,7 @@ impl LocalObjectReader {
             let size = OnceCell::new_with(known_size);
             Ok(Box::new(Self {
                 file: Arc::new(file),
+                admitted_read: Default::default(),
                 block_size,
                 size,
                 path,
@@ -398,14 +404,16 @@ impl Reader for LocalObjectReader {
             let metrics = io_tracker.begin_io("get");
             // The blocking operation owns the reservation. Dropping the async
             // waiter must not refund memory while the read still writes into it.
-            let result = join_local_io(tokio::task::spawn_blocking(move || {
-                #[cfg(unix)]
-                file.read_exact_at(output.as_mut(), range.start as u64)?;
-                #[cfg(windows)]
-                read_exact_at(file, output.as_mut(), range.start as u64)?;
-                Ok(output)
-            }))
-            .await;
+            let result = self
+                .admitted_read
+                .run(file, move |file| {
+                    #[cfg(unix)]
+                    file.read_exact_at(output.as_mut(), range.start as u64)?;
+                    #[cfg(windows)]
+                    read_exact_at(file, output.as_mut(), range.start as u64)?;
+                    Ok(output)
+                })
+                .await;
             metrics.record(&result, bytes);
             if result.is_ok() {
                 io_tracker.record_read("get_range_into", path, bytes, Some(range_u64));
@@ -434,27 +442,30 @@ impl Reader for LocalObjectReader {
             }
             // One blocking dispatch, still one positional read and metric per
             // range. The closure owns every buffer even if its waiter is dropped.
-            Ok(join_local_io(tokio::task::spawn_blocking(move || {
-                let mut outputs = Vec::with_capacity(requests.len());
-                for (range, mut output) in requests {
-                    let metrics = io_tracker.begin_io("get");
-                    #[cfg(unix)]
-                    let result = file.read_exact_at(output.as_mut(), range.start as u64);
-                    #[cfg(windows)]
-                    let result = read_exact_at(file.clone(), output.as_mut(), range.start as u64);
-                    metrics.record(&result, range.len() as u64);
-                    result?;
-                    io_tracker.record_read(
-                        "get_range_into",
-                        path.clone(),
-                        range.len() as u64,
-                        Some(range.start as u64..range.end as u64),
-                    );
-                    outputs.push(output);
-                }
-                Ok(outputs)
-            }))
-            .await?)
+            Ok(self
+                .admitted_read
+                .run(file, move |file| {
+                    let mut outputs = Vec::with_capacity(requests.len());
+                    for (range, mut output) in requests {
+                        let metrics = io_tracker.begin_io("get");
+                        #[cfg(unix)]
+                        let result = file.read_exact_at(output.as_mut(), range.start as u64);
+                        #[cfg(windows)]
+                        let result =
+                            read_exact_at(file.clone(), output.as_mut(), range.start as u64);
+                        metrics.record(&result, range.len() as u64);
+                        result?;
+                        io_tracker.record_read(
+                            "get_range_into",
+                            path.clone(),
+                            range.len() as u64,
+                            Some(range.start as u64..range.end as u64),
+                        );
+                        outputs.push(output);
+                    }
+                    Ok(outputs)
+                })
+                .await?)
         })
     }
 

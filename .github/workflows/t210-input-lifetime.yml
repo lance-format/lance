@@ -37,6 +37,15 @@ jobs:
           print(io[0])
           print("lance-examples benchmark has no lance-io/test-util feature")
           PYFEATURES
+      - name: Verify owned local read coordination and cancellation
+        env:
+          LANCE_CPU_THREADS: 1
+        run: |
+          cargo test --profile ci --locked -p lance-io --lib local::admitted_read::tests:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib reserved_read::tests:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib scheduler::read_into::tests:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::multi:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::take:: -- --nocapture
       - name: Verify fragment hint ownership and real dataset composition
         env:
           LANCE_CPU_THREADS: 1
@@ -54,6 +63,6 @@ jobs:
       - name: Lint benchmark paths
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-examples --example admitted_dataset --no-deps -- -D warnings
-      - name: Lint Lance composition
+      - name: Lint owned I/O and Lance composition
         if: ${{ !cancelled() }}
-        run: cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings
+        run: cargo clippy --profile ci --locked -p lance-io -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings

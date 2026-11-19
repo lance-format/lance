@@ -155,6 +155,10 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// covered by the payload reservation. Readers with direct read-into support
     /// should override this to avoid the intermediate buffer. Cancellation must
     /// keep `output` alive until any underlying operation has stopped using it.
+    /// On Linux, local owned reads coordinate by opened device/inode across
+    /// readers. Waiting is asynchronous, and a detached filesystem operation
+    /// retains both its gate and payload. Ordinary local reads bypass this gate.
+    /// Gate metadata is outside the payload budget; no payload is cached.
     fn get_range_into(
         &self,
         range: Range<usize>,
@@ -199,6 +203,8 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// sequentially. A backend may combine dispatch, but must preserve every
     /// allocation and retain all buffers until access stops on cancellation.
     /// No coalescing, payload allocation or budget acquisition is permitted.
+    /// On Linux, the local backend retains one inode gate for the complete
+    /// blocking batch; unrelated files and ordinary reads remain independent.
     fn get_ranges_into(
         &self,
         requests: Vec<(Range<usize>, ReservedBuffer)>,
