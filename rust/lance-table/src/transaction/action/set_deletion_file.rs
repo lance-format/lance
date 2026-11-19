@@ -27,33 +27,83 @@ use lance_core::{Error, Result};
 /// the same fragment always conflict.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct SetDeletionFile {
-    /// The fragment, by committed id.
-    ///
-    /// Unlike its sibling fragment actions this takes no [`Ref`](super::Ref).
-    /// A deletion file's path is `{fragment_id}-{read_version}-{id}.{suffix}`
-    /// (see [`deletion_file_path`](crate::io::deletion::deletion_file_path)),
-    /// so the writer has to know the committed fragment id before it can write
-    /// the file at all, and a minted id does not exist until apply.
-    pub fragment: u64,
-    /// The new deletion file.
-    pub deletion_file: DeletionFile,
-    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
-    pub data_change: bool,
-    /// The base path the deletion file lives under: committed, or one minted
-    /// earlier in the same operation. `None` for the dataset's own directory.
-    pub base: Option<Ref>,
+    fragment: u64,
+    deletion_file: DeletionFile,
+    data_change: bool,
+    base: Option<Ref>,
 }
 
 impl SetDeletionFile {
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        if let Some(base_id) = self.deletion_file.base_id {
+    /// Replace the deletion file of committed fragment `fragment` with
+    /// `deletion_file`.
+    ///
+    /// * `fragment` is a committed id, unlike its sibling fragment actions: a
+    ///   deletion file's path is `{fragment_id}-{read_version}-{id}.{suffix}`
+    ///   (see [`deletion_file_path`](crate::io::deletion::deletion_file_path)),
+    ///   so the writer has to know the committed fragment id before it can
+    ///   write the file at all, and a minted id does not exist until apply.
+    /// * `deletion_file` has `base_id` unset: apply stamps it from `base`.
+    /// * `base` is the base path the file lives under: committed, or one minted
+    ///   earlier in the same operation. `None` for the dataset's own directory.
+    /// * `data_change` says whether a reader sees rows leave. See
+    ///   [`AddFragment`](super::AddFragment).
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that:
+    ///
+    /// * The file exists under `base`, is readable as the type
+    ///   `deletion_file` declares, and names only offsets below the fragment's
+    ///   physical row count.
+    /// * `deletion_file.num_deleted_rows`, when set, is the number of offsets
+    ///   the file names.
+    /// * If `data_change` is `false`, the file deletes exactly the rows the
+    ///   fragment already treats as deleted.
+    ///
+    /// Breaking the contract is not undefined behavior, but it commits a table
+    /// whose reads fail or return the wrong rows.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a `deletion_file` whose `base_id` is set.
+    pub fn try_new_unchecked(
+        fragment: u64,
+        deletion_file: DeletionFile,
+        base: Option<Ref>,
+        data_change: bool,
+    ) -> Result<Self> {
+        if let Some(base_id) = deletion_file.base_id {
             return Err(Error::invalid_input(format!(
-                "SetDeletionFile for fragment {} carries deletion_file.base_id {base_id}; \
-                 deletion_file.base_id must be unset, since the action's base names where the \
-                 file lives",
-                self.fragment
+                "SetDeletionFile for fragment {fragment} carries deletion_file.base_id \
+                 {base_id}; deletion_file.base_id must be unset, since the action's base names \
+                 where the file lives"
             )));
         }
+        Ok(Self {
+            fragment,
+            deletion_file,
+            data_change,
+            base,
+        })
+    }
+
+    /// The committed fragment whose deletions are set.
+    pub fn fragment(&self) -> u64 {
+        self.fragment
+    }
+
+    /// The new deletion file, with `base_id` unset.
+    pub fn deletion_file(&self) -> &DeletionFile {
+        &self.deletion_file
+    }
+
+    /// The base path the deletion file lives under, or `None` for the
+    /// dataset's own directory.
+    pub fn base(&self) -> Option<Ref> {
+        self.base
+    }
+
+    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let deletion_file = DeletionFile {
             base_id: self.base.map(|base| state.resolve_base(base)).transpose()?,
             ..self.deletion_file.clone()
@@ -77,7 +127,8 @@ impl SetDeletionFile {
         Ok(())
     }
 
-    pub(super) fn is_data_change(&self) -> bool {
+    /// Whether a reader sees rows leave.
+    pub fn is_data_change(&self) -> bool {
         self.data_change
     }
 
@@ -103,15 +154,17 @@ impl TryFrom<pb_actions::SetDeletionFile> for SetDeletionFile {
     type Error = Error;
 
     fn try_from(message: pb_actions::SetDeletionFile) -> Result<Self> {
-        Ok(Self {
-            fragment: message.fragment,
-            deletion_file: DeletionFile::try_from(required(
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Self::try_new_unchecked(
+            message.fragment,
+            DeletionFile::try_from(required(
                 message.deletion_file,
                 "SetDeletionFile.deletion_file",
             )?)?,
-            data_change: !message.data_unchanged,
-            base: message.base.map(Ref::try_from).transpose()?,
-        })
+            message.base.map(Ref::try_from).transpose()?,
+            !message.data_unchanged,
+        )
     }
 }
 
@@ -126,12 +179,7 @@ mod tests {
     use rstest::rstest;
 
     fn set_deletion_file(file: DeletionFile) -> Action {
-        Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: file,
-            data_change: true,
-            base: None,
-        })
+        Action::SetDeletionFile(SetDeletionFile::try_new_unchecked(0, file, None, true).unwrap())
     }
 
     fn deleting(num_deleted_rows: Option<usize>) -> DeletionFile {
@@ -211,12 +259,9 @@ mod tests {
     fn test_set_deletion_file_rejects_a_missing_fragment() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: 7,
-                deletion_file: deletion_file(None),
-                data_change: true,
-                base: None,
-            })],
+            vec![Action::SetDeletionFile(
+                SetDeletionFile::try_new_unchecked(7, deletion_file(None), None, true).unwrap(),
+            )],
         )
         .unwrap_err();
 
@@ -268,14 +313,12 @@ mod tests {
         if mint_base_first {
             actions.push(mint_base());
         }
-        actions.push(Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: file,
-            data_change: true,
-            base,
-        }));
-
-        let result = apply(&manifest_with_base(), actions);
+        // An embedded base_id is rejected when the action is built, the rest
+        // when it is applied.
+        let result = SetDeletionFile::try_new_unchecked(0, file, base, true).and_then(|action| {
+            actions.push(Action::SetDeletionFile(action));
+            apply(&manifest_with_base(), actions)
+        });
 
         match expected {
             Ok(base_id) => {

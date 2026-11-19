@@ -2122,37 +2122,34 @@ mod tests {
 
     #[rstest::rstest]
     #[case::add_field(
-        Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: LanceCoreField::try_from(ArrowField::new("detached", DataType::Int32, true))
-                .unwrap(),
-        }),
+        Action::AddField(AddField::new(
+            0,
+            LanceCoreField::try_from(ArrowField::new("detached", DataType::Int32, true)).unwrap(),
+        )),
         false
     )]
     #[case::rename(
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some("renamed".into()),
-            nullable: None,
-        }),
+        Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name("renamed")),
         true
     )]
-    #[case::drop_field(Action::DropField(DropField { field: FieldRef::Committed(0) }), true)]
+    #[case::drop_field(Action::DropField(DropField::new(FieldRef::Committed(0))), true)]
     #[case::data_only(
-        Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: crate::format::DeletionFile {
-                read_version: 1,
-                id: 1,
-                file_type: crate::format::DeletionFileType::Array,
-                num_deleted_rows: Some(1),
-                base_id: None,
-                inline: None,
-            },
-            data_change: true,
-            base: None,
-        }),
+        Action::SetDeletionFile(
+            SetDeletionFile::try_new_unchecked(
+                0,
+                crate::format::DeletionFile {
+                    read_version: 1,
+                    id: 1,
+                    file_type: crate::format::DeletionFileType::Array,
+                    num_deleted_rows: Some(1),
+                    base_id: None,
+                    inline: None,
+                },
+                None,
+                true,
+            )
+            .unwrap()
+        ),
         true
     )]
     #[test]

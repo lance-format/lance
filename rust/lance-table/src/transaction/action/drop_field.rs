@@ -3,15 +3,13 @@
 
 //! Remove a field from the schema.
 
-use super::apply::{ApplyState, TOMBSTONED_FIELD};
+use super::apply::ApplyState;
 use super::proto::required;
 use super::{FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use lance_file::version::ConcreteFileVersion;
-use std::collections::HashSet;
 
 /// Remove a field from the schema.
 ///
@@ -23,10 +21,20 @@ use std::collections::HashSet;
 /// field is discarded.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DropField {
-    pub field: FieldRef,
+    field: FieldRef,
 }
 
 impl DropField {
+    /// Drop `field`, which must have no children left when this applies.
+    pub fn new(field: FieldRef) -> Self {
+        Self { field }
+    }
+
+    /// The field dropped.
+    pub fn field(&self) -> FieldRef {
+        self.field
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let field_id = state.resolve_schema_field(self.field, "DropField")?;
         let field = state.schema().field_by_id(field_id).ok_or_else(|| {
@@ -47,57 +55,13 @@ impl DropField {
             )));
         }
         remove_field(&mut state.schema_mut().fields, field_id);
-        let schema_field_ids: HashSet<i32> = state
-            .schema()
-            .fields_pre_order()
-            .map(|field| field.id)
-            .collect();
 
         // The fields are gone from the schema, so the slots that backed them in
         // each data file are dead. Tombstoning rather than rewriting the field
         // list keeps a file's remaining columns at the positions they were
         // written at; a file left with nothing live is pruned during
         // normalization.
-        for fragment in state.fragments_mut() {
-            for file in fragment.files.iter_mut() {
-                if !file.fields.contains(&field_id) {
-                    continue;
-                }
-                // A V1 reader finds a field's pages by its position among the
-                // file's fields, so even a tombstone would shift its siblings.
-                // The list stays whole, as `Project` leaves it, until no field
-                // in it is live.
-                if file.file_version()? == ConcreteFileVersion::V1 {
-                    if !file.fields.iter().any(|id| schema_field_ids.contains(id)) {
-                        file.fields = vec![TOMBSTONED_FIELD; file.fields.len()].into();
-                    }
-                    continue;
-                }
-                let fields = file
-                    .fields
-                    .iter()
-                    .map(|id| {
-                        if *id == field_id {
-                            TOMBSTONED_FIELD
-                        } else {
-                            *id
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                file.fields = fields.into();
-            }
-
-            if let Ok(overlaid) = u32::try_from(field_id) {
-                crate::format::overlay::tombstone_overlay_fields(
-                    &mut fragment.overlays,
-                    &[overlaid],
-                );
-            }
-        }
-
-        // Indices over a field that no longer exists are discarded wholesale by
-        // `retain_relevant_indices`, so there is nothing to record here.
-        Ok(())
+        state.tombstone_dropped_field(field_id)
     }
 
     /// Dropping a field discards every value it held.
@@ -148,9 +112,9 @@ impl TryFrom<pb_actions::DropField> for DropField {
     type Error = Error;
 
     fn try_from(message: pb_actions::DropField) -> Result<Self> {
-        Ok(Self {
-            field: required(message.field, "DropField.field")?.try_into()?,
-        })
+        Ok(Self::new(
+            required(message.field, "DropField.field")?.try_into()?,
+        ))
     }
 }
 
@@ -159,6 +123,7 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::Manifest;
+    use crate::transaction::action::apply::TOMBSTONED_FIELD;
     use crate::transaction::action::test_support::{
         added_field, apply, apply_with_indices, backed_manifest,
     };
@@ -174,9 +139,7 @@ mod tests {
     fn test_drop_field_removes_it_and_its_data() {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(0),
-            })],
+            vec![Action::DropField(DropField::new(FieldRef::Committed(0)))],
             vec![sample_index_metadata("idx")],
         )
         .unwrap();
@@ -269,9 +232,7 @@ mod tests {
     }
 
     fn drop_field(id: i32) -> Action {
-        Action::DropField(DropField {
-            field: FieldRef::Committed(id),
-        })
+        Action::DropField(DropField::new(FieldRef::Committed(id)))
     }
 
     /// A drop names exactly one field, so that every field it removes is in
@@ -352,9 +313,7 @@ mod tests {
     fn test_drop_field_rejects_a_missing_field() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(7),
-            })],
+            vec![Action::DropField(DropField::new(FieldRef::Committed(7)))],
         )
         .unwrap_err();
 
@@ -367,14 +326,8 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(0),
-                }),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("replacement"),
-                }),
+                Action::DropField(DropField::new(FieldRef::Committed(0))),
+                Action::AddField(AddField::new(0, added_field("replacement"))),
             ],
         )
         .unwrap();
@@ -396,14 +349,8 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("transient"),
-                }),
-                Action::DropField(DropField {
-                    field: FieldRef::Local(0),
-                }),
+                Action::AddField(AddField::new(0, added_field("transient"))),
+                Action::DropField(DropField::new(FieldRef::Local(0))),
             ],
         )
         .unwrap();

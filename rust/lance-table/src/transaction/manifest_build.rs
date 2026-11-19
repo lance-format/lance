@@ -1861,7 +1861,8 @@ impl Transaction {
             )?;
         }
 
-        let mut manifest = self.assemble_manifest(
+        let mut manifest = Self::assemble_manifest(
+            self.tag.as_deref(),
             current_manifest,
             schema,
             final_fragments,
@@ -2231,7 +2232,7 @@ impl Transaction {
     // parameter struct would only move the list.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn assemble_manifest(
-        &self,
+        tag: Option<&str>,
         current_manifest: Option<&Manifest>,
         mut schema: lance_core::datatypes::Schema,
         fragments: Vec<Fragment>,
@@ -2323,7 +2324,7 @@ impl Transaction {
             }
         }
 
-        manifest.tag.clone_from(&self.tag);
+        manifest.tag = tag.map(str::to_owned);
 
         if config.auto_set_feature_flags {
             // Internal operations (e.g. CreateIndex) build with the default config,

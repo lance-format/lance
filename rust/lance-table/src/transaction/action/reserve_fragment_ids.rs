@@ -29,10 +29,20 @@ use lance_core::{Error, Result};
 /// belong to someone else.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct ReserveFragmentIds {
-    pub count: u32,
+    count: u32,
 }
 
 impl ReserveFragmentIds {
+    /// Reserve `count` fragment ids.
+    pub fn new(count: u32) -> Self {
+        Self { count }
+    }
+
+    /// How many fragment ids are reserved.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         state.reserve_fragment_ids(self.count)
     }
@@ -60,9 +70,7 @@ impl TryFrom<pb_actions::ReserveFragmentIds> for ReserveFragmentIds {
     type Error = Error;
 
     fn try_from(message: pb_actions::ReserveFragmentIds) -> Result<Self> {
-        Ok(Self {
-            count: message.count,
-        })
+        Ok(Self::new(message.count))
     }
 }
 
@@ -70,7 +78,7 @@ impl TryFrom<pb_actions::ReserveFragmentIds> for ReserveFragmentIds {
 mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{Action, AddFragment, Ref};
+    use crate::transaction::action::{Action, AddFragment, AddFragmentParts, Ref};
     use rstest::rstest;
 
     fn reserve(count: u32) -> Action {
@@ -78,14 +86,14 @@ mod tests {
     }
 
     fn add_fragment(local: u32) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(local),
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     #[test]

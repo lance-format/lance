@@ -37,27 +37,56 @@ use lance_core::{Error, Result};
 /// detection ignores it.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AssertUniqueKeys {
-    /// The key columns, in order, and the only key list: the field ids the
-    /// filter type carries are an artifact of its use by the legacy operation,
-    /// cleared on encode and rejected on decode.
-    pub key_fields: Vec<FieldRef>,
-    /// Hashes of the key values of every row this operation inserts, over
-    /// `key_fields`.
-    pub filter: KeyExistenceFilter,
+    key_fields: Vec<FieldRef>,
+    filter: KeyExistenceFilter,
 }
 
 impl AssertUniqueKeys {
+    /// Assert that the keys hashed in `filter`, over the key columns
+    /// `key_fields` in order, are new.
+    ///
+    /// `key_fields` is the only key list: the field ids the filter type carries
+    /// are an artifact of its use by the legacy operation, ignored here and
+    /// cleared on encode.
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that `filter` holds
+    /// the hash of the key of every row the operation inserts, over
+    /// `key_fields`. A row left out can collide with a concurrent insert
+    /// unnoticed, leaving the table with a duplicate key.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `key_fields`.
+    pub fn try_new_unchecked(
+        key_fields: Vec<FieldRef>,
+        filter: KeyExistenceFilter,
+    ) -> Result<Self> {
+        if key_fields.is_empty() {
+            return Err(Error::invalid_input(
+                "AssertUniqueKeys names no key column, so there is nothing for it to assert",
+            ));
+        }
+        Ok(Self { key_fields, filter })
+    }
+
+    /// The key columns, in order.
+    pub fn key_fields(&self) -> &[FieldRef] {
+        &self.key_fields
+    }
+
+    /// Hashes of the key values of every row the operation inserts.
+    pub fn filter(&self) -> &KeyExistenceFilter {
+        &self.filter
+    }
+
     /// Nothing to apply -- the assertion is checked when two operations are
     /// compared, not when one is folded into a manifest. The key columns are
     /// still resolved and looked up, so an assertion naming a field that is not
     /// there fails at the commit that carries it rather than silently guarding
     /// nothing.
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        if self.key_fields.is_empty() {
-            return Err(Error::invalid_input(
-                "AssertUniqueKeys names no key column, so there is nothing for it to assert",
-            ));
-        }
         for key_field in &self.key_fields {
             let field_id = state.resolve_schema_field(*key_field, "AssertUniqueKeys")?;
             let field = state.schema().field_by_id(field_id).ok_or_else(|| {
@@ -109,10 +138,9 @@ impl TryFrom<pb_actions::AssertUniqueKeys> for AssertUniqueKeys {
                 filter.field_ids
             )));
         }
-        Ok(Self {
-            key_fields,
-            filter: KeyExistenceFilter::try_from(&filter)?,
-        })
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Self::try_new_unchecked(key_fields, KeyExistenceFilter::try_from(&filter)?)
     }
 }
 
@@ -124,39 +152,44 @@ mod tests {
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
     use crate::transaction::action::{
-        Action, AddFragment, AddOverlays, Ref, RemoveFragment, TombstoneFieldData,
+        Action, AddFragment, AddFragmentParts, AddOverlays, Ref, RemoveFragment, TombstoneFieldData,
     };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use std::sync::Arc;
 
     fn assertion(key_fields: Vec<FieldRef>, hashes: &[u64]) -> Action {
-        Action::AssertUniqueKeys(AssertUniqueKeys {
-            key_fields,
-            filter: KeyExistenceFilter {
-                field_ids: Vec::new(),
-                filter: FilterType::ExactSet(hashes.iter().copied().collect()),
-            },
-        })
+        Action::AssertUniqueKeys(
+            AssertUniqueKeys::try_new_unchecked(
+                key_fields,
+                KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet(hashes.iter().copied().collect()),
+                },
+            )
+            .unwrap(),
+        )
     }
 
     fn append(local: u32) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(local),
             physical_rows: 5,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn compact(local: u32) -> Action {
-        let Action::AddFragment(mut fragment) = append(local) else {
+        let Action::AddFragment(fragment) = append(local) else {
             unreachable!()
         };
-        fragment.data_change = false;
-        Action::AddFragment(fragment)
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+            data_change: false,
+            ..fragment.into_parts()
+        }))
     }
 
     /// `key_fields` is the only key list. The filter type keeps a field list
@@ -197,7 +230,14 @@ mod tests {
 
     #[test]
     fn test_asserting_over_no_key_column_is_rejected() {
-        let error = apply(&backed_manifest(), vec![assertion(vec![], &[1])]).unwrap_err();
+        let error = AssertUniqueKeys::try_new_unchecked(
+            vec![],
+            KeyExistenceFilter {
+                field_ids: Vec::new(),
+                filter: FilterType::ExactSet([1].into_iter().collect()),
+            },
+        )
+        .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
@@ -399,11 +439,10 @@ mod tests {
             assertion(vec![FieldRef::Committed(0)], &[1]),
         ]);
         let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
-            })])
+            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(field)],
+            ))])
         };
 
         assert!(ours.conflicts_with(&rewrite(0)));
@@ -420,9 +459,9 @@ mod tests {
             assertion(vec![FieldRef::Committed(0)], &[1]),
         ]);
         let overlay = |field: i32| {
-            footprint(vec![Action::AddOverlays(AddOverlays {
-                fragment: Ref::Committed(0),
-                overlays: vec![DataOverlayFile {
+            footprint(vec![Action::AddOverlays(AddOverlays::new_unchecked(
+                Ref::Committed(0),
+                vec![DataOverlayFile {
                     data_file: DataFile::new(
                         "overlay.lance",
                         vec![field],
@@ -434,8 +473,7 @@ mod tests {
                     coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from([0]))),
                     committed_version: 0,
                 }],
-                data_change: true,
-            })])
+            ))])
         };
 
         assert!(ours.conflicts_with(&overlay(0)));
@@ -449,18 +487,21 @@ mod tests {
     #[test]
     fn test_assertions_with_incomparable_filters_conflict() {
         let bloom = |number_of_items: u64| {
-            Action::AssertUniqueKeys(AssertUniqueKeys {
-                key_fields: vec![FieldRef::Committed(0)],
-                filter: KeyExistenceFilter {
-                    field_ids: Vec::new(),
-                    filter: FilterType::Bloom {
-                        bitmap: vec![0; 32],
-                        num_bits: 256,
-                        number_of_items,
-                        probability: 0.01,
+            Action::AssertUniqueKeys(
+                AssertUniqueKeys::try_new_unchecked(
+                    vec![FieldRef::Committed(0)],
+                    KeyExistenceFilter {
+                        field_ids: Vec::new(),
+                        filter: FilterType::Bloom {
+                            bitmap: vec![0; 32],
+                            num_bits: 256,
+                            number_of_items,
+                            probability: 0.01,
+                        },
                     },
-                },
-            })
+                )
+                .unwrap(),
+            )
         };
         let ours = footprint(vec![append(0), bloom(100)]);
         let theirs = footprint(vec![append(0), bloom(200)]);
@@ -492,10 +533,9 @@ mod tests {
             append(0),
             assertion(vec![FieldRef::Committed(0)], &[1]),
         ]);
-        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(3),
-            data_change: true,
-        })]);
+        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment::new(
+            Ref::Committed(3),
+        ))]);
 
         assert!(!ours.conflicts_with(&removal));
     }
