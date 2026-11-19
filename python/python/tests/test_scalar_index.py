@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance.dataset import ScannerBuilder
+from lance._dataset.scanner import ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -277,7 +277,7 @@ def test_list_indices_index_without_details(tmp_path):
     """An index whose manifest entry has no index details (e.g. committed by an
     older writer) is still reported on a best-effort basis: describe_indices()
     does not error, and the type is reported as "Unknown"."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -313,7 +313,7 @@ def test_list_indices_legacy_vector_index_without_details(tmp_path):
     """A legacy vector index predates VectorIndexDetails: it has no index
     details but stores a monolithic index file. Its type is recognized as
     "Vector" from the index file rather than reported as "Unknown"."""
-    from lance.dataset import Index, IndexFile
+    from lance._dataset.index import Index, IndexFile
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -4485,7 +4485,7 @@ def build_distributed_fts_index(
     """
     import uuid
 
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Generate unique index ID for distributed indexing
     index_id = str(uuid.uuid4())
@@ -5454,7 +5454,7 @@ def test_distribute_fts_index_build(tmp_path):
     ds.merge_index_metadata(index_id, index_type="INVERTED")
 
     # Create an Index object using the new dataclass format
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Get the schema field for the indexed column
     # Only use for non nested struct schema
@@ -6018,7 +6018,7 @@ def test_minhashlsh_segment_merge_and_commit_from_python():
     assert ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist()[2] == 2
 
 
-def test_fm_index():
+def test_fm_index(tmp_path):
     texts = ["hello world", "say hello", None, "goodbye", "hello again", "nothing"]
     tbl = pa.table({"id": list(range(len(texts))), "text": texts})
     ds = lance.write_dataset(tbl, "memory://fm_index", max_rows_per_file=2)
@@ -6055,6 +6055,49 @@ def test_fm_index():
     assert contains(ds, "hello") == [0, 1, 4]
     # Unlike NGRAM, a single-character pattern is still answered by the index.
     assert contains(ds, "y") == [1, 3]
+
+    texts = ["left\x00right", "left right", "left_right", None, ""]
+    ds = lance.write_dataset(
+        pa.table({"id": list(range(len(texts))), "text": texts}),
+        tmp_path / "fm_nul",
+        max_rows_per_file=2,
+    )
+    assert len(ds.get_fragments()) == 3
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    segment = ds.create_index_uncommitted(
+        "text", "FM", name=index_name, fragment_ids=fragment_ids[:1]
+    )
+    ds = ds.commit_existing_index_segments(index_name, "text", [segment])
+
+    def check_patterns(ds):
+        safe_predicate = "contains(text, 'left')"
+        assert f"@{index_name}" in ds.scanner(filter=safe_predicate).explain_plan()
+        assert sorted(
+            ds.to_table(filter=safe_predicate, columns=["id"])["id"].to_pylist()
+        ) == [0, 1, 2]
+
+        for pattern in [" ", "left\x00right", "left right", "left\x00 right"]:
+            predicate = f"contains(text, '{pattern}')"
+            plan = ds.scanner(filter=predicate).explain_plan()
+            assert (f"@{index_name}" in plan) == ("\x00" not in pattern)
+            for expression in [
+                predicate,
+                f"NOT ({predicate})",
+                f"({predicate}) AND contains(text, 'right')",
+                f"({predicate}) OR contains(text, 'left_')",
+            ]:
+                expected = ds.to_table(
+                    filter=expression, columns=["id"], use_scalar_index=False
+                )["id"].to_pylist()
+                actual = ds.to_table(filter=expression, columns=["id"])[
+                    "id"
+                ].to_pylist()
+                assert sorted(actual) == sorted(expected), expression
+                assert ds.count_rows(expression) == len(expected), expression
+
+    check_patterns(ds)
+    ds.create_scalar_index("text", "FM", name=index_name)
+    check_patterns(lance.dataset(ds.uri))
 
 
 def test_merge_index_metadata_btree_soft_break(tmp_path):

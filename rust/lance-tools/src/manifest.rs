@@ -7,7 +7,7 @@ use lance_core::Result;
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_message;
 use lance_table::feature_flags::{
-    FLAG_BASE_PATHS, FLAG_COVERED_INDEX_METADATA, FLAG_DELETION_FILES,
+    FLAG_BASE_PATHS, FLAG_BTREE_KEY_LAYOUT, FLAG_COVERED_INDEX_METADATA, FLAG_DELETION_FILES,
     FLAG_DISABLE_TRANSACTION_FILE, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX,
     FLAG_FRAGMENT_TREE, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_INLINE_DELETIONS,
     FLAG_MANAGED_BLOBS, FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS,
@@ -16,12 +16,12 @@ use lance_table::feature_flags::{
     FLAG_USE_V2_FORMAT_DEPRECATED, FLAG_ZONE_WRITE_SEEDS,
 };
 use lance_table::format::overlay::OverlayCoverage;
-use lance_table::format::pb;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
     ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
     RowDatasetVersionMeta, RowIdMeta, WriterVersion,
 };
+use lance_table::format::{pb, pb_actions};
 use lance_table::io::manifest::read_manifest_proto;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -1128,6 +1128,16 @@ fn write_transaction_operation(
                 .sum::<usize>();
             write_kv(f, indent, "overlays", &overlay_count.to_string())
         }
+        pb::transaction::Operation::CompositeOperation(composite) => {
+            write_kv(f, indent, "operation", "composite_operation")?;
+            write_kv(f, indent, "steps", &composite.steps.len().to_string())?;
+            let action_count = composite
+                .steps
+                .iter()
+                .map(|step| step.actions.len())
+                .sum::<usize>();
+            write_kv(f, indent, "actions", &action_count.to_string())
+        }
     }
 }
 
@@ -1337,6 +1347,7 @@ fn format_feature_flags(flags: u64) -> String {
         (FLAG_OBJECT_METADATA, "object_metadata"),
         (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
         (FLAG_INLINE_DELETIONS, "inline_deletions"),
+        (FLAG_BTREE_KEY_LAYOUT, "btree_key_layout"),
     ];
     let mut names = known_flags
         .iter()
@@ -1425,7 +1436,7 @@ fn format_offset_bitmap_map(map: &HashMap<u64, Vec<u8>>) -> String {
     summaries.join(", ")
 }
 
-fn format_update_map(update_map: Option<&pb::transaction::UpdateMap>) -> String {
+fn format_update_map(update_map: Option<&pb_actions::UpdateMap>) -> String {
     update_map
         .map(|update_map| {
             format!(
@@ -1518,6 +1529,39 @@ mod tests {
         assert!(rendered.contains("transaction_error: transaction section is corrupt"));
     }
 
+    #[test]
+    fn test_render_composite_operation_summary() {
+        let step = |actions: usize| pb_actions::UserStep {
+            description: String::new(),
+            actions: vec![pb_actions::Action::default(); actions],
+        };
+        let manifest = LanceToolManifest {
+            path: Path::from("dataset/_versions/1.manifest"),
+            dataset_base: Some(Path::from("dataset")),
+            has_timestamp: false,
+            has_data_format: true,
+            manifest: empty_manifest(),
+            indices: OptionalSection::NotPresent,
+            transaction: OptionalSection::Loaded(TransactionView {
+                source: TransactionSource::Inline { position: 0 },
+                transaction: pb::Transaction {
+                    operation: Some(pb::transaction::Operation::CompositeOperation(
+                        pb_actions::CompositeOperation {
+                            steps: vec![step(2), step(1)],
+                        },
+                    )),
+                    ..Default::default()
+                },
+            }),
+        };
+
+        let rendered = manifest.to_string();
+
+        assert!(rendered.contains("operation: composite_operation"));
+        assert!(rendered.contains("steps: 2"));
+        assert!(rendered.contains("actions: 3"));
+    }
+
     #[tokio::test]
     async fn test_external_transaction_error_includes_path() {
         let object_store = ObjectStore::memory();
@@ -1580,6 +1624,7 @@ mod tests {
             (FLAG_OBJECT_METADATA, "object_metadata"),
             (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
             (FLAG_INLINE_DELETIONS, "inline_deletions"),
+            (FLAG_BTREE_KEY_LAYOUT, "btree_key_layout"),
         ];
         let rendered = format_feature_flags(FLAG_UNKNOWN - 1);
         for (_, name) in known_flags {

@@ -98,9 +98,9 @@ pub const FLAG_FRAGMENT_TREE: u64 = 1 << 12;
 /// The flag requires [`FLAG_COVERED_INDEX_METADATA`] in both feature words, and
 /// the two are retained together while the independent bit is set.
 ///
-/// Reserved ahead of its implementation. This build masks the bit out in
-/// `supported_flags_when`, so it cannot open a table and apply the legacy
-/// suffix contract to independent declarations.
+/// A reader decodes the index section under [`CoveringContract::Independent`]
+/// when this bit is set. A commit sets it only while some index
+/// [`requires_independent_contract`](crate::format::IndexMetadata::requires_independent_contract).
 pub const FLAG_INDEPENDENT_COVERING_FIELDS: u64 = 1 << 13;
 /// Blob v2 descriptors may independently address Lance-owned objects. Readers
 /// must resolve their explicit bases and writers/GC must preserve those references.
@@ -139,28 +139,10 @@ pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
 /// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
 /// sets `key_layout`.
 ///
-/// The segment's index version 2 keeps older readers from using it, but
-/// nothing keeps v12.0.0 and v13.0.0 writers from updating a table with stable
-/// row ids. Their update adds the fragment that receives the rewritten rows to
-/// the segment's `fragment_bitmap` without indexing those rows. v12.0.0
-/// through v14.0.0 refuse this bit, so they commit nothing to the table.
-///
-/// Writer-only. v10.0.0 and v11.0.0 check writer flags only on insert. Their
-/// update, delete, index creation, column addition, and compaction drop the
-/// segment and clear the bit. Their restore, shallow clone, and branch
-/// creation keep the segment and clear the bit. Their reads stay correct.
-///
-/// [`FLAG_ROW_ADDR_INDICES`] cannot stand in for this bit: writers that
-/// support [`FLAG_ROW_ADDR_INDICES`] but not key layouts recompute bit 18 from
-/// `index_version >= 1` on restore, clone, and commits without checking the
-/// source manifest's flags or dropping a damaged `key_layout` segment.
-///
-/// A writer that supports this bit sets it on every published manifest, clones
-/// and restores included, exactly when its index section has a segment with a
-/// `key_layout`, and derives and validates it the way
-/// [`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`] is. A segment with a `key_layout`
-/// from a manifest without the bit is unusable, and such a writer never
-/// carries it into a new manifest.
+/// Writer-only. The
+/// [key layout writer rules](https://lance.org/format/index/scalar/btree/#key-layout-writer-rules)
+/// say when a writer sets this bit and how it treats a `key_layout` segment
+/// from a manifest that lacks it.
 ///
 /// Reserved ahead of its implementation. This build masks the bit out in
 /// `supported_flags_when`, so it refuses to write a table that sets it.
@@ -197,6 +179,50 @@ pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_ZONE_WRITE_SEEDS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
+pub(crate) const COVERING_FLAGS: u64 =
+    FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+
+/// How a manifest's index section lays out each index's key and carried
+/// fields. [`FLAG_INDEPENDENT_COVERING_FIELDS`] selects it for every entry at
+/// once, so a reader picks it before it decodes any `IndexMetadata`.
+///
+/// The same entry reads differently under each:
+///
+/// ```
+/// use lance_table::feature_flags::CoveringContract;
+/// use lance_table::format::{IndexMetadata, pb};
+///
+/// let entry = pb::IndexMetadata {
+///     uuid: Some((&uuid::Uuid::new_v4()).into()),
+///     fields: vec![7, 11],
+///     covering_fields: vec![11],
+///     ..Default::default()
+/// };
+/// let suffix = IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Suffix)?;
+/// assert_eq!(suffix.keyed_fields(), &[7]);
+/// let independent = IndexMetadata::from_manifest_proto(entry, CoveringContract::Independent)?;
+/// assert_eq!(independent.keyed_fields(), &[7, 11]);
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoveringContract {
+    /// The carried fields are the trailing entries of `IndexMetadata.fields`.
+    Suffix,
+    /// `IndexMetadata.fields` holds only key fields, and `covering_fields` is a
+    /// separate list that may repeat a key.
+    Independent,
+}
+
+impl CoveringContract {
+    /// The contract `manifest`'s index section uses.
+    pub fn of(manifest: &Manifest) -> Self {
+        if manifest.reader_feature_flags & FLAG_INDEPENDENT_COVERING_FIELDS != 0 {
+            Self::Independent
+        } else {
+            Self::Suffix
+        }
+    }
+}
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -277,8 +303,8 @@ pub fn apply_feature_flags(
     // A Manifest only points at its index section, so index-dependent flags
     // cannot be derived here. Carry them across the reset so a second call from
     // write_manifest_file preserves the flags already derived from the index list.
-    let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
-        & FLAG_COVERED_INDEX_METADATA;
+    let covering_flags =
+        (manifest.reader_feature_flags | manifest.writer_feature_flags) & COVERING_FLAGS;
     let row_addr_indices = manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES;
     // Same carry for the index section's clustering references and generic
     // metadata, which `build_manifest` derives from the index list.
@@ -382,8 +408,8 @@ pub fn apply_feature_flags(
     }
     manifest.writer_feature_flags |= object_metadata;
 
-    manifest.reader_feature_flags |= covered_index_metadata;
-    manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.reader_feature_flags |= covering_flags;
+    manifest.writer_feature_flags |= covering_flags;
     manifest.writer_feature_flags |= row_addr_indices;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
@@ -480,6 +506,44 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
+/// Refuse to publish a manifest that carries data overlay files from a build that
+/// does not understand them: every later open of the dataset by this build would
+/// be refused.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_table::feature_flags::validate_data_overlay_files;
+/// # use lance_table::format::Manifest;
+/// # fn publish(manifest: &Manifest) -> Result<()> {
+/// validate_data_overlay_files(manifest)?;
+/// // Publish the manifest only after this check succeeds.
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_data_overlay_files(manifest: &Manifest) -> Result<()> {
+    validate_data_overlay_files_when(manifest, data_overlay_files_enabled())
+}
+
+/// Split out so the release-build refusal is testable from a debug build.
+fn validate_data_overlay_files_when(manifest: &Manifest, enabled: bool) -> Result<()> {
+    if enabled
+        || manifest
+            .fragments
+            .iter()
+            .all(|fragment| fragment.overlays.is_empty())
+    {
+        return Ok(());
+    }
+    Err(Error::not_supported(format!(
+        "Cannot commit version {}: it carries data overlay files, an unreleased format that \
+         may still change; set {ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV} to read and write \
+         them with this build of Lance",
+        manifest.version
+    )))
+}
+
 /// Debug builds only, with no environment override, until continuous recording
 /// and retention land. Hidden because it is removed then.
 #[doc(hidden)]
@@ -516,7 +580,6 @@ fn supported_flags_when(
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
-    mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
     mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
@@ -591,6 +654,19 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
         return Err(Error::corrupt_file_named(
             "manifest",
             "FRI requires both reader and writer feature flags",
+        ));
+    }
+
+    if (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & FLAG_INDEPENDENT_COVERING_FIELDS
+        != 0
+        && (manifest.reader_feature_flags & COVERING_FLAGS != COVERING_FLAGS
+            || manifest.writer_feature_flags & COVERING_FLAGS != COVERING_FLAGS)
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Independent covering fields require their bit and the covered index metadata bit \
+             in both reader and writer feature flags",
         ));
     }
 
@@ -955,11 +1031,65 @@ mod tests {
     }
 
     #[test]
-    fn test_independent_covering_fields_flag_is_reserved() {
+    fn test_independent_covering_fields_flag_is_supported() {
         assert_eq!(FLAG_INDEPENDENT_COVERING_FIELDS, 8192);
-        let flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
-        assert!(!can_read_dataset(flags));
-        assert!(!can_write_dataset(flags));
+        assert_eq!(COVERING_FLAGS & !supported_flags_when(false, false), 0);
+        let mut manifest = empty_manifest();
+        assert_eq!(CoveringContract::of(&manifest), CoveringContract::Suffix);
+        manifest.reader_feature_flags = COVERING_FLAGS;
+        manifest.writer_feature_flags = COVERING_FLAGS;
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
+        assert_eq!(
+            CoveringContract::of(&manifest),
+            CoveringContract::Independent
+        );
+    }
+
+    /// The independent bit changes how every index entry reads, so it is only
+    /// meaningful with itself and the covering bit in both words.
+    #[rstest::rstest]
+    #[case::reader_only(COVERING_FLAGS, FLAG_COVERED_INDEX_METADATA)]
+    #[case::writer_only(FLAG_COVERED_INDEX_METADATA, COVERING_FLAGS)]
+    #[case::without_covering_bit(
+        FLAG_INDEPENDENT_COVERING_FIELDS,
+        FLAG_INDEPENDENT_COVERING_FIELDS
+    )]
+    #[case::covering_bit_in_one_word(COVERING_FLAGS, FLAG_INDEPENDENT_COVERING_FIELDS)]
+    fn independent_covering_fields_require_both_bits_in_both_words(
+        #[case] reader: u64,
+        #[case] writer: u64,
+    ) {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = reader;
+        manifest.writer_feature_flags = writer;
+        for error in [
+            ensure_can_read_manifest(&manifest).unwrap_err(),
+            ensure_can_write_manifest(&manifest).unwrap_err(),
+            apply_feature_flags(&mut manifest.clone(), false, false).unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Independent covering fields require"),
+                "{error}"
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::suffix(FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(COVERING_FLAGS)]
+    fn apply_feature_flags_carries_the_covering_bits_across_its_reset(#[case] flags: u64) {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = flags;
+        manifest.writer_feature_flags = flags;
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_eq!(manifest.reader_feature_flags, flags);
+        assert_eq!(manifest.writer_feature_flags, flags);
     }
 
     #[test]
@@ -1057,6 +1187,17 @@ mod tests {
             manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
             0
         );
+
+        // A build that does not understand overlays refuses to publish them.
+        let err = validate_data_overlay_files_when(&manifest, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV),
+            "{err}"
+        );
+        validate_data_overlay_files_when(&manifest, true).unwrap();
+        manifest.fragments = Arc::new(vec![Fragment::new(0)]);
+        validate_data_overlay_files_when(&manifest, false).unwrap();
     }
 
     #[test]

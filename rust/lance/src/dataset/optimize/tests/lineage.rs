@@ -267,11 +267,7 @@ async fn test_row_addrs_only_used_with_remappable_index(
         ..Default::default()
     };
     let original_indices = dataset.load_indices().await.unwrap();
-    let task = TaskData {
-        fragments: dataset.fragments().as_ref().clone(),
-        output_clustering_id: None,
-        output_metadata: HashMap::new(),
-    };
+    let task = TaskData::rewrite_fragments(dataset.fragments().as_ref().clone());
     let mut result = rewrite_files(Cow::Borrowed(&dataset), task, &options)
         .await
         .unwrap();
@@ -688,7 +684,7 @@ async fn test_distributed_compaction_with_stable_row_ids(
         };
         assert!(
             worker
-                .metadata_cache
+                .index_cache
                 .get_with_key(&row_id_index)
                 .await
                 .is_none()
@@ -696,7 +692,7 @@ async fn test_distributed_compaction_with_stable_row_ids(
         get_row_id_index(&worker).await.unwrap();
         assert!(
             worker
-                .metadata_cache
+                .index_cache
                 .get_with_key(&row_id_index)
                 .await
                 .is_some()

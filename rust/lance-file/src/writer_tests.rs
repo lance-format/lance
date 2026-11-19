@@ -16,15 +16,17 @@ mod tests {
         ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
     };
     use arrow_array::builder::{Float32Builder, Int32Builder, StringDictionaryBuilder};
-    use arrow_array::types::{Float64Type, Int32Type};
+    use arrow_array::types::{Float16Type, Float64Type, Int32Type};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, LargeBinaryArray, ListArray,
-        RecordBatch, RecordBatchReader, StringArray, StructArray, UInt64Array,
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float16Array, Float32Array,
+        Int32Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchReader, StringArray,
+        StructArray, UInt64Array,
     };
     use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
+    use futures::TryStreamExt;
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
@@ -258,7 +260,10 @@ mod tests {
     #[tokio::test]
     async fn test_write_batch_snapshots_foreign_values() {
         let owner = Arc::new((0..4096).map(AtomicU64::new).collect::<Vec<_>>());
-        // SAFETY: AtomicU64 has u64's layout and owner keeps the allocation alive.
+        // SAFETY: `owner` holds 4096 initialized `AtomicU64`s, which have u64's size and
+        // bit validity, so the pointer is valid for 4096 * 8 bytes, and the clone passed
+        // as the allocation keeps them alive. The test stores into them only after
+        // checking that no `Buffer` over them is left.
         let buffer = unsafe {
             Buffer::from_custom_allocation(
                 NonNull::new(owner.as_ptr() as *mut u8).unwrap(),
@@ -285,6 +290,11 @@ mod tests {
 
         writer.write_batch(&batch).await.unwrap();
         drop(batch);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the writer kept the foreign buffer"
+        );
         owner[17].store(999, Ordering::Relaxed);
         writer.add_schema_metadata("foo", "bar");
         writer.finish().await.unwrap();
@@ -991,6 +1001,91 @@ mod tests {
         );
         // The rejected batch reached no encoder.
         assert_eq!(writer.finish().await.unwrap().num_rows, 1);
+    }
+
+    #[rstest]
+    #[case::mismatched_first(true)]
+    #[case::mismatched_unused(false)]
+    #[tokio::test]
+    async fn test_writer_checks_first_duplicate_column_type(
+        #[case] mismatched_first: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let expected =
+            arrow_array::record_batch!(("b", Int32, [7, 8]), ("a", Int32, [11, 12])).unwrap();
+        let schema = LanceSchema::try_from(expected.schema().as_ref()).unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![11, 12]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["first", "second"]));
+        let (first, second) = if mismatched_first {
+            (strings, values)
+        } else {
+            (values, strings)
+        };
+        let duplicate = RecordBatch::try_from_iter(vec![
+            ("a", first),
+            ("a", second),
+            ("b", expected["b"].clone()),
+        ])
+        .unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if mismatched_first {
+                let mismatch =
+                    field_type_mismatch(writer.write_batch(&duplicate).await.unwrap_err());
+                assert_eq!(mismatch.field_path, "a");
+                assert!(mismatch.to_string().contains("field `a` does not match"));
+                assert_eq!(mismatch.expected.data_type(), &DataType::Int32);
+                assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+                writer.write_batch(&expected).await.unwrap();
+            } else {
+                writer.write_batch(&duplicate).await.unwrap();
+            }
+        }
+        assert_eq!(writer.finish().await.unwrap().num_rows, 4);
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&expected.schema(), &batches).unwrap();
+        let expected =
+            arrow_select::concat::concat_batches(&expected.schema(), &[expected.clone(), expected])
+                .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[rstest]
@@ -2035,6 +2130,34 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_max_page_bytes_env_var() {
+        // `set_var` is unsound while other test threads may read the environment,
+        // so instead the test re-runs itself in a child process that starts with
+        // the variable set. libtest names the thread after the running test, so
+        // the child's filter cannot drift from this test's name.
+        const CHILD_ENV: &str = "LANCE_TEST_MAX_PAGE_BYTES_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                // 2MiB
+                .env(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "child test failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // libtest also exits 0 when the filter matches no test.
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+
         let arrow_field = Field::new("data", DataType::UInt64, false);
         let arrow_schema = Schema::new(vec![arrow_field]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -2044,11 +2167,6 @@ mod tests {
         let batch =
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
-        // 2MiB
-        unsafe {
-            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
-        }
-
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
             ..Default::default()
@@ -2056,10 +2174,11 @@ mod tests {
 
         let path = TempObjFile::default();
         let object_store = ObjectStore::local();
+        // Only the 2.0 encoder splits pages by `max_page_bytes`.
         let mut writer = create_writer(
             object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
-            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_0,
             options,
         )
         .unwrap();
@@ -2084,6 +2203,8 @@ mod tests {
         .unwrap();
 
         for col_metadata in file_reader.metadata().column_metadatas.iter() {
+            // Without the variable, the 4MB of values stay in one page.
+            assert_eq!(col_metadata.pages.len(), 2);
             for page in col_metadata.pages.iter() {
                 let total_size: u64 = page.buffer_sizes.iter().sum();
                 assert!(
@@ -2092,10 +2213,6 @@ mod tests {
                     total_size
                 );
             }
-        }
-
-        unsafe {
-            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
         }
     }
 
@@ -2866,5 +2983,361 @@ mod tests {
             write_and_read_batches(&batches, Some((spill_store, spill_path.as_ref().clone())))
                 .await;
         assert_eq!(baseline, spilled);
+    }
+
+    /// A smooth trajectory with a constant dimension, a NaN payload and a signed
+    /// zero, so the round trip checks float bits rather than float equality.
+    /// With `num_levels`, every value is instead one of that many levels.
+    fn pcodec_trajectory(num_rows: usize, dimension: usize, num_levels: Option<usize>) -> Vec<f64> {
+        let mut values: Vec<f64> = (0..num_rows * dimension)
+            .map(|i| {
+                let (row, item) = (i / dimension, i % dimension);
+                match item {
+                    _ if num_levels.is_some() => (i % num_levels.unwrap()) as f64,
+                    0 if dimension > 1 => 1.0,
+                    _ => (row as f64 * 0.01 * (item + 1) as f64).sin() * 100.0 + item as f64,
+                }
+            })
+            .collect();
+        values[dimension + 1] = f64::from_bits(0x7ff8_dead_beef_0001);
+        values[2 * dimension + 1] = -0.0;
+        values
+    }
+
+    /// Writes `array` as the 2.3 column "signal" and opens it again.
+    async fn write_v2_3_signal(
+        array: &ArrayRef,
+        metadata: HashMap<String, String>,
+        params: CompressionParams,
+    ) -> lance_core::Result<(FileReader, LanceSchema)> {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("signal", array.data_type().clone(), array.null_count() > 0)
+                .with_metadata(metadata),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema, vec![array.clone()]).unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            params,
+        )
+        .unwrap();
+        writer.write_batch(&batch).await?;
+        writer.finish().await?;
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        Ok((file_reader, lance_schema))
+    }
+
+    async fn read_v2_3_signal(
+        file_reader: &FileReader,
+        lance_schema: &LanceSchema,
+        params: lance_io::ReadBatchParams,
+    ) -> ArrayRef {
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            lance_schema,
+            &["signal"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(params, 1024, 16, projection, FilterExpression::no_filter())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let columns: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
+        arrow_select::concat::concat(&columns).unwrap()
+    }
+
+    fn pcodec_metadata() -> HashMap<String, String> {
+        HashMap::from([(
+            lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
+            "pcodec".to_string(),
+        )])
+    }
+
+    fn page_encodings(file_reader: &FileReader) -> Vec<String> {
+        file_reader.metadata().column_metadatas[0]
+            .pages
+            .iter()
+            .map(describe_encoding)
+            .collect()
+    }
+
+    #[rstest]
+    #[case::narrow_f16(DataType::Float16, vec![6], None, 5000)]
+    #[case::narrow_f32(DataType::Float32, vec![3], None, 5000)]
+    #[case::nested_f64(DataType::Float64, vec![4, 4], None, 5000)]
+    #[case::wide_f64(DataType::Float64, vec![64], None, 5000)]
+    // Rows wider than half a chunk still need two rows per non-final chunk.
+    #[case::very_wide_f64(DataType::Float64, vec![4096], None, 7)]
+    #[case::scalar_f64(DataType::Float64, vec![], None, 5000)]
+    // Few distinct values would otherwise be dictionary encoded.
+    #[case::few_levels_f64(DataType::Float64, vec![], Some(4), 5000)]
+    #[case::few_levels_vector_f64(DataType::Float64, vec![8], Some(4), 5000)]
+    #[tokio::test]
+    async fn test_v2_3_pcodec_round_trip(
+        #[case] item_type: DataType,
+        #[case] dims: Vec<i32>,
+        #[case] num_levels: Option<usize>,
+        #[case] num_rows: usize,
+    ) {
+        use lance_io::ReadBatchParams;
+
+        let dimension = dims.iter().product::<i32>() as usize;
+        let values = pcodec_trajectory(num_rows, dimension, num_levels);
+        let mut array: ArrayRef = match item_type {
+            DataType::Float16 => {
+                Arc::new(Float16Array::from_iter_values(values.iter().map(|v| {
+                    <Float16Type as ArrowPrimitiveType>::Native::from_f64(*v)
+                })))
+            }
+            DataType::Float32 => Arc::new(Float32Array::from_iter_values(
+                values.iter().map(|v| *v as f32),
+            )),
+            _ => Arc::new(arrow_array::Float64Array::from(values)),
+        };
+        for dim in dims.iter().rev() {
+            let item = Arc::new(ArrowField::new("item", array.data_type().clone(), true));
+            array = Arc::new(FixedSizeListArray::new(item, *dim, array, None));
+        }
+        let (file_reader, lance_schema) =
+            write_v2_3_signal(&array, pcodec_metadata(), CompressionParams::new())
+                .await
+                .unwrap();
+        for encoding in page_encodings(&file_reader) {
+            assert!(
+                encoding.contains("Pcodec"),
+                "expected pcodec, got: {encoding}"
+            );
+        }
+
+        // Arrow compares primitive values bytewise, so equality is bit-exact.
+        let full = read_v2_3_signal(&file_reader, &lance_schema, ReadBatchParams::RangeFull).await;
+        assert_eq!(full.to_data(), array.to_data());
+        let last_row = num_rows as u32 - 1;
+        for row in [0, 1, 2, 1023, 1024, last_row]
+            .into_iter()
+            .filter(|r| *r <= last_row)
+        {
+            let taken = read_v2_3_signal(
+                &file_reader,
+                &lance_schema,
+                ReadBatchParams::Indices(arrow_array::UInt32Array::from(vec![row])),
+            )
+            .await;
+            assert_eq!(taken.to_data(), array.slice(row as usize, 1).to_data());
+        }
+    }
+
+    /// A `FixedSizeList<Float64, dimension>` trajectory with optional null
+    /// items and null rows.
+    fn pcodec_vectors(
+        num_rows: usize,
+        dimension: i32,
+        item_validity: Option<NullBuffer>,
+        row_validity: Option<NullBuffer>,
+    ) -> ArrayRef {
+        let values = pcodec_trajectory(num_rows, dimension as usize, None);
+        let items = arrow_array::Float64Array::new(values.into(), item_validity);
+        let item = Arc::new(ArrowField::new("item", DataType::Float64, true));
+        Arc::new(FixedSizeListArray::new(
+            item,
+            dimension,
+            Arc::new(items),
+            row_validity,
+        ))
+    }
+
+    #[rstest]
+    // pcodec cannot hold null items, so wide rows fall back to full zip
+    // instead of failing in a raw mini-block.
+    #[case::wide_null_items(
+        pcodec_vectors(64, 1024, Some(NullBuffer::from_iter((0..64 * 1024).map(|i| i != 5))), None),
+        false
+    )]
+    // Mostly-null wide rows would otherwise be stored sparse and uncompressed.
+    #[case::mostly_null_wide_rows(
+        pcodec_vectors(5000, 64, None, Some(NullBuffer::from_iter((0..5000).map(|i| i % 4 == 0)))),
+        true
+    )]
+    #[tokio::test]
+    async fn test_v2_3_pcodec_routing(#[case] array: ArrayRef, #[case] expect_pcodec: bool) {
+        let (file_reader, lance_schema) =
+            write_v2_3_signal(&array, pcodec_metadata(), CompressionParams::new())
+                .await
+                .unwrap();
+        for encoding in page_encodings(&file_reader) {
+            assert_eq!(encoding.contains("Pcodec"), expect_pcodec, "{encoding}");
+        }
+        let full = read_v2_3_signal(
+            &file_reader,
+            &lance_schema,
+            lance_io::ReadBatchParams::RangeFull,
+        )
+        .await;
+        assert_eq!(full.to_data(), array.to_data());
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_pcodec_rejects_full_zip() {
+        let array = pcodec_vectors(16, 16, None, None);
+        let mut metadata = pcodec_metadata();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            "fullzip".to_string(),
+        );
+        let err = write_v2_3_signal(&array, metadata, CompressionParams::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Field 'signal' requests pcodec compression"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_pcodec_params_keep_dictionary_buffers_writable() {
+        // Configured through CompressionParams, pcodec does not disable the
+        // dictionary, whose indices and values must keep their own compression.
+        let array: ArrayRef = Arc::new(arrow_array::Float64Array::from(pcodec_trajectory(
+            5000,
+            1,
+            Some(4),
+        )));
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "signal".to_string(),
+            CompressionFieldParams {
+                compression: Some("pcodec".to_string()),
+                ..Default::default()
+            },
+        );
+        let (file_reader, lance_schema) = write_v2_3_signal(&array, HashMap::new(), params)
+            .await
+            .unwrap();
+        let read = read_v2_3_signal(
+            &file_reader,
+            &lance_schema,
+            lance_io::ReadBatchParams::RangeFull,
+        )
+        .await;
+        assert_eq!(read.to_data(), array.to_data());
+    }
+    #[rstest]
+    #[case::mixed(false)]
+    #[case::all_null(true)]
+    #[tokio::test]
+    async fn test_write_fixed_size_list_masked_struct_nulls(
+        #[case] all_null: bool,
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(false, true)] sliced: bool,
+        #[values(false, true)] column_write: bool,
+    ) {
+        let valid = if all_null {
+            vec![false; 4]
+        } else {
+            vec![true, false, true, false]
+        };
+        let child_valid: Vec<bool> = valid.iter().flat_map(|valid| [*valid; 2]).collect();
+        let values = Int32Array::from(
+            child_valid
+                .iter()
+                .enumerate()
+                .map(|(i, valid)| valid.then_some(i as i32))
+                .collect::<Vec<_>>(),
+        );
+        let entries = Arc::new(StructArray::new(
+            vec![ArrowField::new("value", DataType::Int32, false)].into(),
+            vec![Arc::new(values)],
+            Some(NullBuffer::from(child_valid)),
+        ));
+        let lists = FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", entries.data_type().clone(), false)),
+            2,
+            entries,
+            Some(NullBuffer::from(valid)),
+        )
+        .unwrap();
+        let lists = if sliced { lists.slice(1, 2) } else { lists };
+        let batch =
+            RecordBatch::try_from_iter(vec![("lists", Arc::new(lists) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(batch.schema().as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        if column_write {
+            writer
+                .write_column(0, batch["lists"].clone())
+                .await
+                .unwrap();
+        } else {
+            writer.write_batch(&batch).await.unwrap();
+        }
+        assert_eq!(
+            writer.finish().await.unwrap().num_rows,
+            batch.num_rows() as u64
+        );
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, batch);
     }
 }

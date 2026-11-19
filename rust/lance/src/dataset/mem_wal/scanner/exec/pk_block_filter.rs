@@ -304,7 +304,8 @@ impl datafusion::physical_plan::RecordBatchStream for PkBlockFilterStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::mem_wal::index::IndexStore;
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;

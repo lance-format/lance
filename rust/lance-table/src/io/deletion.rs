@@ -253,7 +253,6 @@ pub async fn read_deletion_file(
 mod test {
 
     use super::*;
-    use object_store::ObjectStoreExt;
 
     #[tokio::test]
     async fn test_write_no_deletions() {
@@ -346,8 +345,7 @@ mod test {
         );
 
         let data = object_store
-            .inner
-            .get(&path)
+            .read_object(&path)
             .await
             .unwrap()
             .bytes()
@@ -400,8 +398,7 @@ mod test {
         );
 
         let data = object_store
-            .inner
-            .get(&path)
+            .read_object(&path)
             .await
             .unwrap()
             .bytes()

@@ -16,6 +16,7 @@ use nom::character::complete::i64;
 use nom::character::complete::multispace0;
 use nom::character::complete::u8;
 use nom::character::complete::u64;
+use nom::combinator::all_consuming;
 use nom::combinator::cond;
 use nom::combinator::map;
 use nom::combinator::map_res;
@@ -26,6 +27,7 @@ use nom::error::ErrorKind;
 use nom::multi::many0;
 use nom::multi::separated_list1;
 use nom::number::complete::double;
+use nom::number::complete::recognize_float_or_exceptions;
 use nom::sequence::delimited;
 use nom::sequence::pair;
 use nom::sequence::preceded;
@@ -409,14 +411,28 @@ fn unary_arith_op(input: &[u8]) -> IResult<&[u8], UnaryOperator> {
     .parse(input)
 }
 
+fn path_number(input: &[u8]) -> IResult<&[u8], Number> {
+    // Consume the full token so integer parsers cannot accept a decimal prefix.
+    let (rest, token) = recognize_float_or_exceptions(input).map_err(|err| match err {
+        // Let numeric-looking field names such as "1example" fall back to path parsing.
+        nom::Err::Failure(err) => nom::Err::Error(err),
+        err => err,
+    })?;
+    let (_, number) = alt((
+        map(all_consuming(u64), Number::UInt64),
+        map(all_consuming(i64), Number::Int64),
+        map(double, Number::Float64),
+    ))
+    .parse(token)?;
+    Ok((rest, number))
+}
+
 fn path_value(input: &[u8]) -> IResult<&[u8], PathValue<'_>> {
     alt((
         value(PathValue::Null, tag("null")),
         value(PathValue::Boolean(true), tag("true")),
         value(PathValue::Boolean(false), tag("false")),
-        map(u64, |v| PathValue::Number(Number::UInt64(v))),
-        map(i64, |v| PathValue::Number(Number::Int64(v))),
-        map(double, |v| PathValue::Number(Number::Float64(v))),
+        map(path_number, PathValue::Number),
         map(string, PathValue::String),
     ))
     .parse(input)

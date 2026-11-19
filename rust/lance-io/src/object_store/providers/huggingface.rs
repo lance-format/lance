@@ -236,6 +236,9 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         Ok(ObjectStore {
             scheme: "hf".to_string(),
             inner,
+            external_blob_inner: None,
+            direct_local_io: false,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             block_size,

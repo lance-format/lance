@@ -346,6 +346,7 @@ enum BlobV2FieldRewritePlan {
         output_field: Arc<ArrowField>,
     },
     Blob {
+        sidecars: Option<Arc<super::SidecarRewrite>>,
         field_id: u32,
         field_name: String,
         output_field: Arc<ArrowField>,
@@ -428,6 +429,7 @@ impl BlobV2FieldRewritePlan {
                 }
             };
             return Ok(Self::Blob {
+                sidecars: None,
                 field_id,
                 field_name: field.name.clone(),
                 output_field,
@@ -524,6 +526,7 @@ impl BlobV2FieldRewritePlan {
             match self {
                 Self::Passthrough { .. } => Ok(array),
                 Self::Blob {
+                    sidecars,
                     field_id,
                     field_name,
                     output_field,
@@ -533,6 +536,9 @@ impl BlobV2FieldRewritePlan {
                         Some(BlobV2Layout::Logical) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
                             if matches!(output_field.data_type(), ArrowDataType::Struct(fields) if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Prepared)) {
+                                if let Some(sidecars) = sidecars {
+                                    return sidecars.prepare(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
+                                }
                                 return preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field, None).await;
                             }
                             let descriptor =
@@ -689,6 +695,9 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     Ok(Arc::new(list_array))
 }
 
+/// Reusable Blob v2 rewrite plan for new fragments of the same dataset.
+///
+/// Used by compaction to preserve payload references or materialize payload bytes.
 pub struct BlobV2BatchRewritePlan {
     row_addr_idx: usize,
     columns: Vec<(usize, BlobV2FieldRewritePlan)>,
@@ -696,7 +705,16 @@ pub struct BlobV2BatchRewritePlan {
 }
 
 impl BlobV2BatchRewritePlan {
-    pub(crate) fn try_new(
+    /// Build a plan from the dataset schema and scanned batch schema.
+    ///
+    /// Input must include `_rowaddr`; Struct children must be complete and in
+    /// dataset order. Scan legacy blobs as binary and Blob v2 as descriptors.
+    /// `keep_row_addr` retains `_rowaddr` in the output.
+    ///
+    /// `preserve_managed` keeps payload references instead of materializing bytes.
+    /// It requires Managed blobs and a V2_2+ writer. Write output to the same
+    /// dataset's primary storage.
+    pub fn try_new(
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
@@ -740,11 +758,45 @@ impl BlobV2BatchRewritePlan {
         })
     }
 
-    pub(crate) fn output_schema(&self) -> &SchemaRef {
+    /// Build the prepared rewrite used by ordinary sidecar compaction.
+    pub(in crate::dataset) fn with_sidecar_rewrite(
+        mut self,
+        sidecars: Arc<super::SidecarRewrite>,
+    ) -> Self {
+        fn configure(plan: &mut BlobV2FieldRewritePlan, sidecars: &Arc<super::SidecarRewrite>) {
+            match plan {
+                BlobV2FieldRewritePlan::Blob {
+                    sidecars: context, ..
+                } => *context = Some(sidecars.clone()),
+                BlobV2FieldRewritePlan::Struct { children, .. } => {
+                    for child in children {
+                        configure(child, sidecars);
+                    }
+                }
+                BlobV2FieldRewritePlan::List { child, .. }
+                | BlobV2FieldRewritePlan::LargeList { child, .. } => configure(child, sidecars),
+                BlobV2FieldRewritePlan::Passthrough { .. } => {}
+            }
+        }
+        for (_, column) in &mut self.columns {
+            configure(column, &sidecars);
+        }
+        self
+    }
+
+    /// Schema of rewritten batches, for opening the destination writer.
+    pub fn output_schema(&self) -> &SchemaRef {
         &self.output_schema
     }
 
-    pub(crate) async fn transform_batch(
+    /// Rewrite a batch using Blob payloads from `dataset`.
+    ///
+    /// `batch` must match the planned schema and contain valid, non-null `UInt64`
+    /// row addresses from this dataset snapshot. These preconditions are not
+    /// validated. Keep the snapshot alive until the output is committed.
+    ///
+    /// May read from storage. Batches can be transformed concurrently.
+    pub async fn transform_batch(
         &self,
         dataset: &Arc<Dataset>,
         batch: RecordBatch,

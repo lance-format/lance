@@ -90,6 +90,13 @@ async fn count_filtered(dataset: &Dataset, filter: &str) -> u64 {
     scanner.count_rows().await.unwrap()
 }
 
+async fn count_filtered_scoped(dataset: &Dataset, filter: &str) -> u64 {
+    let fragments = dataset.fragments().iter().step_by(4).cloned().collect();
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(fragments).filter(filter).unwrap();
+    scanner.count_rows().await.unwrap()
+}
+
 fn bench_count(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let fixture = rt.block_on(Fixture::open());
@@ -109,6 +116,21 @@ fn bench_count(c: &mut Criterion) {
     let filter_50pct = format!("value < {}", TOTAL_ROWS / 2);
     c.bench_function("count_filtered_50pct", |b| {
         b.iter(|| rt.block_on(count_filtered(ds, &filter_50pct)))
+    });
+
+    // Model one of four workers reading a shared index. Its fragment scope
+    // must also bound address-to-row-id conversion, including deletion reads.
+    let expected = (0..TOTAL_ROWS / 2)
+        .filter(|value| {
+            !value.is_multiple_of(100) && (*value as usize / ROWS_PER_FRAGMENT).is_multiple_of(4)
+        })
+        .count() as u64;
+    assert_eq!(
+        rt.block_on(count_filtered_scoped(ds, &filter_50pct)),
+        expected
+    );
+    c.bench_function("count_filtered_scoped_50pct", |b| {
+        b.iter(|| rt.block_on(count_filtered_scoped(ds, &filter_50pct)))
     });
 }
 

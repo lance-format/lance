@@ -534,6 +534,9 @@ mod tests {
             ArrowDataType::LargeUtf8 => Buffer::from_slice_ref([0_i64, 2, 1, 3]),
             _ => unreachable!(),
         };
+        // SAFETY: the child's offsets are deliberately non-monotonic. `build_unchecked` leaves
+        // validity to the caller, and the encoder must reject them, as this test checks, before
+        // anything reads the strings.
         let child_data = unsafe {
             ArrayData::builder(item_type.clone())
                 .len(3)
@@ -543,6 +546,8 @@ mod tests {
         };
         let data_type =
             ArrowDataType::Dictionary(Box::new(ArrowDataType::Int32), Box::new(item_type));
+        // SAFETY: the keys are in bounds for the three-value child; its offsets, covered above,
+        // are the only invalid part.
         let array_data = unsafe {
             ArrayData::builder(data_type.clone())
                 .len(3)

@@ -4,7 +4,8 @@
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::block_on;
-use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::blocking_dataset::conversions::extract_namespace_info;
+use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
@@ -423,10 +424,7 @@ fn key_existence_filter_from_java(
             FilterType::ExactSet(values.into_iter().map(|value| value as u64).collect())
         }
         "BLOOM" => {
-            let bitmap = env
-                .call_method(object, "getBloomBitmap", "()[B", &[])?
-                .l()?;
-            let bitmap = env.convert_byte_array(JByteArray::from(bitmap))?;
+            let bitmap = env.get_vec_u8_from_method(object, "getBloomBitmap")?;
             let num_bits = u32::try_from(
                 env.call_method(object, "getBloomNumBits", "()I", &[])?
                     .i()?,
@@ -1146,13 +1144,19 @@ fn convert_to_java_operation_inner<'local>(
             )?;
             Ok(java_operation)
         }
-        Operation::DataReplacement { replacements } => {
+        Operation::DataReplacement {
+            replacements,
+            data_change,
+        } => {
             let java_replacements = export_vec(env, &replacements)?;
 
             Ok(env.new_object(
                 "org/lance/operation/DataReplacement",
-                "(Ljava/util/List;)V",
-                &[JValue::Object(&java_replacements)],
+                "(Ljava/util/List;Z)V",
+                &[
+                    JValue::Object(&java_replacements),
+                    JValue::Bool(data_change as u8),
+                ],
             )?)
         }
         Operation::DataOverlay { groups } => {
@@ -1244,6 +1248,11 @@ fn convert_to_java_operation_inner<'local>(
         }
         Operation::Unknown { .. } => Err(Error::input_error(
             "Cannot convert an operation written by a newer version of Lance".to_string(),
+        )),
+        // Transaction V2 is experimental for now and has no Java surface yet;
+        // a composite operation has no Java class to map onto.
+        Operation::CompositeOperation(_) => Err(Error::unsupported_error(
+            "CompositeOperation transactions are not exposed to the Java bindings".to_string(),
         )),
     }
 }
@@ -2096,7 +2105,13 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "replacements", |env, replacement| {
                     replacement.extract_object(env)
                 })?;
-            Operation::DataReplacement { replacements }
+            let data_change = env
+                .call_method(java_operation, "dataChange", "()Z", &[])?
+                .z()?;
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            }
         }
         "DataOverlay" => {
             let groups = import_vec_from_method(env, java_operation, "getGroups", |env, group| {

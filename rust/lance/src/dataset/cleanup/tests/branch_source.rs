@@ -129,7 +129,7 @@ async fn cleanup_keeps_files_read_by_legacy_branches() {
         .await
         .unwrap();
     let expected = child.scan().try_into_batch().await.unwrap();
-    let legacy = Dataset::write(
+    Dataset::write(
         some_batch(),
         Arc::new(legacy),
         write_params(WriteMode::Overwrite),
@@ -150,6 +150,8 @@ async fn cleanup_keeps_files_read_by_legacy_branches() {
             .await
             .unwrap();
     }
+    // Open after rewriting the refs so the handle captures the legacy identifier.
+    let legacy = main.checkout_version(("legacy", None)).await.unwrap();
 
     MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
     let before = utc_now() - TimeDelta::try_days(8).unwrap();

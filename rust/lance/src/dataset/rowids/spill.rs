@@ -620,7 +620,11 @@ async fn read_spilled_column(
     let file = scheduler
         .open_file(&path, &data_file.file_size_bytes)
         .await?;
-    let options = dataset.file_reader_options.clone().unwrap_or_default();
+    let options = dataset
+        .file_reader_options
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
     let cache = dataset.metadata_cache.file_metadata_cache(&path);
     let io =
         Arc::new(LanceEncodingsIo::new(file.clone()).with_read_chunk_size(options.read_chunk_size));
@@ -2202,6 +2206,7 @@ mod tests {
                 let read_version = dataset.manifest.version;
                 let operation = Operation::DataReplacement {
                     replacements: vec![replacement],
+                    data_change: true,
                 };
                 dataset = Dataset::commit(
                     Arc::new(dataset),
@@ -2676,7 +2681,10 @@ mod tests {
                     let read_version = self.dataset.manifest.version;
                     self.dataset = Dataset::commit(
                         Arc::new(self.dataset.clone()),
-                        Operation::DataReplacement { replacements },
+                        Operation::DataReplacement {
+                            replacements,
+                            data_change: true,
+                        },
                         Some(read_version),
                         None,
                         None,
