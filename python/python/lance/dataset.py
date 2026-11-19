@@ -2098,7 +2098,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         Column types can be upcasted (such as int32 to int64) or downcasted
         (such as int64 to int32). However, downcasting will fail if there are
-        any values that cannot be represented in the new type. In general,
+        any values that cannot be represented in the new type, such as an
+        integer out of range, a timestamp with more precision than the new
+        unit, a timestamp that is not at midnight when casting to a date, or a
+        decimal with more digits than the new scale. Floats can be downcasted
+        with a loss of precision, but a finite value that is too large for the
+        new type fails rather than becoming infinity. In general,
         columns can be casted to same general type: integers to integers,
         floats to floats, and strings to strings. However, strings, binary, and
         list columns can be casted between their size variants. For example,
