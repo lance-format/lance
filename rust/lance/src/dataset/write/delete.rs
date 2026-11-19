@@ -380,9 +380,11 @@ impl RetryExecutor for DeleteJob {
     }
 }
 
-/// Legacy delete function - uses DeleteBuilder with no retries for backwards compatibility
+/// Legacy `&mut Dataset` entry point. [`Dataset::delete`] delegates here.
+///
+/// Runs through [`DeleteBuilder`], so commit conflicts are retried with that
+/// builder's default settings.
 pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<DeleteResult> {
-    // Use DeleteBuilder with 0 retries to maintain backwards compatibility
     let dataset = Arc::new(ds.clone());
     let result = DeleteBuilder::new(dataset, predicate).execute().await?;
 
