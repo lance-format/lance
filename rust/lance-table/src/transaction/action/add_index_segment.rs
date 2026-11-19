@@ -148,6 +148,14 @@ impl AddIndexSegment {
         self.parts
     }
 
+    /// Stop covering committed fragment `fragment`, whose rows a reader then
+    /// scans, as a column rewrite landing after the segment prunes it.
+    pub(super) fn forget_covered_fragment(&mut self, fragment: u64) {
+        if let Some(covered) = &mut self.parts.covered_fragments {
+            covered.retain(|covered| *covered != Ref::Committed(fragment));
+        }
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         reject_frag_reuse_history("AddIndexSegment", &self.parts.name)?;
         let fields = self
@@ -316,12 +324,13 @@ impl AddIndexSegment {
     /// reader no way to catch it -- an in-place column rewrite "cannot be
     /// detected just by examining metadata", so a reader trusts
     /// `fragment_bitmap` as it finds it. So the build records the data it read,
-    /// and a segment landing after a rewrite of it conflicts (see
-    /// [`Part::IndexedFieldData`](super::Part::IndexedFieldData)). Deletions,
+    /// and a segment landing after a rewrite of it is rebased to give up the
+    /// rewritten fragments (see `transaction::coverage_repair`). Deletions,
     /// overlays and the removal of a whole fragment are excluded on purpose:
     /// each leaves a trace a reader can act on, so each may still run
-    /// alongside a build. A segment naming a removed fragment reaches its rows
-    /// through the fragment reuse history or loses that coverage.
+    /// alongside a build. A compaction under the segment is an overlap too,
+    /// which the resolver settles by whether the fragment reuse history
+    /// recorded the move.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.claim_index_segment(
             self.parts.name.clone(),
@@ -348,15 +357,6 @@ impl AddIndexSegment {
         // applies.
         for field in dependencies.iter().copied() {
             footprint.require_field(field);
-        }
-        for fragment in self
-            .parts
-            .covered_fragments
-            .iter()
-            .flatten()
-            .filter_map(|fragment| fragment.committed())
-        {
-            footprint.require_indexed_field_data(fragment, dependencies.iter().copied());
         }
     }
 }
@@ -1415,5 +1415,48 @@ mod tests {
         )
         .unwrap();
         assert!(indices.is_empty(), "{indices:?}");
+    }
+
+    /// Withdrawing coverage drops the fragment from the one segment named and
+    /// leaves the rest of the set as it was; a segment the set does not add
+    /// has nothing to withdraw.
+    #[test]
+    fn test_withdrawing_coverage_rewrites_only_that_segment() {
+        let segment = covering("by_a", Some(vec![0, 1]));
+        let uuid = segment.uuid;
+        let other = AddIndexSegment::try_new_unchecked(covering("by_b", Some(vec![0, 1]))).unwrap();
+        let mut operation = CompositeOperation::new(vec![UserStep::new(
+            "build",
+            vec![
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(segment.clone()).unwrap(),
+                ),
+                Action::AddIndexSegment(other.clone()),
+            ],
+        )]);
+
+        operation.withdraw_index_coverage(uuid, 0);
+        operation.withdraw_index_coverage(Uuid::new_v4(), 1);
+
+        let expected = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+            covered_fragments: Some(vec![Ref::Committed(1)]),
+            ..segment
+        })
+        .unwrap();
+        assert_eq!(
+            operation.iter_actions().cloned().collect::<Vec<_>>(),
+            vec![
+                Action::AddIndexSegment(expected),
+                Action::AddIndexSegment(other)
+            ]
+        );
+    }
+
+    fn covering(name: &str, fragments: Option<Vec<u64>>) -> AddIndexSegmentParts {
+        AddIndexSegmentParts {
+            covered_fragments: fragments
+                .map(|ids| ids.into_iter().map(Ref::Committed).collect::<Vec<_>>()),
+            ..segment(name, vec![FieldRef::Committed(0)]).into_parts()
+        }
     }
 }

@@ -280,9 +280,7 @@ impl Footprint {
 
     /// The segments a `CreateIndex` adds and removes. Legacy replaces a
     /// same-named index rather than adding to it, so each new segment
-    /// replaces the index, bringing what its bitmap names under it, and needs
-    /// the data it was built from there as it read it (see
-    /// [`Part::IndexedFieldData`]).
+    /// replaces the index, bringing what its bitmap names under it.
     fn index_changes(&mut self, new_indices: &[IndexMetadata], removed_indices: &[IndexMetadata]) {
         for index in new_indices {
             self.write_index(IndexWrite {
@@ -294,14 +292,8 @@ impl Footprint {
                     .map(|bitmap| bitmap.iter().map(u64::from).collect()),
                 replaces: true,
             });
-            let fields: Vec<FieldRef> = field_refs(&index.fields)
-                .chain(field_refs(&index.covering_fields))
-                .collect();
-            for field in fields.iter().copied() {
+            for field in field_refs(&index.fields).chain(field_refs(&index.covering_fields)) {
                 self.require_field(field);
-            }
-            for fragment in index.fragment_bitmap.iter().flatten() {
-                self.require_indexed_field_data(u64::from(fragment), fields.iter().copied());
             }
         }
         for index in removed_indices {
@@ -317,6 +309,12 @@ impl Footprint {
         rewritten_indices: &[RewrittenIndex],
         writes_frag_reuse_index: bool,
     ) {
+        self.did.compacted_fragments.extend(
+            groups
+                .iter()
+                .flat_map(|group| &group.old_fragments)
+                .map(|fragment| fragment.id),
+        );
         self.remap_indices_over(
             groups
                 .iter()

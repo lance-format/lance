@@ -218,7 +218,8 @@ impl<'a> TransactionRebase<'a> {
     }
 
     /// Adapt the set to what landed since it read: fields dropped since are
-    /// left out of the fragments it mints. Otherwise an action set needs no
+    /// left out of the fragments it mints, and index coverage the commits
+    /// since invalidated is withdrawn. Otherwise an action set needs no
     /// rewriting to move to a newer version: its minted ids are allocated when
     /// the actions are applied, against whichever manifest they land on, and
     /// its committed references name coordinates that do not move.
@@ -228,6 +229,7 @@ impl<'a> TransactionRebase<'a> {
         {
             composite_operation.forget_dropped_fields(&read.schema, dataset.schema());
         }
+        self.repair_index_coverage();
         Ok(self.transaction)
     }
 
@@ -316,6 +318,7 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
+        self.repair_index_coverage();
         // Computed before the operation is borrowed mutably below.
         let self_is_superseded_prune = is_superseded_prune_transaction(&self.transaction);
         if let Operation::CreateIndex {
