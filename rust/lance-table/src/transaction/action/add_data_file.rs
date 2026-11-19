@@ -9,6 +9,7 @@ use super::{FieldRef, Footprint, Ref};
 use crate::format::{DataFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
+use lance_file::version::ConcreteFileVersion;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -241,18 +242,44 @@ impl AddDataFile {
         self.data_change
     }
 
+    /// Stop binding `field`, leaving its column in the file unread, the way a
+    /// drop leaves the column of a fragment it finds already committed.
+    /// Returns whether the file still binds any field.
+    pub(super) fn forget_field(&mut self, field: FieldRef) -> bool {
+        let kept = |position: usize| self.field_ids.get(position) != Some(&field);
+        // Columns past the field list are bound by no field, and stay. An
+        // empty list is a v1 file, which binds columns by field id rather
+        // than position.
+        let column_indices: Vec<i32> = (0..self.file.column_indices.len())
+            .filter(|position| kept(*position))
+            .map(|position| self.file.column_indices[position])
+            .collect();
+        self.file.column_indices = column_indices.into();
+        self.field_ids.retain(|id| *id != field);
+        !self.field_ids.is_empty()
+    }
+
     /// The data of every committed field the file backs, in the fragment it is
     /// attached to. A file backing only minted fields writes nothing.
     ///
-    /// TODO: in a fragment this set mints, a drop landing first could be
-    /// adapted to instead of conflicting, by leaving the field out of the
-    /// file, except for a legacy V1 file: its reader places each field's
-    /// columns by the field's position in the list, so leaving one out would
-    /// shift the rest onto the wrong columns.
+    /// In a fragment this set mints, a committed field's existence is not
+    /// required: apply rejects a file naming a field the schema no longer has,
+    /// so after the check a concurrent drop is adapted to instead, by leaving
+    /// the field out of the file (see
+    /// [`CompositeOperation::forget_dropped_fields`](super::CompositeOperation::forget_dropped_fields)).
+    /// Not a legacy V1 file: its reader places each field's columns by the
+    /// field's position in the list, so leaving one out would shift the rest
+    /// onto the wrong columns. Like `DropField`, which keeps a V1 file's list
+    /// whole, it requires every field it backs to still exist instead.
     ///
     /// New values also supersede the field's overlays in a committed fragment;
     /// see [`Footprint::supersede_overlays`].
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        if self.fragment.committed().is_none() && self.is_v1() {
+            for field in self.field_ids.iter().copied() {
+                footprint.require_field(field);
+            }
+        }
         footprint.write_field_data(
             self.fragment,
             self.field_ids.iter().copied(),
@@ -261,6 +288,15 @@ impl AddDataFile {
         if self.data_change {
             footprint.supersede_overlays(self.fragment, self.field_ids.iter().copied());
         }
+    }
+
+    /// Whether the file is in the legacy V1 format, taking a version that
+    /// does not parse as one, since that is the stricter treatment.
+    pub(super) fn is_v1(&self) -> bool {
+        matches!(
+            self.file.file_version(),
+            Ok(ConcreteFileVersion::V1) | Err(_)
+        )
     }
 }
 
@@ -361,6 +397,102 @@ mod tests {
             error.to_string().contains("local fragment token 3"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A drop that landed after an append read is adapted to by leaving the
+    /// field out of the append's new file, whose column then sits unread. A
+    /// V1 file is left whole: its reader places columns by field position.
+    #[test]
+    fn test_adapting_to_a_drop_leaves_the_field_out_of_new_files() {
+        use crate::transaction::action::{CompositeOperation, DropField, UserStep};
+        use crate::transaction::test_support::default_build_config;
+        use crate::transaction::{Operation, ReadVersionState, Transaction};
+
+        let read = apply(
+            &unbacked_manifest(),
+            vec![Action::AddField(AddField::new(0, added_field("dropped")))],
+        )
+        .unwrap();
+        let current = apply(
+            &read,
+            vec![Action::DropField(DropField::new(FieldRef::Committed(1)))],
+        )
+        .unwrap();
+        let file = |fields: &[i32]| {
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    DataFile {
+                        column_indices: (0..).take(fields.len()).collect(),
+                        ..DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0)
+                    },
+                    fields.iter().copied().map(FieldRef::Committed).collect(),
+                    None,
+                    true,
+                )
+                .unwrap(),
+            )
+        };
+        let append = CompositeOperation::new(vec![UserStep::new(
+            "append",
+            vec![
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+                    id: Ref::Local(0),
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                })),
+                file(&[0, 1]),
+                file(&[1]),
+            ],
+        )]);
+        let land = |append: &CompositeOperation| {
+            Transaction::new(
+                read.version,
+                Operation::CompositeOperation(append.clone()),
+                None,
+            )
+            .build_manifest_with_read_version(
+                Some(&current),
+                vec![],
+                "tx.txn",
+                &default_build_config(),
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
+            )
+            .map(|(manifest, _)| manifest)
+        };
+
+        let error = land(&append).unwrap_err();
+        assert!(
+            error.to_string().contains("which does not exist"),
+            "unexpected error: {error}"
+        );
+
+        let mut v1_append = append.clone();
+        for action in v1_append.steps[0].actions.iter_mut() {
+            if let Action::AddDataFile(file) = action {
+                file.file = DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V1);
+            }
+        }
+        v1_append.forget_dropped_fields(&read.schema, &current.schema);
+        assert!(land(&v1_append).is_err(), "a V1 file is not adapted");
+
+        let mut append = append;
+        append.forget_dropped_fields(&read.schema, &current.schema);
+        let manifest = land(&append).unwrap();
+        let added = manifest.fragments.last().unwrap();
+        assert_eq!(
+            added.files.len(),
+            1,
+            "a file left binding nothing is dropped"
+        );
+        assert_eq!(added.files[0].fields.as_ref(), &[0]);
+        assert_eq!(added.files[0].column_indices.as_ref(), &[0]);
     }
 
     /// `field_ids` is the only field list on the wire; a second one in the

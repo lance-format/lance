@@ -91,6 +91,10 @@ pub enum Part {
     /// a child is added under a field the read version holds, which a writer
     /// that read before may write packed without the child.
     NewRowSchema,
+    /// The whole schema: every field and all its metadata.
+    Schema,
+    /// Every fragment.
+    Fragments,
     /// One key of one of the manifest's string maps.
     MapEntry { map: ConfigMap, key: String },
     /// One of the manifest's string maps, every key included.
@@ -146,6 +150,10 @@ struct Did {
     /// The committed fields, by committed fragment, it wrote new base values
     /// for, which tombstone every overlay on them as they land.
     superseded_overlays: HashSet<(u64, i32)>,
+    /// Committed fields it replaced by a field of the same name with an id of
+    /// its own, as a cast does. A writer that bound the old id in a fragment
+    /// of its own wrote values the new field would read back as null.
+    replaced_fields: HashSet<i32>,
     /// Rewrote the table wholesale. Landing first, it preempts everything
     /// that read before it; landing second, it wins over what landed in
     /// between, and only its parts and forbids are checked.
@@ -194,6 +202,10 @@ enum Forbid {
     IndexWrite(IndexWrite),
     /// No edit of this index segment.
     SegmentEdit(Uuid),
+    /// This field, bound in a fragment the transaction mints, was not replaced
+    /// by a field of the same name: the values would be read back as null.
+    /// A plain drop is adapted to after the check instead.
+    FieldReplaced(i32),
     /// No new base values were written for this field in this fragment: they
     /// tombstone every overlay on it as they land, this transaction's
     /// included, so its values would be lost without a trace.
@@ -250,6 +262,7 @@ impl Forbid {
             Self::OverlaySuperseded { fragment, field } => {
                 theirs.superseded_overlays.contains(&(*fragment, *field))
             }
+            Self::FieldReplaced(field) => theirs.replaced_fields.contains(field),
         }
     }
 
@@ -266,6 +279,11 @@ impl Forbid {
             Self::RowIds(_) => "a new fragment carries some of the same row ids".into(),
             Self::IndexWrite(write) => format!("index '{}' was written", write.name),
             Self::SegmentEdit(segment) => format!("index segment {segment} was edited"),
+            Self::FieldReplaced(field) => {
+                format!(
+                    "field {field}, which this one writes, was replaced by a field of the same name"
+                )
+            }
             Self::OverlaySuperseded { fragment, field } => format!(
                 "new values for field {field} in fragment {fragment} tombstone the overlay \
                  this one adds"
@@ -397,14 +415,12 @@ impl Footprint {
 
     /// Record that this transaction writes `fields`' data in `fragment`.
     ///
-    /// Each committed field must still be there, in a fragment this
-    /// transaction mints as in a committed one: apply rejects a file naming a
-    /// field the schema no longer has.
-    ///
     /// In a committed fragment, each committed field's backing is written,
-    /// so two writers of one field's data collide. A field this transaction
-    /// mints writes nothing a concurrent writer can name, but its cells are
-    /// lost if the fragment is, so the fragment must stay.
+    /// so two writers of one field's data collide, and the field must still
+    /// be there: a drop landing first tombstoned it out of the fragment, and
+    /// a file written for it now would put the column back. A field this
+    /// transaction mints writes nothing a concurrent writer can name, but its
+    /// cells are lost if the fragment is, so the fragment must stay.
     ///
     /// New values (`data_change`) are prepared against the schema the
     /// transaction read, so they need [`Part::NewRowSchema`].
@@ -418,15 +434,15 @@ impl Footprint {
         if data_change && !fields.is_empty() {
             self.read(Part::NewRowSchema);
         }
-        for field in fields.iter().copied() {
-            self.read(Part::FieldExists(field));
-        }
         let Some(fragment) = fragment.committed() else {
+            self.forbids
+                .extend(fields.iter().copied().map(Forbid::FieldReplaced));
             return;
         };
         self.require_fragment(fragment);
         self.forbids.push(Forbid::RelocationFrom(fragment));
         for field in fields.iter().copied() {
+            self.read(Part::FieldExists(field));
             self.read(Part::FieldData { fragment, field });
         }
         if data_change {
@@ -770,6 +786,8 @@ impl From<&CompositeOperation> for Footprint {
         // values as they were read, so values written since would be lost.
         // Names are not matched, so any drop alongside any add counts; the
         // cost is a spurious conflict for an unrelated drop and add in one set.
+        // Committed, the dropped field counts as replaced, so a writer that
+        // bound it in a fragment of its own is not adapted as for a drop.
         let adds_field = composite_operation
             .iter_actions()
             .any(|action| matches!(action, Action::AddField(_)));
@@ -777,6 +795,9 @@ impl From<&CompositeOperation> for Footprint {
             for action in composite_operation.iter_actions() {
                 if let Action::DropField(drop) = action {
                     footprint.require_no_values_written(drop.field());
+                    if let Some(field) = committed_field(drop.field()) {
+                        footprint.did.replaced_fields.insert(field);
+                    }
                 }
             }
         }

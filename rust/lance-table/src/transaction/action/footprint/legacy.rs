@@ -5,11 +5,10 @@
 //!
 //! A named operation has no actions to ask, so its footprint is read straight
 //! off the operation. Several carry post-images -- a fragment restated whole,
-//! as `Delete` and `Update` do -- and applying one replaces everything it
-//! names, not just the part the operation meant to change. So whatever an
-//! operation restates, it reads whole: any change to it since conflicts. An
-//! operation whose post-image is the whole schema, as `Merge` and `Project`
-//! carry, is not described yet and fails closed.
+//! as `Delete` and `Update` do, or the whole schema, as `Merge` and `Project`
+//! do -- and applying one replaces everything it names, not just the part the
+//! operation meant to change. So whatever an operation restates, it reads
+//! whole: any change to it since conflicts.
 //!
 //! Committed, only the facts are read (see [`Footprint`]), and a named
 //! operation states those the same way an action set does.
@@ -22,6 +21,8 @@ use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use crate::transaction::action::{AddOverlays, ConfigUpdate};
 use crate::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use lance_core::datatypes::Schema;
+use std::collections::HashSet;
 
 impl Footprint {
     /// What `transaction`, which read `read`, reads and writes. An action
@@ -182,13 +183,39 @@ impl Footprint {
             // A clone commits into a dataset of its own, and legacy finds it
             // compatible with every operation.
             Operation::Clone { .. } => {}
-            // A merge or projection restates the whole schema, and the MemWAL
-            // state is checked against the data it compacted; neither is
-            // described by parts yet. An unknown operation may touch anything.
-            Operation::Merge { .. }
-            | Operation::Project { .. }
-            | Operation::UpdateMemWalState { .. }
-            | Operation::Unknown { .. } => footprint.mark_opaque(),
+            // A merge installs the schema and the fragment list it carries,
+            // built from what it read: every fragment it read is restated,
+            // and one added since is dropped, as is every field added since.
+            // Committed, it wrote the values of every field it rebound to a
+            // new file in a fragment it read.
+            Operation::Merge {
+                fragments, schema, ..
+            } => {
+                footprint.read(Part::Schema);
+                footprint.read(Part::Fragments);
+                footprint.add_required_column();
+                footprint.tightenings(&read.schema, schema);
+                footprint.append(&merged_fragments_added(fragments, read));
+                footprint
+                    .did
+                    .wrote_values
+                    .extend(merged_values_written(fragments, read));
+                footprint
+                    .did
+                    .replaced_fields
+                    .extend(replaced_fields(&read.schema, schema));
+            }
+            // A projection installs the schema it carries, but prunes the files
+            // of the fields it drops from the fragments as they are at commit.
+            Operation::Project { schema, .. } => {
+                footprint.read(Part::Schema);
+                footprint.tightenings(&read.schema, schema);
+            }
+            // The MemWAL state is checked against the data it compacted, which
+            // no part describes yet. An unknown operation may touch anything.
+            Operation::UpdateMemWalState { .. } | Operation::Unknown { .. } => {
+                footprint.mark_opaque()
+            }
         }
         footprint
     }
@@ -218,6 +245,21 @@ impl Footprint {
             }
             for file in &fragment.files {
                 self.write_field_data(Ref::Local(0), field_refs(&file.fields), true);
+            }
+        }
+    }
+
+    /// The fields a schema installed over `read` tightens to non-nullable. A
+    /// tightening was checked against the values the operation read, so it
+    /// holds only if none were written since.
+    fn tightenings(&mut self, read: &Schema, installed: &Schema) {
+        for field in read.fields_pre_order() {
+            if let Some(kept) = installed.field_by_id(field.id)
+                && field.nullable
+                && !kept.nullable
+            {
+                self.require_no_values_written(FieldRef::Committed(field.id));
+                self.add_required_column();
             }
         }
     }
@@ -289,4 +331,51 @@ impl Footprint {
             self.rewrite_index(FRAG_REUSE_INDEX_NAME.to_string());
         }
     }
+}
+
+/// The fields the read version holds whose values a merge rewrote in a
+/// fragment it read: those backed by a file the fragment did not have. The
+/// first occurrence of a read id is that fragment, as in
+/// [`merged_fragments_added`].
+fn merged_values_written(fragments: &[Fragment], read: &Manifest) -> HashSet<i32> {
+    let mut seen = HashSet::new();
+    fragments
+        .iter()
+        .filter(|merged| seen.insert(merged.id))
+        .filter_map(|merged| Some((merged, read.fragment_by_id(merged.id)?)))
+        .flat_map(|(merged, was)| {
+            merged
+                .files
+                .iter()
+                .filter(move |file| !was.files.contains(file))
+        })
+        .flat_map(|file| file.fields.iter().copied())
+        .filter(|field| *field >= 0 && read.schema.field_by_id(*field).is_some())
+        .collect()
+}
+
+/// The fields of `read` that `installed` replaces by a field of the same
+/// path with another id, as a cast does.
+fn replaced_fields(read: &Schema, installed: &Schema) -> Vec<i32> {
+    read.fields_pre_order()
+        .filter(|field| installed.field_by_id(field.id).is_none())
+        .filter(|field| {
+            read.field_path(field.id)
+                .is_ok_and(|path| installed.field(&path).is_some())
+        })
+        .map(|field| field.id)
+        .collect()
+}
+
+/// The fragments in a merge's list that are not the merged form of one it
+/// read. As the apply decides it: the first occurrence of a read id is that
+/// fragment, and everything else is new.
+fn merged_fragments_added(fragments: &[Fragment], read: &Manifest) -> Vec<Fragment> {
+    let read_ids: HashSet<u64> = read.fragments.iter().map(|fragment| fragment.id).collect();
+    let mut seen = HashSet::new();
+    fragments
+        .iter()
+        .filter(|fragment| !read_ids.contains(&fragment.id) || !seen.insert(fragment.id))
+        .cloned()
+        .collect()
 }

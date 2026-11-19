@@ -105,6 +105,15 @@ impl<'a> Window<'a> {
                         None => !field.nullable || was.contains_key(&field.parent_id),
                     })
             }
+            // Schema equality compares fields, their metadata included, but
+            // not the schema's own metadata.
+            Part::Schema => {
+                read.schema != latest.schema || read.schema.metadata != latest.schema.metadata
+            }
+            Part::Fragments => {
+                !std::sync::Arc::ptr_eq(&read.fragments, &latest.fragments)
+                    && read.fragments != latest.fragments
+            }
             Part::MapEntry { map, key } => {
                 map_of(read, map).and_then(|entries| entries.get(key))
                     != map_of(latest, map).and_then(|entries| entries.get(key))
