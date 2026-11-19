@@ -3166,4 +3166,182 @@ mod tests {
         .await;
         assert_eq!(read.to_data(), array.to_data());
     }
+
+    async fn write_primitive_fsl(
+        fs: &FsFixture,
+        lists: &FixedSizeListArray,
+        version: ConcreteFileVersion,
+        is_column_write: bool,
+    ) -> u64 {
+        let batch =
+            RecordBatch::try_from_iter(vec![("lists", Arc::new(lists.clone()) as ArrayRef)])
+                .unwrap();
+        let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        for part in [batch.slice(0, 1), batch.slice(1, batch.num_rows() - 1)] {
+            if is_column_write {
+                writer.write_column(0, part.column(0).clone()).await
+            } else {
+                writer.write_batch(&part).await
+            }
+            .expect("Arrow-valid fixed-size lists should be writable");
+        }
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap().size_bytes
+    }
+
+    #[rstest]
+    #[case::masked_values(true, false)]
+    #[case::sliced_masked_values(true, true)]
+    #[case::nullable_item(false, false)]
+    #[tokio::test]
+    async fn test_primitive_fsl_masked_items(
+        #[case] item_is_non_nullable: bool,
+        #[case] is_sliced: bool,
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+        #[values(false, true)] is_column_write: bool,
+    ) {
+        let item = Arc::new(ArrowField::new(
+            "item",
+            DataType::Int32,
+            !item_is_non_nullable,
+        ));
+        let values = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(3),
+            None,
+            None,
+            Some(7),
+            item_is_non_nullable.then_some(9),
+        ]));
+        let lists = FixedSizeListArray::try_new(
+            item,
+            2,
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let lists = if is_sliced { lists.slice(1, 2) } else { lists };
+        let fs = FsFixture::default();
+        let size = write_primitive_fsl(&fs, &lists, version, is_column_write).await;
+
+        let batches = crate::testing::read_lance_file(
+            &fs,
+            Arc::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let batch = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let output = batch["lists"]
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(output.len(), lists.len());
+        assert_eq!(output.nulls(), lists.nulls());
+        for row in 0..lists.len() {
+            if lists.is_valid(row) {
+                assert_eq!(output.value(row).to_data(), lists.value(row).to_data());
+            }
+        }
+
+        // The stable format already treats the primitive list item field
+        // as nullable. Compare against writing the same data with that schema.
+        if version != ConcreteFileVersion::V2_3 && item_is_non_nullable {
+            let canonical = FixedSizeListArray::new(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                2,
+                lists.values().clone(),
+                lists.nulls().cloned(),
+            );
+            let control = FsFixture::default();
+            let control_size =
+                write_primitive_fsl(&control, &canonical, version, is_column_write).await;
+            let actual = fs
+                .object_store
+                .open(&fs.tmp_path)
+                .await
+                .unwrap()
+                .get_range(0..size as usize)
+                .await
+                .unwrap();
+            let expected = control
+                .object_store
+                .open(&control.tmp_path)
+                .await
+                .unwrap()
+                .get_range(0..control_size as usize)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_primitive_fsl_masked_items_sparse_mixed_chunks() {
+        let fs = FsFixture::default();
+        let width = 64;
+        let values = Int32Array::from_iter(
+            (0..width)
+                .map(Some)
+                .chain(std::iter::repeat_n(None, 4 * width as usize)),
+        );
+        let lists = FixedSizeListArray::new(
+            Arc::new(ArrowField::new("item", DataType::Int32, false)),
+            width,
+            Arc::new(values),
+            Some(NullBuffer::from(vec![true, false, false, false, false])),
+        );
+        write_primitive_fsl(&fs, &lists, ConcreteFileVersion::V2_3, false).await;
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let pages = &reader.metadata().column_infos[0].page_infos;
+        assert_eq!(pages.len(), 1);
+        assert!(matches!(
+            &pages[0].encoding,
+            lance_encoding::decoder::PageEncoding::Planar(layout) if layout.sparse().is_some()
+        ));
+        let batches = futures::TryStreamExt::try_collect::<Vec<RecordBatch>>(
+            reader
+                .read_stream(
+                    lance_io::ReadBatchParams::RangeFull,
+                    2,
+                    1,
+                    lance_encoding::decoder::FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let batch = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let output = batch["lists"]
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(output.nulls(), lists.nulls());
+        assert_eq!(output.value(0).to_data(), lists.value(0).to_data());
+    }
 }

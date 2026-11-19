@@ -2677,6 +2677,16 @@ impl PrimitiveStructuralEncoder {
         repdef: &mut RepDefBuilder,
         keep_original_array: bool,
     ) -> Result<Arc<dyn Array>> {
+        // Primitive list item fields read back as nullable. Use that
+        // representation for every chunk so a page can gather chunks
+        // with and without masked item nulls together.
+        let nullable_list_type = match array.data_type() {
+            DataType::FixedSizeList(item, size) if !item.is_nullable() => {
+                let item = Arc::new(item.as_ref().clone().with_nullable(true));
+                Some(DataType::FixedSizeList(item, *size))
+            }
+            _ => None,
+        };
         if let Some(validity) = array.nulls() {
             if keep_original_array {
                 repdef.add_validity_bitmap(validity.clone());
@@ -2691,12 +2701,17 @@ impl PrimitiveStructuralEncoder {
             {
                 return Ok(array);
             }
-            let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
-            Ok(make_array(data_no_nulls))
         } else {
             repdef.add_no_null(array.len());
-            Ok(array)
+            if nullable_list_type.is_none() {
+                return Ok(array);
+            }
         }
+        let mut builder = array.to_data().into_builder().nulls(None);
+        if let Some(data_type) = nullable_list_type {
+            builder = builder.data_type(data_type);
+        }
+        Ok(make_array(builder.build()?))
     }
 
     fn extract_validity(
