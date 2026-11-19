@@ -39,10 +39,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
-use object_store::{
-    ObjectStoreExt,
-    throttle::{ThrottleConfig, ThrottledStore},
-};
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
@@ -1081,7 +1078,13 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
         .parts_dir(&dataset.data_dir())
         .join(part.file_name.as_str());
     let store = dataset.object_store(None).await.unwrap();
-    let original = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+    let original = store
+        .read_object(&path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
     let mut changed = original.to_vec();
     if grow {
         changed.push(0);
@@ -1089,8 +1092,7 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
         changed.pop();
     }
     store
-        .inner
-        .put(&path, Bytes::from(changed).into())
+        .put_payload(&path, Bytes::from(changed).into())
         .await
         .unwrap();
     let error = dataset
@@ -1111,7 +1113,7 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
             .await
             .unwrap()
     );
-    store.inner.put(&path, original.into()).await.unwrap();
+    store.put_payload(&path, original.into()).await.unwrap();
     dataset
         .concat_data_file_parts(&target, &[part])
         .await

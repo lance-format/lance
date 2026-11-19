@@ -241,8 +241,7 @@ mod test {
         let body = b"manifest body";
 
         object_store
-            .inner
-            .put(&final_path, PutPayload::from_static(body))
+            .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
         inner_store
@@ -274,8 +273,7 @@ mod test {
         let v1_path = ManifestNamingScheme::V1.manifest_path(&base_path, version);
 
         object_store
-            .inner
-            .put(&v1_path, PutPayload::from_static(b"v1 manifest body"))
+            .put_payload(&v1_path, PutPayload::from_static(b"v1 manifest body"))
             .await
             .expect("seed V1 manifest");
         inner_store.lock().await.insert(
@@ -307,8 +305,7 @@ mod test {
         let body = b"manifest body";
 
         object_store
-            .inner
-            .put(&final_path, PutPayload::from_static(body))
+            .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
         let handler = ExternalManifestCommitHandler {
@@ -343,8 +340,7 @@ mod test {
         let body = b"manifest body";
 
         object_store
-            .inner
-            .put(&final_path, PutPayload::from_static(body))
+            .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
         let handler = ExternalManifestCommitHandler {
@@ -367,8 +363,7 @@ mod test {
             .await
             .expect("the canonical manifest should resolve from object storage");
         let current_meta = object_store
-            .inner
-            .head(&resolved.path)
+            .stat(&resolved.path)
             .await
             .expect("read current object-store metadata");
         assert_eq!(resolved.e_tag, current_meta.e_tag);
@@ -435,13 +430,11 @@ mod test {
         let version = 1;
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
         object_store
-            .inner
-            .put(&staging_path, PutPayload::from_static(b"manifest body"))
+            .put_payload(&staging_path, PutPayload::from_static(b"manifest body"))
             .await
             .expect("seed staging manifest");
         let staging_meta = object_store
-            .inner
-            .head(&staging_path)
+            .stat(&staging_path)
             .await
             .expect("read staging metadata");
 
@@ -465,8 +458,7 @@ mod test {
             .await
             .expect("finalize manifest");
         let final_meta = object_store
-            .inner
-            .head(&location.path)
+            .stat(&location.path)
             .await
             .expect("read finalized metadata");
 

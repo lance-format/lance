@@ -4439,8 +4439,7 @@ mod tests {
             .join(dataset.manifest.fragments[0].files[0].path.as_str());
         let saved = dataset
             .object_store
-            .inner
-            .get(&file)
+            .read_object(&file)
             .await
             .unwrap()
             .bytes()
@@ -4484,8 +4483,7 @@ mod tests {
         assert_eq!(task.managed_scan_permits.available_permits(), 1);
         dataset
             .object_store
-            .inner
-            .put(&file, saved.into())
+            .put_payload(&file, saved.into())
             .await
             .unwrap();
         assert!(

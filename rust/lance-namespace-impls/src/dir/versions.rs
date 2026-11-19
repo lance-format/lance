@@ -9,10 +9,7 @@ use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{CreateTableVersionResponse, TableVersion};
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, ObjectMeta, ObjectStore as OSObjectStore, ObjectStoreExt, PutMode,
-    PutOptions,
-};
+use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStoreExt, PutMode, PutOptions};
 
 use super::DirectoryNamespace;
 
@@ -81,7 +78,7 @@ impl DirectoryNamespace {
             return Ok(false);
         }
 
-        let staging_bytes = match self.object_store.inner.get(staging_path).await {
+        let staging_bytes = match self.object_store.read_object(staging_path).await {
             Ok(r) => r.bytes().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
@@ -103,8 +100,7 @@ impl DirectoryNamespace {
 
         let final_bytes = self
             .object_store
-            .inner
-            .get(final_path)
+            .read_object(final_path)
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
@@ -233,7 +229,6 @@ impl DirectoryNamespace {
     ) -> std::result::Result<(), ObjectStoreError> {
         match self
             .object_store
-            .inner
             .copy_if_not_exists(staging_path, final_path)
             .await
         {
@@ -242,8 +237,7 @@ impl DirectoryNamespace {
             | Err(ObjectStoreError::NotSupported { .. }) => {
                 let manifest_data = self
                     .object_store
-                    .inner
-                    .get(staging_path)
+                    .read_object(staging_path)
                     .await?
                     .bytes()
                     .await
@@ -255,8 +249,7 @@ impl DirectoryNamespace {
                         ))),
                     })?;
                 self.object_store
-                    .inner
-                    .put_opts(
+                    .put_payload_opts(
                         final_path,
                         manifest_data.into(),
                         PutOptions {
