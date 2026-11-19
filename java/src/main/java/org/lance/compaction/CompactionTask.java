@@ -66,7 +66,8 @@ public class CompactionTask implements Serializable {
           compactionOptions.getExcludedFragmentIds(),
           compactionOptions.getDataStorageVersion(),
           compactionOptions.getMaxDataFilesPerFragment(),
-          compactionOptions.getScope());
+          compactionOptions.getScope(),
+          compactionOptions.getDataCacheBytes());
     }
   }
 
@@ -91,7 +92,8 @@ public class CompactionTask implements Serializable {
       List<Long> excludedFragmentIds,
       Optional<String> dataStorageVersion,
       Optional<Long> maxDataFilesPerFragment,
-      Optional<String> scope);
+      Optional<String> scope,
+      Optional<Long> dataCacheBytes);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;

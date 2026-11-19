@@ -174,6 +174,41 @@ def test_bf16_fixed_size_list_cast():
         assert casted == fsl
 
 
+def test_fixed_size_list_cast_sliced_with_nulls():
+    values = pa.array(np.arange(20, dtype=np.float32))
+    # ``from_arrays(mask=...)`` needs PyArrow 15, so build from buffers.
+    validity = pa.array([True] * 4 + [False] + [True] * 5)
+    fsl = pa.Array.from_buffers(
+        pa.list_(pa.float32(), 2),
+        10,
+        [validity.buffers()[1]],
+        null_count=1,
+        children=[values],
+    )
+    sliced = fsl.slice(4, 3)
+    targets = [pa.float64(), lance.arrow.BFloat16Type()]
+    try:
+        # Casting float32 to float16 is not implemented in older PyArrow.
+        pa.array([1.0], pa.float32()).cast(pa.float16())
+        targets.append(pa.float16())
+    except pa.ArrowNotImplementedError:
+        pass
+    for target in targets:
+        casted = lance.arrow.cast(sliced, pa.list_(target, 2))
+        assert len(casted) == 3
+        assert casted.is_null().to_pylist() == [True, False, False]
+        back = lance.arrow.cast(casted, sliced.type)
+        assert back.is_null().to_pylist() == [True, False, False]
+        assert back.values.slice(2, 4).to_pylist() == [10.0, 11.0, 12.0, 13.0]
+
+
+def test_fixed_size_list_cast_without_nulls():
+    fsl = pa.FixedSizeListArray.from_arrays(pa.array([1, 2, 3, 4], pa.float32()), 2)
+    casted = lance.arrow.cast(fsl, pa.list_(pa.float64(), 2))
+    assert casted.null_count == 0
+    assert casted.to_pylist() == [[1.0, 2.0], [3.0, 4.0]]
+
+
 def test_bf16_roundtrip(tmp_path: Path):
     import numpy as np
     from ml_dtypes import bfloat16

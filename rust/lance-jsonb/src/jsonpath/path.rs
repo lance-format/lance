@@ -54,7 +54,12 @@ pub enum Path<'a> {
     /// There can be more than one index, e.g. `$[0, last-1 to last, 5]` represents the first,
     /// the last two, and the sixth element in an Array.
     ArrayIndices(Vec<ArrayIndex>),
-    /// `?(<expression>)` represents selecting all elements in an object or array that match the filter expression, like `$.book[?(@.price < 10)]`.
+    /// `?(<expression>)` represents selecting all elements in an object or array that match the filter expression, like `$.book[*]?(@.price < 10)`.
+    ///
+    /// ```
+    /// # use lance_jsonb::jsonpath::parse_json_path;
+    /// assert!(parse_json_path(b"$.book[*]?(@.price < 10)").is_ok());
+    /// ```
     FilterExpr(Box<Expr<'a>>),
     /// `<expression>` standalone filter expression, like `$.book[*].price > 10`,
     /// and arithmetic expression, like `-$.a[*]` or `$.a + 3`
