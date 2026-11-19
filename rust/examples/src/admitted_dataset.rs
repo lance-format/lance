@@ -22,10 +22,16 @@
 //! requests share one payload pool, while each mode keeps the same per-request I/O
 //! budget. The configured I/O budget therefore scales with REQUESTS; the payload
 //! pool is not an RSS or total transport-memory bound. Each request owns one sink.
+//! `run-cancel MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES CANCEL_AFTER_BATCHES [ATTEMPT_BYTES]`
+//! cancels request zero while it holds the specified output batch. The remaining
+//! requests must finish and validate their complete output using the same pool.
+//! REQUESTS must be at least two. The cancelled prefix is reported separately;
+//! it is never counted as a complete result. An unreachable cancellation point,
+//! an error in any request, or retained final credit fails the command.
 //! Optional positive ATTEMPT_BYTES overrides the admitted/prefetched attempt only,
 //! leaving I/O and shared pool budgets unchanged. Omit it to retain the original
 //! mode defaults; ordinary mode rejects it because it has no payload admission.
-//! Prefix either drain command with `on-worker` to execute the entire request
+//! Prefix any drain command with `on-worker` to execute the entire request
 //! group in one Tokio worker task instead of the runtime's root future. This
 //! changes consumer placement only, not request concurrency or batch processing.
 //! Compare both placements with the same binary and controls; worker placement
@@ -75,12 +81,14 @@ use lance_file::version::LanceFileVersion;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use serde::Serialize;
 
+#[path = "admitted_dataset/cancellation.rs"]
+mod cancellation;
 #[path = "admitted_dataset/dictionary.rs"]
 mod dictionary;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-const USAGE: &str = "usage: prepare|prepare-dictionary URI ROWS FRAME_BYTES FRAGMENT_ROWS | [on-worker] run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US [ATTEMPT_BYTES] | [on-worker] run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES [ATTEMPT_BYTES]";
+const USAGE: &str = "usage: prepare|prepare-dictionary URI ROWS FRAME_BYTES FRAGMENT_ROWS | [on-worker] run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US [ATTEMPT_BYTES] | [on-worker] run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES [ATTEMPT_BYTES] | [on-worker] run-cancel MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES CANCEL_AFTER_BATCHES [ATTEMPT_BYTES]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,8 +103,11 @@ impl ConsumerExecutor {
             return Ok(Self::Caller);
         }
         args.remove(0);
-        if !matches!(args.first().map(String::as_str), Some("run" | "run-many")) {
-            return Err("on-worker requires run or run-many".into());
+        if !matches!(
+            args.first().map(String::as_str),
+            Some("run" | "run-many" | "run-cancel")
+        ) {
+            return Err("on-worker requires run, run-many or run-cancel".into());
         }
         Ok(Self::Worker)
     }
@@ -216,7 +227,7 @@ impl Sink {
         Ok(())
     }
 
-    fn finish(self) -> Output {
+    fn snapshot(&self) -> Output {
         Output {
             rows: self.rows,
             payload_bytes: self.bytes,
@@ -224,8 +235,14 @@ impl Sink {
             batches: self.batches,
             shared_reserved_bytes_on_batch_max: self.shared_reserved_bytes_on_batch_max,
             first_batch_seconds: self.first_batch_seconds,
-            completed_seconds: self.started.map(|t| t.elapsed().as_secs_f64()),
+            completed_seconds: None,
         }
+    }
+
+    fn finish(self) -> Output {
+        let mut output = self.snapshot();
+        output.completed_seconds = self.started.map(|t| t.elapsed().as_secs_f64());
+        output
     }
 }
 
@@ -431,6 +448,7 @@ async fn drain(
     config: &DrainConfig,
     budget: &Arc<AllocationBudget>,
     started: Option<Instant>,
+    mut cancellation: Option<cancellation::Trigger>,
 ) -> Result<Output> {
     let DrainConfig {
         mode,
@@ -456,6 +474,9 @@ async fn drain(
             let mut stream = scanner.try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
                 sink.consume(&batch)?;
+                if let Some(trigger) = &mut cancellation {
+                    trigger.after_batch(&sink).await?;
+                }
                 if !slow.is_zero() {
                     tokio::time::sleep(slow).await;
                 }
@@ -485,6 +506,9 @@ async fn drain(
                         .shared_reserved_bytes_on_batch_max
                         .max(budget.reserved());
                     sink.consume(&batch)?;
+                    if let Some(trigger) = &mut cancellation {
+                        trigger.after_batch(&sink).await?;
+                    }
                     if !slow.is_zero() {
                         tokio::time::sleep(slow).await;
                     }
@@ -502,6 +526,9 @@ async fn drain(
                             .shared_reserved_bytes_on_batch_max
                             .max(budget.reserved());
                         sink.consume(&batch)?;
+                        if let Some(trigger) = &mut cancellation {
+                            trigger.after_batch(&sink).await?;
+                        }
                         if !slow.is_zero() {
                             tokio::time::sleep(slow).await;
                         }
@@ -540,7 +567,7 @@ async fn drain_all(
     }
     let result: Result<Vec<Output>> =
         futures::future::try_join_all((0..config.requests).map(|_| async move {
-            let output = drain(dataset, config, budget, started).await?;
+            let output = drain(dataset, config, budget, started, None).await?;
             verify(&output, expected_rows, expected_hash)?;
             Ok(output)
         }))
@@ -576,7 +603,8 @@ fn peak_rss_kib() -> Option<u64> {
         .ok()
 }
 
-async fn run_command(args: Vec<String>) -> Result<serde_json::Value> {
+async fn run_command(mut args: Vec<String>) -> Result<serde_json::Value> {
+    let cancel_after = cancellation::parse(&mut args)?;
     let result = match args.first().map(String::as_str) {
         Some("prepare" | "prepare-dictionary") if args.len() == 5 => {
             let fixture = if args[0] == "prepare-dictionary" {
@@ -608,15 +636,32 @@ async fn run_command(args: Vec<String>) -> Result<serde_json::Value> {
             let budget = AllocationBudget::new(config.pool_bytes);
             let started = Instant::now();
             let dataset = Dataset::open(&args[2]).await?;
-            let mut outputs = drain_all(
-                &dataset,
-                &config,
-                &budget,
-                args[3].parse()?,
-                &args[4],
-                Some(started),
-            )
-            .await?;
+            let (cancelled, mut outputs) = if let Some(after_batches) = cancel_after {
+                let (cancelled, outputs) = cancellation::run(
+                    &dataset,
+                    &config,
+                    &budget,
+                    args[3].parse()?,
+                    &args[4],
+                    after_batches,
+                    Some(started),
+                )
+                .await?;
+                (Some(cancelled), outputs)
+            } else {
+                (
+                    None,
+                    drain_all(
+                        &dataset,
+                        &config,
+                        &budget,
+                        args[3].parse()?,
+                        &args[4],
+                        Some(started),
+                    )
+                    .await?,
+                )
+            };
             let mut result = serde_json::json!({"mode":args[1],"uri":args[2],"source_head":source_head,
                 "batch_rows":args[5],"workspace_bytes":workspace,"slow_us":args[7],
                 "attempt_workspace_bytes":config.attempt_bytes()?,
@@ -630,6 +675,10 @@ async fn run_command(args: Vec<String>) -> Result<serde_json::Value> {
             } else {
                 result["outputs"] = serde_json::to_value(outputs)?;
             }
+            if let Some(cancelled) = cancelled {
+                result["cancelled"] = serde_json::to_value(cancelled)?;
+                result["final_reserved_bytes"] = serde_json::to_value(budget.reserved())?;
+            }
             result
         }
         _ => return Err(USAGE.into()),
@@ -641,7 +690,10 @@ async fn run_command(args: Vec<String>) -> Result<serde_json::Value> {
 async fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let executor = ConsumerExecutor::parse(&mut args)?;
-    let is_drain = matches!(args.first().map(String::as_str), Some("run" | "run-many"));
+    let is_drain = matches!(
+        args.first().map(String::as_str),
+        Some("run" | "run-many" | "run-cancel")
+    );
     let mut result = executor.run(run_command(args)).await?;
     if is_drain {
         result["consumer_executor"] = serde_json::to_value(executor)?;
@@ -664,7 +716,7 @@ mod tests {
     fn executor_prefix_preserves_the_drain_arguments(
         #[case] on_worker: bool,
         #[case] expected: ConsumerExecutor,
-        #[values("run", "run-many")] command: &str,
+        #[values("run", "run-many", "run-cancel")] command: &str,
     ) {
         let original = [
             command,
@@ -697,7 +749,7 @@ mod tests {
             ConsumerExecutor::parse(&mut args)
                 .unwrap_err()
                 .to_string()
-                .contains("on-worker requires run or run-many")
+                .contains("on-worker requires run, run-many or run-cancel")
         );
     }
 
