@@ -5255,7 +5255,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-physical-plan",
  "futures",
- "hmac 0.13.0",
+ "hmac 0.12.1",
  "lance",
  "lance-core",
  "lance-index",
