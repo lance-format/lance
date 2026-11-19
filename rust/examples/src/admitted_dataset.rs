@@ -603,7 +603,10 @@ fn peak_rss_kib() -> Option<u64> {
         .ok()
 }
 
-async fn run_command(mut args: Vec<String>) -> Result<serde_json::Value> {
+async fn run_command(
+    mut args: Vec<String>,
+    source_head: Option<&str>,
+) -> Result<serde_json::Value> {
     let cancel_after = cancellation::parse(&mut args)?;
     let result = match args.first().map(String::as_str) {
         Some("prepare" | "prepare-dictionary") if args.len() == 5 => {
@@ -623,7 +626,7 @@ async fn run_command(mut args: Vec<String>) -> Result<serde_json::Value> {
             serde_json::json!({"preparation":args[0],"fixture":args[1],"rows":output.rows,"frame_bytes":args[3],"fragment_rows":args[4],"expected":output})
         }
         Some("run" | "run-many") => {
-            let source_head = option_env!("T210_SOURCE_HEAD")
+            let source_head = source_head
                 .filter(|value| value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or(
                     "benchmark build requires T210_SOURCE_HEAD with the verified full source SHA",
@@ -694,7 +697,9 @@ async fn main() -> Result<()> {
         args.first().map(String::as_str),
         Some("run" | "run-many" | "run-cancel")
     );
-    let mut result = executor.run(run_command(args)).await?;
+    let mut result = executor
+        .run(run_command(args, option_env!("T210_SOURCE_HEAD")))
+        .await?;
     if is_drain {
         result["consumer_executor"] = serde_json::to_value(executor)?;
     }

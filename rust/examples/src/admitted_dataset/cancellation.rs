@@ -393,10 +393,14 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        let result = tokio::time::timeout(Duration::from_secs(5), run_command(args))
-            .await
-            .unwrap()
-            .unwrap();
+        // This is a synthetic command-test identity, not a measured artifact SHA.
+        let source_head = "0123456789abcdef0123456789abcdef01234567";
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), run_command(args, Some(source_head)))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(result["source_head"], source_head);
         assert_eq!(result["requests"], 3);
         assert_eq!(result["final_reserved_bytes"], 0);
         let outputs = result["outputs"].as_array().unwrap();
@@ -411,5 +415,33 @@ mod tests {
         assert_eq!(result["cancelled"]["prefix"]["batches"], 1);
         assert!(result["cancelled"]["prefix"]["completed_seconds"].is_null());
         assert!(result["cancelled"]["observed_seconds"].is_number());
+    }
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::short(Some("01234567"))]
+    #[case::non_hex(Some("0123456789abcdef0123456789abcdef0123456g"))]
+    #[tokio::test]
+    async fn command_rejects_invalid_source_before_open(#[case] source_head: Option<&str>) {
+        let args = [
+            "run-cancel",
+            "prefetched",
+            "unused",
+            "17",
+            "hash",
+            "2",
+            "65536",
+            "0",
+            "3",
+            "65536",
+            "1",
+        ]
+        .map(String::from)
+        .to_vec();
+        let error = run_command(args, source_head).await.unwrap_err();
+        assert!(
+            error.to_string().contains("requires T210_SOURCE_HEAD"),
+            "{error}"
+        );
     }
 }
