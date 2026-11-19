@@ -275,19 +275,32 @@ impl FileFragment {
     #[pyo3(signature=(row_indices, columns=None))]
     fn take<'py>(
         self_: PyRef<'py, Self>,
-        row_indices: Vec<usize>,
+        row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Fragment offsets are u32; reject larger values instead of letting
+        // them wrap around to a different, valid row.
+        let indices = row_indices
+            .iter()
+            .map(|&offset| {
+                u32::try_from(offset).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "Fragment offset {offset} is out of range (maximum is {})",
+                        u32::MAX
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
         let dataset_schema = self_.fragment.dataset().schema();
         let projection = if let Some(columns) = columns {
             dataset_schema
-                .project(&columns)
+                .project_preserve_system_columns(&columns)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         } else {
             dataset_schema.clone()
         };
 
-        let indices = row_indices.iter().map(|v| *v as u32).collect::<Vec<_>>();
         let fragment = self_.fragment.clone();
         let batch = rt()
             .spawn(Some(self_.py()), async move {

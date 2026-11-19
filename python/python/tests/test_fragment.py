@@ -1406,6 +1406,63 @@ def test_fragment_take_with_json_column(tmp_path):
     assert metas[2] == '{"val":7}'
 
 
+@pytest.mark.parametrize("with_deletion", [False, True])
+def test_fragment_take_rejects_offsets_above_u32(tmp_path: Path, with_deletion: bool):
+    # Offsets above u32::MAX used to wrap modulo 2**32 and return a real row.
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path)
+    if with_deletion:
+        dataset.delete("a = 0")
+    frag = dataset.get_fragment(0)
+
+    for offset in [2**32, 2**32 + 3]:
+        with pytest.raises(ValueError, match=str(offset)):
+            frag.take([offset])
+        with pytest.raises(ValueError, match=str(offset)):
+            frag.take([1, offset], columns=["a"])
+
+    # Offsets that fit in u32 but are out of range keep the Rust-side error.
+    with pytest.raises(OSError, match=str(2**32 - 1)):
+        frag.take([2**32 - 1])
+    assert frag.take([2]).to_pydict() == {"a": [3 if with_deletion else 2]}
+
+
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_fragment_take_system_columns(tmp_path: Path, enable_stable_row_ids: bool):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(10)}),
+        tmp_path,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    dataset = lance.write_dataset(
+        pa.table({"a": range(10, 20)}), tmp_path, mode="append"
+    )
+    # A deletion makes fragment offsets, row addresses and row ids differ.
+    dataset.delete("a = 11")
+    frag = dataset.get_fragment(1)
+
+    columns = ["_rowaddr", "a", "_rowid"]
+    actual = frag.take([1, 2], columns=columns)
+    expected = dataset.take([11, 12], columns=columns)
+    assert actual.column_names == columns
+    assert actual == expected
+    assert actual["a"].to_pylist() == [12, 13]
+    assert actual["_rowaddr"].to_pylist() == [(1 << 32) + 2, (1 << 32) + 3]
+    if enable_stable_row_ids:
+        assert actual["_rowid"].to_pylist() == [12, 13]
+    else:
+        assert actual["_rowid"] == actual["_rowaddr"]
+
+    by_row_id = dataset._take_rows(actual["_rowid"].to_pylist(), columns=columns)
+    assert actual == by_row_id
+
+    # System columns alone, out of order and duplicated offsets.
+    for columns in (["_rowid"], ["_rowaddr"], ["_rowid", "_rowaddr"]):
+        actual = frag.take([3, 0, 3], columns=columns)
+        expected = dataset.take([13, 10, 13], columns=columns)
+        assert actual.column_names == columns
+        assert actual == expected
+
+
 def test_fragment_create_with_json_column(tmp_path):
     """Test that LanceFragment.create works with Arrow JSON extension type.
 
