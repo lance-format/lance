@@ -585,6 +585,19 @@ comparison.
 
 If the dataset has fewer rows than `num_partitions * sample_rate`, the entire dataset is used for training instead.
 
+The sample of a fixed-size-list vector column is drawn as independent random rows. On object storage this costs about
+one request per sampled row once the sample is sparse, which can dominate training time on large tables. Set
+`LANCE_IVF_TRAINING_SAMPLE_BLOCK_ROWS` to read the IVF sample as random contiguous runs of that many rows instead:
+
+```shell
+export LANCE_IVF_TRAINING_SAMPLE_BLOCK_ROWS=64
+```
+
+Each run costs about one request, so the request count drops by roughly the run length. Rows inside a run are neighbors
+in the table, so when neighbors are similar (for example consecutive video frames) a longer run trains slightly worse
+centroids. The value must be a positive integer; unset or `1` keeps independent rows. Quantizer training samples are
+small and always use independent rows.
+
 #### Quantizer Training
 
 After IVF training, a quantizer (e.g. PQ, SQ) is trained to compress vectors. This phase may sample some of the

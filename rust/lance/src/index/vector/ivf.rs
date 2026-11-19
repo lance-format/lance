@@ -8,7 +8,7 @@ use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
     utils::{
-        filter_finite_training_data, infer_vector_dim, maybe_sample_training_data,
+        filter_finite_training_data, infer_vector_dim, maybe_sample_ivf_training_data,
         sample_unseen_training_data,
     },
 };
@@ -2159,7 +2159,7 @@ pub async fn build_ivf_model(
         sample_size_hint
     );
     let training_data =
-        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
+        maybe_sample_ivf_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -3856,7 +3856,9 @@ async fn sample_ivf_training_chunk(
             )
             .await?
         }
-        None => maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?,
+        None => {
+            maybe_sample_ivf_training_data(dataset, column, sample_size_hint, fragment_ids).await?
+        }
     };
     let (training_data, mt) = if metric_type == MetricType::Cosine {
         let training_data = normalize_fsl_owned(training_data)?;
