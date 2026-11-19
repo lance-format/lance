@@ -98,10 +98,13 @@ fn generate_file(
         ],
         &[&proto_dir],
     )?;
+    let mut variant_config = self::config(&out_dir)?;
+    variant_config.extern_path(".lance.file", "crate::format::pb");
+    variant_config.compile_protos(&[proto_dir.join("file_v2_3.proto")], &[&proto_dir])?;
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance-file/src/pb"),
-        &["lance.file.rs", "lance.file.v2.rs"],
+        &["lance.file.rs", "lance.file.v2.rs", "lance.file23.rs"],
         check,
     )
 }

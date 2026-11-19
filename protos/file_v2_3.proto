@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.file23;
+
+import "file.proto";
+
+/* Global buffer zero of an unstable Lance 2.3 file. The first two fields have
+ * the same wire meaning as lance.file.FileDescriptor. Only the 2.3 reader may
+ * interpret this message; stable file descriptors are unchanged.
+ */
+message FileDescriptor {
+  // Logical schema, including one childless field for each Variant.
+  lance.file.Schema schema = 1;
+  // Number of top-level rows in this file.
+  uint64 length = 2;
+  /* Exactly one entry for each logical Variant field in schema, ordered by
+   * that field's preorder position. Empty for files without logical Variants.
+   * Entries describe this file only and are not part of the table schema.
+   */
+  repeated VariantLayout variant_layouts = 3;
+}
+
+/* The physical representation of one logical Variant leaf. Its columns replace
+ * that leaf during depth-first, schema-order enumeration of physical columns.
+ * No physical field ID below is a table field ID. See format/file/variant.md
+ * for the schema grammar, column mapping, and reconstruction rules.
+ */
+message VariantLayout {
+  /* Required nonnegative ID of a logical field whose logical_type is "variant".
+   * Absence is invalid; zero is a valid field ID.
+   */
+  optional int32 field_id = 1;
+  /* Required local schema with exactly one struct root named "variant".
+   * Its root nullability equals the logical field's nullability. Local field
+   * IDs are consecutive preorder integers starting at zero, with parent IDs
+   * referring only to this schema. Schema and field metadata are empty.
+   * The root contains metadata, value, and optionally typed_value; recursive
+   * value/typed_value nodes obey the Parquet Variant shredding rules.
+   * Absence is invalid, including for an unshredded Variant.
+   */
+  lance.file.Schema physical_schema = 2;
+}

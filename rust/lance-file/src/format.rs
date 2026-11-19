@@ -27,6 +27,12 @@ pub mod pbfile {
     include!("pb/lance.file.v2.rs");
 }
 
+/// File descriptors for the unstable Lance 2.3 logical-to-physical mapping.
+pub mod pb23 {
+    #![allow(clippy::all)]
+    include!("pb/lance.file23.rs");
+}
+
 /// These version/magic values are written at the end of Lance files (e.g. versions/1.version)
 pub const MAJOR_VERSION: i16 = 0;
 pub const MINOR_VERSION: i16 = 2;

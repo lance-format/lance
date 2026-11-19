@@ -92,6 +92,14 @@ Examples:
 
 ### Complex Types
 
+#### Variant Type (unstable 2.3)
+
+The logical type `variant` is a leaf with one field ID and no logical children.
+It requires the paired `FLAG_VARIANT` capability, which remains unsupported
+until implemented. Its Arrow representation and file-local physical column
+mapping are specified in [Variant in Lance 2.3](../file/variant.md). Shredded
+paths do not consume table field IDs or become table schema fields.
+
 #### Struct Type
 
 A struct is a container for named fields with heterogeneous types.

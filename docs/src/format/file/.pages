@@ -1,4 +1,5 @@
 nav:
   - Specification: index.md
   - Encoding Strategy: encoding.md
+  - Variant: variant.md
   - Versioning: versioning.md
