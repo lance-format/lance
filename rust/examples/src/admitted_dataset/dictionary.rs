@@ -135,6 +135,7 @@ mod tests {
                 mode,
                 batch_rows: 17,
                 workspace: 128 * 1024,
+                attempt_workspace: None,
                 slow: Duration::ZERO,
                 requests,
                 pool_bytes,
