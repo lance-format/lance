@@ -28,7 +28,6 @@ use lance_table::format::DataFile;
 mod conflicts;
 mod index_and_config;
 mod rebase;
-mod scaling;
 
 /// Concurrent-writer coverage for the stable-partition rows of the
 /// conflict matrix. Where cross-process behavior matters, the second

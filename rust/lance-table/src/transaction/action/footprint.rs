@@ -390,12 +390,14 @@ impl Footprint {
 
     /// Record that this transaction writes `fields`' data in `fragment`.
     ///
+    /// Each committed field must still be there, in a fragment this
+    /// transaction mints as in a committed one: apply rejects a file naming a
+    /// field the schema no longer has.
+    ///
     /// In a committed fragment, each committed field's backing is written,
-    /// so two writers of one field's data collide, and the field must still
-    /// be there: a drop landing first tombstoned it out of the fragment, and
-    /// a file written for it now would put the column back. A field this
-    /// transaction mints writes nothing a concurrent writer can name, but its
-    /// cells are lost if the fragment is, so the fragment must stay.
+    /// so two writers of one field's data collide. A field this transaction
+    /// mints writes nothing a concurrent writer can name, but its cells are
+    /// lost if the fragment is, so the fragment must stay.
     ///
     /// New values (`data_change`) are prepared against the schema the
     /// transaction read, so they need [`Part::NewRowSchema`].
@@ -409,13 +411,15 @@ impl Footprint {
         if data_change && !fields.is_empty() {
             self.read(Part::NewRowSchema);
         }
+        for field in fields.iter().copied() {
+            self.read(Part::FieldExists(field));
+        }
         let Some(fragment) = fragment.committed() else {
             return;
         };
         self.require_fragment(fragment);
         self.forbids.push(Forbid::RelocationFrom(fragment));
         for field in fields.iter().copied() {
-            self.read(Part::FieldExists(field));
             self.read(Part::FieldData { fragment, field });
         }
         if data_change {

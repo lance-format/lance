@@ -9,6 +9,7 @@ use crate::format::overlay::DataOverlayFile;
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{DataFile, DeletionFile, Fragment, Manifest, RowDatasetVersionMeta, RowIdMeta};
 use lance_core::datatypes::{Field, LogicalType};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 /// What changed between the manifest a pending transaction read and the
@@ -19,6 +20,9 @@ pub struct Window<'a> {
     read: &'a Manifest,
     latest: &'a Manifest,
     committed: Vec<Footprint>,
+    /// How many fragments the check looked up, so a test can pin that the
+    /// cost follows what the transactions touch rather than the table.
+    fragment_lookups: Cell<usize>,
 }
 
 impl<'a> Window<'a> {
@@ -29,7 +33,19 @@ impl<'a> Window<'a> {
             read,
             latest,
             committed,
+            fragment_lookups: Cell::new(0),
         }
+    }
+
+    /// Fragment `id` in `manifest`, counted in `fragment_lookups`.
+    fn fragment<'m>(&self, manifest: &'m Manifest, id: u64) -> Option<&'m Fragment> {
+        self.fragment_lookups.set(self.fragment_lookups.get() + 1);
+        manifest.fragment_by_id(id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fragment_lookups(&self) -> usize {
+        self.fragment_lookups.get()
     }
 
     /// Whether `part` differs between the read and the latest manifest.
@@ -37,27 +53,27 @@ impl<'a> Window<'a> {
         let (read, latest) = (self.read, self.latest);
         match part {
             Part::FragmentExists(id) => {
-                read.fragment_by_id(*id).is_some() != latest.fragment_by_id(*id).is_some()
+                self.fragment(read, *id).is_some() != self.fragment(latest, *id).is_some()
             }
             Part::DataFiles(id)
             | Part::Overlays(id)
             | Part::RowVersions(id)
             | Part::Deletions(id) => self.piece_changed(*id, part),
             Part::FieldData { fragment, field } => {
-                read.fragment_by_id(*fragment).map(|f| backing(f, *field))
-                    != latest.fragment_by_id(*fragment).map(|f| backing(f, *field))
+                self.fragment(read, *fragment).map(|f| backing(f, *field))
+                    != self.fragment(latest, *fragment).map(|f| backing(f, *field))
             }
             Part::Cells { fragment, field } => {
-                read.fragment_by_id(*fragment)
+                self.fragment(read, *fragment)
                     .map(|f| (backing(f, *field), overlays_over(f, *field)))
-                    != latest
-                        .fragment_by_id(*fragment)
+                    != self
+                        .fragment(latest, *fragment)
                         .map(|f| (backing(f, *field), overlays_over(f, *field)))
             }
             Part::IndexedFieldData { fragment, field } => {
                 let (Some(was), Some(now)) = (
-                    read.fragment_by_id(*fragment).map(|f| self.live(f)),
-                    latest.fragment_by_id(*fragment).map(|f| self.live(f)),
+                    self.fragment(read, *fragment).map(|f| self.live(f)),
+                    self.fragment(latest, *fragment).map(|f| self.live(f)),
                 ) else {
                     return false;
                 };
@@ -144,8 +160,7 @@ impl<'a> Window<'a> {
     /// of them included.
     fn piece_changed(&self, id: u64, part: &Part) -> bool {
         let live = |manifest: &Manifest| {
-            manifest
-                .fragment_by_id(id)
+            self.fragment(manifest, id)
                 .map(|fragment| self.live(fragment))
         };
         let (read, latest) = (live(self.read), live(self.latest));

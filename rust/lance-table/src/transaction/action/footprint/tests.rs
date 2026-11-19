@@ -716,27 +716,11 @@ fn test_a_new_v1_file_conflicts_with_a_drop_of_a_field_it_backs() {
     assert_eq!(outcome(&v1_append, &drop_c()), Conflicts);
 }
 
-/// A fragment id reserved once and claimed by two writers collides; row ids
-/// supplied twice collide whatever fragments carry them.
+/// Row ids supplied twice collide whatever fragments carry them. A reserved
+/// fragment id claimed twice is left to apply, which rejects an id in use.
 #[test]
-fn test_reserved_ids_are_claimed_once() {
-    let claim = |id: u64| {
-        set(vec![Action::AddFragment(AddFragment::new_unchecked(
-            AddFragmentParts {
-                id: Ref::Committed(id),
-                physical_rows: 3,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            },
-        ))])
-    };
-    let mut read = table();
-    read.max_fragment_id = Some(5);
-    assert_eq!(outcome_at(&read, &claim(4), &claim(4)), Conflicts);
-    assert_eq!(outcome_at(&read, &claim(4), &claim(5)), Lands);
-
+fn test_reserved_row_ids_are_claimed_once() {
+    let read = table();
     let supplying = |ids: &RoaringTreemap| {
         let mut footprint = Footprint::default();
         footprint.supply_row_ids(ids);
@@ -784,6 +768,41 @@ fn test_a_window_of_several_commits() {
         pending(&alter_c(|alter| alter.with_nullable(false))),
         Verdict::Conflict(_)
     ));
+}
+
+/// The check looks up only the fragments the transactions touch: the same
+/// pending transaction over the same concurrent appends does the same work on
+/// a table a hundred times larger.
+#[rstest]
+#[case::a_delete(delete_rows(1))]
+#[case::a_rewrite(replace_c(1))]
+#[case::an_index_segment(index_over(&[0, 1]))]
+fn test_the_check_follows_what_is_touched_not_the_table(#[case] pending: Operation) {
+    const CONCURRENT_APPENDS: u64 = 10;
+    let check = |fragments: u64| {
+        let template = table().fragments[0].clone();
+        let fragment = |id: u64| Fragment {
+            id,
+            ..template.clone()
+        };
+        let mut read = table();
+        read.fragments = Arc::new((0..fragments).map(fragment).collect());
+        let mut latest = read.clone();
+        latest.version += CONCURRENT_APPENDS;
+        Arc::make_mut(&mut latest.fragments)
+            .extend((fragments..fragments + CONCURRENT_APPENDS).map(fragment));
+        let committed = (0..CONCURRENT_APPENDS)
+            .map(|_| Footprint::of(&Transaction::new(read.version, append(), None)))
+            .collect();
+        let window = Window::new(&read, &latest, committed);
+        let footprint = Footprint::of(&Transaction::new(read.version, pending.clone(), None));
+        let verdict = matches!(footprint.check(&window), Verdict::Compatible);
+        (verdict, window.fragment_lookups())
+    };
+
+    let (small, large) = (check(1_000), check(100_000));
+    assert!(small.1 > 0, "the check looked up no fragment");
+    assert_eq!(small, large);
 }
 
 /// What only the committed transactions can say, with no change of state to

@@ -244,23 +244,15 @@ impl AddDataFile {
     /// The data of every committed field the file backs, in the fragment it is
     /// attached to. A file backing only minted fields writes nothing.
     ///
-    /// In a fragment this set mints, every committed field it backs must
-    /// still exist: apply rejects a file naming a field the schema no longer
-    /// has.
-    ///
-    /// TODO: a drop landing first could be adapted to instead, by leaving the
-    /// field out of the file, except for a legacy V1 file: its reader places
-    /// each field's columns by the field's position in the list, so leaving
-    /// one out would shift the rest onto the wrong columns.
+    /// TODO: in a fragment this set mints, a drop landing first could be
+    /// adapted to instead of conflicting, by leaving the field out of the
+    /// file, except for a legacy V1 file: its reader places each field's
+    /// columns by the field's position in the list, so leaving one out would
+    /// shift the rest onto the wrong columns.
     ///
     /// New values also supersede the field's overlays in a committed fragment;
     /// see [`Footprint::supersede_overlays`].
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        if self.fragment.committed().is_none() {
-            for field in self.field_ids.iter().copied() {
-                footprint.require_field(field);
-            }
-        }
         footprint.write_field_data(
             self.fragment,
             self.field_ids.iter().copied(),

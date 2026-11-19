@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Footprint, Part, Ref};
+use super::{Footprint, Ref};
 use crate::format::{Fragment, RowIdMeta, pb, pb_actions};
 use crate::rowids::read_row_ids;
 use crate::rowids::version::RowDatasetVersionMeta;
@@ -163,19 +163,18 @@ impl AddFragment {
         self.parts.data_change
     }
 
-    /// Nothing for a local token: the fragment does not exist in the read
-    /// version, so no concurrent writer can be naming it.
-    ///
-    /// A committed id is a fragment that must still be absent. A reservation is meant to be one writer's
-    /// alone, but nothing in the format enforces that, so two operations handed
-    /// the same range would otherwise each add a fragment at the same id and
-    /// the second commit would silently win.
+    /// The fragment's id needs nothing here. A committed id names one reserved
+    /// earlier, and apply rejects it if it is already in use, so two
+    /// operations spending one reserved id fail at apply and the second
+    /// retries.
     ///
     /// Row ids the fragment arrives carrying are claimed as an exact set, so
     /// two operations spending one reservation collide. A sequence that does
     /// not decode makes the footprint opaque: apply rejects it anyway, and a
-    /// footprint must not under-report. A spilled sequence lives in a file
-    /// this cannot read, and goes unclaimed.
+    /// footprint must not under-report.
+    ///
+    /// TODO(#11276): a spilled sequence lives in a file this cannot read, and
+    /// goes unclaimed.
     ///
     /// A data change records that new rows arrive, which is what a concurrent
     /// [`AssertUniqueKeys`](super::AssertUniqueKeys) or a column made
@@ -183,9 +182,6 @@ impl AddFragment {
     /// that were already in the dataset -- a compaction rewrite.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.add_rows(self.parts.data_change);
-        if let Some(id) = self.parts.id.committed() {
-            footprint.read(Part::FragmentExists(id));
-        }
         if let Some(RowIdMeta::Inline(data)) = &self.parts.row_id_meta {
             match read_row_ids(data) {
                 Ok(sequence) => footprint.supply_row_ids(&sequence.to_treemap()),
