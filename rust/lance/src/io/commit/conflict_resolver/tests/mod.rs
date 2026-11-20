@@ -25,6 +25,7 @@ use crate::{
 };
 use lance_table::format::DataFile;
 
+mod catchup;
 mod conflicts;
 mod index_and_config;
 mod rebase;

@@ -1786,6 +1786,7 @@ async fn prepare_attempt(
     )
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<NewTransaction>)> {
@@ -1811,6 +1812,7 @@ pub(crate) async fn load_and_sort_new_transactions(
 /// closed. The one exception is a transaction adding index coverage over
 /// committed fragments, whose repair walks every manifest since it read (see
 /// [`TransactionRebase::needs_committed_history`]).
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) async fn record_committed_history(
     rebase: &mut TransactionRebase<'_>,
     dataset: &Dataset,

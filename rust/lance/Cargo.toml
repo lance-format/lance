@@ -374,6 +374,10 @@ name = "concurrent_append"
 harness = false
 
 [[bench]]
+name = "conflict_catchup"
+harness = false
+
+[[bench]]
 name = "hamming"
 harness = false
 

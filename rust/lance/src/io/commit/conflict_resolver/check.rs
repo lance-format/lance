@@ -165,6 +165,8 @@ impl<'a> TransactionRebase<'a> {
         self.footprint_basis
             .history
             .insert(manifest.version, manifest);
+        #[cfg(test)]
+        super::probe::held_history(self.footprint_basis.history.len());
     }
 
     /// Record what the catch-up records of one commit: `transaction`,
@@ -198,6 +200,7 @@ impl<'a> TransactionRebase<'a> {
     /// An action set is checked once, against the change from the version the
     /// first of them landed on to the latest (see [`Footprint`]). Anything else is checked pair
     /// by pair, as [`Self::check_txn`] does.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn check_txns(&mut self, committed: &[(u64, &Transaction)]) -> Result<()> {
         let (Operation::CompositeOperation(_), Some((last, last_transaction))) =
             (&self.transaction.operation, committed.last())
@@ -259,6 +262,8 @@ impl<'a> TransactionRebase<'a> {
         last: &Transaction,
         last_version: u64,
     ) -> Result<()> {
+        #[cfg(test)]
+        super::probe::checked_window();
         let (Some(read), Some(since), Some(latest)) = (
             self.footprint_basis.read.clone(),
             self.footprint_basis.since.clone(),

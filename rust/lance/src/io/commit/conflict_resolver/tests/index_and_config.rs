@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::transaction::action::{
-    Action as TxnAction, AddFragment, AddFragmentParts, CompositeOperation, FieldRef,
+    Action as TxnAction, AddFragment, AddFragmentParts, AddOverlays, CompositeOperation, FieldRef,
     Ref as ActionRef, RemoveFragment, TombstoneFieldData, UserStep,
 };
 
@@ -1039,6 +1040,70 @@ async fn test_a_legacy_index_build_lands_over_an_action_compaction() {
         new_indices[0].fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter([0])
     );
+}
+
+/// A retry repairs the coverage an index build adds as one attempt catching
+/// up on every commit would: what an earlier attempt's window committed is
+/// still seen. Here an overlay lands on a covered fragment in the first
+/// attempt's window, and the fragment is removed in the retry's.
+#[tokio::test]
+async fn test_a_retry_repairs_coverage_as_one_attempt_would() {
+    let dataset = test_dataset(10, 2).await;
+    let overlay = DataOverlayFile {
+        data_file: DataFile::new_legacy_from_fields("o.lance", vec![0], None),
+        coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        committed_version: 2,
+    };
+    let overlaid = action_txn(vec![TxnAction::AddOverlays(AddOverlays::new_unchecked(
+        ActionRef::Committed(0),
+        vec![overlay.clone()],
+    ))]);
+    let removed = action_txn(vec![TxnAction::RemoveFragment(
+        RemoveFragment::new_unchecked(ActionRef::Committed(0), true),
+    )]);
+    let read = dataset.manifest.clone();
+    let mut since = read.as_ref().clone();
+    since.version = 2;
+    Arc::make_mut(&mut since.fragments)[0]
+        .overlays
+        .push(overlay);
+    let since = Arc::new(since);
+    let mut latest = since.as_ref().clone();
+    latest.version = 3;
+    latest.fragments = Arc::new(latest.fragments[1..].to_vec());
+    let latest = Arc::new(latest);
+    let coverage = |rebase: &TransactionRebase| {
+        let Operation::CreateIndex { new_indices, .. } = &rebase.transaction.operation else {
+            panic!("expected CreateIndex operation");
+        };
+        new_indices[0].fragment_bitmap.clone().unwrap()
+    };
+
+    let mut once = TransactionRebase::try_new(&dataset, create_index_txn([0, 1]), None)
+        .await
+        .unwrap();
+    once.record_history(since.clone());
+    once.record_history(latest.clone());
+    once.record_window(read.clone(), latest.clone());
+    once.check_txns(&[(2, &overlaid), (3, &removed)]).unwrap();
+    once.repair_index_coverage();
+
+    let mut first = TransactionRebase::try_new(&dataset, create_index_txn([0, 1]), None)
+        .await
+        .unwrap();
+    first.record_history(since.clone());
+    first.record_window(read.clone(), since.clone());
+    first.check_txns(&[(2, &overlaid)]).unwrap();
+    first.repair_index_coverage();
+    let mut retry = TransactionRebase::try_new(&dataset, first.transaction.clone(), None)
+        .await
+        .unwrap();
+    retry.record_history(latest.clone());
+    retry.record_window(since.clone(), latest.clone());
+    retry.check_txns(&[(3, &removed)]).unwrap();
+    retry.repair_index_coverage();
+
+    assert_eq!(coverage(&retry), coverage(&once));
 }
 
 /// Without the manifests either side of the concurrent commit there is

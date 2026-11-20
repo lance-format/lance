@@ -318,6 +318,44 @@ mod check;
 mod finish;
 mod init;
 
+/// What a commit's conflict resolution held and repeated, for the catch-up
+/// cost tests, which drive it through the public commit path and so cannot
+/// inspect the rebase itself. Per thread: a test's commit runs on its own
+/// runtime thread.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PEAK_HISTORY: Cell<usize> = const { Cell::new(0) };
+        static WINDOW_CHECKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Observed {
+        /// The most whole manifests a rebase held for the coverage repair.
+        pub peak_history: usize,
+        /// How many times a window of committed footprints was checked.
+        pub window_checks: usize,
+    }
+
+    /// What was observed since the last call, resetting the counts.
+    pub fn take() -> Observed {
+        Observed {
+            peak_history: PEAK_HISTORY.with(|peak| peak.replace(0)),
+            window_checks: WINDOW_CHECKS.with(|checks| checks.replace(0)),
+        }
+    }
+
+    pub(super) fn held_history(len: usize) {
+        PEAK_HISTORY.with(|peak| peak.set(peak.get().max(len)));
+    }
+
+    pub(super) fn checked_window() {
+        WINDOW_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    }
+}
+
 impl<'a> TransactionRebase<'a> {
     #[track_caller]
     fn retryable_conflict_err(&self, other_transaction: &Transaction, other_version: u64) -> Error {
