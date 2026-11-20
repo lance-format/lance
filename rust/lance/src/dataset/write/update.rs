@@ -1251,6 +1251,8 @@ mod tests {
     #[rstest]
     #[case::integers("[3, 4]", Some(vec![Some(3.0), Some(4.0)]), None)]
     #[case::floats("[3.5, 4.5]", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::integer_then_float("[3, 4.5]", Some(vec![Some(3.0), Some(4.5)]), None)]
+    #[case::null_then_integer("[NULL, 4]", Some(vec![None, Some(4.0)]), None)]
     #[case::strings("['3.5', '4.5']", Some(vec![Some(3.5), Some(4.5)]), None)]
     #[case::invalid_element("['invalid', '4.5']", None, Some("Cannot cast string"))]
     #[case::all_null_elements("[NULL, NULL]", Some(vec![None, None]), None)]

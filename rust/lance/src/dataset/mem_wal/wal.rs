@@ -23,7 +23,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lance_core::{Error, FenceReason, Result};
 use lance_io::object_store::ObjectStore;
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use tokio::sync::{Mutex, mpsc, watch};
 
@@ -1038,8 +1037,7 @@ impl WalEntryData {
     pub async fn read(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         // Read the file
         let data = object_store
-            .inner
-            .get(path)
+            .read_object(path)
             .await
             .map_err(|e| Error::io(format!("Failed to read WAL file: {}", e)))?
             .bytes()
@@ -1541,7 +1539,7 @@ impl WalTailer {
             .wal_dir
             .clone()
             .join(wal_entry_filename(entry_position));
-        let data = match self.object_store.inner.get(&path).await {
+        let data = match self.object_store.read_object(&path).await {
             Ok(data) => data,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(e) => {
@@ -1860,7 +1858,7 @@ async fn probe_forward_from(
     hint: u64,
 ) -> Result<Option<u64>> {
     let path = wal_dir.clone().join(wal_entry_filename(hint));
-    match object_store.inner.head(&path).await {
+    match object_store.stat(&path).await {
         Ok(_) => {}
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
         Err(e) => {
@@ -1873,7 +1871,7 @@ async fn probe_forward_from(
     let mut pos = hint + 1;
     while pos - hint <= MAX_CURSOR_PROBE {
         let p = wal_dir.clone().join(wal_entry_filename(pos));
-        match object_store.inner.head(&p).await {
+        match object_store.stat(&p).await {
             Ok(_) => pos += 1,
             Err(object_store::Error::NotFound { .. }) => return Ok(Some(pos)),
             Err(e) => {
@@ -1893,7 +1891,7 @@ async fn scan_next_position(
     shard_id: Uuid,
 ) -> Result<u64> {
     let mut max_position = None::<u64>;
-    let mut stream = object_store.inner.list(Some(wal_dir));
+    let mut stream = object_store.list_objects(Some(wal_dir));
     while let Some(item) = stream.next().await {
         let meta = item.map_err(|e| {
             Error::io(format!(
@@ -1921,7 +1919,7 @@ async fn scan_first_position(
     shard_id: Uuid,
 ) -> Result<u64> {
     let mut min_position = None::<u64>;
-    let mut stream = object_store.inner.list(Some(wal_dir));
+    let mut stream = object_store.list_objects(Some(wal_dir));
     while let Some(item) = stream.next().await {
         let meta = item.map_err(|e| {
             Error::io(format!(

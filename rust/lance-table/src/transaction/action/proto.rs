@@ -7,10 +7,13 @@
 //! [`Ref`], [`FieldRef`], [`CompositeOperation`], and [`UserStep`] wrappers, the dispatch over
 //! the `oneof`, and the helpers the per-action conversions share.
 //!
-//! Reading is fail-closed: an action this build does not implement is an error,
+//! Reading is fail-closed: an action this build does not recognize is an error,
 //! never a silently skipped element. The commit path collects concurrent
 //! transactions with `try_collect`, so a transaction carrying an unknown action
-//! must abort the commit rather than be treated as a no-op.
+//! must abort the commit rather than be treated as a no-op. Every specified action
+//! is implemented, so an unrecognized one can only come from a newer Lance --
+//! which protobuf decodes as no variant at all, since it drops the field it does
+//! not know.
 
 use super::{Action, CompositeOperation, FieldRef, Ref, UserStep};
 use crate::format::pb_actions;
@@ -18,6 +21,17 @@ use lance_core::{Error, Result};
 
 pub(super) fn required<T>(value: Option<T>, what: &str) -> Result<T> {
     value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
+}
+
+/// A required string field. Protobuf gives an unset string the empty value, so
+/// the two cases cannot be told apart and neither is usable.
+pub(super) fn non_empty(value: String, what: &str) -> Result<String> {
+    if value.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "{what} is required but was empty"
+        )));
+    }
+    Ok(value)
 }
 
 impl From<Ref> for pb_actions::Ref {
@@ -135,21 +149,13 @@ macro_rules! define_action_proto {
                     $(Some(pb_actions::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
-                    // The specified vocabulary is larger than what is implemented.
-                    // Reject rather than skip: silently dropping an action would
-                    // apply a partial transaction.
-                    Some(other) => {
-                        // Debug-format only the variant name: the payload can
-                        // hold large filters or bitmaps.
-                        let debug = format!("{other:?}");
-                        let variant = debug.split('(').next().unwrap_or_default();
-                        Err(Error::not_supported(format!(
-                            "the action-based transaction uses action {variant}, which is \
-                             specified but not implemented by this version of Lance",
-                        )))
-                    }
-                    None => Err(Error::invalid_input(
-                        "an Action in a CompositeOperation was empty",
+                    // An action written by a newer Lance decodes to no known
+                    // variant, because protobuf drops the field it does not
+                    // know. Reject rather than skip: silently dropping an
+                    // action would apply a partial transaction.
+                    None => Err(Error::not_supported(
+                        "an Action in a CompositeOperation carried no change this version of \
+                         Lance understands; it was either empty or written by a newer version",
                     )),
                 }
             }
@@ -162,18 +168,27 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, RowIdMeta};
+    use crate::format::key_existence::{FilterType, KeyExistenceFilter};
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
     use crate::rowids::version::RowDatasetVersionMeta;
+    use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
-        FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        SetDeletionFile, TombstoneFieldData,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
+        DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
+        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
+    use chrono::DateTime;
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn sample_data_file() -> DataFile {
         DataFile::new_unstarted("data/1.lance", ConcreteFileVersion::V2_0)
@@ -217,17 +232,41 @@ mod tests {
                 data_change: true,
             }),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 6,
+                fragment: Ref::Committed(6),
                 deletion_file: DeletionFile {
                     read_version: 3,
                     id: 9,
                     file_type: DeletionFileType::Bitmap,
                     num_deleted_rows: Some(4),
                     base_id: None,
+                    path: Some("_deletions/9.bin".into()),
                     inline: None,
                 },
                 data_change: true,
                 base: Some(Ref::Committed(2)),
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Committed(6),
+                overlays: vec![DataOverlayFile {
+                    data_file: sample_data_file(),
+                    coverage: OverlayCoverage::PerField(vec![Arc::new(
+                        [1u32, 4].into_iter().collect::<RoaringBitmap>(),
+                    )]),
+                    committed_version: 11,
+                }],
+                data_change: true,
+            }),
+            Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 6,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([0u32, 2])),
+                    },
+                ],
             }),
             Action::AlterField(AlterField {
                 field: FieldRef::Committed(2),
@@ -236,6 +275,69 @@ mod tests {
             }),
             Action::DropField(DropField {
                 field: FieldRef::Committed(3),
+            }),
+            Action::AddIndexSegment(AddIndexSegment {
+                uuid: Uuid::from_u128(7),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                covering_fields: vec![FieldRef::Local(3)],
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
+                    value: vec![1, 2, 3],
+                })),
+                index_version: 2,
+                covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
+                files: vec![IndexFile {
+                    path: "index.idx".into(),
+                    size_bytes: 512,
+                    file_metadata_size_bytes: std::num::NonZero::new(128),
+                }],
+                base: Some(Ref::Local(1)),
+                created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
+                dataset_version: Some(3),
+                data_change: false,
+            }),
+            Action::RemoveIndexSegment(RemoveIndexSegment {
+                uuid: Uuid::from_u128(8),
+                name: "by_a".into(),
+                data_change: true,
+            }),
+            Action::DropIndex(DropIndex {
+                name: "by_c".into(),
+            }),
+            Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid: Uuid::from_u128(9),
+                name: "by_b".into(),
+                add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
+                remove_fragments: vec![2, 3],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: vec![FieldRef::Committed(1)],
+            }),
+            Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(Uuid::from_u128(10), 2),
+                    CompactedSsTable::new(Uuid::from_u128(11), 5),
+                ],
+            }),
+            Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
+                },
+            }),
+            Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(1)],
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 5,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
+                    },
+                ],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
@@ -294,33 +396,56 @@ mod tests {
     }
 
     #[test]
-    fn test_unimplemented_action_is_rejected() {
-        let message = pb_actions::Action {
-            action: Some(pb_actions::action::Action::RefreshRowVersionMetadata(
-                pb_actions::RefreshRowVersionMetadata {
-                    rows: vec![pb_actions::RowSelection {
-                        fragment_id: 1,
-                        coverage: Some(pb_actions::row_selection::Coverage::Full(())),
-                    }],
-                },
-            )),
-        };
-        let error = Action::try_from(message).unwrap_err();
+    fn test_an_unrecognized_action_is_rejected() {
+        // An empty action and one a newer Lance wrote decode the same way:
+        // protobuf drops the field this build does not know.
+        let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
         assert!(
             matches!(error, Error::NotSupported { .. }),
             "expected NotSupported, got {error:?}"
         );
         assert!(
-            error.to_string().contains("not implemented"),
+            error.to_string().contains("written by a newer version"),
             "unexpected message: {error}"
         );
     }
 
-    #[test]
-    fn test_empty_action_is_rejected() {
-        let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
+    #[rstest]
+    #[case::addition(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AddIndexSegment(pb_actions::AddIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            ..Default::default()
+        })),
+    }, "AddIndexSegment.name")]
+    #[case::removal(pb_actions::Action {
+        action: Some(pb_actions::action::Action::RemoveIndexSegment(pb_actions::RemoveIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            data_unchanged: false,
+        })),
+    }, "RemoveIndexSegment.name")]
+    #[case::coverage(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AdjustIndexCoverage(pb_actions::AdjustIndexCoverage {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            add_fragments: Vec::new(),
+            remove_fragments: Vec::new(),
+            fields: Vec::new(),
+            covering_fields: Vec::new(),
+        })),
+    }, "AdjustIndexCoverage.name")]
+    fn test_an_index_action_without_a_name_is_rejected(
+        #[case] message: pb_actions::Action,
+        #[case] expected: &str,
+    ) {
+        // Protobuf cannot tell an unset string from an empty one, and an index
+        // action that does not say which index it edits cannot be checked for
+        // conflicts.
+        let error = Action::try_from(message).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
-            error.to_string().contains("was empty"),
+            error.to_string().contains(expected),
             "unexpected message: {error}"
         );
     }

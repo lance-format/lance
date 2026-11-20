@@ -9,10 +9,7 @@ use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{CreateTableVersionResponse, TableVersion};
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, ObjectMeta, ObjectStore as OSObjectStore, ObjectStoreExt, PutMode,
-    PutOptions,
-};
+use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStoreExt, PutMode, PutOptions};
 
 use super::DirectoryNamespace;
 
@@ -81,7 +78,7 @@ impl DirectoryNamespace {
             return Ok(false);
         }
 
-        let staging_bytes = match self.object_store.inner.get(staging_path).await {
+        let staging_bytes = match self.object_store.read_object(staging_path).await {
             Ok(r) => r.bytes().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
@@ -103,8 +100,7 @@ impl DirectoryNamespace {
 
         let final_bytes = self
             .object_store
-            .inner
-            .get(final_path)
+            .read_object(final_path)
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
@@ -233,7 +229,6 @@ impl DirectoryNamespace {
     ) -> std::result::Result<(), ObjectStoreError> {
         match self
             .object_store
-            .inner
             .copy_if_not_exists(staging_path, final_path)
             .await
         {
@@ -242,8 +237,7 @@ impl DirectoryNamespace {
             | Err(ObjectStoreError::NotSupported { .. }) => {
                 let manifest_data = self
                     .object_store
-                    .inner
-                    .get(staging_path)
+                    .read_object(staging_path)
                     .await?
                     .bytes()
                     .await
@@ -255,8 +249,7 @@ impl DirectoryNamespace {
                         ))),
                     })?;
                 self.object_store
-                    .inner
-                    .put_opts(
+                    .put_payload_opts(
                         final_path,
                         manifest_data.into(),
                         PutOptions {
@@ -343,17 +336,16 @@ impl DirectoryNamespace {
         }
         let is_v2_naming = first_manifest_filename_len == Some(29);
 
-        // V2 filenames invert the version, so a lexically-ordered stream
-        // arrives newest-first; when that matches the requested order, stop
-        // after `limit` manifests instead of paginating the whole directory
-        // (the `get_latest_version` hot path: descending, limit 1).
+        // Only V2 names may be trusted to match stream order: V2 filenames
+        // invert and zero-pad the version, so a lexically-ordered stream
+        // arrives newest-first and a descending request can stop after
+        // `limit` manifests instead of paginating the whole directory (the
+        // `get_latest_version` hot path: descending, limit 1). V1 names are
+        // unpadded, so lexical order diverges from version order across
+        // digit widths (`10.manifest` sorts before `2.manifest`); V1
+        // listings are always collected and sorted numerically.
         let list_is_ordered = self.object_store.list_is_lexically_ordered;
-        let stream_matches_request = list_is_ordered
-            && if is_v2_naming {
-                descending
-            } else {
-                !descending
-            };
+        let stream_matches_request = list_is_ordered && is_v2_naming && descending;
         let early_stop_at = limit.filter(|_| stream_matches_request);
 
         while early_stop_at.is_none_or(|n| table_versions.len() < n) {

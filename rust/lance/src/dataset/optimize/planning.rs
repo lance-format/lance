@@ -15,6 +15,7 @@ use std::sync::Arc;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::writer::FileWriterOptions;
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
@@ -680,6 +681,13 @@ impl CompactionOptions {
         self.data_storage_version
             .map(LanceFileVersion::resolve)
             .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+    }
+
+    pub(super) fn file_writer_options(&self) -> FileWriterOptions {
+        FileWriterOptions {
+            data_cache_bytes: self.data_cache_bytes,
+            ..Default::default()
+        }
     }
 }
 

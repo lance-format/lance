@@ -29,6 +29,22 @@ def test_kmeans():
     assert len(cnts) == 4  # all cluster has data
 
 
+def test_kmeans_dot_updates_centroids_for_large_norm_vectors():
+    # For vectors with norm > 1 the dot distance (1 - x.y) sums to a negative
+    # value, which must not be treated as converged before the first update.
+    centers = np.array([[10, 0], [0, 10], [-10, -10]], dtype=np.float32)
+    noise = np.random.default_rng(0).normal(scale=0.5, size=(300, 2))
+    data = np.repeat(centers, 100, axis=0) + noise.astype(np.float32)
+    # One initial centroid per blob, so no cluster empties out.
+    initial = torch.from_numpy(data[[0, 100, 200]].copy())
+
+    kmeans = KMeans(3, metric="dot", centroids=initial, device="cpu")
+    kmeans.fit(data)
+
+    blob_means = torch.from_numpy(data.reshape(3, 100, 2).mean(axis=1))
+    assert torch.allclose(kmeans.centroids, blob_means, atol=1e-4)
+
+
 @pytest.mark.parametrize(
     "metric,expected",
     [("L2", "l2"), ("euclidean", "l2"), ("COSINE", "cosine"), ("Dot", "dot")],
@@ -67,6 +83,16 @@ def test_torch_kmeans_nans(tmp_path: Path):
             assert part_ids[1] == -1
         else:
             assert part_ids[idx] != -1
+
+
+def test_kmeans_transform_sliced_fixed_size_list():
+    data = np.arange(80, dtype=np.float32).reshape(10, 8)
+    fsl = pa.FixedSizeListArray.from_arrays(pa.array(data.reshape(-1)), 8)
+    kmeans = KMeans(3, centroids=torch.from_numpy(data[[0, 4, 8]]), device="cpu")
+
+    expected = kmeans.transform(torch.from_numpy(data[4:7]))
+    assert len(expected) == 3
+    assert torch.equal(kmeans.transform(fsl.slice(4, 3)), expected)
 
 
 def test_kmeans_random_init_is_seeded():

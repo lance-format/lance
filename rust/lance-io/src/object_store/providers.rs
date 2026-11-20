@@ -314,6 +314,9 @@ impl ObjectStoreRegistry {
         }
 
         // Always wrap with IO tracking
+        if let Some(external) = &mut store.external_blob_inner {
+            external.inner = store.io_tracker.wrap("", external.inner.clone());
+        }
         store.inner = store.io_tracker.wrap("", store.inner);
 
         Ok(Arc::new(store))

@@ -11,8 +11,9 @@
 //!
 //! The wire format and the reasoning behind it live in
 //! `protos/transaction/actions.proto`; the two definitions must stay in step.
-//! Only the subset of the specified vocabulary that is implemented appears here --
-//! an action this build does not know is rejected on load rather than skipped.
+//! Every action the specification defines is implemented here, so the two
+//! vocabularies coincide -- an action a newer Lance writes is rejected on
+//! load rather than skipped.
 //!
 //! Each action lives in its own module and owns everything about itself: its
 //! definition, how it is applied, which coordinates it writes, and its wire
@@ -62,12 +63,23 @@ macro_rules! for_each_action {
             TombstoneFieldData,
             RemoveFragment,
             SetDeletionFile,
+            AddOverlays,
+            RefreshRowVersionMetadata,
+            UpdateCompactedSsTables,
             AlterField,
             DropField,
+            AddIndexSegment,
+            RemoveIndexSegment,
+            AdjustIndexCoverage,
+            DropIndex,
+            AppendFragReuseTransition,
+            TrimFragReuse,
             ReserveFragmentIds,
             ReserveRowIds,
             ResetTable,
             ConfigUpdate,
+            AssertUniqueKeys,
+            AssertCellsUnchanged,
         }
     };
 }
@@ -76,18 +88,30 @@ mod add_base;
 mod add_data_file;
 mod add_field;
 mod add_fragment;
+mod add_index_segment;
+mod add_overlays;
+mod adjust_index_coverage;
 mod alter_field;
+mod append_frag_reuse_transition;
 mod apply;
+mod assert_cells_unchanged;
+mod assert_unique_keys;
 mod config_update;
 mod drop_field;
+mod drop_index;
 mod footprint;
 mod proto;
+mod refresh_row_version_metadata;
 mod remove_fragment;
+mod remove_index_segment;
 mod reserve_fragment_ids;
 mod reserve_row_ids;
 mod reset_table;
+mod row_selection;
 mod set_deletion_file;
 mod tombstone_field_data;
+mod trim_frag_reuse;
+mod update_compacted_sstables;
 
 #[cfg(test)]
 mod test_support;
@@ -96,16 +120,28 @@ pub use add_base::AddBase;
 pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
 pub use add_fragment::AddFragment;
+pub use add_index_segment::AddIndexSegment;
+pub use add_overlays::AddOverlays;
+pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
+pub use append_frag_reuse_transition::{AppendFragReuseTransition, FragReuseMapping};
+pub use assert_cells_unchanged::AssertCellsUnchanged;
+pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
+pub use drop_index::DropIndex;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
+pub use refresh_row_version_metadata::RefreshRowVersionMetadata;
 pub use remove_fragment::RemoveFragment;
+pub use remove_index_segment::RemoveIndexSegment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
 pub use reserve_row_ids::ReserveRowIds;
 pub use reset_table::ResetTable;
+pub use row_selection::{RowSelection, SelectedRows};
 pub use set_deletion_file::SetDeletionFile;
 pub use tombstone_field_data::TombstoneFieldData;
+pub use trim_frag_reuse::TrimFragReuse;
+pub use update_compacted_sstables::UpdateCompactedSsTables;
 
 use apply::ApplyState;
 use lance_core::deepsize::DeepSizeOf;
@@ -339,12 +375,12 @@ impl UserStep {
 
 macro_rules! define_action {
     ($($variant:ident,)*) => {
-        /// A single granular change to the manifest.
+        /// A single granular change to the manifest, or an assertion about the
+        /// version it lands on.
         ///
-        /// The specified vocabulary is larger than this; the variants here are the
-        /// ones this build implements end to end. Each one is defined, applied,
-        /// and encoded in the module named after it, and appears here only
-        /// because it is listed in `for_each_action!`.
+        /// Each variant is defined, applied, and encoded in the module named
+        /// after it, and appears here only because it is listed in
+        /// `for_each_action!`.
         #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
         pub enum Action {
             $($variant($variant),)*
@@ -440,6 +476,45 @@ mod tests {
             data_change: true,
         });
         assert!(remove.is_data_change());
+
+        // An index segment is derived state unless the writer says otherwise,
+        // as the MemWAL index does for the rows it holds.
+        for data_change in [false, true] {
+            let add = Action::AddIndexSegment(AddIndexSegment {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change,
+            });
+            assert_eq!(add.is_data_change(), data_change);
+            let remove = Action::RemoveIndexSegment(RemoveIndexSegment {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                data_change,
+            });
+            assert_eq!(remove.is_data_change(), data_change);
+        }
+
+        let adjust = Action::AdjustIndexCoverage(AdjustIndexCoverage {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "by_a".into(),
+            add_fragments: vec![Ref::Committed(1)],
+            remove_fragments: vec![0],
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: Vec::new(),
+        });
+        assert!(
+            !adjust.is_data_change(),
+            "coverage changes no row a reader sees"
+        );
     }
 
     #[test]

@@ -33,16 +33,24 @@ use crate::format::{
     BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
 };
 use crate::rowids::read_row_ids;
-use crate::rowids::version::build_version_meta;
+use crate::rowids::version::{SpilledRowLineage, build_version_meta};
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::frag_reuse::FragReuseActionInputs;
 use crate::system_index::is_system_index;
-use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
+use crate::system_index::mem_wal::{
+    CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
+};
 use crate::transaction::manifest_build::{apply_range_segments, check_blob_nesting};
 use crate::transaction::validate::schema_fragments_valid;
-use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
+use crate::transaction::{FragReuseUpdate, LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+use uuid::Uuid;
+
+mod frag_reuse_history;
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -59,6 +67,7 @@ impl Transaction {
     /// action set is a delta, so there is nothing for it to be a delta against
     /// when the dataset does not exist yet. The caller turns the absent case
     /// into an error, which is where the `Option` it holds actually lives.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::transaction) fn build_manifest_from_actions(
         &self,
         composite_operation: &CompositeOperation,
@@ -67,6 +76,7 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
+        frag_reuse: &FragReuseUpdate,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         // No `migration_next_row_id` escape, unlike the legacy guard in
         // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
@@ -111,8 +121,13 @@ impl Transaction {
         let mut state = ApplyState::new(
             current_manifest,
             current_indices,
+            config,
+            self.read_version,
             ReadMarks::of(read_manifest),
         );
+        if let FragReuseUpdate::Actions(inputs) = frag_reuse {
+            state.frag_reuse_inputs = inputs.clone();
+        }
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
@@ -120,7 +135,6 @@ impl Transaction {
         state.into_manifest(
             self,
             transaction_file_path,
-            config,
             mem_wal_segments_before.as_ref(),
             read_version_state,
         )
@@ -162,6 +176,8 @@ pub(super) struct ApplyState<'a> {
     /// attempt, the latest committed version on a retry.
     current_manifest: &'a Manifest,
     read_marks: ReadMarks,
+    /// How the manifest this delta produces is to be assembled.
+    build_config: &'a ManifestBuildConfig,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
@@ -169,7 +185,9 @@ pub(super) struct ApplyState<'a> {
     /// committed on top of.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
-    /// The index segments of the version being committed on top of.
+    /// The index segments, as the actions have left them so far. Index
+    /// actions edit this list; the assembly then prunes whatever the data
+    /// actions invalidated.
     indices: Vec<IndexMetadata>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
     /// these are inherited wholesale by the manifest assembly, so an edit has
@@ -194,6 +212,10 @@ pub(super) struct ApplyState<'a> {
     /// Ids of the fragments this operation added, whether minted from the
     /// counter or claimed out of a reservation.
     new_fragments: HashSet<u64>,
+    /// The new fragments an [`AddFragment`](super::AddFragment) added with
+    /// `data_change = false`: rows moved from elsewhere in the table, whose
+    /// values no action in the operation may change.
+    rearranged_fragments: HashSet<u64>,
 
     /// How many fragment ids this operation reserved for a later writer. Like
     /// [`Self::reserved_row_ids`], taken off the counter after this
@@ -205,9 +227,9 @@ pub(super) struct ApplyState<'a> {
     /// reserved range is always the top `count` ids of the resulting watermark.
     reserved_row_ids: u64,
 
-    /// Fields whose backing data changed, per fragment. An index covering such
-    /// a field no longer describes that fragment's contents.
-    rebound_fields: HashMap<u64, HashSet<i32>>,
+    /// Names of the logical indices this operation added a segment to or
+    /// adjusted, whose segment sets are validated once the operation has run.
+    touched_index_names: BTreeSet<String>,
 
     /// Every field a [`TombstoneFieldData`](super::TombstoneFieldData) freed,
     /// by fragment and field, so a re-encode can be checked to re-bind what it
@@ -215,12 +237,32 @@ pub(super) struct ApplyState<'a> {
     tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
 
     /// Committed fragments whose values a data-changing action changed in
-    /// place, which on a stable row id table leaves their row versions stale.
+    /// place, which on a stable row id table leaves their row versions stale,
+    /// and the committed fragments a
+    /// [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)
+    /// restamped, wholly or in part. Every value-changed fragment has to be
+    /// restamped.
     value_changed_fragments: BTreeSet<u64>,
+    restamped_fragments: BTreeSet<u64>,
 
-    /// Whether the table was reset, which discards every index outright rather
-    /// than pruning fragments out of them.
-    reset: bool,
+    /// Fragments a [`RemoveFragment`](super::RemoveFragment) removed: a
+    /// fragment reuse transition may only consume a fragment a compaction
+    /// removed as it was committed.
+    removed_fragments: HashMap<u64, RemovedFragment>,
+    /// Committed fields whose values a data-changing tombstone replaced, by
+    /// fragment. On a tagged fragment reuse history the coverage of segments
+    /// translating into the fragment is withdrawn along the lineage.
+    rebound_fields: Vec<(u64, Vec<u32>)>,
+    /// What the operation asks of the fragment reuse history, settled once
+    /// the whole operation has run.
+    frag_reuse: frag_reuse_history::FragReuseChanges,
+    /// What the commit attempt supplied for the history.
+    frag_reuse_inputs: Arc<FragReuseActionInputs>,
+
+    /// The version the transaction was built against. Not the current
+    /// manifest's version: on a retry the set is replayed onto something newer,
+    /// and what an action saw is still the version it read.
+    read_version: u64,
 }
 
 /// A field a [`TombstoneFieldData`](super::TombstoneFieldData) freed.
@@ -231,11 +273,28 @@ struct TombstonedField {
     rebound: bool,
 }
 
+/// A fragment a [`RemoveFragment`](super::RemoveFragment) removed.
+#[derive(Debug, Clone, Copy)]
+struct RemovedFragment {
+    data_change: bool,
+    /// Whether an earlier action in the operation changed it from the
+    /// committed fragment.
+    modified: bool,
+}
+
 impl<'a> ApplyState<'a> {
-    fn new(manifest: &'a Manifest, indices: Vec<IndexMetadata>, read_marks: ReadMarks) -> Self {
+    fn new(
+        manifest: &'a Manifest,
+        indices: Vec<IndexMetadata>,
+        build_config: &'a ManifestBuildConfig,
+        read_version: u64,
+        read_marks: ReadMarks,
+    ) -> Self {
         Self {
             current_manifest: manifest,
+            read_version,
             read_marks,
+            build_config,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
             indices,
@@ -250,12 +309,17 @@ impl<'a> ApplyState<'a> {
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
             new_fragments: HashSet::new(),
+            rearranged_fragments: HashSet::new(),
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
-            rebound_fields: HashMap::new(),
+            touched_index_names: BTreeSet::new(),
             tombstoned_fields: HashMap::new(),
             value_changed_fragments: BTreeSet::new(),
-            reset: false,
+            restamped_fragments: BTreeSet::new(),
+            removed_fragments: HashMap::new(),
+            rebound_fields: Vec::new(),
+            frag_reuse: Default::default(),
+            frag_reuse_inputs: Default::default(),
         }
     }
 
@@ -264,16 +328,17 @@ impl<'a> ApplyState<'a> {
         mut self,
         transaction: &Transaction,
         transaction_file_path: &str,
-        config: &ManifestBuildConfig,
         mem_wal_segments_before: Option<&LogicalIndexSegments>,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let current_manifest = self.current_manifest;
+        let config = self.build_config;
         let new_version = current_manifest.version + 1;
 
         self.check_spilled_lineage_is_bound()?;
         self.check_reencodes_are_rebound()?;
         self.check_value_changes_are_restamped()?;
+        let publishes_frag_reuse = self.finish_frag_reuse_history()?;
 
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
@@ -286,9 +351,8 @@ impl<'a> ApplyState<'a> {
             schema,
             mut fragments,
             mut indices,
+            touched_index_names,
             new_bases,
-            rebound_fields,
-            reset,
             fragment_high_water,
             field_high_water,
             config: dataset_config,
@@ -304,11 +368,8 @@ impl<'a> ApplyState<'a> {
             check_schema(&schema)?;
         }
 
-        if reset {
-            indices.clear();
-        }
-        prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema)?;
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        validate_index_segment_sets(&indices, &touched_index_names)?;
 
         Transaction::normalize_fragments(&mut fragments)?;
         check_required_fields_are_stored(current_manifest, &schema, &fragments)?;
@@ -348,6 +409,9 @@ impl<'a> ApplyState<'a> {
         }
         inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         apply_index_object_metadata_flag(&mut manifest, &indices);
+        if publishes_frag_reuse {
+            frag_reuse_history::set_feature_flags(&mut manifest, &indices);
+        }
 
         for base in new_bases {
             manifest.base_paths.insert(base.id, base);
@@ -400,6 +464,114 @@ impl<'a> ApplyState<'a> {
 
     pub(super) fn uses_stable_row_ids(&self) -> bool {
         self.current_manifest.uses_stable_row_ids()
+    }
+
+    /// The version the transaction read, which is the newest data an index
+    /// segment added by this operation can have been built from.
+    ///
+    /// Deliberately not the current manifest's version. A set that loses a race
+    /// is replayed against whatever won, and a segment built before that still
+    /// reflects only what its writer could see -- stamping it with the newer
+    /// version would claim coverage of rows it never read.
+    pub(super) fn read_version(&self) -> u64 {
+        self.read_version
+    }
+
+    /// The version this delta produces, for the actions that stamp it into what
+    /// they write. Distinct from [`Self::read_version`]: a retry against a newer
+    /// manifest re-runs the apply, so anything stamped with this is re-stamped
+    /// rather than carried over.
+    pub(super) fn new_version(&self) -> u64 {
+        self.current_manifest.version + 1
+    }
+
+    /// Add an index segment. A segment's uuid identifies it, so re-adding one
+    /// that is already there is a mistake rather than a replacement -- swapping
+    /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)
+    /// followed by an add.
+    pub(super) fn add_index_segment(&mut self, segment: IndexMetadata) -> Result<()> {
+        if self.indices.iter().any(|index| index.uuid == segment.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index segment {} is already part of the dataset; a segment is added once",
+                segment.uuid
+            )));
+        }
+        self.touched_index_names.insert(segment.name.clone());
+        self.indices.push(segment);
+        Ok(())
+    }
+
+    /// Drop an index segment by uuid. A removal that names a segment the
+    /// dataset does not have is a mistake rather than a no-op: it means the
+    /// operation was planned against a different set of segments.
+    pub(super) fn remove_index_segment(&mut self, uuid: Uuid, name: &str) -> Result<()> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be removed"
+            )));
+        };
+        self.indices.remove(position);
+        Ok(())
+    }
+
+    /// Remove every segment of the index `name`.
+    pub(super) fn drop_index(&mut self, name: &str) -> Result<()> {
+        let before = self.indices.len();
+        self.indices.retain(|index| index.name != name);
+        if self.indices.len() == before {
+            return Err(Error::invalid_input(format!(
+                "DropIndex names index '{name}', which has no segment in the dataset"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record MemWAL SSTable compaction progress against the table's existing
+    /// MemWAL index, which has to already be there -- progress against an index
+    /// no one built is rejected rather than inventing the metadata.
+    pub(super) fn update_compacted_sstables(
+        &mut self,
+        compacted_sstables: Vec<CompactedSsTable>,
+    ) -> Result<()> {
+        let new_version = self.new_version();
+        update_mem_wal_index_compacted_sstables(&mut self.indices, new_version, compacted_sstables)
+    }
+
+    /// Where the segment `uuid` lives, checking on the way that it really
+    /// belongs to `name`. A mismatch means the operation was planned against a
+    /// different set of segments, the same way a missing segment does.
+    fn index_segment_position(&self, uuid: Uuid, name: &str) -> Result<Option<usize>> {
+        let Some(position) = self.indices.iter().position(|index| index.uuid == uuid) else {
+            return Ok(None);
+        };
+        let found = &self.indices[position].name;
+        if found != name {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} belongs to index '{found}', but the action names it as part \
+                 of index '{name}'"
+            )));
+        }
+        Ok(Some(position))
+    }
+
+    pub(super) fn index_segment_mut(
+        &mut self,
+        uuid: Uuid,
+        name: &str,
+    ) -> Result<&mut IndexMetadata> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
+            )));
+        };
+        self.touched_index_names.insert(name.to_string());
+        Ok(&mut self.indices[position])
+    }
+
+    /// Row lineage the caller read ahead of time for fragments whose lineage
+    /// lives in a data file, which applying cannot read itself.
+    pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
+        &self.build_config.spilled_row_lineage
     }
 
     pub(super) fn schema(&self) -> &Schema {
@@ -483,17 +655,34 @@ impl<'a> ApplyState<'a> {
 
     /// Drop a fragment and forget everything recorded about it. `false` if no
     /// such fragment was present.
-    pub(super) fn remove_fragment(&mut self, fragment_id: u64) -> bool {
-        let before = self.fragments.len();
-        self.fragments.retain(|fragment| fragment.id != fragment_id);
-        if self.fragments.len() == before {
+    pub(super) fn remove_fragment(&mut self, fragment_id: u64, data_change: bool) -> bool {
+        let Some(position) = self
+            .fragments
+            .iter()
+            .position(|fragment| fragment.id == fragment_id)
+        else {
             return false;
-        }
+        };
+        let removed = self.fragments.remove(position);
+        let modified = self
+            .current_manifest
+            .fragments
+            .iter()
+            .find(|fragment| fragment.id == fragment_id)
+            .is_some_and(|committed| *committed != removed);
+        self.removed_fragments.insert(
+            fragment_id,
+            RemovedFragment {
+                data_change,
+                modified,
+            },
+        );
         self.new_fragments.remove(&fragment_id);
-        self.rebound_fields.remove(&fragment_id);
+        self.rearranged_fragments.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
         self.value_changed_fragments.remove(&fragment_id);
+        self.restamped_fragments.remove(&fragment_id);
         true
     }
 
@@ -504,11 +693,12 @@ impl<'a> ApplyState<'a> {
         self.schema.fields.clear();
         self.schema.metadata.clear();
         self.fragments.clear();
+        self.indices.clear();
         self.new_fragments.clear();
-        self.rebound_fields.clear();
+        self.rearranged_fragments.clear();
         self.tombstoned_fields.clear();
         self.value_changed_fragments.clear();
-        self.reset = true;
+        self.restamped_fragments.clear();
     }
 
     /// The base paths this apply can see: the current manifest's, plus the ones
@@ -732,17 +922,73 @@ impl<'a> ApplyState<'a> {
         self.new_fragments.contains(&fragment_id)
     }
 
+    pub(super) fn note_rearranged(&mut self, fragment_id: u64) {
+        self.rearranged_fragments.insert(fragment_id);
+    }
+
+    /// Whether `fragment_id` is one this operation added with
+    /// `data_change = false`.
+    pub(super) fn is_rearranged(&self, fragment_id: u64) -> bool {
+        self.rearranged_fragments.contains(&fragment_id)
+    }
+
+    /// Refuse a write that changes the values of a fragment this operation
+    /// added with `data_change = false`.
+    ///
+    /// Such a fragment's rows were already in the table: they keep their row
+    /// versions, and the footprint records no inserted rows and no write to a
+    /// committed fragment. A value change in the same operation would hide
+    /// behind all three -- an incremental reader would miss the changed rows,
+    /// a concurrent key assertion would not see a changed key, and an index
+    /// carried onto the fragment through the fragment reuse history would
+    /// answer from the old values.
+    pub(super) fn reject_data_change_to_rearranged(
+        &self,
+        fragment_id: u64,
+        action: &str,
+    ) -> Result<()> {
+        if !self.is_rearranged(fragment_id) {
+            return Ok(());
+        }
+        Err(Error::invalid_input(format!(
+            "{action} changes the values of fragment {fragment_id}, which this operation adds \
+             with data_change = false; a fragment that only moves rows cannot also change \
+             them, so add it with data_change = true, or change the rows in a later operation"
+        )))
+    }
+
+    /// Record that a [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)
+    /// restamped some or all of this fragment's rows.
+    pub(super) fn note_restamp(&mut self, fragment_id: u64) {
+        self.restamped_fragments.insert(fragment_id);
+    }
+
     /// Record that these fields' data in this fragment no longer matches what
     /// an index built over them recorded.
+    ///
+    /// Prunes the segments present now rather than at assembly: a segment an
+    /// later action in this operation adds was built over the new data, so the
+    /// rebind does not invalidate it.
     pub(super) fn rebind_fields(
         &mut self,
         fragment_id: u64,
         fields: impl IntoIterator<Item = i32>,
-    ) {
-        self.rebound_fields
-            .entry(fragment_id)
-            .or_default()
-            .extend(fields);
+    ) -> Result<()> {
+        let fields: Vec<i32> = fields.into_iter().collect();
+        self.rebound_fields.push((
+            fragment_id,
+            fields
+                .iter()
+                .filter_map(|field| u32::try_from(*field).ok())
+                .collect(),
+        ));
+        prune_rebound_fields_from_indices(
+            &mut self.indices,
+            fragment_id,
+            &fields,
+            &self.current_manifest.schema,
+            &self.schema,
+        )
     }
 
     /// Record that a data-changing action changed values stored in this
@@ -821,24 +1067,32 @@ impl<'a> ApplyState<'a> {
     /// On a stable row id table, `get_updated_rows()` reads which rows changed
     /// from `last_updated_at_version_meta`. Apply cannot infer which rows of a
     /// committed fragment a data file or tombstone changed (a column rewrite
-    /// writes the whole fragment but may change only some rows), and no
-    /// action yet lets the writer say, so such a change is refused rather
-    /// than published with stale row versions.
+    /// writes the whole fragment but may change only some rows), so the
+    /// writer has to say with a
+    /// [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata), or the
+    /// change would publish with stale row versions. Checked once every action
+    /// has been seen, because the refresh may come before or after the change.
+    ///
+    /// Any selection of the fragment's rows satisfies it, down to one row:
+    /// which rows changed is exactly what the files cannot say, so the
+    /// writer's selection is taken as given.
     fn check_value_changes_are_restamped(&self) -> Result<()> {
-        if !self.uses_stable_row_ids() || self.value_changed_fragments.is_empty() {
+        if !self.uses_stable_row_ids() {
             return Ok(());
         }
-        let changed = self
+        let unrestamped = self
             .value_changed_fragments
-            .iter()
+            .difference(&self.restamped_fragments)
             .map(|fragment| format!("fragment {fragment}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        if unrestamped.is_empty() {
+            return Ok(());
+        }
+        let unrestamped = unrestamped.join(", ");
         Err(Error::invalid_input(format!(
             "the table has stable row ids, and the operation changes values in place in \
-             committed {changed}, which would leave last_updated_at_version_meta stale; an \
-             action-based transaction cannot yet restamp row versions, so write such a change \
-             with a named operation"
+             committed {unrestamped}, which would leave last_updated_at_version_meta stale; add \
+             a RefreshRowVersionMetadata covering the changed rows of {unrestamped}"
         )))
     }
 
@@ -1077,9 +1331,11 @@ fn required_field_ids(schema: &Schema) -> HashSet<i32> {
 ///
 /// Rebinding a field also invalidates an index on any field it contains or is
 /// nested in: a packed struct is stored under the parent's id while an index may
-/// be keyed on a child. Ancestry is read from `base_schema`, the schema of the
-/// version being committed on top of, because a field this operation drops or
-/// moves has already left the schema being built.
+/// be keyed on a child. A field counts if its ancestry relates it to the index
+/// in either `base_schema`, the schema of the version being committed on top
+/// of, or `working_schema`, the one being built: a field this operation drops
+/// or moves has already left the working schema, and a child it adds is not
+/// yet in the base one.
 ///
 /// A user index with no bitmap -- one built before indices recorded their
 /// coverage -- has no fragment to prune, so a rewrite under it is refused
@@ -1087,22 +1343,22 @@ fn required_field_ids(schema: &Schema) -> HashSet<i32> {
 /// design and are keyed on no column, so a rewrite never affects them.
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
-    rebound: &HashMap<u64, HashSet<i32>>,
+    fragment_id: u64,
+    fields: &[i32],
     base_schema: &Schema,
+    working_schema: &Schema,
 ) -> Result<()> {
-    if rebound.is_empty() {
+    let Ok(fragment_id) = u32::try_from(fragment_id) else {
         return Ok(());
-    }
+    };
     for index in indices.iter_mut() {
-        let affected_field = |fields: &HashSet<i32>| {
-            fields
-                .iter()
-                .copied()
-                .find(|field| field_affects_index(*field, &index.fields, base_schema))
-        };
+        let affected_field = fields.iter().copied().find(|field| {
+            field_affects_index(*field, &index.fields, base_schema)
+                || field_affects_index(*field, &index.fields, working_schema)
+        });
         let Some(bitmap) = index.fragment_bitmap.as_mut() else {
             if !is_system_index(index)
-                && let Some(field) = rebound.values().find_map(affected_field)
+                && let Some(field) = affected_field
             {
                 return Err(Error::invalid_input(format!(
                     "index '{}' has unknown coverage; migrate or rebuild it before rewriting \
@@ -1112,12 +1368,8 @@ fn prune_rebound_fields_from_indices(
             }
             continue;
         };
-        for (fragment_id, fields) in rebound {
-            if affected_field(fields).is_some()
-                && let Ok(fragment_id) = u32::try_from(*fragment_id)
-            {
-                bitmap.remove(fragment_id);
-            }
+        if affected_field.is_some() {
+            bitmap.remove(fragment_id);
         }
     }
     Ok(())
@@ -1162,6 +1414,22 @@ fn auto_cleanup_settings(config: &HashMap<String, String>) -> BTreeMap<&str, &st
         .collect()
 }
 
+/// Refuse an index action naming the fragment reuse history. The history is
+/// not an index on the action path -- its own actions append to and trim it,
+/// merged onto the current history at every attempt -- so an index action
+/// naming it could only splice in a snapshot or drop records a concurrent
+/// writer appended.
+pub(super) fn reject_frag_reuse_history(action: &str, name: &str) -> Result<()> {
+    if name == FRAG_REUSE_INDEX_NAME {
+        return Err(Error::invalid_input(format!(
+            "{action} names '{FRAG_REUSE_INDEX_NAME}', the fragment reuse history, which is not \
+             an index an index action may change; use AppendFragReuseTransition or \
+             TrimFragReuse"
+        )));
+    }
+    Ok(())
+}
+
 fn beyond_read_mark_err(space: &str, id: impl std::fmt::Display, mark: String) -> Error {
     Error::invalid_input(format!(
         "an action names {space} {id} by a Committed ref, but the read version's high-water mark \
@@ -1176,6 +1444,79 @@ fn display_mark(mark: Option<u64>) -> String {
         || "unset (no id handed out)".to_string(),
         |mark| mark.to_string(),
     )
+}
+
+/// Check that the segments left under each touched index name still form one
+/// logical index.
+///
+/// The query path unions a logical index's segments, so they must agree on
+/// what the index is: the same keyed and carried fields, resolved to ids (a
+/// `Local` token means a different field in each operation that mints one), and
+/// the same index type. And they must not describe a fragment twice, which
+/// would double-count its rows. The check runs on the final set rather than the
+/// actions, so a segment added by an earlier commit is compared too.
+///
+/// The rest of the index details is not compared, unlike the conflict check.
+/// A rejection here is permanent, and segments of one index legitimately carry
+/// different details: training knobs chosen per build, map fields with no fixed
+/// encoding order, and datasets that already hold such segments. Whether a
+/// vector query can mix segments is checked by `lance` when it opens them.
+///
+/// Only names this operation touched are checked, so an operation is not blamed
+/// for an inconsistency it did not introduce.
+fn validate_index_segment_sets(
+    indices: &[IndexMetadata],
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    for name in touched {
+        let mut segments = indices.iter().filter(|index| &index.name == name);
+        let Some(first) = segments.next() else {
+            continue;
+        };
+        let type_url = |index: &IndexMetadata| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.clone())
+        };
+        let mut covered = first.fragment_bitmap.clone().unwrap_or_default();
+        for segment in segments {
+            if segment.fields != first.fields || segment.covering_fields != first.covering_fields {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} over fields {:?} (carried {:?}) beside segment {} \
+                     over fields {:?} (carried {:?}); the segments of one index must agree",
+                    segment.uuid,
+                    segment.fields,
+                    segment.covering_fields,
+                    first.uuid,
+                    first.fields,
+                    first.covering_fields
+                )));
+            }
+            if type_url(segment) != type_url(first) {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} of type {:?} beside segment {} of type {:?}; \
+                     the segments of one index must be the same type",
+                    segment.uuid,
+                    type_url(segment),
+                    first.uuid,
+                    type_url(first)
+                )));
+            }
+            let Some(bitmap) = &segment.fragment_bitmap else {
+                continue;
+            };
+            if let Some(fragment) = (&covered & bitmap).min() {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} covering fragment {fragment}, which another \
+                     segment of the index already covers; its rows would be counted twice",
+                    segment.uuid
+                )));
+            }
+            covered |= bitmap;
+        }
+    }
+    Ok(())
 }
 
 fn unbound_token_err(space: &str, token: u32) -> Error {
@@ -1206,6 +1547,7 @@ mod tests {
         MANAGED_BLOBS_META_KEY,
     };
     use crate::format::DataFile;
+    use crate::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
     use crate::rowids::write_row_ids;
     use crate::system_index::mem_wal::{
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
@@ -1213,12 +1555,14 @@ mod tests {
     };
     use crate::transaction::action::test_support::{
         added_field, any_deletion_file, apply, apply_after_reading, apply_with_indices,
-        backed_manifest, manifest_with_base, mint_base, one_column_file,
+        backed_manifest, last_updated_versions, manifest_with_base, mint_base, one_column_file,
+        refresh, refresh_rows, replace_field_data,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
-        ConfigUpdate, DropField, FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds,
-        ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
@@ -1474,6 +1818,56 @@ mod tests {
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
     }
 
+    /// A child the operation itself adds is not in the schema it builds on, so
+    /// its ancestry has to come from the schema being built for a rewrite of
+    /// its parent to reach an index on it.
+    #[test]
+    fn test_rewriting_a_struct_prunes_an_index_on_a_child_added_in_the_same_operation() {
+        let mut manifest = backed_manifest();
+        manifest.schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "x",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )]))
+        .unwrap();
+
+        let mut actions = vec![
+            Action::AddField(AddField {
+                local: 0,
+                parent: Some(FieldRef::Committed(0)),
+                def: added_field("z"),
+            }),
+            Action::AddIndexSegment(AddIndexSegment {
+                uuid: Uuid::from_u128(1),
+                name: "idx".into(),
+                fields: vec![FieldRef::Local(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            }),
+        ];
+        actions.extend(replace_field_data(0, 0, true));
+
+        let (_, indices) = apply_with_indices(&manifest, actions, Vec::new()).unwrap();
+
+        let index = indices.iter().find(|index| index.name == "idx").unwrap();
+        assert!(
+            !index.fragment_bitmap.as_ref().unwrap().contains(0),
+            "rewriting s in fragment 0 should prune it from the index on s.z, got {:?}",
+            index.fragment_bitmap
+        );
+    }
+
     /// An index from before fragment bitmaps has no record of what it covers,
     /// so there is no fragment to prune out of it when data under it is
     /// rewritten. Keeping it would serve stale results, and dropping it
@@ -1613,7 +2007,7 @@ mod tests {
         vec![vec![
             remove_fragment_zero(),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
+                fragment: Ref::Committed(0),
                 deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
@@ -1983,7 +2377,7 @@ mod tests {
         vec![
             mint_fragment(0),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 5,
+                fragment: Ref::Committed(5),
                 deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
@@ -2024,7 +2418,7 @@ mod tests {
     #[rstest]
     #[case::deletion_file(
         Action::SetDeletionFile(SetDeletionFile {
-            fragment: 1,
+            fragment: Ref::Committed(1),
             deletion_file: any_deletion_file(),
             data_change: true,
             base: None,
@@ -2381,12 +2775,28 @@ mod tests {
         assert!(!read_row_ids(data).unwrap().range_runs_span_a_gap());
     }
 
-    /// Fragment 0 of a stable row id table, backed by a file for a nullable
-    /// field 0, so its data can be tombstoned without a replacement.
+    /// Fragments 0 and 1 of a stable row id table, each backed by a file for a
+    /// nullable field 0, so its data can be tombstoned without a replacement.
+    /// Every row was last updated at version 2.
     fn stable_row_id_backed_manifest() -> Manifest {
-        let mut fragment = backed_manifest().fragments[0].clone();
-        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&(0..10).into()).into()));
-        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        let fragments = (0..2u64)
+            .map(|id| {
+                let mut fragment = backed_manifest().fragments[0].clone();
+                fragment.id = id;
+                fragment.files[0].path = format!("data/{id}.lance");
+                fragment.row_id_meta = Some(RowIdMeta::Inline(
+                    write_row_ids(&(id * 10..id * 10 + 10).into()).into(),
+                ));
+                fragment.last_updated_at_version_meta = Some(
+                    RowDatasetVersionMeta::from_sequence(
+                        &RowDatasetVersionSequence::from_uniform_row_count(10, 2),
+                    )
+                    .unwrap(),
+                );
+                fragment
+            })
+            .collect();
+        let mut manifest = make_stable_row_id_manifest(fragments);
         manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
         manifest
     }
@@ -2409,79 +2819,149 @@ mod tests {
         })
     }
 
-    /// `get_updated_rows()` reads `last_updated_at_version_meta`, which only a
-    /// restamp of the changed rows keeps current. Apply cannot tell which rows
-    /// a file for an existing fragment changed, so until an action can say so,
-    /// a value change to a committed fragment of a stable row id table is
-    /// refused. Moving values, writing new fragments, and deleting rows leave
-    /// no row's value changed in place.
-    #[rstest]
-    #[case::new_column_in_a_committed_fragment(
+    fn new_column() -> Vec<Action> {
         vec![
             mint_field(0, "added", None),
             write_data(Ref::Committed(0), FieldRef::Local(0)),
-        ],
-        Some("fragment 0")
-    )]
-    #[case::column_dropped_out_of_a_committed_fragment(
-        vec![tombstone_field_zero(true)],
-        Some("fragment 0")
-    )]
-    #[case::column_rewritten_in_a_committed_fragment(
-        vec![tombstone_field_zero(true), reencode_field_zero(true)],
-        Some("fragment 0")
-    )]
-    #[case::reencode_of_a_committed_fragment(
-        vec![tombstone_field_zero(false), reencode_field_zero(false)],
-        None
-    )]
-    #[case::new_fragment(
-        vec![mint_fragment(0), write_data(Ref::Local(0), FieldRef::Committed(0))],
-        None
-    )]
-    #[case::deletion_in_a_committed_fragment(
-        vec![Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: any_deletion_file(),
-            data_change: true,
-            base: None,
-        })],
-        None
-    )]
-    #[case::changed_fragment_removed_afterwards(
-        vec![
-            tombstone_field_zero(true),
-            Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(0),
-                data_change: true,
-            }),
-        ],
-        None
-    )]
-    fn test_a_value_change_to_a_committed_fragment_needs_a_row_version_restamp(
-        #[case] actions: Vec<Action>,
-        #[case] expected_error: Option<&str>,
-    ) {
-        let result = apply(&stable_row_id_backed_manifest(), actions.clone());
+        ]
+    }
 
-        match expected_error {
-            None => {
-                result.unwrap();
+    fn dropped_column() -> Vec<Action> {
+        vec![tombstone_field_zero(true)]
+    }
+
+    fn rewritten_column() -> Vec<Action> {
+        vec![tombstone_field_zero(true), reencode_field_zero(true)]
+    }
+
+    /// `get_updated_rows()` reads `last_updated_at_version_meta`, which only a
+    /// restamp of the changed rows keeps current. Apply cannot tell which rows
+    /// a file for an existing fragment changed, so a value change to a
+    /// committed fragment of a stable row id table needs a
+    /// `RefreshRowVersionMetadata` covering that fragment, before or after the
+    /// change. The writer's selection is taken as given, down to one row.
+    #[rstest]
+    #[case::not_restamped(vec![], vec![], None)]
+    #[case::restamped_whole(vec![], vec![refresh(&[0])], Some(&[true; 10][..]))]
+    #[case::restamped_rows(
+        vec![],
+        vec![refresh_rows(0, &[1, 3])],
+        Some(&[false, true, false, true, false, false, false, false, false, false][..])
+    )]
+    #[case::restamped_before_the_change(vec![refresh(&[0])], vec![], Some(&[true; 10][..]))]
+    #[case::other_fragment_restamped(vec![], vec![refresh(&[1])], None)]
+    fn test_a_value_change_to_a_committed_fragment_needs_a_row_version_restamp(
+        #[values(new_column, dropped_column, rewritten_column)] change: fn() -> Vec<Action>,
+        #[case] before: Vec<Action>,
+        #[case] after: Vec<Action>,
+        #[case] restamped_rows: Option<&[bool]>,
+    ) {
+        let manifest = stable_row_id_backed_manifest();
+        let actions = [before, change(), after].concat();
+
+        let result = apply(&manifest, actions);
+
+        match restamped_rows {
+            Some(restamped_rows) => {
+                let next = result.unwrap();
+                let expected: Vec<u64> = restamped_rows
+                    .iter()
+                    .map(|&restamped| if restamped { manifest.version + 1 } else { 2 })
+                    .collect();
+                assert_eq!(last_updated_versions(&next.fragments[0]), expected);
             }
-            Some(fragment) => {
+            None => {
                 let error = result.unwrap_err();
                 assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
                 let message = error.to_string();
-                assert!(message.contains(fragment), "{message}");
+                assert!(message.contains("fragment 0"), "{message}");
+                assert!(!message.contains("fragment 1"), "{message}");
                 assert!(
                     message.contains("last_updated_at_version_meta"),
                     "{message}"
                 );
+                assert!(message.contains("RefreshRowVersionMetadata"), "{message}");
                 // Without stable row ids there is no row version to keep.
                 let mut manifest = backed_manifest();
                 manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
-                apply(&manifest, actions).unwrap();
+                apply(&manifest, change()).unwrap();
             }
         }
+    }
+
+    /// Moving values, writing new fragments, and deleting rows leave no row's
+    /// value changed in place, so none of them needs a restamp.
+    #[rstest]
+    #[case::reencode_of_a_committed_fragment(vec![
+        tombstone_field_zero(false),
+        reencode_field_zero(false),
+    ])]
+    #[case::new_fragment(vec![
+        mint_fragment(0),
+        write_data(Ref::Local(0), FieldRef::Committed(0)),
+    ])]
+    #[case::deletion_in_a_committed_fragment(vec![Action::SetDeletionFile(SetDeletionFile {
+        fragment: Ref::Committed(0),
+        deletion_file: any_deletion_file(),
+        data_change: true,
+        base: None,
+    })])]
+    #[case::changed_fragment_removed_afterwards(vec![
+        tombstone_field_zero(true),
+        Action::RemoveFragment(RemoveFragment {
+            fragment: Ref::Committed(0),
+            data_change: true,
+        }),
+    ])]
+    fn test_a_change_leaving_no_value_changed_in_place_needs_no_restamp(
+        #[case] actions: Vec<Action>,
+    ) {
+        apply(&stable_row_id_backed_manifest(), actions).unwrap();
+    }
+
+    /// The fragment reuse history is not an index on the action path: no
+    /// index action may name it, so it changes only through its own actions.
+    #[rstest]
+    #[case::add_segment(|uuid: Uuid| Action::AddIndexSegment(AddIndexSegment {
+        uuid: Uuid::from_u128(uuid.as_u128() + 1),
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        fields: Vec::new(),
+        covering_fields: Vec::new(),
+        index_details: None,
+        index_version: 1,
+        covered_fragments: None,
+        files: Vec::new(),
+        base: None,
+        created_at: None,
+        dataset_version: None,
+        data_change: false,
+    }))]
+    #[case::remove_segment(|uuid| Action::RemoveIndexSegment(RemoveIndexSegment {
+        uuid,
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        data_change: false,
+    }))]
+    #[case::adjust_coverage(|uuid| Action::AdjustIndexCoverage(AdjustIndexCoverage {
+        uuid,
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        add_fragments: Vec::new(),
+        remove_fragments: vec![0],
+        fields: Vec::new(),
+        covering_fields: Vec::new(),
+    }))]
+    #[case::drop_index(|_| Action::DropIndex(DropIndex {
+        name: FRAG_REUSE_INDEX_NAME.into(),
+    }))]
+    fn test_an_index_action_may_not_name_the_fragment_reuse_history(
+        #[case] action: fn(Uuid) -> Action,
+    ) {
+        let mut entry = sample_index_metadata(FRAG_REUSE_INDEX_NAME);
+        entry.fields.clear();
+        entry.index_version = 0;
+        let error = apply_with_indices(&backed_manifest(), vec![action(entry.uuid)], vec![entry])
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(FRAG_REUSE_INDEX_NAME), "{error}");
     }
 }

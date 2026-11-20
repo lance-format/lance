@@ -70,6 +70,15 @@ class CompactionOptions(TypedDict, total=False):
 
     The default will use the same default from ``scanner``.
     """
+    data_cache_bytes: Optional[int]
+    """
+    Total budget in bytes for buffering column data in each output file writer
+    during re-encoding. Divided evenly among cache-owning field encoders,
+    including nested fields. Omitted or None uses the Rust writer default of
+    8 MiB per cache owner. Must be non-negative; zero is allowed. Does not
+    affect binary copy or input scanner buffers.
+    Example: ``Compaction.plan(ds, {"data_cache_bytes": 4 * 1024 * 1024})``.
+    """
     io_buffer_size: Optional[int]
     """
     The number of bytes to allow to queue up in the I/O buffer when scanning

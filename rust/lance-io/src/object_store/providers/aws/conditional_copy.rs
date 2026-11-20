@@ -268,7 +268,7 @@ mod tests {
             .await;
         let store = provider_store(&server, mode).await;
         let result = store
-            .copy_if_not_exists(&Path::from("source"), &Path::from("destination"))
+            .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
             .await
             .unwrap();
         assert_eq!(result.size, 3);
@@ -289,7 +289,7 @@ mod tests {
             .await;
         provider_store(&server, Some("header:cf-copy-destination-if-none-match:*"))
             .await
-            .copy_if_not_exists(&Path::from("source"), &Path::from("destination"))
+            .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
             .await
             .unwrap();
     }
@@ -307,7 +307,7 @@ mod tests {
             .await;
         let result = provider_store(&server, None)
             .await
-            .copy_if_not_exists(&Path::from("source"), &Path::from("destination"))
+            .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
             .await
             .unwrap();
         assert_eq!(result.size, 0);
@@ -338,7 +338,7 @@ mod tests {
             .await;
         let error = provider_store(&server, mode)
             .await
-            .copy_if_not_exists(&Path::from("source"), &Path::from("destination"))
+            .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
             .await
             .unwrap_err();
         assert!(matches!(error, lance_core::Error::IO { .. }));

@@ -40,6 +40,9 @@ pub struct TombstoneFieldData {
 impl TombstoneFieldData {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
+        if self.data_change {
+            state.reject_data_change_to_rearranged(fragment_id, "TombstoneFieldData")?;
+        }
         let field_ids = self
             .field_ids
             .iter()
@@ -106,7 +109,7 @@ impl TombstoneFieldData {
                 .filter_map(|id| u32::try_from(*id).ok())
                 .collect();
             crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
-            state.rebind_fields(fragment_id, field_ids.iter().copied());
+            state.rebind_fields(fragment_id, field_ids.iter().copied())?;
             state.note_value_change(fragment_id);
         }
         // A re-encode leaves both alone: the overlays are newer than the base

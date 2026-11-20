@@ -265,6 +265,7 @@ pub struct ObjectStore {
     external_blob_inner: Option<ExternalBlobStore>,
     // Keep the registry's weak binding alive while only an external view is held.
     _external_blob_origin: Option<Arc<Self>>,
+    direct_local_io: bool,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     // Whether local writes sync file data and directory entries before returning.
@@ -835,7 +836,7 @@ impl ObjectStore {
                 let (wrapped, external) =
                     wrapper.wrap_with_external_blobs(&store_prefix, inner.clone(), inner);
                 inner = wrapped;
-                Some(ExternalBlobStore::new(external))
+                Some(ExternalBlobStore::new(io_tracker.wrap("", external)))
             } else {
                 None
             };
@@ -847,6 +848,7 @@ impl ObjectStore {
                 inner: tracked_store,
                 external_blob_inner,
                 _external_blob_origin: None,
+                direct_local_io: false,
                 local_dir_operations: None,
                 local_fsync: false,
                 scheme: path.scheme().to_string(),
@@ -941,7 +943,15 @@ impl ObjectStore {
     /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
     /// their inner object-store implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
-        self.is_local() && self.store_prefix == self.scheme
+        self.has_absolute_local_mapping() && self.is_local() && !self.has_wrapper()
+    }
+
+    fn has_absolute_local_mapping(&self) -> bool {
+        self.direct_local_io && self.store_prefix == self.scheme
+    }
+
+    fn has_wrapper(&self) -> bool {
+        self.external_blob_inner.is_some() || self._external_blob_origin.is_some()
     }
 
     /// Canonicalize a local object path, resolving rooted and UNC stores through
@@ -965,7 +975,7 @@ impl ObjectStore {
         if let Some(local_dir_operations) = &self.local_dir_operations {
             return local_dir_operations.canonicalize(path).await;
         }
-        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+        if self.has_absolute_local_mapping() {
             return canonicalize_local_io_result(
                 tokio::fs::canonicalize(super::local::to_local_path(path)).await,
             );
@@ -985,7 +995,7 @@ impl ObjectStore {
     /// The lite scheduler is designed for backends like io_uring where
     /// tasks should only be polled when the consumer polls them.
     pub fn prefers_lite_scheduler(&self) -> bool {
-        self.scheme == "file+uring"
+        self.scheme == "file+uring" && self.has_direct_local_paths()
     }
 
     pub fn scheme(&self) -> &str {
@@ -1140,7 +1150,7 @@ impl ObjectStore {
             return store;
         }
         let mut store = self.as_ref().clone();
-        store.inner = self.io_tracker.wrap("", external.inner.clone());
+        store.inner = external.inner.clone();
         store.paginated_lister = None;
         store.external_blob_inner = None;
         store._external_blob_origin = Some(self.clone());
@@ -1165,7 +1175,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" => {
+            "file+uring" if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1230,7 +1240,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" => {
+            "file+uring" if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1372,6 +1382,69 @@ impl ObjectStore {
         }
     }
 
+    /// Read an object directly, preserving request and body errors separately.
+    pub async fn read_object(&self, path: &Path) -> object_store::Result<object_store::GetResult> {
+        self.inner.get(path).await
+    }
+
+    /// Publish a payload without buffering it through a Lance writer.
+    pub async fn put_payload(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+    ) -> object_store::Result<WriteResult> {
+        self.put_payload_opts(path, payload, Default::default())
+            .await
+    }
+
+    /// Publish a payload with the caller's preconditions.
+    pub async fn put_payload_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<WriteResult> {
+        let size = payload.content_length();
+        let result = self.inner.put_opts(path, payload, options).await?;
+        Ok(WriteResult {
+            size,
+            e_tag: result.e_tag,
+        })
+    }
+
+    /// List objects with a single backend stream.
+    pub fn list_objects(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    /// Read one byte range in a single backend request.
+    pub async fn read_range(&self, path: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    /// Read metadata without fetching the object body.
+    pub async fn stat(&self, path: &Path) -> object_store::Result<ObjectMeta> {
+        self.inner.head(path).await
+    }
+
+    /// Rename an object using the provider's replacement semantics.
+    pub async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    /// Publish by rename only if the destination is absent.
+    pub async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename_if_not_exists(from, to).await
+    }
+
+    /// Copy only if the destination is absent.
+    pub async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+
     /// A helper function to create a file and write content to it.
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
         let mut writer = self.create(path).await?;
@@ -1401,8 +1474,8 @@ impl ObjectStore {
         }
 
         if self.is_local() {
-            let staging_path =
-                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            let name = format!("lance-io.staging.{}", uuid::Uuid::new_v4().simple());
+            let staging_path = path.parent().unwrap_or_default().join(name.as_str());
             self.inner.put(&staging_path, content).await?;
             let result = self.inner.rename_if_not_exists(&staging_path, path).await;
             if result.is_err()
@@ -1655,7 +1728,7 @@ impl ObjectStore {
     ///
     /// This uses the provider's native conditional copy. An existing destination
     /// with the same size is treated as a successful retry.
-    pub async fn copy_if_not_exists(
+    pub async fn copy_if_not_exists_or_same_size(
         &self,
         source_path: &Path,
         destination_path: &Path,
@@ -1993,7 +2066,7 @@ impl ObjectStore {
             metrics.record(&result, 0);
             return result;
         }
-        if self.has_direct_local_paths() {
+        if self.has_absolute_local_mapping() && self.is_local() {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
@@ -2028,7 +2101,7 @@ impl ObjectStore {
         for location in deferred {
             self.inner.delete(&location).await?;
         }
-        if self.scheme == "file-object-store" {
+        if self.has_absolute_local_mapping() && self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
             return super::local::remove_dir_all(&path);
@@ -2068,7 +2141,7 @@ impl ObjectStore {
         verified_dirs: HashSet<Path>,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        if !self.has_direct_local_paths() && self.scheme != "file-object-store" {
+        if !self.has_absolute_local_mapping() {
             return Ok(());
         }
 
@@ -2542,7 +2615,10 @@ impl ObjectStore {
             Some(wrapper) => {
                 let (store, external) =
                     wrapper.wrap_with_external_blobs(&store_prefix, store.clone(), store);
-                (store, Some(ExternalBlobStore::new(external)))
+                (
+                    store,
+                    Some(ExternalBlobStore::new(io_tracker.wrap("", external))),
+                )
             }
             None => (store, None),
         };
@@ -2554,6 +2630,7 @@ impl ObjectStore {
             inner: tracked_store,
             external_blob_inner,
             _external_blob_origin: None,
+            direct_local_io: false,
             local_dir_operations: None,
             local_fsync: false,
             scheme: scheme.into(),
@@ -2769,7 +2846,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_if_absent() {
         let temp_dir = TempStrDir::default();
-        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let parent = Path::from(temp_dir.as_str()).join("目录");
+        let basename = format!(".{}", "x".repeat(240));
+        let path = parent.join(basename.as_str());
         let store = ObjectStore::local();
         store
             .put_if_absent(&path, Bytes::from_static(b"first").into())
@@ -3403,6 +3482,141 @@ mod tests {
 
         assert!(path.join("fresh").exists());
         assert!(!path.join("verified").exists());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_external_view_counts_reads_once(#[values(false, true)] apply_late: bool) {
+        let wrapper = Arc::new(IOTracker::default());
+        let params = ObjectStoreParams {
+            object_store_wrapper: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            ..Default::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap();
+        let mut store = store.as_ref().clone();
+        if apply_late {
+            store.apply_wrapper(wrapper.as_ref());
+        }
+        let store = Arc::new(store);
+        let path = Path::from("payload");
+        store.put(&path, b"blob").await.unwrap();
+        for view in [store.clone(), store.for_external_blobs()] {
+            store.io_stats_incremental();
+            wrapper.incremental_stats();
+            assert_eq!(
+                view.inner.get_range(&path, 0..4).await.unwrap(),
+                b"blob".as_slice()
+            );
+            let stats = store.io_stats_snapshot();
+            assert_eq!(stats.read_iops, 1);
+            assert_eq!(stats.read_bytes, 4);
+            assert_eq!(wrapper.stats().read_iops, 1);
+        }
+    }
+
+    #[rstest]
+    #[case::file("file")]
+    #[case::storage("file-object-store")]
+    #[cfg_attr(target_os = "linux", case::uring("file+uring"))]
+    #[tokio::test]
+    async fn test_local_io_uses_wrapped_backend(
+        #[case] scheme: &str,
+        #[values(false, true)] apply_late: bool,
+    ) {
+        let directory = TempStdDir::default();
+        std::fs::write(directory.join("source"), b"disk").unwrap();
+        let file_url = Url::from_directory_path(&directory).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let replacement = Arc::new(InMemory::new());
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: replacement.clone(),
+        });
+        let params = ObjectStoreParams {
+            object_store_wrapper: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            ..Default::default()
+        };
+        let (store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            url.as_ref(),
+            &params,
+        )
+        .await
+        .unwrap();
+        let store = if apply_late {
+            let mut store = store.as_ref().clone();
+            store.apply_wrapper(wrapper.as_ref());
+            Arc::new(store)
+        } else {
+            store
+        };
+        assert!(!store.has_direct_local_paths());
+        let source = base.clone().join("source");
+        replacement
+            .put(&source, Bytes::from_static(b"wrapped").into())
+            .await
+            .unwrap();
+
+        // Both ordinary and external views must reach the selected backend,
+        // including the known-size reader and local copy shortcuts.
+        for view in [store.clone(), store.for_external_blobs()] {
+            assert_eq!(
+                view.open(&source).await.unwrap().get_all().await.unwrap(),
+                b"wrapped".as_slice()
+            );
+            assert_eq!(
+                view.open_with_size(&source, 7)
+                    .await
+                    .unwrap()
+                    .get_all()
+                    .await
+                    .unwrap(),
+                b"wrapped".as_slice()
+            );
+            let destination = base.clone().join("copy");
+            view.copy(&source, &destination).await.unwrap();
+            assert_eq!(
+                replacement
+                    .get(&destination)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                b"wrapped".as_slice()
+            );
+            view.copy_via_stream(&source, &view, &base.clone().join("streamed"))
+                .await
+                .unwrap();
+            view.put(&base.clone().join("new"), b"new").await.unwrap();
+            assert_eq!(
+                replacement
+                    .get(&base.clone().join("new"))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                b"new".as_slice()
+            );
+        }
+        assert_eq!(std::fs::read(directory.join("source")).unwrap(), b"disk");
+        for name in ["copy", "streamed", "new"] {
+            assert!(
+                !directory.join(name).exists(),
+                "wrapper was bypassed for {name}"
+            );
+        }
+        assert!(wrapper.called());
     }
 
     #[derive(Debug)]
@@ -4164,7 +4378,7 @@ mod tests {
         store.put(&destination, b"old").await.unwrap();
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 
@@ -4193,7 +4407,7 @@ mod tests {
         observations.part_count.store(0, Ordering::SeqCst);
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 

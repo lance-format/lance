@@ -1134,7 +1134,8 @@ mod tests {
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DataStorageFormat};
     use crate::transaction::action::{
-        AddField, AlterField, CompositeOperation, DropField, FieldRef, SetDeletionFile, UserStep,
+        AddField, AlterField, CompositeOperation, DropField, FieldRef, Ref, SetDeletionFile,
+        UserStep,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
@@ -2141,13 +2142,14 @@ mod tests {
     #[case::drop_field(Action::DropField(DropField { field: FieldRef::Committed(0) }), true)]
     #[case::data_only(
         Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
+            fragment: Ref::Committed(0),
             deletion_file: crate::format::DeletionFile {
                 read_version: 1,
                 id: 1,
                 file_type: crate::format::DeletionFileType::Array,
                 num_deleted_rows: Some(1),
                 base_id: None,
+                path: None,
                 inline: None,
             },
             data_change: true,

@@ -19,6 +19,10 @@ Install `pylance` along with the data libraries used in these quickstarts:
 --8<-- "snippets/quickstart/pylance-install.sh"
 ```
 
+!!! note
+    `numpy` is optional. `pylance` installs without it on `pyarrow` 18 or newer, since older
+    `pyarrow` versions pull `numpy` in themselves. Install `pylance[numpy]` to get it explicitly.
+
 For the latest features and bug fixes, you can install the preview version:
 
 === "pip"
