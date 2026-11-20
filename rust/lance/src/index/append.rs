@@ -912,7 +912,7 @@ pub fn select_segments_to_merge<'a>(
 /// Whether a scalar index can merge multiple segments without rescanning their data.
 fn has_segment_merge_primitive(index_type: IndexType) -> bool {
     match index_type {
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram => true,
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram | IndexType::MinHashLsh => true,
         #[cfg(feature = "geo")]
         IndexType::RTree => true,
         _ => false,
@@ -1345,6 +1345,26 @@ async fn merge_scalar_indices<'a>(
                     .await?;
                     let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::rtree::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
+                IndexType::MinHashLsh => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        address_domain,
+                    )
+                    .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
+                    super::scalar::minhash_lsh::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
