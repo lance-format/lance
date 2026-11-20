@@ -156,8 +156,20 @@ pub const FLAG_DELETION_FILE_PATHS: u64 = 1 << 21;
 /// Reserved ahead of its implementation. This build masks the bit out in
 /// `supported_flags_when`, so it refuses to write a table that sets it.
 pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 22;
+/// Some index has a predicate (`IndexMetadata.predicate`), so it holds only the
+/// rows of its covered fragments where the predicate is TRUE.
+///
+/// A reader that ignored the predicate would answer queries from a partial
+/// index as if it held every row, and a writer that ignored it would drop the
+/// predicate from the next manifest it commits or maintain the index without
+/// its predicate field dependencies. Both feature words must carry this bit
+/// while any index in the manifest has a predicate.
+///
+/// Reserved ahead of its implementation. This build masks the bit out in
+/// `supported_flags_when`, so it refuses to read or write a table that sets it.
+pub const FLAG_INDEX_PREDICATES: u64 = 1 << 23;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 23;
+pub const FLAG_UNKNOWN: u64 = 1 << 24;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -185,6 +197,7 @@ const _: () = assert!(FLAG_DELETION_FILE_PATHS < FLAG_UNKNOWN);
 // Same fence for this bit: v15.0.0-beta.7 refuses bit 19 and up.
 const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 19);
 const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_INDEX_PREDICATES < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -609,6 +622,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
     mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
+    mark_supported(&mut supported, FLAG_INDEX_PREDICATES, false);
     supported
 }
 
@@ -930,7 +944,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 23);
+        assert_eq!(FLAG_UNKNOWN, 1 << 24);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -1181,6 +1195,21 @@ mod tests {
 
         assert_eq!(manifest.reader_feature_flags, flags);
         assert_eq!(manifest.writer_feature_flags, flags);
+    }
+
+    #[test]
+    fn test_index_predicates_flag_is_reserved() {
+        assert_eq!(FLAG_INDEX_PREDICATES, 1 << 23);
+        assert!(!can_read_dataset(FLAG_INDEX_PREDICATES));
+        assert!(!can_write_dataset(FLAG_INDEX_PREDICATES));
+
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_INDEX_PREDICATES;
+        manifest.writer_feature_flags = FLAG_INDEX_PREDICATES;
+        let read_error = ensure_can_read_manifest(&manifest).unwrap_err();
+        assert!(matches!(read_error, Error::NotSupported { .. }));
+        let write_error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(write_error, Error::NotSupported { .. }));
     }
 
     #[test]
@@ -1679,7 +1708,7 @@ mod tests {
         assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
         assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
         assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 23);
+        assert_eq!(FLAG_UNKNOWN, 1 << 24);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
     }

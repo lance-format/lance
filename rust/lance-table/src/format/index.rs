@@ -824,6 +824,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             base_id: idx.base_id,
             files,
             local_fragment_aliases: Default::default(),
+            predicate: None,
         }
     }
 }
