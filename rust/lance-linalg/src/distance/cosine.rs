@@ -14,8 +14,7 @@ use half::{bf16, f16};
 
 use super::{
     BatchKernel, Dot, Normalize, PairKernel, assert_batch_output_layout, assert_equal_lengths,
-    dot::dot,
-    norm_l2::{norm_l2, norm_l2_impl},
+    dot::dot, norm_l2::norm_l2,
 };
 use crate::Result;
 #[cfg(not(target_arch = "x86_64"))]
@@ -427,14 +426,40 @@ const PORTABLE_FMA: bool = cfg!(any(
     target_feature = "fma"
 ));
 
-/// `x·x`, `x·y` and `y·y`, accumulated in f64, where no product or partial sum
-/// of f32 values can overflow or underflow. Every f32 candidate shares this
-/// body and returns the same bits: a candidate's target features only change
-/// how the compiler vectorizes it, and since the product of two f32 values is
-/// exact in f64, `FMA` only decides whether each multiply-add is one
-/// instruction. The compiler drops the sums a caller ignores.
+/// `x·y` and `y·y`, accumulated in f64, where no product or partial sum of f32
+/// values can overflow or underflow. Every f32 candidate shares this body and
+/// returns the same bits: a candidate's target features only change how the
+/// compiler vectorizes it, and since the product of two f32 values is exact in
+/// f64, `FMA` only decides whether each multiply-add is one instruction.
 #[inline(always)]
-fn cosine_sums_f64<const FMA: bool>(x: &[f32], y: &[f32]) -> [f64; 3] {
+fn dot_and_norm_squared_f64<const FMA: bool>(x: &[f32], y: &[f32]) -> (f64, f64) {
+    const LANES: usize = 8;
+    let madd = |a: f64, b: f64, c: f64| if FMA { a.mul_add(b, c) } else { a * b + c };
+    let (x_chunks, x_tail) = x.as_chunks::<LANES>();
+    let (y_chunks, y_tail) = y.as_chunks::<LANES>();
+    let mut xy = [0.0_f64; LANES];
+    let mut yy = [0.0_f64; LANES];
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
+        for i in 0..LANES {
+            let (a, b) = (f64::from(x[i]), f64::from(y[i]));
+            xy[i] = madd(a, b, xy[i]);
+            yy[i] = madd(b, b, yy[i]);
+        }
+    }
+    let (mut xy_tail, mut yy_tail) = (0.0, 0.0);
+    for (&a, &b) in x_tail.iter().zip(y_tail) {
+        let (a, b) = (f64::from(a), f64::from(b));
+        xy_tail = madd(a, b, xy_tail);
+        yy_tail = madd(b, b, yy_tail);
+    }
+    let sum = |v: [f64; LANES]| ((v[0] + v[4]) + (v[2] + v[6])) + ((v[1] + v[5]) + (v[3] + v[7]));
+    (sum(xy) + xy_tail, sum(yy) + yy_tail)
+}
+
+/// [`dot_and_norm_squared_f64`] plus `x·x` in the same pass, for the kernels
+/// that are not given the norm of `x`.
+#[inline(always)]
+fn norms_squared_and_dot_f64<const FMA: bool>(x: &[f32], y: &[f32]) -> (f64, f64, f64) {
     const LANES: usize = 8;
     let madd = |a: f64, b: f64, c: f64| if FMA { a.mul_add(b, c) } else { a * b + c };
     let (x_chunks, x_tail) = x.as_chunks::<LANES>();
@@ -458,20 +483,20 @@ fn cosine_sums_f64<const FMA: bool>(x: &[f32], y: &[f32]) -> [f64; 3] {
         yy_tail = madd(b, b, yy_tail);
     }
     let sum = |v: [f64; LANES]| ((v[0] + v[4]) + (v[2] + v[6])) + ((v[1] + v[5]) + (v[3] + v[7]));
-    [sum(xx) + xx_tail, sum(xy) + xy_tail, sum(yy) + yy_tail]
+    (sum(xx) + xx_tail, sum(xy) + xy_tail, sum(yy) + yy_tail)
 }
 
 /// Cosine distance from `x`, whose L2 norm is `x_norm`, to `y`, in f64.
 #[inline(always)]
 fn cosine_f32_wide<const FMA: bool>(x: &[f32], x_norm: f64, y: &[f32]) -> f32 {
-    let [_, xy, yy] = cosine_sums_f64::<FMA>(x, y);
+    let (xy, yy) = dot_and_norm_squared_f64::<FMA>(x, y);
     (1.0 - xy / x_norm / yy.sqrt()) as f32
 }
 
 /// Cosine distance between `x` and `y`, with both norms in f64.
 #[inline(always)]
 fn cosine_pair_f32_wide<const FMA: bool>(x: &[f32], y: &[f32]) -> f32 {
-    let [xx, xy, yy] = cosine_sums_f64::<FMA>(x, y);
+    let (xx, xy, yy) = norms_squared_and_dot_f64::<FMA>(x, y);
     (1.0 - xy / xx.sqrt() / yy.sqrt()) as f32
 }
 
@@ -503,7 +528,7 @@ fn cosine_with_norms_f32_wide<const FMA: bool>(
     y: &[f32],
 ) -> f32 {
     if f32_norm_in_range(x_norm, x.len()) && f32_norm_in_range(y_norm, y.len()) {
-        let [_, xy, _] = cosine_sums_f64::<FMA>(x, y);
+        let (xy, _) = dot_and_norm_squared_f64::<FMA>(x, y);
         (1.0 - xy / f64::from(x_norm) / f64::from(y_norm)) as f32
     } else {
         cosine_pair_f32_wide::<FMA>(x, y)
@@ -519,7 +544,9 @@ fn cosine_batch_f32_wide<const FMA: bool>(
     dimension: usize,
     output: &mut [f32],
 ) {
-    let x_norm = norm_l2_impl::<f32, f64, 16>(x);
+    // Summed as `cosine_pair_f32_wide` sums `x·x`, so `cosine_batch_into` and
+    // `cosine` agree to the bit.
+    let x_norm = dot_and_norm_squared_f64::<FMA>(x, x).0.sqrt();
     if dimension == 8
         && let Ok(key) = <&[f32; 8]>::try_from(x)
     {
