@@ -26,6 +26,7 @@ use tracing::instrument;
 
 use crate::{
     object_store::DEFAULT_CLOUD_IO_PARALLELISM,
+    object_store::hf_throttle::is_huggingface_rate_limited,
     traits::{ByteStream, Reader},
 };
 
@@ -123,7 +124,10 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
         match f().await {
             Ok(val) => return Ok(val),
             Err(err) => {
-                if retries == 0 {
+                // OpenDAL already spent its Hugging Face retry budget and waited
+                // out Retry-After. Repeating the request here would arrive
+                // before the server allowed it.
+                if retries == 0 || is_huggingface_rate_limited(&err) {
                     return Err(err);
                 }
                 retries -= 1;

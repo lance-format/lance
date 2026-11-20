@@ -48,6 +48,7 @@ use crate::uring::{UringCurrentThreadReader, UringReader};
 pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
+pub(crate) mod hf_throttle;
 mod list_retry;
 mod local_staging;
 #[cfg(feature = "metrics")]

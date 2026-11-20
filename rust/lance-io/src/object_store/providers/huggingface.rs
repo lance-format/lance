@@ -210,7 +210,7 @@ fn build_hf_store_inner(
     })?;
     let operator = finish_huggingface_operator(operator, max_retries);
 
-    Ok(OpendalStore::new(operator))
+    Ok(OpendalStore::new_huggingface(operator))
 }
 
 impl HuggingfaceStoreProvider {
@@ -588,6 +588,7 @@ mod tests {
                 match calls.fetch_add(1, Ordering::SeqCst) {
                     0 => ResponseTemplate::new(429).insert_header("retry-after", "1"),
                     1 => ResponseTemplate::new(500),
+                    2 => ResponseTemplate::new(429).insert_header("retry-after", "1"),
                     _ => ResponseTemplate::new(200).set_body_bytes(b"hf-data".to_vec()),
                 }
             }
@@ -597,19 +598,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        // The 429 waits out Retry-After, the 500 shares the same retry budget,
-        // and the last retry succeeds: three requests, not a fresh transport
-        // burst after every failure.
+        // Two retries: 429 (wait), 500, then 429 (wait, terminal). The terminal
+        // 429 must not start a fourth request after OpenDAL's budget is spent.
         let store = hf_store(&server, &[("client_max_retries", "2")]).await;
-        let data = store
+        let err = store
             .inner
             .get_opts(&Path::from("frames.lance"), Default::default())
             .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        assert_eq!(data.as_ref(), b"hf-data");
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("RateLimited"),
+            "unexpected error: {err}"
+        );
 
         let request_times = request_times.lock().unwrap();
         assert_eq!(request_times.len(), 3);
@@ -704,19 +704,20 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn hf_store_zero_retries_makes_one_request() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
             .mount(&server)
             .await;
 
         let store = hf_store(&server, &[("client_max_retries", "0")]).await;
 
+        let start = tokio::time::Instant::now();
         assert!(
             store
                 .inner
@@ -724,29 +725,59 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "a zero retry budget must not wait for Retry-After"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    async fn hf_store_with_terminal_rate_limit(server: &wiremock::MockServer) -> ObjectStore {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "3600"))
+            .mount(server)
+            .await;
+        hf_store(server, &[("client_max_retries", "3")]).await
+    }
+
+    #[tokio::test]
+    async fn hf_reader_get_range_stops_after_terminal_rate_limit() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let store = hf_store_with_terminal_rate_limit(&server).await;
+        let reader = store.open(&Path::from("frames.lance")).await.unwrap();
+
+        let err = reader.get_range(0..4).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the 300s retry bound"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("RateLimited"),
+            "unexpected error: {err}"
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn hf_store_surfaces_retry_after_beyond_bound() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn hf_recursive_list_stops_after_terminal_rate_limit() {
+        use futures::TryStreamExt as _;
+        use wiremock::MockServer;
 
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "3600"))
-            .mount(&server)
-            .await;
+        let store = hf_store_with_terminal_rate_limit(&server).await;
 
-        let store = hf_store(&server, &[("client_max_retries", "3")]).await;
-
-        let err = store
-            .inner
-            .get_opts(&Path::from("frames.lance"), Default::default())
-            .await
-            .unwrap_err();
+        let err = store.list(None).try_next().await.unwrap_err();
         assert!(
             err.to_string().contains("exceeds the 300s retry bound"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("RateLimited"),
             "unexpected error: {err}"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);

@@ -6,7 +6,7 @@ use std::time::Duration;
 use http::header::{ACCEPT_ENCODING, HeaderValue, RETRY_AFTER};
 use http::{Request, Response, StatusCode};
 use opendal::layers::RetryLayer;
-use opendal::raw::{SystemTime, Timestamp};
+use opendal::raw::{SystemTime, Timestamp, with_error_response_context};
 use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Operator};
 
 /// Largest server-provided `Retry-After` delay this transport waits for.
@@ -31,7 +31,7 @@ fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
     )
 }
 
-fn retry_after_exceeded(uri: &str, delay: Duration) -> Error {
+fn retry_after_exceeded(delay: Duration) -> Error {
     Error::new(
         ErrorKind::RateLimited,
         format!(
@@ -40,7 +40,6 @@ fn retry_after_exceeded(uri: &str, delay: Duration) -> Error {
             MAX_RETRY_AFTER.as_secs()
         ),
     )
-    .with_context("uri", uri)
 }
 
 /// Sends `Accept-Encoding: identity` unless the request already sets an encoding.
@@ -56,7 +55,9 @@ fn retry_after_exceeded(uri: &str, delay: Duration) -> Error {
 /// retry layer. This is the only boundary where the header is available as a
 /// typed response header; OpenDAL's retry layer only sees the error. The retry
 /// layer keeps ownership of every attempt, so mixed responses share its
-/// `client_max_retries` budget.
+/// `client_max_retries` budget. The transport cannot tell whether the retry layer
+/// will spend its last retry, so the final positive-header 429 is also held; the
+/// error may be delayed by up to `MAX_RETRY_AFTER`, but no extra request is sent.
 #[derive(Debug)]
 struct IdentityEncodingTransport {
     inner: HttpTransporter,
@@ -69,7 +70,6 @@ impl HttpTransport for IdentityEncodingTransport {
             .entry(ACCEPT_ENCODING)
             .or_insert(HeaderValue::from_static("identity"));
 
-        let uri = req.uri().to_string();
         let response = self.inner.fetch(req).await?;
         if !self.honor_retry_after || response.status() != StatusCode::TOO_MANY_REQUESTS {
             return Ok(response);
@@ -78,7 +78,11 @@ impl HttpTransport for IdentityEncodingTransport {
             return Ok(response);
         };
         if delay > MAX_RETRY_AFTER {
-            return Err(retry_after_exceeded(&uri, delay));
+            let (parts, _) = response.into_parts();
+            return Err(with_error_response_context(
+                retry_after_exceeded(delay),
+                parts,
+            ));
         }
         if delay.is_zero() {
             return Ok(response);
