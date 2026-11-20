@@ -31,6 +31,8 @@ pub(crate) mod resident;
 pub mod rotation;
 pub(crate) mod row_addresses;
 pub mod scan_stats;
+#[cfg(target_arch = "x86_64")]
+mod sign_unpack;
 pub mod storage;
 pub mod transform;
 mod walk;

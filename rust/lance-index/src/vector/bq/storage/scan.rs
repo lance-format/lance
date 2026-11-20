@@ -376,9 +376,8 @@ impl<'a> RabitDistCalculator<'a> {
         }
         if scalar {
             out.binary_ips.clear();
-            out.binary_ips.extend((0..n).map(|id| {
-                compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table)
-            }));
+            out.binary_ips
+                .extend((0..n).map(|id| self.binary_ip(id, code_len)));
         } else {
             self.binary_distances_with_scratch(
                 n,

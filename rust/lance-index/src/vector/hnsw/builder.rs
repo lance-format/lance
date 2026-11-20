@@ -1749,26 +1749,24 @@ impl IvfSubIndex for HNSW {
             return Ok(RecordBatch::new_empty(schema));
         }
 
-        let mut prefilter_generator = self
-            .inner
-            .visited_generator_queue
-            .pop()
-            .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
         let rerank_query = query.clone();
         // A reranking search keeps `ef` candidates on every path for `VectorStore::rerank`.
         let (top_k, k) = (k, if params.reranks() { params.ef } else { k });
         let (mut results, comparisons) = if prefilter.is_empty() {
             self.search_basic(query, k, &params, None, storage)?
         } else {
-            // the bitset must be moved into a callee on every path so its
-            // borrow of `prefilter_generator` ends before the push below
+            let mut prefilter_generator = self
+                .inner
+                .visited_generator_queue
+                .pop()
+                .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
             let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
             let mut prefilter_bitset = prefilter_generator.generate(storage.len());
             for index in indices {
                 prefilter_bitset.insert(index as u32);
             }
             let remained = prefilter_bitset.count_ones();
-            if remained == storage.len() {
+            let filtered_results = if remained == storage.len() {
                 // mask passes every row: same as unfiltered
                 drop(prefilter_bitset);
                 self.search_basic(query, k, &params, None, storage)?
@@ -1793,11 +1791,12 @@ impl IvfSubIndex for HNSW {
                 }
             } else {
                 self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
-            }
+            };
+            // Another search can already have returned a generator to the queue.
+            let _ = self.inner.visited_generator_queue.push(prefilter_generator);
+            filtered_results
         };
         metrics.record_comparisons(comparisons);
-        // if the queue is full, we just don't push it back, so ignore the error here
-        let _ = self.inner.visited_generator_queue.push(prefilter_generator);
         if params.reranks() && storage.rerank(rerank_query, params.dist_q_c, &mut results) {
             // The search applied the bounds to the scores rerank replaced.
             let lower = params.lower_bound.unwrap_or(f32::MIN);
