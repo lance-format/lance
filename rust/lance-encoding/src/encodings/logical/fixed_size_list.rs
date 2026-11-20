@@ -603,10 +603,11 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray,
+        Array, ArrayRef, BooleanArray, FixedSizeListArray,
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
     };
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Fields};
     use rstest::rstest;
 
@@ -926,6 +927,59 @@ mod tests {
                 STRUCTURAL_ENCODING_META_KEY.to_string(),
                 STRUCTURAL_ENCODING_FULLZIP.to_string(),
             )]),
+        )
+        .await;
+    }
+
+    /// Boolean items are bit-packed, so a full-zip fixed-size list of booleans must
+    /// widen them when its rows carry item validity or do not fill whole bytes. Lists
+    /// too wide for mini-block chunks take the full-zip layout without being asked to.
+    #[rstest]
+    #[case::full_zip_null_items_one(1, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_null_items_three(3, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_null_items_eight(8, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_null_items_sixteen(16, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_partial_byte_rows(3, false, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_whole_byte_rows(16, false, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::wide_partial_byte_rows(4095, false, None)]
+    #[case::wide_null_items(4095, true, None)]
+    #[case::wide_whole_byte_rows(32768, false, None)]
+    #[tokio::test]
+    async fn test_boolean_fsl_round_trip(
+        #[case] dimension: i32,
+        #[case] has_null_items: bool,
+        #[case] structural_encoding: Option<&str>,
+    ) {
+        let num_rows = 20;
+        let items = BooleanArray::from_iter(
+            (0..num_rows * dimension)
+                .map(|i| (!has_null_items || i % 5 != 0).then_some(i % 3 == 0)),
+        );
+        let lists = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            dimension,
+            Arc::new(items),
+            Some(NullBuffer::from(
+                (0..num_rows).map(|i| i % 7 != 0).collect::<Vec<_>>(),
+            )),
+        );
+        let metadata = structural_encoding
+            .map(|encoding| {
+                HashMap::from([(
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    encoding.to_string(),
+                )])
+            })
+            .unwrap_or_default();
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(lists)],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_range(0..num_rows as u64)
+                .with_range(10..13)
+                .with_indices(vec![0, 9, 19]),
+            metadata,
         )
         .await;
     }
