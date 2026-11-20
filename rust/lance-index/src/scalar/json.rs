@@ -4,6 +4,7 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use std::{
+    mem,
     ops::Bound,
     sync::{Arc, Mutex},
 };
@@ -16,17 +17,24 @@ use datafusion_common::{
     config::ConfigOptions,
     tree_node::{Transformed, TreeNode},
 };
-use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_execution::{
+    SendableRecordBatchStream, TaskContext,
+    disk_manager::DiskManagerBuilder,
+    runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
+};
 use datafusion_expr::{Expr, Operator, ScalarUDF, expr::ScalarFunction};
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
 use datafusion_physical_plan::{
-    ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec,
+    ExecutionPlan, SpillManager,
+    metrics::{ExecutionPlanMetricsSet, SpillMetrics},
+    projection::ProjectionExec,
+    sorts::sort::SortExec,
     stream::RecordBatchStreamAdapter,
 };
-use futures::{StreamExt, stream::BoxStream};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
 use lance_datafusion_exec::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
@@ -73,6 +81,10 @@ pub const JSON_ROW_ID_DOMAIN_VERSION: u32 = 0;
 pub const JSON_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
 
 const JSON_INDEX_VERSION: u32 = JSON_ROW_ADDR_DOMAIN_VERSION;
+
+/// Memory budget for batches retained while looking for the first non-null value.
+/// The current batch and the spill I/O buffers are additional.
+const JSON_TYPE_INFERENCE_MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 
 /// The version a build predating `JsonIndexDetails::target_index_version` used
 /// when loading the target, for the targets whose format has changed since.
@@ -1069,36 +1081,74 @@ impl JsonIndexPlugin {
         Ok(None)
     }
 
-    /// Extract JSON and infer the target type from the first non-null value.
-    ///
-    /// Only the prefix needed for inference is buffered. Once a type is found,
-    /// the remainder of the input stays streaming.
-    async fn extract_json_with_type_info(
-        data: SendableRecordBatchStream,
-        path: String,
+    /// Infer the type from the first non-null value and replay the consumed prefix.
+    async fn infer_json_type(
+        stream: SendableRecordBatchStream,
+        path: &str,
+        memory_limit: usize,
+        runtime: Arc<RuntimeEnv>,
     ) -> Result<(SendableRecordBatchStream, DataType)> {
-        let mut stream = Self::extract_json(data, path.clone())?;
         let schema = stream.schema();
+        let mut stream = stream.fuse();
+        let metrics = ExecutionPlanMetricsSet::new();
+        let spill_manager =
+            SpillManager::new(runtime, SpillMetrics::new(&metrics, 0), schema.clone());
         let mut buffered_batches = Vec::new();
-        let mut inferred_type = None;
+        let mut buffered_bytes = 0usize;
+        let mut spill_file = None;
 
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-            inferred_type = Self::infer_type_from_batch(&batch, &path)?;
-            buffered_batches.push(batch);
-            if inferred_type.is_some() {
-                break;
+        let (typed_batch, inferred_type) = loop {
+            let Some(batch) = stream.try_next().await? else {
+                break (None, DataType::Utf8);
+            };
+            if let Some(data_type) = Self::infer_type_from_batch(&batch, path)? {
+                break (Some(batch), data_type);
             }
-        }
 
-        let inferred_type = inferred_type.unwrap_or(DataType::Utf8);
-        let buffered = futures::stream::iter(buffered_batches.into_iter().map(Ok));
-        let recreated_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            buffered.chain(stream),
-        )) as SendableRecordBatchStream;
+            if spill_file.is_none() {
+                buffered_bytes = buffered_bytes
+                    .saturating_add(batch.get_array_memory_size())
+                    .saturating_add(mem::size_of::<RecordBatch>())
+                    .saturating_add(mem::size_of_val(batch.columns()));
+                if buffered_bytes <= memory_limit {
+                    buffered_batches.push(batch);
+                    continue;
+                }
+            }
 
-        Ok((recreated_stream, inferred_type))
+            let manager = spill_manager.clone();
+            let file = spill_file.take();
+            let buffered = mem::take(&mut buffered_batches);
+            // The blocking task owns the file until the write completes, even on cancellation.
+            spill_file = Some(
+                tokio::task::spawn_blocking(move || {
+                    let mut file = match file {
+                        Some(file) => file,
+                        None => manager.create_in_progress_file("JSON index type inference")?,
+                    };
+                    for batch in buffered.into_iter().chain(std::iter::once(batch)) {
+                        file.append_batch(&batch)?;
+                    }
+                    Ok::<_, DataFusionError>(file)
+                })
+                .await??,
+            );
+        };
+
+        let prefix: BoxStream<'static, _> = if let Some(mut file) = spill_file {
+            let file = tokio::task::spawn_blocking(move || file.finish())
+                .await??
+                .ok_or_else(|| Error::internal("JSON inference spill contained no batches"))?;
+            spill_manager.read_spill_as_stream_unbuffered(file, None)?
+        } else {
+            futures::stream::iter(buffered_batches.into_iter().map(Ok)).boxed()
+        };
+        let typed = futures::stream::iter(typed_batch.into_iter().map(Ok));
+        let replay = prefix.chain(typed).chain(stream);
+        Ok((
+            Box::pin(RecordBatchStreamAdapter::new(schema, replay)),
+            inferred_type,
+        ))
     }
 
     fn validate_json_types(
@@ -1438,11 +1488,19 @@ impl BasicTrainer for JsonIndexPlugin {
                     DataType::from(target_data_type),
                 )
             } else {
-                // Reads until the first value at `path`, holding what it read.
                 progress
                     .stage_start("infer_json_type", None, "rows")
                     .await?;
-                let extracted = Self::extract_json_with_type_info(data, path.clone()).await?;
+                let disk_manager = DiskManagerBuilder::default().with_max_temp_directory_size(
+                    LanceExecutionOptions::default().max_temp_directory_size(),
+                );
+                let runtime = RuntimeEnvBuilder::new()
+                    .with_disk_manager_builder(disk_manager)
+                    .build_arc()?;
+                let stream = Self::extract_json(data, path.clone())?;
+                let extracted =
+                    Self::infer_json_type(stream, &path, JSON_TYPE_INFERENCE_MEMORY_LIMIT, runtime)
+                        .await?;
                 progress.stage_complete("infer_json_type").await?;
                 extracted
             };
@@ -1914,7 +1972,8 @@ mod tests {
     use crate::scalar::bitmap::{BitmapIndex, BitmapIndexPlugin};
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::lookup_test_util::lookup_pairs;
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, record_batch};
+    use arrow_array::types::UInt64Type;
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, cast::AsArray, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
@@ -1922,7 +1981,10 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use rstest::rstest;
     use std::ops::Bound;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[derive(Debug, Clone)]
     struct RequestStore {
@@ -2796,142 +2858,301 @@ mod tests {
         );
     }
 
-    // Note: The old test_detect_json_value_type test has been removed as we now use
-    // JSONB's inherent type information instead of string-based type detection
-
-    #[tokio::test]
-    async fn test_json_extract_with_type_info() {
-        use arrow_array::{LargeBinaryArray, UInt64Array};
-        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-        use futures::stream;
-
-        // Create test JSONB data
-        let json_data = vec![
-            r#"{"name": "Alice", "age": 30, "active": true}"#,
-            r#"{"name": "Bob", "age": 25, "active": false}"#,
-            r#"{"name": "Charlie", "age": 35, "active": true}"#,
-        ];
-
-        // Convert JSON strings to JSONB binary format
-        let mut jsonb_values = Vec::new();
-        for json_str in &json_data {
-            let owned_jsonb: lance_jsonb::OwnedJsonb = json_str.parse().unwrap();
-            jsonb_values.push(Some(owned_jsonb.to_vec()));
-        }
-
-        // Create test batch with JSONB data
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-
-        let jsonb_array = LargeBinaryArray::from(
-            jsonb_values
-                .iter()
-                .map(|v| v.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let row_ids = UInt64Array::from(vec![1, 2, 3]);
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(jsonb_array) as ArrayRef,
-                Arc::new(row_ids) as ArrayRef,
-            ],
+    fn json_inference_batch(doc: &str, row: u64) -> RecordBatch {
+        let jsonb: lance_jsonb::OwnedJsonb = doc.parse().unwrap();
+        record_batch!(
+            (VALUE_COLUMN_NAME, LargeBinary, [jsonb.to_vec().as_slice()]),
+            (ROW_ID, UInt64, [row]),
+            (
+                ROW_ADDR,
+                UInt64,
+                [u64::from(RowAddress::new_from_parts(3, row as u32))]
+            )
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch)]),
-        )) as SendableRecordBatchStream;
-
-        // Test type inference for integer field
-        let (_result_stream, inferred_type) =
-            JsonIndexPlugin::extract_json_with_type_info(stream, "$.age".to_string())
-                .await
-                .unwrap();
-
-        assert_eq!(inferred_type, DataType::Int64);
-
-        // Create new test stream for boolean field
-        let batch2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(LargeBinaryArray::from(vec![
-                    json_data[0]
-                        .parse::<lance_jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[1]
-                        .parse::<lance_jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[2]
-                        .parse::<lance_jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                ])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let stream2 = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch2)]),
-        )) as SendableRecordBatchStream;
-
-        // Test type inference for boolean field
-        let (_, inferred_type) =
-            JsonIndexPlugin::extract_json_with_type_info(stream2, "$.active".to_string())
-                .await
-                .unwrap();
-
-        assert_eq!(inferred_type, DataType::Boolean);
-
-        // Create test stream for string field
-        let batch3 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(LargeBinaryArray::from(vec![
-                    json_data[0]
-                        .parse::<lance_jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[1]
-                        .parse::<lance_jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[2]
-                        .parse::<lance_jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                ])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let stream3 = Box::pin(RecordBatchStreamAdapter::new(
+    fn json_inference_source(
+        batches: impl Iterator<Item = datafusion_common::Result<RecordBatch>> + Send + 'static,
+    ) -> SendableRecordBatchStream {
+        let schema = json_inference_batch("{}", 0).schema();
+        let input = Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            stream::iter(vec![Ok(batch3)]),
-        )) as SendableRecordBatchStream;
+            futures::stream::iter(batches),
+        ));
+        JsonIndexPlugin::extract_json(input, "$.value".to_string()).unwrap()
+    }
 
-        // Test type inference for string field
-        let (_, inferred_type) =
-            JsonIndexPlugin::extract_json_with_type_info(stream3, "$.name".to_string())
+    fn assert_inference_spill_released(runtime: &RuntimeEnv) {
+        let progress = runtime.disk_manager.spilling_progress();
+        assert_eq!(progress.active_files_count, 0);
+        assert_eq!(progress.current_bytes, 0);
+    }
+
+    #[rstest]
+    #[case::empty(None, DataType::Utf8)]
+    #[case::integer(Some(r#"{"value": 30}"#), DataType::Int64)]
+    #[case::boolean(Some(r#"{"value": true}"#), DataType::Boolean)]
+    #[case::string(Some(r#"{"value": "Alice"}"#), DataType::Utf8)]
+    #[tokio::test]
+    async fn test_json_inference_without_spill(
+        #[case] doc: Option<&'static str>,
+        #[case] expected_type: DataType,
+    ) {
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        let source =
+            json_inference_source(doc.into_iter().map(|doc| Ok(json_inference_batch(doc, 0))));
+        let schema = source.schema();
+        let (output, inferred_type) =
+            JsonIndexPlugin::infer_json_type(source, "$.value", 0, runtime.clone())
+                .await
+                .unwrap();
+
+        assert_eq!(inferred_type, expected_type);
+        assert_eq!(output.schema(), schema);
+        assert!(runtime.disk_manager.temp_dir_paths().is_empty());
+        assert_eq!(
+            output.try_collect::<Vec<_>>().await.unwrap().len(),
+            usize::from(doc.is_some()),
+        );
+    }
+
+    #[rstest]
+    #[case::missing_path("{}")]
+    #[case::json_null(r#"{"value": null}"#)]
+    #[tokio::test]
+    async fn test_json_inference_spills_null_prefix(#[case] doc: &'static str) {
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        let mut row_addresses: Vec<Weak<dyn Array>> = Vec::new();
+        let source = json_inference_source((0..64).map(move |row| {
+            row_addresses.retain(|address| address.strong_count() > 0);
+            assert!(
+                row_addresses.len() <= 8,
+                "inference retained too many batches"
+            );
+            let batch = json_inference_batch(doc, row);
+            row_addresses.push(Arc::downgrade(&batch[ROW_ADDR]));
+            Ok(batch)
+        }));
+        let schema = source.schema();
+        let (mut output, inferred_type) =
+            JsonIndexPlugin::infer_json_type(source, "$.value", 2048, runtime.clone())
                 .await
                 .unwrap();
 
         assert_eq!(inferred_type, DataType::Utf8);
+        assert_eq!(output.schema(), schema);
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            1
+        );
+        assert!(runtime.disk_manager.used_disk_space() > 0);
+        let batches = output.by_ref().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.len(), 64);
+        for (row, batch) in (0..64).zip(batches) {
+            assert_eq!(
+                batch,
+                json_inference_source(std::iter::once(Ok(json_inference_batch(doc, row))))
+                    .try_next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+        }
+        assert_inference_spill_released(&runtime);
+    }
+
+    #[rstest]
+    #[case::memory(64 * 1024, 0)]
+    #[case::spill(2048, 1)]
+    #[tokio::test]
+    async fn test_json_inference_replays_prefix_before_typed_batch_and_tail(
+        #[case] memory_limit: usize,
+        #[case] expected_spills: usize,
+    ) {
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polled = polls.clone();
+        let source = json_inference_source((0..19).map(move |row| {
+            polled.fetch_add(1, Ordering::Relaxed);
+            let doc = if row < 16 {
+                "{}".to_string()
+            } else {
+                format!(r#"{{"value": {row}}}"#)
+            };
+            Ok(json_inference_batch(&doc, row))
+        }));
+        let (output, inferred_type) =
+            JsonIndexPlugin::infer_json_type(source, "$.value", memory_limit, runtime.clone())
+                .await
+                .unwrap();
+
+        assert_eq!(inferred_type, DataType::Int64);
+        assert_eq!(polls.load(Ordering::Relaxed), 17);
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            expected_spills
+        );
+        let typed =
+            JsonIndexPlugin::convert_stream_by_type(output, inferred_type, "$.value".to_string())
+                .unwrap();
+        let batches = typed.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.len(), 19);
+        for (row, batch) in (0..19).zip(batches) {
+            let value = (row >= 16).then_some(row as i64);
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch[VALUE_COLUMN_NAME]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .next(),
+                Some(value),
+            );
+            assert_eq!(batch[ROW_ID].as_primitive::<UInt64Type>().value(0), row);
+            let addr = u64::from(RowAddress::new_from_parts(3, row as u32));
+            assert_eq!(batch[ROW_ADDR].as_primitive::<UInt64Type>().value(0), addr);
+        }
+        assert_eq!(polls.load(Ordering::Relaxed), 19);
+        assert_inference_spill_released(&runtime);
+    }
+
+    #[tokio::test]
+    async fn test_json_inference_dropping_replay_releases_oversize_batch_spill() {
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        let source = json_inference_source(std::iter::once(Ok(json_inference_batch("{}", 0))));
+        let (mut output, inferred_type) =
+            JsonIndexPlugin::infer_json_type(source, "$.value", 1, runtime.clone())
+                .await
+                .unwrap();
+        assert_eq!(inferred_type, DataType::Utf8);
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            1
+        );
+        assert!(output.try_next().await.unwrap().is_some());
+        assert!(runtime.disk_manager.used_disk_space() > 0);
+
+        drop(output);
+        assert_inference_spill_released(&runtime);
+    }
+
+    #[rstest]
+    #[case::array(r#"{"value":[]}"#, "Array")]
+    #[case::object(r#"{"value":{}}"#, "Object")]
+    #[tokio::test]
+    async fn test_json_inference_rejects_containers_after_spill(
+        #[case] doc: &str,
+        #[case] json_type: &str,
+    ) {
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        let source = json_inference_source(
+            [
+                Ok(json_inference_batch("{}", 0)),
+                Ok(json_inference_batch(doc, 1)),
+            ]
+            .into_iter(),
+        );
+        let error = JsonIndexPlugin::infer_json_type(source, "$.value", 0, runtime.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("JSON path '$.value' with JSON type {json_type}"))
+        );
+        assert!(!runtime.disk_manager.temp_dir_paths().is_empty());
+        assert_inference_spill_released(&runtime);
+    }
+
+    #[rstest]
+    #[case::input(1024 * 1024, "inference input failed")]
+    #[case::quota(1, "exceeded the allowable limit")]
+    #[tokio::test]
+    async fn test_json_inference_spill_errors_release_file(
+        #[case] quota: u64,
+        #[case] expected: &str,
+    ) {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_max_temp_directory_size(quota),
+            )
+            .build_arc()
+            .unwrap();
+        let disk = runtime.disk_manager.clone();
+        let source =
+            json_inference_source(std::iter::once(Ok(json_inference_batch("{}", 0))).chain(
+                std::iter::once_with(move || {
+                    assert_eq!(disk.spilling_progress().active_files_count, 1);
+                    assert!(disk.used_disk_space() > 0);
+                    Err(DataFusionError::Execution(
+                        "inference input failed".to_string(),
+                    ))
+                }),
+            ));
+        let error = JsonIndexPlugin::infer_json_type(source, "$.value", 0, runtime.clone())
+            .await
+            .err()
+            .unwrap();
+        if quota == 1 {
+            assert!(matches!(error, Error::Arrow { .. }), "{error}");
+        } else {
+            assert!(matches!(error, Error::Execution { .. }), "{error}");
+        }
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(!runtime.disk_manager.temp_dir_paths().is_empty());
+        assert_inference_spill_released(&runtime);
+    }
+
+    #[test]
+    fn test_json_inference_cancelled_append_releases_spill() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+                let (started, started_rx) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = std::sync::mpsc::channel::<()>();
+                let source = json_inference_source(
+                    std::iter::once(Ok(json_inference_batch("{}", 0))).chain(std::iter::once_with(
+                        move || {
+                            // Hold the only blocking worker while the second append is queued.
+                            tokio::task::spawn_blocking(move || {
+                                started.send(()).unwrap();
+                                let _ = release_rx.recv();
+                            });
+                            Ok(json_inference_batch("{}", 1))
+                        },
+                    )),
+                );
+                let mut inference = Box::pin(JsonIndexPlugin::infer_json_type(
+                    source,
+                    "$.value",
+                    0,
+                    runtime.clone(),
+                ));
+                tokio::select! {
+                    biased;
+                    _ = &mut inference => panic!("the second append should be queued"),
+                    result = started_rx => result.unwrap(),
+                }
+
+                drop(inference);
+                assert_eq!(
+                    runtime.disk_manager.spilling_progress().active_files_count,
+                    1
+                );
+                assert!(runtime.disk_manager.used_disk_space() > 0);
+                release.send(()).unwrap();
+                // Wait behind the cancelled build's append on the sole blocking worker.
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                assert_inference_spill_released(&runtime);
+            });
     }
 
     /// Trains a JSON-path index of `target_index_type` over `json_docs` (fed to the

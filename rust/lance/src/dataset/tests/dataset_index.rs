@@ -8704,6 +8704,88 @@ async fn test_json_btree_index_statistics() {
     assert_eq!(stats["indices"][0]["max"], "3000");
 }
 
+#[tokio::test]
+async fn test_json_btree_infers_types_across_fragments() {
+    use lance_index::pb::{JsonIndexDetails, JsonTargetDataType};
+
+    let batch = json_batch(vec![
+        r#"{"absent": null}"#,
+        "{}",
+        r#"{"number": null}"#,
+        r#"{"number": 8, "absent": null}"#,
+        r#"{"number": 3}"#,
+        r#"{"number": 8}"#,
+    ]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    for (path, expected_type) in [
+        ("absent", JsonTargetDataType::Utf8),
+        ("number", JsonTargetDataType::Int64),
+    ] {
+        let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+            "target_index_type": "btree",
+            "path": path,
+        }));
+        let name = format!("json_{path}");
+        dataset
+            .create_index(
+                &["json"],
+                IndexType::Scalar,
+                Some(name.clone()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices_by_name(&name).await.unwrap();
+        let details: JsonIndexDetails =
+            indices[0].index_details.as_ref().unwrap().to_msg().unwrap();
+        assert_eq!(details.target_data_type, expected_type as i32);
+    }
+
+    for (path, predicate, expected_ids) in [
+        (
+            "absent",
+            "json_get_string(json, 'absent') IS NULL",
+            &[0, 1, 2, 3, 4, 5][..],
+        ),
+        ("number", "json_get_int(json, 'number') = 8", &[3, 5][..]),
+        (
+            "number",
+            "json_get_int(json, 'number') >= 3 AND json_get_int(json, 'number') < 8",
+            &[4][..],
+        ),
+    ] {
+        for indexed in [true, false] {
+            let mut scan = dataset.scan();
+            scan.with_row_id()
+                .filter(predicate)
+                .unwrap()
+                .use_scalar_index(indexed);
+            if indexed {
+                let plan = scan.explain_plan(false).await.unwrap();
+                assert!(plan.contains(&format!("@json_{path}(")), "{plan}");
+            }
+            let rows = scan.try_into_batch().await.unwrap();
+            let mut ids = rows[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(ids, expected_ids, "{predicate}, indexed={indexed}");
+        }
+    }
+}
+
 /// A JSON-wrapped ngram target always needs a recheck. On legacy (V1) datasets
 /// the legacy scanner rechecks by re-materializing the index expression via
 /// `JsonQuery::to_expr`, so a filtered contains-scan must plan instead of
