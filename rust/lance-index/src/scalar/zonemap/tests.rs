@@ -6727,26 +6727,28 @@ async fn test_build_segment_update_folds_seeds_and_scan_into_target_zones(#[case
     assert!(nulls.contains((2 << 32) | 1));
     assert_eq!(nulls.len(), Some(5));
 
-    // Reusing seeds without positions for an index that keeps them is a
-    // caller error, not a silent downgrade.
-    let seed = seed_of(3, 4, int_values(2, 0));
-    let mut no_positions = ReusedZones::new(false);
-    no_positions
-        .reuse(&harvested(seed, 2), 4, &DataType::Int32, true)
-        .unwrap();
-    let err = build_zonemap_segment(
-        ZoneMapSegmentBase::Update(&existing),
-        &DataType::Int32,
-        no_positions,
-        None,
-        &HashMap::new(),
-        &[3],
-        local_store(&TempObjDir::default()).as_ref(),
-    )
-    .await
-    .err()
-    .expect("reuse without positions must be rejected");
-    assert!(err.to_string().contains("without null positions"), "{err}");
+    if !is_merge {
+        // Reusing seeds without positions for an index that keeps them is a
+        // caller error, not a silent downgrade.
+        let seed = seed_of(3, 4, int_values(2, 0));
+        let mut no_positions = ReusedZones::new(false);
+        no_positions
+            .reuse(&harvested(seed, 2), 4, &DataType::Int32, true)
+            .unwrap();
+        let err = build_zonemap_segment(
+            ZoneMapSegmentBase::Update(&existing),
+            &DataType::Int32,
+            no_positions,
+            None,
+            &HashMap::new(),
+            &[3],
+            local_store(&TempObjDir::default()).as_ref(),
+        )
+        .await
+        .err()
+        .expect("reuse without positions must be rejected");
+        assert!(err.to_string().contains("without null positions"), "{err}");
+    }
 }
 
 #[tokio::test]

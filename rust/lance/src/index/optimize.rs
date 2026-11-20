@@ -2866,7 +2866,7 @@ mod tests {
     #[rstest::rstest]
     #[case::merge_only(0, Some(4), None, 1, false)]
     #[case::seeded_single_build(4, Some(4), None, 1, true)]
-    #[case::multiple_builds(8, Some(4), None, 1, false)]
+    #[case::seeded_multiple_builds(8, Some(4), None, 1, true)]
     #[case::bounded_segments(8, Some(4), Some(8), 2, false)]
     #[case::unbounded(4, None, None, 1, false)]
     #[tokio::test]
@@ -2930,9 +2930,11 @@ mod tests {
                 if use_seeds {
                     SEED_REUSE_REPORTS.with(|reports| {
                         let reports = reports.lock().unwrap();
-                        assert_eq!(reports.len(), 1);
-                        assert_eq!(reports[0].reused_fragments, [2]);
-                        assert_eq!(reports[0].scanned_rows, 0);
+                        assert_eq!(reports.len(), plan.tasks.len());
+                        for (report, fragment_id) in reports.iter().zip(2u64..) {
+                            assert_eq!(report.reused_fragments, [fragment_id]);
+                            assert_eq!(report.scanned_rows, 0);
+                        }
                     });
                 }
                 results
