@@ -225,31 +225,24 @@ impl InvertedIndex {
             }
             _ => false,
         };
+        let mut builder;
         let files = if can_update {
             // A single unchanged partition has nothing to merge yet. Copy it
             // and consolidate with the new tail once, instead of decoding and
             // writing the old postings before decoding them again at finalize.
-            first
-                .to_builder()
-                .with_progress(progress)
-                .update(new_data, dest_store, None)
-                .await?
+            builder = first.to_builder().with_progress(progress);
+            builder.update(new_data, dest_store, None).await?
         } else {
-            InvertedIndexBuilder::new(first.params.clone())
+            builder = InvertedIndexBuilder::new(first.params.clone())
                 .with_progress(progress)
                 .with_token_set_format(first.token_set_format)
-                .with_format_version(first.format_version())
+                .with_format_version(first.format_version());
+            builder
                 .update_from_segments(new_data, dest_store, segments, old_data_filters)
                 .await?
         };
 
-        let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: first.index_version(),
-            files,
-        })
+        builder.into_created_index(files, first.index_version())
     }
 }
 
@@ -1099,18 +1092,12 @@ impl InvertedIndex {
         mapping: RowAddrTranslatorRef<'_>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let files = self
-            .to_builder()
+        let mut builder = self.to_builder();
+        let files = builder
             .remap_with(mapping, self.store.clone(), dest_store)
             .await?;
 
-        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: self.index_version(),
-            files,
-        })
+        builder.into_created_index(files, self.index_version())
     }
 }
 
@@ -1172,18 +1159,12 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let files = self
-            .to_builder()
+        let mut builder = self.to_builder();
+        let files = builder
             .update(new_data, dest_store, old_data_filter)
             .await?;
 
-        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: self.index_version(),
-            files,
-        })
+        builder.into_created_index(files, self.index_version())
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
