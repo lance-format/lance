@@ -1247,6 +1247,7 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
+    use arrow_array::builder::{GenericListBuilder, LargeListBuilder, ListBuilder, StringBuilder};
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
@@ -2343,6 +2344,45 @@ mod tests {
             build_label_list_index(&all).await,
             read_index_contents(merged_store.as_ref()).await,
             "merging an unsorted segment diverged from a full build"
+        );
+    }
+
+    #[rstest]
+    #[case::list(ListBuilder::new(StringBuilder::new()))]
+    #[case::large_list(LargeListBuilder::new(StringBuilder::new()))]
+    #[tokio::test]
+    async fn test_build_ignores_children_of_null_lists<O: OffsetSizeTrait>(
+        #[case] mut lists: GenericListBuilder<O, StringBuilder>,
+    ) {
+        lists.values().append_value("outside slice");
+        lists.append(true);
+        lists.values().append_value("hidden");
+        lists.append(false);
+        lists.append(true);
+        lists.values().append_null();
+        lists.values().append_value("visible");
+        lists.append(true);
+
+        let lists = lists.finish().slice(1, 3);
+        let batch = RecordBatch::try_from_iter([
+            (VALUE_COLUMN_NAME, Arc::new(lists) as ArrayRef),
+            (ROW_ADDR, Arc::new(UInt64Array::from(vec![10, 11, 12]))),
+        ])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let (_dir, store) = test_util::index_store();
+        train_label_list_index(stream, store.as_ref(), &NoopIndexBuildProgress)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_index_contents(store.as_ref()).await,
+            IndexContents {
+                labels: vec![(None, vec![12]), (Some("visible".into()), vec![12])],
+                list_nulls: vec![10],
+            }
         );
     }
 
