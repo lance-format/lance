@@ -56,6 +56,34 @@ class InvertedIndexParamsTest {
   }
 
   @Test
+  void disableCrossArrayUnnestIsSerialized() {
+    ScalarIndexParams params = InvertedIndexParams.builder().disableCrossArrayUnnest(true).build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(true, json.get("disable_cross_array_unnest"));
+  }
+
+  @Test
+  void maxSubDocsPerRowOptionsAreSerialized() {
+    Map<MaxSubDocsPerRowExceedAction, String> expectedActions =
+        Map.of(
+            MaxSubDocsPerRowExceedAction.FAIL, "fail",
+            MaxSubDocsPerRowExceedAction.SKIP_ROW, "skip_row");
+    for (Map.Entry<MaxSubDocsPerRowExceedAction, String> expectedAction :
+        expectedActions.entrySet()) {
+      ScalarIndexParams params =
+          InvertedIndexParams.builder()
+              .maxSubDocsPerRow(128)
+              .maxSubDocsPerRowExceedAction(expectedAction.getKey())
+              .build();
+
+      Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+      assertEquals(128, ((Number) json.get("max_sub_docs_per_row")).longValue());
+      assertEquals(expectedAction.getValue(), json.get("max_sub_docs_per_row_exceed_action"));
+    }
+  }
+
+  @Test
   void blockSizeIsSerialized() {
     ScalarIndexParams params = InvertedIndexParams.builder().blockSize(128).build();
 
