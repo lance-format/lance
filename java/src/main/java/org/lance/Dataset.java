@@ -724,6 +724,39 @@ public class Dataset implements Closeable {
   private native void nativeMigrateManifestPathsV2();
 
   /**
+   * Register additional base paths on this dataset.
+   *
+   * <p>The base paths are added to the manifest in a new version and can be targeted by later
+   * writes through {@link WriteParams.Builder#withTargetBases(List)}. See {@link #getBasePaths()}
+   * for the registered bases.
+   *
+   * @param newBases the base paths to add; each needs a name and path that are not already used
+   * @throws IllegalArgumentException if {@code newBases} is null or the dataset is closed
+   */
+  public void addBases(List<BasePath> newBases) {
+    addBases(newBases, null);
+  }
+
+  /**
+   * Register additional base paths on this dataset.
+   *
+   * @param newBases the base paths to add; each needs a name and path that are not already used
+   * @param transactionProperties optional key-value pairs recorded on the transaction, may be null
+   * @throws IllegalArgumentException if {@code newBases} is null or the dataset is closed
+   * @see #addBases(List)
+   */
+  public void addBases(List<BasePath> newBases, Map<String, String> transactionProperties) {
+    Preconditions.checkArgument(newBases != null, "newBases can not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeAddBases(newBases, Optional.ofNullable(transactionProperties));
+    }
+  }
+
+  private native void nativeAddBases(
+      List<BasePath> newBases, Optional<Map<String, String>> transactionProperties);
+
+  /**
    * Add columns to the dataset.
    *
    * @param sqlExpressions The SQL expressions to add columns
@@ -2945,6 +2978,49 @@ public class Dataset implements Closeable {
   }
 
   private native Dataset nativeShallowClone(
+      String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
+
+  /**
+   * Deep clone the specified version into a new dataset at the target path, using default store
+   * parameters.
+   *
+   * @param targetPath the URI to clone the dataset into
+   * @param ref the referred version of the current dataset
+   * @return a new Dataset instance at the target path
+   * @see #deepClone(String, Ref, Map)
+   */
+  public Dataset deepClone(String targetPath, Ref ref) {
+    return deepClone(targetPath, ref, null);
+  }
+
+  /**
+   * Deep clone the specified version into a new dataset at the target path.
+   *
+   * <p>Unlike {@link #shallowClone(String, Ref, Map)}, this copies the data files, so the new
+   * dataset does not depend on the source. The target can live in a different object store.
+   *
+   * @param targetPath the URI to clone the dataset into
+   * @param ref the referred version of the current dataset
+   * @param storageOptions Optional object store options for the destination dataset; empty uses
+   *     default store parameters
+   * @return a new Dataset instance at the target path
+   */
+  public Dataset deepClone(String targetPath, Ref ref, Map<String, String> storageOptions) {
+    Preconditions.checkArgument(targetPath != null, "Target path can not be null");
+    Preconditions.checkArgument(ref != null, "ref can not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Dataset newDataset = nativeDeepClone(targetPath, ref, Optional.ofNullable(storageOptions));
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+      return newDataset;
+    }
+  }
+
+  private native Dataset nativeDeepClone(
       String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
 
   /**

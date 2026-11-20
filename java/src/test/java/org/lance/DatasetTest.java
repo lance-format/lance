@@ -2213,6 +2213,35 @@ public class DatasetTest {
   }
 
   @Test
+  void testDeepClone(@TempDir Path tempDir) throws Exception {
+    String srcPath = tempDir.resolve("deep_clone_src").toString();
+    String dstPath = tempDir.resolve("deep_clone_dst").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        assertEquals(1, empty.version());
+      }
+
+      try (Dataset src = suite.write(1, 5)) {
+        try (Dataset clone = src.deepClone(dstPath, Ref.ofMain(src.version()))) {
+          assertEquals(dstPath, clone.uri());
+          assertEquals(src.getSchema().getFields(), clone.getSchema().getFields());
+          assertEquals(5, clone.countRows());
+        }
+
+        // A deep clone owns its data files, unlike a shallow clone that references the source.
+        try (Stream<Path> files = Files.walk(Path.of(dstPath, "data"))) {
+          assertTrue(files.anyMatch(file -> file.toString().endsWith(".lance")));
+        }
+        try (Dataset opened = Dataset.open(allocator, dstPath, new ReadOptions.Builder().build())) {
+          assertEquals(5, opened.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
   void testBranches(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("testBranches").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

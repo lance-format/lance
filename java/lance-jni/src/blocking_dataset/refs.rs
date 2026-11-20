@@ -224,6 +224,49 @@ fn inner_shallow_clone<'local>(
     BlockingDataset { inner: new_ds }.into_java(env)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeDeepClone<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    target_path: JString,
+    reference: JObject,
+    storage_options: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_deep_clone(
+            &mut env,
+            java_dataset,
+            target_path,
+            reference,
+            storage_options
+        )
+    )
+}
+
+fn inner_deep_clone<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    target_path: JString,
+    jref: JObject,
+    storage_options: JObject,
+) -> Result<JObject<'local>> {
+    let target_path_str = target_path.extract(env)?;
+    let reference = transform_jref_to_ref(jref, env)?;
+    let storage_opts = transform_jstorage_options(storage_options, env)?;
+    let new_ds = {
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        block_on(
+            dataset_guard
+                .inner
+                .deep_clone(target_path_str.as_str(), reference, storage_opts),
+        )?
+    };
+
+    BlockingDataset { inner: new_ds }.into_java(env)
+}
+
 //////////////////////////////
 fn optional_datetime_to_java_instant<'local>(
     env: &mut JNIEnv<'local>,
