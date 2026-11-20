@@ -156,14 +156,26 @@ impl<'a> TransactionRebase<'a> {
         self.footprint_basis.latest = Some(latest);
     }
 
-    /// Record `manifest`, committed since this transaction read, for the
-    /// coverage repair to walk. See [`Self::adds_index_coverage`].
-    pub fn record_history(&mut self, manifest: Arc<Manifest>) {
-        self.footprint_basis
-            .history
-            .insert(manifest.version, manifest);
+    /// Trace what changed from `before` to `after`, the next manifest
+    /// committed since this transaction read, for the coverage repair. See
+    /// [`Self::adds_index_coverage`].
+    pub fn trace_commit(&mut self, before: &Manifest, after: &Manifest) {
+        let trace = Arc::make_mut(&mut self.footprint_basis.trace);
+        trace.observe(before, after);
         #[cfg(test)]
-        super::probe::held_history(self.footprint_basis.history.len());
+        super::probe::traced(trace.len());
+    }
+
+    /// Carry over what an earlier attempt traced, whose window ended where
+    /// this one's starts.
+    pub(crate) fn with_trace(mut self, trace: Arc<FragmentTrace>) -> Self {
+        self.footprint_basis.trace = trace;
+        self
+    }
+
+    /// What this rebase traced, for the next attempt to carry on from.
+    pub(crate) fn trace(&self) -> Arc<FragmentTrace> {
+        self.footprint_basis.trace.clone()
     }
 
     /// Record what the catch-up records of one commit: `transaction`,
@@ -176,10 +188,8 @@ impl<'a> TransactionRebase<'a> {
         before: &Manifest,
         after: Arc<Manifest>,
     ) {
-        if self.needs_committed_manifests(transaction) {
-            self.record_committed(version, transaction, before);
-        }
-        self.record_history(after.clone());
+        self.fold_commit(version, transaction, Some(before));
+        self.trace_commit(before, &after);
         self.record_window(Arc::new(before.clone()), after);
     }
 
@@ -1641,21 +1651,17 @@ impl<'a> TransactionRebase<'a> {
         if !self.footprint_basis.repairs_index_coverage {
             return;
         }
-        let Some(read) = self.footprint_basis.read.clone() else {
+        let (Some(read), Some(latest)) = (
+            self.footprint_basis.read.clone(),
+            self.footprint_basis.latest.clone(),
+        ) else {
             return;
         };
-        let mut committed: Vec<Arc<Manifest>> =
-            self.footprint_basis.history.values().cloned().collect();
-        if let Some(latest) = &self.footprint_basis.latest
-            && !self.footprint_basis.history.contains_key(&latest.version)
-        {
-            committed.push(latest.clone());
-        }
-        committed.sort_by_key(|manifest| manifest.version);
         let moved_to = |fragment| self.moved_to(fragment);
         let since = CommittedSince {
             read: &read,
-            committed: committed.iter().map(|manifest| manifest.as_ref()).collect(),
+            latest: &latest,
+            trace: &self.footprint_basis.trace,
             moved_to: &moved_to,
         };
         let withdrawals: Vec<(uuid::Uuid, Vec<u64>)> =

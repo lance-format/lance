@@ -18,8 +18,9 @@
 //! - `peak_heap`: the most heap the commit held above where it started.
 //! - reads and bytes, by kind: manifests (`_versions/`), transaction files,
 //!   deletion files, index files.
-//! - time inside the catch-up (`load_and_sort_new_transactions`), the
-//!   footprint bookkeeping (`record_committed_history`), the conflict check
+//! - time inside the catch-up (`catch_up`; on main and before it was
+//!   streamed, `load_and_sort_new_transactions` then the footprint
+//!   bookkeeping, `record_committed_history`), the conflict check
 //!   (`check_txns`) and the finish (`finish_with_tagged_rewrite`), summed over
 //!   attempts, wall (busy) per span.
 //! - `retry`: from the lost race to the commit landing.
@@ -107,7 +108,8 @@ const ROWS_PER_FRAGMENT: u32 = 16;
 const DELETE_FRAGMENTS: Range<u64> = 0..4;
 /// The fragments a compaction job removes; nothing concurrent touches them.
 const COMPACT_FRAGMENTS: Range<u64> = 4..8;
-const PHASES: [&str; 4] = [
+const PHASES: [&str; 5] = [
+    "catch_up",
     "load_and_sort_new_transactions",
     "record_committed_history",
     "check_txns",

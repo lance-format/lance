@@ -681,14 +681,15 @@ struct Cost {
     manifest_reads: u64,
     deletion_reads: u64,
     index_reads: u64,
-    peak_history: usize,
+    /// The most fragments the coverage repair traced.
+    peak_traced: usize,
     window_checks: usize,
 }
 
 impl Cost {
     fn of(stats: &IoStats, sizes: &HashMap<Path, u64>, observed: probe::Observed) -> Self {
         let mut cost = Self {
-            peak_history: observed.peak_history,
+            peak_traced: observed.peak_traced,
             window_checks: observed.window_checks,
             ..Default::default()
         };
@@ -762,18 +763,29 @@ impl std::fmt::Debug for Race {
     }
 }
 
+/// What committing a job costs: its first attempt, the retry after it lost
+/// the race when it did, and how many fragments the commits since it read
+/// created and removed between them.
+struct Catchup {
+    first: Cost,
+    retry: Option<Cost>,
+    touched: usize,
+}
+
 /// The cost of committing `job` over `VERSIONS` commits of `mix`, and, with
 /// `lose_race`, of the retry after losing its first attempt to one more.
-async fn catch_up(job: Job, mix: Mix, lose_race: bool) -> (Cost, Option<Cost>) {
+async fn catch_up(job: Job, mix: Mix, lose_race: bool) -> Catchup {
     let uri = format!("shared-memory://catchup-{}/table", Uuid::new_v4());
     let mut history = History::new(&uri).await;
     let (transaction, affected_rows) = history.stage(job).await;
+    let read = history.writer.manifest.clone();
     history.advance(VERSIONS, job, mix).await;
     let winner = if lose_race {
         Some(history.race_winner().await)
     } else {
         None
     };
+    let touched = touched_between(&read, &history.writer.manifest);
 
     let tracker = IOTracker::default();
     let race = Arc::new(Race {
@@ -840,18 +852,37 @@ async fn catch_up(job: Job, mix: Mix, lose_race: bool) -> (Cost, Option<Cost>) {
         .unwrap();
     let last = Cost::of(&tracker.incremental_stats(), &sizes, probe::take());
     let first = race.first_attempt.lock().unwrap().take();
-    match first {
+    let (first, retry) = match first {
         Some((stats, observed)) => (Cost::of(&stats, &sizes, observed), Some(last)),
         None => {
             assert!(!lose_race, "the job never wrote its manifest");
             (last, None)
         }
+    };
+    Catchup {
+        first,
+        retry,
+        touched,
     }
+}
+
+/// At most how many fragments the commits from `read` to `latest` created
+/// and removed: every id allocated between them, which may also have been
+/// removed again, and every fragment of `read` gone by `latest`.
+fn touched_between(read: &Manifest, latest: &Manifest) -> usize {
+    let allocated = latest.max_fragment_id().unwrap_or(0) - read.max_fragment_id().unwrap_or(0);
+    let gone = read
+        .fragments
+        .iter()
+        .filter(|fragment| latest.fragment_by_id(fragment.id).is_none())
+        .count();
+    2 * allocated as usize + gone
 }
 
 /// A job catching up on `VERSIONS` commits loads each manifest once, reads
 /// each deletion file it merges at most twice (as it read it and as it is
-/// now) and the index metadata a bounded number of times, holds no manifest
+/// now) and the index metadata a bounded number of times, traces only the
+/// fragments the commits created and removed, holds no manifest
 /// per version, and checks the window once.
 #[rstest]
 #[tokio::test]
@@ -869,17 +900,17 @@ async fn catch_up_reads_each_version_once(
     job: Job,
     #[values(Mix::Legacy, Mix::Half, Mix::Action)] mix: Mix,
 ) {
-    let (cost, _) = catch_up(job, mix, false).await;
+    let Catchup { first, touched, .. } = catch_up(job, mix, false).await;
     let merged = if job.deletes() { JOB_DELETES } else { 0 };
     let bounds = Cost {
         manifest_loads: VERSIONS + 1,
         manifest_reads: READS_PER_MANIFEST * (VERSIONS + 1) + 2,
         deletion_reads: 2 * merged,
         index_reads: INDEX_READS,
-        peak_history: 1,
+        peak_traced: touched,
         window_checks: 1,
     };
-    assert_within(&cost, &bounds, &format!("{job:?} over {mix:?}"));
+    assert_within(&first, &bounds, &format!("{job:?} over {mix:?}"));
 }
 
 /// The retry after a lost race catches up on the one commit that won it,
@@ -896,7 +927,7 @@ async fn retry_reads_only_the_race_winner(
     )]
     job: Job,
 ) {
-    let (_, retry) = catch_up(job, Mix::Half, true).await;
+    let Catchup { retry, touched, .. } = catch_up(job, Mix::Half, true).await;
     let retry = retry.unwrap();
     let merged = if job.deletes() { JOB_DELETES } else { 0 };
     let bounds = Cost {
@@ -904,7 +935,7 @@ async fn retry_reads_only_the_race_winner(
         manifest_reads: READS_PER_MANIFEST * (1 + RETRY_SLACK) + 2,
         deletion_reads: 2 * merged,
         index_reads: INDEX_READS,
-        peak_history: 1,
+        peak_traced: touched,
         window_checks: 1,
     };
     assert_within(&retry, &bounds, &format!("retry of {job:?}"));
@@ -918,9 +949,9 @@ fn assert_within(cost: &Cost, bounds: &Cost, case: &str) {
         ("deletion_reads", cost.deletion_reads, bounds.deletion_reads),
         ("index_reads", cost.index_reads, bounds.index_reads),
         (
-            "peak_history",
-            cost.peak_history as u64,
-            bounds.peak_history as u64,
+            "peak_traced",
+            cost.peak_traced as u64,
+            bounds.peak_traced as u64,
         ),
         (
             "window_checks",

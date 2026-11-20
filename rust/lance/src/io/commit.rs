@@ -1785,7 +1785,7 @@ async fn prepare_attempt(
     )
 }
 
-#[tracing::instrument(level = "debug", skip_all)]
+#[cfg(test)]
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<NewTransaction>)> {
@@ -1826,12 +1826,12 @@ pub(crate) async fn catch_up(
     let mut transactions = Vec::new();
     let mut previous = since.manifest.clone();
     let mut latest_location = None;
-    let keeps_history = rebase.adds_index_coverage();
+    let traces = rebase.adds_index_coverage();
     while let Some(((version, transaction, location), manifest)) = commits.try_next().await? {
         let before = (previous.version + 1 == version).then_some(previous.as_ref());
         rebase.fold_commit(version, &transaction, before);
-        if keeps_history {
-            rebase.record_history(manifest.clone());
+        if traces {
+            rebase.trace_commit(&previous, &manifest);
         }
         previous = manifest;
         latest_location = Some(location.clone());
@@ -1983,6 +1983,9 @@ pub(crate) async fn commit_transaction(
     // Track the transaction file written in the current loop iteration so we can
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
+    // What the coverage repair traced of the versions earlier attempts caught
+    // up on, so a retry repairs as one attempt over the whole window would.
+    let mut trace = Arc::default();
 
     // An allocating clustering submission from a reusable-id snapshot: judge
     // every transaction in its window for field-identity changes; see
@@ -2023,9 +2026,11 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
                     .await?
-                    .with_read_version_dataset(&read_version_dataset);
+                    .with_read_version_dataset(&read_version_dataset)
+                    .with_trace(std::mem::take(&mut trace));
             let (loaded_dataset, other_transactions) =
                 catch_up(&mut rebase, &dataset, None).await?;
+            trace = rebase.trace();
             dataset = loaded_dataset;
 
             ensure_can_write_manifest(&dataset.manifest)?;

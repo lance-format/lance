@@ -1082,8 +1082,8 @@ async fn test_a_retry_repairs_coverage_as_one_attempt_would() {
     let mut once = TransactionRebase::try_new(&dataset, create_index_txn([0, 1]), None)
         .await
         .unwrap();
-    once.record_history(since.clone());
-    once.record_history(latest.clone());
+    once.trace_commit(&read, &since);
+    once.trace_commit(&since, &latest);
     once.record_window(read.clone(), latest.clone());
     once.check_txns(&[(2, &overlaid), (3, &removed)]).unwrap();
     once.repair_index_coverage();
@@ -1091,14 +1091,15 @@ async fn test_a_retry_repairs_coverage_as_one_attempt_would() {
     let mut first = TransactionRebase::try_new(&dataset, create_index_txn([0, 1]), None)
         .await
         .unwrap();
-    first.record_history(since.clone());
+    first.trace_commit(&read, &since);
     first.record_window(read.clone(), since.clone());
     first.check_txns(&[(2, &overlaid)]).unwrap();
     first.repair_index_coverage();
     let mut retry = TransactionRebase::try_new(&dataset, first.transaction.clone(), None)
         .await
-        .unwrap();
-    retry.record_history(latest.clone());
+        .unwrap()
+        .with_trace(first.trace());
+    retry.trace_commit(&since, &latest);
     retry.record_window(since.clone(), latest.clone());
     retry.check_txns(&[(3, &removed)]).unwrap();
     retry.repair_index_coverage();
