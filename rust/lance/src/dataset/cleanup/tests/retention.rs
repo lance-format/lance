@@ -515,6 +515,31 @@ async fn cleanup_thinning_rejects_invalid_period() {
     }
 }
 
+#[tokio::test]
+async fn cleanup_rejects_older_than_before_earliest_timestamp() {
+    let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
+    fixture.create_some_data().await.unwrap();
+    let dataset = fixture.open().await.unwrap();
+
+    let error = dataset
+        .cleanup_old_versions(TimeDelta::MAX, None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert_contains!(error.to_string(), "older_than");
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest
+        .config
+        .insert("lance.auto_cleanup.interval".into(), "1".into());
+    manifest
+        .config
+        .insert("lance.auto_cleanup.older_than".into(), "300000years".into());
+    let error = build_cleanup_policy(&dataset, &manifest).await.unwrap_err();
+    assert!(matches!(error, Error::Cleanup { .. }), "{error}");
+    assert_contains!(error.to_string(), "lance.auto_cleanup.older_than");
+}
+
 #[rstest]
 #[tokio::test]
 async fn cleanup_thinning_preserves_branch_dependencies(

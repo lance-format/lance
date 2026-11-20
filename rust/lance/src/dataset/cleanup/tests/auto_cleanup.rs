@@ -211,6 +211,25 @@ async fn auto_cleanup_old_versions() {
 }
 
 #[tokio::test]
+async fn auto_cleanup_age_before_earliest_timestamp_keeps_commit() {
+    // The hook runs after the new manifest is published, so an age it cannot
+    // apply has to fail the cleanup and leave the commit reported as done.
+    let fixture = MockDatasetFixture::try_new().unwrap();
+    fixture.create_some_data().await.unwrap();
+    let mut dataset = fixture.open().await.unwrap();
+    dataset
+        .update_config([
+            ("lance.auto_cleanup.interval", "1"),
+            ("lance.auto_cleanup.older_than", "300000years"),
+        ])
+        .await
+        .unwrap();
+    fixture.overwrite_some_data().await.unwrap();
+    assert_eq!(fixture.open().await.unwrap().version().version, 3);
+    assert_eq!(fixture.count_files().await.unwrap().num_manifest_files, 3);
+}
+
+#[tokio::test]
 async fn test_auto_cleanup_interval_zero() {
     let fixture = MockDatasetFixture::try_new().unwrap();
 
