@@ -27,6 +27,10 @@ use crate::{Error, Result};
 // Target the vector payload size, independently of the storage block size.
 const TRAINING_SAMPLE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
+/// Sample fraction of the rows above which [`sample_fsl_uniform`] reads the
+/// sampled rows with one scan instead of `take`, see [`sample_fsl_by_scan`].
+const DENSE_SAMPLE_SCAN_FRACTION: f64 = 0.1;
+
 /// Bound each training read to about 64 MiB of fixed-width vector values.
 /// A vector wider than the target still needs one complete row per batch.
 fn training_sample_batch_rows(byte_width: usize) -> Result<usize> {
@@ -1031,6 +1035,9 @@ async fn sample_fsl_uniform(
     vector_field: &lance_core::datatypes::Field,
 ) -> Result<FixedSizeListArray> {
     let indices = generate_random_indices(num_rows, sample_size_hint);
+    if indices.len() as f64 >= num_rows as f64 * DENSE_SAMPLE_SCAN_FRACTION {
+        return sample_fsl_by_scan(dataset, column, &indices, byte_width, vector_field).await;
+    }
     let projection = Arc::new(dataset.schema().project(&[column])?);
 
     let batch_rows = training_sample_batch_rows(byte_width)?;
@@ -1078,6 +1085,66 @@ async fn sample_fsl_uniform(
         total_rows,
     );
 
+    fsl_values_to_array(vector_field, values_buf, total_rows)
+}
+
+/// Read the rows at sorted `indices` with one sequential scan of `column`
+/// instead of `take`: the same uniform sample, read at scan speed.
+///
+/// `take` of a dense sample is bound by the latency of one small read per row,
+/// while a scan streams whole pages, so above this fraction of the rows reading
+/// every row and keeping the sampled ones is faster.
+async fn sample_fsl_by_scan(
+    dataset: &Dataset,
+    column: &str,
+    indices: &[u64],
+    byte_width: usize,
+    vector_field: &lance_core::datatypes::Field,
+) -> Result<FixedSizeListArray> {
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?.scan_in_order(true);
+    let mut stream = scanner.try_into_stream().await?;
+    let mut values_buf = MutableBuffer::with_capacity(indices.len() * byte_width);
+    let mut total_rows = 0;
+    let mut batch_start = 0u64;
+    let mut remaining = indices;
+    while let Some(batch) = stream.try_next().await? {
+        let batch_end = batch_start + batch.num_rows() as u64;
+        let in_batch = remaining.partition_point(|&index| index < batch_end);
+        if in_batch > 0 {
+            let local = arrow_array::UInt32Array::from_iter_values(
+                remaining[..in_batch]
+                    .iter()
+                    .map(|&index| (index - batch_start) as u32),
+            );
+            let array =
+                arrow::compute::take(&get_column_from_batch(&batch, column)?, &local, None)?;
+            accumulate_fsl_values(
+                &mut values_buf,
+                &mut total_rows,
+                &array,
+                byte_width,
+                false,
+                usize::MAX,
+            )?;
+            remaining = &remaining[in_batch..];
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        batch_start = batch_end;
+    }
+    if !remaining.is_empty() {
+        return Err(Error::internal(format!(
+            "Sample training data: the scan of column {column} ended at row {batch_start} \
+             before sampled row {}",
+            remaining[0]
+        )));
+    }
+    info!(
+        "Sample training data: retrieved {} rows by uniform random sampling over a scan",
+        total_rows
+    );
     fsl_values_to_array(vector_field, values_buf, total_rows)
 }
 
@@ -1918,6 +1985,42 @@ mod tests {
         assert!(training_data.len() > 0 && training_data.len() <= sample_size);
         assert_eq!(training_data.null_count(), 0);
         assert_eq!(training_data.value_length(), dims as i32);
+    }
+
+    /// A dense sample read with one scan holds exactly the rows `take` returns
+    /// for the same offsets, across fragments and around deleted rows.
+    #[tokio::test]
+    async fn test_dense_sample_scan_matches_take() {
+        let data = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_batch_rows(RowCount::from(3_000))
+            .unwrap();
+        let mut dataset = InsertBuilder::new("memory://dense_sample_scan")
+            .with_params(&WriteParams {
+                max_rows_per_file: 700,
+                max_rows_per_group: 100,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        dataset.delete("id % 7 = 3").await.unwrap();
+        assert!(dataset.get_fragments().len() > 1);
+
+        let num_rows = dataset.count_rows(None).await.unwrap();
+        let indices = generate_random_indices(num_rows, num_rows / 2);
+        let field = dataset.schema().field("vec").unwrap().clone();
+        let scanned = sample_fsl_by_scan(&dataset, "vec", &indices, 8 * 4, &field)
+            .await
+            .unwrap();
+
+        let projection = dataset.schema().project(&["vec"]).unwrap();
+        let taken = dataset.take(&indices, projection).await.unwrap();
+        let values =
+            |fsl: &FixedSizeListArray| fsl.values().as_primitive::<Float32Type>().values().to_vec();
+        assert_eq!(scanned.len(), indices.len());
+        assert_eq!(values(&scanned), values(taken["vec"].as_fixed_size_list()));
     }
 
     #[rstest::rstest]
