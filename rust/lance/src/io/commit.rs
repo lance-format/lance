@@ -1411,6 +1411,7 @@ pub(crate) async fn do_commit_detached_transaction(
             let checked = crate::index::vector::ivf::validate_committed_vector_segments(
                 dataset,
                 &transaction.operation,
+                &manifest,
                 &indices,
             )
             .await;
@@ -2075,6 +2076,7 @@ pub(crate) async fn commit_transaction(
             let checked = crate::index::vector::ivf::validate_committed_vector_segments(
                 &dataset,
                 &attempt_transaction.operation,
+                &manifest,
                 &indices,
             )
             .await;
