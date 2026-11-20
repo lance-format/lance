@@ -318,12 +318,16 @@ class IndicesBuilder:
             output_uri unless the value is None)
         """
         from lance.dependencies import torch
+        from lance.torch import _to_device
         from lance.torch.kmeans import KMeans
         from lance.vector import compute_partitions
 
-        centroids = torch.from_numpy(
-            np.stack(ivf_model.centroids.to_numpy(zero_copy_only=False))
-        ).to(accelerator)
+        centroids = _to_device(
+            torch.from_numpy(
+                np.stack(ivf_model.centroids.to_numpy(zero_copy_only=False))
+            ),
+            accelerator,
+        )
         kmeans = KMeans(
             ivf_model.num_partitions,
             metric=ivf_model.distance_type,

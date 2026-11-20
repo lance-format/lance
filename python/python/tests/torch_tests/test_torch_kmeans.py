@@ -10,8 +10,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from lance.torch import preferred_device  # noqa: E402
 from lance.torch.distance import dot_distance, l2_distance  # noqa: E402
 from lance.torch.kmeans import KMeans  # noqa: E402
+from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
 
 
@@ -106,3 +108,20 @@ def test_kmeans_random_init_is_seeded():
     first, second = init(7), init(7)
     assert torch.equal(first, second)
     assert not torch.equal(first, init(8))
+
+
+@pytest.mark.gpu
+def test_create_ivf_pq_float64_on_accelerator(tmp_path: Path):
+    values = pa.array(np.random.default_rng(0).standard_normal(512 * 16))
+    arr = pa.FixedSizeListArray.from_arrays(values, 16)
+    ds = lance.write_dataset(pa.Table.from_arrays([arr], ["vector"]), tmp_path)
+
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=4,
+        accelerator=preferred_device().type,
+    )
+
+    validate_vector_index(ds, "vector", sample_size=16)
