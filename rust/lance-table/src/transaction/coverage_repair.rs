@@ -430,6 +430,26 @@ mod tests {
         assert_eq!(case.stale(), vec![1]);
     }
 
+    /// The compaction output carries the rewritten values from the version it
+    /// first appears in, so the rewrite shows only on the covered fragment.
+    #[rstest]
+    #[case::indexed_field(&["a"], vec![1])]
+    #[case::unrelated_field(&["c"], vec![])]
+    fn test_a_fragment_rewritten_then_compacted(
+        #[case] indexed: &[&str],
+        #[case] expected: Vec<u64>,
+    ) {
+        let read = read();
+        let rewritten = rewrite(&read.fragments, 1, "a");
+        let compacted = with(&without(&rewritten, 1), fragment(7));
+        let case = Case::new(
+            vec![manifest(2, rewritten), manifest(3, compacted)],
+            indexed,
+        )
+        .moved(1, Some(vec![7]));
+        assert_eq!(case.stale(), expected);
+    }
+
     /// A compaction output rewritten in the same window as the compaction is
     /// compared from the version it first appears in.
     #[test]
