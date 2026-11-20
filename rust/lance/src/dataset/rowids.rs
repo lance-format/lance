@@ -11,7 +11,7 @@ use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
-use lance_select::{RowAddrSelection, RowAddrTreeMap};
+use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use lance_table::{
     format::{
         Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
@@ -249,27 +249,6 @@ pub(crate) async fn get_row_id_index_with(
     Ok(Some(index))
 }
 
-/// The fragment's live row ids: its persisted row-id sequence minus the rows
-/// its deletion vector marks gone. A persisted sequence covers every row the
-/// fragment ever held, so a row whose old copy was deleted (e.g. rewritten by an
-/// update under the same stable row id) would otherwise be retained as a stale
-/// old-index entry.
-pub(crate) async fn live_row_ids(
-    fragment: &super::fragment::FileFragment,
-    seq: &RowIdSequence,
-) -> Result<RowAddrTreeMap> {
-    let deletion_vector = fragment.get_deletion_vector().await?;
-    Ok(match deletion_vector {
-        Some(dv) => seq
-            .iter()
-            .enumerate()
-            .filter(|(offset, _)| !dv.contains(*offset as u32))
-            .map(|(_, row_id)| row_id)
-            .collect(),
-        None => RowAddrTreeMap::from(seq),
-    })
-}
-
 /// Map a set of physical row addresses to their stable row ids
 ///
 /// A fragment's [`RowIdSequence`] holds one id per physical row in offset order;
@@ -294,12 +273,19 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
         };
         let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
 
+        let deletion_vector = file_fragment.get_deletion_vector().await?;
         match selection {
             RowAddrSelection::Full => {
-                row_ids |= live_row_ids(&file_fragment, &sequence).await?;
+                let mut fragment_ids = RowAddrTreeMap::from(sequence.as_ref());
+                if let Some(deletions) = deletion_vector {
+                    let offsets = deletions.to_sorted_iter().map(|offset| offset as usize);
+                    for deleted_id in sequence.select(offsets) {
+                        fragment_ids.remove(deleted_id);
+                    }
+                }
+                row_ids |= fragment_ids;
             }
             RowAddrSelection::Partial(offsets) => {
-                let deletion_vector = file_fragment.get_deletion_vector().await?;
                 for physical_offset in offsets.iter() {
                     // A deletion does not compact the row id sequence; the deleted row keeps
                     // its slot (the deletion vector tracks it separately). So a physical offset

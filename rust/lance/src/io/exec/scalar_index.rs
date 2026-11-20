@@ -1628,7 +1628,7 @@ mod tests {
             max_rows_per_file: 5,
             ..Default::default()
         };
-        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
             .await
             .unwrap();
         let fragment_id = dataset.get_fragments()[1].id() as u32;
@@ -1693,6 +1693,17 @@ mod tests {
             .unwrap();
         assert!(scoped.is_exact());
         assert_eq!(scoped.lower, NullableRowAddrMask::allow_nothing());
+
+        dataset.delete("id = 7").await.unwrap();
+        let all_offsets = (0..5)
+            .map(|offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+            .collect::<RowAddrTreeMap>();
+        for selection in [&full_fragment, &all_offsets] {
+            let live_ids = super::translate_addr_treemap_to_row_ids(&dataset, selection)
+                .await
+                .unwrap();
+            assert_eq!(live_ids, [5, 6, 8, 9].into_iter().collect());
+        }
     }
 
     /// An empty block-list (e.g. NGram's "cannot tell, scan everything" result

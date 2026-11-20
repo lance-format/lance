@@ -42,7 +42,7 @@ use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector
 use super::{CreateIndexBuilder, loading::DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::rowids::{live_row_ids, load_row_id_sequences};
+use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
 use crate::index::scalar::merge::{MergeRefresh, block_stale_rows};
 use crate::index::scalar::{
     IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, list_element,
@@ -88,39 +88,19 @@ async fn build_stable_row_id_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
 ) -> Result<RowAddrTreeMap> {
-    // For stable row IDs we cannot derive fragment ownership from row_id bits.
-    // Instead, we:
-    // 1) keep only fragments still considered "effective" for the old index, and
-    // 2) load their persisted row-id sequences from dataset metadata, then
-    // 3) build one exact allow-list used to retain only still-valid old rows.
-    let retained_frags = dataset
-        .manifest
-        .fragments
-        .iter()
-        .filter(|frag| effective_old_frags.contains(frag.id as u32))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if retained_frags.is_empty() {
-        return Ok(RowAddrTreeMap::new());
-    }
-
-    let row_id_sequences = load_row_id_sequences(dataset, &retained_frags)
-        .try_collect::<Vec<_>>()
+    // Stable IDs can move between fragments. Translate each fragment's live rows
+    // before taking the union so a deleted copy cannot contribute its ID.
+    let row_id_maps: Vec<_> = stream::iter(effective_old_frags)
+        .map(|fragment_id| async move {
+            let mut addrs = RowAddrTreeMap::new();
+            addrs.insert_fragment(fragment_id);
+            translate_addr_treemap_to_row_ids(dataset, &addrs).await
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
         .await?;
-
-    let mut row_id_maps = Vec::with_capacity(row_id_sequences.len());
-    for (frag_id, seq) in &row_id_sequences {
-        let fragment = dataset.get_fragment(*frag_id as usize).ok_or_else(|| {
-            Error::internal(format!(
-                "Missing fragment {frag_id} for its loaded row-id sequence"
-            ))
-        })?;
-        row_id_maps.push(live_row_ids(&fragment, seq).await?);
-    }
     let row_id_map_refs = row_id_maps.iter().collect::<Vec<_>>();
 
-    // Merge all fragment-local row-id sets into one exact membership structure.
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
 }
 
