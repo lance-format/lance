@@ -433,6 +433,20 @@ pub(crate) async fn sample_unseen_training_data(
     .await
 }
 
+// Quantizers operate on normalized coordinates for cosine. Sampling has already
+// excluded nulls, and normalization can produce non-finite values.
+pub(super) fn prepare_quantizer_training_data(
+    data: FixedSizeListArray,
+    distance_type: DistanceType,
+) -> Result<FixedSizeListArray> {
+    let data = if distance_type == DistanceType::Cosine {
+        lance_linalg::kernels::normalize_fsl_owned(data)?
+    } else {
+        data
+    };
+    filter_finite_training_data(data)
+}
+
 /// Filter out non-finite vectors from sampled training data.
 ///
 /// This is a no-op when all rows are finite, avoiding an unnecessary copy.

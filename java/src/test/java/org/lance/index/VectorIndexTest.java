@@ -609,9 +609,9 @@ public class VectorIndexTest {
         assertArrayEquals(bytes, restored.toBytes());
         Arrays.fill(bytes, (byte) 0);
         assertArrayEquals(model.toBytes(), restored.toBytes());
-        // A worker with a model must not sample or retrain, even with sampleRate=0.
+        // A supplied model makes the training sample rate irrelevant.
         vectorParams.setSqParams(
-            new SQBuildParams.Builder().setSampleRate(0).setModel(restored).build());
+            new SQBuildParams.Builder().setSampleRate(-1).setModel(restored).build());
       }
       if (indexType == IndexType.IVF_HNSW_SQ) {
         vectorParams.setHnswParams(new HnswBuildParams.Builder().build());

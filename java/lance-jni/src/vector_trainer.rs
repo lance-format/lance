@@ -235,28 +235,17 @@ fn inner_train_sq_model<'local>(
     distance_type_jstr: JString<'local>,
 ) -> Result<JByteArray<'local>> {
     let column: String = env.get_string(&column_jstr)?.into();
-    let (params, model) = extract_sq_build_params(env, sq_params_obj)?;
+    let params = extract_sq_build_params(env, sq_params_obj)?;
     let distance_type = parse_distance_type(env, &distance_type_jstr)?;
     let bytes = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(dataset_obj, NATIVE_DATASET) }?;
-        let model = match model {
-            Some(model) => {
-                model.validate_for_build(
-                    dataset_guard.inner.schema(),
-                    &column,
-                    distance_type,
-                    &params,
-                )?;
-                model
-            }
-            None => block_on(build_sq_model(
-                &dataset_guard.inner,
-                &column,
-                distance_type,
-                &params,
-            ))?,
-        };
+        let model = block_on(build_sq_model(
+            &dataset_guard.inner,
+            &column,
+            distance_type,
+            &params,
+        ))?;
         serialize_sq_model(&model)?
     };
     Ok(env.byte_array_from_slice(&bytes)?)

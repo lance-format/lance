@@ -20,11 +20,12 @@ import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * A reusable SQ8 model containing the vector dimension, trained quantization bounds, and training
- * metric. Train it once with {@link VectorTrainer#trainSqModel} and send {@link #toBytes()} to
- * workers. {@link DistanceType#Cosine} models encode normalized vectors. L2 and dot product models
- * encode raw vectors and can be used for either metric. All segments to be physically merged must
- * also share IVF centroids and a distance metric.
+ * A reusable SQ8 model containing the vector dimension, quantization bounds, and whether the bounds
+ * were trained on raw or normalized coordinates. Train it once with {@link
+ * VectorTrainer#trainSqModel} and send {@link #toBytes()} to workers. {@link DistanceType#Cosine}
+ * models encode normalized vectors. L2 and dot product models encode raw vectors and can be used
+ * for either metric. All segments to be physically merged must also share IVF centroids and a
+ * distance metric.
  *
  * <p>The opaque serialized representation is for transfer between workers using the same SDK
  * version, not persistent storage across SDK upgrades.

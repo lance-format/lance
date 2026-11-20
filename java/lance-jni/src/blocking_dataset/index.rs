@@ -19,9 +19,7 @@ use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong};
 use lance::dataset::Dataset;
-use lance::index::{
-    DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment, vector::sq::SqModel,
-};
+use lance::index::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use lance::table::format::IndexMetadata;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
@@ -219,7 +217,7 @@ fn inner_create_index<'local>(
     let mut skip_commit = fragment_ids.is_some();
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
-    let (params, sq_model): (Box<dyn IndexParams>, _) = match index_type {
+    let params_result: Result<Box<dyn IndexParams>> = match index_type {
         IndexType::Scalar
         | IndexType::BTree
         | IndexType::Bitmap
@@ -238,14 +236,14 @@ fn inner_create_index<'local>(
                 params: params_opt.clone(),
             };
             skip_commit = skip_commit || (index_type == IndexType::BTree && batch_reader.is_some());
-            (Box::new(scalar_params), None)
+            Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
             // System indices - not user-creatable
-            return Err(Error::input_error(format!(
+            Err(Error::input_error(format!(
                 "Cannot create system index type: {:?}. System indices are managed internally.",
                 index_type
-            )));
+            )))
         }
         IndexType::Vector
         | IndexType::IvfFlat
@@ -257,10 +255,11 @@ fn inner_create_index<'local>(
         | IndexType::IvfHnswFlat
         | IndexType::IvfHnswRq => {
             // For vector indices, use the existing parameter handling
-            let (params, sq_model) = get_vector_index_params(env, params_jobj)?;
-            (Box::new(params), sq_model)
+            get_vector_index_params(env, params_jobj)
         }
     };
+
+    let params = params_result?;
 
     let index_metadata = if progress.is_some() || skip_commit {
         // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
@@ -279,7 +278,6 @@ fn inner_create_index<'local>(
             &columns_slice,
             index_type,
             params.as_ref(),
-            sq_model,
             replace,
             train,
             name,
@@ -331,7 +329,6 @@ fn inner_create_index<'local>(
             &columns_slice,
             index_type,
             params.as_ref(),
-            sq_model,
             replace,
             train,
             name,
@@ -360,7 +357,6 @@ fn execute_create_index(
     columns: &[&str],
     index_type: IndexType,
     params: &dyn IndexParams,
-    sq_model: Option<SqModel>,
     replace: bool,
     train: bool,
     name: Option<String>,
@@ -374,10 +370,6 @@ fn execute_create_index(
         .create_index_builder(columns, index_type, params)
         .replace(replace)
         .train(train);
-
-    if let Some(model) = sq_model {
-        index_builder = index_builder.with_sq_model(model);
-    }
 
     if let Some(name) = name {
         index_builder = index_builder.name(name);

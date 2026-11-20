@@ -3,144 +3,22 @@
 
 //! Training reusable scalar quantization models for distributed index builds.
 use super::utils::{
-    filter_finite_training_data, get_vector_dim, get_vector_type, maybe_sample_training_data,
+    get_vector_type, infer_vector_dim, maybe_sample_training_data, prepare_quantizer_training_data,
 };
 use crate::Dataset;
 use arrow_array::Array;
-use arrow_schema::DataType;
-use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_index::vector::{
     quantizer::{Quantization, QuantizerBuildParams},
-    sq::{ScalarQuantizer, builder::SQBuildParams, storage::ScalarQuantizationMetadata},
+    sq::{ScalarQuantizer, builder::SQBuildParams},
 };
 use lance_linalg::distance::DistanceType;
 
-/// A trained SQ8 quantizer and the metric used to choose its input space.
-///
-/// Cosine encodes normalized vectors. L2 and dot product encode raw vectors
-/// and may share the same SQ model. A physical merge also requires shared IVF
-/// centroids and a common distance metric.
-#[derive(Debug, Clone)]
-pub struct SqModel {
-    metadata: ScalarQuantizationMetadata,
-    distance_type: DistanceType,
-}
-
-impl SqModel {
-    /// Restore trained bounds and their distance metric.
-    ///
-    /// ```
-    /// use lance::index::vector::sq::SqModel;
-    /// use lance_index::vector::sq::storage::ScalarQuantizationMetadata;
-    /// use lance_linalg::distance::DistanceType;
-    /// let model = SqModel::try_new(
-    ///     ScalarQuantizationMetadata { dim: 32, num_bits: 8, bounds: -1.0..1.0 },
-    ///     DistanceType::L2,
-    /// )?;
-    /// assert_eq!(model.metadata().dim, 32);
-    /// # Ok::<(), lance_core::Error>(())
-    /// ```
-    pub fn try_new(
-        metadata: ScalarQuantizationMetadata,
-        distance_type: DistanceType,
-    ) -> Result<Self> {
-        validate_sq_metric(distance_type)?;
-        if metadata.dim == 0 || metadata.dim > i32::MAX as usize {
-            return Err(Error::invalid_input(format!(
-                "SQ model dimension must be in 1..={}, got {}",
-                i32::MAX,
-                metadata.dim
-            )));
-        }
-        if metadata.num_bits != 8 {
-            return Err(Error::invalid_input(format!(
-                "SQ model num_bits must be 8, got {}",
-                metadata.num_bits
-            )));
-        }
-        if !metadata.bounds.start.is_finite()
-            || !metadata.bounds.end.is_finite()
-            || metadata.bounds.start > metadata.bounds.end
-            || !(metadata.bounds.end - metadata.bounds.start).is_finite()
-        {
-            return Err(Error::invalid_input(format!(
-                "SQ model bounds must be finite and ordered with a finite range, got {:?}",
-                metadata.bounds
-            )));
-        }
-        Ok(Self {
-            metadata,
-            distance_type,
-        })
-    }
-
-    /// Return the dimension, bit width and bounds used to encode vectors.
-    pub fn metadata(&self) -> &ScalarQuantizationMetadata {
-        &self.metadata
-    }
-
-    /// Return the metric used at training time.
-    pub fn distance_type(&self) -> DistanceType {
-        self.distance_type
-    }
-
-    /// Check that this model can encode the given column with the requested settings.
-    ///
-    /// See [`Self::try_new`] for constructing a model and [`build_sq_model`] for training one.
-    pub fn validate_for_build(
-        &self,
-        schema: &Schema,
-        column: &str,
-        distance_type: DistanceType,
-        params: &SQBuildParams,
-    ) -> Result<()> {
-        validate_sq_metric(distance_type)?;
-        if (self.distance_type == DistanceType::Cosine) != (distance_type == DistanceType::Cosine) {
-            return Err(Error::invalid_input(format!(
-                "SQ model was trained with {} and cannot encode vectors for {}",
-                self.distance_type, distance_type,
-            )));
-        }
-        let (_, element_type) = get_vector_type(schema, column)?;
-        if !matches!(
-            element_type,
-            DataType::Float16 | DataType::Float32 | DataType::Float64
-        ) {
-            return Err(Error::invalid_input(format!(
-                "SQ requires floating-point vectors, got {element_type} for column {column}"
-            )));
-        }
-        let dimension = get_vector_dim(schema, column)?;
-        if self.metadata.dim != dimension || self.metadata.num_bits != params.num_bits {
-            return Err(Error::invalid_input(format!(
-                "SQ model dimension {} and num_bits {} do not match requested dimension {dimension} and num_bits {}",
-                self.metadata.dim, self.metadata.num_bits, params.num_bits,
-            )));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn quantizer(&self) -> ScalarQuantizer {
-        ScalarQuantizer::with_bounds(
-            self.metadata.num_bits,
-            self.metadata.dim,
-            self.metadata.bounds.clone(),
-        )
-    }
-}
-
-fn validate_sq_metric(distance_type: DistanceType) -> Result<()> {
-    if distance_type == DistanceType::Hamming {
-        return Err(Error::invalid_input(
-            "SQ does not support the hamming metric",
-        ));
-    }
-    Ok(())
-}
+pub use lance_index::vector::sq::builder::{SqInputSpace, SqModel};
 
 /// Train an SQ model with the same preprocessing as the IVF builder.
 /// Null and non-finite vectors are excluded. An empty usable sample is rejected.
+/// A supplied model is validated against the column and returned directly.
 ///
 /// ```no_run
 /// # use lance::{Dataset, Result, index::DatasetIndexExt};
@@ -150,10 +28,10 @@ fn validate_sq_metric(distance_type: DistanceType) -> Result<()> {
 /// use lance::index::vector::{VectorIndexParams, sq::build_sq_model};
 /// let sq_params = SQBuildParams::default();
 /// let model = build_sq_model(dataset, "vector", DistanceType::L2, &sq_params).await?;
-/// let params = VectorIndexParams::with_ivf_sq_params(DistanceType::L2, Default::default(), sq_params);
-/// dataset.create_index_builder(&["vector"], IndexType::Vector, &params)
-///     .with_sq_model(model)
-///     .await?;
+/// let params = VectorIndexParams::with_ivf_sq_params(
+///     DistanceType::L2, Default::default(), SQBuildParams { model: Some(model), ..sq_params },
+/// );
+/// dataset.create_index_builder(&["vector"], IndexType::Vector, &params).await?;
 /// # Ok(()) }
 /// ```
 pub async fn build_sq_model(
@@ -162,7 +40,18 @@ pub async fn build_sq_model(
     distance_type: DistanceType,
     params: &SQBuildParams,
 ) -> Result<SqModel> {
-    validate_sq_metric(distance_type)?;
+    if let Some(model) = &params.model {
+        let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
+        model.validate_for_build(
+            infer_vector_dim(&vector_type)?,
+            &element_type,
+            distance_type,
+            params.num_bits,
+        )?;
+        return Ok(model.clone());
+    }
+
+    let input_space = SqInputSpace::try_from(distance_type)?;
     if params.num_bits != 8 {
         return Err(Error::invalid_input(format!(
             "SQ num_bits must be 8, got {}",
@@ -175,19 +64,14 @@ pub async fn build_sq_model(
         ));
     }
     let data = maybe_sample_training_data(dataset, column, params.try_sample_size()?, None).await?;
-    let data = if distance_type == DistanceType::Cosine {
-        lance_linalg::kernels::normalize_fsl_owned(data)?
-    } else {
-        data
-    };
-    let data = filter_finite_training_data(data)?;
+    let data = prepare_quantizer_training_data(data, distance_type)?;
     if data.is_empty() {
         return Err(Error::invalid_input(
             "SQ training requires at least one finite, non-null vector",
         ));
     }
     let quantizer = ScalarQuantizer::build(&data, DistanceType::L2, params)?;
-    SqModel::try_new(quantizer.metadata(None), distance_type)
+    SqModel::try_new(quantizer.metadata(None), input_space)
 }
 
 #[cfg(test)]
@@ -200,7 +84,10 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
-    use lance_index::{IndexType, vector::ivf::IvfBuildParams};
+    use lance_index::{
+        IndexType,
+        vector::{ivf::IvfBuildParams, sq::storage::ScalarQuantizationMetadata},
+    };
     use std::sync::Arc;
 
     #[rstest::rstest]
@@ -222,7 +109,7 @@ mod tests {
             num_bits,
             bounds: lower..upper,
         };
-        let err = SqModel::try_new(metadata, DistanceType::L2).unwrap_err();
+        let err = SqModel::try_new(metadata, SqInputSpace::Raw).unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains(message));
     }
@@ -234,16 +121,17 @@ mod tests {
             num_bits: 8,
             bounds: 1.0..1.0,
         };
-        SqModel::try_new(metadata, DistanceType::L2).unwrap();
+        SqModel::try_new(metadata, SqInputSpace::Raw).unwrap();
     }
 
     #[rstest::rstest]
-    #[case::l2(DistanceType::L2, 3.0, 8.0)]
-    #[case::dot(DistanceType::Dot, 3.0, 8.0)]
-    #[case::cosine(DistanceType::Cosine, 0.6, 0.8)]
+    #[case::l2(DistanceType::L2, SqInputSpace::Raw, 3.0, 8.0)]
+    #[case::dot(DistanceType::Dot, SqInputSpace::Raw, 3.0, 8.0)]
+    #[case::cosine(DistanceType::Cosine, SqInputSpace::L2Normalized, 0.6, 0.8)]
     #[tokio::test]
     async fn test_sq_training_space(
         #[case] metric: DistanceType,
+        #[case] input_space: SqInputSpace,
         #[case] lower: f64,
         #[case] upper: f64,
     ) {
@@ -276,11 +164,14 @@ mod tests {
         assert!((metadata.bounds.start - lower).abs() < 1e-6);
         assert!((metadata.bounds.end - upper).abs() < 1e-6);
         assert_eq!(metadata.dim, 2);
-        assert_eq!(sq.distance_type(), metric);
+        assert_eq!(sq.input_space(), input_space);
     }
 
+    #[rstest::rstest]
+    #[case::local_training(false)]
+    #[case::shared_model(true)]
     #[tokio::test]
-    async fn test_build_sq_shard_without_valid_vectors() {
+    async fn test_build_sq_shard_without_valid_vectors(#[case] reuse_model: bool) {
         let reader = gen_batch()
             .col(
                 "vector",
@@ -306,13 +197,28 @@ mod tests {
         let fragment_id = fragments[0].id() as u32;
         let centroids =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![3.0, 4.0]), 2).unwrap();
+        let sq_params = if reuse_model {
+            let model = build_sq_model(
+                &dataset,
+                "vector",
+                DistanceType::L2,
+                &SQBuildParams::default(),
+            )
+            .await
+            .unwrap();
+            // Computing a training sample size would overflow if the model were ignored.
+            SQBuildParams {
+                sample_rate: usize::MAX,
+                model: Some(model),
+                ..Default::default()
+            }
+        } else {
+            SQBuildParams::default()
+        };
         let params = VectorIndexParams::with_ivf_sq_params(
             DistanceType::L2,
             IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
-            SQBuildParams {
-                num_bits: 8,
-                sample_rate: 256,
-            },
+            sq_params,
         );
         let index = dataset
             .create_index_builder(&["vector"], IndexType::Vector, &params)
@@ -328,19 +234,20 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::empty(0, false)]
-    #[case::all_null(2, true)]
-    #[case::non_finite(2, false)]
+    #[case::empty(0, false, 1.0)]
+    #[case::all_null(2, true, 1.0)]
+    #[case::non_finite(2, false, f32::NAN)]
     #[tokio::test]
-    async fn test_sq_empty_training(#[case] rows: usize, #[case] all_null: bool) {
+    async fn test_sq_empty_training(
+        #[case] rows: usize,
+        #[case] all_null: bool,
+        #[case] value: f32,
+    ) {
         let reader = gen_batch()
             .col(
                 "vector",
-                array::cycle_vec(
-                    array::cycle::<Float32Type>(vec![f32::NAN]),
-                    Dimension::from(2),
-                )
-                .with_nulls(&[all_null]),
+                array::cycle_vec(array::cycle::<Float32Type>(vec![value]), Dimension::from(2))
+                    .with_nulls(&[all_null]),
             )
             .into_reader_rows(RowCount::from(rows as u64), BatchCount::from(1));
         let dataset = Dataset::write(reader, "memory://", None).await.unwrap();

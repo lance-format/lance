@@ -10,56 +10,50 @@ use jni::{
     objects::{JByteArray, JClass, JObject},
     sys::jintArray,
 };
-use lance::index::vector::sq::SqModel;
-use lance_index::vector::sq::{builder::SQBuildParams, storage::ScalarQuantizationMetadata};
-use lance_linalg::distance::DistanceType;
+use lance_index::vector::sq::{
+    builder::{SQBuildParams, SqInputSpace, SqModel},
+    storage::ScalarQuantizationMetadata,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct SqModelPayload {
     #[serde(flatten)]
     metadata: ScalarQuantizationMetadata,
-    distance_type: String,
+    input_space: SqInputSpace,
 }
 
 pub(crate) fn serialize_sq_model(model: &SqModel) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&SqModelPayload {
         metadata: model.metadata().clone(),
-        distance_type: model.distance_type().to_string(),
+        input_space: model.input_space(),
     })?)
 }
 
 fn parse_sq_model(bytes: &[u8]) -> Result<SqModel> {
     let model: SqModelPayload = serde_json::from_slice(bytes)
         .map_err(|e| Error::input_error(format!("Invalid SQ model: {e}")))?;
-    let distance_type = DistanceType::try_from(model.distance_type.as_str())
-        .map_err(|e| Error::input_error(format!("Invalid SQ model distance_type: {e}")))?;
-    Ok(SqModel::try_new(model.metadata, distance_type)?)
+    Ok(SqModel::try_new(model.metadata, model.input_space)?)
 }
 
-pub(crate) fn extract_sq_build_params(
-    env: &mut JNIEnv,
-    sq_obj: JObject,
-) -> Result<(SQBuildParams, Option<SqModel>)> {
+pub(crate) fn extract_sq_build_params(env: &mut JNIEnv, sq_obj: JObject) -> Result<SQBuildParams> {
     let num_bits = env.call_method(&sq_obj, "getNumBits", "()S", &[])?.s()? as u16;
     let model = env.get_optional_from_method(&sq_obj, "getModel", |env, model| {
         parse_sq_model(&env.get_vec_u8_from_method(&model, "toBytes")?)
     })?;
     let sample_rate = if model.is_some() {
-        0
+        SQBuildParams::default().sample_rate
     } else {
         let rate = env.call_method(&sq_obj, "getSampleRate", "()I", &[])?.i()?;
         usize::try_from(rate).map_err(|_| {
             Error::input_error(format!("SQ sampleRate must be non-negative, got {rate}"))
         })?
     };
-    Ok((
-        SQBuildParams {
-            num_bits,
-            sample_rate,
-        },
+    Ok(SQBuildParams {
+        num_bits,
+        sample_rate,
         model,
-    ))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -100,10 +94,10 @@ mod tests {
             // Without float_roundtrip, JSON rounds this upper bound to 1.0.
             bounds: -0.123456789012345..1.0_f64.next_down(),
         };
-        let model = SqModel::try_new(metadata.clone(), DistanceType::Cosine).unwrap();
+        let model = SqModel::try_new(metadata.clone(), SqInputSpace::L2Normalized).unwrap();
         let restored = parse_sq_model(&serialize_sq_model(&model).unwrap()).unwrap();
         assert_eq!(restored.metadata(), &metadata);
-        assert_eq!(restored.distance_type(), model.distance_type());
+        assert_eq!(restored.input_space(), model.input_space());
     }
 
     #[test]
@@ -112,7 +106,7 @@ mod tests {
             "dim": 32,
             "num_bits": 8,
             "bounds": {"start": 0.0, "end": 1.0},
-            "distance_type": "l2",
+            "input_space": "raw",
         });
         for (field, value, expected) in [
             ("dim", json!(0), "SQ model dimension"),
@@ -122,11 +116,7 @@ mod tests {
                 json!({"start": 2.0, "end": 1.0}),
                 "SQ model bounds",
             ),
-            (
-                "distance_type",
-                json!("unknown"),
-                "Invalid SQ model distance_type",
-            ),
+            ("input_space", json!("unknown"), "unknown variant"),
         ] {
             let mut invalid = payload.clone();
             invalid[field] = value;
