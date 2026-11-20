@@ -691,6 +691,70 @@ mod tests {
         assert!((dists[0] - expected).abs() < 1e-6);
     }
 
+    /// Cosine multivector distances equal the per-pair `cosine_distance` reference
+    /// exactly, with query sub-vectors of different norms.
+    #[rstest::rstest]
+    fn test_multivec_distance_cosine_matches_pairwise(
+        #[values(DataType::Float16, DataType::Float32, DataType::Float64)] dtype: DataType,
+    ) {
+        fn reference<T: Cosine>(query: &[T], rows: &[&[T]], dim: usize) -> Vec<f32> {
+            rows.iter()
+                .map(|row| {
+                    query
+                        .chunks_exact(dim)
+                        .map(|q| {
+                            row.chunks_exact(dim)
+                                .map(|v| cosine_distance(q, v))
+                                .min_by(f32::total_cmp)
+                                .unwrap()
+                        })
+                        .sum()
+                })
+                .collect()
+        }
+
+        let query = [1, 2, 0, 3, -4, 1];
+        let rows = [[3, 1, 2, -1, 0, 5], [2, 2, 1, 7, 1, -3]];
+        let values = rows.iter().flatten().copied().collect::<Vec<_>>();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(arrow_values(&dtype, values.clone()), 3)
+                .unwrap();
+        let multivecs = ListArray::new(
+            Arc::new(Field::new("item", vectors.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([2, 2]),
+            Arc::new(vectors),
+            None,
+        );
+        let query_array = arrow_values(&dtype, query.to_vec());
+        let got = DistanceType::Cosine
+            .multivec(query_array.as_ref(), &multivecs)
+            .unwrap();
+
+        let expected = match dtype {
+            DataType::Float16 => {
+                let to = |v: &[i32]| {
+                    v.iter()
+                        .map(|&x| f16::from_f32(x as f32))
+                        .collect::<Vec<_>>()
+                };
+                let (q, r0, r1) = (to(&query), to(&values[..6]), to(&values[6..]));
+                reference(&q, &[&r0, &r1], 3)
+            }
+            DataType::Float32 => {
+                let to = |v: &[i32]| v.iter().map(|&x| x as f32).collect::<Vec<_>>();
+                let (q, r0, r1) = (to(&query), to(&values[..6]), to(&values[6..]));
+                reference(&q, &[&r0, &r1], 3)
+            }
+            DataType::Float64 => {
+                let to = |v: &[i32]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
+                let (q, r0, r1) = (to(&query), to(&values[..6]), to(&values[6..]));
+                reference(&q, &[&r0, &r1], 3)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(got, expected, "{dtype}");
+    }
+
     #[test]
     fn test_multivec_distance_empty_row_is_nan() {
         let query: Arc<dyn Array> = Arc::new(Float32Array::from_iter_values([1.0_f32, 2.0]));
