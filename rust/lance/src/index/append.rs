@@ -37,7 +37,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::vector::ivf::{
-    SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
+    IVFIndex, SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
@@ -1920,8 +1920,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let explicit_append = options.num_indices_to_merge == Some(0);
             let default_append_for_heterogeneous_models = options.num_indices_to_merge.is_none()
                 && compatibility == VectorSegmentCompatibility::QueryCompatibleModelsDiffer;
+            // A legacy merge cannot drop the postings of rows an update moved
+            // under their stable row ids (see `optimize_vector_indices`).
+            let default_append_for_legacy_stable_row_ids = options.num_indices_to_merge.is_none()
+                && dataset.manifest.uses_stable_row_ids()
+                && logical_index
+                    .iter()
+                    .any(|(_, index)| index.as_any().is::<IVFIndex>());
 
-            if !unindexed.is_empty() && (explicit_append || default_append_for_heterogeneous_models)
+            if !unindexed.is_empty()
+                && (explicit_append
+                    || default_append_for_heterogeneous_models
+                    || default_append_for_legacy_stable_row_ids)
             {
                 // CreateIndex commits append new segments at the end of the manifest's
                 // stable index order. Reusing the current suffix model keeps consecutive

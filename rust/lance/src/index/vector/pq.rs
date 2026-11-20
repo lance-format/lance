@@ -523,7 +523,7 @@ impl VectorIndex for PQIndex {
     }
 
     fn quantizer(&self) -> Quantizer {
-        unimplemented!("only for IVF")
+        Quantizer::Product(self.pq.clone())
     }
 
     fn partition_size(&self, _: usize) -> usize {
