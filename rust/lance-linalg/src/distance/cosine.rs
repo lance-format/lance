@@ -1155,24 +1155,28 @@ mod tests {
         });
     }
 
-    /// Vectors whose squared norm leaves the f32 range (#11269): in f32,
-    /// `[1e20, 0, ..]` squares to `inf` and `[1e-30, 0, ..]` to zero, so an
-    /// aligned vector came back at distance 1, NaN or `-inf`, and flat search
-    /// ranked it last or dropped it. Each query is checked against
-    /// `[scale, 0, ..]` (distance 0) and the unit vector at 60 degrees
-    /// (distance 0.5), through the flat-search entry point and every candidate.
+    /// Vectors whose squared norm leaves the f32 range (#11269). In f32,
+    /// `[1e20, 1e20, 0, ..]` squares to `inf`, `[1e-21, 1e-21, 0, ..]` to
+    /// imprecise subnormals and `[1e-30, 1e-30, 0, ..]` to zero, and the norms
+    /// of `[3e38, 3e38, 0, ..]` and `[1e-45, 1e-45, 0, ..]` are not f32 values
+    /// at all, so an aligned vector came back at distance 1, NaN or `-inf`,
+    /// and flat search ranked it last or dropped it. Each query is checked
+    /// against `[scale, scale, 0, ..]` (distance 0) and `[1, 0, ..]`
+    /// (distance `1 - 1/sqrt(2)`) through every f32 entry point and candidate.
+    /// Where an entry point takes norms, they come from `norm_l2` and
+    /// `norm_l2_fsl`, as the cached-norm callers compute them.
     #[rstest::rstest]
     fn test_cosine_f32_out_of_range_norms(
-        #[values(1e20, 3e38, 1e-30, 1e-45)] scale: f32,
+        #[values(1e20, 3e38, 1e-21, 1e-30, 1e-45)] scale: f32,
         #[values(8, 16, 40)] dimension: usize,
     ) {
-        let mut scaled = vec![0.0_f32; dimension];
-        scaled[0] = scale;
-        let mut unit = vec![0.0_f32; dimension];
-        unit[0] = 1.0;
-        let mut unit_60 = vec![0.0_f32; dimension];
-        (unit_60[0], unit_60[1]) = (0.5, 0.75_f32.sqrt());
-        let batch = [scaled.as_slice(), &unit_60].concat();
+        let vector = |head: &[f32]| {
+            let mut v = vec![0.0_f32; dimension];
+            v[..head.len()].copy_from_slice(head);
+            v
+        };
+        let scaled = vector(&[scale, scale]);
+        let batch = [scaled.as_slice(), &vector(&[1.0])].concat();
         let targets = FixedSizeListArray::try_new(
             Arc::new(arrow_schema::Field::new(
                 "item",
@@ -1184,25 +1188,37 @@ mod tests {
             None,
         )
         .unwrap();
+        let target_norms = crate::distance::norm_l2_fsl(&targets).unwrap();
+        let want = [0.0, 1.0 - std::f64::consts::FRAC_1_SQRT_2];
 
-        for (x, x_norm) in [(&scaled, scale), (&unit, 1.0)] {
+        for x in [&scaled, &vector(&[1.0, 1.0])] {
+            let x_norm = norm_l2(x);
             let check = |got: [f32; 2], path: &str| {
-                for (got, want) in got.into_iter().zip([0.0, 0.5]) {
+                for (got, want) in got.into_iter().zip(want) {
                     assert!(
-                        (got - want).abs() <= 1e-6,
-                        "{path}: |x| = {x_norm:e}, scale {scale:e}, dim {dimension}: {got} != {want}"
+                        (f64::from(got) - want).abs() <= 1e-6,
+                        "{path}: x = [{:e}, ..], scale {scale:e}, dim {dimension}: {got} != {want}",
+                        x[0]
                     );
                 }
+            };
+            let each_target = |distance: &dyn Fn(&[f32], f32) -> f32| {
+                let mut got = [f32::NAN; 2];
+                for ((got, y), &y_norm) in got
+                    .iter_mut()
+                    .zip(batch.chunks_exact(dimension))
+                    .zip(target_norms.values())
+                {
+                    *got = distance(y, y_norm);
+                }
+                got
             };
 
             let got = crate::distance::DistanceType::Cosine
                 .batch(&Float32Array::from(x.clone()), &targets)
                 .unwrap();
             check([got.value(0), got.value(1)], "DistanceType::Cosine.batch");
-            check(
-                [f32::cosine(x, &scaled), f32::cosine(x, &unit_60)],
-                "Cosine::cosine",
-            );
+            check(each_target(&|y, _| f32::cosine(x, y)), "Cosine::cosine");
             for candidate in COSINE_F32_BATCH.candidates() {
                 let Some(kernel) = candidate.kernel() else {
                     continue;
@@ -1215,23 +1231,31 @@ mod tests {
                 let Some(kernel) = candidate.kernel() else {
                     continue;
                 };
-                let got = [
-                    kernel.call(x, x_norm, &scaled),
-                    kernel.call(x, x_norm, &unit_60),
-                ];
-                check(got, candidate.name());
+                check(
+                    each_target(&|y, _| kernel.call(x, x_norm, y)),
+                    candidate.name(),
+                );
             }
             for candidate in COSINE_WITH_NORMS_F32.candidates() {
                 let Some(kernel) = candidate.kernel() else {
                     continue;
                 };
-                let got = [
-                    kernel.call(x, x_norm, scale, &scaled),
-                    kernel.call(x, x_norm, 1.0, &unit_60),
-                ];
-                check(got, candidate.name());
+                check(
+                    each_target(&|y, y_norm| kernel.call(x, x_norm, y_norm, y)),
+                    candidate.name(),
+                );
             }
         }
+    }
+
+    /// The f32 entry points sum in f64 and round once, so an ordinary distance
+    /// is correctly rounded. Every sum here is exact in f64.
+    #[test]
+    fn test_cosine_f32_rounds_once() {
+        let (x, y) = ([1.0_f32, 2.0, 3.0], [4.0_f32, 5.0, 6.0]);
+        let want = (1.0 - 32.0 / 14.0_f64.sqrt() / 77.0_f64.sqrt()) as f32;
+        assert_eq!(f32::cosine(&x, &y), want);
+        assert_eq!(cosine_distance_batch_vec(&x, &y, 3), [want]);
     }
 
     /// Every host-supported half-precision kernel must agree with an f64
