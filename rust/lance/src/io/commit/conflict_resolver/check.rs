@@ -118,31 +118,28 @@ impl<'a> TransactionRebase<'a> {
             )
     }
 
-    /// Whether any check of this transaction against `committed` compares
-    /// footprints, which needs the latest manifest: an action set on either
-    /// side.
-    pub fn checks_by_footprint(&self, committed: &[Arc<Transaction>]) -> bool {
-        let is_action_set = |transaction: &Transaction| {
-            matches!(transaction.operation, Operation::CompositeOperation(_))
-        };
-        is_action_set(&self.transaction)
-            || committed
-                .iter()
-                .any(|transaction| is_action_set(transaction))
+    /// Whether this transaction adds index coverage over committed fragments,
+    /// which `repair_index_coverage` may have to repair against every
+    /// manifest committed since it read.
+    pub fn adds_index_coverage(&self) -> bool {
+        !new_coverage(&self.transaction, &HashSet::new()).is_empty()
     }
 
-    /// Whether this transaction, catching up on `committed`, needs every
-    /// manifest committed since it read: only to repair the index coverage it
-    /// adds over committed fragments, and for a named `CreateIndex` only once
-    /// an action set committed underneath it (see `repair_index_coverage`).
-    pub fn needs_committed_history(&self, committed: &[Arc<Transaction>]) -> bool {
-        if new_coverage(&self.transaction, &HashSet::new()).is_empty() {
-            return false;
+    /// Fold in what the footprint checks keep of `transaction`, committed as
+    /// `version` on top of `before`, which is `None` when that manifest is
+    /// gone. Only a named commit's footprint is kept, and only for an action
+    /// set; without `before` it is left unrecorded and its check fails closed.
+    pub fn fold_commit(
+        &mut self,
+        version: u64,
+        transaction: &Transaction,
+        before: Option<&Manifest>,
+    ) {
+        if let Some(before) = before
+            && self.needs_committed_manifests(transaction)
+        {
+            self.record_committed(version, transaction, before);
         }
-        matches!(self.transaction.operation, Operation::CompositeOperation(_))
-            || committed.iter().any(|transaction| {
-                matches!(transaction.operation, Operation::CompositeOperation(_))
-            })
     }
 
     /// Record the footprint of `transaction`, which committed on top of
@@ -160,7 +157,7 @@ impl<'a> TransactionRebase<'a> {
     }
 
     /// Record `manifest`, committed since this transaction read, for the
-    /// coverage repair to walk. See [`Self::needs_committed_history`].
+    /// coverage repair to walk. See [`Self::adds_index_coverage`].
     pub fn record_history(&mut self, manifest: Arc<Manifest>) {
         self.footprint_basis
             .history

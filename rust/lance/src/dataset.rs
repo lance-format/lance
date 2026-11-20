@@ -661,7 +661,11 @@ impl Dataset {
 
     /// Replace the manifest, refreshing derived state. Base stores are kept
     /// when `base_paths` is unchanged.
-    fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
+    pub(crate) fn set_manifest(
+        &mut self,
+        manifest: Arc<Manifest>,
+        manifest_location: ManifestLocation,
+    ) {
         if manifest.base_paths != self.manifest.base_paths {
             self.base_object_stores = Default::default();
         }
@@ -4548,98 +4552,73 @@ impl Dataset {
 /// itself is not kept: a writer far behind would hold one per version.
 pub(crate) type NewTransaction = (u64, Arc<Transaction>, ManifestLocation);
 
-pub(crate) struct NewTransactionResult<'a> {
-    pub dataset: BoxFuture<'a, Result<Dataset>>,
-    pub new_transactions: BoxStream<'a, Result<NewTransaction>>,
-}
-
-pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'_> {
-    // Resolve every manifest with version > our current version (the latest plus
-    // the ones in between). On non-lexically-ordered stores this uses the version
-    // hint to avoid an O(n) listing.
-    let io_parallelism = dataset.object_store.as_ref().io_parallelism();
-    // Both stages must poll their input even when the store permits only one I/O.
-    let stage_parallelism = (io_parallelism / 2).max(1);
+/// Every commit after `dataset`'s version, through `through` when given, in
+/// ascending version order, each with the manifest it committed.
+///
+/// Manifests load concurrently but are yielded in order, so a caller can
+/// fold each into what it keeps and drop it: at most the read-ahead window is
+/// held at once, never a manifest per version.
+pub(crate) fn new_commits(
+    dataset: &Dataset,
+    through: Option<u64>,
+) -> BoxStream<'_, Result<(NewTransaction, Arc<Manifest>)>> {
+    // On non-lexically-ordered stores this uses the version hint to avoid an
+    // O(n) listing.
     let locations = dataset.commit_handler.list_manifest_locations_since(
         &dataset.base,
         dataset.object_store.as_ref(),
         dataset.manifest.version,
     );
+    let read_ahead = dataset.object_store.as_ref().io_parallelism().max(1);
+    futures::TryFutureExt::try_flatten_stream(async move {
+        let mut locations: Vec<ManifestLocation> = locations
+            .try_filter(|location| {
+                futures::future::ready(through.is_none_or(|through| location.version <= through))
+            })
+            .try_collect()
+            .await?;
+        locations.sort_by_key(|location| location.version);
+        Ok::<_, Error>(
+            futures::stream::iter(locations)
+                .map(move |location| load_commit(dataset, location))
+                .buffered(read_ahead),
+        )
+    })
+    .boxed()
+}
 
-    // Will send the latest manifest via a channel.
-    let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();
-    let mut latest_tx = Some(latest_tx);
-
-    let manifests = locations
-        .map_ok(move |location| {
-            let latest_tx = latest_tx.take();
-            async move {
-                let manifest = Dataset::get_manifest(
-                    dataset.object_store.as_ref(),
-                    &location,
-                    &dataset.uri,
-                    dataset.session.as_ref(),
-                )
-                .await?;
-
-                if let Some(latest_tx) = latest_tx {
-                    // We ignore the error, since we don't care if the receiver is dropped.
-                    let _ = latest_tx.send((manifest.clone(), location.clone()));
-                }
-
-                Ok((manifest, location))
-            }
-        })
-        .try_buffer_unordered(stage_parallelism);
-    let transactions = manifests
-        .map_ok(move |(manifest, location)| async move {
-            let manifest_copy = manifest.clone();
-            let tx_key = TransactionKey {
-                version: manifest.version,
-            };
-            let transaction =
-                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
-                    cached
-                } else {
-                    let mut dataset_version = dataset.clone();
-                    dataset_version.set_manifest(manifest_copy.clone(), location.clone());
-                    let loaded =
-                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::internal(format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ))
-                        })?);
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&tx_key, loaded.clone())
-                        .await;
-                    loaded
-                };
-            Ok((manifest.version, transaction, location))
-        })
-        .try_buffer_unordered(stage_parallelism);
-
-    let dataset = async move {
-        if let Ok((latest_manifest, location)) = latest_rx.await {
-            // Advancing a retry must preserve the handle's branch incarnation.
-            let mut latest = dataset.clone();
-            latest.set_manifest(latest_manifest, location);
-            Ok(latest)
-        } else {
-            // If we didn't get the latest manifest, we can still return the dataset
-            // with the current manifest.
-            Ok(dataset.clone())
-        }
-    }
-    .boxed();
-
-    let new_transactions = transactions.boxed();
-
-    NewTransactionResult {
-        dataset,
-        new_transactions,
-    }
+async fn load_commit(
+    dataset: &Dataset,
+    location: ManifestLocation,
+) -> Result<(NewTransaction, Arc<Manifest>)> {
+    let manifest = Dataset::get_manifest(
+        dataset.object_store.as_ref(),
+        &location,
+        &dataset.uri,
+        dataset.session.as_ref(),
+    )
+    .await?;
+    let tx_key = TransactionKey {
+        version: manifest.version,
+    };
+    let transaction = if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
+        cached
+    } else {
+        let mut dataset_version = dataset.clone();
+        dataset_version.set_manifest(manifest.clone(), location.clone());
+        let loaded = Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
+            Error::internal(format!(
+                "Dataset version {} does not have a transaction file",
+                manifest.version
+            ))
+        })?);
+        dataset
+            .metadata_cache
+            .insert_with_key(&tx_key, loaded.clone())
+            .await;
+        loaded
+    };
+    Ok(((manifest.version, transaction, location), manifest))
 }
 
 /// # Schema Evolution

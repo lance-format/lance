@@ -1189,9 +1189,6 @@ async fn test_an_action_catch_up_is_checked_against_every_commit(
         ],
     )
     .await;
-    let (latest, transactions) = crate::io::commit::load_and_sort_new_transactions(&read)
-        .await
-        .unwrap();
     let mut rebase = TransactionRebase::try_new(
         &read,
         action_table_metadata_txn(read.manifest.version, "a"),
@@ -1199,14 +1196,9 @@ async fn test_an_action_catch_up_is_checked_against_every_commit(
     )
     .await
     .unwrap();
-    crate::io::commit::record_committed_history(
-        &mut rebase,
-        &latest,
-        read.manifest.clone(),
-        &transactions,
-    )
-    .await
-    .unwrap();
+    let (_, transactions) = crate::io::commit::catch_up(&mut rebase, &read, None)
+        .await
+        .unwrap();
 
     let committed: Vec<(u64, &Transaction)> = transactions
         .iter()
@@ -1229,18 +1221,10 @@ async fn caught_up_rebase(
     read: &Dataset,
     ours: Transaction,
 ) -> (TransactionRebase<'_>, Vec<crate::dataset::NewTransaction>) {
-    let (latest, transactions) = crate::io::commit::load_and_sort_new_transactions(read)
+    let mut rebase = TransactionRebase::try_new(read, ours, None).await.unwrap();
+    let (_, transactions) = crate::io::commit::catch_up(&mut rebase, read, None)
         .await
         .unwrap();
-    let mut rebase = TransactionRebase::try_new(read, ours, None).await.unwrap();
-    crate::io::commit::record_committed_history(
-        &mut rebase,
-        &latest,
-        read.manifest.clone(),
-        &transactions,
-    )
-    .await
-    .unwrap();
     (rebase, transactions)
 }
 
