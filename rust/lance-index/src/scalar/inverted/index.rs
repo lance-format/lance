@@ -107,6 +107,8 @@ mod grouping;
 mod inverted_index;
 mod partition;
 mod position_blocks;
+#[cfg(feature = "fts-format-research")]
+mod research_positions;
 mod posting_batch_builder;
 mod posting_builder;
 mod posting_list;

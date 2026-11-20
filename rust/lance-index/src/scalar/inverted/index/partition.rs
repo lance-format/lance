@@ -910,6 +910,10 @@ impl InvertedPartition {
             // 256-document blocks score with quantized document lengths.
             inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
         )?;
+        #[cfg(feature = "fts-format-research")]
+        {
+            inverted_list.research_path = Some(posting_path.to_owned());
+        }
         inverted_list.modern_num_docs = Some(docs.len());
 
         Ok(Self {
@@ -948,6 +952,10 @@ impl InvertedPartition {
             // 256-document blocks score with quantized document lengths.
             inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
         )?;
+        #[cfg(feature = "fts-format-research")]
+        {
+            inverted_list.research_path = Some(posting_file_path(id));
+        }
         inverted_list.modern_num_docs = Some(docs.len());
 
         Ok(Self {
