@@ -42,6 +42,7 @@ pub(crate) const LOOKUP_BATCH_SIZE: usize = 8192;
 pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
+mod eval;
 pub mod expression;
 pub mod fmindex;
 pub mod inverted;

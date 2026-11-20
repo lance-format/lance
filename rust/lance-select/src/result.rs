@@ -215,10 +215,30 @@ impl std::ops::BitAnd<Self> for NullableIndexExprResult {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self {
-        Self {
-            lower: self.lower & rhs.lower,
-            upper: self.upper & rhs.upper,
-            exact: self.exact && rhs.exact,
+        if self.exact && rhs.exact {
+            Self::exact(self.lower & rhs.lower)
+        } else {
+            Self {
+                lower: self.lower & rhs.lower,
+                upper: self.upper & rhs.upper,
+                exact: false,
+            }
+        }
+    }
+}
+
+impl std::ops::BitAnd<&Self> for NullableIndexExprResult {
+    type Output = Self;
+
+    fn bitand(self, rhs: &Self) -> Self {
+        if self.exact && rhs.exact {
+            Self::exact(self.lower & &rhs.lower)
+        } else {
+            Self {
+                lower: self.lower & &rhs.lower,
+                upper: self.upper & &rhs.upper,
+                exact: false,
+            }
         }
     }
 }
@@ -227,10 +247,30 @@ impl std::ops::BitOr<Self> for NullableIndexExprResult {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self {
-        Self {
-            lower: self.lower | rhs.lower,
-            upper: self.upper | rhs.upper,
-            exact: self.exact && rhs.exact,
+        if self.exact && rhs.exact {
+            Self::exact(self.lower | rhs.lower)
+        } else {
+            Self {
+                lower: self.lower | rhs.lower,
+                upper: self.upper | rhs.upper,
+                exact: false,
+            }
+        }
+    }
+}
+
+impl std::ops::BitOr<&Self> for NullableIndexExprResult {
+    type Output = Self;
+
+    fn bitor(self, rhs: &Self) -> Self {
+        if self.exact && rhs.exact {
+            Self::exact(self.lower | &rhs.lower)
+        } else {
+            Self {
+                lower: self.lower | &rhs.lower,
+                upper: self.upper | &rhs.upper,
+                exact: false,
+            }
         }
     }
 }
@@ -606,5 +646,68 @@ mod tests {
             panic!("ready transform must complete");
         };
         assert!(mapped.is_exact());
+    }
+
+    fn allow_with_nulls(rows: &[u64], nulls: &[u64]) -> NullableRowAddrMask {
+        NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(rows.iter().copied()),
+            RowAddrTreeMap::from_iter(nulls.iter().copied()),
+        ))
+    }
+
+    fn block_with_nulls(rows: &[u64], nulls: &[u64]) -> NullableRowAddrMask {
+        NullableRowAddrMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(rows.iter().copied()),
+            RowAddrTreeMap::from_iter(nulls.iter().copied()),
+        ))
+    }
+
+    fn all_result_variants(with_nulls: bool) -> Vec<NullableIndexExprResult> {
+        // Include a NULL row present only in `nulls` (6) as well as one in both `selected` and `nulls` (5).
+        let nulls: &[u64] = if with_nulls { &[5, 6] } else { &[] };
+        let allow_lo = allow_with_nulls(&[1, 5], nulls);
+        let allow_hi = allow_with_nulls(&[1, 2, 5], nulls);
+        let block_lo = block_with_nulls(&[2, 3, 5], nulls);
+        let block_hi = block_with_nulls(&[3, 5], nulls);
+
+        vec![
+            NullableIndexExprResult::exact(allow_lo.clone()),
+            NullableIndexExprResult::at_most(allow_hi.clone()),
+            NullableIndexExprResult::at_least(allow_lo.clone()),
+            NullableIndexExprResult::new(allow_lo, allow_hi),
+            NullableIndexExprResult::exact(block_hi.clone()),
+            NullableIndexExprResult::at_most(block_hi.clone()),
+            NullableIndexExprResult::at_least(block_lo.clone()),
+            NullableIndexExprResult::new(block_lo, block_hi),
+        ]
+    }
+
+    #[test]
+    fn nullable_index_expr_result_borrowed_ops_match_owned_across_all_shapes() {
+        let variants = [all_result_variants(false), all_result_variants(true)].concat();
+
+        for lhs in &variants {
+            for rhs in &variants {
+                let owned_and = lhs.clone() & rhs.clone();
+                let borrowed_and = lhs.clone() & rhs;
+                assert_eq!(borrowed_and.lower, owned_and.lower);
+                assert_eq!(borrowed_and.upper, owned_and.upper);
+                assert_eq!(borrowed_and.is_exact(), owned_and.is_exact());
+                assert_eq!(borrowed_and.is_exact(), lhs.is_exact() && rhs.is_exact());
+                if borrowed_and.is_exact() {
+                    assert_eq!(borrowed_and.lower, borrowed_and.upper);
+                }
+
+                let owned_or = lhs.clone() | rhs.clone();
+                let borrowed_or = lhs.clone() | rhs;
+                assert_eq!(borrowed_or.lower, owned_or.lower);
+                assert_eq!(borrowed_or.upper, owned_or.upper);
+                assert_eq!(borrowed_or.is_exact(), owned_or.is_exact());
+                assert_eq!(borrowed_or.is_exact(), lhs.is_exact() && rhs.is_exact());
+                if borrowed_or.is_exact() {
+                    assert_eq!(borrowed_or.lower, borrowed_or.upper);
+                }
+            }
+        }
     }
 }
