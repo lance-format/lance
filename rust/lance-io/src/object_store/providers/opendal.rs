@@ -50,10 +50,12 @@ fn retry_after_exceeded(delay: Duration) -> Error {
 /// `text/plain` objects on a full GET, and the read fails with "HTTP response does
 /// not contain file content length".
 ///
-/// When `honor_retry_after` is set, a `429` carrying `Retry-After` is held until
-/// the server-directed delay has elapsed before the response is returned to the
-/// retry layer. This is the only boundary where the header is available as a
-/// typed response header; OpenDAL's retry layer only sees the error. The retry
+/// When `honor_retry_after` is set, a `429` carrying an in-bound `Retry-After`
+/// is held until the server-directed delay has elapsed before the response is
+/// returned to the retry layer. A delay above `MAX_RETRY_AFTER` returns a
+/// permanent error immediately instead. This is the only boundary where the
+/// header is available as a typed response header; OpenDAL's retry layer only
+/// sees the error. The retry
 /// layer keeps ownership of every attempt, so mixed responses share its
 /// `client_max_retries` budget. The transport cannot tell whether the retry layer
 /// will spend its last retry, so the final positive-header 429 is also held; the
@@ -109,9 +111,11 @@ pub(in crate::object_store) fn finish_opendal_operator(
 
 /// Finish a Hugging Face operator.
 ///
-/// The transport waits out `Retry-After` on a `429` before the response reaches
-/// OpenDAL's retry layer, so the first retry already honors the server-directed
-/// delay and every attempt shares one `client_max_retries` budget.
+/// The transport waits out an in-bound `Retry-After` on a `429` before the
+/// response reaches OpenDAL's retry layer, so the first retry already honors the
+/// server-directed delay and every attempt shares one `client_max_retries` budget.
+/// A delay above the transport bound is surfaced immediately without retrying.
+#[cfg(feature = "huggingface")]
 pub(in crate::object_store) fn finish_huggingface_operator(
     operator: Operator,
     max_retries: usize,

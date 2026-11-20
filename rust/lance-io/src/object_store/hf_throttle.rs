@@ -5,8 +5,8 @@
 //!
 //! OpenDAL's retry layer owns the `client_max_retries` budget for a Hugging Face
 //! store. Once it returns a 429 error, Lance's reader and list retry loops must
-//! not repeat the request: the server-directed delay has already elapsed and
-//! another request would arrive before the next allowed time.
+//! not repeat the request: OpenDAL has either spent the retry budget or surfaced
+//! an over-limit `Retry-After` that must not be retried early.
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};

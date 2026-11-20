@@ -41,6 +41,7 @@ impl OpendalStore {
         }
     }
 
+    #[cfg(feature = "huggingface")]
     pub(super) fn new_huggingface(operator: Operator) -> Self {
         Self {
             inner: InnerOpendalStore::new(operator),

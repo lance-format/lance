@@ -124,9 +124,9 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
         match f().await {
             Ok(val) => return Ok(val),
             Err(err) => {
-                // OpenDAL already spent its Hugging Face retry budget and waited
-                // out Retry-After. Repeating the request here would arrive
-                // before the server allowed it.
+                // OpenDAL owns the Hugging Face rate-limit response: it either
+                // spent the retry budget or surfaced an over-limit Retry-After.
+                // Repeating the request here would bypass that decision.
                 if retries == 0 || is_huggingface_rate_limited(&err) {
                     return Err(err);
                 }
