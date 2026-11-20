@@ -1200,6 +1200,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
+        batch_size_bytes: Optional[int] = None,
         use_scalar_index: Optional[bool] = None,
         ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
@@ -1214,6 +1215,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
+        batch_size_bytes: int, optional
+            Approximate byte target per scan batch.
         blob_mode: str, default "lazy"
             Controls how blob columns are returned.
 
@@ -1230,6 +1233,7 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            batch_size_bytes=batch_size_bytes,
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
