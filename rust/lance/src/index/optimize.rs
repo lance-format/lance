@@ -26,8 +26,7 @@
 //! against the model of a reference segment; merges combine the task results
 //! that carry their `group` with the committed segments they list into one
 //! segment. A task that is the only input of its merge folds those old
-//! segments in itself, in one pass, except LabelList, whose old segments
-//! remain in the merge stage. Separately, a scalar kind that moved to the
+//! segments in itself, in one pass. Separately, a scalar kind that moved to the
 //! row-address domain while a committed segment still stores row ids (an
 //! RTree segment written by a release before the move, say) stays unsplit:
 //! the split plan would rebuild only the segments it absorbs, leaving a
@@ -365,7 +364,6 @@ pub struct OptimizeIndexTask {
     /// The committed segments this task may fold into its output. For an
     /// unsplit index these are all of its segments; for a split one, the
     /// segments its merge absorbs when this task is the merge's only input.
-    /// LabelList keeps its old segments in the merge stage instead.
     #[serde(with = "index_metadata_hex::vec")]
     pub old_segments: Vec<IndexMetadata>,
     /// How many of `old_segments` to fold in, as
@@ -1334,15 +1332,12 @@ async fn pack_split_index(
         }
         let (plan_id, read_version) = (plan.plan_id, plan.read_version);
         let group = plan.merges.len() as u32;
-        // LabelList has a pure segment merger, but its append path would
-        // rescan several old segments. Keep those in the merge stage even
-        // when only one task builds new fragments.
-        let (absorbed_by_task, absorbed_by_merge) =
-            if builds.len() == 1 && !segment_has_label_list_details(&reference) {
-                (absorbed, Vec::new())
-            } else {
-                (Vec::new(), absorbed)
-            };
+        // A single task folds the old segments in itself, in one pass.
+        let (absorbed_by_task, absorbed_by_merge) = if builds.len() == 1 {
+            (absorbed, Vec::new())
+        } else {
+            (Vec::new(), absorbed)
+        };
         for fragments in builds {
             plan.tasks.push(OptimizeIndexTask {
                 plan_id,
