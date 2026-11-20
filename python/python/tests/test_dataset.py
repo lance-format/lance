@@ -1223,6 +1223,18 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+@pytest.mark.parametrize("name", ["plain", "a`b", "`a`"])
+@pytest.mark.parametrize("max_rows_per_file", [1, 2])
+def test_take_literal_column_names(tmp_path: Path, name, max_rows_per_file):
+    table = pa.table({"a": [1, 2], name: [10, 20]})
+    dataset = lance.write_dataset(
+        table, tmp_path, max_rows_per_file=max_rows_per_file, max_rows_per_group=1
+    )
+    assert dataset.schema == table.schema
+    assert dataset.take([0]).equals(table.slice(0, 1))
+    assert dataset.take([1, 0, 1]).equals(table.take([1, 0, 1]))
+
+
 @pytest.mark.parametrize("columns", [["a", "nope"], ["s.nope"], ["a.b"]])
 def test_take_unknown_column(tmp_path: Path, columns):
     table = pa.table({"a": [1, 10], "s": pa.array([{"x": 2}, {"x": 20}])})
