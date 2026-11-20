@@ -57,7 +57,7 @@ use crate::scalar::inverted::InvertedIndexParams;
 use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
 use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
-use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
+use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, RowAddrMask};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
@@ -2057,16 +2057,78 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
-    match result {
-        SearchResult::Exact(mask) => {
-            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
+// Exact subtrees need only one owned mask until a public endpoint boundary.
+// Bounds keep the existing endpoint algebra, including results returned by a
+// row-address translator whose endpoint representation is owned by the loader.
+enum EvaluatedIndexExpr {
+    ExactOwned(NullableRowAddrMask),
+    Bounds(NullableIndexExprResult),
+}
+
+impl EvaluatedIndexExpr {
+    fn from_search_result(result: SearchResult) -> Self {
+        match result {
+            SearchResult::Exact(mask) => Self::ExactOwned(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtMost(mask) => Self::Bounds(NullableIndexExprResult::at_most(
+                NullableRowAddrMask::AllowList(mask),
+            )),
+            SearchResult::AtLeast(mask) => Self::Bounds(NullableIndexExprResult::at_least(
+                NullableRowAddrMask::AllowList(mask),
+            )),
         }
-        SearchResult::AtMost(mask) => {
-            NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(mask))
+    }
+
+    fn into_nullable(self) -> NullableIndexExprResult {
+        match self {
+            Self::ExactOwned(mask) => NullableIndexExprResult::exact(mask),
+            Self::Bounds(result) => result,
         }
-        SearchResult::AtLeast(mask) => {
-            NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
+    }
+
+    fn drop_nulls(self) -> IndexExprResult {
+        match self {
+            Self::ExactOwned(mask) => IndexExprResult::exact(mask.drop_nulls()),
+            Self::Bounds(result) => result.drop_nulls(),
+        }
+    }
+
+    fn into_prefilter(self) -> RowAddrMask {
+        match self {
+            Self::ExactOwned(mask) => mask.drop_nulls(),
+            Self::Bounds(result) => result.upper.drop_nulls(),
+        }
+    }
+}
+
+impl std::ops::Not for EvaluatedIndexExpr {
+    type Output = Self;
+
+    fn not(self) -> Self {
+        match self {
+            Self::ExactOwned(mask) => Self::ExactOwned(!mask),
+            Self::Bounds(result) => Self::Bounds(!result),
+        }
+    }
+}
+
+impl std::ops::BitAnd for EvaluatedIndexExpr {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::ExactOwned(lhs), Self::ExactOwned(rhs)) => Self::ExactOwned(lhs & rhs),
+            (lhs, rhs) => Self::Bounds(lhs.into_nullable() & rhs.into_nullable()),
+        }
+    }
+}
+
+impl std::ops::BitOr for EvaluatedIndexExpr {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::ExactOwned(lhs), Self::ExactOwned(rhs)) => Self::ExactOwned(lhs | rhs),
+            (lhs, rhs) => Self::Bounds(lhs.into_nullable() | rhs.into_nullable()),
         }
     }
 }
@@ -2083,8 +2145,10 @@ impl ScalarIndexExpr {
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
-        self.evaluate_with_options(index_loader, metrics, true)
-            .await
+        Ok(self
+            .evaluate_with_options(index_loader, metrics, true)
+            .await?
+            .into_nullable())
     }
 
     #[async_recursion]
@@ -2093,7 +2157,7 @@ impl ScalarIndexExpr {
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
         track_nulls: bool,
-    ) -> Result<NullableIndexExprResult> {
+    ) -> Result<EvaluatedIndexExpr> {
         match self {
             Self::Not(inner) => {
                 // NOT needs the child's NULL rows to preserve SQL three-valued
@@ -2126,12 +2190,16 @@ impl ScalarIndexExpr {
                         metrics,
                     )
                     .await?;
-                let result = search_result_to_nullable(search_result);
+                let result = EvaluatedIndexExpr::from_search_result(search_result);
                 if index.results_are_row_addresses() {
                     // Translate address-domain results to the row-id domain
                     // before combining or scanning; otherwise stable-row-id
                     // datasets silently drop matches (issue #7434).
-                    index_loader.row_addr_result_to_row_ids(result).await
+                    Ok(EvaluatedIndexExpr::Bounds(
+                        index_loader
+                            .row_addr_result_to_row_ids(result.into_nullable())
+                            .await?,
+                    ))
                 } else {
                     Ok(result)
                 }
@@ -2149,6 +2217,35 @@ impl ScalarIndexExpr {
             .evaluate_with_options(index_loader, metrics, false)
             .await?
             .drop_nulls())
+    }
+
+    /// Evaluate the candidate mask consumed by a prefilter without materializing
+    /// an unused lower endpoint for an exact expression.
+    ///
+    /// The returned owned mask has the same membership as [`Self::evaluate`]'s
+    /// upper endpoint. NULL rows are discarded only after boolean evaluation;
+    /// NOT still tracks NULLs throughout its subtree, and address-domain index
+    /// results pass through [`ScalarIndexLoader::row_addr_result_to_row_ids`].
+    ///
+    /// ```
+    /// # use lance_index::scalar::{MetricsCollector, expression::{ScalarIndexExpr, ScalarIndexLoader}};
+    /// # async fn example(expr: &ScalarIndexExpr, loader: &dyn ScalarIndexLoader, metrics: &dyn MetricsCollector) -> lance_core::Result<()> {
+    /// let candidates = expr.evaluate_prefilter(loader, metrics).await?;
+    /// let result = expr.evaluate(loader, metrics).await?;
+    /// assert_eq!(candidates, result.upper);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(level = "debug", skip_all)]
+    pub async fn evaluate_prefilter(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowAddrMask> {
+        Ok(self
+            .evaluate_with_options(index_loader, metrics, false)
+            .await?
+            .into_prefilter())
     }
 
     pub fn to_expr(&self) -> Expr {
@@ -3129,23 +3226,316 @@ pub fn create_filter_plan(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
 
     use arrow_array::Array;
     use arrow_schema::{Field, Fields, Schema};
     use chrono::Utc;
+    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
+    use lance_core::deepsize::DeepSizeOf;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_datafusion::planner::Planner;
     use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
     use roaring::RoaringBitmap;
     use rstest::rstest;
 
-    use crate::scalar::json::{JsonQuery, JsonQueryParser};
+    use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::registry::ScalarIndexPlugin;
+    use crate::scalar::{
+        CreatedIndex, IndexStore, OldIndexDataFilter, ScalarIndexParams, UpdateCriteria,
+        json::{JsonQuery, JsonQueryParser},
+    };
+    use crate::{Index, IndexType};
     use datafusion_expr::{col, lit};
 
     use super::*;
+
+    fn nullable_mask(selected: &[u64], nulls: &[u64]) -> NullableRowAddrMask {
+        NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+            selected.iter().copied().collect(),
+            nulls.iter().copied().collect(),
+        ))
+    }
+
+    #[rstest]
+    #[case::and(false)]
+    #[case::or(true)]
+    fn exact_owned_boolean_composition_preserves_nulls(#[case] is_or: bool) {
+        let lhs = nullable_mask(&[0, 1, 2], &[1]);
+        let rhs = nullable_mask(&[1, 2, 3], &[3]);
+        let exact_lhs = EvaluatedIndexExpr::ExactOwned(lhs.clone());
+        let exact_rhs = EvaluatedIndexExpr::ExactOwned(rhs.clone());
+        let public_lhs = NullableIndexExprResult::exact(lhs);
+        let public_rhs = NullableIndexExprResult::exact(rhs);
+        let (owned, expected) = if is_or {
+            (!(exact_lhs | exact_rhs), !(public_lhs | public_rhs))
+        } else {
+            (!(exact_lhs & exact_rhs), !(public_lhs & public_rhs))
+        };
+        assert!(matches!(&owned, EvaluatedIndexExpr::ExactOwned(_)));
+        let actual = owned.drop_nulls();
+        let expected = expected.drop_nulls();
+        assert!(actual.is_exact());
+        assert_eq!(actual.lower, expected.lower);
+        assert_eq!(actual.upper, expected.upper);
+    }
+
+    enum BoundShape {
+        AtMost,
+        AtLeast,
+        Refined,
+    }
+
+    #[rstest]
+    #[case::at_most_and(BoundShape::AtMost, false)]
+    #[case::at_most_or(BoundShape::AtMost, true)]
+    #[case::at_least_and(BoundShape::AtLeast, false)]
+    #[case::at_least_or(BoundShape::AtLeast, true)]
+    #[case::refined_and(BoundShape::Refined, false)]
+    #[case::refined_or(BoundShape::Refined, true)]
+    fn mixed_bounds_keep_the_existing_endpoint_algebra(
+        #[case] shape: BoundShape,
+        #[case] is_or: bool,
+    ) {
+        let exact = nullable_mask(&[0, 1, 2], &[1]);
+        let bound = nullable_mask(&[1, 2, 3], &[3]);
+        let bounds = match shape {
+            BoundShape::AtMost => NullableIndexExprResult::at_most(bound),
+            BoundShape::AtLeast => NullableIndexExprResult::at_least(bound),
+            BoundShape::Refined => NullableIndexExprResult::new(nullable_mask(&[2], &[]), bound),
+        };
+        let expected_exact = NullableIndexExprResult::exact(exact.clone());
+        let expected_bounds = bounds.clone();
+        let exact = EvaluatedIndexExpr::ExactOwned(exact);
+        let bounds = EvaluatedIndexExpr::Bounds(bounds);
+        let (actual, expected) = if is_or {
+            (!(exact | bounds), !(expected_exact | expected_bounds))
+        } else {
+            (!(exact & bounds), !(expected_exact & expected_bounds))
+        };
+        assert!(matches!(&actual, EvaluatedIndexExpr::Bounds(_)));
+        let actual = actual.into_nullable();
+        assert_eq!(actual.is_exact(), expected.is_exact());
+        assert_eq!(actual.lower, expected.lower);
+        assert_eq!(actual.upper, expected.upper);
+        assert_eq!(
+            EvaluatedIndexExpr::Bounds(actual).into_prefilter(),
+            expected.drop_nulls().upper
+        );
+    }
+
+    #[derive(Debug, DeepSizeOf)]
+    struct EvaluationIndex {
+        rows: NullableRowAddrSet,
+        is_row_address: bool,
+        tracked_nulls: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl Index for EvaluationIndex {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::Bitmap
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok([0].into_iter().collect())
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndex for EvaluationIndex {
+        async fn search(
+            &self,
+            query: &dyn AnyQuery,
+            metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            self.search_with_options(query, SearchOptions::default(), metrics)
+                .await
+        }
+
+        async fn search_with_options(
+            &self,
+            _query: &dyn AnyQuery,
+            options: SearchOptions,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            self.tracked_nulls
+                .lock()
+                .unwrap()
+                .push(options.track_nulls());
+            let rows = if options.track_nulls() {
+                self.rows.clone()
+            } else {
+                NullableRowAddrSet::new(self.rows.true_rows(), RowAddrTreeMap::new())
+            };
+            Ok(SearchResult::Exact(rows))
+        }
+
+        fn results_are_row_addresses(&self) -> bool {
+            self.is_row_address
+        }
+
+        fn can_remap(&self) -> bool {
+            false
+        }
+
+        async fn remap(
+            &self,
+            _mapping: &RowAddrRemap,
+            _dest_store: &dyn IndexStore,
+        ) -> Result<CreatedIndex> {
+            Err(Error::not_supported("Expression fixture is read-only"))
+        }
+
+        async fn update(
+            &self,
+            _new_data: SendableRecordBatchStream,
+            _dest_store: &dyn IndexStore,
+            _old_data_filter: Option<OldIndexDataFilter>,
+        ) -> Result<CreatedIndex> {
+            Err(Error::not_supported("Expression fixture is read-only"))
+        }
+
+        fn update_criteria(&self) -> UpdateCriteria {
+            unreachable!("Expression fixture is read-only")
+        }
+
+        fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+            Err(Error::not_supported(
+                "Expression fixture has no durable parameters",
+            ))
+        }
+    }
+
+    struct EvaluationLoader {
+        index: Arc<EvaluationIndex>,
+        translations: AtomicUsize,
+    }
+
+    fn shifted_mask(mask: NullableRowAddrMask) -> NullableRowAddrMask {
+        let shift =
+            |rows: &RowAddrTreeMap| rows.clone().into_addr_iter().map(|row| row + 100).collect();
+        match mask {
+            NullableRowAddrMask::AllowList(set) => NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(shift(set.selected_rows()), shift(set.null_rows())),
+            ),
+            NullableRowAddrMask::BlockList(set) => NullableRowAddrMask::BlockList(
+                NullableRowAddrSet::new(shift(set.selected_rows()), shift(set.null_rows())),
+            ),
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndexLoader for EvaluationLoader {
+        async fn load_index(
+            &self,
+            _column: &str,
+            _index_name: &str,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            Ok(self.index.clone())
+        }
+
+        async fn row_addr_result_to_row_ids(
+            &self,
+            result: NullableIndexExprResult,
+        ) -> Result<NullableIndexExprResult> {
+            self.translations.fetch_add(1, AtomicOrdering::Relaxed);
+            assert!(result.is_exact());
+            Ok(NullableIndexExprResult::new(
+                shifted_mask(result.lower),
+                shifted_mask(result.upper),
+            ))
+        }
+    }
+
+    #[rstest]
+    #[case::row_ids(false, 0)]
+    #[case::row_addresses(true, 100)]
+    #[tokio::test]
+    async fn prefilter_matches_upper_and_preserves_recursive_not_and_translation(
+        #[case] is_row_address: bool,
+        #[case] offset: u64,
+    ) {
+        let index = Arc::new(EvaluationIndex {
+            rows: NullableRowAddrSet::new([0, 1].into_iter().collect(), [1].into_iter().collect()),
+            is_row_address,
+            tracked_nulls: Mutex::new(Vec::new()),
+        });
+        let loader = EvaluationLoader {
+            index: index.clone(),
+            translations: AtomicUsize::new(0),
+        };
+        let leaf = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".into(),
+            index_name: "x_idx".into(),
+            index_type: "Bitmap".into(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Int64(Some(7)))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let expr = ScalarIndexExpr::Not(Box::new(ScalarIndexExpr::And(
+            Box::new(leaf.clone()),
+            Box::new(ScalarIndexExpr::Or(
+                Box::new(leaf.clone()),
+                Box::new(leaf.clone()),
+            )),
+        )));
+        let metrics = NoOpMetricsCollector;
+        let candidates = expr.evaluate_prefilter(&loader, &metrics).await.unwrap();
+        let evaluated = expr.evaluate(&loader, &metrics).await.unwrap();
+        let nullable = expr.evaluate_nullable(&loader, &metrics).await.unwrap();
+        assert!(evaluated.is_exact());
+        assert_eq!(candidates, evaluated.upper);
+        assert_eq!(candidates, nullable.drop_nulls().upper);
+        assert!(!candidates.selected(offset));
+        assert!(!candidates.selected(offset + 1));
+        assert!(candidates.selected(offset + 2));
+        assert_eq!(*index.tracked_nulls.lock().unwrap(), vec![true; 9]);
+        assert_eq!(
+            loader.translations.load(AtomicOrdering::Relaxed),
+            if is_row_address { 9 } else { 0 }
+        );
+
+        index.tracked_nulls.lock().unwrap().clear();
+        let owned = leaf
+            .evaluate_with_options(&loader, &metrics, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            matches!(owned, EvaluatedIndexExpr::Bounds(_)),
+            is_row_address
+        );
+        assert_eq!(*index.tracked_nulls.lock().unwrap(), [false]);
+        let candidates = leaf.evaluate_prefilter(&loader, &metrics).await.unwrap();
+        let evaluated = leaf.evaluate(&loader, &metrics).await.unwrap();
+        assert_eq!(candidates, evaluated.upper);
+        assert!(candidates.selected(offset));
+        assert!(!candidates.selected(offset + 1));
+    }
 
     struct ColInfo {
         data_type: DataType,
