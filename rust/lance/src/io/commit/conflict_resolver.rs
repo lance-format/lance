@@ -124,6 +124,10 @@ struct FootprintBasis {
     /// `AdjustIndexCoverage` carries no index details of its own, so they are
     /// looked up by [`TransactionRebase::load_current_lineage`].
     ngram_segments: HashSet<uuid::Uuid>,
+    /// While [`TransactionRebase::check_txns`] checks a named transaction,
+    /// the footprints of the committed action sets it passed, with their
+    /// versions, to check against the window once.
+    deferred_action_sets: Option<Vec<(Footprint, u64)>>,
     /// The fragments created and removed since `read`, for the coverage
     /// repair. Traced only for a transaction that adds index coverage over
     /// committed fragments, and carried from one attempt to the next, whose

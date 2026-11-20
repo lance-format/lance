@@ -212,10 +212,7 @@ impl<'a> TransactionRebase<'a> {
         let (Operation::CompositeOperation(_), Some((last, last_transaction))) =
             (&self.transaction.operation, committed.last())
         else {
-            for (version, transaction) in committed {
-                self.check_txn(transaction, *version)?;
-            }
-            return Ok(());
+            return self.check_named_txns(committed);
         };
         let Some(footprints) = committed
             .iter()
@@ -227,11 +224,49 @@ impl<'a> TransactionRebase<'a> {
         self.check_window(footprints, last_transaction, *last)
     }
 
+    /// Check this named transaction against `committed` pair by pair, except
+    /// that the committed action sets are gathered and checked against the
+    /// window once. Each check would compare this transaction's footprint
+    /// with the same change from `since` to `latest`, differing only in the
+    /// committed footprint its forbids are held against, so one check over
+    /// all of them reaches the same verdict. It runs last, against the
+    /// transaction as the named checks left it, which is what lands.
+    fn check_named_txns(&mut self, committed: &[(u64, &Transaction)]) -> Result<()> {
+        self.footprint_basis.deferred_action_sets = Some(Vec::new());
+        let checked = committed
+            .iter()
+            .try_for_each(|(version, transaction)| self.check_txn(transaction, *version));
+        let deferred = self
+            .footprint_basis
+            .deferred_action_sets
+            .take()
+            .unwrap_or_default();
+        checked?;
+        let Some(&(_, last_version)) = deferred.last() else {
+            return Ok(());
+        };
+        let Some(last) = committed
+            .iter()
+            .find_map(|(version, transaction)| (*version == last_version).then_some(*transaction))
+        else {
+            return Err(Error::internal(format!(
+                "deferred action set at version {last_version} is not among the committed \
+                 transactions"
+            )));
+        };
+        let footprints = deferred
+            .into_iter()
+            .map(|(footprint, _)| footprint)
+            .collect();
+        self.check_window(footprints, last, last_version)
+    }
+
     /// Whether an action set and `other_transaction`, committed as
     /// `other_version`, conflict, where at least one of them is an action set.
     ///
     /// Reached from both directions: for a pending action set checked pair by
-    /// pair, and for a pending named operation over a committed action set.
+    /// pair, and for a pending named operation over a committed action set,
+    /// whose footprint [`Self::check_txns`] gathers to check once.
     /// The window is the whole change the commits being checked made, with
     /// only `other_transaction`'s footprint: what the other
     /// commits in it changed is held against this one too, which fails safe.
@@ -245,6 +280,10 @@ impl<'a> TransactionRebase<'a> {
         let Some(footprint) = self.committed_footprint(other_transaction, other_version) else {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         };
+        if let Some(deferred) = &mut self.footprint_basis.deferred_action_sets {
+            deferred.push((footprint, other_version));
+            return Ok(());
+        }
         self.check_window(vec![footprint], other_transaction, other_version)
     }
 
