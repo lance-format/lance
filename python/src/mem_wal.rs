@@ -21,12 +21,15 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::{
+    MemTableStats, ShardMemory, WriteBatchBuffer, WriteStatsSnapshot,
+};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids,
     evaluate_sharding_spec,
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
+use lance_arrow::deepcopy::deep_copy_batch;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
@@ -244,12 +247,58 @@ struct ClosedShardWriterState {
     memtable_stats: MemTableStats,
 }
 
-fn collect_record_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
-    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
-        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
-    reader
-        .collect::<Result<_, _>>()
-        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+const DEFAULT_MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
+
+impl PyShardWriter {
+    fn collect_record_batches(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        max_bytes: usize,
+    ) -> PyResult<Vec<RecordBatch>> {
+        let inner = self.inner.clone();
+        let mut buffer = rt()
+            .block_on(Some(py), async move {
+                let guard = inner.lock().await;
+                let writer = guard.as_ref().ok_or_else(|| {
+                    lance_core::Error::invalid_input("ShardWriter is already closed")
+                })?;
+                WriteBatchBuffer::new(writer.config(), max_bytes)
+            })?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Iterating Python readers directly preserves their exceptions, including
+        // KeyboardInterrupt; exporting through the C stream turns them into strings.
+        let mut reader: Box<dyn Iterator<Item = PyResult<RecordBatch>> + '_> = if data
+            .is_instance(&py.import("pyarrow")?.getattr("RecordBatchReader")?)?
+        {
+            Box::new(
+                data.try_iter()?
+                    .map(|batch| RecordBatch::from_pyarrow_bound(&batch?)),
+            )
+        } else {
+            let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+                .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+            Box::new(reader.map(|batch| {
+                batch.map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+            }))
+        };
+        loop {
+            py.check_signals()?;
+            let Some(batch) = reader.next() else {
+                break;
+            };
+            // FFI buffer lengths cannot reveal opaque owners such as NumPy
+            // allocations. Copy every buffer, including nulls and dictionary
+            // children, so buffered batches cannot retain those foreign owners.
+            let batch = deep_copy_batch(&batch?)
+                .map_err(|e| PyIOError::new_err(format!("Failed to copy batch: {e}")))?;
+            buffer
+                .push(batch)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+        py.check_signals()?;
+        Ok(buffer.into_batches())
+    }
 }
 
 #[pymethods]
@@ -258,8 +307,9 @@ impl PyShardWriter {
     ///
     /// Accepts any PyArrow-compatible data source (RecordBatch, Table,
     /// or an Arrow stream reader).
-    pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = collect_record_batches(data)?;
+    #[pyo3(signature = (data, *, max_bytes=DEFAULT_MAX_WRITE_BYTES))]
+    pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>, max_bytes: usize) -> PyResult<()> {
+        let batches = self.collect_record_batches(py, data, max_bytes)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -283,8 +333,14 @@ impl PyShardWriter {
     /// Accepts any PyArrow-compatible data source carrying the shard's primary
     /// key column(s). Rust core validates that primary keys exist and builds the
     /// tombstone rows.
-    pub fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = collect_record_batches(keys)?;
+    #[pyo3(signature = (keys, *, max_bytes=DEFAULT_MAX_WRITE_BYTES))]
+    pub fn delete(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        max_bytes: usize,
+    ) -> PyResult<()> {
+        let batches = self.collect_record_batches(py, keys, max_bytes)?;
 
         if batches.is_empty() {
             return Ok(());

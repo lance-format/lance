@@ -148,6 +148,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         Ok(ObjectStore {
             inner: Arc::new(inner),
             external_blob_inner: None,
+            direct_local_io: true,
             _external_blob_origin: None,
             local_dir_operations,
             local_fsync,
@@ -265,6 +266,7 @@ mod tests {
         ObjectStore {
             inner: Arc::new(inner),
             external_blob_inner: None,
+            direct_local_io: true,
             _external_blob_origin: None,
             local_dir_operations: Some(local_dir_operations),
             local_fsync: false,

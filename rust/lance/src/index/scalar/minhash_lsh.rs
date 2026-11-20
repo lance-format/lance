@@ -3,15 +3,18 @@
 
 use std::sync::Arc;
 
+use datafusion::execution::SendableRecordBatchStream;
 use futures::future::try_join_all;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::index_files_to_table;
+use lance_index::progress::noop_progress;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::minhash_lsh::{MinHashLshIndex, merge_minhash_indices};
+use lance_index::scalar::minhash_lsh::MinHashLshIndex;
+use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, index_files_to_table};
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 use crate::index::append::build_per_segment_filters;
+use crate::index::frag_reuse::{OpenPurpose, StagedRemappingPlans};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of MinHash LSH segments into a single segment.
@@ -22,7 +25,7 @@ use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
-    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    staged: Option<&StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -56,45 +59,23 @@ pub(in crate::index) async fn merge_segments(
         )));
     }
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    // Every segment here stores row addresses so the filters are built
-    // in the address domain.
+    // Current segments store addresses. A legacy segment can only reach here
+    // without stable row IDs, where its IDs are also physical addresses.
     let (fragment_bitmap, filters) =
         build_per_segment_filters(dataset, &segment_refs, staged, true).await?;
 
-    let scalar_indices = try_join_all(segments.iter().map(|segment| {
-        let field_path = &field_path;
-        async move {
-            let scalar_index = super::open_scalar_index_with_plan(
-                dataset,
-                field_path,
-                segment,
-                staged.and_then(|plans| plans.get(&segment.uuid)),
-                crate::index::frag_reuse::OpenPurpose::Maintenance,
-                &NoOpMetricsCollector,
-            )
-            .await?;
-            Ok::<_, Error>((segment.uuid, scalar_index))
-        }
-    }))
-    .await?;
-    let mut sources = Vec::with_capacity(scalar_indices.len());
-    for ((segment_uuid, scalar_index), filter) in scalar_indices.iter().zip(&filters) {
-        let minhash_index = scalar_index
-            .as_any()
-            .downcast_ref::<MinHashLshIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected MinHash LSH segment {}, got {:?}",
-                    segment_uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        sources.push((minhash_index, filter.as_ref()));
-    }
-
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = merge_minhash_indices(&sources, &new_store).await?;
+    let created_index = open_and_merge_segments(
+        dataset,
+        &field_path,
+        &segment_refs,
+        None,
+        &new_store,
+        &filters,
+        staged,
+    )
+    .await?;
 
     Ok(IndexMetadata {
         uuid: new_uuid,
@@ -111,6 +92,46 @@ pub(in crate::index) async fn merge_segments(
     })
 }
 
+pub(in crate::index) async fn open_and_merge_segments(
+    dataset: &Dataset,
+    field_path: &str,
+    segments: &[&IndexMetadata],
+    new_data: Option<SendableRecordBatchStream>,
+    new_store: &LanceIndexStore,
+    filters: &[Option<OldIndexDataFilter>],
+    staged: Option<&StagedRemappingPlans>,
+) -> Result<CreatedIndex> {
+    let scalar_indices = try_join_all(segments.iter().map(|segment| async move {
+        let scalar_index = super::open_scalar_index_with_plan(
+            dataset,
+            field_path,
+            segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
+        Ok::<_, Error>((segment.uuid, scalar_index))
+    }))
+    .await?;
+    let mut sources = Vec::with_capacity(scalar_indices.len());
+    for ((segment_uuid, scalar_index), filter) in scalar_indices.iter().zip(filters) {
+        let minhash_index = scalar_index
+            .as_any()
+            .downcast_ref::<MinHashLshIndex>()
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "expected MinHash LSH segment {}, got {:?}",
+                    segment_uuid,
+                    scalar_index.index_type()
+                ))
+            })?;
+        sources.push((minhash_index, filter.as_ref()));
+    }
+
+    MinHashLshIndex::merge_segments(&sources, new_data, new_store, noop_progress()).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -121,22 +142,31 @@ mod tests {
         ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use futures::future::try_join_all;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::index_files_to_table;
     use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_index::scalar::minhash_lsh::{
-        BANDS_FILENAME, MINHASH_LSH_INDEX_VERSION, MinHashQuery, SIGNATURES_FILENAME,
+        BANDS_FILENAME, MINHASH_LSH_INDEX_VERSION, MinHashLshIndex, MinHashQuery,
+        SIGNATURES_FILENAME,
     };
-    use lance_index::scalar::{BuiltinIndexType, IndexStore, ScalarIndexParams};
+    use lance_index::scalar::{
+        BuiltinIndexType, IndexStore, ScalarIndexParams, index_files_to_table,
+    };
+    use roaring::RoaringBitmap;
+    use rstest::rstest;
     use uuid::Uuid;
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::index::LanceIndexStoreExt;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
-    use crate::dataset::{WriteMode, WriteParams};
-    use crate::index::{CreateIndexBuilder, DatasetIndexExt};
+    use crate::dataset::scanner::Scanner;
+    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::append::fragment_reuse_affects_segments;
+    use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
+    use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
     use crate::{Dataset, Error};
 
     const INDEX_NAME: &str = "text_minhash";
@@ -200,9 +230,36 @@ mod tests {
         .unwrap()
     }
 
+    async fn create_index_segments(dataset: &mut Dataset, fragments_per_segment: usize) {
+        let fragments: Vec<_> = dataset.fragment_bitmap.iter().collect();
+        let groups = fragments.chunks(fragments_per_segment);
+        let mut staged = Vec::with_capacity(groups.len());
+        for group in groups {
+            staged.push(
+                CreateIndexBuilder::new(dataset, &["text"], IndexType::MinHashLsh, &params())
+                    .name(INDEX_NAME.into())
+                    .fragments(group.to_vec())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "text", staged)
+            .await
+            .unwrap();
+    }
+
     async fn search_ids(dataset: &Dataset, id: i32, limit: usize) -> Vec<i32> {
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(row_text(id), "text"))
+        search_text_ids(&mut dataset.scan(), row_text(id), limit).await
+    }
+
+    async fn search_text_ids(
+        scan: &mut Scanner,
+        text: impl Into<String>,
+        limit: usize,
+    ) -> Vec<i32> {
+        scan.minhash_search(MinHashQuery::new(text, "text"))
             .unwrap()
             .limit(Some(limit as i64), None)
             .unwrap()
@@ -351,9 +408,11 @@ mod tests {
         assert_eq!(search_ids(&dataset, 6, 1).await, vec![6]);
         assert_eq!(search_ids(&dataset, 1, 1).await, vec![1]);
 
-        // default optimize: the newest segment absorbs the next fragment
+        // Default optimize merges the newest segment with the next fragment
+        // and drops the deleted row from the rewritten signatures.
         let _ = dataset;
         let mut dataset = append(uri, 8..12).await;
+        dataset.delete("id = 5").await.unwrap();
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
@@ -361,16 +420,21 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
         let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(segments.len(), 2);
-        assert!(
-            segments
-                .iter()
-                .any(|segment| { segment.fragment_bitmap.as_ref().unwrap().len() == 2 })
-        );
+        let merged = segments
+            .iter()
+            .find(|segment| segment.fragment_bitmap.as_ref().unwrap().len() == 2)
+            .unwrap();
+        let index = dataset
+            .open_scalar_index("text", &merged.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let index = index.as_any().downcast_ref::<MinHashLshIndex>().unwrap();
+        assert_eq!(index.num_docs(), 7);
         for id in [1, 6, 10] {
             assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);
         }
 
-        // merging every segment rebuilds one segment from the derived params
+        // Merging every segment produces one segment from the stored signatures.
         let mut dataset = dataset;
         dataset
             .optimize_indices(&OptimizeOptions::merge(2))
@@ -388,11 +452,168 @@ mod tests {
         for id in [1, 6, 10] {
             assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);
         }
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 12);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 11);
+    }
+
+    #[rstest]
+    #[case::one_build(8, 8, None, 1, 1)]
+    #[case::parallel_builds(8, 4, None, 2, 1)]
+    #[case::bounded_segments(8, 4, Some(8), 2, 2)]
+    #[case::merge_only(0, 4, None, 0, 1)]
+    #[tokio::test]
+    async fn test_bounded_optimize_reuses_signatures(
+        #[case] added: i32,
+        #[case] task_limit: u64,
+        #[case] segment_limit: Option<u64>,
+        #[case] task_count: usize,
+        #[case] segment_count: usize,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = write(dir.as_str(), 0..8, 4).await;
+        create_index_segments(&mut dataset, 1).await;
+        dataset.delete("id = 1").await.unwrap();
+        let old_files: Vec<_> = dataset
+            .fragments()
+            .iter()
+            .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+            .collect();
+
+        if added > 0 {
+            dataset = append(dir.as_str(), 8..8 + added).await;
+        }
+
+        let options = OptimizeOptions::merge(2)
+            .max_rows_per_task(Some(task_limit))
+            .max_rows_per_segment(segment_limit);
+        dataset.object_store.io_stats_incremental();
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), task_count);
+        assert_eq!(plan.merges.len(), segment_count);
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .map(|task| task.old_segments.len())
+                .sum::<usize>(),
+            if task_count == 1 { 2 } else { 0 }
+        );
+
+        let built: Vec<_> = try_join_all(plan.tasks.iter().map(|task| task.execute(&dataset)))
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let merged = try_join_all(
+            plan.merges
+                .iter()
+                .map(|merge| merge.execute(&dataset, &built)),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
+        commit_optimize_indices(&mut dataset, merged, &options)
+            .await
+            .unwrap();
+        let rescan = dataset
+            .object_store
+            .io_stats_incremental()
+            .requests
+            .into_iter()
+            .find(|request| {
+                old_files
+                    .iter()
+                    .any(|file| request.path.as_ref().ends_with(file))
+            });
+        assert!(rescan.is_none(), "old data was rescanned: {rescan:?}");
+
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(segments.len(), segment_count);
+        assert_eq!(
+            segments
+                .iter()
+                .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
+                .collect::<RoaringBitmap>(),
+            *dataset.fragment_bitmap
+        );
+        for id in (0..8 + added).filter(|&id| id != 1) {
+            assert_eq!(
+                search_text_ids(dataset.scan().fast_search(), row_text(id), 1).await,
+                vec![id]
+            );
+        }
+        let hits = search_text_ids(dataset.scan().fast_search(), row_text(1), 16).await;
+        assert!(!hits.contains(&1), "{hits:?}");
     }
 
     #[tokio::test]
-    async fn test_deferred_compaction_survives_merge_and_optimize() {
+    async fn test_bounded_optimize_filters_stable_row_id_updates() {
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch(0..8))], schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::MinHashLsh,
+                Some(INDEX_NAME.into()),
+                &params(),
+                true,
+            )
+            .await
+            .unwrap();
+        let replacement = "fresh asparagus jicama kohlrabi arugula";
+        let mut dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 1")
+            .unwrap()
+            .set("text", &format!("'{replacement}'"))
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch(8..9))], schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let options = OptimizeOptions::merge(1).max_rows_per_task(Some(1));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.merges[0].old_segments.len(), 1);
+        dataset.optimize_indices(&options).await.unwrap();
+
+        assert_eq!(
+            search_text_ids(dataset.scan().fast_search(), replacement, 1).await,
+            vec![1]
+        );
+        let hits = search_text_ids(dataset.scan().fast_search(), row_text(1), 9).await;
+        assert!(!hits.contains(&1), "found a stale signature: {hits:?}");
+        assert_eq!(
+            search_text_ids(dataset.scan().fast_search(), row_text(8), 1).await,
+            vec![8]
+        );
+    }
+
+    #[rstest]
+    #[case::unbounded(false)]
+    #[case::bounded(true)]
+    #[tokio::test]
+    async fn test_deferred_compaction_survives_merge_and_optimize(#[case] bounded: bool) {
         // A deferred compaction leaves the stored row ids in the old fragments;
         // merges and updates must remap them the way queries do, otherwise the
         // rebuilt segment claims the compacted fragment without its rows.
@@ -421,36 +642,163 @@ mod tests {
         .await
         .unwrap();
 
-        // An explicit merge of the deferred segment
         let mut dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
         let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-        let merged = dataset
-            .merge_existing_index_segments(segments)
-            .await
-            .unwrap();
-        dataset
-            .commit_existing_index_segments(INDEX_NAME, "text", vec![merged])
-            .await
-            .unwrap();
-        for id in 0..6 {
-            assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);
+        let old_uuid = segments[0].uuid;
+        if !bounded {
+            // An explicit merge of the deferred segment
+            let merged = dataset
+                .merge_existing_index_segments(segments)
+                .await
+                .unwrap();
+            dataset
+                .commit_existing_index_segments(INDEX_NAME, "text", vec![merged])
+                .await
+                .unwrap();
+            for id in 0..6 {
+                assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);
+            }
         }
 
-        // An append followed by the default optimize updates the segment
-        let mut dataset = append(uri, 6..7).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
+        let append_end = if bounded { 14 } else { 7 };
+        let mut dataset = append(uri, 6..append_end).await;
+        let options = if bounded {
+            assert!(
+                dataset
+                    .open_frag_reuse_index(&NoOpMetricsCollector)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let options = OptimizeOptions::default()
+                .max_rows_per_task(Some(4))
+                .max_rows_per_segment(Some(4));
+            let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+            assert_eq!(plan.tasks.len(), 2);
+            assert!(
+                plan.tasks
+                    .iter()
+                    .all(|task| { task.fragments.len() == 1 && task.old_segments.is_empty() })
+            );
+            assert_eq!(plan.merges.len(), 2);
+            assert!(
+                plan.merges
+                    .iter()
+                    .all(|merge| { merge.old_segments.is_empty() && merge.replaces.is_empty() })
+            );
+            options
+        } else {
+            // An append followed by the default optimize updates the segment
+            OptimizeOptions::default()
+        };
+        dataset.optimize_indices(&options).await.unwrap();
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(segments.len(), if bounded { 3 } else { 1 });
+        if bounded {
+            assert!(segments.iter().any(|segment| segment.uuid == old_uuid));
+        }
+        assert_eq!(
+            segments
+                .iter()
+                .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
+                .collect::<RoaringBitmap>(),
+            *dataset.fragment_bitmap
+        );
+        for id in 0..append_end {
+            let mut scan = dataset.scan();
+            if bounded {
+                scan.fast_search();
+            }
+            assert_eq!(search_text_ids(&mut scan, row_text(id), 1).await, vec![id]);
+        }
+    }
+
+    #[rstest]
+    #[case::deferred_compaction(false)]
+    #[case::shallow_clone(true)]
+    #[tokio::test]
+    async fn test_single_task_optimize_reuses_signatures_after_relocation(
+        #[case] shallow_clone: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = write(&format!("{}/source", dir.as_str()), 0..8, 2).await;
+        create_index_segments(&mut dataset, 2).await;
+        dataset.delete("id = 1").await.unwrap();
+
+        if shallow_clone {
+            dataset = dataset
+                .shallow_clone(
+                    &format!("{}/clone", dir.as_str()),
+                    dataset.version_id(),
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 4,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
+        }
+
+        let sources = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(sources.len(), 2);
+        if shallow_clone {
+            assert!(sources.iter().all(|source| source.base_id.is_some()));
+        } else {
+            let remap = dataset
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(fragment_reuse_affects_segments(&remap, sources.iter()));
+        }
+
+        let data_files: Vec<_> = dataset
+            .fragments()
+            .iter()
+            .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+            .collect();
+        // For a shallow clone the data files are read through the base store.
+        let data_store = dataset
+            .object_store_for_data_file(&dataset.fragments()[0].files[0])
+            .await
+            .unwrap();
+        data_store.io_stats_incremental();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+        let requests = data_store.io_stats_incremental().requests;
+        let rescan = requests.iter().find(|request| {
+            data_files
+                .iter()
+                .any(|file| request.path.as_ref().ends_with(file))
+        });
+        assert!(rescan.is_none(), "old text was rescanned: {rescan:?}");
+
         let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(segments.len(), 1);
+        assert!(segments[0].base_id.is_none());
         assert_eq!(
-            segments[0].fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            segments[0].fragment_bitmap.as_ref(),
+            Some(dataset.fragment_bitmap.as_ref())
         );
-        for id in 0..7 {
-            assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);
+        for id in (0..8).filter(|&id| id != 1) {
+            assert_eq!(
+                search_text_ids(dataset.scan().fast_search(), row_text(id), 1).await,
+                vec![id]
+            );
         }
+        let hits = search_text_ids(dataset.scan().fast_search(), row_text(1), 8).await;
+        assert!(!hits.contains(&1), "{hits:?}");
     }
 
     #[tokio::test]
@@ -613,5 +961,34 @@ mod tests {
 
         // Either way the index still answers correctly.
         assert_eq!(search_ids(&dataset, 2, 6).await, before);
+
+        if enable_stable_row_ids {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch(6..8))], schema()),
+                    Some(WriteParams {
+                        max_rows_per_file: 1,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let options = OptimizeOptions::merge(1).max_rows_per_task(Some(1));
+            let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+            assert_eq!(plan.tasks.len(), 1);
+            assert_eq!(plan.tasks[0].fragments.len(), 2);
+            assert_eq!(plan.tasks[0].old_segments[0].uuid, legacy_uuid);
+
+            dataset.optimize_indices(&options).await.unwrap();
+            let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].index_version, MINHASH_LSH_INDEX_VERSION as i32);
+            for id in 0..8 {
+                assert_eq!(
+                    search_text_ids(dataset.scan().fast_search(), row_text(id), 1).await,
+                    vec![id]
+                );
+            }
+        }
     }
 }

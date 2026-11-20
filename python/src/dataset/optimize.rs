@@ -64,6 +64,9 @@ fn parse_compaction_options(
             "batch_size" => {
                 opts.batch_size = value.extract()?;
             }
+            "data_cache_bytes" => {
+                opts.data_cache_bytes = value.extract()?;
+            }
             "io_buffer_size" => {
                 opts.io_buffer_size = value.extract()?;
             }

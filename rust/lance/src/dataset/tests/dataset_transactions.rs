@@ -812,8 +812,7 @@ fn ranged_read_bytes(stats: &IoStats) -> u64 {
 /// Manifest body bytes of the dataset handle's current version.
 async fn manifest_size(ds: &Dataset) -> u64 {
     ds.object_store
-        .inner
-        .head(&ds.manifest_location().path)
+        .stat(&ds.manifest_location().path)
         .await
         .unwrap()
         .size
@@ -3237,13 +3236,14 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: fragment_id,
+                fragment: Ref::Committed(fragment_id),
                 deletion_file: DeletionFile {
                     read_version,
                     id: 1,
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(2),
                     base_id: None,
+                    path: None,
                     inline: None,
                 },
                 data_change: true,
@@ -3334,13 +3334,14 @@ mod composite {
             composite_txn(
                 read_version,
                 vec![Action::SetDeletionFile(SetDeletionFile {
-                    fragment: fragment_id,
+                    fragment: Ref::Committed(fragment_id),
                     deletion_file: DeletionFile {
                         read_version,
                         id,
                         file_type: DeletionFileType::Array,
                         num_deleted_rows: Some(1),
                         base_id: None,
+                        path: None,
                         inline: None,
                     },
                     data_change: true,
@@ -5583,13 +5584,14 @@ mod composite {
         let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
             vec![
                 Action::SetDeletionFile(SetDeletionFile {
-                    fragment,
+                    fragment: Ref::Committed(fragment),
                     deletion_file: DeletionFile {
                         read_version,
                         id: 1,
                         file_type: DeletionFileType::Array,
                         num_deleted_rows: Some(1),
                         base_id: None,
+                        path: None,
                         inline: None,
                     },
                     data_change: true,
