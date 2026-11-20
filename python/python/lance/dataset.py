@@ -3735,6 +3735,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_sample_rate: Optional[int] = None,
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
+        kmeans_algorithm: Optional[str] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
         require_commit: bool = True,
@@ -3964,6 +3965,8 @@ class LanceDataset(pa.dataset.Dataset):
                 kwargs["streaming_coreset_rate"] = streaming_coreset_rate
             if streaming_refine_passes is not None:
                 kwargs["streaming_refine_passes"] = streaming_refine_passes
+            if kmeans_algorithm is not None:
+                kwargs["kmeans_algorithm"] = kmeans_algorithm
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -4146,6 +4149,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_sample_rate: Optional[int] = None,
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
+        kmeans_algorithm: Optional[str] = None,
         skip_transpose: bool = False,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
@@ -4265,6 +4269,11 @@ class LanceDataset(pa.dataset.Dataset):
             Number of extra streaming Lloyd refinement passes to run after streaming
             coreset training. Each pass loads at most
             ``num_partitions * streaming_sample_rate`` raw vectors at a time.
+        kmeans_algorithm : str, optional
+            The clustering each node of hierarchical IVF k-means runs when more
+            than 256 partitions are trained: ``"emeans"`` or ``"lloyd"``. Defaults
+            to e-means for ``l2`` and ``cosine`` and Lloyd for ``dot``; e-means
+            does not support ``dot``. Streaming training always runs Lloyd.
         kwargs :
             Parameters passed to the index building process.
 
@@ -4389,6 +4398,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_sample_rate=streaming_sample_rate,
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
+            kmeans_algorithm=kmeans_algorithm,
             skip_transpose=skip_transpose,
             require_commit=True,
             **kwargs,
@@ -4426,6 +4436,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_sample_rate: Optional[int] = None,
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
+        kmeans_algorithm: Optional[str] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
         **kwargs,
@@ -4536,6 +4547,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_sample_rate=streaming_sample_rate,
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
+            kmeans_algorithm=kmeans_algorithm,
             skip_transpose=skip_transpose,
             rabitq_model=rabitq_model,
             require_commit=False,

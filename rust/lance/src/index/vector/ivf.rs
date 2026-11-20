@@ -79,7 +79,8 @@ use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::kmeans::{KMeans, KMeansParams};
+use lance_index::vector::kmeans::emeans::EMeansParams;
+use lance_index::vector::kmeans::{HierarchicalNodeAlgorithm, KMeans, KMeansParams};
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
 };
@@ -3430,8 +3431,15 @@ where
             let _ = progress_tx.send(total);
         })
     };
+    // e-means supports only L2, which cosine training reaches by normalizing.
+    let node_algorithm = match (&params.kmeans_algorithm, metric_type) {
+        (Some(algorithm), _) => algorithm.clone(),
+        (None, MetricType::L2) => HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()),
+        (None, _) => HierarchicalNodeAlgorithm::Lloyd,
+    };
     let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
         .with_balance_factor(1.0)
+        .with_hierarchical_node_algorithm(node_algorithm)
         .with_on_progress(on_progress);
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         data,

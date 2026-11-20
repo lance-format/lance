@@ -20,6 +20,8 @@ use futures::{StreamExt, TryFutureExt};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
+use lance_index::vector::kmeans::HierarchicalNodeAlgorithm;
+use lance_index::vector::kmeans::emeans::EMeansParams;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -4583,6 +4585,18 @@ fn prepare_vector_index_params(
         }
         if let Some(streaming_refine_passes) = kwargs.get_item("streaming_refine_passes")? {
             ivf_params.streaming_refine_passes = streaming_refine_passes.extract()?;
+        }
+        if let Some(kmeans_algorithm) = kwargs.get_item("kmeans_algorithm")? {
+            let kmeans_algorithm: String = kmeans_algorithm.extract()?;
+            ivf_params.kmeans_algorithm = Some(match kmeans_algorithm.to_lowercase().as_str() {
+                "emeans" => HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()),
+                "lloyd" => HierarchicalNodeAlgorithm::Lloyd,
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "kmeans_algorithm must be 'emeans' or 'lloyd', got '{kmeans_algorithm}'"
+                    )));
+                }
+            });
         }
 
         // Parse IVF params

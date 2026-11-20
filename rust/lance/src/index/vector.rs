@@ -2462,6 +2462,7 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         streaming_sample_rate: None,
         streaming_coreset_rate: None,
         streaming_refine_passes: 0,
+        kmeans_algorithm: None,
         precomputed_partitions_file: None,
         precomputed_shuffle_buffers: None,
         shuffle_partition_batches: 1024 * 10, // Default
