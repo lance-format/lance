@@ -364,7 +364,7 @@ impl MergeInsertJob {
                 .lance_file_format(),
             self.dataset.clone(),
             index_mapper,
-            projection,
+            projection.clone(),
             add_row_addr,
         )?;
 
@@ -383,12 +383,6 @@ impl MergeInsertJob {
             columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
         }
         target = Arc::new(project(target, &Schema::new(columns))?);
-
-        let column_names = schema
-            .field_names()
-            .into_iter()
-            .filter(|name| name.as_str() != ROW_ID && name.as_str() != ROW_ADDR)
-            .collect::<Vec<_>>();
 
         // 5a - Scan unindexed fragments and overlay-stale rows using current values.
         //      A row can be reached by the composite index probe only if it
@@ -410,9 +404,10 @@ impl MergeInsertJob {
                 }
                 builder.with_physical_row_addr_prefilter(fallback_rows);
             }
+            // Must match the take's nested projection: `UnionExec` requires identical types.
             let fallback_data = builder
                 .with_row_id()
-                .project(&column_names)?
+                .project_with_schema(&projection.to_schema())?
                 .create_plan()
                 .await?;
             let unioned = UnionExec::try_new(vec![target, fallback_data])?;
