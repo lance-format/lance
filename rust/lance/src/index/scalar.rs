@@ -962,6 +962,47 @@ pub(crate) async fn open_scalar_index_with_plan(
             Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
             None => (None, None),
         };
+    if !index.local_fragment_aliases.is_empty() {
+        if index.index_details.is_none() {
+            return Err(Error::not_supported(format!(
+                "Index segment {} stores provisional fragment ids and has no index details",
+                index.uuid
+            )));
+        }
+        if !plugin.supports_batch_row_id_remapping() {
+            return Err(Error::not_supported(format!(
+                "Index segment {} stores provisional fragment ids, which {} indices do not support",
+                index.uuid,
+                plugin.name()
+            )));
+        }
+        if dataset.manifest.uses_stable_row_ids() && !index.results_are_row_addrs() {
+            return Err(Error::not_supported(format!(
+                "Index segment {} stores logical row ids, and provisional fragment ids cannot retarget those",
+                index.uuid
+            )));
+        }
+    }
+    let (frag_reuse_index, batch_remapping) = match batch_remapping {
+        Some(batch_remapping) => (
+            None,
+            Some(super::local_fragment_addresses::compose_batch_remapper(
+                index,
+                batch_remapping,
+            )),
+        ),
+        None => (
+            super::local_fragment_addresses::LocalFragmentRemapper::compose(
+                index,
+                frag_reuse_index,
+            ),
+            None,
+        ),
+    };
+    let index_cache = match super::local_fragment_addresses::alias_cache_namespace(index) {
+        Some(namespace) => index_cache.with_key_prefix(&namespace),
+        None => index_cache,
+    };
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -1058,6 +1099,10 @@ pub(crate) async fn cached_scalar_index_container(
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(uuid, cache_id);
+    let index_cache = match super::local_fragment_addresses::alias_cache_namespace(index) {
+        Some(namespace) => index_cache.with_key_prefix(&namespace),
+        None => index_cache,
+    };
     index_cache
         .get_unsized_with_key(&ScalarIndexCacheKey)
         .await
@@ -1388,6 +1433,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 

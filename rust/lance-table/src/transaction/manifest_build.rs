@@ -13,9 +13,10 @@
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
     FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
-    ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
-    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
+    apply_index_object_metadata_flag, apply_local_fragment_alias_flag,
+    apply_row_addr_index_feature_flag, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
+    validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -2373,7 +2374,11 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
             manifest.writer_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
         }
+        for index in indices {
+            index.validate_local_fragment_aliases()?;
+        }
         apply_row_addr_index_feature_flag(&mut manifest, indices);
+        apply_local_fragment_alias_flag(&mut manifest, indices);
 
         manifest.set_timestamp(config.timestamp_nanos);
 
@@ -6736,6 +6741,7 @@ mod tests {
                 files: None,
                 clustering_id: None,
                 metadata: Default::default(),
+                local_fragment_aliases: Default::default(),
             }
         }
 

@@ -325,6 +325,7 @@ pub fn apply_feature_flags(
     let object_metadata = manifest.writer_feature_flags & FLAG_OBJECT_METADATA;
     let deletion_file_paths_writer = manifest.writer_feature_flags & FLAG_DELETION_FILE_PATHS;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
+    let local_fragment_aliases = manifest.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES;
     let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
     if non_reusable_field_ids {
         manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
@@ -435,11 +436,30 @@ pub fn apply_feature_flags(
 
     manifest.reader_feature_flags |= covering_flags;
     manifest.writer_feature_flags |= covering_flags;
+    manifest.reader_feature_flags |= local_fragment_aliases;
+    manifest.writer_feature_flags |= local_fragment_aliases;
     manifest.writer_feature_flags |= row_addr_indices;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 
     Ok(())
+}
+
+/// Set or clear the local-fragment-alias bit from the index list.
+///
+/// Call this after [`apply_feature_flags`]. The reset keeps a bit already
+/// present, so a later write without the index list does not drop it. This
+/// call clears the bit when the last aliased segment is gone.
+pub fn apply_local_fragment_alias_flag(manifest: &mut Manifest, indices: &[IndexMetadata]) {
+    manifest.reader_feature_flags &= !FLAG_LOCAL_FRAGMENT_ALIASES;
+    manifest.writer_feature_flags &= !FLAG_LOCAL_FRAGMENT_ALIASES;
+    if indices
+        .iter()
+        .any(|index| !index.local_fragment_aliases.is_empty())
+    {
+        manifest.reader_feature_flags |= FLAG_LOCAL_FRAGMENT_ALIASES;
+        manifest.writer_feature_flags |= FLAG_LOCAL_FRAGMENT_ALIASES;
+    }
 }
 
 /// Derive the writer fence from the final index list, including unsupported
@@ -605,7 +625,7 @@ fn supported_flags_when(
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
-    mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, false);
+    mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, true);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
     mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
@@ -1031,8 +1051,8 @@ mod tests {
     #[test]
     fn test_local_fragment_aliases_are_paired_and_not_sticky() {
         assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
-        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
-        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
         assert_eq!(STICKY_PAIRED_FLAGS & FLAG_LOCAL_FRAGMENT_ALIASES, 0);
 
         for (reader, writer) in [
@@ -1054,12 +1074,19 @@ mod tests {
         manifest.reader_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
         manifest.writer_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
         validate_paired_feature_flags(&manifest).unwrap();
-        let error = ensure_can_read_manifest(&manifest).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
-        let error = ensure_can_write_manifest(&manifest).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
 
         apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        apply_local_fragment_alias_flag(&mut manifest, &[]);
         assert_eq!(
             manifest.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
             0
@@ -1674,8 +1701,8 @@ mod tests {
     #[test]
     fn test_deletion_file_paths_flag() {
         assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
-        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
-        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
         assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
         assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
         assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));

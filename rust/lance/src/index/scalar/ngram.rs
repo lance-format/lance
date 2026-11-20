@@ -161,6 +161,7 @@ pub(in crate::index) async fn merge_segments(
         files: Some(index_files_to_table(created_index.files)),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 
@@ -209,12 +210,21 @@ pub(in crate::index) async fn open_and_merge_segments(
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let frag_reuse_index = frag_reuse_index
         .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-    NGramIndex::merge_segments_with_remapper(
+    let remappers = segments
+        .iter()
+        .map(|segment| {
+            crate::index::local_fragment_addresses::LocalFragmentRemapper::compose(
+                segment,
+                frag_reuse_index.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    NGramIndex::merge_segments_with_remappers(
         &segment_stores,
         new_data,
         new_store,
         old_data_filters,
-        frag_reuse_index,
+        &remappers,
         results_are_row_addresses,
     )
     .await

@@ -1202,6 +1202,7 @@ async fn train_model_segment(
         files: Some(built.files),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 
@@ -1592,6 +1593,7 @@ async fn merge_vector_segments(
         files: Some(files),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 

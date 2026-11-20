@@ -2468,6 +2468,7 @@ async fn test_create_index_commits_independent_covering_fields(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     let transaction = Transaction::new(
@@ -2542,6 +2543,7 @@ async fn test_shallow_clone_preserves_the_covering_fence() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     dataset
         .apply_commit(
@@ -2722,6 +2724,7 @@ async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let uuid = index.uuid;
 
@@ -2998,6 +3001,7 @@ mod composite {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         dataset
             .apply_commit(

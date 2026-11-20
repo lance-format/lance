@@ -6642,6 +6642,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -6684,6 +6685,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -6746,6 +6748,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         // We need to commit this new index to the dataset so it can be found

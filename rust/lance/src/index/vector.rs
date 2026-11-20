@@ -2430,6 +2430,7 @@ pub async fn initialize_vector_index(
         files: Some(summary.files),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     let transaction = Transaction::new(

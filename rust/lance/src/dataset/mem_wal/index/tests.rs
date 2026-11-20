@@ -441,6 +441,7 @@ fn fts_index_metadata_with_details(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     }
 }
 

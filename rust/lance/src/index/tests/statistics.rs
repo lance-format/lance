@@ -359,6 +359,7 @@ async fn test_describe_indices_tolerates_missing_index_details() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -404,6 +405,7 @@ async fn test_describe_indices_fragment_coverage_unions_segments() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     // Query-time fragment reuse can make two segment masks overlap. Union
@@ -461,6 +463,7 @@ async fn test_describe_indices_derives_type_from_url_without_plugin() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -502,6 +505,7 @@ async fn test_describe_indices_unknown_type_empty_bitmap_has_unknown_coverage() 
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     let description = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -535,6 +539,7 @@ async fn test_describe_indices_empty_vector_bitmap_has_known_zero_coverage() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let expected_bitmap_size =
         u64::try_from(metadata.fragment_bitmap_serialized_size().unwrap()).unwrap();

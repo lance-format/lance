@@ -801,6 +801,7 @@ mod test {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let prefilter = DatasetPreFilter::new(Arc::new(dataset), &[index], None);
 

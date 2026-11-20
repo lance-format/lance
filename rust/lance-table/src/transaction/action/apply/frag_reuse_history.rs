@@ -219,6 +219,7 @@ impl ApplyState<'_> {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         if is_tagged(&entry) && !rebound_fields.is_empty() {
             self.withdraw_along_lineage(&entry, ledger, rebound_fields);
