@@ -134,7 +134,7 @@ pub(crate) use take::row_offsets_to_row_addresses;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
-use self::refs::Refs;
+use self::refs::{HistoryLock, Refs};
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
@@ -726,9 +726,20 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let reservation = self.reserve_branch(branch, version).await?;
-        // The reservation was just written, so skip complete_branch's ref reread.
-        self.clone_reserved_branch(reservation, store_params).await
+        refs::check_new_branch(branch)?;
+        let guard = HistoryLock::acquire(
+            self.object_store.clone(),
+            &self.branch_location(),
+            "create branch",
+        )
+        .await?;
+        let result = async {
+            let reservation = self.reserve_branch_unlocked(branch, version.into()).await?;
+            // Keep history exclusion across both phases, without acquiring it twice.
+            self.clone_reserved_branch(reservation, store_params).await
+        }
+        .await;
+        guard.finish(result).await
     }
 
     /// Reserve a branch name at an exact source version without creating the branch dataset.
@@ -763,8 +774,23 @@ impl Dataset {
         version: impl Into<refs::Ref>,
     ) -> Result<BranchReservation> {
         refs::check_new_branch(branch)?;
+        let guard = HistoryLock::acquire(
+            self.object_store.clone(),
+            &self.branch_location(),
+            "reserve branch",
+        )
+        .await?;
+        let result = self.reserve_branch_unlocked(branch, version.into()).await;
+        guard.finish(result).await
+    }
 
-        let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
+    // The caller holds history exclusion while checking and reserving the source.
+    async fn reserve_branch_unlocked(
+        &self,
+        branch: &str,
+        version: refs::Ref,
+    ) -> Result<BranchReservation> {
+        let (source_branch, version_number) = self.resolve_reference(version).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
         if self.object_store.exists(&branch_file).await? {
@@ -813,25 +839,38 @@ impl Dataset {
         reservation: BranchReservation,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let branch = reservation.branch();
-        let contents = self
-            .branches()
-            .get(branch)
-            .await
-            .map_err(|error| match error {
-                Error::RefNotFound { .. } => Error::RefNotFound {
-                    message: format!("branch {branch} was deleted after it was reserved"),
-                },
-                error => error,
-            })?;
-        if contents.identifier != reservation.identifier {
-            return Err(Error::RefConflict {
-                message: format!("branch {branch} was deleted and recreated after it was reserved"),
-            });
+        let guard = HistoryLock::acquire(
+            self.object_store.clone(),
+            &self.branch_location(),
+            "complete branch",
+        )
+        .await?;
+        let result = async {
+            let branch = reservation.branch();
+            let contents = self
+                .branches()
+                .get(branch)
+                .await
+                .map_err(|error| match error {
+                    Error::RefNotFound { .. } => Error::RefNotFound {
+                        message: format!("branch {branch} was deleted after it was reserved"),
+                    },
+                    error => error,
+                })?;
+            if contents.identifier != reservation.identifier {
+                return Err(Error::RefConflict {
+                    message: format!(
+                        "branch {branch} was deleted and recreated after it was reserved"
+                    ),
+                });
+            }
+            self.clone_reserved_branch(reservation, store_params).await
         }
-        self.clone_reserved_branch(reservation, store_params).await
+        .await;
+        guard.finish(result).await
     }
 
+    // The caller keeps history exclusion until the clone commit settles.
     async fn clone_reserved_branch(
         &self,
         reservation: BranchReservation,
