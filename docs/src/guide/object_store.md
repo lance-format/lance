@@ -637,7 +637,13 @@ parameter; explicit `storage_options` override environment variables:
 ## Hugging Face Configuration
 
 Use `hf://datasets/<owner>/<repo>/<path>` to read a Lance dataset hosted on
-Hugging Face. Pass these options through `storage_options`:
+Hugging Face. Append `@<revision>` to the repository to pin a commit, branch,
+or tag: `hf://datasets/<owner>/<repo>@<revision>/<path>`. An `@` later in the
+path is part of the path, not part of the revision. A revision in the URL
+cannot contain `/`, `@`, or percent escapes; pass such a revision through
+`hf_revision` or `revision` instead. If either option is also supplied, it must
+name the same revision; a conflicting value is rejected. Pass these options
+through `storage_options`:
 
 | Key | Description |
 | --- | --- |
