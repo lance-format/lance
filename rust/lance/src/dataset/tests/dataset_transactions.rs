@@ -4560,16 +4560,17 @@ mod composite {
 
     async fn index_coverage(dataset: &Dataset, name: &str) -> Vec<u32> {
         let indices = load_all_indices(dataset).await.unwrap();
-        let segment = indices
-            .iter()
-            .find(|index| index.name == name)
-            .expect("index segment should be committed");
-        segment
-            .fragment_bitmap
-            .as_ref()
-            .expect("coverage should be recorded")
-            .iter()
-            .collect()
+        let mut coverage = RoaringBitmap::new();
+        let mut found = false;
+        for segment in indices.iter().filter(|index| index.name == name) {
+            found = true;
+            coverage |= segment
+                .fragment_bitmap
+                .as_ref()
+                .expect("coverage should be recorded");
+        }
+        assert!(found, "index segment should be committed");
+        coverage.iter().collect()
     }
 
     #[tokio::test]
@@ -4599,12 +4600,10 @@ mod composite {
                     )
                     .unwrap(),
                 ),
-                // The index covers the fragment this same commit minted, which
-                // has no id until the commit lands.
-                Action::AddIndexSegment(index_segment(
-                    "by_a",
-                    vec![Ref::Committed(existing), Ref::Local(0)],
-                )),
+                // The index covers the existing fragment and the fragment this
+                // same commit minted (in separate committed and local segments).
+                Action::AddIndexSegment(index_segment("by_a", vec![Ref::Committed(existing)])),
+                Action::AddIndexSegment(index_segment("by_a", vec![Ref::Local(0)])),
             ],
         )
         .await;

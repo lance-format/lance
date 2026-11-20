@@ -1247,7 +1247,8 @@ impl ApplyState {
         Ok(id)
     }
 
-    pub(super) fn resolve_fragment(&self, reference: Ref) -> Result<u64> {
+    /// Resolve a committed or operation-local fragment reference against this state.
+    pub fn resolve_fragment(&self, reference: Ref) -> Result<u64> {
         match reference {
             Ref::Committed(id) => {
                 if self.read_marks.fragment.is_none_or(|mark| id > mark) {
@@ -1930,6 +1931,13 @@ fn validate_index_segment_sets(
                     type_url(segment),
                     first.uuid,
                     type_url(first)
+                )));
+            }
+            if segment.results_are_row_addrs() != first.results_are_row_addrs() {
+                return Err(Error::invalid_input(format!(
+                    "Index '{name}' mixes row-ID and row-address segments {} (version {}) \
+                     and {} (version {}); rebuild every segment in one commit",
+                    first.uuid, first.index_version, segment.uuid, segment.index_version,
                 )));
             }
             let Some(bitmap) = &segment.fragment_bitmap else {

@@ -19,12 +19,15 @@ use async_trait::async_trait;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::scalar::{
-    BatchRowIdRemapper, RowAddrTranslator, RowAddrTranslatorRef, RowIdRemapper,
+    BatchRowIdRemapper, BuiltinIndexType, RowAddrTranslator, RowAddrTranslatorRef, RowIdRemapper,
+    ScalarIndexParams,
 };
+use lance_index::{IndexParams, IndexType};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, Manifest};
 use roaring::RoaringTreemap;
 
+use super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY;
 use crate::Dataset;
 
 /// Translates stored fragment ids, then applies `then` when a fragment-reuse
@@ -216,6 +219,101 @@ impl BatchRowIdRemapper for LocalFragmentBatchRemapper {
             _ => lance_index::scalar::DEFAULT_MATERIALIZATION_BUDGET_BYTES,
         }
     }
+}
+
+/// Reject an index before training if its row addresses cannot be rebased
+/// with `local_fragment_aliases`.
+pub fn ensure_index_can_rebase_local_fragments(
+    index_type: IndexType,
+    params: &dyn IndexParams,
+) -> Result<()> {
+    match index_type {
+        IndexType::FragmentReuse => Err(Error::invalid_input(
+            "Fragment reuse index can only be created through compaction",
+        )),
+        IndexType::MemWal => Err(Error::not_supported(
+            "Staged create_index cannot build the MemWAL system index",
+        )),
+        IndexType::Vector
+        | IndexType::IvfFlat
+        | IndexType::IvfSq
+        | IndexType::IvfPq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswFlat
+        | IndexType::IvfRq
+        | IndexType::IvfHnswRq => Err(Error::not_supported(
+            "Staged create_index cannot build a vector index over uncommitted fragments because vector indices store logical row ids that a commit retry can reassign",
+        )),
+        IndexType::Inverted => Err(Error::not_supported(
+            "Staged create_index cannot build an inverted index over uncommitted fragments because inverted indices store logical row ids that a commit retry can reassign",
+        )),
+        IndexType::Scalar => {
+            let scalar_params = params
+                .as_any()
+                .downcast_ref::<ScalarIndexParams>()
+                .ok_or_else(|| {
+                    Error::invalid_input("Scalar index type must take a ScalarIndexParams")
+                })?;
+            ensure_scalar_plugin_can_rebase_local_fragments(&scalar_params.index_type)
+        }
+        IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::LabelList
+        | IndexType::NGram
+        | IndexType::ZoneMap
+        | IndexType::BloomFilter
+        | IndexType::RTree
+        | IndexType::Fm
+        | IndexType::MinHashLsh => {
+            let builtin = BuiltinIndexType::try_from(index_type)?;
+            ensure_scalar_plugin_can_rebase_local_fragments(builtin.as_str())
+        }
+    }
+}
+
+fn ensure_scalar_plugin_can_rebase_local_fragments(plugin_name: &str) -> Result<()> {
+    if plugin_name.eq_ignore_ascii_case("inverted") || plugin_name.eq_ignore_ascii_case("fts") {
+        return Err(Error::not_supported(
+            "Staged create_index cannot build an inverted index over uncommitted fragments because inverted indices store logical row ids that a commit retry can reassign",
+        ));
+    }
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(plugin_name)?;
+    if !plugin.supports_batch_row_id_remapping() {
+        return Err(Error::not_supported(format!(
+            "Staged create_index over uncommitted fragments requires local_fragment_aliases support, which {} indices do not implement yet",
+            plugin.name()
+        )));
+    }
+    Ok(())
+}
+
+/// Check that a trained segment can be rebased with `local_fragment_aliases`.
+pub fn ensure_segment_can_rebase_local_fragments(
+    base_manifest: &Manifest,
+    segment: &IndexMetadata,
+) -> Result<()> {
+    let details = segment.index_details.as_ref().ok_or_else(|| {
+        Error::not_supported(format!(
+            "Staged index {} has no index details",
+            segment.name
+        ))
+    })?;
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(details.as_ref())?;
+    if !plugin.supports_batch_row_id_remapping() {
+        return Err(Error::not_supported(format!(
+            "Staged index {} uses {}, which does not implement local_fragment_aliases support yet",
+            segment.name,
+            plugin.name()
+        )));
+    }
+    if base_manifest.uses_stable_row_ids() && !segment.results_are_row_addrs() {
+        return Err(Error::not_supported(format!(
+            "Staged index {} stores logical row ids, and a retry can reassign those",
+            segment.name
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

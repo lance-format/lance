@@ -10,8 +10,10 @@ use super::{FieldRef, Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -47,6 +49,11 @@ pub struct AddIndexSegmentParts {
     pub index_version: i32,
     /// The fragments this segment covers. An empty list says the segment
     /// covers nothing.
+    ///
+    /// A segment must cover either [`Ref::Committed`] or [`Ref::Local`]
+    /// fragments, not both. For [`Ref::Local`], the index files store each
+    /// fragment's local id, and `apply` builds
+    /// [`IndexMetadata::local_fragment_aliases`] from `covered_fragments`.
     ///
     /// `None` says no coverage is recorded, which only the MemWAL system index
     /// (`__lance_mem_wal`) may say: it is not served per fragment. A user index
@@ -114,6 +121,8 @@ impl AddIndexSegment {
     /// * The segment indexes every row of `covered_fragments` as the version it
     ///   reflects holds them, keyed on `fields` and carrying the values of
     ///   `covering_fields`, and no other rows.
+    /// * When `covered_fragments` contains [`Ref::Local`] references, the
+    ///   segment's files store each fragment's local id as its fragment id.
     /// * If `data_change` is `false`, the segment holds no rows a reader can
     ///   see. That is true of an ordinary index, which is derived state, and
     ///   not of the MemWAL index.
@@ -123,8 +132,10 @@ impl AddIndexSegment {
     ///
     /// # Errors
     ///
-    /// Rejects an empty `name`, and unset `covered_fragments` on any index but
-    /// the MemWAL system index.
+    /// Rejects an empty `name`, unset `covered_fragments` on any index but
+    /// the MemWAL system index, a `covered_fragments` list that mixes
+    /// [`Ref::Committed`] and [`Ref::Local`], duplicate [`Ref::Local`] ids,
+    /// and [`Ref::Local`] carrying [`RowAddress::TOMBSTONE_FRAG`].
     pub fn try_new_unchecked(mut parts: AddIndexSegmentParts) -> Result<Self> {
         parts.name = non_empty(parts.name, "AddIndexSegment.name")?;
         if parts.covered_fragments.is_none() && parts.name != MEM_WAL_INDEX_NAME {
@@ -133,6 +144,35 @@ impl AddIndexSegment {
                  index '{MEM_WAL_INDEX_NAME}' may omit its coverage",
                 parts.name
             )));
+        }
+        if let Some(covered) = &parts.covered_fragments {
+            let mut has_committed = false;
+            let mut local_ids = BTreeSet::new();
+            for &reference in covered {
+                match reference {
+                    Ref::Committed(_) => has_committed = true,
+                    Ref::Local(local_id) => {
+                        if local_id == RowAddress::TOMBSTONE_FRAG {
+                            return Err(Error::invalid_input(format!(
+                                "AddIndexSegment for index '{}' covers reserved local fragment id {local_id}",
+                                parts.name
+                            )));
+                        }
+                        if !local_ids.insert(local_id) {
+                            return Err(Error::invalid_input(format!(
+                                "AddIndexSegment for index '{}' covers local fragment {local_id} more than once",
+                                parts.name
+                            )));
+                        }
+                    }
+                }
+                if has_committed && !local_ids.is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "AddIndexSegment for index '{}' mixes committed and local fragments in covered_fragments; use separate segments",
+                        parts.name
+                    )));
+                }
+            }
         }
         Ok(Self { parts })
     }
@@ -191,7 +231,7 @@ impl AddIndexSegment {
             files: (!self.parts.files.is_empty()).then(|| self.parts.files.clone()),
             clustering_id: None,
             metadata: Default::default(),
-            local_fragment_aliases: Default::default(),
+            local_fragment_aliases: self.resolve_local_fragment_aliases(state)?,
         };
         // Belt and braces: `lower_covering` builds the legacy form by
         // construction, so a failure here means the two have drifted apart.
@@ -275,6 +315,48 @@ impl AddIndexSegment {
             )));
         }
         Ok(version)
+    }
+
+    fn resolve_local_fragment_aliases(&self, state: &ApplyState) -> Result<BTreeMap<u32, u32>> {
+        let Some(covered) = &self.parts.covered_fragments else {
+            return Ok(BTreeMap::new());
+        };
+        let mut aliases = BTreeMap::new();
+        let mut committed_ids = BTreeSet::new();
+        for &reference in covered {
+            let Ref::Local(local_id) = reference else {
+                continue;
+            };
+            let committed = state.resolve_fragment(reference)?;
+            if !state.has_live_fragment(committed) {
+                return Err(Error::invalid_input(format!(
+                    "AddIndexSegment for index '{}' covers {reference:?}, which was removed earlier in this operation",
+                    self.parts.name
+                )));
+            }
+            let committed = u32::try_from(committed).map_err(|_| {
+                Error::invalid_input(format!(
+                    "AddIndexSegment for index '{}' covers fragment {committed}, which does not fit in a fragment id",
+                    self.parts.name
+                ))
+            })?;
+            if committed == RowAddress::TOMBSTONE_FRAG {
+                return Err(Error::invalid_input(format!(
+                    "AddIndexSegment for index '{}' resolves local fragment {local_id} to {committed}, which is reserved",
+                    self.parts.name
+                )));
+            }
+            if !committed_ids.insert(committed) {
+                return Err(Error::invalid_input(format!(
+                    "AddIndexSegment for index '{}' resolves more than one local fragment to committed fragment {committed}",
+                    self.parts.name
+                )));
+            }
+            if local_id != committed {
+                aliases.insert(local_id, committed);
+            }
+        }
+        Ok(aliases)
     }
 
     fn resolve_coverage(&self, fragments: &[Ref], state: &ApplyState) -> Result<RoaringBitmap> {
@@ -559,6 +641,223 @@ mod tests {
         // operation read, so replaying it elsewhere restamps it.
         assert_eq!(index.dataset_version, manifest.version);
         assert!(index.dataset_version < next.version);
+    }
+
+    #[test]
+    fn test_local_fragment_aliases_follow_the_fragment_high_water() {
+        let action = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+            covered_fragments: Some(vec![Ref::Local(0)]),
+            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+        })
+        .unwrap();
+        let add = Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+            id: Ref::Local(0),
+            physical_rows: 10,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        }));
+
+        let low = backed_manifest();
+        let (_, low_indices) = apply_with_indices(
+            &low,
+            vec![add.clone(), Action::AddIndexSegment(action.clone())],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(low_indices[0].local_fragment_aliases.get(&0), Some(&1));
+        assert!(low_indices[0].fragment_bitmap.as_ref().unwrap().contains(1));
+
+        let mut high = low;
+        high.max_fragment_id = Some(9);
+        let (_, high_indices) = apply_with_indices(
+            &high,
+            vec![add, Action::AddIndexSegment(action)],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(high_indices[0].local_fragment_aliases.get(&0), Some(&10));
+        assert!(
+            high_indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(10)
+        );
+        assert_eq!(low_indices[0].uuid, high_indices[0].uuid);
+
+        let mut near_top = backed_manifest();
+        near_top.max_fragment_id = Some(RowAddress::TOMBSTONE_FRAG - 3);
+        let first_committed = RowAddress::TOMBSTONE_FRAG - 2;
+        let second_committed = RowAddress::TOMBSTONE_FRAG - 1;
+        let add_second = Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+            id: Ref::Local(1),
+            physical_rows: 10,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        }));
+        let two_locals = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+            covered_fragments: Some(vec![Ref::Local(0), Ref::Local(1)]),
+            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+        })
+        .unwrap();
+        let (_, two_local_indices) = apply_with_indices(
+            &near_top,
+            vec![
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+                    id: Ref::Local(0),
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                })),
+                add_second,
+                Action::AddIndexSegment(two_locals),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            two_local_indices[0].local_fragment_aliases,
+            BTreeMap::from([(0, first_committed), (1, second_committed)])
+        );
+
+        let removed_err = apply_with_indices(
+            &backed_manifest(),
+            vec![
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+                    id: Ref::Local(0),
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                })),
+                Action::RemoveFragment(RemoveFragment::new(Ref::Local(0))),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        covered_fragments: Some(vec![Ref::Local(0)]),
+                        ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                    })
+                    .unwrap(),
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(removed_err, Error::InvalidInput { .. }),
+            "{removed_err}"
+        );
+
+        // Reject mixed committed/local coverage, duplicate local ids, and the
+        // reserved tombstone fragment id.
+        for bad_parts in [
+            AddIndexSegmentParts {
+                covered_fragments: Some(vec![Ref::Committed(0), Ref::Local(0)]),
+                ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+            },
+            AddIndexSegmentParts {
+                covered_fragments: Some(vec![Ref::Local(0), Ref::Local(0)]),
+                ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+            },
+            AddIndexSegmentParts {
+                covered_fragments: Some(vec![Ref::Local(RowAddress::TOMBSTONE_FRAG)]),
+                ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+            },
+        ] {
+            let err = AddIndexSegment::try_new_unchecked(bad_parts).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_proto_decode_enforces_coverage_invariants_and_identity_alias_replay() {
+        let base_proto =
+            pb_actions::AddIndexSegment::from(&segment("by_a", vec![FieldRef::Committed(0)]));
+
+        // Proto decode enforces the same coverage checks as try_new_unchecked.
+        for bad_refs in [
+            vec![Ref::Committed(0), Ref::Local(0)],
+            vec![Ref::Local(0), Ref::Local(0)],
+            vec![Ref::Local(RowAddress::TOMBSTONE_FRAG)],
+        ] {
+            let message = pb_actions::AddIndexSegment {
+                covered_fragments: Some(pb_actions::FragmentCoverage {
+                    fragments: bad_refs.into_iter().map(pb_actions::Ref::from).collect(),
+                }),
+                ..base_proto.clone()
+            };
+            let err = AddIndexSegment::try_from(message).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        }
+
+        // Valid committed-only and local-only segments round-trip through protobuf.
+        for good_refs in [
+            vec![Ref::Committed(0), Ref::Committed(1)],
+            vec![Ref::Local(0), Ref::Local(1)],
+        ] {
+            let action = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                covered_fragments: Some(good_refs),
+                ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+            })
+            .unwrap();
+            let round_tripped =
+                AddIndexSegment::try_from(pb_actions::AddIndexSegment::from(&action)).unwrap();
+            assert_eq!(round_tripped, action);
+        }
+
+        // On an empty table Local(0) lands on fragment 0, so no alias is needed.
+        // Replaying onto a table where fragment 0 is taken aliases 0 -> 1.
+        let local_action = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+            covered_fragments: Some(vec![Ref::Local(0)]),
+            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+        })
+        .unwrap();
+        let decoded =
+            AddIndexSegment::try_from(pb_actions::AddIndexSegment::from(&local_action)).unwrap();
+        let add_local = Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+            id: Ref::Local(0),
+            physical_rows: 10,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        }));
+
+        let mut empty_manifest = backed_manifest();
+        empty_manifest.fragments = Arc::new(Vec::new());
+        empty_manifest.max_fragment_id = None;
+        let (_, empty_indices) = apply_with_indices(
+            &empty_manifest,
+            vec![add_local.clone(), Action::AddIndexSegment(decoded.clone())],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty_indices[0].fragment_bitmap,
+            Some([0].into_iter().collect())
+        );
+        assert!(empty_indices[0].local_fragment_aliases.is_empty());
+
+        let (_, shifted_indices) = apply_with_indices(
+            &backed_manifest(),
+            vec![add_local, Action::AddIndexSegment(decoded)],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            shifted_indices[0].fragment_bitmap,
+            Some([1].into_iter().collect())
+        );
+        assert_eq!(
+            shifted_indices[0].local_fragment_aliases,
+            BTreeMap::from([(0, 1)])
+        );
     }
 
     /// A segment that does not say what it reflects reflects the version its
@@ -1289,7 +1588,7 @@ mod tests {
                 })),
                 Action::AddIndexSegment(
                     AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
-                        covered_fragments: Some(vec![Ref::Committed(0), Ref::Local(0)]),
+                        covered_fragments: Some(vec![Ref::Local(0)]),
                         ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
                     })
                     .unwrap(),
@@ -1299,10 +1598,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            indices[0].fragment_bitmap,
-            Some([0, 1].into_iter().collect())
-        );
+        assert_eq!(indices[0].fragment_bitmap, Some([1].into_iter().collect()));
+        assert_eq!(indices[0].local_fragment_aliases, BTreeMap::from([(0, 1)]));
     }
 
     #[test]

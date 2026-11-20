@@ -75,6 +75,194 @@ fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarInd
     Ok(ScalarIndexParams::new("inverted".to_string()).with_params(&params.to_training_json()?))
 }
 
+fn resolve_index_name_for_field(
+    indices: &[IndexMetadata],
+    field_id: i32,
+    column_path: &str,
+    requested_name: Option<&str>,
+    index_type: IndexType,
+    params: &dyn IndexParams,
+) -> Result<String> {
+    let index_name = match requested_name {
+        Some(name) => name.to_string(),
+        None => {
+            // Generate default name with collision handling.
+            // A name is available when there is no existing index with:
+            //   - the same name AND different fields, OR
+            //   - the same name AND same field BUT a different index kind
+            let base_name = format!("{column_path}_idx");
+            let mut candidate = base_name.clone();
+            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
+            while indices.iter().any(|idx| {
+                // A covered index still names the same column by its keyed
+                // prefix; only that prefix decides whether this is "the same
+                // field", not the full `fields` vector including carried
+                // columns.
+                let different_field = idx.keyed_field() != Some(field_id);
+                idx.name == candidate
+                    && (different_field || !index_matches_type(idx, index_type, params))
+            }) {
+                candidate = format!("{base_name}_{counter}");
+                counter += 1;
+            }
+            candidate
+        }
+    };
+    if indices
+        .iter()
+        .any(|idx| idx.name == index_name && idx.keyed_field() != Some(field_id))
+    {
+        return Err(Error::index(format!(
+            "Index name '{index_name}' already exists with different fields, \
+            please specify a different name"
+        )));
+    }
+    Ok(index_name)
+}
+
+struct ResolvedIndexTarget {
+    field_id: i32,
+    column: String,
+    default_name_base: String,
+    inverted_params: Option<InvertedIndexParams>,
+}
+
+fn is_scalar_fts_request(index_type: IndexType, params: &dyn IndexParams) -> bool {
+    index_type == IndexType::Scalar
+        && params
+            .as_any()
+            .downcast_ref::<ScalarIndexParams>()
+            .is_some_and(|params| {
+                params.index_type.eq_ignore_ascii_case("inverted")
+                    || params.index_type.eq_ignore_ascii_case("fts")
+            })
+}
+
+fn resolve_index_target(
+    schema: &lance_core::datatypes::Schema,
+    columns: &[impl AsRef<str>],
+    index_type: IndexType,
+    params: &dyn IndexParams,
+    is_copy_of_existing: bool,
+) -> Result<ResolvedIndexTarget> {
+    if columns.len() != 1 {
+        return Err(Error::index(
+            "Only support building index on 1 column at the moment".to_string(),
+        ));
+    }
+    let column_input = columns[0].as_ref();
+    let scalar_fts_request = is_scalar_fts_request(index_type, params);
+    let inverted_params = if index_type == IndexType::Inverted {
+        if let Some(params) = params.as_any().downcast_ref::<InvertedIndexParams>() {
+            Some(params.clone())
+        } else if let Some(params) = params.as_any().downcast_ref::<ScalarIndexParams>() {
+            Some(resolved_inverted_params(params)?)
+        } else {
+            return Err(Error::index(
+                "Inverted index type must take InvertedIndexParams or ScalarIndexParams"
+                    .to_string(),
+            ));
+        }
+    } else if scalar_fts_request {
+        Some(resolved_inverted_params(
+            params
+                .as_any()
+                .downcast_ref::<ScalarIndexParams>()
+                .expect("scalar_fts_request verified scalar params"),
+        )?)
+    } else {
+        None
+    };
+    if let Some(params) = &inverted_params
+        && !is_copy_of_existing
+    {
+        params.validate_for_creation()?;
+    }
+    let resolved_fts_field = if let Some(params) = &inverted_params {
+        Some(crate::index::scalar::inverted::resolve_fts_field(
+            schema,
+            column_input,
+            params.get_document_granularity(),
+        )?)
+    } else {
+        None
+    };
+    let lookup_column = resolved_fts_field
+        .as_ref()
+        .map(|resolved| resolved.root_column.as_str())
+        .unwrap_or(column_input);
+    // Use case-insensitive lookup for both simple and nested paths.
+    // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
+    let Some(field_path) = schema.resolve_case_insensitive(lookup_column) else {
+        return Err(Error::index(format!(
+            "CreateIndex: column '{column_input}' does not exist"
+        )));
+    };
+    let field = if let Some(resolved) = &resolved_fts_field {
+        schema.field_by_id(resolved.final_field_id).ok_or_else(|| {
+            Error::index(format!(
+                "CreateIndex: FTS field path '{column_input}' resolved to missing field id {}",
+                resolved.final_field_id
+            ))
+        })?
+    } else {
+        *field_path.last().ok_or_else(|| {
+            Error::index(format!(
+                "CreateIndex: column '{column_input}' resolved to an empty field path"
+            ))
+        })?
+    };
+    // Reconstruct the column path with correct case from schema
+    // Use quoted format for SQL parsing (special chars are quoted)
+    let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+    let quoted_column = format_field_path(&names);
+    let column = resolved_fts_field
+        .as_ref()
+        .map(|resolved| resolved.canonical_path.clone())
+        .unwrap_or(quoted_column);
+    let default_name_base = resolved_fts_field
+        .as_ref()
+        .map(|resolved| {
+            if resolved.document_granularity.is_list_element() {
+                format!("{}_list_element", resolved.canonical_path)
+            } else {
+                resolved.canonical_path.clone()
+            }
+        })
+        .unwrap_or_else(|| default_index_name(&names));
+    Ok(ResolvedIndexTarget {
+        field_id: field.id,
+        column,
+        default_name_base,
+        inverted_params,
+    })
+}
+
+pub fn resolve_staged_index_name(
+    schema: &lance_core::datatypes::Schema,
+    indices: &[IndexMetadata],
+    columns: &[impl AsRef<str>],
+    requested_name: Option<&str>,
+    index_type: IndexType,
+    params: &dyn IndexParams,
+) -> Result<String> {
+    let target = resolve_index_target(schema, columns, index_type, params, false)?;
+    let index_name = resolve_index_name_for_field(
+        indices,
+        target.field_id,
+        &target.default_name_base,
+        requested_name,
+        index_type,
+        params,
+    )?;
+    if indices.iter().any(|idx| idx.name == index_name) {
+        return Err(Error::index(format!(
+            "Index name '{index_name}' already exists; use extend_index to add coverage or specify a different name"
+        )));
+    }
+    Ok(index_name)
+}
+
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
     columns: Vec<String>,
@@ -222,303 +410,217 @@ impl<'a> CreateIndexBuilder<'a> {
         &mut self,
     ) -> BoxFuture<'_, Result<(IndexMetadata, ObservedBuild)>> {
         async move {
-        if self.columns.len() != 1 {
-            return Err(Error::index(
-                "Only support building index on 1 column at the moment".to_string(),
-            ));
-        }
-        let column_input = &self.columns[0];
-        let scalar_fts_request = self.index_type == IndexType::Scalar
-            && self
-                .params
-                .as_any()
-                .downcast_ref::<ScalarIndexParams>()
-                .is_some_and(|params| {
-                    params.index_type.eq_ignore_ascii_case("inverted")
-                        || params.index_type.eq_ignore_ascii_case("fts")
-                });
-        // Load indices from the disk. Names are reserved against every index the
-        // manifest carries: one this build cannot read still owns its name, and
-        // handing that name out again commits two indices under it.
-        let indices = load_all_indices(self.dataset).await?;
-        // These always store row ids, so refuse them before training.
-        let index_kind = if self.index_type.is_vector() {
-            Some("vector")
-        } else if self.index_type == IndexType::Inverted || scalar_fts_request {
-            Some("full-text")
-        } else {
-            None
-        };
-        if let Some(index_kind) = index_kind {
-            ensure_index_kind_allowed_with_frag_reuse(
-                &self.dataset.manifest,
-                &indices,
-                index_kind,
-                column_input,
-            )?;
-        }
-        let inverted_params = if self.index_type == IndexType::Inverted {
-            if let Some(params) = self
-                .params
-                .as_any()
-                .downcast_ref::<InvertedIndexParams>()
-            {
-                Some(params.clone())
-            } else if let Some(params) =
-                self.params.as_any().downcast_ref::<ScalarIndexParams>()
-            {
-                Some(resolved_inverted_params(params)?)
-            } else {
+            if self.columns.len() != 1 {
                 return Err(Error::index(
-                    "Inverted index type must take InvertedIndexParams or ScalarIndexParams"
-                        .to_string(),
+                    "Only support building index on 1 column at the moment".to_string(),
                 ));
             }
-        } else if scalar_fts_request {
-            Some(resolved_inverted_params(
-                self.params
-                    .as_any()
-                    .downcast_ref::<ScalarIndexParams>()
-                    .expect("scalar_fts_request verified scalar params"),
-            )?)
-        } else {
-            None
-        };
-        if let Some(params) = &inverted_params
-            && !self.is_copy_of_existing
-        {
-            params.validate_for_creation()?;
-        }
-        let resolved_fts_field = if let Some(params) = &inverted_params {
-            Some(crate::index::scalar::inverted::resolve_fts_field(
+            let column_input = &self.columns[0];
+            let scalar_fts_request = is_scalar_fts_request(self.index_type, self.params);
+            // Load indices from the disk. Names are reserved against every index the
+            // manifest carries: one this build cannot read still owns its name, and
+            // handing that name out again commits two indices under it.
+            let indices = load_all_indices(self.dataset).await?;
+            // These always store row ids, so refuse them before training.
+            let index_kind = if self.index_type.is_vector() {
+                Some("vector")
+            } else if self.index_type == IndexType::Inverted || scalar_fts_request {
+                Some("full-text")
+            } else {
+                None
+            };
+            if let Some(index_kind) = index_kind {
+                ensure_index_kind_allowed_with_frag_reuse(
+                    &self.dataset.manifest,
+                    &indices,
+                    index_kind,
+                    column_input,
+                )?;
+            }
+            let target = resolve_index_target(
                 self.dataset.schema(),
-                column_input,
-                params.get_document_granularity(),
-            )?)
-        } else {
-            None
-        };
-        let lookup_column = resolved_fts_field
-            .as_ref()
-            .map(|resolved| resolved.root_column.as_str())
-            .unwrap_or(column_input);
-        // Use case-insensitive lookup for both simple and nested paths.
-        // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
-        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(lookup_column) else {
-            return Err(Error::index(format!(
-                "CreateIndex: column '{column_input}' does not exist"
-            )));
-        };
-        let field = if let Some(resolved) = &resolved_fts_field {
-            self.dataset
-                .schema()
-                .field_by_id(resolved.final_field_id)
-                .ok_or_else(|| {
-                    Error::index(format!(
-                        "CreateIndex: FTS field path '{column_input}' resolved to missing field id {}",
-                        resolved.final_field_id
-                    ))
-                })?
-        } else {
-            *field_path.last().ok_or_else(|| {
-                Error::index(format!(
-                    "CreateIndex: column '{column_input}' resolved to an empty field path"
-                ))
-            })?
-        };
-        // Reconstruct the column path with correct case from schema
-        // Use quoted format for SQL parsing (special chars are quoted)
-        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
-        let quoted_column: String = format_field_path(&names);
-        let column = resolved_fts_field
-            .as_ref()
-            .map(|resolved| resolved.canonical_path.as_str())
-            .unwrap_or(quoted_column.as_str());
+                &self.columns,
+                self.index_type,
+                self.params,
+                self.is_copy_of_existing,
+            )?;
+            let inverted_params = target.inverted_params;
+            let column = target.column.as_str();
 
-        // A fragment list naming the whole table is a whole-table build, not a
-        // subset: `effective_vector_fragments` normalizes it to `None` so a
-        // retrain gets the same row floor as a create.
-        let vector_fragments_for_validation =
-            is_builtin_vector_index(self.index_type, self.params)
-                .then(|| effective_vector_fragments(self.dataset, self.fragments.as_deref()))
-                .flatten();
-        let quantizer_minimum_rows = self
-            .params
-            .as_any()
-            .downcast_ref::<VectorIndexParams>()
-            .and_then(|params| super::vector::vector_quantizer_minimum_rows(&params.stages));
-        let train = should_train_index(
-            self.dataset,
-            self.train,
-            vector_fragments_for_validation.as_deref(),
-            quantizer_minimum_rows,
-            column,
-        )
-        .await?;
-
-        if !train {
-            // A partition count is not among the settings a definition records,
-            // so a caller who asked for one gets a different shape when the
-            // index finally trains.
-            if let Some(requested) = self
+            // A fragment list naming the whole table is a whole-table build, not a
+            // subset: `effective_vector_fragments` normalizes it to `None` so a
+            // retrain gets the same row floor as a create.
+            let vector_fragments_for_validation =
+                is_builtin_vector_index(self.index_type, self.params)
+                    .then(|| effective_vector_fragments(self.dataset, self.fragments.as_deref()))
+                    .flatten();
+            let quantizer_minimum_rows = self
                 .params
                 .as_any()
                 .downcast_ref::<VectorIndexParams>()
-                .and_then(|params| {
-                    params.stages.iter().find_map(|stage| match stage {
-                        StageParams::Ivf(ivf) => ivf.num_partitions,
-                        _ => None,
+                .and_then(|params| super::vector::vector_quantizer_minimum_rows(&params.stages));
+            let train = should_train_index(
+                self.dataset,
+                self.train,
+                vector_fragments_for_validation.as_deref(),
+                quantizer_minimum_rows,
+                column,
+            )
+            .await?;
+
+            if !train {
+                // A partition count is not among the settings a definition records,
+                // so a caller who asked for one gets a different shape when the
+                // index finally trains.
+                if let Some(requested) = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<VectorIndexParams>()
+                    .and_then(|params| {
+                        params.stages.iter().find_map(|stage| match stage {
+                            StageParams::Ivf(ivf) => ivf.num_partitions,
+                            _ => None,
+                        })
                     })
-                })
-            {
-                warn!(
-                    column,
-                    requested_num_partitions = requested,
-                    "Not enough rows to train even one partition, so the index is \
+                {
+                    warn!(
+                        column,
+                        requested_num_partitions = requested,
+                        "Not enough rows to train even one partition, so the index is \
                      recorded empty and will be trained once more data arrives. Its \
                      partition count will come from target_partition_size then, not \
                      from the num_partitions requested here."
-                );
+                    );
+                }
             }
-        }
 
-        let fri = self
-            .dataset
-            .open_frag_reuse_index(&NoOpMetricsCollector)
-            .await?;
-        // Read without consuming: a failed build must leave the requested name in
-        // place so a retry commits under it instead of an auto-generated one.
-        let index_name = if let Some(name) = self.name.as_deref() {
-            name.to_string()
-        } else {
-            // Generate default name with collision handling.
-            // A name is available when there is no existing index with:
-            //   - the same name AND different fields, OR
-            //   - the same name AND same field BUT a different index kind
-            let column_path = resolved_fts_field
-                .as_ref()
-                .map(|resolved| {
-                    if resolved.document_granularity.is_list_element() {
-                        format!("{}_list_element", resolved.canonical_path)
-                    } else {
-                        resolved.canonical_path.clone()
-                    }
-                })
-                .unwrap_or_else(|| default_index_name(&names));
-            let base_name = format!("{column_path}_idx");
-            let mut candidate = base_name.clone();
-            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
-            while indices.iter().any(|idx| {
-                // A covered index still names the same column by its keyed
-                // prefix; only that prefix decides whether this is "the same
-                // field", not the full `fields` vector including carried
-                // columns.
-                let different_field = idx.keyed_field() != Some(field.id);
-                idx.name == candidate
-                    && (different_field || !index_matches_type(idx, self.index_type, self.params))
-            }) {
-                candidate = format!("{base_name}_{counter}");
-                counter += 1;
-            }
-            candidate
-        };
-        let existing_named_indices = indices
-            .iter()
-            .filter(|idx| idx.name == index_name)
-            .collect::<Vec<_>>();
-        if existing_named_indices.iter().any(|idx| {
-            // Same rule as above: the keyed prefix decides identity, not the
-            // full `fields` vector.
-            idx.keyed_field() != Some(field.id)
-        }) {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists with different fields, \
-                please specify a different name"
-            )));
-        }
-        if !existing_named_indices.is_empty() && !self.replace {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists, \
+            let fri = self
+                .dataset
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await?;
+            // Read without consuming: a failed build must leave the requested name in
+            // place so a retry commits under it instead of an auto-generated one.
+            let index_name = resolve_index_name_for_field(
+                &indices,
+                target.field_id,
+                &target.default_name_base,
+                self.name.as_deref(),
+                self.index_type,
+                self.params,
+            )?;
+            if !self.replace && indices.iter().any(|idx| idx.name == index_name) {
+                return Err(Error::index(format!(
+                    "Index name '{index_name}' already exists, \
                 please specify a different name or use replace=True"
-            )));
-        }
-        ensure_index_uuid_allowed(
-            self.index_type,
-            self.params,
-            self.fragments.as_ref(),
-            self.index_uuid.as_ref(),
-        )?;
+                )));
+            }
+            ensure_index_uuid_allowed(
+                self.index_type,
+                self.params,
+                self.fragments.as_ref(),
+                self.index_uuid.as_ref(),
+            )?;
 
-        let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
-        let mut output_index_uuid = index_id;
-        let observed = self.observe_build(train)?;
-        let progress = observed.progress();
-        let created_index = match (self.index_type, self.params.index_name()) {
-            (
-                IndexType::Bitmap
-                | IndexType::BTree
-                | IndexType::Inverted
-                | IndexType::NGram
-                | IndexType::Fm
-                | IndexType::ZoneMap
-                | IndexType::BloomFilter
-                | IndexType::LabelList
-                | IndexType::RTree
-                | IndexType::MinHashLsh,
-                LANCE_SCALAR_INDEX,
-            ) => {
-                let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
+            let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
+            let mut output_index_uuid = index_id;
+            let observed = self.observe_build(train)?;
+            let progress = observed.progress();
+            let created_index = match (self.index_type, self.params.index_name()) {
+                (
+                    IndexType::Bitmap
+                    | IndexType::BTree
+                    | IndexType::Inverted
+                    | IndexType::NGram
+                    | IndexType::Fm
+                    | IndexType::ZoneMap
+                    | IndexType::BloomFilter
+                    | IndexType::LabelList
+                    | IndexType::RTree
+                    | IndexType::MinHashLsh,
+                    LANCE_SCALAR_INDEX,
+                ) => {
+                    let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
-                // If custom params were provided, extract the params JSON and apply it
-                let mut params = if let Some(provided_params) =
-                    self.params.as_any().downcast_ref::<ScalarIndexParams>()
-                {
-                    if let Some(params_json) = &provided_params.params {
-                        // Parse and apply the custom parameters
-                        if let Ok(json_value) =
-                            serde_json::from_str::<serde_json::Value>(params_json)
-                        {
-                            base_params.with_params(&json_value)
+                    // If custom params were provided, extract the params JSON and apply it
+                    let mut params = if let Some(provided_params) =
+                        self.params.as_any().downcast_ref::<ScalarIndexParams>()
+                    {
+                        if let Some(params_json) = &provided_params.params {
+                            // Parse and apply the custom parameters
+                            if let Ok(json_value) =
+                                serde_json::from_str::<serde_json::Value>(params_json)
+                            {
+                                base_params.with_params(&json_value)
+                            } else {
+                                base_params
+                            }
                         } else {
                             base_params
                         }
                     } else {
                         base_params
+                    };
+                    if let Some(inverted_params) = &inverted_params {
+                        params = scalar_params_from_inverted(inverted_params)?;
                     }
-                } else {
-                    base_params
-                };
-                if let Some(inverted_params) = &inverted_params {
-                    params = scalar_params_from_inverted(inverted_params)?;
-                }
 
-                let preprocessed_data = self.preprocessed_data.take();
-                if self.index_type == IndexType::Bitmap && self.fragments.is_some() {
-                    if !train {
-                        return Err(Error::invalid_input(
-                            "canonical bitmap segment build requires train=true".to_string(),
-                        ));
-                    }
-                    if preprocessed_data.is_some() {
-                        return Err(Error::invalid_input(
-                            "canonical bitmap segment build does not accept preprocessed data"
-                                .to_string(),
-                        ));
-                    }
-                    let fragments = self.fragments.clone().ok_or_else(|| {
-                        Error::invalid_input(
-                            "canonical bitmap segment build requires fragment ids".to_string(),
+                    let preprocessed_data = self.preprocessed_data.take();
+                    if self.index_type == IndexType::Bitmap && self.fragments.is_some() {
+                        if !train {
+                            return Err(Error::invalid_input(
+                                "canonical bitmap segment build requires train=true".to_string(),
+                            ));
+                        }
+                        if preprocessed_data.is_some() {
+                            return Err(Error::invalid_input(
+                                "canonical bitmap segment build does not accept preprocessed data"
+                                    .to_string(),
+                            ));
+                        }
+                        let fragments = self.fragments.clone().ok_or_else(|| {
+                            Error::invalid_input(
+                                "canonical bitmap segment build requires fragment ids".to_string(),
+                            )
+                        })?;
+                        build_bitmap_index_segment(
+                            self.dataset,
+                            column,
+                            index_id,
+                            fragments,
+                            progress.clone(),
                         )
-                    })?;
-                    build_bitmap_index_segment(
-                        self.dataset,
-                        column,
-                        index_id,
-                        fragments,
-                        progress.clone(),
-                    )
-                    .await?
-                } else {
+                        .await?
+                    } else {
+                        build_scalar_index(
+                            self.dataset,
+                            column,
+                            index_id,
+                            &params,
+                            train,
+                            self.fragments.clone(),
+                            preprocessed_data,
+                            progress.clone(),
+                        )
+                        .await?
+                    }
+                }
+                (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
+                    // Guess the index type
+                    let params = self
+                        .params
+                        .as_any()
+                        .downcast_ref::<ScalarIndexParams>()
+                        .ok_or_else(|| {
+                            Error::index(
+                                "Scalar index type must take a ScalarIndexParams".to_string(),
+                            )
+                        })?
+                        .clone();
+                    let params = if let Some(inverted_params) = &inverted_params {
+                        scalar_params_from_inverted(inverted_params)?
+                    } else {
+                        params
+                    };
                     build_scalar_index(
                         self.dataset,
                         column,
@@ -526,225 +628,204 @@ impl<'a> CreateIndexBuilder<'a> {
                         &params,
                         train,
                         self.fragments.clone(),
-                        preprocessed_data,
+                        None,
                         progress.clone(),
                     )
                     .await?
                 }
-            }
-            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
-                // Guess the index type
-                let params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<ScalarIndexParams>()
-                    .ok_or_else(|| {
-                        Error::index("Scalar index type must take a ScalarIndexParams".to_string())
-                    })?
-                    .clone();
-                let params = if let Some(inverted_params) = &inverted_params {
-                    scalar_params_from_inverted(inverted_params)?
-                } else {
-                    params
-                };
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    index_id,
-                    &params,
-                    train,
-                    self.fragments.clone(),
-                    None,
-                    progress.clone(),
-                )
-                .await?
-            }
-            (IndexType::Inverted, _) => {
-                // Inverted index params.
-                let inverted_params = inverted_params
-                    .as_ref()
-                    .expect("IndexType::Inverted parameters were resolved above");
+                (IndexType::Inverted, _) => {
+                    // Inverted index params.
+                    let inverted_params = inverted_params
+                        .as_ref()
+                        .expect("IndexType::Inverted parameters were resolved above");
 
-                let params = scalar_params_from_inverted(inverted_params)?;
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    index_id,
-                    &params,
-                    train,
-                    self.fragments.clone(),
-                    None,
-                    progress.clone(),
-                )
-                .await?
-            }
-            (
-                IndexType::Vector
-                | IndexType::IvfPq
-                | IndexType::IvfSq
-                | IndexType::IvfFlat
-                | IndexType::IvfRq
-                | IndexType::IvfHnswFlat
-                | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq
-                | IndexType::IvfHnswRq,
-                LANCE_VECTOR_INDEX,
-            ) => {
-                // Vector index params.
-                let vec_params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| {
-                        Error::index("Vector index type must take a VectorIndexParams".to_string())
-                    })?;
-                let index_version = vec_params.index_type().version() as u32;
+                    let params = scalar_params_from_inverted(inverted_params)?;
+                    build_scalar_index(
+                        self.dataset,
+                        column,
+                        index_id,
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                        None,
+                        progress.clone(),
+                    )
+                    .await?
+                }
+                (
+                    IndexType::Vector
+                    | IndexType::IvfPq
+                    | IndexType::IvfSq
+                    | IndexType::IvfFlat
+                    | IndexType::IvfRq
+                    | IndexType::IvfHnswFlat
+                    | IndexType::IvfHnswPq
+                    | IndexType::IvfHnswSq
+                    | IndexType::IvfHnswRq,
+                    LANCE_VECTOR_INDEX,
+                ) => {
+                    // Vector index params.
+                    let vec_params = self
+                        .params
+                        .as_any()
+                        .downcast_ref::<VectorIndexParams>()
+                        .ok_or_else(|| {
+                            Error::index(
+                                "Vector index type must take a VectorIndexParams".to_string(),
+                            )
+                        })?;
+                    let index_version = vec_params.index_type().version() as u32;
 
-                let effective_fragments =
-                    effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let (files, built_target) = if train {
-                    // Check if this is distributed indexing (fragment-level)
-                    if let Some(fragments) = effective_fragments.as_deref() {
-                        if vector_params_have_precomputed_ivf(vec_params) {
-                            // For distributed indexing, build only on specified fragments
-                            // This creates temporary index metadata without committing
-                            let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
-                                self.dataset,
-                                column,
-                                &index_name,
-                                index_id,
-                                vec_params,
-                                fri,
-                                fragments,
-                                progress.clone(),
-                            ))
-                            .await?;
-                            output_index_uuid = segment_uuid;
-                            (files, None)
+                    let effective_fragments =
+                        effective_vector_fragments(self.dataset, self.fragments.as_deref());
+                    let (files, built_target) = if train {
+                        // Check if this is distributed indexing (fragment-level)
+                        if let Some(fragments) = effective_fragments.as_deref() {
+                            if vector_params_have_precomputed_ivf(vec_params) {
+                                // For distributed indexing, build only on specified fragments
+                                // This creates temporary index metadata without committing
+                                let (segment_uuid, files) =
+                                    Box::pin(build_distributed_vector_index(
+                                        self.dataset,
+                                        column,
+                                        &index_name,
+                                        index_id,
+                                        vec_params,
+                                        fri,
+                                        fragments,
+                                        progress.clone(),
+                                    ))
+                                    .await?;
+                                output_index_uuid = segment_uuid;
+                                (files, None)
+                            } else {
+                                let built = Box::pin(build_filtered_vector_index(
+                                    self.dataset,
+                                    column,
+                                    &index_name,
+                                    index_id,
+                                    vec_params,
+                                    fri,
+                                    fragments,
+                                    progress.clone(),
+                                ))
+                                .await?;
+                                (built.files, built.target_partition_size)
+                            }
                         } else {
-                            let built = Box::pin(build_filtered_vector_index(
+                            // Standard full dataset indexing
+                            let built = Box::pin(build_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
                                 index_id,
                                 vec_params,
                                 fri,
-                                fragments,
                                 progress.clone(),
                             ))
                             .await?;
                             (built.files, built.target_partition_size)
                         }
                     } else {
-                        // Standard full dataset indexing
-                        let built = Box::pin(build_vector_index(
+                        // Create empty vector index
+                        let files = build_empty_vector_index(
                             self.dataset,
                             column,
                             &index_name,
                             index_id,
                             vec_params,
-                            fri,
-                            progress.clone(),
-                        ))
+                        )
                         .await?;
-                        (built.files, built.target_partition_size)
+                        (files, None)
+                    };
+                    CreatedIndex {
+                        index_details: vector_index_details(vec_params, built_target),
+                        index_version,
+                        files: table_files_to_index(files),
+                    }
+                }
+                // Can't use if let Some(...) here because it's not stable yet.
+                // TODO: fix after https://github.com/rust-lang/rust/issues/51114
+                (IndexType::Vector, name)
+                    if self
+                        .dataset
+                        .session
+                        .index_extensions
+                        .contains_key(&(IndexType::Vector, name.to_string())) =>
+                {
+                    let ext = self
+                        .dataset
+                        .session
+                        .index_extensions
+                        .get(&(IndexType::Vector, name.to_string()))
+                        .expect("already checked")
+                        .clone()
+                        .to_vector()
+                        // this should never happen because we control the registration
+                        // if this fails, the registration logic has a bug
+                        .ok_or(Error::internal(
+                            "unable to cast index extension to vector".to_string(),
+                        ))?;
+
+                    // An extension that has not been trained writes nothing: the
+                    // definition is the whole index until there is data for it.
+                    if train {
+                        ext.create_index(self.dataset, column, &index_id, self.params)
+                            .await?;
+                    }
+                    // Capture file sizes after vector index creation
+                    let index_dir = self.dataset.indices_dir().join(index_id.to_string());
+                    let files =
+                        list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                    CreatedIndex {
+                        index_details: vector_index_details_default(),
+                        index_version: self.index_type.version() as u32,
+                        files: table_files_to_index(files),
+                    }
+                }
+                (IndexType::FragmentReuse, _) => {
+                    return Err(Error::index(
+                        "Fragment reuse index can only be created through compaction".to_string(),
+                    ));
+                }
+                (index_type, index_name) => {
+                    return Err(Error::index(format!(
+                        "Index type {index_type} with name {index_name} is not supported"
+                    )));
+                }
+            };
+
+            let index_metadata = IndexMetadata {
+                uuid: output_index_uuid,
+                name: index_name,
+                fields: vec![target.field_id],
+                covering_fields: vec![],
+                dataset_version: self.dataset.manifest.version,
+                fragment_bitmap: if train {
+                    match &self.fragments {
+                        Some(fragment_ids) => Some(fragment_ids.iter().collect()),
+                        None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
                     }
                 } else {
-                    // Create empty vector index
-                    let files = build_empty_vector_index(
-                        self.dataset,
-                        column,
-                        &index_name,
-                        index_id,
-                        vec_params,
-                    )
-                    .await?;
-                    (files, None)
-                };
-                CreatedIndex {
-                    index_details: vector_index_details(vec_params, built_target),
-                    index_version,
-                    files: table_files_to_index(files),
-                }
-            }
-            // Can't use if let Some(...) here because it's not stable yet.
-            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
-            (IndexType::Vector, name)
-                if self
-                    .dataset
-                    .session
-                    .index_extensions
-                    .contains_key(&(IndexType::Vector, name.to_string())) =>
-            {
-                let ext = self
-                    .dataset
-                    .session
-                    .index_extensions
-                    .get(&(IndexType::Vector, name.to_string()))
-                    .expect("already checked")
-                    .clone()
-                    .to_vector()
-                    // this should never happen because we control the registration
-                    // if this fails, the registration logic has a bug
-                    .ok_or(Error::internal(
-                        "unable to cast index extension to vector".to_string(),
-                    ))?;
-
-                // An extension that has not been trained writes nothing: the
-                // definition is the whole index until there is data for it.
-                if train {
-                    ext.create_index(self.dataset, column, &index_id, self.params)
-                        .await?;
-                }
-                // Capture file sizes after vector index creation
-                let index_dir = self.dataset.indices_dir().join(index_id.to_string());
-                let files =
-                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
-                CreatedIndex {
-                    index_details: vector_index_details_default(),
-                    index_version: self.index_type.version() as u32,
-                    files: table_files_to_index(files),
-                }
-            }
-            (IndexType::FragmentReuse, _) => {
-                return Err(Error::index(
-                    "Fragment reuse index can only be created through compaction".to_string(),
-                ));
-            }
-            (index_type, index_name) => {
-                return Err(Error::index(format!(
-                    "Index type {index_type} with name {index_name} is not supported"
-                )));
-            }
-        };
-
-        let index_metadata = IndexMetadata {
-            uuid: output_index_uuid,
-            name: index_name,
-            fields: vec![field.id],
-            covering_fields: vec![],
-            dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: if train {
-                match &self.fragments {
-                    Some(fragment_ids) => Some(fragment_ids.iter().collect()),
-                    None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
-                }
-            } else {
-                // Empty bitmap for untrained indices
-                Some(roaring::RoaringBitmap::new())
-            },
-            index_details: Some(Arc::new(created_index.index_details)),
-            index_version: created_index.index_version as i32,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None,
-            files: Some(index_files_to_table(created_index.files)),
-            clustering_id: None,
-            metadata: Default::default(),
-            local_fragment_aliases: Default::default(),
-        };
-        // A generic scalar request only resolves to an implementation here.
-        ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
-        Ok((index_metadata, observed))
+                    // Empty bitmap for untrained indices
+                    Some(roaring::RoaringBitmap::new())
+                },
+                index_details: Some(Arc::new(created_index.index_details)),
+                index_version: created_index.index_version as i32,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
+                files: Some(index_files_to_table(created_index.files)),
+                clustering_id: None,
+                metadata: Default::default(),
+                local_fragment_aliases: Default::default(),
+            };
+            // A generic scalar request only resolves to an implementation here.
+            ensure_index_allowed_with_frag_reuse(
+                &self.dataset.manifest,
+                &indices,
+                &index_metadata,
+            )?;
+            Ok((index_metadata, observed))
         }
         .boxed()
     }

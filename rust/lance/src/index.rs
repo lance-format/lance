@@ -14,7 +14,7 @@ use lance_index::IndexType;
 
 mod api;
 pub(crate) mod append;
-mod create;
+pub(crate) mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
