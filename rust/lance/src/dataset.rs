@@ -4569,7 +4569,9 @@ pub(crate) fn new_commits(
         dataset.object_store.as_ref(),
         dataset.manifest.version,
     );
-    let read_ahead = dataset.object_store.as_ref().io_parallelism().max(1);
+    // Loaded manifests wait for the one before them, so each in flight may
+    // be held whole: read ahead as far as the unordered load did per stage.
+    let read_ahead = (dataset.object_store.as_ref().io_parallelism() / 2).max(1);
     futures::TryFutureExt::try_flatten_stream(async move {
         let mut locations: Vec<ManifestLocation> = locations
             .try_filter(|location| {
