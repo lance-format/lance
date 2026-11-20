@@ -384,10 +384,12 @@ impl<'a> InsertBuilder<'a> {
                 .check_compatible(dataset.schema(), &schema_cmp_opts)
                 .is_err()
             {
-                let normalized_data_schema =
-                    super::promote_legacy_blob_schema(&normalized_data_schema)?;
-                let dataset_schema = super::promote_legacy_blob_schema(dataset.schema())?;
-                normalized_data_schema.check_compatible(&dataset_schema, &schema_cmp_opts)?;
+                let (comparison_schema, dataset_schema) = super::blob_write_comparison_schemas(
+                    &normalized_data_schema,
+                    dataset.schema(),
+                    context.storage_version,
+                )?;
+                comparison_schema.check_compatible(&dataset_schema, &schema_cmp_opts)?;
             }
         }
 
