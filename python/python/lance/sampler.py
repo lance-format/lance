@@ -530,6 +530,7 @@ class ShardedBatchSampler(Sampler):
         )
         if not self._randomize:
             yield from shard_scan
+            return
 
         random.seed(self._seed + self._epoch)
         heap = []
