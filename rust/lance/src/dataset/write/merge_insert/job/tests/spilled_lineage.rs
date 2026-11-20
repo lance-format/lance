@@ -258,11 +258,15 @@ async fn merge_insert_keeps_small_or_disabled_lineage_inline(
     )
     .await;
 }
-/// A concurrent append consumes the ids predicted by the first attempt.
-/// The commit must allocate different ids and creation versions to the
-/// insert group while keeping the spilled update group's lineage.
+/// A concurrent insert consumes the ids predicted by the first attempt.
+/// A disjoint merge can rebase directly; an append requires a full retry
+/// because it does not track inserted keys. Both paths must allocate new
+/// ids and creation versions while keeping the spilled update lineage.
+#[rstest]
+#[case::append_requires_retry(false)]
+#[case::disjoint_merge_rebases(true)]
 #[tokio::test]
-async fn merge_insert_spill_rebases_insert_lineage() {
+async fn merge_insert_spill_rebases_insert_lineage(#[case] is_concurrent_merge: bool) {
     let mut dataset = dataset("memory://").await;
     dataset
         .update_config([
@@ -277,8 +281,10 @@ async fn merge_insert_spill_rebases_insert_lineage() {
     )
     .unwrap();
     let original = Arc::new(dataset.clone());
-    let prepared = job(original.clone())
-        .execute_uncommitted_batches(vec![source])
+    let stale_job = job(original.clone());
+    let prepared = stale_job
+        .clone()
+        .execute_uncommitted_batches(vec![source.clone()])
         .await
         .unwrap();
     let Operation::Update { new_fragments, .. } = &prepared.transaction.operation else {
@@ -288,21 +294,43 @@ async fn merge_insert_spill_rebases_insert_lineage() {
     assert!(new_fragments[0].has_spilled_row_lineage());
     assert!(new_fragments[1].row_id_meta.is_none());
     assert!(new_fragments[1].created_at_version_meta.is_none());
-    let appended = record_batch!(("key", UInt32, [8]), ("value", UInt32, [800])).unwrap();
-    dataset
-        .append(
-            RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
-            None,
-        )
-        .await
-        .unwrap();
-    let append_version = dataset.version().version;
-    let merged = CommitBuilder::new(original)
+    let concurrent = record_batch!(("key", UInt32, [8]), ("value", UInt32, [800])).unwrap();
+    let insert_version = if is_concurrent_merge {
+        let (other, _) = job(original.clone())
+            .execute_batches(vec![concurrent])
+            .await
+            .unwrap();
+        other.version().version
+    } else {
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(concurrent.clone())], concurrent.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.version().version
+    };
+    let committed = CommitBuilder::new(original)
         .execute(prepared.transaction)
-        .await
-        .unwrap();
+        .await;
+    let merged = if is_concurrent_merge {
+        Arc::new(committed.unwrap())
+    } else {
+        let error = committed.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Append"), "{error}");
+        let (merged, stats) = stale_job.execute_batches(vec![source]).await.unwrap();
+        assert_eq!(stats.num_attempts, 2);
+        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(stats.num_inserted_rows, 1);
+        merged
+    };
     let version = merged.version().version;
-    assert_eq!(version, append_version + 1);
+    assert_eq!(version, insert_version + 1);
     check_rows(
         &merged,
         &[
@@ -310,7 +338,7 @@ async fn merge_insert_spill_rebases_insert_lineage() {
             (1, Some(1), None, 1, 1),
             (2, Some(2), Some(200), 2, version),
             (3, Some(3), None, 2, 2),
-            (4, Some(8), Some(800), append_version, append_version),
+            (4, Some(8), Some(800), insert_version, insert_version),
             (5, Some(4), Some(400), version, version),
         ],
     )

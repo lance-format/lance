@@ -1512,11 +1512,9 @@ impl MergeInsertJob {
         let joined = self
             .create_joined_stream(provider, source_mode, source_projection)
             .await?;
-        let inserted_rows_filter = self
-            .params
-            .primary_key_field_ids(full_schema)
-            .filter(|_| self.params.insert_not_matched)
-            .map(KeyExistenceFilterBuilder::new);
+        let inserted_rows_filter = Some(KeyExistenceFilterBuilder::new(
+            self.params.on_field_ids(full_schema)?,
+        ));
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
@@ -1583,6 +1581,11 @@ impl MergeInsertJob {
             let (updated_fragments, removed_fragment_ids) =
                 Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
 
+            let inserted_rows_filter = inserted_rows_filter
+                .lock()
+                .map_err(|_| Error::internal("Merge insert key filter lock poisoned"))?
+                .as_ref()
+                .map(KeyExistenceFilterBuilder::build);
             let operation = Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
@@ -1595,12 +1598,12 @@ impl MergeInsertJob {
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
-                inserted_rows_filter: None,
+                inserted_rows_filter: inserted_rows_filter.clone(),
                 updated_fragment_offsets: None,
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows, None)
+            (operation, affected_rows, inserted_rows_filter)
         } else if !is_full_schema {
             // Non-delete partial-schema merge: patch the provided columns into
             // existing fragments in place. (Delete is handled above; a wider
