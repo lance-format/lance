@@ -22,6 +22,7 @@ use object_store::path::Path;
 use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
+use crate::dataset::TableLayoutConfig;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{
@@ -301,6 +302,12 @@ impl<'a> InsertBuilder<'a> {
                         format_duration(duration).to_string(),
                     );
                 }
+                // Persist the layout this write used with the first data-bearing
+                // version, so later appends and compaction follow the same file
+                // sizing without a second config commit. Only explicit settings
+                // are persisted: a write that leaves them unset keeps the table
+                // config it was given.
+                upsert_values.extend(context.params.layout.config_values());
                 let config_upsert_values = if upsert_values.is_empty() {
                     None
                 } else {
@@ -483,6 +490,24 @@ impl<'a> InsertBuilder<'a> {
             WriteDestination::Uri(_) => params.storage_version_or_default(),
         };
 
+        // Size this write's files by the table's layout unless the caller
+        // overrode it. `max_rows_per_file` and `max_bytes_per_file` remain the
+        // defaults of last resort, so writes to tables without layout config are
+        // unchanged.
+        let persisted_layout = match &dest {
+            WriteDestination::Dataset(dataset) => {
+                TableLayoutConfig::from_dataset_config(&dataset.manifest.config)?
+            }
+            WriteDestination::Uri(_) => TableLayoutConfig::default(),
+        };
+        let resolved_layout = params.layout.fallback_to(persisted_layout);
+        if let Some(target_rows_per_fragment) = resolved_layout.target_rows_per_fragment {
+            params.max_rows_per_file = target_rows_per_fragment;
+        }
+        if let Some(max_bytes_per_file) = resolved_layout.max_bytes_per_file {
+            params.max_bytes_per_file = max_bytes_per_file;
+        }
+
         Ok(WriteContext {
             params,
             dest,
@@ -521,6 +546,278 @@ mod test {
     use crate::session::Session;
 
     use super::*;
+
+    fn layout_for_rows(target_rows_per_fragment: usize) -> crate::dataset::TableLayoutConfig {
+        crate::dataset::TableLayoutConfig {
+            target_rows_per_fragment: Some(target_rows_per_fragment),
+            ..Default::default()
+        }
+    }
+
+    fn id_batch(num_rows: usize) -> RecordBatch {
+        record_batch!((
+            "id",
+            Int32,
+            Int32Array::from_iter_values(0..num_rows as i32)
+        ))
+        .unwrap()
+    }
+
+    fn fragment_row_counts(dataset: &Dataset) -> Vec<usize> {
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata.physical_rows.unwrap())
+            .collect()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn write_layout_is_committed_with_the_first_version(
+        #[values(WriteMode::Create, WriteMode::Append, WriteMode::Overwrite)] mode: WriteMode,
+    ) {
+        let params = WriteParams {
+            mode,
+            layout: layout_for_rows(100),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&params)
+            .execute(vec![id_batch(250)])
+            .await
+            .unwrap();
+
+        // The layout and the data land together, so version 1 already describes
+        // how its own files are sized.
+        assert_eq!(dataset.manifest.version, 1);
+        assert_eq!(
+            dataset
+                .config()
+                .get("lance.layout.target_rows_per_fragment")
+                .map(String::as_str),
+            Some("100")
+        );
+        // Only the settings this write used are persisted.
+        assert!(
+            !dataset
+                .config()
+                .contains_key("lance.layout.max_bytes_per_file")
+        );
+        assert_eq!(fragment_row_counts(&dataset), vec![100, 100, 50]);
+    }
+
+    #[tokio::test]
+    async fn write_layout_sizes_files_by_bytes() {
+        // Ten batches of ten rows, written as V1 files so each row group is
+        // flushed to the file and the byte bound can be observed between them.
+        // The payloads are incompressible on purpose, so the encoded bytes track
+        // the input size.
+        let payload = 1024;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next_payload = || {
+            (0..payload)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state & 0xFF) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let mut batches = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let payloads = BinaryArray::from_iter_values((0..10).map(|_| next_payload()));
+            batches.push(
+                RecordBatch::try_from_iter([
+                    (
+                        "id",
+                        Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
+                    ),
+                    ("payload", Arc::new(payloads) as ArrayRef),
+                ])
+                .unwrap(),
+            );
+        }
+
+        let max_bytes_per_file = 25 * 1024;
+        let v1_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        // Control: the same input and file version without the layout bound write
+        // one file, so the split below is the bound's doing.
+        let unbounded = InsertBuilder::new("memory://")
+            .with_params(&v1_params)
+            .execute(batches.clone())
+            .await
+            .unwrap();
+        assert_eq!(fragment_row_counts(&unbounded), vec![100]);
+
+        let params = WriteParams {
+            layout: crate::dataset::TableLayoutConfig {
+                max_bytes_per_file: Some(max_bytes_per_file),
+                ..Default::default()
+            },
+            ..v1_params
+        };
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&params)
+            .execute(batches)
+            .await
+            .unwrap();
+
+        let persisted_max_bytes = max_bytes_per_file.to_string();
+        assert_eq!(
+            dataset
+                .config()
+                .get("lance.layout.max_bytes_per_file")
+                .map(String::as_str),
+            Some(persisted_max_bytes.as_str())
+        );
+        // The bound is soft, so a file may pass it by one batch; what it must do
+        // is close files instead of writing the whole input as one.
+        let fragment_rows = fragment_row_counts(&dataset);
+        assert!(fragment_rows.len() > 1, "got {fragment_rows:?}");
+        assert_eq!(fragment_rows.iter().sum::<usize>(), 100);
+    }
+
+    #[tokio::test]
+    async fn write_layout_applies_after_reopen_and_to_appends() {
+        let dir = TempStrDir::default();
+        let create_params = WriteParams {
+            layout: layout_for_rows(50),
+            ..Default::default()
+        };
+        InsertBuilder::new(dir.as_str())
+            .with_params(&create_params)
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(fragment_row_counts(&reopened), vec![50, 50, 20]);
+
+        // A plain append sets no layout, so it follows the persisted one even
+        // though `WriteParams::default()` allows a million rows per file.
+        let appended = InsertBuilder::new(Arc::new(reopened))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![id_batch(60)])
+            .await
+            .unwrap();
+
+        assert_eq!(appended.manifest.version, 2);
+        assert_eq!(fragment_row_counts(&appended), vec![50, 50, 20, 50, 10]);
+        assert_eq!(
+            appended
+                .config()
+                .get("lance.layout.target_rows_per_fragment")
+                .map(String::as_str),
+            Some("50")
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn explicit_write_layout_wins_over_persisted_layout(
+        // The second case is exactly `WriteParams::default().max_rows_per_file`:
+        // setting a value equal to a default is still an explicit choice.
+        #[values(1000, 1024 * 1024)] explicit_rows_per_file: usize,
+    ) {
+        let create_params = WriteParams {
+            layout: layout_for_rows(50),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&create_params)
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+
+        let appended = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                layout: layout_for_rows(explicit_rows_per_file),
+                ..Default::default()
+            })
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+
+        // 120 rows fit one file under either override; the persisted 50-row
+        // target would have produced three.
+        assert_eq!(&fragment_row_counts(&appended)[3..], &[120]);
+    }
+
+    #[tokio::test]
+    async fn overwrite_uses_the_persisted_layout_without_changing_it() {
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                layout: layout_for_rows(50),
+                ..Default::default()
+            })
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+
+        // An overwrite override sizes this version's files but, like the rest of
+        // the table config, is not written by an overwrite.
+        let overwritten = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                layout: layout_for_rows(1000),
+                ..Default::default()
+            })
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+        assert_eq!(overwritten.manifest.version, 2);
+        assert_eq!(fragment_row_counts(&overwritten), vec![120]);
+        assert_eq!(
+            overwritten
+                .config()
+                .get("lance.layout.target_rows_per_fragment")
+                .map(String::as_str),
+            Some("50")
+        );
+
+        let appended = InsertBuilder::new(Arc::new(overwritten))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+        assert_eq!(fragment_row_counts(&appended), vec![120, 50, 50, 20]);
+    }
+
+    #[tokio::test]
+    async fn write_ignores_legacy_compaction_keys() {
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+        dataset
+            .update_config([("lance.compaction.target_rows_per_fragment", "10")])
+            .await
+            .unwrap();
+
+        let appended = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![id_batch(120)])
+            .await
+            .unwrap();
+
+        // The compaction-only key never sizes writes, so 120 rows stay one file.
+        assert_eq!(fragment_row_counts(&appended), vec![120, 120]);
+    }
 
     #[rstest]
     #[tokio::test]

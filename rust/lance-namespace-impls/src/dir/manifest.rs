@@ -28,7 +28,8 @@ use futures::{
 use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
-    InsertBuilder, ReadParams, WhenMatched, WriteMode, WriteParams, builder::DatasetBuilder,
+    InsertBuilder, ReadParams, TableLayoutConfig, WhenMatched, WriteMode, WriteParams,
+    builder::DatasetBuilder,
 };
 use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
@@ -2271,12 +2272,15 @@ impl ManifestNamespace {
             // Pin both limits so the overwrite never splits into multiple fragments: the
             // replacement indices map each row to address `(0 << 32) | offset`, valid only
             // for a single fragment with id 0. The row count is bounded below u32::MAX by
-            // `ManifestIndexAccumulator::next_row_id`.
+            // `ManifestIndexAccumulator::next_row_id`. They are stated as explicit layout
+            // overrides so a table `lance.layout.*` setting cannot split the rewrite either.
             let write_params = WriteParams {
                 mode: WriteMode::Overwrite,
                 session: self.session.clone(),
-                max_rows_per_file: u32::MAX as usize,
-                max_bytes_per_file: usize::MAX,
+                layout: TableLayoutConfig {
+                    target_rows_per_fragment: Some(u32::MAX as usize),
+                    max_bytes_per_file: Some(usize::MAX),
+                },
                 skip_auto_cleanup: true,
                 ..WriteParams::default()
             };

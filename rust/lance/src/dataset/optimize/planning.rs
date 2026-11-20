@@ -35,7 +35,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::index::{
     load_indices_for_remapping, vector_segment_merge_groups_for_compaction,
 };
-use crate::dataset::{WriteParams, versions};
+use crate::dataset::{TableLayoutConfig, WriteParams, versions};
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::vector::details::needs_vector_details_inference;
 use crate::index::{
@@ -424,6 +424,11 @@ impl CompactionOptions {
     /// - `lance.compaction.max_overlays_per_fragment`
     /// - `lance.compaction.max_data_files_per_fragment`
     /// - `lance.compaction.data_storage_version`
+    ///
+    /// The table's shared layout settings (`lance.layout.target_rows_per_fragment`
+    /// and `lance.layout.max_bytes_per_file`) fill in the row target and the byte
+    /// bound first, so the compaction-specific keys above take precedence over
+    /// them.
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -434,7 +439,20 @@ impl CompactionOptions {
     ///
     /// Only fields with corresponding config keys are modified; other fields
     /// retain their current values.
+    ///
+    /// The shared `lance.layout.*` settings are applied before the
+    /// `lance.compaction.*` keys, so a compaction-specific key wins over the
+    /// table layout. A caller that needs a value to win over both starts from
+    /// [`Self::from_dataset_config`] and assigns the field afterwards, which is
+    /// also how the bindings apply their explicit arguments.
     pub fn apply_dataset_config(&mut self, config: &HashMap<String, String>) -> Result<()> {
+        let layout = TableLayoutConfig::from_dataset_config(config)?;
+        if let Some(target_rows_per_fragment) = layout.target_rows_per_fragment {
+            self.target_rows_per_fragment = target_rows_per_fragment;
+        }
+        if let Some(max_bytes_per_file) = layout.max_bytes_per_file {
+            self.max_bytes_per_file = Some(max_bytes_per_file);
+        }
         for (key, value) in config {
             let Some(field) = key.strip_prefix(COMPACTION_CONFIG_PREFIX) else {
                 continue;
