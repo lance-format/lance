@@ -14,7 +14,7 @@ rust-version.workspace = true
 [dependencies]
 arrayref = "0.3"
 crunchy = "0.2"
-paste = "1"
+paste = { package = "pastey", version = "=0.2.3" }
 seq-macro = "0.3"
 
 [dev-dependencies]
