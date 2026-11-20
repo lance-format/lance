@@ -2776,7 +2776,7 @@ async fn test_indexed_merge_insert_update_if_primary_key() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false).with_metadata(
             [(
-                "lance-schema:unenforced-primary-key".to_string(),
+                lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
                 "true".to_string(),
             )]
             .into(),
