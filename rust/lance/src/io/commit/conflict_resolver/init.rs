@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::datatypes::Schema;
+
 use super::*;
 
 impl<'a> TransactionRebase<'a> {
@@ -20,14 +22,21 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateBases { .. } => {
+            | Operation::UpdateBases { .. }
+            // An action set can modify fragments, but conflicts against it are
+            // settled by comparing footprints, which are derived from the
+            // actions rather than from collected rebase state.
+            | Operation::CompositeOperation(_) => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
+                let is_composite =
+                    matches!(transaction.operation, Operation::CompositeOperation(_));
                 let read_fragments = is_create_index.then(|| ReadFragments {
                     fragments: dataset.fragments().clone(),
                     moved_files: None,
                 });
-                let read_schema = is_create_index.then(|| dataset.schema().clone());
+                let read_schema =
+                    (is_create_index || is_composite).then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
                         if new_indices
@@ -247,21 +256,32 @@ impl<'a> TransactionRebase<'a> {
         self
     }
 
-    /// Use the transaction's read snapshot for every CreateIndex check. The
-    /// submitting handle may already be newer, hiding rewritten columns or
-    /// removed fields when compared with the latest version.
+    /// Use the transaction's read snapshot for every CreateIndex check, and for
+    /// an action set's footprints. The submitting handle may already be newer,
+    /// hiding rewritten columns or removed fields when compared with the latest
+    /// version.
     pub(crate) fn with_read_version_dataset(mut self, dataset: &Dataset) -> Self {
-        if matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
-            self.read_fragments = Some(ReadFragments {
-                fragments: dataset.fragments().clone(),
-                moved_files: None,
-            });
-            self.read_schema = Some(dataset.schema().clone());
+        match self.transaction.operation {
+            Operation::CreateIndex { .. } => {
+                self.read_fragments = Some(ReadFragments {
+                    fragments: dataset.fragments().clone(),
+                    moved_files: None,
+                });
+                self.read_schema = Some(dataset.schema().clone());
+            }
+            Operation::CompositeOperation(_) => {
+                self.read_schema = Some(dataset.schema().clone());
+            }
+            _ => {}
         }
         self
     }
 
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
+        if matches!(self.transaction.operation, Operation::CompositeOperation(_)) {
+            self.current_schema = Some(dataset.schema().clone());
+            return Ok(());
+        }
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }
@@ -347,20 +367,41 @@ impl<'a> TransactionRebase<'a> {
         &mut self,
         missing: &[u64],
         latest_version: u64,
+        read_schema: &Schema,
+        latest_schema: &Schema,
     ) -> Result<()> {
         if missing.is_empty() {
             return Ok(());
         }
+        if conflicts_with_unseen_schema_change(
+            &self.transaction.operation,
+            read_schema,
+            latest_schema,
+        ) {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} between transaction read version {} and latest                      version {latest_version} were cleaned up, so {} cannot safely check                      conflicts with schema changes; retry the operation on the latest version",
+                    self.transaction.read_version, self.transaction.operation
+                )
+                .into(),
+            ));
+        }
         // A missing transaction may have changed a source fragment or inserted
         // the same keys without touching any shared fragment. Neither conflict
         // check can establish safety across a gap.
+        //
+        // An action set is checked by comparing footprints, which needs every
+        // transaction in the window: replay re-validates only what still
+        // exists, not that a read, key, or definition it depends on is
+        // unchanged. Nearly every action set depends on one, so refuse them all.
         if !self.modified_fragment_ids.is_empty()
             || matches!(
                 &self.transaction.operation,
                 Operation::Update {
                     inserted_rows_filter: Some(_),
                     ..
-                }
+                } | Operation::CompositeOperation(_)
             )
         {
             return Err(Error::retryable_commit_conflict_source(
@@ -414,6 +455,61 @@ impl<'a> TransactionRebase<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether a schema change hidden in a history gap could be undone or violated
+/// by `operation`. A Project replaces the schema with one derived from its read
+/// version. New rows were only validated against the read schema, and their
+/// files keep the field ids they were written with: a field that was dropped,
+/// recast or reused by an overwrite would read them back as nulls or as the
+/// wrong type, and a column that became non-nullable could hold their nulls.
+fn conflicts_with_unseen_schema_change(
+    operation: &Operation,
+    read_schema: &Schema,
+    latest_schema: &Schema,
+) -> bool {
+    let new_fragments = match operation {
+        Operation::Project { .. } => return true,
+        Operation::Append { fragments } => fragments,
+        Operation::Update { new_fragments, .. } => new_fragments,
+        _ => return false,
+    };
+    if new_fragments.is_empty() {
+        return false;
+    }
+    let changes_written_field = new_fragments
+        .iter()
+        .flat_map(|fragment| &fragment.files)
+        .flat_map(|file| file.fields.iter())
+        .filter(|field_id| **field_id >= 0)
+        .any(|field_id| {
+            match (
+                read_schema.field_ancestry_by_id(*field_id),
+                latest_schema.field_ancestry_by_id(*field_id),
+            ) {
+                // An overwrite can reuse an id for another column of the same
+                // type, or put the same path under another container kind, so
+                // every ancestor must keep its name and kind.
+                (Some(read_path), Some(latest_path)) => {
+                    !read_path
+                        .iter()
+                        .map(|field| (&field.name, &field.logical_type))
+                        .eq(latest_path
+                            .iter()
+                            .map(|field| (&field.name, &field.logical_type)))
+                        || read_path.last().map(|field| field.data_type())
+                            != latest_path.last().map(|field| field.data_type())
+                }
+                _ => true,
+            }
+        });
+    let requires_new_values = latest_schema.fields_pre_order().any(|field| {
+        !field.nullable
+            && read_schema
+                .field_by_id(field.id)
+                .is_none_or(|read_field| read_field.nullable)
+    });
+    changes_written_field || requires_new_values
 }
 
 /// See `RewriteReuseState`. `dataset` is the handle the transaction is committed

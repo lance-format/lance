@@ -6,9 +6,9 @@ import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 
+from lance.dependencies import numpy as np
 from lance.indices.ivf import IvfModel
 from lance.indices.pq import PqModel
 
@@ -180,8 +180,9 @@ class IndicesBuilder:
         ----------
 
         ivf_model: IvfModel
-            The IVF model to use to partition the vectors into clusters.  This is
-            needed because PQ is trained on residuals from the IVF model.
+            The IVF model to use to partition the vectors into clusters.  PQ is
+            trained on the residuals from this model for L2 and cosine, and on the
+            raw vectors for dot, matching the single-node index build.
         num_subvectors: int
             The number of subvectors to divide the source vectors into.  This must be
             a divisor of the vector dimension.  If not specified the default will be
@@ -266,7 +267,7 @@ class IndicesBuilder:
             fragment_ids=fragment_ids,
         )
 
-        # Global PQ training using IVF residuals
+        # Global PQ training (residuals for L2 and cosine, raw vectors for dot).
         pq_model = self.train_pq(
             ivf_model,
             num_subvectors,

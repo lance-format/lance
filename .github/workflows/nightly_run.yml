@@ -44,6 +44,10 @@ jobs:
           # Run only the jumbo tests in release mode with limited parallelism
           # to avoid OOM issues (these tests use >5GiB memory each)
           cargo test --release --package lance-encoding -- --ignored jumbo --test-threads=1
+      - name: Run IVF Split Memory Test
+        run: |
+          cd rust
+          cargo test --release --package lance --test resource_tests -- --ignored test_ivf_split_reshuffle_memory_stays_bounded
 
   # Full Rust test suite on Windows. PRs only test lance-io on Windows (see
   # windows-build in rust.yml) to keep that job on the free 4-core runner.

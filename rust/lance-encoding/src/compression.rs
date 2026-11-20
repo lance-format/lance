@@ -966,6 +966,63 @@ pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>
     raw.then(|| Box::new(ValueEncoder::default()) as _)
 }
 
+/// Reject a packed struct whose children cannot be stored as one packed value.
+///
+/// Packed structs are encoded as a single primitive column, so every child,
+/// including the children of nested structs and fixed-size lists, must be a
+/// value type. A list, map or similar child would otherwise panic while the
+/// column is converted into a data block, so this runs when the encoder is
+/// created, before any data is written.
+pub fn validate_packed_struct_children(field: &Field) -> Result<()> {
+    fn find_unsupported<'a>(
+        path: &mut Vec<&'a str>,
+        name: &'a str,
+        data_type: &'a DataType,
+    ) -> Option<&'a DataType> {
+        path.push(name);
+        let found = match data_type {
+            DataType::Struct(fields) => fields
+                .iter()
+                .find_map(|child| find_unsupported(path, child.name(), child.data_type())),
+            DataType::FixedSizeList(item, _) => {
+                find_unsupported(path, item.name(), item.data_type())
+            }
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::Map(_, _)
+            | DataType::RunEndEncoded(_, _)
+            | DataType::Union(_, _) => Some(data_type),
+            _ => None,
+        };
+        if found.is_none() {
+            path.pop();
+        }
+        found
+    }
+
+    let DataType::Struct(fields) = field.data_type() else {
+        return Ok(());
+    };
+    let mut path = Vec::new();
+    if let Some(data_type) = fields
+        .iter()
+        .find_map(|child| find_unsupported(&mut path, child.name(), child.data_type()))
+    {
+        return Err(Error::not_supported_source(
+            format!(
+                "Packed struct field '{}' has a child '{}' of type {}, which packed struct encoding does not support",
+                field.name,
+                path.join("."),
+                data_type,
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {
     let DataBlock::Struct(data) = data else {
         return Ok(None);

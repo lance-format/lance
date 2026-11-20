@@ -3087,6 +3087,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -5123,6 +5124,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
 
         async fn multivector_scoring(
@@ -5958,8 +5960,8 @@ mod tests {
         struct MaskLoader(RowAddrMask);
         #[async_trait::async_trait]
         impl FilterLoader for MaskLoader {
-            async fn load(self: Box<Self>) -> Result<RowAddrMask> {
-                Ok(self.0)
+            async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
+                Ok(Arc::new(self.0))
             }
         }
         let owning = |fragments: &[u32]| {

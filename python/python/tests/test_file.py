@@ -967,6 +967,26 @@ def test_session_read_range(tmp_path):
         session.read_range("data/missing.bin", 0, 4)
 
 
+def test_session_size(tmp_path):
+    """Test that LanceFileSession.size() returns the object size without reading it."""
+    session = LanceFileSession(str(tmp_path))
+
+    payload = bytes(range(256)) * 3
+    local = tmp_path / "src.bin"
+    local.write_bytes(payload)
+    session.upload_file(str(local), "data/file.bin")
+    assert session.size("data/file.bin") == len(payload)
+
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+    session.upload_file(str(empty), "data/nested/empty.bin")
+    assert session.size("data/nested/empty.bin") == 0
+
+    # A missing object raises OSError (consistent with read_range).
+    with pytest.raises(OSError):
+        session.size("data/missing.bin")
+
+
 def test_session_delete_file(tmp_path):
     """Test that LanceFileSession.delete_file() removes files and is idempotent."""
     session = LanceFileSession(str(tmp_path))

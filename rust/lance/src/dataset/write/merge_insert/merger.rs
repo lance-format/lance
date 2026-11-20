@@ -24,10 +24,8 @@ use futures::{
 };
 use lance_arrow::SchemaExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD, Result};
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use roaring::RoaringTreemap;
+use std::sync::{Arc, Mutex};
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -118,7 +116,7 @@ pub(super) struct Merger {
     /// Whether to enable stable row ids
     enable_stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
-    processed_row_ids: Arc<Mutex<HashSet<u64>>>,
+    processed_row_ids: Arc<Mutex<RoaringTreemap>>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
     processed_insert_keys: Arc<Mutex<InsertedKeyTracker>>,
     /// Inserted keys for declared primary-key conflict detection; absent otherwise.
@@ -204,7 +202,7 @@ impl Merger {
             with_row_id,
             output_schema,
             enable_stable_row_ids,
-            processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
+            processed_row_ids: Arc::new(Mutex::new(RoaringTreemap::new())),
             processed_insert_keys: Arc::new(Mutex::new(InsertedKeyTracker::default())),
             inserted_rows_filter: Arc::new(Mutex::new(inserted_rows_filter)),
         })

@@ -9,6 +9,10 @@ use super::*;
 async fn test_list_versions_under_ordering_and_limit() {
     use lance_table::io::commit::ManifestNamingScheme;
 
+    fn versions(r: &[TableVersion]) -> Vec<i64> {
+        r.iter().map(|t| t.version).collect()
+    }
+
     async fn seed_and_check(ns: &DirectoryNamespace) {
         let table_path = ns.base_path.clone().join("lv_test.lance");
         for v in 1..=7u64 {
@@ -32,9 +36,6 @@ async fn test_list_versions_under_ordering_and_limit() {
             .put(&detached, b"d".as_slice())
             .await
             .unwrap();
-        fn versions(r: &[TableVersion]) -> Vec<i64> {
-            r.iter().map(|t| t.version).collect()
-        }
 
         let got = ns
             .list_versions_under(&table_path, true, Some(1))
@@ -83,12 +84,43 @@ async fn test_list_versions_under_ordering_and_limit() {
         assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
     }
 
+    /// V1 manifest names are unpadded (`10.manifest` sorts lexically before
+    /// `2.manifest`), so even a lexically-ordered listing does not arrive in
+    /// version order: V1 listings must be collected and sorted numerically,
+    /// never early-stopped as if the stream matched the request.
+    async fn seed_v1_and_check(ns: &DirectoryNamespace) {
+        let table_path = ns.base_path.clone().join("lv_test_v1.lance");
+        for v in 1..=12u64 {
+            let p = ManifestNamingScheme::V1.manifest_path(&table_path, v);
+            ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
+        }
+
+        let got = ns
+            .list_versions_under(&table_path, false, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(versions(&got), vec![1, 2, 3, 4, 5]);
+
+        let got = ns
+            .list_versions_under(&table_path, false, None)
+            .await
+            .unwrap();
+        assert_eq!(versions(&got), (1..=12i64).collect::<Vec<_>>());
+
+        let got = ns
+            .list_versions_under(&table_path, true, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(versions(&got), vec![12, 11, 10]);
+    }
+
     let ns_mem = DirectoryNamespaceBuilder::new("memory://lv-test")
         .build()
         .await
         .unwrap();
     assert!(ns_mem.object_store.list_is_lexically_ordered);
     seed_and_check(&ns_mem).await;
+    seed_v1_and_check(&ns_mem).await;
 
     let (ns_fs, _tmp) = create_test_namespace().await;
     assert!(!ns_fs.object_store.list_is_lexically_ordered);

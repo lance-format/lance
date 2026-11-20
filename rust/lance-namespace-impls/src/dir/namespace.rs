@@ -666,12 +666,7 @@ impl LanceNamespace for DirectoryNamespace {
                 None,
             )
             .await
-            .map_err(|e| {
-                Error::io_source(box_error(std::io::Error::other(format!(
-                    "Failed to add columns: {}",
-                    e
-                ))))
-            })?;
+            .map_err(|e| Self::map_mutation_error(e, "add_columns", &table_uri))?;
 
         let version = dataset.version().version as i64;
         Ok(AlterTableAddColumnsResponse::new(version))
@@ -838,7 +833,7 @@ impl LanceNamespace for DirectoryNamespace {
         })?;
 
         // Idempotent retry: version path already published with the same content.
-        match self.object_store.inner.head(&final_path).await {
+        match self.object_store.stat(&final_path).await {
             Ok(existing_meta) => {
                 return self
                     .resolve_existing_table_version(ExistingTableVersionResolve {
@@ -884,7 +879,7 @@ impl LanceNamespace for DirectoryNamespace {
             Err(ObjectStoreError::AlreadyExists { .. })
             | Err(ObjectStoreError::Precondition { .. }) => {
                 // Lost a Create race: succeed only if the winner published identical bytes.
-                let existing_meta = self.object_store.inner.head(&final_path).await.map_err(|e| {
+                let existing_meta = self.object_store.stat(&final_path).await.map_err(|e| {
                     lance_core::Error::from(NamespaceError::Internal {
                         message: format!(
                             "Version {} conflict for table at '{}' but failed to stat winner: {}",
@@ -921,19 +916,14 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        let final_meta = self
-            .object_store
-            .inner
-            .head(&final_path)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to stat created version {} for table at '{}': {}",
-                        version, table_uri, e
-                    ),
-                })
-            })?;
+        let final_meta = self.object_store.stat(&final_path).await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to stat created version {} for table at '{}': {}",
+                    version, table_uri, e
+                ),
+            })
+        })?;
 
         // Delete the staging manifest after successful copy
         if let Err(e) = self.object_store.inner.delete(&staging_path).await {
