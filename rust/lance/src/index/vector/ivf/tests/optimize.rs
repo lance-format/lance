@@ -167,8 +167,10 @@ async fn test_optimize_ivf_flat_binary_vectors() {
 
 #[tokio::test]
 async fn test_optimize_ivf_hnsw_records_actual_file_sizes() {
-    // Regression test: `optimize_ivf_hnsw_indices` must record the on-disk
-    // file sizes, which are only known after `finish()` writes the footer.
+    // Regression test: the current-format IVF_HNSW_SQ builder must record the
+    // on-disk file sizes, which are only known after `finish()` writes the
+    // footer. `IndexFileVersion::Legacy` does not apply to HNSW, so the index
+    // must stay on the v2 path this covers.
     const DIM: usize = 16;
     let data = gen_batch()
         .col(
@@ -184,15 +186,12 @@ async fn test_optimize_ivf_hnsw_records_actual_file_sizes() {
         .await
         .unwrap();
 
-    // Legacy file version keeps the index on the v1 path that goes through
-    // `optimize_ivf_hnsw_indices`.
-    let mut params = VectorIndexParams::with_ivf_hnsw_sq_params(
+    let params = VectorIndexParams::with_ivf_hnsw_sq_params(
         MetricType::L2,
         IvfBuildParams::new(2),
         HnswBuildParams::default().num_edges(50),
         SQBuildParams::default(),
     );
-    params.version(IndexFileVersion::Legacy);
     dataset
         .create_index(&["vec"], IndexType::Vector, None, &params, false)
         .await
@@ -239,6 +238,82 @@ async fn test_optimize_ivf_hnsw_records_actual_file_sizes() {
             file.path
         );
     }
+}
+
+/// A released 0.11.0 IVF_HNSW_SQ index is a legacy (0, 2) file. There is no
+/// incremental legacy HNSW writer, so optimize must refuse it with the existing
+/// NotSupported guidance before creating any output or publishing a version.
+#[tokio::test]
+async fn test_optimize_legacy_hnsw_sq_refuses_before_writing() {
+    let test_dir = copy_test_data_to_tmp("v0.11.0/legacy_hnsw_sq").unwrap();
+    let uri = test_dir.path_str();
+    let mut dataset = Dataset::open(&uri).await.unwrap();
+    let segments = dataset.load_indices().await.unwrap();
+    assert_eq!(segments.len(), 1);
+    let legacy_uuid = segments[0].uuid;
+    assert_eq!(
+        index_file_version(&dataset, &legacy_uuid).await,
+        (0, 2),
+        "the fixture must remain a legacy v1 index file"
+    );
+    let legacy = dataset
+        .open_vector_index("vector", &legacy_uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert!(
+        legacy.as_any().is::<IVFIndex>(),
+        "the fixture is a v1 IVFIndex"
+    );
+    assert!(matches!(
+        legacy.sub_index_type(),
+        (SubIndexType::Hnsw, QuantizationType::Scalar)
+    ));
+    assert_eq!(
+        dataset
+            .unindexed_fragments("vector_idx")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the fixture must leave an unindexed fragment for optimize"
+    );
+
+    // The legacy file must still serve its indexed rows before any optimize.
+    let old_vector = vector_for_id(&dataset, 0).await;
+    assert!(
+        nearest_ids(&dataset, &old_vector, 10).await.contains(&0),
+        "the legacy index must still read its old rows"
+    );
+
+    let version = dataset.version().version;
+    let index_dir_count = || {
+        std::fs::read_dir(test_dir.std_path().join("_indices"))
+            .unwrap()
+            .count()
+    };
+    let index_dirs_before = index_dir_count();
+    let error = dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::NotSupported { .. }),
+        "expected NotSupported, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("IVF_HNSW_SQ"), "{message}");
+    assert!(message.contains("retrain"), "{message}");
+    assert_eq!(
+        dataset.version().version,
+        version,
+        "the rejected optimize must not publish a version"
+    );
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+    assert_eq!(
+        index_dir_count(),
+        index_dirs_before,
+        "the rejected optimize must not allocate an index output directory"
+    );
 }
 
 #[tokio::test]
@@ -719,4 +794,53 @@ async fn test_steady_state_splits_v3_segment_beside_legacy_segment() {
         rebuilt.ivf_model().num_partitions() > 2,
         "the oversized partition must be split"
     );
+}
+
+async fn index_file_version(dataset: &Dataset, uuid: &Uuid) -> (u16, u16) {
+    let path = dataset
+        .indices_dir()
+        .join(uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let reader = dataset.object_store.open(&path).await.unwrap();
+    let footer = read_last_block(reader.as_ref()).await.unwrap();
+    read_version(&footer).unwrap()
+}
+
+async fn vector_for_id(dataset: &Dataset, id: i64) -> Float32Array {
+    let batch = dataset
+        .scan()
+        .project(&["id", "vector"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["id"].as_primitive::<arrow_array::types::Int64Type>();
+    let position = ids
+        .values()
+        .iter()
+        .position(|value| *value == id)
+        .unwrap_or_else(|| panic!("row id {id} is missing"));
+    batch["vector"]
+        .as_fixed_size_list()
+        .value(position)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap()
+        .clone()
+}
+
+async fn nearest_ids(dataset: &Dataset, query: &Float32Array, k: usize) -> Vec<i64> {
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vector", query, k)
+        .unwrap()
+        .minimum_nprobes(2)
+        .use_index(true)
+        .project(&["id"])
+        .unwrap();
+    let result = scanner.try_into_batch().await.unwrap();
+    result["id"]
+        .as_primitive::<arrow_array::types::Int64Type>()
+        .values()
+        .to_vec()
 }

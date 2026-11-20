@@ -50,14 +50,12 @@ use futures::{
     Stream, TryStreamExt,
     stream::{self, StreamExt},
 };
-use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
-    traits::DatasetTakeRows,
     utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
@@ -1047,8 +1045,11 @@ pub(crate) async fn optimize_vector_indices(
         .ok_or(Error::index(
             "optimizing vector index: the first index isn't IVF".to_string(),
         ))?;
-    let legacy_sub_index = first_idx.sub_index.as_any();
-    if !legacy_sub_index.is::<PQIndex>() && !legacy_sub_index.is::<HNSWIndex<ScalarQuantizer>>() {
+    // Only the legacy IVF_PQ writer exists. Reject every other legacy
+    // sub-index before creating any output file: the HNSW partition writer
+    // rejects scalar quantization, so allowing it here would create empty
+    // index and auxiliary writers before failing.
+    if !first_idx.sub_index.as_any().is::<PQIndex>() {
         let (sub_index_type, quantization_type) = first_idx.sub_index.sub_index_type();
         return Err(Error::not_supported(format!(
             "optimizing vector index: a legacy-format {} index cannot be optimized \
@@ -1076,51 +1077,30 @@ pub(crate) async fn optimize_vector_indices(
         .join(INDEX_FILE_NAME);
     let writer = object_store.create(&index_file).await?;
 
-    let (merged, files) =
-        if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
-            let (merged, file) = optimize_ivf_pq_indices(
-                first_idx,
-                pq_index,
-                vector_column,
-                unindexed,
-                &existing_indices,
-                options,
-                writer,
-                dataset.version().version,
-            )
-            .await?;
-            (merged, vec![file])
-        } else if let Some(hnsw_sq) = first_idx
-            .sub_index
-            .as_any()
-            .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
-        {
-            let aux_file = dataset
-                .indices_dir()
-                .join(new_uuid.to_string())
-                .join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_writer = object_store.create(&aux_file).await?;
-            optimize_ivf_hnsw_indices(
-                Arc::new(dataset),
-                first_idx,
-                hnsw_sq,
-                vector_column,
-                unindexed,
-                &existing_indices,
-                options,
-                writer,
-                aux_writer,
-            )
-            .await?
-        } else {
-            return Err(Error::internal(
+    let pq_index = first_idx
+        .sub_index
+        .as_any()
+        .downcast_ref::<PQIndex>()
+        .ok_or_else(|| {
+            Error::internal(
                 "optimizing vector index: the legacy sub index was checked above".to_string(),
-            ));
-        };
+            )
+        })?;
+    let (merged, file) = optimize_ivf_pq_indices(
+        first_idx,
+        pq_index,
+        vector_column,
+        unindexed,
+        &existing_indices,
+        options,
+        writer,
+        dataset.version().version,
+    )
+    .await?;
 
     // never change the index version,
     // because we won't update the legacy vector index format
-    Ok((new_uuid, merged, files))
+    Ok((new_uuid, merged, vec![file]))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -1498,172 +1478,6 @@ async fn optimize_ivf_pq_indices(
             size_bytes,
             file_metadata_size_bytes: None,
         },
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn optimize_ivf_hnsw_indices<Q: Quantization>(
-    dataset: Arc<dyn DatasetTakeRows>,
-    first_idx: &IVFIndex,
-    hnsw_index: &HNSWIndex<Q>,
-    vector_column: &str,
-    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn VectorIndex>],
-    options: &OptimizeOptions,
-    writer: Box<dyn Writer>,
-    aux_writer: Box<dyn Writer>,
-) -> Result<(usize, Vec<IndexFile>)> {
-    let distance_type = first_idx.metric_type;
-    let quantizer = hnsw_index.quantizer().clone();
-    let ivf = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
-        first_idx.ivf.centroids.clone().unwrap(),
-        distance_type,
-        vector_column,
-        quantizer.clone(),
-        None,
-    )?;
-
-    // Shuffled un-indexed data with partition.
-    let unindexed_data = match unindexed {
-        Some(unindexed) => Some(
-            shuffle_dataset(
-                unindexed,
-                Arc::new(ivf),
-                None,
-                first_idx.ivf.num_partitions() as u32,
-                10000,
-                2,
-                None,
-            )
-            .await?,
-        ),
-        None => None,
-    };
-
-    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
-
-    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
-    let start_pos = if num_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - num_to_merge
-    };
-
-    let indices_to_merge = existing_indices[start_pos..]
-        .iter()
-        .map(|idx| {
-            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
-                "optimizing vector index: it is not a IVF index".to_string(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Prepare the HNSW writer
-    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer =
-        V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())?;
-    writer.add_metadata(
-        INDEX_METADATA_SCHEMA_KEY,
-        json!(IndexMetadata {
-            index_type: format!("IVF_HNSW_{}", quantizer.quantization_type()),
-            distance_type: distance_type.to_string(),
-        })
-        .to_string()
-        .as_str(),
-    );
-
-    // Prepare the quantization storage writer
-    let schema = Schema::new(vec![
-        ROW_ID_FIELD.clone(),
-        arrow_schema::Field::new(
-            quantizer.column(),
-            DataType::FixedSizeList(
-                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                quantizer.code_dim() as i32,
-            ),
-            false,
-        ),
-    ]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        V1FileWriter::with_object_writer(aux_writer, schema, &V1FileWriterOptions::default())?;
-    aux_writer.add_metadata(
-        INDEX_METADATA_SCHEMA_KEY,
-        json!(IndexMetadata {
-            index_type: quantizer.quantization_type().to_string(),
-            distance_type: distance_type.to_string(),
-        })
-        .to_string()
-        .as_str(),
-    );
-
-    // Write the metadata of quantizer
-    let quantization_metadata = match &quantizer {
-        Quantizer::Product(pq) => {
-            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
-            let codebook_pos = aux_writer.tell().await?;
-            aux_writer
-                .object_writer
-                .write_protobuf(&codebook_tensor)
-                .await?;
-
-            Some(QuantizationMetadata {
-                codebook_position: Some(codebook_pos),
-                ..Default::default()
-            })
-        }
-        _ => None,
-    };
-
-    aux_writer.add_metadata(
-        quantizer.metadata_key(),
-        quantizer
-            .metadata(quantization_metadata)?
-            .to_string()
-            .as_str(),
-    );
-
-    let hnsw_params = &hnsw_index.metadata().params;
-    let (hnsw_metadata, aux_ivf) = write_hnsw_quantization_index_partitions(
-        dataset,
-        vector_column,
-        distance_type,
-        hnsw_params,
-        &mut writer,
-        Some(&mut aux_writer),
-        &mut ivf_mut,
-        quantizer,
-        unindexed_data,
-        Some(&indices_to_merge),
-    )
-    .await?;
-
-    // Add the metadata of HNSW partitions
-    let hnsw_metadata_json = json!(hnsw_metadata);
-    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
-
-    ivf_mut.write(&mut writer).await?;
-    // `finish` writes the footer and returns the authoritative on-disk size.
-    let index_size = writer.finish().await?.size_bytes;
-
-    // Write the aux file
-    aux_ivf.write(&mut aux_writer).await?;
-    let aux_size = aux_writer.finish().await?.size_bytes;
-
-    Ok((
-        existing_indices.len() - start_pos,
-        vec![
-            IndexFile {
-                path: INDEX_FILE_NAME.to_string(),
-                size_bytes: index_size,
-                file_metadata_size_bytes: None,
-            },
-            IndexFile {
-                path: INDEX_AUXILIARY_FILE_NAME.to_string(),
-                size_bytes: aux_size,
-                file_metadata_size_bytes: None,
-            },
-        ],
     ))
 }
 
