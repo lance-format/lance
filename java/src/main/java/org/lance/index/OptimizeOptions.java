@@ -61,7 +61,11 @@ public class OptimizeOptions {
     return indexNames;
   }
 
-  /** Whether to retrain the index instead of performing an incremental merge. */
+  /**
+   * Whether to retrain the index instead of performing an incremental merge.
+   *
+   * <p>Only vector indices are retrained; scalar and full-text search indices are not.
+   */
   public boolean isRetrain() {
     return retrain;
   }
@@ -140,7 +144,8 @@ public class OptimizeOptions {
     }
 
     /**
-     * Whether to retrain the index.
+     * Whether to retrain the index. Only vector indices are retrained; see {@link
+     * OptimizeOptions#isRetrain()}.
      *
      * @param retrain if true, retrain instead of incremental merge
      */

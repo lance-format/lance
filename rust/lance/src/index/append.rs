@@ -37,7 +37,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::vector::ivf::{
-    SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
+    IVFIndex, SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
@@ -912,7 +912,7 @@ pub fn select_segments_to_merge<'a>(
 /// Whether a scalar index can merge multiple segments without rescanning their data.
 fn has_segment_merge_primitive(index_type: IndexType) -> bool {
     match index_type {
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram => true,
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram | IndexType::MinHashLsh => true,
         #[cfg(feature = "geo")]
         IndexType::RTree => true,
         _ => false,
@@ -1345,6 +1345,26 @@ async fn merge_scalar_indices<'a>(
                     .await?;
                     let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::rtree::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
+                IndexType::MinHashLsh => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        address_domain,
+                    )
+                    .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
+                    super::scalar::minhash_lsh::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
@@ -1900,8 +1920,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let explicit_append = options.num_indices_to_merge == Some(0);
             let default_append_for_heterogeneous_models = options.num_indices_to_merge.is_none()
                 && compatibility == VectorSegmentCompatibility::QueryCompatibleModelsDiffer;
+            // A legacy merge cannot drop the postings of rows an update moved
+            // under their stable row ids (see `optimize_vector_indices`).
+            let default_append_for_legacy_stable_row_ids = options.num_indices_to_merge.is_none()
+                && dataset.manifest.uses_stable_row_ids()
+                && logical_index
+                    .iter()
+                    .any(|(_, index)| index.as_any().is::<IVFIndex>());
 
-            if !unindexed.is_empty() && (explicit_append || default_append_for_heterogeneous_models)
+            if !unindexed.is_empty()
+                && (explicit_append
+                    || default_append_for_heterogeneous_models
+                    || default_append_for_legacy_stable_row_ids)
             {
                 // CreateIndex commits append new segments at the end of the manifest's
                 // stable index order. Reusing the current suffix model keeps consecutive

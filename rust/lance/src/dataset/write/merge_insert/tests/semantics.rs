@@ -673,16 +673,18 @@ async fn test_source_dedupe_behavior_first_seen(
         is_full_schema, enable_stable_row_ids
     );
 
-    // Create initial dataset with keys 1, 2, 3, 4
+    // Create initial dataset with keys 1, 2 in fragment 0 and 3, 4 in
+    // fragment 1, so with stable row ids the duplicate key 3 has a row id
+    // that differs from its row address.
     let dataset = lance_datagen::gen_batch()
         .col("key", array::step_custom::<UInt32Type>(1, 1))
         .col("value", array::step_custom::<UInt32Type>(10, 10))
         .into_dataset_with_params(
             &test_uri,
-            FragmentCount(1),
-            FragmentRowCount(4),
+            FragmentCount(2),
+            FragmentRowCount(2),
             Some(WriteParams {
-                max_rows_per_file: 4,
+                max_rows_per_file: 2,
                 enable_stable_row_ids,
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()

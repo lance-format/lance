@@ -963,29 +963,35 @@ mod tests {
     async fn test_injected_aws_creds_option_is_used() {
         let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
         let registry = Arc::new(ObjectStoreRegistry::default());
+        let connector = Arc::new(RecordingConnector::default());
 
         let params = ObjectStoreParams {
             aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("region".to_string(), "us-east-1".to_string())]),
+            ))),
+            http_connector: Some(connector.clone()),
             ..ObjectStoreParams::default()
         };
-
-        // Not called yet
-        assert!(!mock_provider.called.load(Ordering::Relaxed));
 
         let (store, _) = ObjectStore::from_uri_and_params(registry, "s3://not-a-bucket", &params)
             .await
             .unwrap();
 
-        // fails, but we don't care
-        let _ = store
-            .open(&Path::parse("/").unwrap())
-            .await
-            .unwrap()
-            .get_range(0..1)
-            .await;
+        assert!(!mock_provider.called.load(Ordering::Relaxed));
+        assert!(connector.requests.lock().unwrap().is_empty());
 
-        // Not called yet
+        let result =
+            object_store::ObjectStoreExt::get(store.inner.as_ref(), &Path::from("file")).await;
+
         assert!(mock_provider.called.load(Ordering::Relaxed));
+        let error = result.unwrap_err();
+        assert!(matches!(error, object_store::Error::NotFound { .. }));
+        assert!(error.to_string().contains("file"), "{error}");
+        assert!(connector.connects.load(Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/file"), "{requests:?}");
     }
 
     #[tokio::test]
