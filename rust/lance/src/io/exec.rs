@@ -5,6 +5,13 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
+use std::sync::Arc;
+
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use lance_arrow::RecordBatchExt;
+use lance_core::Result;
+
 #[cfg(feature = "substrait")]
 pub mod ann_proto;
 pub(crate) mod column_width;
@@ -52,6 +59,38 @@ pub(crate) use scan::LanceStream;
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;
+
+/// Source provenance survives tombstone masking without changing the user's row IDs
+/// or addresses. It is carried by the scan plan and dropped by the consumer.
+#[derive(Clone, Debug)]
+pub(crate) struct FragmentIdColumn(Arc<Field>);
+
+impl FragmentIdColumn {
+    pub(crate) fn new(name: &str) -> Self {
+        Self(Arc::new(Field::new(name, DataType::UInt64, false)))
+    }
+
+    pub(crate) fn add_to_schema(&self, schema: &Schema) -> Schema {
+        Schema::new_with_metadata(
+            schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain([self.0.clone()])
+                .collect::<Vec<_>>(),
+            schema.metadata().clone(),
+        )
+    }
+
+    pub(crate) fn add_to_batch(
+        &self,
+        batch: &RecordBatch,
+        fragment_id: usize,
+    ) -> Result<RecordBatch> {
+        let ids = UInt64Array::from_value(fragment_id as u64, batch.num_rows());
+        Ok(batch.try_with_column(self.0.as_ref().clone(), Arc::new(ids))?)
+    }
+}
 
 /// Declares which vesrion of the relational algebra we are producing
 ///

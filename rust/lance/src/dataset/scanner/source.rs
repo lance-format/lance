@@ -48,8 +48,9 @@ use crate::io::exec::filtered_read::{
 };
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceFilterExec, LancePushdownScanExec,
-    LanceScanConfig, LanceScanExec, Planner, RowAddrMaskFilterExec, ScanConfig, TakeExec, project,
+    AddRowAddrExec, FilterPlan as ExprFilterPlan, FragmentIdColumn, LanceFilterExec,
+    LancePushdownScanExec, LanceScanConfig, LanceScanExec, Planner, RowAddrMaskFilterExec,
+    ScanConfig, TakeExec, project,
 };
 use crate::{Error, Result};
 
@@ -430,6 +431,10 @@ impl Scanner {
 
         if make_deletions_null {
             read_options = read_options.with_deleted_rows()?;
+            read_options.fragment_id_column = self
+                .fragment_id_column
+                .as_deref()
+                .map(FragmentIdColumn::new);
         }
 
         if self.fast_search && filter_plan.has_index_query() {
@@ -496,6 +501,7 @@ impl Scanner {
             }
         };
 
+        let fragment_id_column = read_options.fragment_id_column.clone();
         let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             read_options,
@@ -527,6 +533,7 @@ impl Scanner {
         };
         let mut stale_options = FilteredReadOptions::new(take_projection)
             .with_physical_row_addr_prefilter(Arc::new(physical_rows));
+        stale_options.fragment_id_column = fragment_id_column;
         if let Some(fragments) = &self.fragments {
             stale_options = stale_options.with_fragments(Arc::new(fragments.clone()));
         }
@@ -1107,12 +1114,20 @@ impl Scanner {
             file_reader_options: self.resolved_file_reader_options(),
             parallelism_cap: None,
         };
-        Arc::new(LanceScanExec::new(
+        let fragment_id_column = if with_make_deletions_null {
+            self.fragment_id_column
+                .as_deref()
+                .map(FragmentIdColumn::new)
+        } else {
+            None
+        };
+        Arc::new(LanceScanExec::new_with_fragment_id(
             self.dataset.clone(),
             fragments,
             range,
             projection,
             config,
+            fragment_id_column,
         ))
     }
 
