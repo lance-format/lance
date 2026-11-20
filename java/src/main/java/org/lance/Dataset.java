@@ -724,6 +724,26 @@ public class Dataset implements Closeable {
   private native void nativeMigrateManifestPathsV2();
 
   /**
+   * Enable stable row IDs on an existing dataset.
+   *
+   * <p>Passing {@code enableStableRowIds} to a later write does not migrate an existing dataset;
+   * this method does. It commits a new version and refreshes this dataset to it. It does nothing
+   * when the dataset already uses stable row IDs.
+   *
+   * <p>The migration is rejected while the dataset has secondary indices; drop them first and
+   * recreate them afterwards. It also fails if a concurrent write commits during the migration, so
+   * quiesce writers first.
+   */
+  public void migrateToStableRowIds() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMigrateToStableRowIds();
+    }
+  }
+
+  private native void nativeMigrateToStableRowIds();
+
+  /**
    * Add columns to the dataset.
    *
    * @param sqlExpressions The SQL expressions to add columns

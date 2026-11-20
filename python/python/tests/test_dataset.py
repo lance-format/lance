@@ -926,6 +926,35 @@ def test_has_stable_row_ids_property(tmp_path: Path, enable_stable_row_ids: bool
     assert ds.has_stable_row_ids is enable_stable_row_ids
 
 
+def test_migrate_to_stable_row_ids(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": range(6)}), tmp_path, max_rows_per_file=3)
+    assert not ds.has_stable_row_ids
+
+    ds.create_scalar_index("a", "BTREE", name="a_idx")
+    with pytest.raises(ValueError, match="a_idx"):
+        ds.migrate_to_stable_row_ids()
+    assert not ds.has_stable_row_ids
+    ds.drop_index("a_idx")
+
+    ds.migrate_to_stable_row_ids()
+    assert ds.has_stable_row_ids
+    assert lance.dataset(tmp_path).has_stable_row_ids
+
+    def row_id_to_value(dataset):
+        rows = dataset.to_table(columns=["a"], with_row_id=True)
+        return dict(zip(rows["_rowid"].to_pylist(), rows["a"].to_pylist()))
+
+    migrated = row_id_to_value(ds)
+    assert sorted(migrated.values()) == list(range(6))
+
+    version = ds.version
+    ds.migrate_to_stable_row_ids()
+    assert ds.version == version
+
+    ds.optimize.compact_files(target_rows_per_fragment=100)
+    assert row_id_to_value(ds) == migrated
+
+
 def _live_row_addrs(ds):
     rows = ds.to_table(columns=[], with_row_id=True, with_row_address=True)
     return dict(zip(rows["_rowid"].to_pylist(), rows["_rowaddr"].to_pylist()))
