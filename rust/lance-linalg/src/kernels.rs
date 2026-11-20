@@ -168,11 +168,9 @@ pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
 /// wider float exists, accumulates in that wider type: squaring an `f16`
 /// saturates to `inf` at `|x| >= 256` and to zero at `|x| <= 1.726e-4`, so an
 /// ordinary `f16` vector would otherwise normalize to all-zero or all-`inf`.
-/// `f32` and `f64` accumulate in themselves — the same saturation still exists at
-/// the extremes of their own range (an `f32` square overflows above `1.8447e19`),
-/// but widening `f32` would perturb the output of existing f32 vectors by a few
-/// ulp (about 10 at dimension 768, growing as sqrt(dim)), so it is deliberately
-/// left alone; `f64` has nothing wider to widen to.
+/// An `f32` square overflows above `1.8447e19` and underflows below `1.1e-19`,
+/// so `f32` accumulates in `f64` too. `f64` accumulates in itself: it has
+/// nothing wider to widen to.
 ///
 /// The width relation is a contract on the implementor, not something the bounds
 /// can express. Tying the accumulator to the element type here still buys two
@@ -196,8 +194,9 @@ impl Normalizable for bf16 {
     type Acc = f64;
 }
 
+/// `f32` shares `bf16`'s exponent range, so it needs `f64` for the same reason.
 impl Normalizable for f32 {
-    type Acc = Self;
+    type Acc = f64;
 }
 
 impl Normalizable for f64 {

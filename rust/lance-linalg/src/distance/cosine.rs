@@ -19,10 +19,7 @@ use super::{
 };
 use crate::Result;
 #[cfg(not(target_arch = "x86_64"))]
-use crate::simd::{
-    FloatSimd, SIMD,
-    f32::{f32x8, f32x16},
-};
+use crate::simd::{FloatSimd, SIMD};
 
 /// Cosine Distance
 pub trait Cosine: Dot + Normalize {
@@ -293,6 +290,12 @@ mod half_c {
 }
 
 impl Cosine for f32 {
+    /// The norm of `x` is accumulated in f64, like the kernels' sums.
+    #[inline]
+    fn cosine(x: &[Self], other: &[Self]) -> f32 {
+        Self::cosine_fast(x, norm_l2_impl::<Self, f64, 16>(x) as Self, other)
+    }
+
     #[inline]
     fn cosine_fast(x: &[Self], x_norm: Self, other: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), other.len());
@@ -395,57 +398,116 @@ lance_core::dispatch! {
     };
 }
 
-#[cfg(target_arch = "x86_64")]
+/// Whether the portable kernels fuse their f64 multiply-adds: only where the
+/// baseline has fused multiply-add, since `f64::mul_add` is a libm call
+/// without it.
+const PORTABLE_FMA: bool = cfg!(any(
+    target_arch = "aarch64",
+    target_arch = "loongarch64",
+    target_feature = "fma"
+));
+
+/// `x·y` and `y·y`, accumulated in f64, where no product or partial sum of f32
+/// values can overflow or underflow. Every f32 candidate shares this body and
+/// returns the same bits: a candidate's target features only change how the
+/// compiler vectorizes it, and since the product of two f32 values is exact in
+/// f64, `FMA` only decides whether each multiply-add is one instruction.
+#[inline(always)]
+fn dot_and_norm_squared_f64<const FMA: bool>(x: &[f32], y: &[f32]) -> (f64, f64) {
+    const LANES: usize = 8;
+    let madd = |a: f64, b: f64, c: f64| if FMA { a.mul_add(b, c) } else { a * b + c };
+    let (x_chunks, x_tail) = x.as_chunks::<LANES>();
+    let (y_chunks, y_tail) = y.as_chunks::<LANES>();
+    let mut xy = [0.0_f64; LANES];
+    let mut yy = [0.0_f64; LANES];
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
+        for i in 0..LANES {
+            let (a, b) = (f64::from(x[i]), f64::from(y[i]));
+            xy[i] = madd(a, b, xy[i]);
+            yy[i] = madd(b, b, yy[i]);
+        }
+    }
+    let (mut xy_tail, mut yy_tail) = (0.0, 0.0);
+    for (&a, &b) in x_tail.iter().zip(y_tail) {
+        let (a, b) = (f64::from(a), f64::from(b));
+        xy_tail = madd(a, b, xy_tail);
+        yy_tail = madd(b, b, yy_tail);
+    }
+    let sum = |v: [f64; LANES]| ((v[0] + v[4]) + (v[2] + v[6])) + ((v[1] + v[5]) + (v[3] + v[7]));
+    (sum(xy) + xy_tail, sum(yy) + yy_tail)
+}
+
+/// Cosine distance from `x`, whose L2 norm is `x_norm`, to `y`, in f64.
+#[inline(always)]
+fn cosine_f32_wide<const FMA: bool>(x: &[f32], x_norm: f64, y: &[f32]) -> f32 {
+    let (xy, yy) = dot_and_norm_squared_f64::<FMA>(x, y);
+    (1.0 - xy / x_norm / yy.sqrt()) as f32
+}
+
+/// [`Cosine::cosine_with_norms`] for f32, in f64.
+#[inline(always)]
+fn cosine_with_norms_f32_wide<const FMA: bool>(
+    x: &[f32],
+    x_norm: f32,
+    y_norm: f32,
+    y: &[f32],
+) -> f32 {
+    let (xy, _) = dot_and_norm_squared_f64::<FMA>(x, y);
+    (1.0 - xy / f64::from(x_norm) / f64::from(y_norm)) as f32
+}
+
+/// [`Cosine::cosine_batch_into`] for f32, in f64. Fixed-size keys at the PQ
+/// widths let the compiler unroll each vector and keep the key in registers.
+#[inline(always)]
+fn cosine_batch_f32_wide<const FMA: bool>(
+    x: &[f32],
+    batch: &[f32],
+    dimension: usize,
+    output: &mut [f32],
+) {
+    let x_norm = norm_l2_impl::<f32, f64, 16>(x);
+    if dimension == 8
+        && let Ok(key) = <&[f32; 8]>::try_from(x)
+    {
+        for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
+            *distance = cosine_f32_wide::<FMA>(key, x_norm, y);
+        }
+    } else if dimension == 16
+        && let Ok(key) = <&[f32; 16]>::try_from(x)
+    {
+        for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
+            *distance = cosine_f32_wide::<FMA>(key, x_norm, y);
+        }
+    } else {
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = cosine_f32_wide::<FMA>(x, x_norm, y);
+        }
+    }
+}
+
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(COSINE_F32_PORTABLE: CosineKernel<f32>)]
     #[inline]
     fn cosine_f32_portable(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        cosine_scalar(x, x_norm, y)
+        cosine_f32_wide::<PORTABLE_FMA>(x, x_norm.into(), y)
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(COSINE_WITH_NORMS_F32_PORTABLE: CosineWithNormsKernel)]
     #[inline]
     fn cosine_with_norms_f32_portable(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-        cosine_scalar_fast(x, x_norm, y, y_norm)
+        cosine_with_norms_f32_wide::<PORTABLE_FMA>(x, x_norm, y_norm, y)
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(COSINE_F32_BATCH_PORTABLE: BatchKernel)]
     fn cosine_batch_f32_portable(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
-        let x_norm = norm_l2(x);
-        // Dim 8 uses the AVX candidates' SSE path so results stay bit-identical
-        // across candidates. Dim 16 can't use their `f32x16` without AVX, so
-        // it folds in scalar instead.
-        if dimension == 8
-            && let Ok(key) = <&[f32; 8]>::try_from(x)
-        {
-            let key = x86::Sse8::new(key);
-            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                *distance = key.cosine(x_norm, y);
-            }
-        } else if dimension == 16
-            && let Ok(key) = <&[f32; 16]>::try_from(x)
-        {
-            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
-                let (xy, y2) = key
-                    .iter()
-                    .zip(y)
-                    .fold((0.0f32, 0.0f32), |(xy, y2), (&a, &b)| (xy + a * b, y2 + b * b));
-                *distance = 1.0 - xy / x_norm / y2.sqrt();
-            }
-        } else {
-            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = cosine_scalar(x, x_norm, y);
-            }
-        }
+        cosine_batch_f32_wide::<PORTABLE_FMA>(x, batch, dimension, output);
     }
 }
 
@@ -463,98 +525,14 @@ lance_core::target_kernel! {
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::{CosineKernel, CosineWithNormsKernel, dot, norm_l2, norm_l2_impl};
+    use super::{
+        CosineKernel, CosineWithNormsKernel, cosine_batch_f32_wide, cosine_f32_wide,
+        cosine_with_norms_f32_wide,
+    };
     use crate::distance::BatchKernel;
-    use crate::simd::f32::{f32x8, f32x16};
     use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::x86::{hsum256_pd, hsum256_ps};
+    use crate::simd::x86::hsum256_pd;
     use crate::simd::{FloatSimd, SIMD};
-
-    /// A preloaded 8-dimension key for every x86 batch kernel. SSE is part of
-    /// the x86_64 baseline, so this needs no runtime selection. Its reduction
-    /// order matches `f32x8::reduce_sum`.
-    pub(super) struct Sse8 {
-        lo: __m128,
-        hi: __m128,
-    }
-
-    impl Sse8 {
-        #[inline]
-        pub(super) fn new(key: &[f32; 8]) -> Self {
-            // SAFETY: both loads read within the eight-element array, and
-            // x86_64 guarantees SSE.
-            unsafe {
-                Self {
-                    lo: _mm_loadu_ps(key.as_ptr()),
-                    hi: _mm_loadu_ps(key.as_ptr().add(4)),
-                }
-            }
-        }
-
-        #[inline]
-        pub(super) fn cosine(&self, key_norm: f32, y: &[f32; 8]) -> f32 {
-            // SAFETY: both loads read within the eight-element array, and
-            // x86_64 guarantees SSE.
-            unsafe {
-                let (lo, hi) = (_mm_loadu_ps(y.as_ptr()), _mm_loadu_ps(y.as_ptr().add(4)));
-                let xy = _mm_add_ps(_mm_mul_ps(self.lo, lo), _mm_mul_ps(self.hi, hi));
-                let y2 = _mm_add_ps(_mm_mul_ps(lo, lo), _mm_mul_ps(hi, hi));
-                1.0 - hsum128_ps(xy) / key_norm / hsum128_ps(y2).sqrt()
-            }
-        }
-    }
-
-    /// # Safety
-    ///
-    /// None beyond SSE, which x86_64 guarantees; `unsafe` only because the
-    /// intrinsics are `#[target_feature(enable = "sse")]`.
-    #[inline]
-    unsafe fn hsum128_ps(values: __m128) -> f32 {
-        unsafe {
-            let sum64 = _mm_add_ps(values, _mm_movehl_ps(values, values));
-            let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
-            _mm_cvtss_f32(sum32)
-        }
-    }
-
-    /// Fills `output` for the 8- and 16-dimension PQ widths shared by every
-    /// AVX batch kernel, returning `false` for any other layout.
-    #[target_feature(enable = "avx")]
-    #[inline]
-    fn cosine_batch_f32_narrow(
-        x: &[f32],
-        x_norm: f32,
-        batch: &[f32],
-        dimension: usize,
-        output: &mut [f32],
-    ) -> bool {
-        if dimension == 8
-            && let Ok(key) = <&[f32; 8]>::try_from(x)
-        {
-            // The SSE path benchmarks faster than `f32x8` at this width and
-            // keeps every candidate bit-identical.
-            let key = Sse8::new(key);
-            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                *distance = key.cosine(x_norm, y);
-            }
-            true
-        } else if dimension == 16
-            && let Ok(key) = <&[f32; 16]>::try_from(x)
-        {
-            // SAFETY: the load reads within the sixteen-element array.
-            let key = unsafe { f32x16::load_unaligned(key.as_ptr()) };
-            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
-                // SAFETY: the load reads within the sixteen-element array.
-                let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
-                let xy = key * y;
-                let y2 = y * y;
-                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
-            }
-            true
-        } else {
-            false
-        }
-    }
 
     lance_core::target_kernel! {
         #[target_features("avx512f")]
@@ -565,12 +543,7 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            let x_norm = norm_l2(x);
-            if !cosine_batch_f32_narrow(x, x_norm, batch, dimension, output) {
-                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                    *distance = cosine_f32_avx512(x, x_norm, y);
-                }
-            }
+            cosine_batch_f32_wide::<true>(x, batch, dimension, output);
         }
     }
 
@@ -583,12 +556,7 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            let x_norm = norm_l2(x);
-            if !cosine_batch_f32_narrow(x, x_norm, batch, dimension, output) {
-                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                    *distance = cosine_f32_avx_fma(x, x_norm, y);
-                }
-            }
+            cosine_batch_f32_wide::<true>(x, batch, dimension, output);
         }
     }
 
@@ -601,140 +569,40 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            let x_norm = norm_l2(x);
-            if !cosine_batch_f32_narrow(x, x_norm, batch, dimension, output) {
-                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                    *distance = cosine_f32_avx(x, x_norm, y);
-                }
-            }
+            cosine_batch_f32_wide::<false>(x, batch, dimension, output);
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx512f")]
         #[candidate(pub(super) COSINE_F32_AVX512: CosineKernel<f32>)]
-        /// 16-wide `__m512` xy/yy with `vfmadd231ps` per iteration.
         #[inline]
         pub(super) fn cosine_f32_avx512(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-            // Callers pass equal lengths; `min` keeps the unchecked loads in
-            // bounds for any input, as a safe function must.
-            let dim = x.len().min(other.len());
-            let unrolled_len = dim / 16 * 16;
-
-            let mut acc_xy = _mm512_setzero_ps();
-            let mut acc_yy = _mm512_setzero_ps();
-            for i in (0..unrolled_len).step_by(16) {
-                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        _mm512_loadu_ps(x.as_ptr().add(i)),
-                        _mm512_loadu_ps(other.as_ptr().add(i)),
-                    )
-                };
-                acc_xy = _mm512_fmadd_ps(xv, yv, acc_xy);
-                acc_yy = _mm512_fmadd_ps(yv, yv, acc_yy);
-            }
-
-            let mut xy = _mm512_reduce_add_ps(acc_xy);
-            let mut yy = _mm512_reduce_add_ps(acc_yy);
-            for i in unrolled_len..dim {
-                xy += x[i] * other[i];
-                yy += other[i] * other[i];
-            }
-
-            1.0 - xy / x_norm / yy.sqrt()
+            cosine_f32_wide::<true>(x, x_norm.into(), other)
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx", "fma")]
         #[candidate(pub(super) COSINE_F32_AVX_FMA: CosineKernel<f32>)]
-        /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
         #[inline]
         pub(super) fn cosine_f32_avx_fma(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(other.len());
-            let unrolled_len = dim / 16 * 16;
-            let mut y_norm16 = f32x16::zeros();
-            let mut xy16 = f32x16::zeros();
-            for i in (0..unrolled_len).step_by(16) {
-                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        f32x16::load_unaligned(x.as_ptr().add(i)),
-                        f32x16::load_unaligned(other.as_ptr().add(i)),
-                    )
-                };
-                xy16.multiply_add(xv, yv);
-                y_norm16.multiply_add(yv, yv);
-            }
-            let aligned_len = dim / 8 * 8;
-            let mut y_norm8 = f32x8::zeros();
-            let mut xy8 = f32x8::zeros();
-            for i in (unrolled_len..aligned_len).step_by(8) {
-                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        f32x8::load_unaligned(x.as_ptr().add(i)),
-                        f32x8::load_unaligned(other.as_ptr().add(i)),
-                    )
-                };
-                xy8.multiply_add(xv, yv);
-                y_norm8.multiply_add(yv, yv);
-            }
-            // Inlined rather than the dispatched `norm_l2`, which is an
-            // indirect call unless the baseline covers its best candidate. On
-            // a tail this short every norm candidate computes the same sum.
-            // The tail `dot` keeps its dispatched call, as in the
-            // `cosine_with_norms` kernels: it was dispatched before `norm_l2`
-            // was, so inlining it would be a separate change to all of them.
-            let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
-            let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
-            let xy =
-                xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
-            1.0 - xy / x_norm / y_norm.sqrt()
+            cosine_f32_wide::<true>(x, x_norm.into(), other)
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx")]
         #[candidate(pub(super) COSINE_F32_AVX: CosineKernel<f32>)]
-        /// AVX-only path (no FMA) for Sandy/Ivy Bridge.
         #[inline]
         pub(super) fn cosine_f32_avx(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(other.len());
-            let aligned_len = dim / 8 * 8;
-
-            let mut acc_xy = _mm256_setzero_ps();
-            let mut acc_yy = _mm256_setzero_ps();
-            for i in (0..aligned_len).step_by(8) {
-                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        _mm256_loadu_ps(x.as_ptr().add(i)),
-                        _mm256_loadu_ps(other.as_ptr().add(i)),
-                    )
-                };
-                acc_xy = _mm256_add_ps(acc_xy, _mm256_mul_ps(xv, yv));
-                acc_yy = _mm256_add_ps(acc_yy, _mm256_mul_ps(yv, yv));
-            }
-
-            // SAFETY: AVX is enabled for this function.
-            let (xy_main, yy_main) = unsafe { (hsum256_ps(acc_xy), hsum256_ps(acc_yy)) };
-
-            // See `cosine_f32_avx_fma` for `norm_l2_impl`.
-            let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
-            let y_norm = yy_main + tail_norm.powi(2);
-            let xy = xy_main + dot(&x[aligned_len..], &other[aligned_len..]);
-            1.0 - xy / x_norm / y_norm.sqrt()
+            cosine_f32_wide::<false>(x, x_norm.into(), other)
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx512f")]
         #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX512: CosineWithNormsKernel)]
-        /// 16-wide `__m512` with `vfmadd231ps` per iteration.
         #[inline]
         pub(super) fn cosine_with_norms_f32_avx512(
             x: &[f32],
@@ -742,35 +610,13 @@ mod x86 {
             y_norm: f32,
             y: &[f32],
         ) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 16 * 16;
-
-            let mut acc = _mm512_setzero_ps();
-            for i in (0..unrolled_len).step_by(16) {
-                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        _mm512_loadu_ps(x.as_ptr().add(i)),
-                        _mm512_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                acc = _mm512_fmadd_ps(xv, yv, acc);
-            }
-
-            let mut xy = _mm512_reduce_add_ps(acc);
-            for i in unrolled_len..dim {
-                xy += x[i] * y[i];
-            }
-
-            1.0 - xy / x_norm / y_norm
+            cosine_with_norms_f32_wide::<true>(x, x_norm, y_norm, y)
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx", "fma")]
         #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX_FMA: CosineWithNormsKernel)]
-        /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
         #[inline]
         pub(super) fn cosine_with_norms_f32_avx_fma(
             x: &[f32],
@@ -778,42 +624,13 @@ mod x86 {
             y_norm: f32,
             y: &[f32],
         ) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 16 * 16;
-            let mut xy16 = f32x16::zeros();
-            for i in (0..unrolled_len).step_by(16) {
-                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        f32x16::load_unaligned(x.as_ptr().add(i)),
-                        f32x16::load_unaligned(y.as_ptr().add(i)),
-                    )
-                };
-                xy16.multiply_add(xv, yv);
-            }
-            let aligned_len = dim / 8 * 8;
-            let mut xy8 = f32x8::zeros();
-            for i in (unrolled_len..aligned_len).step_by(8) {
-                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        f32x8::load_unaligned(x.as_ptr().add(i)),
-                        f32x8::load_unaligned(y.as_ptr().add(i)),
-                    )
-                };
-                xy8.multiply_add(xv, yv);
-            }
-            let xy =
-                xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
-            1.0 - xy / x_norm / y_norm
+            cosine_with_norms_f32_wide::<true>(x, x_norm, y_norm, y)
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx")]
         #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX: CosineWithNormsKernel)]
-        /// AVX-only path (no FMA) for Sandy/Ivy Bridge.
         #[inline]
         pub(super) fn cosine_with_norms_f32_avx(
             x: &[f32],
@@ -821,26 +638,7 @@ mod x86 {
             y_norm: f32,
             y: &[f32],
         ) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let aligned_len = dim / 8 * 8;
-
-            let mut acc = _mm256_setzero_ps();
-            for i in (0..aligned_len).step_by(8) {
-                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        _mm256_loadu_ps(x.as_ptr().add(i)),
-                        _mm256_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(xv, yv));
-            }
-
-            // SAFETY: AVX is enabled for this function.
-            let xy_main = unsafe { hsum256_ps(acc) };
-            let xy = xy_main + dot(&x[aligned_len..], &y[aligned_len..]);
-            1.0 - xy / x_norm / y_norm
+            cosine_with_norms_f32_wide::<false>(x, x_norm, y_norm, y)
         }
     }
 
@@ -850,7 +648,8 @@ mod x86 {
         /// 8-wide `__m512d` xy/yy with `vfmadd231pd` per iteration.
         #[inline]
         pub(super) fn cosine_f64_avx512(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
+            // Callers pass equal lengths; `min` keeps the unchecked loads in
+            // bounds for any input, as a safe function must.
             let dim = x.len().min(y.len());
             let unrolled_len = dim / 8 * 8;
 
@@ -887,7 +686,7 @@ mod x86 {
         /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
         #[inline]
         pub(super) fn cosine_f64_avx_fma(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
+            // See `cosine_f64_avx512` for `min`.
             let dim = x.len().min(y.len());
             let unrolled_len = dim / 8 * 8;
             let mut y_norm8 = f64x8::zeros();
@@ -936,7 +735,7 @@ mod x86 {
         /// AVX-only path (no FMA) for Sandy/Ivy Bridge.
         #[inline]
         pub(super) fn cosine_f64_avx(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
+            // See `cosine_f64_avx512` for `min`.
             let dim = x.len().min(y.len());
             let aligned_len = dim / 4 * 4;
 
@@ -974,136 +773,14 @@ mod x86 {
 #[cfg(not(target_arch = "x86_64"))]
 lance_core::target_kernel! {
     #[target_features()]
-    #[candidate(COSINE_F32_PORTABLE: CosineKernel<f32>)]
-    /// `simd::f32` is backed by the baseline NEON or LSX on these architectures.
-    #[inline]
-    fn cosine_f32_portable(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-        // Callers pass equal lengths; `min` keeps the unchecked loads in
-        // bounds for any input, as a safe function must.
-        let dim = x.len().min(other.len());
-        let unrolled_len = dim / 16 * 16;
-        let mut y_norm16 = f32x16::zeros();
-        let mut xy16 = f32x16::zeros();
-        for i in (0..unrolled_len).step_by(16) {
-            // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-            let (xv, yv) = unsafe {
-                (
-                    f32x16::load_unaligned(x.as_ptr().add(i)),
-                    f32x16::load_unaligned(other.as_ptr().add(i)),
-                )
-            };
-            xy16.multiply_add(xv, yv);
-            y_norm16.multiply_add(yv, yv);
-        }
-        let aligned_len = dim / 8 * 8;
-        let mut y_norm8 = f32x8::zeros();
-        let mut xy8 = f32x8::zeros();
-        for i in (unrolled_len..aligned_len).step_by(8) {
-            // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-            let (xv, yv) = unsafe {
-                (
-                    f32x8::load_unaligned(x.as_ptr().add(i)),
-                    f32x8::load_unaligned(other.as_ptr().add(i)),
-                )
-            };
-            xy8.multiply_add(xv, yv);
-            y_norm8.multiply_add(yv, yv);
-        }
-        // See the x86 `cosine_f32_avx_fma` for `norm_l2_impl`.
-        let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
-        let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
-        let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
-        1.0 - xy / x_norm / y_norm.sqrt()
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-lance_core::target_kernel! {
-    #[target_features()]
-    #[candidate(COSINE_WITH_NORMS_F32_PORTABLE: CosineWithNormsKernel)]
-    /// See `cosine_f32_portable` for the SIMD backends.
-    #[inline]
-    fn cosine_with_norms_f32_portable(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-        // See `cosine_f32_portable` for `min`.
-        let dim = x.len().min(y.len());
-        let unrolled_len = dim / 16 * 16;
-        let mut xy16 = f32x16::zeros();
-        for i in (0..unrolled_len).step_by(16) {
-            // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-            let (xv, yv) = unsafe {
-                (
-                    f32x16::load_unaligned(x.as_ptr().add(i)),
-                    f32x16::load_unaligned(y.as_ptr().add(i)),
-                )
-            };
-            xy16.multiply_add(xv, yv);
-        }
-        let aligned_len = dim / 8 * 8;
-        let mut xy8 = f32x8::zeros();
-        for i in (unrolled_len..aligned_len).step_by(8) {
-            // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-            let (xv, yv) = unsafe {
-                (
-                    f32x8::load_unaligned(x.as_ptr().add(i)),
-                    f32x8::load_unaligned(y.as_ptr().add(i)),
-                )
-            };
-            xy8.multiply_add(xv, yv);
-        }
-        let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
-        1.0 - xy / x_norm / y_norm
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-lance_core::target_kernel! {
-    #[target_features()]
-    #[candidate(COSINE_F32_BATCH_PORTABLE: BatchKernel)]
-    /// See `cosine_f32_portable` for the SIMD backends.
-    fn cosine_batch_f32_portable(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
-        let x_norm = norm_l2(x);
-        if dimension == 8
-            && let Ok(key) = <&[f32; 8]>::try_from(x)
-        {
-            // SAFETY: the load reads within the eight-element array.
-            let key = unsafe { f32x8::load_unaligned(key.as_ptr()) };
-            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                // SAFETY: the load reads within the eight-element array.
-                let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
-                let xy = key * y;
-                let y2 = y * y;
-                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
-            }
-        } else if dimension == 16
-            && let Ok(key) = <&[f32; 16]>::try_from(x)
-        {
-            // SAFETY: the load reads within the sixteen-element array.
-            let key = unsafe { f32x16::load_unaligned(key.as_ptr()) };
-            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
-                // SAFETY: the load reads within the sixteen-element array.
-                let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
-                let xy = key * y;
-                let y2 = y * y;
-                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
-            }
-        } else {
-            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = cosine_f32_portable(x, x_norm, y);
-            }
-        }
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-lance_core::target_kernel! {
-    #[target_features()]
     #[candidate(COSINE_F64_PORTABLE: CosineKernel<f64>)]
     /// `simd::f64` is backed by the baseline NEON or LSX on these architectures.
     #[inline]
     fn cosine_f64_portable(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
         use crate::simd::f64::{f64x4, f64x8};
 
-        // See `cosine_f32_portable` for `min`.
+        // Callers pass equal lengths; `min` keeps the unchecked loads in
+        // bounds for any input, as a safe function must.
         let dim = x.len().min(y.len());
         let unrolled_len = dim / 8 * 8;
         let mut y_norm8 = f64x8::zeros();
@@ -1430,7 +1107,7 @@ mod tests {
                 }
 
                 let batch = [y, x].concat();
-                let mut pq_width_result = None;
+                let mut first_result = None;
                 for candidate in COSINE_F32_BATCH.candidates() {
                     let Some(kernel) = candidate.kernel() else {
                         continue;
@@ -1440,26 +1117,18 @@ mod tests {
                     check_cosine(got[0], want, candidate.name(), dimension)?;
                     check_cosine(got[1], want_self, candidate.name(), dimension)?;
 
-                    // At the PQ widths every candidate shares one reduction
-                    // order, except the x86 portable kernel at 16 dimensions,
-                    // which cannot use the AVX `f32x16`.
-                    let shares_pq_path = dimension == 8
-                        || (dimension == 16
-                            && (cfg!(not(target_arch = "x86_64"))
-                                || !candidate.features().is_empty()));
-                    if shares_pq_path {
-                        let bits = got.map(f32::to_bits);
-                        let (first, first_bits) =
-                            *pq_width_result.get_or_insert((candidate.name(), bits));
-                        prop_assert_eq!(
-                            bits,
-                            first_bits,
-                            "{} and {} differ at dim {}",
-                            candidate.name(),
-                            first,
-                            dimension
-                        );
-                    }
+                    // Every candidate shares one f64 body, so they return the
+                    // same bits at every width.
+                    let bits = got.map(f32::to_bits);
+                    let (first, first_bits) = *first_result.get_or_insert((candidate.name(), bits));
+                    prop_assert_eq!(
+                        bits,
+                        first_bits,
+                        "{} and {} differ at dim {}",
+                        candidate.name(),
+                        first,
+                        dimension
+                    );
                 }
             }
             Ok(())
