@@ -408,7 +408,14 @@ impl VectorIndex for PQIndex {
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        let pq_code_length = self.pq.code_dim() * length;
+        // Legacy pages store packed PQ codes: one byte per sub-vector for 8-bit,
+        // but one byte per two sub-vectors for 4-bit (see `ProductQuantizer::field`).
+        let num_sub_vectors_in_byte = if self.pq.num_bits == 4 {
+            self.pq.num_sub_vectors / 2
+        } else {
+            self.pq.num_sub_vectors
+        };
+        let pq_code_length = num_sub_vectors_in_byte * length;
         let pq_codes =
             read_legacy_index_values(reader.as_ref(), &DataType::UInt8, offset, pq_code_length)
                 .await?;
@@ -421,7 +428,7 @@ impl VectorIndex for PQIndex {
         let pq_codes = transpose(
             pq_codes.as_primitive(),
             row_ids.len(),
-            self.pq.num_sub_vectors,
+            num_sub_vectors_in_byte,
         );
 
         let (primitive_row_ids, transposed_pq_codes) =
@@ -443,7 +450,7 @@ impl VectorIndex for PQIndex {
                 let transposed_codes = transpose(
                     &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
                     remapped_row_ids.len(),
-                    self.pq.num_sub_vectors,
+                    num_sub_vectors_in_byte,
                 );
                 (
                     Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
@@ -709,7 +716,10 @@ mod tests {
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 
+    use crate::index::vector::IndexFileVersion;
     use crate::index::vector::ivf::build_ivf_model;
+    use crate::index::{DatasetIndexExt, vector::VectorIndexParams};
+    use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::DEFAULT_QUERY_PARALLELISM;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -959,6 +969,61 @@ mod tests {
 
         assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
         assert!(err.to_string().contains("not representable"), "got {err}");
+    }
+
+    /// Legacy (v1) IVF_PQ pages store 4-bit PQ codes packed, one byte per two
+    /// sub-vectors (`ProductQuantizer::field`), unlike one byte per sub-vector
+    /// for 8-bit codes. Searching a legacy 4-bit index must load one packed
+    /// byte per row and return the queried row itself: an exact copy of a
+    /// stored row lands in the same partition with the same residual, whose
+    /// own PQ code is the per-sub-vector argmin of the distance table.
+    #[tokio::test]
+    async fn test_search_legacy_ivf_pq_4bit() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        const DIM: usize = 32;
+        const NUM_VECTORS: usize = 512;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let vectors = generate_random_array_with_seed::<Float32Type>(NUM_VECTORS * DIM, [37u8; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors.clone(), DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 10)
+            .version(IndexFileVersion::Legacy)
+            .clone();
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        for query_id in [0usize, 5, 17, 33] {
+            let query = vectors.slice(query_id * DIM, DIM);
+            let results = dataset
+                .scan()
+                .with_row_id()
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let row_ids = results["_rowid"].as_primitive::<UInt64Type>();
+            assert!(
+                row_ids.values().contains(&(query_id as u64)),
+                "query {query_id} did not retrieve its own row, got row ids {:?}",
+                row_ids.values()
+            );
+        }
     }
 
     struct TestPreFilter {
