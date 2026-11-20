@@ -4,6 +4,7 @@
 import json
 import os
 import uuid
+from decimal import Decimal
 from pathlib import Path
 
 import lance
@@ -551,6 +552,68 @@ def test_alter_columns(tmp_path: Path):
         match="At least one of name, nullable, or data_type must be specified",
     ):
         dataset.alter_columns({"path": "x"})
+
+
+@pytest.mark.parametrize(
+    ("values", "data_type"),
+    [
+        pytest.param(pa.array([1.5, 1e300]), pa.float32(), id="float_overflow"),
+        pytest.param(
+            pa.array([1_000_000_001_500_000_000], pa.timestamp("ns")),
+            pa.timestamp("s"),
+            id="timestamp_unit",
+        ),
+        pytest.param(
+            pa.array([1_000_000_001_500_000_000], pa.timestamp("ns")),
+            pa.date32(),
+            id="timestamp_to_date",
+        ),
+        pytest.param(
+            pa.array([Decimal("1.25"), Decimal("2.50")], pa.decimal128(10, 2)),
+            pa.decimal128(10, 0),
+            id="decimal_scale",
+        ),
+    ],
+)
+def test_alter_columns_rejects_lossy_cast(tmp_path: Path, values, data_type):
+    dataset = lance.write_dataset(pa.table({"x": values}), tmp_path)
+
+    with pytest.raises(OSError, match="cannot be represented in the new type"):
+        dataset.alter_columns({"path": "x", "data_type": data_type})
+
+    dataset = lance.dataset(tmp_path)
+    assert dataset.version == 1
+    assert dataset.to_table()["x"].combine_chunks() == values
+
+
+@pytest.mark.parametrize(
+    ("values", "data_type"),
+    [
+        pytest.param(pa.array([1.5, 0.1, None]), pa.float32(), id="float_precision"),
+        pytest.param(
+            pa.array([1_000_000_001_000_000_000, None], pa.timestamp("ns")),
+            pa.timestamp("s"),
+            id="whole_seconds",
+        ),
+        pytest.param(
+            pa.array([86_400_000_000_000], pa.timestamp("ns")),
+            pa.date32(),
+            id="midnight_to_date",
+        ),
+        pytest.param(
+            pa.array([Decimal("1.00"), None], pa.decimal128(10, 2)),
+            pa.decimal128(10, 0),
+            id="whole_decimal",
+        ),
+    ],
+)
+def test_alter_columns_representable_downcast(tmp_path: Path, values, data_type):
+    dataset = lance.write_dataset(pa.table({"x": values}), tmp_path)
+
+    dataset.alter_columns({"path": "x", "data_type": data_type})
+
+    expected = values.cast(data_type, safe=False)
+    assert dataset.to_table()["x"].combine_chunks() == expected
 
 
 def test_merge_columns(tmp_path: Path):

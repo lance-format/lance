@@ -48,6 +48,7 @@ use crate::uring::{UringCurrentThreadReader, UringReader};
 pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
+pub(crate) mod hf_throttle;
 mod list_retry;
 mod local_staging;
 #[cfg(feature = "metrics")]
@@ -736,43 +737,222 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
     })
 }
 
+/// Repository type prefixes accepted by Hugging Face URLs, mapped to the
+/// singular names OpenDAL expects.
 #[cfg(feature = "huggingface")]
-fn parse_hf_repo_id(url: &Url) -> Result<String> {
-    // Accept forms with repo type prefix (models/datasets/spaces) or legacy without.
-    let mut segments: Vec<String> = Vec::new();
-    if let Some(host) = url.host_str() {
-        segments.push(host.to_string());
-    }
-    segments.extend(
-        url.path()
-            .trim_start_matches('/')
-            .split('/')
-            .map(|s| s.to_string()),
-    );
+const HF_REPO_TYPE_PREFIXES: [(&str, &str); 8] = [
+    ("datasets", "dataset"),
+    ("dataset", "dataset"),
+    ("models", "model"),
+    ("model", "model"),
+    ("spaces", "space"),
+    ("space", "space"),
+    ("buckets", "bucket"),
+    ("bucket", "bucket"),
+];
 
-    if segments.len() < 2 {
-        return Err(Error::invalid_input(
-            "Huggingface URL must contain at least owner and repo",
-        ));
-    }
+#[cfg(feature = "huggingface")]
+pub(crate) fn is_hf_repo_type_prefix(host: &str) -> bool {
+    HF_REPO_TYPE_PREFIXES
+        .iter()
+        .any(|(prefix, _)| *prefix == host)
+}
 
-    let repo_type_candidates = ["models", "datasets", "spaces"];
-    let (owner, repo_with_rev) = if repo_type_candidates.contains(&segments[0].as_str()) {
-        if segments.len() < 3 {
-            return Err(Error::invalid_input(
-                "Huggingface URL missing owner/repo after repo type",
-            ));
+/// The components of an `hf://` URL.
+///
+/// The supported form is
+/// `hf://(datasets|models|spaces|buckets)/<owner>/<repo>@<revision>/<path>`,
+/// where `@<revision>` is optional and singular repository type aliases are
+/// accepted. The legacy `hf://<owner>/<repo>/<path>` form is accepted and
+/// treated as a model repository. Only the repository segment is split on `@`,
+/// so an `@` in the path remains part of the path.
+#[cfg(feature = "huggingface")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedHfUrl {
+    pub repo_type: String,
+    pub repo_id: String,
+    pub revision: Option<String>,
+    pub relative_path: String,
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
+    let host = url.host_str().ok_or_else(|| {
+        Error::invalid_input("Huggingface URL must contain a repository type or owner")
+    })?;
+    let mut segments = url.path().trim_start_matches('/').split('/');
+
+    let (repo_type, owner, repo_with_revision) = match HF_REPO_TYPE_PREFIXES
+        .iter()
+        .find(|(prefix, _)| *prefix == host)
+    {
+        Some((_, canonical)) => {
+            let owner = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| Error::invalid_input("Huggingface URL must contain owner"))?;
+            let repo = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input("Huggingface URL must contain repository name")
+                })?;
+            (canonical.to_string(), owner, repo)
         }
-        (segments[1].as_str(), segments[2].as_str())
-    } else {
-        (segments[0].as_str(), segments[1].as_str())
+        // A host that is not a known repository type is the legacy owner form.
+        None => {
+            let repo = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input("Huggingface URL must contain repository name")
+                })?;
+            ("model".to_string(), host, repo)
+        }
     };
 
-    let repo = repo_with_rev
-        .split_once('@')
-        .map(|(r, _)| r)
-        .unwrap_or(repo_with_rev);
-    Ok(format!("{owner}/{repo}"))
+    let relative_path = segments.collect::<Vec<_>>().join("/");
+    // Bucket repositories have no revision and use `namespace/name` before the
+    // path. Keep `@` literal there, matching how bucket URLs resolved before
+    // this parser was centralized.
+    if repo_type == "bucket" {
+        return Ok(ParsedHfUrl {
+            repo_type,
+            repo_id: format!("{owner}/{repo_with_revision}"),
+            revision: None,
+            relative_path,
+        });
+    }
+
+    let (repo_name, revision) = match repo_with_revision.split_once('@') {
+        Some((repo_name, revision)) => {
+            if repo_name.is_empty() {
+                return Err(Error::invalid_input(
+                    "Huggingface URL must contain repository name before '@'",
+                ));
+            }
+            validate_hf_url_revision(revision)?;
+            (repo_name, Some(revision.to_string()))
+        }
+        None => (repo_with_revision, None),
+    };
+
+    Ok(ParsedHfUrl {
+        repo_type,
+        repo_id: format!("{owner}/{repo_name}"),
+        revision,
+        relative_path,
+    })
+}
+
+/// Reject revisions that cannot be represented unambiguously in an `hf://`
+/// path. A revision that needs a slash or URL escaping can still be selected
+/// with the `hf_revision` or `revision` storage option.
+#[cfg(feature = "huggingface")]
+fn validate_hf_url_revision(revision: &str) -> Result<()> {
+    if revision.is_empty() {
+        return Err(Error::invalid_input(
+            "Huggingface URL revision must not be empty; write '<repo>@<revision>/<path>' or omit '@'",
+        ));
+    }
+    if let Some(character) = revision
+        .chars()
+        .find(|character| !character.is_ascii_graphic() || matches!(character, '@' | '/' | '%'))
+    {
+        return Err(Error::invalid_input(format!(
+            "Invalid Huggingface URL revision {revision:?}: character {character:?} is not supported; pass the revision through the hf_revision or revision storage option instead"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn validate_hf_revision_option(key: &str, revision: &str) -> Result<()> {
+    if revision.is_empty() || revision.chars().all(char::is_whitespace) {
+        return Err(Error::invalid_input(format!(
+            "Huggingface storage option {key} must not be empty"
+        )));
+    }
+    if revision.chars().any(char::is_control) {
+        return Err(Error::invalid_input(format!(
+            "Huggingface storage option {key} contains control characters: {revision:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// The revision selected for one `hf://` base, or the option that contradicts
+/// a revision in the URL.
+#[cfg(feature = "huggingface")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HfRevisionResolution {
+    Selected(Option<String>),
+    Conflict {
+        key: &'static str,
+        option_revision: String,
+        url_revision: String,
+    },
+}
+
+/// Select the revision used by an `hf://` base.
+///
+/// A revision in the URL wins over storage options. Supplying the same revision
+/// under either option name is accepted, while a different revision is
+/// reported as a conflict so a pin cannot silently change. Without a URL
+/// revision, `hf_revision` keeps precedence over `revision`, matching the
+/// documented option aliases.
+#[cfg(feature = "huggingface")]
+pub(crate) fn resolve_hf_revision_inner(
+    url_revision: Option<&str>,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<HfRevisionResolution> {
+    let prefixed = storage_options.and_then(|options| options.get("hf_revision"));
+    let unprefixed = storage_options.and_then(|options| options.get("revision"));
+
+    if let Some(revision) = prefixed {
+        validate_hf_revision_option("hf_revision", revision)?;
+    }
+    if let Some(revision) = unprefixed {
+        validate_hf_revision_option("revision", revision)?;
+    }
+
+    if let Some(url_revision) = url_revision {
+        for (key, option_revision) in [("hf_revision", prefixed), ("revision", unprefixed)] {
+            if let Some(option_revision) = option_revision
+                && option_revision != url_revision
+            {
+                return Ok(HfRevisionResolution::Conflict {
+                    key,
+                    option_revision: option_revision.clone(),
+                    url_revision: url_revision.to_string(),
+                });
+            }
+        }
+        return Ok(HfRevisionResolution::Selected(Some(
+            url_revision.to_string(),
+        )));
+    }
+
+    Ok(HfRevisionResolution::Selected(
+        prefixed.or(unprefixed).cloned(),
+    ))
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn resolve_hf_revision(
+    url_revision: Option<&str>,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<Option<String>> {
+    match resolve_hf_revision_inner(url_revision, storage_options)? {
+        HfRevisionResolution::Selected(revision) => Ok(revision),
+        HfRevisionResolution::Conflict {
+            key,
+            option_revision,
+            url_revision,
+        } => Err(Error::invalid_input(format!(
+            "Huggingface storage option {key}={option_revision:?} conflicts with revision {url_revision:?} in the URL"
+        ))),
+    }
 }
 
 impl ObjectStore {
