@@ -1137,7 +1137,9 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     }
 
     fn provides_exact_answer(&self) -> bool {
-        true
+        // It answers list membership, not equality on the whole list, which is
+        // what a merge-insert join on the column asks for.
+        false
     }
 
     fn version(&self) -> u32 {
