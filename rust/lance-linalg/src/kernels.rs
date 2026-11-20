@@ -613,6 +613,62 @@ mod tests {
         out.values().as_primitive::<Float64Type>().values().to_vec()
     }
 
+    /// An `f32` sum of squares overflows above `|x| = 1.8447e19` and underflows
+    /// below `|x| = 1.1e-19` (to zero at `2.6e-23`), so these vectors normalized
+    /// to all-zero or all-`inf`/NaN and a cosine index missed them (#11269).
+    #[test]
+    fn test_normalize_f32_out_of_range() {
+        let cases: &[(&str, &[f32])] = &[
+            ("square_overflows", &[1e20, 0.0]),
+            ("sum_overflows", &[1e19; 12]),
+            ("square_underflows", &[1e-30, 0.0]),
+            ("subnormal", &[1e-45, 0.0]),
+        ];
+        for (name, v) in cases {
+            let fsl = || {
+                let field = Arc::new(Field::new("item", DataType::Float32, true));
+                let values = Arc::new(Float32Array::from(v.to_vec()));
+                FixedSizeListArray::try_new(field, v.len() as i32, values, None).unwrap()
+            };
+            let (arrow_out, _) = normalize_arrow(&Float32Array::from(v.to_vec())).unwrap();
+            for (entry, out) in [
+                ("normalize", normalize(v).0.collect::<Vec<_>>()),
+                (
+                    "normalize_arrow",
+                    arrow_out.as_primitive::<Float32Type>().values().to_vec(),
+                ),
+                (
+                    "normalize_fsl",
+                    normalize_fsl(&fsl())
+                        .unwrap()
+                        .values()
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .to_vec(),
+                ),
+                (
+                    "normalize_fsl_owned",
+                    normalize_fsl_owned(fsl())
+                        .unwrap()
+                        .values()
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .to_vec(),
+                ),
+            ] {
+                let norm = out
+                    .iter()
+                    .map(|&x| f64::from(x).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    approx::relative_eq!(norm, 1.0, max_relative = 1e-6),
+                    "{entry} / {name}: normalized norm {norm} != 1, output {out:?}"
+                );
+            }
+        }
+    }
+
     /// `normalize` must accumulate the sum of squares in a type wider than the
     /// element type. `f16::powi` rounds each square back to `f16`, which
     /// saturates to `inf` at `|x| >= 256` and to zero at `|x| <= 1.726e-4`, so an
