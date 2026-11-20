@@ -101,7 +101,7 @@ async fn test_stable_row_indices() {
     // uuid. The scalar index defaults to BTree, which is address-domain
     // under stable row ids and supports remap, so eager compaction remaps
     // it in place (a new uuid, but full coverage of the live fragments) --
-    // unlike an index whose type cannot remap (ZoneMap, BloomFilter, FM;
+    // unlike an index whose type cannot remap (ZoneMap or BloomFilter;
     // see `test_addr_domain_index_after_compaction_with_stable_row_ids`).
     let current_indices = index_by_name(&dataset).await;
     assert_eq!(current_indices["vector"], indices["vector"]);
@@ -129,17 +129,8 @@ async fn test_stable_row_indices() {
 }
 /// Regression test for https://github.com/lance-format/lance/issues/8076
 ///
-/// Zone map, bloom filter, and FM indices report matches as physical row addresses, so
-/// compaction invalidates it even under stable row ids. Reusing it for the rewritten
-/// fragments made a filtered scan fail with an internal error (a fragment referenced
-/// by the index no longer existed) or, once translation tolerated that, silently drop
-/// every match.
-///
-/// NGram also reports matches as physical row addresses, but -- unlike these
-/// three -- it supports eager remap (`ScalarIndexPlugin::can_remap`), so an
-/// eager compaction keeps it covering the rewritten fragments instead of
-/// losing coverage of them; see `test_compact_ngram_with_stable_row_ids` for
-/// that case instead.
+/// Address-domain indices must either remap their addresses or lose coverage
+/// of rewritten fragments, even on a table with stable row IDs.
 #[rstest]
 #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i > 0", 199)]
 #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
@@ -193,7 +184,7 @@ async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
         ..Default::default()
     };
     if defer_index_remap && index_type == IndexType::Fm {
-        // FM discards the fragment reuse index at load.
+        // Stable row ID tables do not admit FMIndex for deferred compaction.
         let error = plan_compaction(&dataset, &options).await.unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("`addr_idx`"), "{error}");
@@ -211,8 +202,9 @@ async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
         .expect("index must survive compaction")
         .clone();
     let covered = index.effective_fragment_bitmap(&live_fragments);
-    if defer_index_remap {
-        // Readers translate its addresses through the fragment reuse index.
+    if defer_index_remap || index_type == IndexType::Fm {
+        // The FMIndex eager remap persists the rewritten addresses. The
+        // deferred cases translate their addresses when read.
         assert_eq!(covered, Some(live_fragments));
     } else {
         // The index only knows the pre-compaction fragments, so it must not claim
@@ -225,6 +217,10 @@ async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
 
     let mut scanner = dataset.scan();
     scanner.filter(query).unwrap();
+    if index_type == IndexType::Fm {
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    }
     let matched = scanner.try_into_batch().await.unwrap();
     assert_eq!(matched.num_rows(), expected_rows);
 }

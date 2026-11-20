@@ -137,12 +137,6 @@ pub struct IndexMetadata {
 /// index (e.g. JSON) can classify the target index it holds, which has details and
 /// a version but no [`IndexMetadata`] of its own.
 pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i32) -> bool {
-    let is_fm = details
-        .type_url
-        .rsplit_once('/')
-        .is_some_and(|(_, details_type_name)| {
-            details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
-        });
     let is_btree_addr_domain = IndexMetadata::is_btree_addr_domain(details, index_version);
     let is_bitmap_addr_domain = IndexMetadata::is_bitmap_addr_domain(details, index_version);
     let is_label_list_addr_domain =
@@ -158,7 +152,7 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
     let is_json_addr_domain = details.type_url.ends_with("JsonIndexDetails") && index_version >= 1;
     details.type_url.ends_with("ZoneMapIndexDetails")
         || details.type_url.ends_with("BloomFilterIndexDetails")
-        || is_fm
+        || IndexMetadata::is_fm(details)
         || IndexMetadata::is_list_element(details)
         || is_btree_addr_domain
         || is_bitmap_addr_domain
@@ -228,7 +222,7 @@ impl IndexMetadata {
     /// Such an index cannot follow its data through a rewrite the way a row-id-domain
     /// index can: the addresses it stores name fragments and offsets, which a rewrite
     /// invalidates. A type whose index supports remap (BTree) can still be rewritten in
-    /// place; a type that cannot (ZoneMap, BloomFilter, FM) instead loses coverage of the
+    /// place; a type that cannot (e.g. ZoneMap or BloomFilter) instead loses coverage of the
     /// rewritten fragments until it is rebuilt, or is kept in step through the fragment
     /// reuse index's read-time translation.
     ///
@@ -323,13 +317,23 @@ impl IndexMetadata {
         details.type_url.ends_with("MinHashLshIndexDetails") && index_version >= 1
     }
 
+    // FMIndex stores physical addresses in every supported format.
+    fn is_fm(details: &prost_types::Any) -> bool {
+        details
+            .type_url
+            .rsplit_once('/')
+            .is_some_and(|(_, type_name)| {
+                type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
+            })
+    }
+
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
     /// and its type actively supports being remapped in place onto a rewrite's new
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
-    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram and
-    /// MinHash LSH's indexes support this today (`ScalarIndexPlugin::can_remap`);
-    /// ZoneMap, BloomFilter, FM and RTree cannot remap. This gate recognizes the
+    /// Of the address-domain types, BTree, Bitmap, FMIndex, LabelList, ListElement,
+    /// NGram and MinHash LSH support this today (`ScalarIndexPlugin::can_remap`).
+    /// ZoneMap, BloomFilter and RTree cannot remap. This gate recognizes the
     /// supported built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
@@ -337,6 +341,7 @@ impl IndexMetadata {
                 || Self::is_bitmap_addr_domain(details, self.index_version)
                 || Self::is_label_list_addr_domain(details, self.index_version)
                 || Self::is_list_element(details)
+                || Self::is_fm(details)
                 || Self::is_ngram_addr_domain(details, self.index_version)
                 || Self::is_minhash_addr_domain(details, self.index_version)
         })

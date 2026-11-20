@@ -2371,6 +2371,11 @@ mod tests {
             .await
             .unwrap();
         let source_uuid = segment.uuid;
+        let unchanged = dataset
+            .merge_existing_index_segments(vec![segment.clone()])
+            .await
+            .unwrap();
+        assert_eq!(unchanged.uuid, source_uuid);
 
         // Retire fragment 0: delete its rows and compact it away.
         dataset.delete("text = 'alpha beta gamma'").await.unwrap();
