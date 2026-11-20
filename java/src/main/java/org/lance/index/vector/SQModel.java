@@ -26,8 +26,8 @@ import java.util.Objects;
  * encode raw vectors and can be used for either metric. All segments to be physically merged must
  * also share IVF centroids and a distance metric.
  *
- * <p>The opaque protobuf representation is for transfer between workers using the same SDK version,
- * not persistent storage across SDK upgrades.
+ * <p>The opaque serialized representation is for transfer between workers using the same SDK
+ * version, not persistent storage across SDK upgrades.
  *
  * <pre>{@code
  * SQModel model = VectorTrainer.trainSqModel(

@@ -573,7 +573,9 @@ public class VectorIndexTest {
   @CsvSource({"IVF_RQ,L2", "IVF_SQ,L2", "IVF_SQ,Cosine", "IVF_SQ,Dot", "IVF_HNSW_SQ,L2"})
   public void testSharedModelEnablesPhysicalMerge(
       IndexType indexType, DistanceType metric, @TempDir Path tempDir) throws Exception {
-    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("shared_vector_model"));
+    // Shift each fragment by one vector so independently trained SQ bounds would differ.
+    try (TestVectorDataset fixture =
+            new TestVectorDataset(tempDir.resolve("shared_vector_model"), 32);
         Dataset dataset = fixture.create()) {
       List<Fragment> fragments = dataset.getFragments();
       IvfBuildParams training =
@@ -642,8 +644,11 @@ public class VectorIndexTest {
               .build();
       dataset.commitExistingIndexSegments(
           TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, List.of(first, second));
-      Set<Integer> expected = metric == DistanceType.Dot ? Set.of(79, 159) : Set.of(1, 81);
-      assertSharedModelRecall(dataset, query, List.of(first.uuid(), second.uuid()), expected);
+      Set<Integer> expected = metric == DistanceType.Dot ? Set.of(79, 159) : Set.of(1, 80);
+      // The two exact L2 matches come from different segments.
+      int requiredMatches = indexType == IndexType.IVF_SQ && metric == DistanceType.L2 ? 2 : 1;
+      assertSharedModelRecall(
+          dataset, query, List.of(first.uuid(), second.uuid()), expected, requiredMatches);
       Index merged = dataset.mergeExistingIndexSegments(List.of(first, second));
       assertEquals(
           Set.of(fragments.get(0).getId(), fragments.get(1).getId()),
@@ -655,12 +660,13 @@ public class VectorIndexTest {
                   TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, List.of(merged))
               .size());
 
-      assertSharedModelRecall(dataset, query, List.of(merged.uuid()), expected);
+      assertSharedModelRecall(dataset, query, List.of(merged.uuid()), expected, requiredMatches);
     }
   }
 
   private static void assertSharedModelRecall(
-      Dataset dataset, Query query, List<UUID> segments, Set<Integer> expected) throws Exception {
+      Dataset dataset, Query query, List<UUID> segments, Set<Integer> expected, int requiredMatches)
+      throws Exception {
     ScanOptions options = new ScanOptions.Builder().nearest(query).indexSegments(segments).build();
     try (LanceScanner scanner = dataset.newScan(options);
         ArrowReader reader = scanner.scanBatches()) {
@@ -672,8 +678,16 @@ public class VectorIndexTest {
         }
       }
       assertEquals(2, actual.size());
-      actual.retainAll(expected);
-      assertTrue(actual.size() >= 1, "Expected Recall@2 >= 0.5, got " + actual.size() / 2.0);
+      long matches = actual.stream().filter(expected::contains).count();
+      assertTrue(
+          matches >= requiredMatches,
+          () ->
+              "Expected at least "
+                  + requiredMatches
+                  + " matches from "
+                  + expected
+                  + ", got "
+                  + actual);
     }
   }
 

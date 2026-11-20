@@ -11,65 +11,30 @@ use jni::{
     sys::jintArray,
 };
 use lance::index::vector::sq::SqModel;
-use lance_index::{
-    pb::VectorMetricType,
-    vector::sq::{builder::SQBuildParams, storage::ScalarQuantizationMetadata},
-};
-use prost::Message;
+use lance_index::vector::sq::{builder::SQBuildParams, storage::ScalarQuantizationMetadata};
+use lance_linalg::distance::DistanceType;
+use serde::{Deserialize, Serialize};
 
-// This message is a same-SDK transfer handle, not an on-disk index format.
-#[derive(Clone, PartialEq, Message)]
-struct SqModelProto {
-    #[prost(uint32, tag = "1")]
-    dimension: u32,
-    #[prost(uint32, tag = "2")]
-    num_bits: u32,
-    #[prost(double, optional, tag = "3")]
-    lower_bound: Option<f64>,
-    #[prost(double, optional, tag = "4")]
-    upper_bound: Option<f64>,
-    #[prost(enumeration = "VectorMetricType", optional, tag = "5")]
-    distance_type: Option<i32>,
+#[derive(Serialize, Deserialize)]
+struct SqModelPayload {
+    #[serde(flatten)]
+    metadata: ScalarQuantizationMetadata,
+    distance_type: String,
 }
 
-pub(crate) fn serialize_sq_model(model: &SqModel) -> Vec<u8> {
-    let metadata = model.metadata();
-    SqModelProto {
-        dimension: metadata.dim as u32,
-        num_bits: metadata.num_bits as u32,
-        lower_bound: Some(metadata.bounds.start),
-        upper_bound: Some(metadata.bounds.end),
-        distance_type: Some(VectorMetricType::from(model.distance_type()) as i32),
-    }
-    .encode_to_vec()
+pub(crate) fn serialize_sq_model(model: &SqModel) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&SqModelPayload {
+        metadata: model.metadata().clone(),
+        distance_type: model.distance_type().to_string(),
+    })?)
 }
 
 fn parse_sq_model(bytes: &[u8]) -> Result<SqModel> {
-    let model = SqModelProto::decode(bytes)
+    let model: SqModelPayload = serde_json::from_slice(bytes)
         .map_err(|e| Error::input_error(format!("Invalid SQ model: {e}")))?;
-    let metric = model
-        .distance_type
-        .and_then(|value| VectorMetricType::try_from(value).ok())
-        .ok_or_else(|| {
-            Error::input_error("SQ model has a missing or invalid distance type".into())
-        })?;
-    let num_bits = u16::try_from(model.num_bits).map_err(|_| {
-        Error::input_error(format!(
-            "SQ model num_bits must be 8, got {}",
-            model.num_bits
-        ))
-    })?;
-    let model = ScalarQuantizationMetadata {
-        dim: model.dimension as usize,
-        num_bits,
-        bounds: model
-            .lower_bound
-            .ok_or_else(|| Error::input_error("SQ model lower_bound is missing".into()))?
-            ..model
-                .upper_bound
-                .ok_or_else(|| Error::input_error("SQ model upper_bound is missing".into()))?,
-    };
-    Ok(SqModel::try_new(model, metric.into())?)
+    let distance_type = DistanceType::try_from(model.distance_type.as_str())
+        .map_err(|e| Error::input_error(format!("Invalid SQ model distance_type: {e}")))?;
+    Ok(SqModel::try_new(model.metadata, distance_type)?)
 }
 
 pub(crate) fn extract_sq_build_params(
@@ -124,52 +89,60 @@ fn inner_inspect<'local>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::JavaExceptionClass;
+    use serde_json::json;
 
     #[test]
     fn test_sq_model_transfer() {
         let metadata = ScalarQuantizationMetadata {
             dim: 32,
             num_bits: 8,
-            bounds: -0.123456789012345..9.87654321098765,
+            // Without float_roundtrip, JSON rounds this upper bound to 1.0.
+            bounds: -0.123456789012345..1.0_f64.next_down(),
         };
-        let model = SqModel::try_new(metadata.clone(), VectorMetricType::Cosine.into()).unwrap();
-        let restored = parse_sq_model(&serialize_sq_model(&model)).unwrap();
+        let model = SqModel::try_new(metadata.clone(), DistanceType::Cosine).unwrap();
+        let restored = parse_sq_model(&serialize_sq_model(&model).unwrap()).unwrap();
         assert_eq!(restored.metadata(), &metadata);
         assert_eq!(restored.distance_type(), model.distance_type());
-        for bytes in [
-            vec![],
-            vec![255],
-            vec![8, 32, 16, 8],
-            SqModelProto {
-                dimension: 0,
-                num_bits: 8,
-                lower_bound: Some(0.0),
-                upper_bound: Some(1.0),
-                distance_type: Some(VectorMetricType::L2 as i32),
-            }
-            .encode_to_vec(),
-            SqModelProto {
-                dimension: 32,
-                num_bits: 65544,
-                lower_bound: Some(0.0),
-                upper_bound: Some(1.0),
-                distance_type: Some(VectorMetricType::L2 as i32),
-            }
-            .encode_to_vec(),
-            SqModelProto {
-                dimension: 32,
-                num_bits: 8,
-                lower_bound: Some(f64::NAN),
-                upper_bound: Some(1.0),
-                distance_type: Some(VectorMetricType::L2 as i32),
-            }
-            .encode_to_vec(),
+    }
+
+    #[test]
+    fn test_rejects_invalid_sq_models() {
+        let payload = json!({
+            "dim": 32,
+            "num_bits": 8,
+            "bounds": {"start": 0.0, "end": 1.0},
+            "distance_type": "l2",
+        });
+        for (field, value, expected) in [
+            ("dim", json!(0), "SQ model dimension"),
+            ("num_bits", json!(65544), "u16"),
+            (
+                "bounds",
+                json!({"start": 2.0, "end": 1.0}),
+                "SQ model bounds",
+            ),
+            (
+                "distance_type",
+                json!("unknown"),
+                "Invalid SQ model distance_type",
+            ),
         ] {
-            let err = parse_sq_model(&bytes).unwrap_err();
+            let mut invalid = payload.clone();
+            invalid[field] = value;
+            let err = parse_sq_model(&serde_json::to_vec(&invalid).unwrap()).unwrap_err();
             assert!(
                 err.to_string()
-                    .starts_with("java/lang/IllegalArgumentException:")
+                    .starts_with(JavaExceptionClass::IllegalArgumentException.as_str())
             );
+            assert!(err.to_string().contains(expected), "{err}");
         }
+
+        let err = parse_sq_model(b"not JSON").unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(JavaExceptionClass::IllegalArgumentException.as_str())
+        );
+        assert!(err.to_string().contains("Invalid SQ model"));
     }
 }

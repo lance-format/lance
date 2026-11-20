@@ -257,7 +257,7 @@ fn inner_train_sq_model<'local>(
                 &params,
             ))?,
         };
-        serialize_sq_model(&model)
+        serialize_sq_model(&model)?
     };
     Ok(env.byte_array_from_slice(&bytes)?)
 }
