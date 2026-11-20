@@ -6663,8 +6663,7 @@ async fn test_build_segment_update_folds_seeds_and_scan_into_target_zones(#[case
                 .await
                 .unwrap();
         super::merge_zonemap_segments(
-            &[existing.as_ref()],
-            &RoaringBitmap::from_iter([0, 1]),
+            &[(existing.as_ref(), &RoaringBitmap::from_iter([0, 1]))],
             reused,
             scanned,
             &[1, 2],
@@ -6748,6 +6747,69 @@ async fn test_build_segment_update_folds_seeds_and_scan_into_target_zones(#[case
     .err()
     .expect("reuse without positions must be rejected");
     assert!(err.to_string().contains("without null positions"), "{err}");
+}
+
+#[tokio::test]
+async fn test_merge_rejects_scanned_zones_without_null_positions() {
+    let dir = TempObjDir::default();
+    let store = local_store(&dir);
+    build_segment_from_batches(
+        store.as_ref(),
+        ZoneMapIndexBuilderParams::new(4),
+        vec![vec![None, Some(1)]],
+    )
+    .await;
+    let existing = ZoneMapIndex::load(
+        store,
+        None,
+        &LanceCache::no_cache(),
+        true,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    assert!(existing.has_null_bitmap());
+
+    let mut scanned = super::ScannedZones::default();
+    for (fragment, track_nulls) in [(1, false), (2, true)] {
+        let batch = arrow_array::record_batch!(
+            (VALUE_COLUMN_NAME, Int32, [None, Some(1)]),
+            (ROW_ADDR, UInt64, [fragment << 32, (fragment << 32) | 1])
+        )
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter([Ok(batch)]),
+        ));
+        scanned.merge(
+            super::train_zonemap_scan(
+                &DataType::Int32,
+                4,
+                track_nulls,
+                HashMap::from([(fragment, 2)]),
+                stream,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    let dest = TempObjDir::default();
+    let error = super::merge_zonemap_segments(
+        &[(existing.as_ref(), &RoaringBitmap::from_iter([0]))],
+        ReusedZones::new(true),
+        scanned,
+        &[1, 2],
+        local_store(&dest).as_ref(),
+    )
+    .await
+    .err()
+    .expect("scanning without null positions must be rejected");
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("scanned without null positions"),
+        "{error}"
+    );
 }
 
 /// The low-level plugin entry reuses only seeds whose every record fits

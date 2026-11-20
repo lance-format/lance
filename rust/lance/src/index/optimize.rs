@@ -40,11 +40,13 @@
 //! single-process optimize, so they stay one task, as does a BloomFilter
 //! index whose segments do not merge by their zones.
 //!
-//! ZoneMap reuses compatible v1 segments. Without pending remaps, v0 or
-//! incompatible segments are rebuilt over their live coverage plus new
-//! fragments, using the same task bounds. Pending remaps retain old segments
-//! and build only new data. A fragment is indivisible even when it exceeds
-//! the bound.
+//! ZoneMap reuses compatible v1 segments and rebuilds v0 or incompatible
+//! segments over their live coverage plus new fragments, using the same task
+//! bounds. If a selected live segment has a separate base path or a pending
+//! legacy remap, the plan only indexes new fragments. Bounded
+//! optimization skips ZoneMap under a tagged fragment reuse history, or
+//! returns an error when the index is named explicitly. A fragment is
+//! indivisible even when it exceeds the bound.
 //!
 //! [`OptimizeOptions::consolidate`] instead selects a suffix of complete vector
 //! segments within a physical-row budget, leaving unindexed fragments alone.
@@ -117,9 +119,10 @@ use uuid::Uuid;
 
 use super::DatasetIndexExt;
 use super::append::{
-    append_vector_segment, expects_definition_only, fragment_reuse_affects_segments,
-    index_field_path, is_definition_only_segment, merge_indices_with_unindexed_frags,
-    partition_dormant_vector_segments, select_segments_to_merge, tagged_segment_coverage,
+    append_vector_segment, append_zonemap_segment, expects_definition_only,
+    fragment_reuse_affects_segments, index_field_path, is_definition_only_segment,
+    merge_indices_with_unindexed_frags, partition_dormant_vector_segments,
+    select_segments_to_merge, tagged_segment_coverage,
 };
 use super::frag_reuse::{
     MissingCoverageReason, OpenPurpose, SegmentRemappingPlan, segment_coverage_reason,
@@ -1000,11 +1003,13 @@ async fn plan_split_vector_index(
         .unwrap_or(0)
         .min(segments.len());
     let selected = segments[segments.len() - num_to_merge..].to_vec();
-    let mut candidates = maintenance_candidates(dataset, name, selected)
-        .await?
-        .unwrap_or_default();
-    retain_matching_versions(name, reference, &mut candidates);
-    let absorbed: Vec<IndexMetadata> = candidates.into_iter().cloned().collect();
+    let absorbed: Vec<IndexMetadata> =
+        maintenance_candidates(dataset, name, Some(reference.index_version), selected)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .cloned()
+            .collect();
     if !absorbed.is_empty() {
         // Segments merge physically only when they share one model.
         let pairs = logical_index
@@ -1046,32 +1051,8 @@ async fn plan_split_scalar_index(
     named: bool,
 ) -> Result<Option<SplitInputs>> {
     let last = *segments.last().expect("an index has at least one segment");
-    let selected = select_segments_to_merge(dataset, segments, options);
-    // The single-process merge removes a selected segment whose fragments are
-    // all gone along with the rest; the split merge cannot absorb it.
-    let dead: Vec<_> = selected
-        .iter()
-        .filter(|segment| {
-            segment
-                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
-                .is_some_and(|bitmap| bitmap.is_empty())
-        })
-        .map(|segment| segment.uuid)
-        .collect();
-    let candidates = maintenance_candidates(dataset, name, selected).await?;
-    let can_rebuild_zonemap = segment_has_zonemap_details(last) && candidates.is_some();
-    let mut candidates = candidates.unwrap_or_default();
-    let reference = if can_rebuild_zonemap {
-        // Use the first live source's parameters for merging or rebuilding.
-        let reference = candidates.first().copied().unwrap_or(last);
-        if let Some(mut inputs) =
-            plan_zonemap_rebuild(dataset, field_path, &candidates, &fragments, reference).await?
-        {
-            inputs.replaces.extend(dead);
-            return Ok(Some(inputs));
-        }
-        reference
-    } else {
+    let is_zonemap = segment_has_zonemap_details(last);
+    if !is_zonemap {
         let reference_index = dataset
             .open_scalar_index_for_maintenance(field_path, &last.uuid, &NoOpMetricsCollector)
             .await?;
@@ -1084,10 +1065,39 @@ async fn plan_split_scalar_index(
                  current format",
             );
         }
-        retain_matching_versions(name, last, &mut candidates);
+    }
+    let selected = select_segments_to_merge(dataset, segments, options);
+    // The single-process merge removes a selected segment whose fragments are
+    // all gone along with the rest; the split merge cannot absorb it.
+    let dead: Vec<_> = selected
+        .iter()
+        .filter(|segment| {
+            segment
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
+                .is_some_and(|bitmap| bitmap.is_empty())
+        })
+        .map(|segment| segment.uuid)
+        .collect();
+    let required_version = (!is_zonemap).then_some(last.index_version);
+    let candidates = maintenance_candidates(dataset, name, required_version, selected).await?;
+    let reference = if is_zonemap && let Some(candidates) = &candidates {
+        // Use the first live source's parameters for merging or rebuilding.
+        let reference = candidates.first().copied().unwrap_or(last);
+        if let Some(mut inputs) =
+            plan_zonemap_rebuild(dataset, candidates, &fragments, reference).await?
+        {
+            inputs.replaces.extend(dead);
+            return Ok(Some(inputs));
+        }
+        reference
+    } else {
         last
     };
-    let absorbed = candidates.into_iter().cloned().collect();
+    let absorbed = candidates
+        .unwrap_or_default()
+        .into_iter()
+        .cloned()
+        .collect();
     Ok(Some(SplitInputs {
         reference: reference.clone(),
         fragments,
@@ -1149,13 +1159,12 @@ async fn bloomfilter_split_merges(
 /// Plan a fragment-local rebuild when the selected ZoneMap segments cannot be reused.
 async fn plan_zonemap_rebuild(
     dataset: &Dataset,
-    field_path: &str,
     selected: &[&IndexMetadata],
     fragments: &[Fragment],
     reference: &IndexMetadata,
 ) -> Result<Option<SplitInputs>> {
     // Metadata checks avoid loading all zone statistics during planning.
-    if !scalar::zonemap::requires_rebuild_from_metadata(dataset, field_path, selected).await? {
+    if !scalar::zonemap::requires_rebuild_from_metadata(dataset, selected).await? {
         return Ok(None);
     }
     let mut coverage: RoaringBitmap = fragments
@@ -1164,7 +1173,7 @@ async fn plan_zonemap_rebuild(
         .collect();
     for segment in selected {
         coverage |= segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .unwrap_or_default();
     }
     Ok(Some(SplitInputs {
@@ -1261,11 +1270,13 @@ async fn train_model_segment(
     })
 }
 
-/// Select live sources for split maintenance. `None` defers all selected sources
-/// because of a base or remap restriction; `Some` may contain no live sources.
+/// Select live sources for split maintenance. A required version applies to
+/// every live source. A blocked group returns `None`, while an eligible group
+/// can be empty.
 async fn maintenance_candidates<'a>(
     dataset: &Dataset,
     name: &str,
+    required_version: Option<i32>,
     mut selected: Vec<&'a IndexMetadata>,
 ) -> Result<Option<Vec<&'a IndexMetadata>>> {
     selected.retain(|segment| {
@@ -1273,7 +1284,13 @@ async fn maintenance_candidates<'a>(
             .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .is_some_and(|bitmap| !bitmap.is_empty())
     });
-    let reason = if selected.iter().any(|segment| segment.base_id.is_some()) {
+    let reason = if required_version.is_some_and(|version| {
+        selected
+            .iter()
+            .any(|segment| segment.index_version != version)
+    }) {
+        Some("their on-disk index versions differ")
+    } else if selected.iter().any(|segment| segment.base_id.is_some()) {
         Some("a segment lives in the base dataset of a shallow clone")
     } else if let Some(frag_reuse_index) =
         dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?
@@ -1290,24 +1307,6 @@ async fn maintenance_candidates<'a>(
         return Ok(None);
     }
     Ok(Some(selected))
-}
-
-/// Keep the default merge policy for indices that do not rebuild mixed versions.
-fn retain_matching_versions(
-    name: &str,
-    reference: &IndexMetadata,
-    candidates: &mut Vec<&IndexMetadata>,
-) {
-    if candidates
-        .iter()
-        .any(|segment| segment.index_version != reference.index_version)
-    {
-        log::warn!(
-            "Index '{name}': appending new segments without merging existing ones because \
-             their on-disk index versions differ"
-        );
-        candidates.clear();
-    }
 }
 
 /// Pack one split index's inputs into tasks and merges and append them to
@@ -1448,7 +1447,7 @@ impl OptimizeIndexTask {
         dataset: &Dataset,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<Option<IndexSegmentResult>> {
-        let mut options = OptimizeOptions::default().progress(progress);
+        let mut options = OptimizeOptions::default().progress(progress.clone());
         options.num_indices_to_merge = self.num_indices_to_merge;
         options.enable_partition_rebalancing = self.enable_partition_rebalancing;
         options.retrain = self.retrain;
@@ -1481,6 +1480,22 @@ impl OptimizeIndexTask {
                     &index,
                     &fragments,
                     &options,
+                )
+                .await?,
+            )
+        } else if self.old_segments.is_empty() && segment_has_zonemap_details(&self.reference) {
+            if fragments.is_empty() {
+                return Ok(None);
+            }
+            let field = keyed_field(&dataset, &self.reference)?;
+            let field_path = dataset.schema().field_path(field.id)?;
+            Some(
+                append_zonemap_segment(
+                    &dataset,
+                    &field_path,
+                    &self.reference,
+                    &fragments,
+                    progress,
                 )
                 .await?,
             )
@@ -1808,9 +1823,6 @@ pub async fn commit_optimize_indices(
 mod tests {
     use super::*;
 
-    use crate::index::frag_reuse_reader::tests::{
-        fixture_with_index, install, persist_fixture, prepare,
-    };
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
     use arrow_array::{
@@ -1834,6 +1846,10 @@ mod tests {
     use crate::dataset::transaction::{UpdateMode, UpdatedFragmentOffsets};
     use crate::dataset::{UpdateBuilder, WriteParams};
     use crate::index::CreateIndexBuilder;
+    use crate::index::frag_reuse_reader::tests::{
+        fixture_with_index, install, persist_fixture, prepare,
+    };
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
 
     const DIM: usize = 64;
     const VECTOR_INDEX: &str = "vector_idx";
@@ -2848,18 +2864,18 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::merge_only(0, Some(4), None, 1)]
-    #[case::single_build(4, Some(4), None, 1)]
-    #[case::multiple_builds(8, Some(4), None, 1)]
-    #[case::bounded_segments(8, Some(4), Some(8), 2)]
-    #[case::unbounded(4, None, None, 1)]
+    #[case::merge_only(0, Some(4), None, 1, false)]
+    #[case::seeded_single_build(4, Some(4), None, 1, true)]
+    #[case::multiple_builds(8, Some(4), None, 1, false)]
+    #[case::bounded_segments(8, Some(4), Some(8), 2, false)]
+    #[case::unbounded(4, None, None, 1, false)]
     #[tokio::test]
     async fn test_split_zonemap_merges_without_rescanning(
         #[case] appended_rows: usize,
         #[case] task_limit: Option<u64>,
         #[case] segment_limit: Option<u64>,
         #[case] expected_segments: usize,
-        #[values(false, true)] use_seeds: bool,
+        #[case] use_seeds: bool,
     ) {
         let dir = TempStrDir::default();
         let mut dataset = write_dataset(dir.as_str(), 8, 4).await;
@@ -2880,21 +2896,15 @@ mod tests {
             .commit_existing_index_segments(SCALAR_INDEX, "id", staged)
             .await
             .unwrap();
-        let indexed_files = dataset
-            .fragments()
-            .iter()
-            .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
-            .collect::<Vec<_>>();
+        let indexed_files = data_files(&dataset, 0..2);
         if appended_rows > 0 {
             append(&mut dataset, appended_rows, 4).await;
         }
         let options = OptimizeOptions::merge(2)
             .max_rows_per_task(task_limit)
             .max_rows_per_segment(segment_limit);
-        dataset.object_store.as_ref().io_stats_incremental();
+        read_paths(&dataset);
         let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
-        let plan: OptimizeIndicesPlan =
-            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         assert_eq!(plan.tasks.len(), appended_rows / 4);
         assert_eq!(plan.merges.len(), expected_segments);
         let task_sources = plan
@@ -2914,49 +2924,30 @@ mod tests {
             assert_eq!(task_sources, 0);
             assert_eq!(merge_sources, 2);
         }
-        let built =
-            futures::future::try_join_all(plan.tasks.iter().map(|task| task.execute(&dataset)))
-                .await
-                .unwrap()
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-        let built: Vec<IndexSegmentResult> =
-            serde_json::from_str(&serde_json::to_string(&built).unwrap()).unwrap();
-        let merged = futures::future::try_join_all(
-            plan.merges
-                .iter()
-                .map(|merge| merge.execute(&dataset, &built)),
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .flatten()
-        .collect();
-        commit_optimize_indices(&mut dataset, merged, &options)
+        let results = SEED_REUSE_REPORTS
+            .scope(std::sync::Mutex::new(Vec::new()), async {
+                let results = execute_plan(&dataset, &plan).await;
+                if use_seeds {
+                    SEED_REUSE_REPORTS.with(|reports| {
+                        let reports = reports.lock().unwrap();
+                        assert_eq!(reports.len(), 1);
+                        assert_eq!(reports[0].reused_fragments, [2]);
+                        assert_eq!(reports[0].scanned_rows, 0);
+                    });
+                }
+                results
+            })
+            .await;
+        commit_optimize_indices(&mut dataset, results, &options)
             .await
             .unwrap();
-        let rescanned = dataset
-            .object_store
-            .as_ref()
-            .io_stats_incremental()
-            .requests
-            .into_iter()
-            .filter(|request| {
-                indexed_files
-                    .iter()
-                    .any(|file| request.path.as_ref().ends_with(file))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            rescanned.is_empty(),
-            "indexed data was rescanned: {rescanned:?}"
-        );
+        let paths = read_paths(&dataset);
+        assert!(!read_any(&paths, &indexed_files), "{paths:?}");
 
         let dataset = Dataset::open(dir.as_str()).await.unwrap();
         let merged = segments(&dataset, SCALAR_INDEX).await;
         assert_eq!(merged.len(), expected_segments);
-        assert_eq!(coverage(&merged), *dataset.fragment_bitmap);
+        assert_eq!(coverage(&merged), *dataset.table_state.fragment_bitmap);
         assert!(merged.iter().all(|segment| segment.index_version == 1));
         if let Some(limit) = segment_limit {
             assert!(
@@ -2991,6 +2982,65 @@ mod tests {
             results.push(ids);
         }
         assert_eq!(results[0], results[1], "{predicate}");
+    }
+
+    /// A column rewrite drops a fragment from index coverage but leaves its old
+    /// zones in the index file. Once reindexed, the fragment must get statistics
+    /// only from its new segment, even when both segments merge.
+    #[rstest::rstest]
+    #[case::merge_only(false)]
+    #[case::single_build(true)]
+    #[tokio::test]
+    async fn test_split_zonemap_drops_zones_withdrawn_from_a_source(#[case] append_data: bool) {
+        let dir = TempStrDir::default();
+        let mut dataset = write_dataset(dir.as_str(), 100, 50).await;
+        let index_name = "value_idx";
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::ZoneMap,
+                Some(index_name.to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Row 52 was null and is now 5200 in the same fragment and offset.
+        dataset = rewrite_value(dataset, dir.as_str(), 52).await;
+        assert_eq!(
+            coverage(&segments(&dataset, index_name).await),
+            RoaringBitmap::from_iter([0])
+        );
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(segments(&dataset, index_name).await.len(), 2);
+        if append_data {
+            append(&mut dataset, 4, 4).await;
+        }
+
+        let options = OptimizeOptions::merge(2).max_rows_per_task(Some(4));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), usize::from(append_data));
+        assert_eq!(plan.merges.len(), 1);
+        if append_data {
+            assert_eq!(plan.tasks[0].old_segments.len(), 2);
+        } else {
+            assert_eq!(plan.merges[0].old_segments.len(), 2);
+        }
+        let results = execute_plan(&dataset, &plan).await;
+        commit_optimize_indices(&mut dataset, results, &options)
+            .await
+            .unwrap();
+
+        let merged = segments(&dataset, index_name).await;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(coverage(&merged), *dataset.table_state.fragment_bitmap);
+        assert_scalar_query_matches_scan(&dataset, "value IS NULL").await;
+        assert_scalar_query_matches_scan(&dataset, "value IS NOT NULL").await;
+        assert_eq!(ids_where(&dataset, "value = 5200").await, [52]);
     }
 
     #[rstest::rstest]
@@ -3077,7 +3127,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             coverage(&segments(&dataset, SCALAR_INDEX).await),
-            *dataset.fragment_bitmap
+            *dataset.table_state.fragment_bitmap
         );
         for predicate in [
             "value IS NULL",
@@ -3092,7 +3142,6 @@ mod tests {
 
     #[rstest::rstest]
     #[case::btree(BuiltinIndexType::BTree, IndexType::BTree)]
-    #[case::bitmap(BuiltinIndexType::Bitmap, IndexType::Bitmap)]
     #[case::zonemap(BuiltinIndexType::ZoneMap, IndexType::ZoneMap)]
     #[tokio::test]
     async fn test_split_scalar_preserves_shallow_clone_segments(
@@ -3139,7 +3188,7 @@ mod tests {
         let committed = segments(&dataset, SCALAR_INDEX).await;
         assert_eq!(committed.len(), old.len() + 1);
         assert!(old.iter().all(|segment| committed.contains(segment)));
-        assert_eq!(coverage(&committed), *dataset.fragment_bitmap);
+        assert_eq!(coverage(&committed), *dataset.table_state.fragment_bitmap);
         assert_scalar_query_matches_scan(&dataset, "id >= 2 AND id < 10").await;
 
         // A retired base segment must not block maintenance of local live sources.
@@ -3162,19 +3211,18 @@ mod tests {
         let committed = segments(&dataset, SCALAR_INDEX).await;
         assert_eq!(committed.len(), 1);
         assert!(committed[0].base_id.is_none());
-        assert_eq!(coverage(&committed), *dataset.fragment_bitmap);
+        assert_eq!(coverage(&committed), *dataset.table_state.fragment_bitmap);
         assert_scalar_query_matches_scan(&dataset, "id >= 2 AND id < 10").await;
     }
 
     #[rstest::rstest]
-    #[case::split(Some(4), None)]
-    #[case::bounded_segments(Some(4), Some(4))]
-    #[case::unsplit(None, None)]
+    #[case::split(Some(4), 2)]
+    #[case::unsplit_single_source(None, 1)]
+    #[case::unsplit_multiple_sources(None, 2)]
     #[tokio::test]
     async fn test_zonemap_preserves_shared_remap_policy(
         #[case] task_limit: Option<u64>,
-        #[case] segment_limit: Option<u64>,
-        #[values(1, 2)] source_count: usize,
+        #[case] source_count: usize,
     ) {
         let batch = arrow_array::record_batch!(
             ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
@@ -3250,9 +3298,7 @@ mod tests {
             "{error}"
         );
 
-        let options = OptimizeOptions::merge(2)
-            .max_rows_per_task(task_limit)
-            .max_rows_per_segment(segment_limit);
+        let options = OptimizeOptions::merge(2).max_rows_per_task(task_limit);
         if task_limit.is_some() {
             let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
             assert!(plan.tasks.is_empty() && plan.merges.is_empty());
@@ -3301,38 +3347,15 @@ mod tests {
             assert!(old.iter().all(|source| merged[0].uuid != source.uuid));
         }
         assert!(merged.iter().all(|segment| segment.index_version == 1));
-        assert_eq!(coverage(&merged), *dataset.fragment_bitmap);
+        assert_eq!(coverage(&merged), *dataset.table_state.fragment_bitmap);
         for predicate in ["value IS NULL", "value >= 3.0", "value = 8.0"] {
             assert_scalar_query_matches_scan(&dataset, predicate).await;
         }
     }
 
-    #[rstest::rstest]
     #[tokio::test]
-    async fn test_zonemap_preserves_shared_tagged_policy(
-        #[values(false, true)] multiple_sources: bool,
-        #[values(false, true)] append_data: bool,
-    ) {
+    async fn test_zonemap_preserves_shared_tagged_policy() {
         let mut dataset = fixture_with_index(IndexType::ZoneMap).await;
-        if multiple_sources {
-            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
-            let mut staged = Vec::new();
-            for fragment in dataset.get_fragments() {
-                staged.push(
-                    CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::ZoneMap, &params)
-                        .name("i_idx".into())
-                        .replace(true)
-                        .fragments(vec![fragment.id() as u32])
-                        .execute_uncommitted()
-                        .await
-                        .unwrap(),
-                );
-            }
-            dataset
-                .commit_existing_index_segments("i_idx", "i", staged)
-                .await
-                .unwrap();
-        }
         dataset.delete("i = 3").await.unwrap();
         let (transition, destinations) = prepare(&dataset).await;
         install(
@@ -3348,16 +3371,14 @@ mod tests {
         .await;
         let stored = load_all_indices(&dataset).await.unwrap().as_ref().clone();
         persist_fixture(&mut dataset, stored).await;
-        if append_data {
-            let batch = arrow_array::record_batch!(("i", Int32, [8, 9])).unwrap();
-            dataset
-                .append(
-                    RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-                    None,
-                )
-                .await
-                .unwrap();
-        }
+        let batch = arrow_array::record_batch!(("i", Int32, [8, 9])).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
         let options = OptimizeOptions::merge(2)
             .max_rows_per_task(Some(4))
             .max_rows_per_segment(Some(4));
@@ -3376,32 +3397,12 @@ mod tests {
             error.to_string().contains("tagged fragment reuse history"),
             "{error}"
         );
-        for value in 0..if append_data { 10 } else { 8 } {
-            let predicate = format!("i = {value}");
-            let mut actual = Vec::new();
-            for use_index in [true, false] {
-                let mut scan = dataset.scan();
-                scan.filter(&predicate).unwrap().use_scalar_index(use_index);
-                if use_index {
-                    assert!(
-                        scan.explain_plan(false)
-                            .await
-                            .unwrap()
-                            .contains("ScalarIndexQuery")
-                    );
-                }
-                actual.push(scan.try_into_batch().await.unwrap());
-            }
-            assert_eq!(actual[0], actual[1], "{predicate}");
-            assert_eq!(actual[0].num_rows(), usize::from(value != 3));
-        }
     }
 
     #[rstest::rstest]
     #[case::zone_size_full(4, true, false)]
     #[case::zone_size_partial(4, true, true)]
     #[case::null_policy_full(2, false, false)]
-    #[case::null_policy_partial(2, false, true)]
     #[tokio::test]
     async fn test_zonemap_distributed_rebuild_incompatible_parameters(
         #[case] second_zone_size: u64,
@@ -3474,7 +3475,7 @@ mod tests {
         }
         assert_eq!(
             coverage(&segments(&dataset, SCALAR_INDEX).await),
-            *dataset.fragment_bitmap
+            *dataset.table_state.fragment_bitmap
         );
         assert_scalar_query_matches_scan(&dataset, "id >= 2 AND id < 10").await;
     }

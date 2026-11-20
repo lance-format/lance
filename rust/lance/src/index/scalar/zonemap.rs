@@ -11,13 +11,13 @@ use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::pbold::ZoneMapIndexDetails;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::{
-    HarvestedZoneSeed, NULL_BITMAP_POLICY_META_KEY, ReusedZones, ScannedZones, SeedOutcome,
-    ZONEMAP_INDEX_FILENAME, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapIndexVersion,
-    ZoneMapSegmentBase, merge_zonemap_segments, train_zonemap_scan, write_zonemap_segment,
+    HarvestedZoneSeed, ReusedZones, ScannedZones, SeedOutcome, ZoneMapIndex,
+    ZoneMapIndexBuilderParams, ZoneMapIndexVersion, ZoneMapSegmentBase,
+    merge_zonemap_indices_with_filters, merge_zonemap_segments, train_zonemap_scan,
+    write_zonemap_segment,
 };
 use lance_index::scalar::{CreatedIndex, IndexStore, TrainingCriteria};
 use lance_select::RowAddrTreeMap;
@@ -37,7 +37,6 @@ use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 /// source, so adding merge support cannot turn a successful update into an error.
 pub(in crate::index) async fn requires_rebuild(
     dataset: &Dataset,
-    column: &str,
     segments: &[&IndexMetadata],
 ) -> Result<bool> {
     if let Some(reuse) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?
@@ -60,13 +59,12 @@ pub(in crate::index) async fn requires_rebuild(
             return Ok(true);
         }
     }
-    requires_rebuild_from_metadata(dataset, column, segments).await
+    requires_rebuild_from_metadata(dataset, segments).await
 }
 
 /// Check version and parameter compatibility after the planner accepts source locations.
 pub(in crate::index) async fn requires_rebuild_from_metadata(
     dataset: &Dataset,
-    column: &str,
     segments: &[&IndexMetadata],
 ) -> Result<bool> {
     if segments
@@ -77,12 +75,7 @@ pub(in crate::index) async fn requires_rebuild_from_metadata(
     }
     let mut parameters = None;
     for segment in segments {
-        let details = super::fetch_index_details(dataset, column, segment).await?;
-        let details = details.to_msg::<ZoneMapIndexDetails>()?;
-        let current = (
-            details.rows_per_zone,
-            stored_null_bitmap_policy(dataset, segment).await?,
-        );
+        let current = stored_merge_parameters(dataset, segment).await?;
         if parameters
             .as_ref()
             .is_some_and(|reference| reference != &current)
@@ -101,18 +94,27 @@ pub(in crate::index) async fn merge_segments(
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "ZoneMap", &segments)?;
-    let (fragment_bitmap, _) = merge.coverage_union(dataset)?;
+    let mut fragment_bitmap = RoaringBitmap::new();
+    let mut source_coverages = Vec::with_capacity(segments.len());
+    for segment in merge.segments() {
+        let effective = segment
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+        fragment_bitmap |= &effective;
+        source_coverages.push(effective);
+    }
 
     let opened = open_dyn_sources(dataset, merge.field_path(), merge.segments(), staged).await?;
     let source_indices = downcast_sources::<ZoneMapIndex>(&opened, merge.segments(), "ZoneMap")?;
+    let sources: Vec<_> = source_indices.into_iter().zip(&source_coverages).collect();
 
     let (new_uuid, new_store) = merge.new_store(dataset)?;
-    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
-        &source_indices,
-        &new_store,
-        &fragment_bitmap,
-    )
-    .await?;
+    let created_index = merge_zonemap_indices_with_filters(&sources, &new_store).await?;
 
     Ok(merge.build_metadata(
         new_uuid,
@@ -601,7 +603,6 @@ pub(in crate::index) async fn open_and_merge_segments(
         Error::invalid_input("ZoneMap update requires at least one source segment")
     })?;
     let mut indices = Vec::with_capacity(segments.len());
-    let mut coverage = RoaringBitmap::new();
     for segment in segments {
         let index = super::open_scalar_index_with_plan(
             dataset,
@@ -612,23 +613,24 @@ pub(in crate::index) async fn open_and_merge_segments(
             &NoOpMetricsCollector,
         )
         .await?;
-        coverage |= segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        let coverage = segment
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "ZoneMap segment {} is missing fragment coverage",
                     segment.uuid
                 ))
             })?;
-        indices.push(index);
+        indices.push((index, coverage));
     }
     let sources = indices
         .iter()
         .zip(segments)
-        .map(|(index, segment)| {
+        .map(|((index, coverage), segment)| {
             index
                 .as_any()
                 .downcast_ref::<ZoneMapIndex>()
+                .map(|index| (index, coverage))
                 .ok_or_else(|| {
                     Error::index(format!(
                         "ZoneMap merge: expected ZoneMap segment {}, got {:?}",
@@ -638,8 +640,8 @@ pub(in crate::index) async fn open_and_merge_segments(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    let base = ZoneMapSegmentBase::Update(sources[0]);
-    let data_type = sources[0].value_type();
+    let first = sources[0].0;
+    let data_type = first.value_type();
     let harvester = if harvest {
         reference
             .keyed_field()
@@ -650,8 +652,8 @@ pub(in crate::index) async fn open_and_merge_segments(
     let (reused, scanned) = collect_segment_zones(
         dataset,
         column,
-        base.rows_per_zone(),
-        sources.iter().all(|source| source.has_null_bitmap()),
+        first.rows_per_zone(),
+        sources.iter().all(|(source, _)| source.has_null_bitmap()),
         data_type,
         unindexed,
         harvester,
@@ -660,7 +662,16 @@ pub(in crate::index) async fn open_and_merge_segments(
     )
     .await?;
     let refreshed: Vec<u64> = unindexed.iter().map(|fragment| fragment.id).collect();
-    merge_zonemap_segments(&sources, &coverage, reused, scanned, &refreshed, store).await
+    merge_zonemap_segments(&sources, reused, scanned, &refreshed, store).await
+}
+
+/// Read the physical parameters the merger uses, without reading the zones.
+pub(in crate::index) async fn stored_merge_parameters(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<(u64, bool)> {
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, index).await?;
+    ZoneMapIndex::load_merge_parameters(&store).await
 }
 
 /// The persisted null-position policy of a ZoneMap segment, read from its
@@ -669,11 +680,6 @@ pub(in crate::index) async fn open_and_merge_segments(
 /// `store_null_bitmap: false`; an index without the key (legacy or default)
 /// keeps the default.
 pub async fn stored_null_bitmap_policy(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
-    let store = LanceIndexStore::from_dataset_for_existing(dataset, index).await?;
-    let file = store.open_index_file(ZONEMAP_INDEX_FILENAME).await?;
-    Ok(file
-        .schema()
-        .metadata
-        .get(NULL_BITMAP_POLICY_META_KEY)
-        .is_none_or(|value| value != "false"))
+    let (_, store_null_bitmap) = stored_merge_parameters(dataset, index).await?;
+    Ok(store_null_bitmap)
 }

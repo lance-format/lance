@@ -18,7 +18,8 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{
-        CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+        BuiltinIndexType, CreatedIndex, OldIndexDataFilter, ScalarIndex, ScalarIndexParams,
+        index_files_to_table,
         inverted::InvertedIndex,
         json,
         lance_format::LanceIndexStore,
@@ -1107,8 +1108,7 @@ async fn merge_scalar_indices<'a>(
             .any(|segment| migrated_to_row_addrs(segment) && !segment.results_are_row_addrs());
 
     let zonemap_requires_rebuild = index_type == IndexType::ZoneMap
-        && super::scalar::zonemap::requires_rebuild(&dataset, field_path, &selected_old_indices)
-            .await?;
+        && super::scalar::zonemap::requires_rebuild(&dataset, &selected_old_indices).await?;
 
     // Two or more bloom filter segments merge by their zones unless only a
     // rebuild catches the index up (a pending compaction remap, since the
@@ -1200,10 +1200,8 @@ async fn merge_scalar_indices<'a>(
         }
         let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
 
-        // Try a seed-based update before falling back to a full column scan.
-        // Seeds are only available if every unindexed fragment had a seed buffer
-        // written during its data file write, and the plugin validates that the
-        // seeds are compatible with the current index configuration.
+        // ZoneMap can combine seed and scan statistics in one build. The
+        // generic seed update below needs compatible seeds for every new fragment.
         let index_details =
             fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
         let details = IndexDetails(index_details.clone());
@@ -1643,6 +1641,54 @@ pub async fn index_field_path(
         .map(|resolved| resolved.canonical_path.clone())
         .unwrap_or(raw_field_path);
     Ok((field_path, resolved_fts))
+}
+
+/// Build a ZoneMap over just this task's fragments. The reference supplies
+/// settings, so loading the old zones and null bitmap would be wasted work.
+pub(super) async fn append_zonemap_segment(
+    dataset: &Dataset,
+    field_path: &str,
+    reference: &IndexMetadata,
+    fragments: &[Fragment],
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<IndexMergeResults<'static>> {
+    let (rows_per_zone, store_null_bitmap) =
+        super::scalar::zonemap::stored_merge_parameters(dataset, reference).await?;
+    let details = fetch_index_details(dataset, field_path, reference).await?;
+    let use_seeds = IndexDetails(details.clone())
+        .get_plugin()?
+        .might_use_seeds(&details);
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": rows_per_zone,
+            "store_null_bitmap": store_null_bitmap,
+            "use_seeds": use_seeds,
+        }));
+    let new_fragment_bitmap: RoaringBitmap = fragments
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let new_uuid = Uuid::new_v4();
+    let created = super::scalar::build_scalar_index(
+        dataset,
+        field_path,
+        new_uuid,
+        &params,
+        true,
+        Some(new_fragment_bitmap.iter().collect()),
+        None,
+        progress,
+    )
+    .await?;
+    Ok(IndexMergeResults {
+        new_uuid,
+        removed_indices: Vec::new(),
+        new_fragment_bitmap,
+        new_dataset_version: dataset.manifest.version,
+        new_index_version: created.index_version as i32,
+        new_index_details: created.index_details,
+        files: index_files_to_table(created.files),
+    })
 }
 
 /// Build one new vector segment over `fragments`, encoded against the model
