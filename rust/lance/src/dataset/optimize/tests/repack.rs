@@ -1246,15 +1246,44 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SchedulerStates {
     }
 }
 
-/// A repack reads with `io_buffer_size`, as a rewrite does, both the files of
-/// the dataset and, in a shallow clone, the source files it references.
+/// Sets an environment variable until dropped, then restores its old value,
+/// so a failing assertion does not leave it set for later tests.
+struct EnvVar {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.old {
+                Some(old) => std::env::set_var(self.key, old),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// A repack reads with `io_buffer_size`, or `LANCE_DEFAULT_IO_BUFFER_SIZE`
+/// when that is unset, as a rewrite does, both the files of the dataset and,
+/// in a shallow clone, the source files it references.
 #[rstest]
-#[case::own_files(false)]
-#[case::shallow_clone(true)]
+#[case::own_files(false, false)]
+#[case::shallow_clone(true, false)]
+#[case::env_var(false, true)]
 // The events are recorded on this thread only, so the scheduler's I/O loop
 // has to run on it too.
 #[tokio::test(flavor = "current_thread")]
-async fn repack_reads_with_io_buffer_size(#[case] shallow_clone: bool) {
+#[serial_test::serial(LANCE_DEFAULT_IO_BUFFER_SIZE)]
+async fn repack_reads_with_io_buffer_size(#[case] shallow_clone: bool, #[case] from_env: bool) {
     use tracing_subscriber::layer::SubscriberExt;
 
     let source_dir = TempStrDir::default();
@@ -1280,11 +1309,16 @@ async fn repack_reads_with_io_buffer_size(#[case] shallow_clone: bool) {
 
     let io_buffer_size = 3 * 1024 * 1024 + 1;
     let options = CompactionOptions {
-        io_buffer_size: Some(io_buffer_size),
+        io_buffer_size: (!from_env).then_some(io_buffer_size),
         ..repack_options(Some(1))
     };
     let plan = plan_compaction(&dataset, &options).await.unwrap();
     let task = plan.compaction_tasks().next().unwrap();
+    // `DEFAULT_IO_BUFFER_SIZE` reads the variable once and caches it, so read
+    // it before setting the variable, or a scan elsewhere could cache this value.
+    let _ = *crate::dataset::scanner::DEFAULT_IO_BUFFER_SIZE;
+    let _env =
+        from_env.then(|| EnvVar::set("LANCE_DEFAULT_IO_BUFFER_SIZE", &io_buffer_size.to_string()));
 
     // tracing caches each callsite's interest from the firing thread's default
     // dispatcher while exactly one dispatcher is registered; a second live
