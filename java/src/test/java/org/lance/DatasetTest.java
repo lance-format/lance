@@ -125,12 +125,39 @@ public class DatasetTest {
   }
 
   @Test
-  void testCreateEmptyDataset(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("new_empty_dataset").toString();
+  void testInitialConfigOptional() {
+    WriteParams.Builder builder = new WriteParams.Builder();
+    assertEquals(Optional.empty(), builder.build().getInitialConfig());
+    assertEquals(
+        Optional.of(Map.of("app.owner", "analytics")),
+        builder.withInitialConfig(Map.of("app.owner", "analytics")).build().getInitialConfig());
+    assertEquals(
+        Optional.empty(),
+        builder.withInitialConfig(Collections.emptyMap()).build().getInitialConfig());
+  }
+
+  @Test
+  void testCreateEmptyDatasetWithInitialConfig(@TempDir Path tempDir) {
+    String path = tempDir.resolve("initial_config").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
+      Schema schema = new TestUtils.SimpleTestDataset(allocator, path).getSchema();
+      try (Dataset created =
+          Dataset.write()
+              .allocator(allocator)
+              .schema(schema)
+              .uri(path)
+              .initialConfig(Map.of("app.owner", "analytics"))
+              .execute()) {
+        assertEquals(1, created.version());
+        assertEquals(0, created.countRows());
+        assertEquals(schema, created.getSchema());
+        assertTrue(created.getFragments().isEmpty());
+        assertEquals("analytics", created.getConfig().get("app.owner"));
+      }
+      try (Dataset reopened = Dataset.open().allocator(allocator).uri(path).build()) {
+        assertEquals(1, reopened.version());
+        assertEquals("analytics", reopened.getConfig().get("app.owner"));
+      }
     }
   }
 

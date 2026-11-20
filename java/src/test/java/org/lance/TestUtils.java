@@ -266,7 +266,9 @@ public class TestUtils {
                     .withMaxRowsPerGroup(20)
                     .withMode(WriteParams.WriteMode.CREATE)
                     .withStorageOptions(new HashMap<>())
+                    .withInitialConfig(Map.of("app.owner", "analytics"))
                     .build())) {
+          assertEquals("analytics", dataset.getConfig().get("app.owner"));
           assertEquals(ROW_COUNT, dataset.countRows());
           schema = reader.getVectorSchemaRoot().getSchema();
           validateFragments(dataset);
@@ -278,6 +280,7 @@ public class TestUtils {
 
     public void openDatasetAndValidate() throws IOException {
       try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+        assertEquals("analytics", dataset.getConfig().get("app.owner"));
         assertEquals(1, dataset.version());
         assertEquals(1, dataset.latestVersion());
         assertEquals(ROW_COUNT, dataset.countRows());

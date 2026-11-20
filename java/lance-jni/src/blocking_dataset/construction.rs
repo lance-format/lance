@@ -24,7 +24,7 @@ use jni::sys::{jboolean, jlong};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::Ref;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{Dataset, ReadParams, WriteParams};
+use lance::dataset::{Dataset, InsertBuilder, ReadParams, WriteParams};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
@@ -107,9 +107,16 @@ impl BlockingDataset {
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
-        params: Option<WriteParams>,
+        params: WriteParams,
+        initial_config: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let inner = block_on(Dataset::write(reader, uri, params))?;
+        let mut builder = InsertBuilder::new(uri).with_params(&params);
+        if let Some(config) = initial_config {
+            builder = builder.with_initial_config(config);
+        }
+        let inner = block_on(
+            builder.execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>),
+        )?;
         Ok(Self { inner })
     }
 
@@ -244,6 +251,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     file_write_options: JObject,                // FileWriteOptions
+    initial_config: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -265,6 +273,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
             file_write_options,
+            initial_config,
         )
     )
 }
@@ -288,6 +297,7 @@ fn inner_create_with_ffi_schema<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     file_write_options: JObject,                // FileWriteOptions
+    initial_config: JObject,
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -311,6 +321,7 @@ fn inner_create_with_ffi_schema<'local>(
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         file_write_options,
+        initial_config,
         reader,
         None,  // No namespace for schema-only creation
         false, // No managed versioning for schema-only creation
@@ -356,22 +367,23 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     _obj: JObject,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,                    // Optional<Integer>
-    max_rows_per_group: JObject,                   // Optional<Integer>
-    max_bytes_per_file: JObject,                   // Optional<Long>
-    mode: JObject,                                 // Optional<String>
-    enable_stable_row_ids: JObject,                // Optional<Boolean>
-    data_storage_version: JObject,                 // Optional<String>
-    enable_v2_manifest_paths: JObject,             // Optional<Boolean>
-    storage_options_obj: JObject,                  // Map<String, String>
-    base_store_params_obj: JObject,                // Map<String, Map<String, String>>
-    initial_bases: JObject,                        // Optional<List<BasePath>>
-    target_bases: JObject,                         // Optional<List<String>>
-    allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,        // Optional<Long>
-    file_write_options: JObject,                   // FileWriteOptions
-    namespace_obj: JObject,                        // LanceNamespace (can be null)
-    table_id_obj: JObject,                         // List<String> (can be null)
+    max_rows_per_file: JObject,                 // Optional<Integer>
+    max_rows_per_group: JObject,                // Optional<Integer>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    mode: JObject,                              // Optional<String>
+    enable_stable_row_ids: JObject,             // Optional<Boolean>
+    data_storage_version: JObject,              // Optional<String>
+    enable_v2_manifest_paths: JObject,          // Optional<Boolean>
+    storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
+    initial_config: JObject,
+    namespace_obj: JObject, // LanceNamespace (can be null)
+    table_id_obj: JObject,  // List<String> (can be null)
     namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -394,6 +406,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
             file_write_options,
+            initial_config,
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
@@ -420,9 +433,10 @@ fn inner_create_with_ffi_stream<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     file_write_options: JObject,                // FileWriteOptions
-    namespace_obj: JObject,                     // LanceNamespace (can be null)
-    table_id_obj: JObject,                      // List<String> (can be null)
-    namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
+    initial_config: JObject,
+    namespace_obj: JObject,                    // LanceNamespace (can be null)
+    table_id_obj: JObject,                     // List<String> (can be null)
+    namespace_client_managed_versioning: bool, // Whether namespace manages versioning
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -447,6 +461,7 @@ fn inner_create_with_ffi_stream<'local>(
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         file_write_options,
+        initial_config,
         reader,
         namespace_info,
         namespace_client_managed_versioning,
@@ -476,6 +491,7 @@ fn create_dataset<'local>(
     allow_external_blob_outside_bases: JObject,
     blob_pack_file_size_threshold: JObject,
     file_write_options: JObject,
+    initial_config: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_managed_versioning: bool,
@@ -499,6 +515,11 @@ fn create_dataset<'local>(
         &blob_pack_file_size_threshold,
         &file_write_options,
     )?;
+
+    let initial_config = env.get_optional(&initial_config, |env, config| {
+        let config = JMap::from_env(env, &config)?;
+        to_rust_map(env, &config)
+    })?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
     if let Some((namespace, table_id)) = namespace_info {
@@ -540,7 +561,7 @@ fn create_dataset<'local>(
         });
     }
 
-    let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
+    let dataset = BlockingDataset::write(reader, &path_str, write_params, initial_config)?;
     dataset.into_java(env)
 }
 
