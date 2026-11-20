@@ -363,6 +363,7 @@ def dataset(
                 commit_lock=commit_lock,
                 index_cache_size=index_cache_size,
                 storage_options=storage_options,
+                default_scan_options=default_scan_options,
                 metadata_cache_size_bytes=metadata_cache_size_bytes,
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
