@@ -6,7 +6,7 @@ use super::assign_action::{
 };
 use super::inserted_rows::{KeyExistenceFilter, KeyExistenceFilterBuilder};
 
-use super::merger::Merger;
+use super::merger::{Merger, MergerCondition};
 use super::{
     DeduplicatingSourcePartitionStream, INDEXED_JOIN_BATCH_ROWS, MAX_FRAGMENT_UPDATE_BATCH_BYTES,
     MAX_INDEXED_JOIN_BATCH_BYTES, MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertAnalysis,
@@ -67,7 +67,7 @@ use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
-    datatypes::{OnMissing, SchemaCompareOptions},
+    datatypes::{OnMissing, SchemaCompareOptions, format_field_path},
     utils::tokio::get_num_compute_intensive_cpus,
 };
 use lance_datafusion::{
@@ -222,6 +222,7 @@ impl MergeInsertJob {
         source_mode: SourceProviderMode,
         indexed_keys: Vec<(String, IndexMetadata)>,
         source_projection: Option<Arc<Schema>>,
+        condition_columns: &[String],
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
@@ -352,11 +353,18 @@ impl MergeInsertJob {
             .await?;
 
         // 4 - Take the mapped row ids (TakeExec stays for legacy storage:
-        //     the v1 reader cannot serve a FilteredReadExec)
+        //     the v1 reader cannot serve a FilteredReadExec). An `update_if`
+        //     condition may read target columns the source omits.
         let projection = self
             .dataset
             .empty_projection()
-            .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
+            .union_arrow_schema(schema.as_ref(), OnMissing::Error)?
+            .union_columns(
+                condition_columns
+                    .iter()
+                    .map(|name| format_field_path(&[name.as_str()])),
+                OnMissing::Error,
+            )?;
         let mut target = versions::merge_insert_indexed_take(
             self.dataset
                 .manifest()
@@ -570,6 +578,7 @@ impl MergeInsertJob {
     async fn create_full_table_joined_stream(
         &self,
         source: SendableRecordBatchStream,
+        condition_columns: &[String],
     ) -> Result<SendableRecordBatchStream> {
         let session_config = SessionConfig::default().with_target_partitions(1);
         let session_ctx = SessionContext::new_with_config(session_config);
@@ -602,7 +611,8 @@ impl MergeInsertJob {
                 let existing = session_ctx.read_lance(self.dataset.clone(), true, true)?;
                 let columns = schema
                     .field_names()
-                    .iter()
+                    .into_iter()
+                    .chain(condition_columns)
                     .map(|s| s.as_str())
                     .chain([ROW_ID, ROW_ADDR])
                     .collect::<Vec<_>>();
@@ -633,6 +643,7 @@ impl MergeInsertJob {
         source_provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,
         source_projection: Option<Arc<Schema>>,
+        condition_columns: &[String],
     ) -> Result<SendableRecordBatchStream> {
         if self.params.use_index
             && matches!(
@@ -652,6 +663,7 @@ impl MergeInsertJob {
                         source_mode,
                         indexed_keys,
                         source_projection,
+                        condition_columns,
                     )
                     .await;
             }
@@ -681,7 +693,8 @@ impl MergeInsertJob {
         } else {
             source
         };
-        self.create_full_table_joined_stream(source).await
+        self.create_full_table_joined_stream(source, condition_columns)
+            .await
     }
 
     /// Executes the merge insert job from a one-shot stream source.
@@ -1509,8 +1522,15 @@ impl MergeInsertJob {
             None
         };
         let source_schema = source_projection.clone().unwrap_or(source_schema);
+        // Both joins must also take the target columns the condition reads.
+        let update_condition =
+            MergerCondition::try_new(&self.params, full_schema, source_schema.as_ref())?;
+        let condition_columns = update_condition
+            .as_ref()
+            .map(|condition| condition.target_only_columns.clone())
+            .unwrap_or_default();
         let joined = self
-            .create_joined_stream(provider, source_mode, source_projection)
+            .create_joined_stream(provider, source_mode, source_projection, &condition_columns)
             .await?;
         let inserted_rows_filter = self
             .params
@@ -1519,6 +1539,7 @@ impl MergeInsertJob {
             .map(KeyExistenceFilterBuilder::new);
         let merger = Merger::try_new(
             self.params.clone(),
+            update_condition,
             source_schema,
             joined.schema().as_ref(),
             !is_full_schema,

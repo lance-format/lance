@@ -5,8 +5,9 @@ use super::{MERGE_SOURCE_SENTINEL, MergeInsertParams, WhenNotMatchedBySource};
 use crate::{Result, dataset::WhenMatched};
 use datafusion::common::{
     Column, TableReference,
-    tree_node::{Transformed, TransformedResult, TreeNode},
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
+use datafusion::functions::core::expr_fn::get_field;
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::{Case, Expr, col};
 use lance_core::datatypes::Schema;
@@ -116,6 +117,95 @@ pub fn condition_reads_target(condition: &Expr, dataset_schema: &Schema) -> bool
             .is_none_or(|relation| relation.table() == "target")
             && dataset_schema.field(&column.name).is_some()
     })
+}
+
+/// Rewrites the column references of a condition planned over a `source` and a
+/// `target` struct column (the merger's form) to fields of those structs,
+/// following the rule of [`condition_reads_target`]: an unqualified dataset
+/// column is the target's when the source lacks it, and ambiguous when both
+/// carry it. An unqualified name is matched to a dataset column as the
+/// planner matches column names: exactly, or else ignoring ASCII case.
+///
+/// A relation names the struct only when its first part is `source` or
+/// `target`, so `target.s.x` (relation `target.s`) reads `target.s.x` while
+/// `foo.target.a` is left for planning to reject. `source` and `target`
+/// themselves, and names that are not dataset columns, are left unchanged.
+pub fn bind_struct_columns(
+    condition: Expr,
+    dataset_schema: &Schema,
+    source: &arrow_schema::Schema,
+) -> Result<Expr> {
+    condition
+        .transform(|expr| {
+            let Expr::Column(column) = &expr else {
+                return Ok(Transformed::no(expr));
+            };
+            let mut name = column.name.as_str();
+            let path = match &column.relation {
+                None if name == "source" || name == "target" => None,
+                None => {
+                    let fields = &dataset_schema.fields;
+                    let Some(field) = fields
+                        .iter()
+                        .find(|f| f.name == name)
+                        .or_else(|| fields.iter().find(|f| f.name.eq_ignore_ascii_case(name)))
+                    else {
+                        return Ok(Transformed::no(expr));
+                    };
+                    name = field.name.as_str();
+                    if source.column_with_name(name).is_some() {
+                        return Err(crate::Error::invalid_input(format!(
+                            "Ambiguous reference to unqualified column '{name}' in the merge \
+                             insert condition: both the source and the target have it. Write \
+                             'source.{name}' or 'target.{name}' instead."
+                        ))
+                        .into());
+                    }
+                    Some(vec!["target"])
+                }
+                Some(TableReference::Bare { table }) => Some(vec![table.as_ref()]),
+                Some(TableReference::Partial { schema, table }) => {
+                    Some(vec![schema.as_ref(), table.as_ref()])
+                }
+                Some(TableReference::Full {
+                    catalog,
+                    schema,
+                    table,
+                }) => Some(vec![catalog.as_ref(), schema.as_ref(), table.as_ref()]),
+            };
+            let Some(path) = path.filter(|path| matches!(path[0], "source" | "target")) else {
+                return Ok(Transformed::no(expr));
+            };
+            let root = Expr::Column(Column::new_unqualified(path[0]));
+            let bound = path[1..]
+                .iter()
+                .copied()
+                .chain([name])
+                .fold(root, get_field);
+            Ok(Transformed::yes(bound))
+        })
+        .data()
+        .map_err(crate::Error::from)
+}
+
+/// The top-level `target` struct fields a condition bound by
+/// [`bind_struct_columns`] reads, in order of first reference.
+pub fn struct_target_columns(condition: &Expr) -> Result<Vec<String>> {
+    let mut columns: Vec<String> = Vec::new();
+    condition.apply(|expr| {
+        if let Expr::ScalarFunction(function) = expr
+            && function.func.name() == "get_field"
+            && let [Expr::Column(root), Expr::Literal(name, _), ..] = function.args.as_slice()
+            && root.relation.is_none()
+            && root.name == "target"
+            && let Some(Some(name)) = name.try_as_str()
+            && !columns.iter().any(|column| column == name)
+        {
+            columns.push(name.to_string());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(columns)
 }
 
 /// Transforms merge insert parameters into a logical expression. The output
