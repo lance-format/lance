@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{Array, cast::AsArray, make_array};
+use arrow_array::{Array, cast::AsArray, make_array, new_null_array};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -29,6 +29,7 @@ use crate::decoder::{
     ListReadMode, LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch,
     ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
     StructuralFieldScheduler, StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
+    ValuePredicate,
 };
 use crate::encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler};
 use crate::format::metadata::PageLayout;
@@ -38,7 +39,7 @@ use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation};
 use super::structure::StructuralProjection;
 use super::{
     CachedPage, CachedPageData, ComplexAllNullScheduler, FullZipScheduler, LevelCodec,
-    MiniBlockScheduler, NoCachedPageData, PageDataCacheKey, PageInitialization,
+    MiniBlockScheduler, NoCachedPageData, PageDataCacheKey, PageInitialization, PageValues,
     SimpleAllNullScheduler, StructuralPageScheduler,
 };
 use super::{constant, planar, sparse};
@@ -871,12 +872,21 @@ impl StructuralPrimitiveFieldScheduler {
         requested_ranges: Option<&[Range<u64>]>,
         context: &SchedulerContext,
     ) -> Result<()> {
-        let cache = context.cache().clone();
         let page_indices = match requested_ranges {
             None => (0..self.page_row_ends.len()).collect::<Vec<_>>(),
             Some(ranges) => pages_overlapping_ranges(&self.page_row_ends, ranges)?,
         };
         let positions = self.build_pages(&page_indices)?;
+        self.initialize_built_pages(positions, context).await
+    }
+
+    /// Initializes the built pages at `positions` (ascending indices into `page_schedulers`).
+    async fn initialize_built_pages(
+        &mut self,
+        positions: Vec<usize>,
+        context: &SchedulerContext,
+    ) -> Result<()> {
+        let cache = context.cache().clone();
         let misses = self
             .find_cache_misses(positions.into_iter(), &cache)
             .await?;
@@ -891,6 +901,73 @@ impl StructuralPrimitiveFieldScheduler {
         let buffers = read_page_initialization_buffers(context.io(), all_ranges).await?;
         self.initialize_cache_misses(misses, buffers, cache, context.io())
             .await
+    }
+
+    /// See [`crate::decoder::CoreFieldDecoderStrategy::rows_that_may_match`].
+    pub(crate) async fn rows_that_may_match(
+        &mut self,
+        ranges: &[Range<u64>],
+        data_type: &DataType,
+        predicate: &dyn ValuePredicate,
+        context: &SchedulerContext,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let page_indices = pages_overlapping_ranges(&self.page_row_ends, ranges)?;
+        let positions = self.build_pages(&page_indices)?;
+        let mut page_values = positions
+            .iter()
+            .map(|&position| {
+                self.page_schedulers[position]
+                    .scheduler
+                    .known_values(data_type)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if page_values
+            .iter()
+            .all(|values| matches!(values, PageValues::Unknown))
+        {
+            return Ok(None);
+        }
+        // Only initialize pages that can report their values once loaded.
+        let not_loaded = positions
+            .iter()
+            .zip(&page_values)
+            .filter(|(_, values)| matches!(values, PageValues::NotLoaded))
+            .map(|(&position, _)| position)
+            .collect::<Vec<_>>();
+        if !not_loaded.is_empty() {
+            self.initialize_built_pages(not_loaded, context).await?;
+            for (&position, values) in positions.iter().zip(&mut page_values) {
+                if matches!(values, PageValues::NotLoaded) {
+                    *values = self.page_schedulers[position]
+                        .scheduler
+                        .known_values(data_type)?;
+                }
+            }
+        }
+
+        // Null matching doesn't depend on the page, so check it once.
+        let null_may_match = predicate.any_may_match(&new_null_array(data_type, 1));
+        let mut rows: Vec<Range<u64>> = Vec::with_capacity(positions.len());
+        for (position, values) in positions.into_iter().zip(page_values) {
+            let page = &self.page_schedulers[position];
+            let may_match = match values {
+                // Keep pages that are still not loaded after initialization.
+                PageValues::Unknown | PageValues::NotLoaded => true,
+                PageValues::AnyOf {
+                    values,
+                    may_have_nulls,
+                } => (may_have_nulls && null_may_match) || predicate.any_may_match(&values),
+            };
+            if !may_match {
+                continue;
+            }
+            // Merge adjacent pages.
+            match rows.last_mut() {
+                Some(last) if last.end == page.row_range.start => last.end = page.row_range.end,
+                _ => rows.push(page.row_range.clone()),
+            }
+        }
+        Ok(Some(rows))
     }
 }
 
@@ -2272,5 +2349,202 @@ mod tests {
             assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
             assert!(error.to_string().contains(expected_message));
         }
+    }
+
+    /// Encodes each array as a separate page of a single column. Returns the encoded bytes and
+    /// the column metadata.
+    async fn encode_pages(
+        field: &lance_core::datatypes::Field,
+        arrays: Vec<ArrayRef>,
+    ) -> (Bytes, crate::decoder::ColumnInfo) {
+        use crate::encoder::{
+            ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+        };
+        use crate::repdef::RepDefBuilder;
+        use crate::testing::{TestEncoding, create_test_field_encoder, test_encoding_strategy};
+
+        let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU16);
+        // A one-byte cache flushes each array into its own page.
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: 1,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+        };
+        let mut encoder = create_test_field_encoder(
+            encoding_strategy.as_ref(),
+            field,
+            &mut ColumnIndexSequence::default(),
+            &encoding_options,
+        )
+        .unwrap();
+
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+        let mut pages = Vec::new();
+        let mut row_number = 0;
+        for array in arrays {
+            let num_rows = array.len() as u64;
+            let tasks = encoder
+                .maybe_encode(
+                    array,
+                    &mut external_buffers,
+                    RepDefBuilder::default(),
+                    row_number,
+                    num_rows,
+                )
+                .unwrap();
+            for task in tasks {
+                pages.push(task.await.unwrap());
+            }
+            row_number += num_rows;
+        }
+        for task in encoder.flush(&mut external_buffers).unwrap() {
+            pages.push(task.await.unwrap());
+        }
+        let column = encoder
+            .finish(&mut external_buffers)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        pages.extend(column.final_pages);
+
+        let mut data = bytes::BytesMut::new();
+        let page_infos = pages
+            .into_iter()
+            .map(|page| {
+                let buffer_offsets_and_sizes = page
+                    .data
+                    .iter()
+                    .map(|buffer| {
+                        let offset = data.len() as u64;
+                        data.extend_from_slice(buffer);
+                        (offset, buffer.len() as u64)
+                    })
+                    .collect::<Vec<_>>();
+                crate::decoder::PageInfo {
+                    num_rows: page.num_rows,
+                    priority: page.row_number,
+                    encoding: page.description,
+                    buffer_offsets_and_sizes: buffer_offsets_and_sizes.into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let column_info =
+            crate::decoder::ColumnInfo::new(0, page_infos.into(), Vec::new(), column.encoding);
+        (data.freeze(), column_info)
+    }
+
+    /// Matches the listed strings, and nulls if `None` is listed.
+    struct StringsPredicate(&'static [Option<&'static str>]);
+
+    impl crate::decoder::ValuePredicate for StringsPredicate {
+        fn any_may_match(&self, values: &ArrayRef) -> bool {
+            arrow_cast::cast(values, &DataType::Utf8)
+                .unwrap()
+                .as_string::<i32>()
+                .iter()
+                .any(|value| self.0.contains(&value))
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::one_value(&[Some("seg-c")], 0..4150, vec![1000..2000, 3000..4050])]
+    #[case::value_in_two_pages(&[Some("seg-a")], 0..4150, vec![0..1000, 2000..4050])]
+    #[case::value_with_nulls(&[Some("seg-d")], 0..4150, vec![2000..4050])]
+    #[case::missing_value(&[Some("missing")], 0..4150, vec![3000..4050])]
+    #[case::nulls(&[None], 0..4150, vec![2000..4150])]
+    #[case::requested_rows(&[Some("seg-c")], 500..1500, vec![1000..2000])]
+    #[tokio::test]
+    async fn test_rows_that_may_match(
+        #[case] accepted: &'static [Option<&'static str>],
+        #[case] requested_rows: Range<u64>,
+        #[case] expected: Vec<Range<u64>>,
+        #[values(DataType::Utf8, DataType::LargeUtf8)] data_type: DataType,
+    ) {
+        use crate::decoder::CoreFieldDecoderStrategy;
+        use arrow_array::StringArray;
+        use lance_core::cache::LanceCache;
+
+        let strings = |values: Vec<Option<String>>| -> ArrayRef {
+            arrow_cast::cast(&StringArray::from(values), &data_type).unwrap()
+        };
+        let pages = vec![
+            // Dictionary pages: two values, one value, two values with nulls.
+            strings(
+                (0..1000)
+                    .map(|i| Some(["seg-a", "seg-b"][i % 2].to_string()))
+                    .collect(),
+            ),
+            strings(vec![Some("seg-c".to_string()); 1000]),
+            strings(
+                (0..1000)
+                    .map(|i| (i % 10 != 0).then(|| ["seg-a", "seg-d"][i % 2].to_string()))
+                    .collect(),
+            ),
+            // No dictionary: all values distinct, and too few rows to dictionary-encode.
+            // Then an all-null page.
+            strings((0..1000).map(|i| Some(format!("unique-{i}"))).collect()),
+            strings(vec![Some("seg-c".to_string()); 50]),
+            strings(vec![None; 100]),
+        ];
+        let field =
+            lance_core::datatypes::Field::try_from(&ArrowField::new("id", data_type.clone(), true))
+                .unwrap();
+        let (data, column_info) = encode_pages(&field, pages).await;
+
+        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let rows = CoreFieldDecoderStrategy::default()
+            .rows_that_may_match(
+                &field,
+                Arc::new(column_info),
+                &[requested_rows],
+                &StringsPredicate(accepted),
+                Arc::new(crate::BufferScheduler::new(data)) as Arc<dyn EncodingsIo>,
+                cache.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, Some(expected));
+
+        // The page metadata is cached under the same key a read uses.
+        let cache_key = PageDataCacheKey {
+            column_index: 0,
+            page_index: 1,
+            view: PageCacheView::Native,
+            target_data_type_tag: format!("{data_type:?}").into(),
+        };
+        assert!(cache.get_with_key(&cache_key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rows_that_may_match_without_known_values() {
+        use crate::decoder::CoreFieldDecoderStrategy;
+        use arrow_array::StringArray;
+        use lance_core::cache::LanceCache;
+
+        let array: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..1000).map(|i| format!("unique-{i}")),
+        ));
+        let field =
+            lance_core::datatypes::Field::try_from(&ArrowField::new("id", DataType::Utf8, false))
+                .unwrap();
+        let (data, column_info) = encode_pages(&field, vec![array]).await;
+
+        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let rows = CoreFieldDecoderStrategy::default()
+            .rows_that_may_match(
+                &field,
+                Arc::new(column_info),
+                &[0..1000],
+                &StringsPredicate(&[Some("unique-7")]),
+                Arc::new(crate::BufferScheduler::new(data)) as Arc<dyn EncodingsIo>,
+                cache.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, None);
+        // Nothing is loaded for a column that can't be checked.
+        assert_eq!(cache.size().await, 0);
     }
 }

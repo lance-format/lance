@@ -21,8 +21,9 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
-        RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
+        ColumnInfo, CoreFieldDecoderStrategy, DecoderConfig, DecoderPlugins, FilterExpression,
+        PageEncoding, ReadBatchTask, RequestedRows, SchedulerDecoderConfig, ValuePredicate,
+        schedule_and_decode, schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
 };
@@ -2580,6 +2581,52 @@ impl ProjectedFileReader {
             )
             .await?;
         self.read_prepared_tasks(params, batch_size, prepared, read_len, filter)
+            .await
+    }
+
+    /// Runs [`CoreFieldDecoderStrategy::rows_that_may_match`] on the single field of `projection`.
+    pub async fn rows_that_may_match(
+        &self,
+        projection: &ReaderProjection,
+        ranges: &[Range<u64>],
+        predicate: &dyn ValuePredicate,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let [field] = projection.schema.fields.as_slice() else {
+            return Err(Error::invalid_input(format!(
+                "rows_that_may_match needs a projection of one field, got {} fields",
+                projection.schema.fields.len()
+            )));
+        };
+        let (prepared, _) = self
+            .core
+            .read_projection
+            .prepare(
+                &self.core.metadata_provider,
+                projection,
+                &self.core.scheduler,
+                &self.core.cache,
+            )
+            .await?;
+        let column_info = prepared
+            .decoder_projection
+            .column_indices
+            .first()
+            .and_then(|column_index| prepared.column_infos.get(*column_index as usize))
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "no column metadata was prepared for field {}",
+                    field.name
+                ))
+            })?;
+        CoreFieldDecoderStrategy::from_decoder_config(&self.core.options.decoder_config)
+            .rows_that_may_match(
+                field,
+                column_info.clone(),
+                ranges,
+                predicate,
+                self.core.scheduler.clone(),
+                self.core.cache.clone(),
+            )
             .await
     }
 }
