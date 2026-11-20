@@ -122,6 +122,31 @@ or `covering_fields` include that column. This marks those fragments as needing 
 without invalidating the entire segment and prevents invalid data from being read from the
 index.
 
+The update rule above and the overlay exclusion in
+[Handling deleted and invalidated rows](#handling-deleted-and-invalidated-rows) treat a changed
+field as affecting an index dependency when the two fields are the same or either is nested in
+the other. Thus changing `s.a` affects a segment that depends on `s`, and changing `s` affects a
+segment that depends on `s.a`.
+
+### Removed and replaced fields
+
+A manifest that removes a field from the schema also removes every index segment whose
+dependency set, the union of `fields` and `covering_fields`, contains the id of the removed
+field or of any field that the removed field is nested in. The removal happens in the same
+manifest as the schema change. Dropping a field removes its nested fields too. Removing `s.b`
+leaves a segment keyed on `s.a` in place, because neither field is nested in the other. A type
+replacement removes the old field and adds one with a new id (see
+[Schema Evolution](../table/schema.md#schema-evolution)), so the rule applies to the old field.
+A writer may instead refuse the schema change, for example a cast of a column that an index
+depends on. The rule does not apply to the system indices, the
+[Fragment Reuse Index](system/frag_reuse.md) and the [MemWAL Index](system/mem_wal.md),
+which hold table state instead of field values.
+
+The removal keeps a segment from serving old values for a reused id, either the id of a removed
+field that a writer gives to a new field (see
+[Field ID Assignment](../table/schema.md#field-id-assignment)) or the id of a struct after a new
+child replaces a removed one.
+
 ## Index Compatibility
 
 Before using an index segment, engines must verify they support it:
@@ -183,6 +208,28 @@ also keep `FLAG_COVERED_INDEX_METADATA` set in both feature words whenever the i
 bit is set, including manifests with no covering entries and manifests that drop the last
 covering index. The two bits are retained together until an atomic reverse conversion
 clears them together.
+
+### Covering fields in transactions
+
+A serialized `Transaction` records no covering-field contract, whether a transaction file
+stores it or a manifest embeds it in its inline transaction section (see
+[Transaction Files](../table/transaction.md#transaction-files) and
+[Inline Transaction Sections](../table/transaction.md#inline-transaction-sections)). Every
+`IndexMetadata` that it holds, such as the `new_indices` and `removed_indices` of
+`CreateIndex`, uses the legacy contract, whatever the feature flags of any manifest,
+including the manifest that embeds it. This holds for every index type. In
+such an entry, `fields` lists the keys in key order, then the entries of `covering_fields`
+in order, so a column that the index is keyed on and carries appears twice. A reader takes
+the keys of such an entry as `fields[..len(fields) - len(covering_fields)]`. An entry is
+invalid when its `covering_fields` is not empty and is not a trailing slice of `fields`
+that leaves at least one key. A reader never picks a contract from the lengths or the
+contents of the lists.
+
+A writer converts each entry to the contract of the manifest that it builds, every time it
+builds one. That includes a commit that retries against a manifest whose flags differ from
+those of the manifest it first read. Under the independent contract the writer stores the
+key prefix as `fields`, as an activation normalizes an entry. Under the legacy contract it
+stores the entry unchanged.
 
 ### Serving carried columns
 
