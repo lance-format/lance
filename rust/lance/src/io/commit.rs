@@ -1824,6 +1824,17 @@ pub(crate) async fn commit_transaction(
     affected_rows: Option<&RowAddrTreeMap>,
     expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    // The next attached version follows the one the transaction read. A
+    // detached version has no place in the history to follow, so this is the
+    // caller's mistake rather than an exhausted version space.
+    if is_detached_version(transaction.read_version) {
+        return Err(Error::invalid_input(format!(
+            "cannot commit on top of detached version {}: detached versions are not part of \
+             the dataset's history. Commit the change as detached to build on it, or restore \
+             the detached version to make it the latest version first",
+            transaction.read_version
+        )));
+    }
     dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -2025,7 +2036,7 @@ pub(crate) async fn commit_transaction(
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
             return Err(Error::internal(
-                "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.",
+                "more than 2^63 versions have been created and so regular version numbers are appearing as 'detached' versions.",
             ));
         }
         // Build an up-to-date manifest from the transaction and current

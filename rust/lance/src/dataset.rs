@@ -705,6 +705,8 @@ impl Dataset {
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     /// A segment after the first cannot be a reserved dataset directory.
     /// A literal `.` path segment is rejected.
+    /// The source cannot be a detached version: it is not part of the dataset's history.
+    /// Restore it first to clone or branch from it.
     ///
     /// New branch names are limited to a portable budget of 211 bytes, measured
     /// after the name is path-part encoded twice: once for the branch metadata
@@ -765,6 +767,8 @@ impl Dataset {
         refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
+        // Before the reservation is written, so a rejected source leaves no ref behind.
+        refs::ensure_clone_source_attached(version_number)?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
         if self.object_store.exists(&branch_file).await? {
@@ -4177,6 +4181,8 @@ impl Dataset {
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
     /// 'store_params': the object store params to use for the new dataset.
+    /// The source cannot be a detached version: it is not part of the dataset's history.
+    /// Restore it first to clone or branch from it.
     ///
     /// The returned handle retains the source's store parameters for shared files.
     /// When reopening a clone across stores, supply the source parameters with
@@ -4278,6 +4284,7 @@ impl Dataset {
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
     /// - `version`: the version cloned from, could be a version number, branch head, or tag.
+    ///   It cannot be a detached version: restore that first.
     /// - `store_params`: the object store params for the target dataset (e.g. the
     ///   credentials of the target account).
     ///
@@ -4296,6 +4303,8 @@ impl Dataset {
 
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
+        // Before any file is copied into the target.
+        refs::ensure_clone_source_attached(src_ds.manifest.version)?;
         ensure_can_write_manifest(&src_ds.manifest)?;
         // Rejects a tagged FRI history this writer cannot fully interpret
         // before anything is copied or written to the target.
