@@ -8233,6 +8233,39 @@ def test_detached_commits(tmp_path: Path):
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
 
 
+@pytest.mark.parametrize("copy", ["shallow_clone", "deep_clone", "create_branch"])
+@pytest.mark.parametrize("by_tag", [False, True])
+def test_copy_of_detached_version_is_rejected(tmp_path: Path, copy: str, by_tag: bool):
+    dataset = lance.write_dataset(pa.table({"x": [0]}), tmp_path / "src")
+    frag = lance.LanceFragment.create(dataset.uri, pa.table({"x": [1]}))
+    op = lance.LanceOperation.Append([frag])
+    detached = dataset.commit(
+        dataset.uri, op, read_version=dataset.version, detached=True
+    )
+    reference = detached.version
+    if by_tag:
+        dataset.tags.create("staged", detached.version)
+        reference = "staged"
+
+    target = tmp_path / "copy"
+    with pytest.raises(OSError, match=f"detached version {detached.version}"):
+        if copy == "create_branch":
+            dataset.create_branch("copy", reference)
+        else:
+            getattr(dataset, copy)(target, reference)
+    assert dataset.branches.list() == {}
+    assert not target.exists()
+
+    # Once restored, the staged rows can be copied.
+    dataset.checkout_version(reference).restore()
+    restored = lance.dataset(tmp_path / "src")
+    if copy == "create_branch":
+        copied = restored.create_branch("copy", restored.version)
+    else:
+        copied = getattr(restored, copy)(target, restored.version)
+    assert copied.to_table() == pa.table({"x": [0, 1]})
+
+
 def test_detached_raw_arrow_merge_preserves_schema_metadata(tmp_path: Path):
     metadata = {b"source": b"user metadata"}
     table = pa.table({"x": [0, 1]}).replace_schema_metadata(metadata)

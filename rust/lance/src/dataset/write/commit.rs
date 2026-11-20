@@ -452,6 +452,11 @@ impl<'a> CommitBuilder<'a> {
                  Use deep_clone instead.",
             ));
         }
+        // Also reached by Clone transactions built outside `shallow_clone`,
+        // `deep_clone` and `create_branch`, which check their source earlier.
+        if let Operation::Clone { ref_version, .. } = &transaction.operation {
+            crate::dataset::refs::ensure_clone_source_attached(*ref_version)?;
+        }
 
         let session = self
             .session

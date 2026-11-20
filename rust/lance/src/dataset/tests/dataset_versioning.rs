@@ -36,10 +36,11 @@ use lance_file::version::LanceFileVersion;
 use lance_io::local::to_local_path;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreProvider};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+use lance_table::format::is_detached_version;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
-use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
+use crate::dataset::refs::{Ref, base_branches_contents_path, branch_contents_path};
 use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure, copy_test_data_to_tmp};
 use futures::StreamExt as _;
 use futures::TryStreamExt;
@@ -594,7 +595,7 @@ async fn test_restore_preserves_row_id_high_water_mark() {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum EmptyTableCopy {
+enum CopyKind {
     ShallowClone,
     Branch,
     DeepClone,
@@ -605,11 +606,11 @@ enum EmptyTableCopy {
 /// hand out row addresses from the namespace the source has already issued ids
 /// from.
 #[rstest]
-#[case::shallow_clone(EmptyTableCopy::ShallowClone)]
-#[case::branch(EmptyTableCopy::Branch)]
-#[case::deep_clone(EmptyTableCopy::DeepClone)]
+#[case::shallow_clone(CopyKind::ShallowClone)]
+#[case::branch(CopyKind::Branch)]
+#[case::deep_clone(CopyKind::DeepClone)]
 #[tokio::test]
-async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: EmptyTableCopy) {
+async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: CopyKind) {
     let test_dir = TempStrDir::default();
     let source_uri = format!("{}/source", test_dir.as_str());
     let copy_uri = format!("{}/copy", test_dir.as_str());
@@ -633,29 +634,27 @@ async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: EmptyTabl
 
     let version = source.version().version;
     match copy {
-        EmptyTableCopy::ShallowClone => {
+        CopyKind::ShallowClone => {
             source
                 .shallow_clone(&copy_uri, version, None)
                 .await
                 .unwrap();
         }
-        EmptyTableCopy::Branch => {
+        CopyKind::Branch => {
             source.create_branch("copy", version, None).await.unwrap();
         }
-        EmptyTableCopy::DeepClone => {
+        CopyKind::DeepClone => {
             source.deep_clone(&copy_uri, version, None).await.unwrap();
         }
     }
     let open_copy = async || match copy {
-        EmptyTableCopy::Branch => Dataset::open(&source_uri)
+        CopyKind::Branch => Dataset::open(&source_uri)
             .await
             .unwrap()
             .checkout_branch("copy")
             .await
             .unwrap(),
-        EmptyTableCopy::ShallowClone | EmptyTableCopy::DeepClone => {
-            Dataset::open(&copy_uri).await.unwrap()
-        }
+        CopyKind::ShallowClone | CopyKind::DeepClone => Dataset::open(&copy_uri).await.unwrap(),
     };
     let mut copied = open_copy().await;
     assert!(copied.manifest.fragments.is_empty());
@@ -684,6 +683,287 @@ async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: EmptyTabl
         scan_row_ids(&open_copy().await).await,
         (next_row_id..next_row_id + 5).collect::<Vec<_>>()
     );
+}
+
+/// Commit `rows` on top of `dataset` as a detached version.
+async fn commit_detached_append(dataset: &Dataset, rows: std::ops::Range<u32>) -> Dataset {
+    let batch = u32_batch(rows);
+    let append = crate::dataset::write::InsertBuilder::new(Arc::new(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+    let detached = CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_detached(true)
+        .execute(append)
+        .await
+        .unwrap();
+    assert!(is_detached_version(detached.version().version));
+    detached
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DetachedSource {
+    /// A detached version of the main branch, by number.
+    Version,
+    /// A tag that points at a detached version of the main branch.
+    Tag,
+    /// A detached version of another branch, by branch and number.
+    BranchVersion,
+}
+
+/// A detached version is not part of the dataset's history. A copy started
+/// from one used to keep its detached version number, so the copy's only
+/// manifest was itself detached: the clone or branch reported success but
+/// could not be opened as its latest version, and a later append to the
+/// clone's URI silently created a new, unrelated dataset in its place.
+#[rstest]
+#[case::shallow_clone(CopyKind::ShallowClone)]
+#[case::branch(CopyKind::Branch)]
+#[case::deep_clone(CopyKind::DeepClone)]
+#[tokio::test]
+async fn test_copy_of_detached_version_is_rejected(
+    #[case] copy: CopyKind,
+    #[values(
+        DetachedSource::Version,
+        DetachedSource::Tag,
+        DetachedSource::BranchVersion
+    )]
+    source_ref: DetachedSource,
+) {
+    let test_dir = TempStrDir::default();
+    let source_uri = format!("{}/source", test_dir.as_str());
+    let copy_uri = format!("{}/copy", test_dir.as_str());
+    let batch = u32_batch(0..10);
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let staged_on = match source_ref {
+        DetachedSource::BranchVersion => source.create_branch("dev", 1, None).await.unwrap(),
+        DetachedSource::Version | DetachedSource::Tag => source.clone(),
+    };
+    let detached_version = commit_detached_append(&staged_on, 10..15)
+        .await
+        .version()
+        .version;
+    if matches!(source_ref, DetachedSource::Tag) {
+        source
+            .tags()
+            .create("staged", detached_version)
+            .await
+            .unwrap();
+    }
+    let reference = |version: u64| -> Ref {
+        match source_ref {
+            DetachedSource::Version => Ref::VersionNumber(version),
+            DetachedSource::Tag if version == detached_version => Ref::Tag("staged".to_string()),
+            DetachedSource::Tag => Ref::VersionNumber(version),
+            DetachedSource::BranchVersion => Ref::Version(Some("dev".to_string()), Some(version)),
+        }
+    };
+
+    let error = match copy {
+        CopyKind::ShallowClone => source
+            .shallow_clone(&copy_uri, reference(detached_version), None)
+            .await
+            .map(|_| ()),
+        CopyKind::Branch => source
+            .create_branch("copy", reference(detached_version), None)
+            .await
+            .map(|_| ()),
+        CopyKind::DeepClone => source
+            .deep_clone(&copy_uri, reference(detached_version), None)
+            .await
+            .map(|_| ()),
+    }
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("detached version {detached_version}")),
+        "{error}"
+    );
+
+    // Nothing was published or copied for the rejected copy, so the branch
+    // name stays free and the target stays empty.
+    assert!(!source.list_branches().await.unwrap().contains_key("copy"));
+    assert!(!std::path::Path::new(&copy_uri).exists());
+
+    // Restoring the detached version brings it into the history, and the
+    // restored version can be copied.
+    let mut staged = source
+        .checkout_version(reference(detached_version))
+        .await
+        .unwrap();
+    staged.restore().await.unwrap();
+    let restored = staged.version().version;
+    let copied = match copy {
+        CopyKind::ShallowClone => {
+            source
+                .shallow_clone(&copy_uri, reference(restored), None)
+                .await
+                .unwrap();
+            Dataset::open(&copy_uri).await.unwrap()
+        }
+        CopyKind::Branch => {
+            source
+                .create_branch("copy", reference(restored), None)
+                .await
+                .unwrap();
+            Dataset::open(&source_uri)
+                .await
+                .unwrap()
+                .checkout_branch("copy")
+                .await
+                .unwrap()
+        }
+        CopyKind::DeepClone => {
+            source
+                .deep_clone(&copy_uri, reference(restored), None)
+                .await
+                .unwrap();
+            Dataset::open(&copy_uri).await.unwrap()
+        }
+    };
+    assert_eq!(copied.version().version, restored);
+    assert_eq!(copied.count_rows(None).await.unwrap(), 15);
+}
+
+/// The commit API takes the clone source as plain fields, so the check cannot
+/// rely on `shallow_clone` having resolved the reference.
+#[tokio::test]
+async fn test_clone_transaction_from_detached_version_is_rejected() {
+    let test_dir = TempStrDir::default();
+    let source_uri = format!("{}/source", test_dir.as_str());
+    let copy_uri = format!("{}/copy", test_dir.as_str());
+    let batch = u32_batch(0..10);
+    let source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let detached_version = commit_detached_append(&source, 10..15)
+        .await
+        .version()
+        .version;
+
+    let clone = Operation::Clone {
+        is_shallow: true,
+        ref_name: None,
+        ref_version: detached_version,
+        ref_path: source_uri.clone(),
+        branch_name: None,
+    };
+    let error = CommitBuilder::new(copy_uri.as_str())
+        .execute(Transaction::new(detached_version, clone, None))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("detached version {detached_version}")),
+        "{error}"
+    );
+    assert!(!std::path::Path::new(&copy_uri).exists());
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WriteFromDetached {
+    Append,
+    Delete,
+    UpdateConfig,
+    Compact,
+    RawCommit,
+}
+
+/// A write through a detached checkout has no version to follow in the
+/// history; it used to fail with an internal error that asked for a bug
+/// report. It is invalid input instead, and the dataset is left as it was.
+#[rstest]
+#[case::append(WriteFromDetached::Append)]
+#[case::delete(WriteFromDetached::Delete)]
+#[case::update_config(WriteFromDetached::UpdateConfig)]
+#[case::compact(WriteFromDetached::Compact)]
+#[case::raw_commit(WriteFromDetached::RawCommit)]
+#[tokio::test]
+async fn test_attached_commit_from_detached_version_is_rejected(#[case] write: WriteFromDetached) {
+    let test_dir = TempStrDir::default();
+    let batch = u32_batch(0..10);
+    let source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        test_dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let detached_version = commit_detached_append(&source, 10..15)
+        .await
+        .version()
+        .version;
+    let mut checkout = source.checkout_version(detached_version).await.unwrap();
+
+    let result = match write {
+        WriteFromDetached::Append => {
+            let batch = u32_batch(15..20);
+            checkout
+                .append(
+                    RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                    None,
+                )
+                .await
+        }
+        WriteFromDetached::Delete => checkout.delete("i < 3").await.map(|_| ()),
+        WriteFromDetached::UpdateConfig => {
+            checkout.update_config([("key", "value")]).await.map(|_| ())
+        }
+        WriteFromDetached::Compact => crate::dataset::optimize::compact_files(
+            &mut checkout,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .map(|_| ()),
+        WriteFromDetached::RawCommit => CommitBuilder::new(test_dir.as_str())
+            .execute(Transaction::new(
+                detached_version,
+                Operation::Append { fragments: vec![] },
+                None,
+            ))
+            .await
+            .map(|_| ()),
+    };
+    let error = result.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("detached version {detached_version}")),
+        "{error}"
+    );
+
+    let latest = Dataset::open(test_dir.as_str()).await.unwrap();
+    assert_eq!(latest.version().version, source.version().version);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 10);
+    let staged = latest.checkout_version(detached_version).await.unwrap();
+    assert_eq!(staged.count_rows(None).await.unwrap(), 15);
+
+    // A detached commit on top of the detached version is still allowed.
+    let restacked = commit_detached_append(&staged, 15..20).await;
+    assert_eq!(restacked.count_rows(None).await.unwrap(), 20);
 }
 
 #[rstest]
