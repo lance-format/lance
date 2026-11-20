@@ -4593,8 +4593,6 @@ dependencies = [
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
- "lance-arrow-scalar",
- "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
@@ -4659,9 +4657,11 @@ version = "15.0.0-beta.25"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-data",
  "arrow-ipc",
  "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "bytemuck",
@@ -4671,35 +4671,8 @@ dependencies = [
  "half",
  "lance-jsonb",
  "num-traits",
+ "proptest",
  "rand 0.9.5",
- "rstest",
-]
-
-[[package]]
-name = "lance-arrow-scalar"
-version = "59.0.0"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "half",
- "proptest",
- "rstest",
-]
-
-[[package]]
-name = "lance-arrow-stats"
-version = "59.0.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "arrow-select",
- "lance-arrow-scalar",
- "proptest",
  "rstest",
 ]
 
@@ -5043,7 +5016,6 @@ dependencies = [
  "itertools 0.14.0",
  "jieba-rs",
  "lance-arrow",
- "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
