@@ -389,6 +389,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::dataset::fragment::FileFragment;
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{CommitBuilder, InsertBuilder};
 
@@ -405,6 +406,36 @@ mod tests {
             ],
         );
         Box::new(RecordBatchIterator::new(vec![batch], schema))
+    }
+
+    /// A dataset whose only registered base has the sparse id 2.
+    async fn dataset_with_sparse_existing_base(
+        primary: &TempStrDir,
+        existing: &TempStrDir,
+    ) -> Dataset {
+        InsertBuilder::new(primary.as_str())
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![BasePath::new(
+                    2,
+                    existing.to_string(),
+                    Some("existing".to_string()),
+                    false,
+                )]),
+                ..Default::default()
+            })
+            .execute_stream(test_data())
+            .await
+            .unwrap()
+    }
+
+    fn assert_data_file_in(base: &TempStrDir, data_file: &DataFile) {
+        let path = std::path::Path::new(base.as_str()).join(data_file.path.as_str());
+        assert!(
+            path.exists(),
+            "data file was not written to the expected base: {}",
+            path.display()
+        );
     }
 
     #[tokio::test]
@@ -832,6 +863,87 @@ mod tests {
             .unwrap();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].files[0].base_id, None);
+    }
+
+    #[rstest]
+    #[case::v1(LanceFileVersion::Legacy)]
+    #[case::v2(LanceFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_create_fragments_preserves_sparse_base_ids_for_numeric_target(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let primary = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let dataset = dataset_with_sparse_existing_base(&primary, &existing).await;
+
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            initial_bases: Some(vec![
+                BasePath::new(0, base_a.to_string(), Some("base-a".to_string()), false),
+                BasePath::new(0, base_b.to_string(), Some("base-b".to_string()), false),
+            ]),
+            target_bases: Some(vec![3]),
+            ..Default::default()
+        };
+        let fragments =
+            FileFragment::create_fragments(dataset.uri.as_str(), test_data(), Some(params))
+                .await
+                .unwrap();
+
+        assert_eq!(fragments.len(), 3);
+        for fragment in &fragments {
+            let data_file = &fragment.files[0];
+            // Existing base 2 makes the first automatic base 3, not a lower
+            // free id. Numeric target 3 must therefore stay bound to base A.
+            assert_eq!(data_file.base_id, Some(3));
+            assert_data_file_in(&base_a, data_file);
+        }
+    }
+
+    #[rstest]
+    #[case::v1(LanceFileVersion::Legacy)]
+    #[case::v2(LanceFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_create_fragments_all_bases_starts_with_sparse_existing_base(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let primary = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let dataset = dataset_with_sparse_existing_base(&primary, &existing).await;
+
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            initial_bases: Some(vec![
+                BasePath::new(0, base_a.to_string(), Some("base-a".to_string()), false),
+                BasePath::new(0, base_b.to_string(), Some("base-b".to_string()), false),
+            ]),
+            target_all_bases: Some(false),
+            ..Default::default()
+        };
+        let fragments =
+            FileFragment::create_fragments(dataset.uri.as_str(), test_data(), Some(params))
+                .await
+                .unwrap();
+
+        assert_eq!(fragments.len(), 3);
+        let expected = [(Some(2), &existing), (Some(3), &base_a), (Some(4), &base_b)];
+        for (fragment, (expected_base_id, base)) in fragments.iter().zip(expected) {
+            let data_file = &fragment.files[0];
+            // Rotation starts at the existing base and keeps the automatic
+            // bases in allocation order after it.
+            assert_eq!(data_file.base_id, expected_base_id);
+            assert_data_file_in(base, data_file);
+        }
     }
 
     #[rstest]
