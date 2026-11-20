@@ -32,6 +32,7 @@ use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::system_index::is_system_index;
 use lance_table::transaction::TaggedRewriteAssembly;
 use lance_table::transaction::action::{Action, Footprint, Ref as ActionRef};
+use lance_table::transaction::coverage_repair::FragmentTrace;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -123,10 +124,15 @@ struct FootprintBasis {
     /// `AdjustIndexCoverage` carries no index details of its own, so they are
     /// looked up by [`TransactionRebase::load_current_lineage`].
     ngram_segments: HashSet<uuid::Uuid>,
-    /// Every manifest committed since `read`, by version, for the coverage
-    /// repair to walk. Recorded only for a transaction that adds index
-    /// coverage over committed fragments; empty otherwise.
-    history: HashMap<u64, Arc<Manifest>>,
+    /// While [`TransactionRebase::check_txns`] checks a named transaction,
+    /// the footprints of the committed action sets it passed, with their
+    /// versions, to check against the window once.
+    deferred_action_sets: Option<Vec<(Footprint, u64)>>,
+    /// The fragments created and removed since `read`, for the coverage
+    /// repair. Traced only for a transaction that adds index coverage over
+    /// committed fragments, and carried from one attempt to the next, whose
+    /// window starts where the previous one ended.
+    trace: Arc<FragmentTrace>,
 }
 
 impl FootprintBasis {
@@ -317,6 +323,44 @@ fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
 mod check;
 mod finish;
 mod init;
+
+/// What a commit's conflict resolution held and repeated, for the catch-up
+/// cost tests, which drive it through the public commit path and so cannot
+/// inspect the rebase itself. Per thread: a test's commit runs on its own
+/// runtime thread.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PEAK_TRACED: Cell<usize> = const { Cell::new(0) };
+        static WINDOW_CHECKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Observed {
+        /// The most fragments a rebase traced for the coverage repair.
+        pub peak_traced: usize,
+        /// How many times a window of committed footprints was checked.
+        pub window_checks: usize,
+    }
+
+    /// What was observed since the last call, resetting the counts.
+    pub fn take() -> Observed {
+        Observed {
+            peak_traced: PEAK_TRACED.with(|peak| peak.replace(0)),
+            window_checks: WINDOW_CHECKS.with(|checks| checks.replace(0)),
+        }
+    }
+
+    pub(super) fn traced(len: usize) {
+        PEAK_TRACED.with(|peak| peak.set(peak.get().max(len)));
+    }
+
+    pub(super) fn checked_window() {
+        WINDOW_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    }
+}
 
 impl<'a> TransactionRebase<'a> {
     #[track_caller]

@@ -994,21 +994,10 @@ async fn replay_staged_segments_from(
     .await?
     .for_staged_replay();
     rebase.load_current_lineage(dataset).await?;
-    let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(&read_dataset)
+    let snapshot = dataset.manifest.version;
+    let (_, window) = crate::io::commit::catch_up(&mut rebase, &read_dataset, Some(snapshot))
         .await
         .map_err(|error| rebuild(read_version, &error))?;
-    let snapshot = dataset.manifest.version;
-    let window: Vec<_> = transactions
-        .into_iter()
-        .filter(|(version, _, _)| *version <= snapshot)
-        .collect();
-    crate::io::commit::record_committed_history(
-        &mut rebase,
-        dataset,
-        read_dataset.manifest.clone(),
-        &window,
-    )
-    .await?;
     // The listing only knows the manifests that still exist. A version
     // cleaned up between the build and the snapshot leaves no trace in it,
     // and whatever that commit did to the indexed columns cannot be

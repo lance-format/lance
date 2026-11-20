@@ -2350,21 +2350,13 @@ async fn test_an_action_delete_merges_deletions_again_on_a_retry() {
     let mut checked_since = read.clone();
     for row in [1, 2] {
         let latest = delete_legacy(checked_since.clone(), row).await;
-        let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(&checked_since)
-            .await
-            .unwrap();
         let mut rebase = TransactionRebase::try_new(&read, ours, Some(&affected))
             .await
             .unwrap()
             .with_read_version_dataset(&read);
-        crate::io::commit::record_committed_history(
-            &mut rebase,
-            &latest,
-            checked_since.manifest.clone(),
-            &transactions,
-        )
-        .await
-        .unwrap();
+        let (_, transactions) = crate::io::commit::catch_up(&mut rebase, &checked_since, None)
+            .await
+            .unwrap();
         let committed: Vec<(u64, &Transaction)> = transactions
             .iter()
             .map(|(version, transaction, _)| (*version, transaction.as_ref()))

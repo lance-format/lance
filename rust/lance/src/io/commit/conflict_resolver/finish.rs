@@ -16,6 +16,7 @@ impl<'a> TransactionRebase<'a> {
     /// build as `FragReuseUpdate::Rewrite` on the prepared index list. The transaction
     /// itself keeps the caller's entry, so the next attempt diffs the same
     /// intent again instead of treating this assembly as its own.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn finish_with_tagged_rewrite(
         self,
         dataset: &Dataset,

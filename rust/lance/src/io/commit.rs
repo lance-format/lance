@@ -59,8 +59,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransaction, NewTransactionResult, TRANSACTIONS_DIR,
-    load_new_transactions, write_manifest_file,
+    ManifestWriteConfig, NewTransaction, TRANSACTIONS_DIR, new_commits, write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
     ReadSnapshot, validate_frag_reuse_history,
@@ -1786,90 +1785,61 @@ async fn prepare_attempt(
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<NewTransaction>)> {
-    let NewTransactionResult {
-        dataset: new_ds,
-        new_transactions,
-    } = load_new_transactions(dataset);
-    let new_transactions = new_transactions.try_collect::<Vec<_>>();
-    let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
-    txns.sort_by_key(|(version, _, _)| *version);
-    Ok((new_ds, txns))
+    let mut commits = new_commits(dataset, None);
+    let mut transactions = Vec::new();
+    let mut latest = None;
+    while let Some((commit, manifest)) = commits.try_next().await? {
+        latest = Some((manifest, commit.2.clone()));
+        transactions.push(commit);
+    }
+    Ok((advanced_to(dataset, latest), transactions))
 }
 
-/// Record in `rebase` what its footprint checks need of `transactions`, which
-/// committed on top of `since`, in version order: the latest manifest, and
-/// the footprints an action set takes from the manifests either side of a
-/// named commit.
+/// `dataset` moved to `latest`, keeping the handle's branch incarnation.
+fn advanced_to(dataset: &Dataset, latest: Option<(Arc<Manifest>, ManifestLocation)>) -> Dataset {
+    let mut advanced = dataset.clone();
+    if let Some((manifest, location)) = latest {
+        advanced.set_manifest(manifest, location);
+    }
+    advanced
+}
+
+/// Catch `rebase` up on the commits after `since`, through `through` when
+/// given: load each manifest once, in version order, and fold it into what
+/// the footprint checks keep before the next is loaded. Returns `since`
+/// moved to the last commit, and the commits in version order.
 ///
-/// Manifests are loaded a commit at a time, and each pair is reduced to its
-/// footprint before the next is loaded: a writer thousands of versions behind
-/// holds what each commit touched, never a manifest per version. A commit
-/// whose preceding manifest is gone is left unrecorded, and its check fails
-/// closed. The one exception is a transaction adding index coverage over
-/// committed fragments, whose repair walks every manifest since it read (see
-/// [`TransactionRebase::needs_committed_history`]).
-pub(crate) async fn record_committed_history(
+/// A writer thousands of versions behind holds what each commit touched,
+/// never a manifest per version. A commit whose preceding manifest is gone
+/// is folded without it, and a check that needs its footprint fails closed.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn catch_up(
     rebase: &mut TransactionRebase<'_>,
-    dataset: &Dataset,
-    since: Arc<Manifest>,
-    transactions: &[NewTransaction],
-) -> Result<()> {
-    let Some((last_version, _, last_location)) = transactions.last() else {
-        return Ok(());
-    };
-    let load = |location| {
-        Dataset::get_manifest(
-            dataset.object_store.as_ref(),
-            location,
-            dataset.uri(),
-            dataset.session.as_ref(),
-        )
-    };
-    let committed: Vec<Arc<Transaction>> = transactions
-        .iter()
-        .map(|(_, transaction, _)| transaction.clone())
-        .collect();
-    let keeps_history = rebase.needs_committed_history(&committed);
-    if !keeps_history && !rebase.checks_by_footprint(&committed) {
-        return Ok(());
+    since: &Dataset,
+    through: Option<u64>,
+) -> Result<(Dataset, Vec<NewTransaction>)> {
+    let mut commits = new_commits(since, through);
+    let mut transactions = Vec::new();
+    let mut previous = since.manifest.clone();
+    let mut latest_location = None;
+    let traces = rebase.adds_index_coverage();
+    while let Some(((version, transaction, location), manifest)) = commits.try_next().await? {
+        let before = (previous.version + 1 == version).then_some(previous.as_ref());
+        rebase.fold_commit(version, &transaction, before);
+        if traces {
+            rebase.trace_commit(&previous, &manifest);
+        }
+        previous = manifest;
+        latest_location = Some(location.clone());
+        transactions.push((version, transaction, location));
     }
-    let mut previous = since.clone();
-    for (index, (version, transaction, location)) in transactions.iter().enumerate() {
-        let needs_before = rebase.needs_committed_manifests(transaction);
-        if !needs_before && !keeps_history {
-            continue;
-        }
-        let before = if previous.version + 1 == *version {
-            Some(previous)
-        } else {
-            match index.checked_sub(1).map(|index| &transactions[index]) {
-                Some((before_version, _, before_location))
-                    if needs_before && before_version + 1 == *version =>
-                {
-                    Some(load(before_location).await?)
-                }
-                _ => None,
-            }
-        };
-        let after = load(location).await?;
-        if needs_before && let Some(before) = before {
-            rebase.record_committed(*version, transaction, &before);
-        }
-        if keeps_history {
-            rebase.record_history(after.clone());
-        }
-        previous = after;
-    }
-    let latest = if previous.version == *last_version {
-        previous
-    } else {
-        load(last_location).await?
-    };
-    rebase.record_window(since, latest);
-    Ok(())
+    rebase.record_window(since.manifest.clone(), previous.clone());
+    let latest = latest_location.map(|location| (previous, location));
+    Ok((advanced_to(since, latest), transactions))
 }
 
 /// Success-path bookkeeping shared by the direct-success and
@@ -2013,6 +1983,9 @@ pub(crate) async fn commit_transaction(
     // Track the transaction file written in the current loop iteration so we can
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
+    // What the coverage repair traced of the versions earlier attempts caught
+    // up on, so a retry repairs as one attempt over the whole window would.
+    let mut trace = Arc::default();
 
     // An allocating clustering submission from a reusable-id snapshot: judge
     // every transaction in its window for field-identity changes; see
@@ -2046,29 +2019,22 @@ pub(crate) async fn commit_transaction(
             }
         } else if !strict_overwrite {
             let checked_since = dataset.manifest.clone();
-            let (loaded_dataset, other_transactions) =
-                load_and_sort_new_transactions(&dataset).await?;
-            dataset = loaded_dataset;
-
-            ensure_can_write_manifest(&dataset.manifest)?;
-
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
-
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
                     .await?
-                    .with_read_version_dataset(&read_version_dataset);
+                    .with_read_version_dataset(&read_version_dataset)
+                    .with_trace(std::mem::take(&mut trace));
+            let (loaded_dataset, other_transactions) =
+                catch_up(&mut rebase, &dataset, None).await?;
+            trace = rebase.trace();
+            dataset = loaded_dataset;
+
+            ensure_can_write_manifest(&dataset.manifest)?;
             rebase.load_current_lineage(&dataset).await?;
-            record_committed_history(
-                &mut rebase,
-                &dataset,
-                checked_since.clone(),
-                &other_transactions,
-            )
-            .await?;
             let seen = other_transactions
                 .iter()
                 .map(|(version, _, _)| *version)

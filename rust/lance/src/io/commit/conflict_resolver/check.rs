@@ -118,31 +118,28 @@ impl<'a> TransactionRebase<'a> {
             )
     }
 
-    /// Whether any check of this transaction against `committed` compares
-    /// footprints, which needs the latest manifest: an action set on either
-    /// side.
-    pub fn checks_by_footprint(&self, committed: &[Arc<Transaction>]) -> bool {
-        let is_action_set = |transaction: &Transaction| {
-            matches!(transaction.operation, Operation::CompositeOperation(_))
-        };
-        is_action_set(&self.transaction)
-            || committed
-                .iter()
-                .any(|transaction| is_action_set(transaction))
+    /// Whether this transaction adds index coverage over committed fragments,
+    /// which `repair_index_coverage` may have to repair against every
+    /// manifest committed since it read.
+    pub fn adds_index_coverage(&self) -> bool {
+        !new_coverage(&self.transaction, &HashSet::new()).is_empty()
     }
 
-    /// Whether this transaction, catching up on `committed`, needs every
-    /// manifest committed since it read: only to repair the index coverage it
-    /// adds over committed fragments, and for a named `CreateIndex` only once
-    /// an action set committed underneath it (see `repair_index_coverage`).
-    pub fn needs_committed_history(&self, committed: &[Arc<Transaction>]) -> bool {
-        if new_coverage(&self.transaction, &HashSet::new()).is_empty() {
-            return false;
+    /// Fold in what the footprint checks keep of `transaction`, committed as
+    /// `version` on top of `before`, which is `None` when that manifest is
+    /// gone. Only a named commit's footprint is kept, and only for an action
+    /// set; without `before` it is left unrecorded and its check fails closed.
+    pub fn fold_commit(
+        &mut self,
+        version: u64,
+        transaction: &Transaction,
+        before: Option<&Manifest>,
+    ) {
+        if let Some(before) = before
+            && self.needs_committed_manifests(transaction)
+        {
+            self.record_committed(version, transaction, before);
         }
-        matches!(self.transaction.operation, Operation::CompositeOperation(_))
-            || committed.iter().any(|transaction| {
-                matches!(transaction.operation, Operation::CompositeOperation(_))
-            })
     }
 
     /// Record the footprint of `transaction`, which committed on top of
@@ -159,12 +156,26 @@ impl<'a> TransactionRebase<'a> {
         self.footprint_basis.latest = Some(latest);
     }
 
-    /// Record `manifest`, committed since this transaction read, for the
-    /// coverage repair to walk. See [`Self::needs_committed_history`].
-    pub fn record_history(&mut self, manifest: Arc<Manifest>) {
-        self.footprint_basis
-            .history
-            .insert(manifest.version, manifest);
+    /// Trace what changed from `before` to `after`, the next manifest
+    /// committed since this transaction read, for the coverage repair. See
+    /// [`Self::adds_index_coverage`].
+    pub fn trace_commit(&mut self, before: &Manifest, after: &Manifest) {
+        let trace = Arc::make_mut(&mut self.footprint_basis.trace);
+        trace.observe(before, after);
+        #[cfg(test)]
+        super::probe::traced(trace.len());
+    }
+
+    /// Carry over what an earlier attempt traced, whose window ended where
+    /// this one's starts.
+    pub(crate) fn with_trace(mut self, trace: Arc<FragmentTrace>) -> Self {
+        self.footprint_basis.trace = trace;
+        self
+    }
+
+    /// What this rebase traced, for the next attempt to carry on from.
+    pub(crate) fn trace(&self) -> Arc<FragmentTrace> {
+        self.footprint_basis.trace.clone()
     }
 
     /// Record what the catch-up records of one commit: `transaction`,
@@ -177,10 +188,8 @@ impl<'a> TransactionRebase<'a> {
         before: &Manifest,
         after: Arc<Manifest>,
     ) {
-        if self.needs_committed_manifests(transaction) {
-            self.record_committed(version, transaction, before);
-        }
-        self.record_history(after.clone());
+        self.fold_commit(version, transaction, Some(before));
+        self.trace_commit(before, &after);
         self.record_window(Arc::new(before.clone()), after);
     }
 
@@ -198,14 +207,12 @@ impl<'a> TransactionRebase<'a> {
     /// An action set is checked once, against the change from the version the
     /// first of them landed on to the latest (see [`Footprint`]). Anything else is checked pair
     /// by pair, as [`Self::check_txn`] does.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn check_txns(&mut self, committed: &[(u64, &Transaction)]) -> Result<()> {
         let (Operation::CompositeOperation(_), Some((last, last_transaction))) =
             (&self.transaction.operation, committed.last())
         else {
-            for (version, transaction) in committed {
-                self.check_txn(transaction, *version)?;
-            }
-            return Ok(());
+            return self.check_named_txns(committed);
         };
         let Some(footprints) = committed
             .iter()
@@ -217,11 +224,49 @@ impl<'a> TransactionRebase<'a> {
         self.check_window(footprints, last_transaction, *last)
     }
 
+    /// Check this named transaction against `committed` pair by pair, except
+    /// that the committed action sets are gathered and checked against the
+    /// window once. Each check would compare this transaction's footprint
+    /// with the same change from `since` to `latest`, differing only in the
+    /// committed footprint its forbids are held against, so one check over
+    /// all of them reaches the same verdict. It runs last, against the
+    /// transaction as the named checks left it, which is what lands.
+    fn check_named_txns(&mut self, committed: &[(u64, &Transaction)]) -> Result<()> {
+        self.footprint_basis.deferred_action_sets = Some(Vec::new());
+        let checked = committed
+            .iter()
+            .try_for_each(|(version, transaction)| self.check_txn(transaction, *version));
+        let deferred = self
+            .footprint_basis
+            .deferred_action_sets
+            .take()
+            .unwrap_or_default();
+        checked?;
+        let Some(&(_, last_version)) = deferred.last() else {
+            return Ok(());
+        };
+        let Some(last) = committed
+            .iter()
+            .find_map(|(version, transaction)| (*version == last_version).then_some(*transaction))
+        else {
+            return Err(Error::internal(format!(
+                "deferred action set at version {last_version} is not among the committed \
+                 transactions"
+            )));
+        };
+        let footprints = deferred
+            .into_iter()
+            .map(|(footprint, _)| footprint)
+            .collect();
+        self.check_window(footprints, last, last_version)
+    }
+
     /// Whether an action set and `other_transaction`, committed as
     /// `other_version`, conflict, where at least one of them is an action set.
     ///
     /// Reached from both directions: for a pending action set checked pair by
-    /// pair, and for a pending named operation over a committed action set.
+    /// pair, and for a pending named operation over a committed action set,
+    /// whose footprint [`Self::check_txns`] gathers to check once.
     /// The window is the whole change the commits being checked made, with
     /// only `other_transaction`'s footprint: what the other
     /// commits in it changed is held against this one too, which fails safe.
@@ -235,6 +280,10 @@ impl<'a> TransactionRebase<'a> {
         let Some(footprint) = self.committed_footprint(other_transaction, other_version) else {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         };
+        if let Some(deferred) = &mut self.footprint_basis.deferred_action_sets {
+            deferred.push((footprint, other_version));
+            return Ok(());
+        }
         self.check_window(vec![footprint], other_transaction, other_version)
     }
 
@@ -259,6 +308,8 @@ impl<'a> TransactionRebase<'a> {
         last: &Transaction,
         last_version: u64,
     ) -> Result<()> {
+        #[cfg(test)]
+        super::probe::checked_window();
         let (Some(read), Some(since), Some(latest)) = (
             self.footprint_basis.read.clone(),
             self.footprint_basis.since.clone(),
@@ -1639,21 +1690,17 @@ impl<'a> TransactionRebase<'a> {
         if !self.footprint_basis.repairs_index_coverage {
             return;
         }
-        let Some(read) = self.footprint_basis.read.clone() else {
+        let (Some(read), Some(latest)) = (
+            self.footprint_basis.read.clone(),
+            self.footprint_basis.latest.clone(),
+        ) else {
             return;
         };
-        let mut committed: Vec<Arc<Manifest>> =
-            self.footprint_basis.history.values().cloned().collect();
-        if let Some(latest) = &self.footprint_basis.latest
-            && !self.footprint_basis.history.contains_key(&latest.version)
-        {
-            committed.push(latest.clone());
-        }
-        committed.sort_by_key(|manifest| manifest.version);
         let moved_to = |fragment| self.moved_to(fragment);
         let since = CommittedSince {
             read: &read,
-            committed: committed.iter().map(|manifest| manifest.as_ref()).collect(),
+            latest: &latest,
+            trace: &self.footprint_basis.trace,
             moved_to: &moved_to,
         };
         let withdrawals: Vec<(uuid::Uuid, Vec<u64>)> =

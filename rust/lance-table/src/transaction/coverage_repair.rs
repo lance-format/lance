@@ -13,8 +13,10 @@
 //! The repair is read off the manifests, not off the transactions that
 //! produced them: a fragment's data for a field changed when the data files
 //! backing that field differ between the version the segment was built from
-//! and the latest. Its cost grows with the fragments the segment covers and
-//! the number of versions committed since, never with the table.
+//! and the latest. Of the versions between, it keeps only a [`FragmentTrace`]
+//! of the fragments they created and removed, never a manifest per version.
+
+use std::collections::HashMap;
 
 use lance_core::datatypes::Schema;
 
@@ -26,13 +28,68 @@ use uuid::Uuid;
 pub struct CommittedSince<'a> {
     /// The manifest the transaction read.
     pub read: &'a Manifest,
-    /// The manifests committed since, in ascending version order; the last
-    /// is the latest. It may start with `read` itself.
-    pub committed: Vec<&'a Manifest>,
+    /// The latest manifest.
+    pub latest: &'a Manifest,
+    /// The fragments created and removed between them.
+    pub trace: &'a FragmentTrace,
     /// The fragments a fragment reuse history records `fragment`'s rows as
     /// moved into, following one compaction after another: empty when it
     /// records no move of `fragment`, `None` when the history cannot be walked.
     pub moved_to: &'a dyn Fn(u64) -> Option<Vec<u64>>,
+}
+
+/// The fragments created and removed across a run of manifests: each created
+/// fragment as it first appeared, and each removed one as it last was.
+///
+/// That is all the repair reads of the versions between the read and the
+/// latest: a covered fragment still live is compared from where it first
+/// appears to the latest, and one removed is judged by what it carried when
+/// it left. So it holds what the commits touched, never a manifest per
+/// version, and a commit carries it from one attempt to the next.
+#[derive(Debug, Default, Clone)]
+pub struct FragmentTrace {
+    created: HashMap<u64, Fragment>,
+    removed: HashMap<u64, Fragment>,
+}
+
+impl FragmentTrace {
+    /// Record what changed from `before` to `after`, the next manifest
+    /// observed. Both list their fragments sorted by id, which
+    /// [`Manifest`] maintains.
+    pub fn observe(&mut self, before: &Manifest, after: &Manifest) {
+        let mut before = before.fragments.iter().peekable();
+        let mut after = after.fragments.iter().peekable();
+        loop {
+            match (before.peek(), after.peek()) {
+                (None, None) => break,
+                (Some(old), Some(new)) if old.id == new.id => {
+                    before.next();
+                    after.next();
+                }
+                (None, Some(new)) => {
+                    self.created.entry(new.id).or_insert_with(|| (*new).clone());
+                    after.next();
+                }
+                (Some(old), Some(new)) if old.id > new.id => {
+                    self.created.entry(new.id).or_insert_with(|| (*new).clone());
+                    after.next();
+                }
+                (Some(old), _) => {
+                    self.removed.insert(old.id, (*old).clone());
+                    before.next();
+                }
+            }
+        }
+    }
+
+    /// How many fragments are held.
+    pub fn len(&self) -> usize {
+        self.created.len() + self.removed.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// The coverage a pending transaction gives one index segment.
@@ -69,13 +126,10 @@ pub struct NewCoverage {
 ///   moves at all.
 /// - Where the history cannot be walked, coverage goes.
 pub fn stale_coverage(since: &CommittedSince<'_>, coverage: &NewCoverage) -> Vec<u64> {
-    let Some(latest) = since.committed.last() else {
-        return Vec::new();
-    };
-    if latest.version == since.read.version {
+    if since.latest.version == since.read.version {
         return Vec::new();
     }
-    let history = History::new(since, latest);
+    let history = History::new(since);
     coverage
         .fragments
         .iter()
@@ -84,29 +138,23 @@ pub fn stale_coverage(since: &CommittedSince<'_>, coverage: &NewCoverage) -> Vec
         .collect()
 }
 
-/// The read manifest and every one committed since, as the repair walks them.
+/// The read manifest, the latest, and the trace between them, as the repair
+/// reads them.
 struct History<'a> {
-    /// The read manifest followed by every one committed since, ascending.
-    manifests: Vec<&'a Manifest>,
+    read: &'a Manifest,
     latest: &'a Manifest,
+    trace: &'a FragmentTrace,
     schemas: [&'a Schema; 2],
     moved_to: &'a dyn Fn(u64) -> Option<Vec<u64>>,
 }
 
 impl<'a> History<'a> {
-    fn new(since: &CommittedSince<'a>, latest: &'a Manifest) -> Self {
-        let mut manifests = vec![since.read];
-        manifests.extend(
-            since
-                .committed
-                .iter()
-                .copied()
-                .filter(|manifest| manifest.version > since.read.version),
-        );
+    fn new(since: &CommittedSince<'a>) -> Self {
         Self {
-            manifests,
-            latest,
-            schemas: [&since.read.schema, &latest.schema],
+            read: since.read,
+            latest: since.latest,
+            trace: since.trace,
+            schemas: [&since.read.schema, &since.latest.schema],
             moved_to: since.moved_to,
         }
     }
@@ -131,14 +179,18 @@ impl<'a> History<'a> {
     /// too: a compaction output carries the rewritten values from the start,
     /// so the rewrite shows only on the fragment it moved rows out of.
     fn rewritten(&self, fragment: u64, fields: &[i32]) -> bool {
-        let mut appearances = self
-            .manifests
-            .iter()
-            .filter_map(|manifest| manifest.fragment_by_id(fragment));
-        let Some(first) = appearances.next() else {
+        let Some(first) = self
+            .read
+            .fragment_by_id(fragment)
+            .or_else(|| self.trace.created.get(&fragment))
+        else {
             return false;
         };
-        let Some(last) = appearances.next_back() else {
+        let Some(last) = self
+            .latest
+            .fragment_by_id(fragment)
+            .or_else(|| self.trace.removed.get(&fragment))
+        else {
             return false;
         };
         self.backing(first, fields) != self.backing(last, fields)
@@ -152,10 +204,10 @@ impl<'a> History<'a> {
             return false;
         }
         let Some(last) = self
-            .manifests
-            .iter()
-            .rev()
-            .find_map(|manifest| manifest.fragment_by_id(fragment))
+            .trace
+            .removed
+            .get(&fragment)
+            .or_else(|| self.read.fragment_by_id(fragment))
         else {
             return false;
         };
@@ -353,10 +405,17 @@ mod tests {
                 Some(moved) => moved.clone(),
                 None => Some(Vec::new()),
             };
+            let mut trace = FragmentTrace::default();
+            let mut previous = &read;
+            for manifest in &self.committed {
+                trace.observe(previous, manifest);
+                previous = manifest;
+            }
             stale_coverage(
                 &CommittedSince {
                     read: &read,
-                    committed: self.committed.iter().collect(),
+                    latest: previous,
+                    trace: &trace,
                     moved_to: &moved_to,
                 },
                 &NewCoverage {
