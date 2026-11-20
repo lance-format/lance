@@ -653,6 +653,7 @@ mod tests {
             index.ranges_to_files.clone(),
             None,
             index.results_are_row_addresses,
+            Arc::default(),
         )
         .unwrap()
     }
