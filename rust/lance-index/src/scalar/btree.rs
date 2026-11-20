@@ -38,6 +38,7 @@ use crate::{
         },
     },
 };
+use arrow::compute::cast;
 use arrow_arith::numeric::add;
 use arrow_array::{
     Array, ArrayAccessor, ArrayRef, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
@@ -1205,14 +1206,25 @@ impl BTreeLookup {
             nulls_first: true,
         };
         // Bounds become 1-row arrays of the column type so arrow's type-dispatched
-        // comparator can compare them against the `min`/`max` columns.
+        // comparator can compare them against the `min`/`max` columns. The bounds
+        // of a LIKE prefix on a dictionary column are plain strings, so they are
+        // cast to the dictionary type of the statistics.
+        let bound_array = |value: &OrderableScalarValue| -> Result<ArrayRef> {
+            let array = value.0.to_array_of_size(1)?;
+            match mins.data_type() {
+                DataType::Dictionary(_, _) if array.data_type() != mins.data_type() => {
+                    Ok(cast(&array, mins.data_type())?)
+                }
+                _ => Ok(array),
+            }
+        };
         let lower_arr = match range.0 {
             Bound::Unbounded => None,
-            Bound::Included(v) | Bound::Excluded(v) => Some(v.0.to_array_of_size(1)?),
+            Bound::Included(v) | Bound::Excluded(v) => Some(bound_array(v)?),
         };
         let upper_arr = match range.1 {
             Bound::Unbounded => None,
-            Bound::Included(v) | Bound::Excluded(v) => Some(v.0.to_array_of_size(1)?),
+            Bound::Included(v) | Bound::Excluded(v) => Some(bound_array(v)?),
         };
 
         // Start row: peek a little to the left of the lower bound. A query for 7
@@ -5895,6 +5907,60 @@ mod tests {
                 assert!(ids.contains(&1), "Should contain row 1 (app)");
                 assert!(ids.contains(&2), "Should contain row 2 (application)");
                 assert!(!ids.contains(&3), "Should not contain row 3 (banana)");
+            }
+            _ => panic!("Expected Exact result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_search_dictionary() {
+        use arrow_array::{DictionaryArray, types::Int16Type};
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Sorted, with two values per page, so the prefix prunes pages.
+        let values: DictionaryArray<Int16Type> = vec!["app", "apple", "application", "banana"]
+            .into_iter()
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", values.data_type().clone(), false),
+            Field::new("_rowaddr", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(values),
+                Arc::new(arrow_array::UInt64Array::from_iter_values(0..4)),
+            ],
+        )
+        .unwrap();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch.slice(0, 2)), Ok(batch.slice(2, 2))]),
+        ));
+        train_btree_index(stream, test_store.as_ref(), 2, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+
+        // The planner passes the LIKE pattern of a dictionary column as a plain string.
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("appl".to_string())));
+        match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(row_ids) => {
+                let ids: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(ids, vec![1, 2]);
             }
             _ => panic!("Expected Exact result"),
         }
