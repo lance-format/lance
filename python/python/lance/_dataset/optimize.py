@@ -46,6 +46,7 @@ class DatasetOptimizer:
         data_storage_version: Optional[str] = None,
         max_data_files_per_fragment: Optional[int] = None,
         scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]] = None,
+        data_cache_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -195,6 +196,14 @@ class DatasetOptimizer:
             config, and refuses the ``"force_binary_copy"`` mode. A run that
             does both commits the rewrites and the repacks separately; if the
             repack commit fails, the dataset is left at the rewrite's version.
+        data_cache_bytes: int, optional
+            Total budget in bytes for buffering column data in each output
+            file writer during re-encoding. Divided evenly among cache-owning
+            field encoders, including nested fields. Defaults to the Rust
+            writer's 8 MiB per cache owner when omitted or None. Must be
+            non-negative; zero is allowed. Does not affect binary copy or the
+            input scanner's buffers.
+            For example, ``compact_files(data_cache_bytes=4 * 1024 * 1024)``.
 
         Returns
         -------
@@ -227,6 +236,7 @@ class DatasetOptimizer:
                 data_storage_version=data_storage_version,
                 max_data_files_per_fragment=max_data_files_per_fragment,
                 scope=scope,
+                data_cache_bytes=data_cache_bytes,
             ).items()
             if v is not None
         }
@@ -272,7 +282,16 @@ class DatasetOptimizer:
         """
         return self._dataset._ds.inline_deletions()
 
-    def optimize_indices(self, **kwargs) -> None:
+    def optimize_indices(
+        self,
+        *,
+        num_indices_to_merge: Optional[int] = None,
+        index_names: Optional[list[str]] = None,
+        retrain: Optional[bool] = None,
+        max_rows_per_task: Optional[int] = None,
+        max_rows_per_segment: Optional[int] = None,
+        max_rows_to_consolidate: Optional[int] = None,
+    ) -> None:
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
@@ -290,11 +309,11 @@ class DatasetOptimizer:
         num_indices_to_merge: optional, int, default None
             The number of indices to merge.
             If set to 0, new delta index will be created.
-        index_names: List[str], default None
+        index_names: optional, list[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False
-            Whether to retrain the whole index.
+        retrain: optional, bool, default None
+            Whether to retrain the whole index. None is the same as False.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
             and all indices will be merged into one.
@@ -302,6 +321,8 @@ class DatasetOptimizer:
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
             This rebuilds the index from the source data and may be expensive.
+            Only vector indices are retrained; scalar and full-text search
+            indices are not.
         max_rows_per_task: optional, int, default None
             Upper bound on the rows one build task covers. Setting this or
             `max_rows_per_segment` splits the build of every index whose
@@ -329,7 +350,14 @@ class DatasetOptimizer:
         belong to :py:meth:`lance.optimize.OptimizeIndices.commit`, which uses
         the defaults when they are omitted.
         """
-        self._dataset._ds.optimize_indices(**kwargs)
+        self._dataset._ds.optimize_indices(
+            num_indices_to_merge=num_indices_to_merge,
+            index_names=index_names,
+            retrain=retrain,
+            max_rows_per_task=max_rows_per_task,
+            max_rows_per_segment=max_rows_per_segment,
+            max_rows_to_consolidate=max_rows_to_consolidate,
+        )
 
     def enable_auto_cleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
         """Enable autocleaning for an existing dataset.

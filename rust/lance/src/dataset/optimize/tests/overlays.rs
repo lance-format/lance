@@ -304,6 +304,7 @@ async fn test_normalize_source_fragments_keeps_fully_deleted() {
         file_type: DeletionFileType::Array,
         num_deleted_rows: Some(4),
         base_id: None,
+        path: None,
         inline: None,
     });
     let normalized = normalize_source_fragments(&dataset, &[fragment])

@@ -1811,9 +1811,22 @@ impl<'a> CleanupTask<'a> {
             let store = self.dataset.object_store.as_ref();
             let concurrency = execution.concurrency.max(1);
             let batch_size = concurrency.saturating_mul(BULK_DELETE_BATCH_FILES);
-            let mut chunks = all_files_to_remove.try_chunks(batch_size);
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk.map_err(|error| error.1)?;
+            // Not `try_chunks`: it reserves `batch_size` slots up front, which overflows
+            // or aborts on allocation for a large but valid `delete_concurrency`.
+            let mut files = std::pin::pin!(all_files_to_remove);
+            let mut is_exhausted = false;
+            while !is_exhausted {
+                let mut chunk = Vec::new();
+                while chunk.len() < batch_size {
+                    let Some(file) = files.try_next().await? else {
+                        is_exhausted = true;
+                        break;
+                    };
+                    chunk.push(file);
+                }
+                if chunk.is_empty() {
+                    break;
+                }
                 Self::delete_chunk(
                     chunk,
                     store,
@@ -3147,8 +3160,8 @@ mod tests {
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{
-            AutoCleanupParams, CommitBuilder, DeleteBuilder, ReadParams, WriteMode, WriteParams,
-            builder::DatasetBuilder,
+            AutoCleanupParams, CommitBuilder, DeleteBuilder, InsertBuilder, ReadParams, WriteMode,
+            WriteParams, builder::DatasetBuilder,
         },
         index::vector::VectorIndexParams,
     };
@@ -3203,6 +3216,43 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert_contains!(error.to_string(), "delete_concurrency");
         assert_contains!(error.to_string(), value.to_string());
+    }
+
+    #[rstest]
+    #[case::large(1_000_000)]
+    #[case::max(tokio::sync::Semaphore::MAX_PERMITS)]
+    #[tokio::test]
+    async fn test_cleanup_with_large_delete_concurrency(#[case] concurrency: usize) {
+        let test_dir = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let dataset = InsertBuilder::new(test_dir.as_str())
+            .execute(vec![rows.clone()])
+            .await
+            .unwrap();
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            })
+            .execute(vec![rows])
+            .await
+            .unwrap();
+
+        let stats = dataset
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1])
+                    .unwrap()
+                    .build(),
+            )
+            .with_delete_concurrency(concurrency)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, 1);
+        assert_eq!(stats.failed_deletes, 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
     }
 
     #[derive(Debug)]
@@ -4389,8 +4439,7 @@ mod tests {
             .join(dataset.manifest.fragments[0].files[0].path.as_str());
         let saved = dataset
             .object_store
-            .inner
-            .get(&file)
+            .read_object(&file)
             .await
             .unwrap()
             .bytes()
@@ -4434,8 +4483,7 @@ mod tests {
         assert_eq!(task.managed_scan_permits.available_permits(), 1);
         dataset
             .object_store
-            .inner
-            .put(&file, saved.into())
+            .put_payload(&file, saved.into())
             .await
             .unwrap();
         assert!(
@@ -6069,6 +6117,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
             inline: Some(encoded.into()),
         });
         let transaction = Transaction::new(
@@ -8370,6 +8419,142 @@ mod tests {
                 .await
                 .unwrap();
             assert!(fixture.list_fri_map_dirs().await.is_empty());
+        }
+
+        /// The action-based form of a stable-partition compaction: remove the
+        /// sources, add the destinations at their reserved ids, and record
+        /// `transition`'s mapping, with or without the source removals.
+        fn composite_compaction(
+            transition: &pb_fri::Transition,
+            destinations: &[Fragment],
+            remove_sources: bool,
+        ) -> Transaction {
+            use lance_table::transaction::action::{
+                Action, AddDataFile, AddFragment, AppendFragReuseTransition, CompositeOperation,
+                FieldRef, Ref, RemoveFragment, UserStep,
+            };
+            let mut actions = Vec::new();
+            if remove_sources {
+                actions.extend(transition.sources.iter().map(|source| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(source.id),
+                        data_change: false,
+                    })
+                }));
+            }
+            for destination in destinations {
+                actions.push(Action::AddFragment(AddFragment {
+                    id: Ref::Committed(destination.id),
+                    physical_rows: destination.physical_rows.unwrap() as u64,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: false,
+                }));
+                for file in &destination.files {
+                    actions.push(Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Committed(destination.id),
+                        field_ids: file
+                            .fields
+                            .iter()
+                            .copied()
+                            .map(FieldRef::Committed)
+                            .collect(),
+                        file: lance_table::format::DataFile {
+                            fields: Arc::from([]),
+                            ..file.clone()
+                        },
+                        data_change: false,
+                        base: None,
+                    }));
+                }
+            }
+            actions.push(Action::AppendFragReuseTransition(
+                AppendFragReuseTransition {
+                    sources: transition
+                        .sources
+                        .iter()
+                        .map(|source| Ref::Committed(source.id))
+                        .collect(),
+                    destinations: destinations
+                        .iter()
+                        .map(|destination| Ref::Committed(destination.id))
+                        .collect(),
+                    mapping: transition.mapping.clone().unwrap(),
+                },
+            ));
+            Transaction::new(
+                0,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "compact", actions,
+                )])),
+                None,
+            )
+        }
+
+        /// A row map written for an action-based compaction whose commit
+        /// fails is collected like any other orphan once it ages out, while
+        /// the map a committed action-based history references stays.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn orphan_map_of_a_failed_composite_commit_ages_out() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (dataset, _) = make_tagged(&fixture).await;
+            let mut dataset = dataset;
+            reserve_fragments(&mut dataset, 20).await;
+
+            let (transition, destinations) =
+                reader_tests::prepare_partition(&dataset, &[10, 11], 30).await;
+            let committed_map_id = match &transition.mapping {
+                Some(pb_fri::transition::Mapping::StablePartition(mapping)) => {
+                    mapping.map_id.clone()
+                }
+                _ => unreachable!(),
+            };
+            let read_version = dataset.manifest.version;
+            let dataset = CommitBuilder::new(Arc::new(dataset))
+                .with_experimental_composite_operations(true)
+                .execute(Transaction {
+                    read_version,
+                    ..composite_compaction(&transition, &destinations, true)
+                })
+                .await
+                .unwrap();
+
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            let (orphan, orphan_destinations) =
+                reader_tests::prepare_partition(&dataset, &[30, 31], 50).await;
+            let orphan_map_id = match &orphan.mapping {
+                Some(pb_fri::transition::Mapping::StablePartition(mapping)) => {
+                    mapping.map_id.clone()
+                }
+                _ => unreachable!(),
+            };
+            let read_version = dataset.manifest.version;
+            CommitBuilder::new(Arc::new(dataset))
+                .with_experimental_composite_operations(true)
+                .execute(Transaction {
+                    read_version,
+                    ..composite_compaction(&orphan, &orphan_destinations, false)
+                })
+                .await
+                .unwrap_err();
+            assert!(fixture.list_fri_map_dirs().await.contains(&orphan_map_id));
+
+            // Young, so kept; old, so collected. The committed map stays.
+            fixture
+                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert!(fixture.list_fri_map_dirs().await.contains(&orphan_map_id));
+            MockClock::set_system_time(TimeDelta::try_days(20).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            let remaining = fixture.list_fri_map_dirs().await;
+            assert!(!remaining.contains(&orphan_map_id), "{remaining:?}");
+            assert!(remaining.contains(&committed_map_id), "{remaining:?}");
         }
 
         /// D5: reference resolution decodes external entry content too. The

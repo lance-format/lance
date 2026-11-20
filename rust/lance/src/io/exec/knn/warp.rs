@@ -612,6 +612,7 @@ fn partition_query(
         query_parallelism: 0,
         dist_q_c,
         approx_mode: selection.approx_mode,
+        rq_graph_scoring: Default::default(),
     }
 }
 

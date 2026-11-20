@@ -24,7 +24,7 @@ use lance_core::cache::{
 };
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
-use lance_index::vector::{ApproxMode, DIST_COL, Query, VECTOR_RESULT_SCHEMA};
+use lance_index::vector::{ApproxMode, DIST_COL, Query, RqGraphScoring, VECTOR_RESULT_SCHEMA};
 use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrMask;
 use lance_table::{format::IndexMetadata, rowids::RowIdIndex};
@@ -235,6 +235,7 @@ impl QuantizedRefinementKey {
             query_parallelism,
             dist_q_c: _,
             approx_mode,
+            rq_graph_scoring,
             column: _,
             key: _,
         } = query;
@@ -264,6 +265,10 @@ impl QuantizedRefinementKey {
             ApproxMode::Fast => 0,
             ApproxMode::Normal => 1,
             ApproxMode::Accurate => 2,
+        });
+        builder.write_u8(match rq_graph_scoring {
+            RqGraphScoring::MultiBit => 0,
+            RqGraphScoring::OneBitRerank => 1,
         });
         builder.finish()
     }
@@ -791,6 +796,7 @@ mod tests {
             query_parallelism: 0,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -835,6 +841,7 @@ mod tests {
     #[case::parallelism(|q: &mut Query| q.query_parallelism = 2)]
     #[case::centroid_distance(|q: &mut Query| q.dist_q_c = -0.0)]
     #[case::scoring_mode(|q: &mut Query| q.approx_mode = ApproxMode::Accurate)]
+    #[case::rq_graph_scoring(|q: &mut Query| q.rq_graph_scoring = RqGraphScoring::OneBitRerank)]
     #[test]
     fn refinement_key_binds_query_controls(#[case] change: fn(&mut Query)) {
         let original = refinement_query();

@@ -9,6 +9,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::version::ConcreteFileVersion;
+use lance_file::writer::FileWriterOptions;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
@@ -58,6 +59,8 @@ pub struct Updater {
     write_schema: Option<Schema>,
 
     allow_external_blob_outside_bases: bool,
+
+    file_writer_options: FileWriterOptions,
 
     write_version: ConcreteFileVersion,
 
@@ -159,6 +162,7 @@ impl Updater {
             write_schema,
             final_schema,
             allow_external_blob_outside_bases: false,
+            file_writer_options: FileWriterOptions::default(),
             write_version,
             finished: false,
             deletion_restorer: DeletionRestorer::new(
@@ -241,13 +245,21 @@ impl Updater {
     ///
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<Box<dyn GenericWriter>> {
-        versions::open_update_writer(
+        versions::open_update_writer_with_options(
             self.write_version,
             self.dataset(),
             &schema,
             self.allow_external_blob_outside_bases,
+            self.file_writer_options.clone(),
         )
         .await
+    }
+
+    /// Write the new file with `options` instead of the defaults. Call before
+    /// the first [`Self::update`].
+    pub(super) fn set_file_writer_options(&mut self, options: FileWriterOptions) {
+        debug_assert!(self.writer.is_none(), "the writer is already open");
+        self.file_writer_options = options;
     }
 
     /// Allow trusted existing external blob references to pass through an update rewrite.

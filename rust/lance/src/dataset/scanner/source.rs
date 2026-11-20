@@ -890,16 +890,25 @@ impl Scanner {
 
         let refine_expr = filter_plan.refine_expr.as_ref();
 
+        // A recheck must evaluate the user's filter. Reconstructing it from the
+        // index expression via `to_expr` is not equivalent for every query: an
+        // `IS NULL` leaf carries no literal type, so its accessor cannot be
+        // rebuilt exactly. The planner already owns the original filter, and a
+        // recheck means the index result is only a candidate set.
+        let recheck_filter = if needs_recheck {
+            Some(filter_plan.full_expr.as_ref().expect_ok()?.clone())
+        } else {
+            None
+        };
+
         // If all we want is the row ids then we can skip the take.  However, if there is a refine
         // or a recheck then we still need to do a take because we need filter columns.
         let needs_take =
             needs_recheck || projection.has_data_fields() || filter_plan.refine_expr.is_some();
         if needs_take {
             let mut take_projection = projection.clone();
-            if needs_recheck {
-                // If we need to recheck then we need to also take the columns used for the filter
-                let filter_expr = index_expr.to_expr();
-                let filter_cols = Planner::column_names_in_expr(&filter_expr);
+            if let Some(recheck_filter) = recheck_filter.as_ref() {
+                let filter_cols = Planner::column_names_in_expr(recheck_filter);
                 take_projection = take_projection.union_columns(filter_cols, OnMissing::Error)?;
             }
             if let Some(refine_expr) = refine_expr {
@@ -912,11 +921,7 @@ impl Scanner {
 
         let post_take_filter = match (needs_recheck, refine_expr) {
             (false, None) => None,
-            (true, None) => {
-                // If we need to recheck then we need to apply the filter to the results
-                Some(index_expr.to_expr())
-            }
-            (true, Some(_)) => Some(filter_plan.full_expr.as_ref().unwrap().clone()),
+            (true, _) => recheck_filter,
             (false, Some(refine_expr)) => Some(refine_expr.clone()),
         };
 
@@ -1158,10 +1163,7 @@ impl Scanner {
         let fields_to_take = output_projection
             .clone()
             .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if !fields_to_take.has_data_fields()
-            && !fields_to_take.with_row_id
-            && !fields_to_take.with_row_addr
-        {
+        if fields_to_take.is_empty() {
             // No new columns needed
             return Ok(input);
         }
