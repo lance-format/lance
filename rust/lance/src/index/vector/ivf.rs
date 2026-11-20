@@ -1964,6 +1964,7 @@ pub async fn build_ivf_model(
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
+    params.validate()?;
     let centroids = params.centroids.clone();
     if let (Some(centroids), false) = (centroids.as_deref(), params.retrain) {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
@@ -2077,6 +2078,12 @@ pub async fn train_ivf_model_from_sample(
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
+    params.validate()?;
+    if params.e_means.is_some() && !matches!(metric_type, MetricType::L2 | MetricType::Cosine) {
+        return Err(Error::invalid_input(
+            "e-means IVF training supports only L2 and cosine",
+        ));
+    }
     let num_partitions = params.num_partitions.filter(|&k| k > 0).ok_or_else(|| {
         Error::invalid_input(format!(
             "num_partitions must be set and positive when training from samples, got {:?}",
@@ -3657,6 +3664,11 @@ where
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     const REDOS: usize = 1;
+    if params.e_means.is_some() && metric_type != MetricType::L2 {
+        return Err(Error::invalid_input(
+            "e-means IVF training supports only L2 and cosine",
+        ));
+    }
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
@@ -3682,6 +3694,10 @@ where
     let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
         .with_balance_factor(1.0)
         .with_on_progress(on_progress);
+    let kmeans_params = match &params.e_means {
+        Some(options) => kmeans_params.with_e_means(options.clone()),
+        None => kmeans_params,
+    };
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         data,
         kmeans_params,
@@ -3696,7 +3712,11 @@ where
         Arc::new(data.clone()) as ArrayRef,
         dimension as i32,
     )?;
-    let loss = kmeans.compute_loss(&training_data)?;
+    let loss = if params.e_means.is_some() {
+        kmeans.loss
+    } else {
+        kmeans.compute_loss(&training_data)?
+    };
     Ok(IvfModel::new(
         FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?,
         Some(loss),
@@ -7476,8 +7496,13 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::kmeans(None)]
+    #[case::e_means(Some(lance_index::vector::kmeans::EMeansParams { epochs: 2.5, ..Default::default() }))]
     #[tokio::test]
-    async fn train_ivf_from_sample_builds_searchable_index() {
+    async fn train_ivf_from_sample_builds_searchable_index(
+        #[case] e_means: Option<lance_index::vector::kmeans::EMeansParams>,
+    ) {
         let sample = FixedSizeListArray::try_new_from_values(
             Float32Array::from(
                 (0..64)
@@ -7518,7 +7543,10 @@ mod tests {
         let model = train_ivf_model_from_sample(
             sample,
             MetricType::L2,
-            &IvfBuildParams::new(2),
+            &IvfBuildParams {
+                e_means,
+                ..IvfBuildParams::new(2)
+            },
             noop_progress(),
         )
         .await

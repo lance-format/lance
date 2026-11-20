@@ -4564,6 +4564,17 @@ fn prepare_vector_index_params(
             pq_params.max_iters = max_iters;
         }
 
+        if let Some(epochs) = get_dict_opt::<f64>(kwargs, "e_means_epochs")? {
+            let options = lance_index::vector::kmeans::EMeansParams {
+                epochs,
+                ..Default::default()
+            };
+            options
+                .validate()
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            ivf_params.e_means = Some(options);
+        }
+
         if let Some(streaming_sample_rate) = kwargs.get_item("streaming_sample_rate")? {
             ivf_params.streaming_sample_rate = Some(streaming_sample_rate.extract()?);
         }
