@@ -285,6 +285,66 @@ def test_sample_batches(tmp_path: Path):
     assert all_ids == [i for i in range(2000) if i // 25 % 2 == 1]
 
 
+@pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])
+def test_set_epoch_reaches_persistent_workers(tmp_path: Path, sampler_cls):
+    lance.write_dataset(pa.table({"ids": range(400)}), tmp_path, max_rows_per_file=50)
+    # Non-consecutive epochs: workers must see the value set_epoch stored,
+    # not a count of how many epochs they have run.
+    epochs = [0, 1, 5]
+
+    def epoch_orders(loader, sampler):
+        orders = []
+        for epoch in epochs:
+            sampler.set_epoch(epoch)
+            orders.append([i for batch in loader for i in batch.tolist()])
+        return orders
+
+    def make(**loader_kwargs):
+        sampler = sampler_cls(rank=0, world_size=1, randomize=True, seed=42)
+        dataset = LanceDataset(
+            tmp_path, batch_size=25, columns=["ids"], sampler=sampler
+        )
+        loader = torch.utils.data.DataLoader(dataset, batch_size=None, **loader_kwargs)
+        return loader, sampler
+
+    expected = epoch_orders(*make(num_workers=0))
+    assert len({tuple(order) for order in expected}) == len(epochs)
+
+    persistent = epoch_orders(
+        *make(
+            num_workers=1,
+            persistent_workers=True,
+            multiprocessing_context="spawn",
+        )
+    )
+    assert persistent == expected
+
+
+@pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])
+@pytest.mark.parametrize(
+    "context",
+    [lambda: torch.device("meta"), torch.inference_mode],
+    ids=["meta", "inference"],
+)
+def test_set_epoch_ignores_torch_construction_context(
+    tmp_path: Path, sampler_cls, context
+):
+    lance.write_dataset(pa.table({"ids": range(10)}), tmp_path)
+    sampler = sampler_cls(rank=0, world_size=1, randomize=True)
+    sampler.set_epoch(2)
+    # Neither a default device nor inference mode while LanceDataset shares the
+    # epoch may leak into its storage, and the epoch already set must survive.
+    with context():
+        LanceDataset(tmp_path, batch_size=5, sampler=sampler)
+    assert sampler._epoch == 2
+    sampler.set_epoch(3)
+    assert sampler._epoch == 3
+    # Subclasses that assign _epoch directly must update the shared storage too.
+    sampler._epoch = 4
+    assert sampler._epoch == 4
+    assert isinstance(sampler._epoch_value, torch.Tensor)
+
+
 def test_filtered_sampling_odd_batch_size(tmp_path: Path):
     tbl = pa.Table.from_pydict(
         {

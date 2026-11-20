@@ -34,6 +34,7 @@ from ..sampler import (
     Sampler,
     ShardedBatchSampler,
     ShardedFragmentSampler,
+    _SharedEpoch,
     maybe_sample,
 )
 from .dist import get_global_rank, get_global_world_size
@@ -358,6 +359,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         if rank is not None and world_size is not None:
             warnings.warn("rank and world_size are deprecated", DeprecationWarning)
         self.sampler: Optional[Sampler] = sampler
+        if isinstance(sampler, _SharedEpoch):
+            # Let set_epoch in the main process reach persistent DataLoader workers.
+            sampler._share_epoch_with_workers()
 
         # Dataset with huggingface metadata
         if (
