@@ -13,7 +13,7 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
 
 use super::{
-    BatchKernel, Dot, Normalize, assert_batch_output_layout, assert_equal_lengths,
+    BatchKernel, Dot, Normalize, PairKernel, assert_batch_output_layout, assert_equal_lengths,
     dot::dot,
     norm_l2::{norm_l2, norm_l2_impl},
 };
@@ -290,10 +290,12 @@ mod half_c {
 }
 
 impl Cosine for f32 {
-    /// The norm of `x` is accumulated in f64, like the kernels' sums.
+    /// The kernel computes the norm of `x` itself, in f64: it need not be an
+    /// f32 value.
     #[inline]
     fn cosine(x: &[Self], other: &[Self]) -> f32 {
-        Self::cosine_fast(x, norm_l2_impl::<Self, f64, 16>(x) as Self, other)
+        assert_equal_lengths(x.len(), other.len());
+        COSINE_F32_PAIR.get().call(x, other)
     }
 
     #[inline]
@@ -341,6 +343,24 @@ lance_core::dispatch! {
 }
 
 lance_core::dispatch! {
+    static COSINE_F32_PAIR: Dispatch<PairKernel> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::COSINE_F32_PAIR_AVX512,
+                x86::COSINE_F32_PAIR_AVX_FMA,
+                x86::COSINE_F32_PAIR_AVX,
+                COSINE_F32_PAIR_PORTABLE,
+            ]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[COSINE_F32_PAIR_PORTABLE]
+        }
+    };
+}
+
+lance_core::dispatch! {
     static COSINE_WITH_NORMS_F32: Dispatch<CosineWithNormsKernel> = {
         #[cfg(target_arch = "x86_64")]
         {
@@ -359,10 +379,10 @@ lance_core::dispatch! {
 }
 
 lance_core::dispatch! {
-    /// Unlike `L2_F32_BATCH`, this has an AVX-512 candidate: Haswell builds
-    /// have always used the AVX-512 kernel on AVX-512 hosts outside the 8- and
-    /// 16-dimension paths. Keeping those results means Haswell builds select
-    /// at runtime, at one indirect call per batch.
+    /// Unlike `L2_F32_BATCH`, this has an AVX-512 candidate, so Haswell builds
+    /// select at runtime, at one indirect call per batch. Every candidate runs
+    /// the same f64 body and returns the same bits; AVX-512 hosts run it on
+    /// 512-bit vectors.
     static COSINE_F32_BATCH: Dispatch<BatchKernel> = {
         #[cfg(target_arch = "x86_64")]
         {
@@ -407,41 +427,71 @@ const PORTABLE_FMA: bool = cfg!(any(
     target_feature = "fma"
 ));
 
-/// `x·y` and `y·y`, accumulated in f64, where no product or partial sum of f32
-/// values can overflow or underflow. Every f32 candidate shares this body and
-/// returns the same bits: a candidate's target features only change how the
-/// compiler vectorizes it, and since the product of two f32 values is exact in
-/// f64, `FMA` only decides whether each multiply-add is one instruction.
+/// `x·x`, `x·y` and `y·y`, accumulated in f64, where no product or partial sum
+/// of f32 values can overflow or underflow. Every f32 candidate shares this
+/// body and returns the same bits: a candidate's target features only change
+/// how the compiler vectorizes it, and since the product of two f32 values is
+/// exact in f64, `FMA` only decides whether each multiply-add is one
+/// instruction. The compiler drops the sums a caller ignores.
 #[inline(always)]
-fn dot_and_norm_squared_f64<const FMA: bool>(x: &[f32], y: &[f32]) -> (f64, f64) {
+fn cosine_sums_f64<const FMA: bool>(x: &[f32], y: &[f32]) -> [f64; 3] {
     const LANES: usize = 8;
     let madd = |a: f64, b: f64, c: f64| if FMA { a.mul_add(b, c) } else { a * b + c };
     let (x_chunks, x_tail) = x.as_chunks::<LANES>();
     let (y_chunks, y_tail) = y.as_chunks::<LANES>();
+    let mut xx = [0.0_f64; LANES];
     let mut xy = [0.0_f64; LANES];
     let mut yy = [0.0_f64; LANES];
     for (x, y) in x_chunks.iter().zip(y_chunks) {
         for i in 0..LANES {
             let (a, b) = (f64::from(x[i]), f64::from(y[i]));
+            xx[i] = madd(a, a, xx[i]);
             xy[i] = madd(a, b, xy[i]);
             yy[i] = madd(b, b, yy[i]);
         }
     }
-    let (mut xy_tail, mut yy_tail) = (0.0, 0.0);
+    let (mut xx_tail, mut xy_tail, mut yy_tail) = (0.0, 0.0, 0.0);
     for (&a, &b) in x_tail.iter().zip(y_tail) {
         let (a, b) = (f64::from(a), f64::from(b));
+        xx_tail = madd(a, a, xx_tail);
         xy_tail = madd(a, b, xy_tail);
         yy_tail = madd(b, b, yy_tail);
     }
     let sum = |v: [f64; LANES]| ((v[0] + v[4]) + (v[2] + v[6])) + ((v[1] + v[5]) + (v[3] + v[7]));
-    (sum(xy) + xy_tail, sum(yy) + yy_tail)
+    [sum(xx) + xx_tail, sum(xy) + xy_tail, sum(yy) + yy_tail]
 }
 
 /// Cosine distance from `x`, whose L2 norm is `x_norm`, to `y`, in f64.
 #[inline(always)]
 fn cosine_f32_wide<const FMA: bool>(x: &[f32], x_norm: f64, y: &[f32]) -> f32 {
-    let (xy, yy) = dot_and_norm_squared_f64::<FMA>(x, y);
+    let [_, xy, yy] = cosine_sums_f64::<FMA>(x, y);
     (1.0 - xy / x_norm / yy.sqrt()) as f32
+}
+
+/// Cosine distance between `x` and `y`, with both norms in f64.
+#[inline(always)]
+fn cosine_pair_f32_wide<const FMA: bool>(x: &[f32], y: &[f32]) -> f32 {
+    let [xx, xy, yy] = cosine_sums_f64::<FMA>(x, y);
+    (1.0 - xy / xx.sqrt() / yy.sqrt()) as f32
+}
+
+/// Whether `norm` is accurate if it came from an f32 sum of `dimension`
+/// squares, as `norm_l2` computes it: the sum neither overflowed nor lost
+/// precision to subnormal squares. The f32 kernels use a norm passed in only
+/// when this holds, and otherwise compute it from the vector.
+#[inline]
+fn f32_norm_in_range(norm: f32, dimension: usize) -> bool {
+    (f32::MIN_POSITIVE * dimension as f32..f32::INFINITY).contains(&(norm * norm))
+}
+
+/// [`Cosine::cosine_fast`] for f32, in f64.
+#[inline(always)]
+fn cosine_fast_f32_wide<const FMA: bool>(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+    if f32_norm_in_range(x_norm, x.len()) {
+        cosine_f32_wide::<FMA>(x, x_norm.into(), y)
+    } else {
+        cosine_pair_f32_wide::<FMA>(x, y)
+    }
 }
 
 /// [`Cosine::cosine_with_norms`] for f32, in f64.
@@ -452,8 +502,12 @@ fn cosine_with_norms_f32_wide<const FMA: bool>(
     y_norm: f32,
     y: &[f32],
 ) -> f32 {
-    let (xy, _) = dot_and_norm_squared_f64::<FMA>(x, y);
-    (1.0 - xy / f64::from(x_norm) / f64::from(y_norm)) as f32
+    if f32_norm_in_range(x_norm, x.len()) && f32_norm_in_range(y_norm, y.len()) {
+        let [_, xy, _] = cosine_sums_f64::<FMA>(x, y);
+        (1.0 - xy / f64::from(x_norm) / f64::from(y_norm)) as f32
+    } else {
+        cosine_pair_f32_wide::<FMA>(x, y)
+    }
 }
 
 /// [`Cosine::cosine_batch_into`] for f32, in f64. Fixed-size keys at the PQ
@@ -490,7 +544,16 @@ lance_core::target_kernel! {
     #[candidate(COSINE_F32_PORTABLE: CosineKernel<f32>)]
     #[inline]
     fn cosine_f32_portable(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        cosine_f32_wide::<PORTABLE_FMA>(x, x_norm.into(), y)
+        cosine_fast_f32_wide::<PORTABLE_FMA>(x, x_norm, y)
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F32_PAIR_PORTABLE: PairKernel)]
+    #[inline]
+    fn cosine_pair_f32_portable(x: &[f32], y: &[f32]) -> f32 {
+        cosine_pair_f32_wide::<PORTABLE_FMA>(x, y)
     }
 }
 
@@ -526,8 +589,8 @@ mod x86 {
     use std::arch::x86_64::*;
 
     use super::{
-        CosineKernel, CosineWithNormsKernel, cosine_batch_f32_wide, cosine_f32_wide,
-        cosine_with_norms_f32_wide,
+        CosineKernel, CosineWithNormsKernel, PairKernel, cosine_batch_f32_wide,
+        cosine_fast_f32_wide, cosine_pair_f32_wide, cosine_with_norms_f32_wide,
     };
     use crate::distance::BatchKernel;
     use crate::simd::f64::{f64x4, f64x8};
@@ -578,7 +641,7 @@ mod x86 {
         #[candidate(pub(super) COSINE_F32_AVX512: CosineKernel<f32>)]
         #[inline]
         pub(super) fn cosine_f32_avx512(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-            cosine_f32_wide::<true>(x, x_norm.into(), other)
+            cosine_fast_f32_wide::<true>(x, x_norm, other)
         }
     }
 
@@ -587,7 +650,7 @@ mod x86 {
         #[candidate(pub(super) COSINE_F32_AVX_FMA: CosineKernel<f32>)]
         #[inline]
         pub(super) fn cosine_f32_avx_fma(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-            cosine_f32_wide::<true>(x, x_norm.into(), other)
+            cosine_fast_f32_wide::<true>(x, x_norm, other)
         }
     }
 
@@ -596,7 +659,34 @@ mod x86 {
         #[candidate(pub(super) COSINE_F32_AVX: CosineKernel<f32>)]
         #[inline]
         pub(super) fn cosine_f32_avx(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-            cosine_f32_wide::<false>(x, x_norm.into(), other)
+            cosine_fast_f32_wide::<false>(x, x_norm, other)
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) COSINE_F32_PAIR_AVX512: PairKernel)]
+        #[inline]
+        pub(super) fn cosine_pair_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
+            cosine_pair_f32_wide::<true>(x, y)
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) COSINE_F32_PAIR_AVX_FMA: PairKernel)]
+        #[inline]
+        pub(super) fn cosine_pair_f32_avx_fma(x: &[f32], y: &[f32]) -> f32 {
+            cosine_pair_f32_wide::<true>(x, y)
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) COSINE_F32_PAIR_AVX: PairKernel)]
+        #[inline]
+        pub(super) fn cosine_pair_f32_avx(x: &[f32], y: &[f32]) -> f32 {
+            cosine_pair_f32_wide::<false>(x, y)
         }
     }
 
@@ -1098,6 +1188,27 @@ mod tests {
                     check_cosine(kernel.call(x, x_norm, y), want, candidate.name(), dimension)?;
                 }
 
+                // Every pair candidate shares one f64 body.
+                let (want_pair, _) = cosine_ref(&x_f64, &y_f64, 0.0);
+                let mut first_pair = None;
+                for candidate in COSINE_F32_PAIR.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let got = kernel.call(x, y);
+                    check_cosine(got, want_pair, candidate.name(), dimension)?;
+                    let (first, first_bits) =
+                        *first_pair.get_or_insert((candidate.name(), got.to_bits()));
+                    prop_assert_eq!(
+                        got.to_bits(),
+                        first_bits,
+                        "{} and {} differ at dim {}",
+                        candidate.name(),
+                        first,
+                        dimension
+                    );
+                }
+
                 for candidate in COSINE_WITH_NORMS_F32.candidates() {
                     let Some(kernel) = candidate.kernel() else {
                         continue;
@@ -1219,6 +1330,12 @@ mod tests {
                 .unwrap();
             check([got.value(0), got.value(1)], "DistanceType::Cosine.batch");
             check(each_target(&|y, _| f32::cosine(x, y)), "Cosine::cosine");
+            for candidate in COSINE_F32_PAIR.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                check(each_target(&|y, _| kernel.call(x, y)), candidate.name());
+            }
             for candidate in COSINE_F32_BATCH.candidates() {
                 let Some(kernel) = candidate.kernel() else {
                     continue;
