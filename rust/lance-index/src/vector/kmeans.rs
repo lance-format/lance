@@ -506,6 +506,35 @@ fn gathered_membership_of_rows<T: Num + Clone + Send + Sync, Algo: KMeansAlgo<T>
         .collect()
 }
 
+/// Whether an `f32` centroid table of `num_values` values is small enough for
+/// the transposed [`L2Prepared`] kernel, as PQ sub-vector codebooks are.
+fn fits_l2_prepared(num_values: usize, dimension: usize) -> bool {
+    dimension <= L2_PREPARED_MAX_DIMENSION && num_values * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
+}
+
+/// The nearest centroid of every `f32` vector of `data` under L2 and the
+/// squared distance to it, with the tiled GEMM of e-means assignment.
+fn gemm_membership_and_dist(
+    centroids: &[f32],
+    data: &[f32],
+    dimension: usize,
+) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+    let norms = f32::prepare_centroids(centroids, dimension);
+    let num_rows = data.len() / dimension;
+    let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<f32>()))
+        .min(num_rows.div_ceil(MEMBERSHIP_MIN_TASKS))
+        .max(MEMBERSHIP_MIN_TASK_ROWS);
+    let rows: Vec<usize> = (0..num_rows).collect();
+    rows.par_chunks(chunk_rows)
+        .flat_map_iter(|rows| {
+            let _busy = profile::work(Work::Assign);
+            let mut assignments = Vec::with_capacity(rows.len());
+            f32::assign_rows(data, dimension, centroids, &norms, rows, &mut assignments);
+            assignments.into_iter().map(Option::unzip)
+        })
+        .unzip()
+}
+
 /// [`KMeansAlgo::membership_of_rows`] for `f32` vectors under L2: every task
 /// scores its rows against all centroids with the tiled GEMM of e-means
 /// assignment, reading the rows in place. Tasks are sequential inside, so the
@@ -825,6 +854,18 @@ where
         // Large centroid tables keep one vector per job: a vector already
         // carries enough work there.
         let min_rows = MIN_JOB_DISTANCE_TERMS.div_ceil(centroids.len().max(1));
+        // Unbiased L2 assignment against a table too large for `L2Prepared`,
+        // as in the IVF shuffle: one GEMM per tile instead of one kernel call
+        // per vector-centroid pair.
+        if index.is_none()
+            && distance_type == DistanceType::L2
+            && cluster_sizes.is_none()
+            && let (Some(centroids), Some(data)) =
+                (T::as_f32_slice(centroids), T::as_f32_slice(data))
+            && !fits_l2_prepared(centroids.len(), dimension)
+        {
+            return gemm_membership_and_dist(centroids, data, dimension);
+        }
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -840,10 +881,8 @@ where
             None => match distance_type {
                 DistanceType::L2 => match T::as_f32_slice(centroids)
                     .zip(T::as_f32_slice(data))
-                    .filter(|_| {
-                        dimension <= L2_PREPARED_MAX_DIMENSION
-                            && centroids.len() * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
-                    }) {
+                    .filter(|(centroids, _)| fits_l2_prepared(centroids.len(), dimension))
+                {
                     // PQ sub-vector codebooks: one SoA pass per vector instead of one
                     // kernel call per centroid, whose call and dispatch overhead
                     // dominates at these dimensions.
@@ -2735,6 +2774,65 @@ mod tests {
         let err =
             kmeans_find_partitions_binary(&centroids, &[], 1, DistanceType::Hamming).unwrap_err();
         assert!(err.to_string().contains("empty query"), "{err}");
+    }
+
+    /// Unbiased flat L2 assignment against a large centroid table, as the IVF
+    /// shuffle runs it, picks the centroid pairwise L2 picks up to rounding on
+    /// exact ties, reports the same distance, and leaves NaN rows unassigned.
+    #[rstest]
+    #[case::ivf_partitions(2_000, 366, 128)]
+    #[case::high_dimension(300, 40, 1024)]
+    #[case::large_low_dimension_table(1_000, 4_096, 16)]
+    fn test_flat_l2_gemm_assignment_matches_pairwise(
+        #[case] num_rows: usize,
+        #[case] k: usize,
+        #[case] dimension: usize,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(5);
+        let mut data: Vec<f32> = (0..num_rows * dimension)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        data[dimension..2 * dimension].fill(f32::NAN);
+        let centroids: Vec<f32> = (0..k * dimension)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &centroids,
+            &data,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+
+        assert_eq!(membership.len(), num_rows);
+        assert_eq!((membership[1], distances[1]), (None, None));
+        for (row, vector) in data
+            .chunks_exact(dimension)
+            .enumerate()
+            .filter(|(row, _)| *row != 1)
+        {
+            let pairwise: Vec<f32> = centroids
+                .chunks_exact(dimension)
+                .map(|centroid| l2::l2(vector, centroid))
+                .collect();
+            let expected = argmin(pairwise.iter().copied()).unwrap();
+            let best = pairwise[expected as usize];
+            let chosen = membership[row].unwrap();
+            let tolerance = 1e-4 * best.max(1.0);
+            assert!(
+                (pairwise[chosen as usize] - best).abs() <= tolerance,
+                "row {row}: centroid {chosen} at {} is not tied with {expected} at {best}",
+                pairwise[chosen as usize]
+            );
+            let distance = distances[row].unwrap();
+            assert!(
+                (distance - best).abs() <= tolerance,
+                "row {row}: distance {distance} vs {best}"
+            );
+        }
     }
 
     /// The GEMM membership of hierarchical nodes picks the child the gathered
