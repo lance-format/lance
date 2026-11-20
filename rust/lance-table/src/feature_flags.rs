@@ -145,8 +145,19 @@ pub const FLAG_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
 /// The reader bit is set while any fragment sets `path`, and the writer bit remains set
 /// on subsequent versions so cleanup preserves files referenced by retained versions.
 pub const FLAG_DELETION_FILE_PATHS: u64 = 1 << 21;
+/// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
+/// sets `key_layout`.
+///
+/// Writer-only. The
+/// [key layout writer rules](https://lance.org/format/index/scalar/btree/#key-layout-writer-rules)
+/// say when a writer sets this bit and how it treats a `key_layout` segment
+/// from a manifest that lacks it.
+///
+/// Reserved ahead of its implementation. This build masks the bit out in
+/// `supported_flags_when`, so it refuses to write a table that sets it.
+pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 22;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 22;
+pub const FLAG_UNKNOWN: u64 = 1 << 23;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -171,6 +182,9 @@ const _: () = assert!(FLAG_LOCAL_FRAGMENT_ALIASES < FLAG_DELETION_FILE_PATHS);
 // Released builds refuse bit 20 and above, so they cannot read this format.
 const _: () = assert!(FLAG_DELETION_FILE_PATHS >= 1 << 20);
 const _: () = assert!(FLAG_DELETION_FILE_PATHS < FLAG_UNKNOWN);
+// Same fence for this bit: v15.0.0-beta.7 refuses bit 19 and up.
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 19);
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -594,6 +608,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
     supported
 }
 
@@ -895,6 +910,19 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_key_layout_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_BTREE_KEY_LAYOUT;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert!(!can_write_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 22);
+    }
+
+    #[test]
     fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         assert!(can_read_dataset(FLAG_OBJECT_METADATA));
@@ -902,7 +930,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 22);
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -1651,7 +1679,7 @@ mod tests {
         assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
         assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
         assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 22);
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
     }
