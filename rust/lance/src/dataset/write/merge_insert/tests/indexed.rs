@@ -1391,6 +1391,91 @@ async fn test_merge_insert_use_index() {
     assert_eq!(updated_count, 3);
 }
 
+/// A LABEL_LIST index answers list membership, not equality on the whole list,
+/// so a merge keyed on the list column must join without probing it.
+#[tokio::test]
+async fn test_merge_insert_on_label_list_indexed_key() {
+    let tags = |rows: &[&[&str]]| {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in rows {
+            for tag in *row {
+                builder.values().append_value(tag);
+            }
+            builder.append(true);
+        }
+        Arc::new(builder.finish()) as ArrayRef
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let target = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            tags(&[&["a"], &["a", "b"], &["c"]]),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(target)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["tags"],
+        IndexType::LabelList,
+        None,
+        &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            tags(&[&["a", "b"], &["d"]]),
+            Arc::new(Int32Array::from(vec![20, 40])),
+        ],
+    )
+    .unwrap();
+    let (ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["tags".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(source)],
+            schema.clone(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(stats.num_inserted_rows, 1);
+
+    let batch = ds
+        .scan()
+        .project(&["value"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut values = batch["value"].as_primitive::<Int32Type>().values().to_vec();
+    values.sort();
+    assert_eq!(values, vec![1, 3, 20, 40]);
+}
+
 #[tokio::test]
 async fn test_full_schema_upsert_fragment_bitmap() {
     let schema = Arc::new(Schema::new(vec![
