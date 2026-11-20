@@ -63,9 +63,10 @@ pub struct NewCoverage {
 ///   is nested in one of its fields, in the read or the latest schema.
 /// - A covered fragment removed since keeps its coverage: a plain delete
 ///   leaves no rows to describe, and a recorded move is translated by the
-///   reader. It loses it when the rows moved somewhere rewritten since, when a
-///   compaction folded in an overlay the segment did not see, or when the
-///   segment cannot follow moves at all.
+///   reader. It loses it when its data was rewritten before it was removed,
+///   when the rows moved somewhere rewritten since, when a compaction folded
+///   in an overlay the segment did not see, or when the segment cannot follow
+///   moves at all.
 /// - Where the history cannot be walked, coverage goes.
 pub fn stale_coverage(since: &CommittedSince<'_>, coverage: &NewCoverage) -> Vec<u64> {
     let Some(latest) = since.committed.last() else {
@@ -125,20 +126,22 @@ impl<'a> History<'a> {
             })
     }
 
-    /// Whether `fragment` is live at the latest version and the data backing
-    /// `fields` in it differs from when it was first seen in the window.
+    /// Whether the data backing `fields` in `fragment` differs between when it
+    /// was first and last seen in the window. A fragment removed since counts
+    /// too: a compaction output carries the rewritten values from the start,
+    /// so the rewrite shows only on the fragment it moved rows out of.
     fn rewritten(&self, fragment: u64, fields: &[i32]) -> bool {
-        let Some(now) = self.latest.fragment_by_id(fragment) else {
-            return false;
-        };
-        let Some(first) = self
+        let mut appearances = self
             .manifests
             .iter()
-            .find_map(|manifest| manifest.fragment_by_id(fragment))
-        else {
+            .filter_map(|manifest| manifest.fragment_by_id(fragment));
+        let Some(first) = appearances.next() else {
             return false;
         };
-        self.backing(first, fields) != self.backing(now, fields)
+        let Some(last) = appearances.next_back() else {
+            return false;
+        };
+        self.backing(first, fields) != self.backing(last, fields)
     }
 
     /// Whether `fragment` left the dataset within the window carrying an
