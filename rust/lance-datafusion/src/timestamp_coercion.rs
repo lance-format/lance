@@ -232,17 +232,20 @@ fn unwrap_node(
             if !COMPARISONS.contains(op) {
                 return Ok(None);
             }
-            let (widened, op, operand) = match widened_timestamp(left, schema) {
-                Some(widened) => (widened, *op, right),
-                None => match (widened_timestamp(right, schema), op.swap()) {
-                    (Some(widened), Some(op)) => (widened, op, left),
-                    _ => return Ok(None),
-                },
-            };
-            let Some(value) = widened_value(operand, &widened.widened_type, simplify)? else {
-                return Ok(None);
-            };
-            Ok(unwrap_comparison(&widened, op, value))
+            // Both sides can be widening casts, as when a literal in one unit
+            // meets a column cast to a finer one, so each side is tried as the
+            // cast expression until the other folds to a literal.
+            if let Some(widened) = widened_timestamp(left, schema)
+                && let Some(value) = widened_value(right, &widened.widened_type, simplify)?
+            {
+                return Ok(unwrap_comparison(&widened, *op, value));
+            }
+            if let (Some(widened), Some(op)) = (widened_timestamp(right, schema), op.swap())
+                && let Some(value) = widened_value(left, &widened.widened_type, simplify)?
+            {
+                return Ok(unwrap_comparison(&widened, op, value));
+            }
+            Ok(None)
         }
         Expr::Between(Between {
             expr,
@@ -321,21 +324,28 @@ pub fn unwrap_timestamp_widening_casts(
     simplify: &dyn Fn(Expr) -> DFResult<Expr>,
     schema: &DFSchema,
 ) -> Result<Expr> {
-    Ok(expr
-        .transform_up(|node| {
-            let Some(mut rewritten) = unwrap_node(&node, simplify, schema)? else {
-                return Ok(Transformed::no(node));
-            };
-            // A rewrite strips one cast. The expression it wrapped can be a
-            // widening cast itself, such as `CAST(ts AS TIMESTAMP(3))` once
-            // coercion widens it again to a microsecond operand, which
-            // `simplify` would unwrap by truncation in turn.
-            while let Some(again) = unwrap_node(&rewritten, simplify, schema)? {
-                rewritten = again;
-            }
-            Ok(Transformed::yes(rewritten))
-        })?
-        .data)
+    Ok(unwrap_all(expr, simplify, schema)?.data)
+}
+
+fn unwrap_all(
+    expr: Expr,
+    simplify: &dyn Fn(Expr) -> DFResult<Expr>,
+    schema: &DFSchema,
+) -> DFResult<Transformed<Expr>> {
+    expr.transform_up(|node| {
+        let Some(rewritten) = unwrap_node(&node, simplify, schema)? else {
+            return Ok(Transformed::no(node));
+        };
+        // A rewrite strips one cast, but the expression it wrapped can be a
+        // widening cast itself, such as `CAST(ts AS TIMESTAMP(3))` once
+        // coercion widens it again for a microsecond operand. `simplify` would
+        // unwrap that one by truncation in turn, so every comparison the
+        // rewrite produced, including the bounds of a `BETWEEN` that became an
+        // `AND`, is rewritten again. Each rewrite removes a cast, so this ends.
+        Ok(Transformed::yes(
+            unwrap_all(rewritten, simplify, schema)?.data,
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -348,7 +358,7 @@ mod tests {
     };
     use arrow_buffer::IntervalDayTime;
     use arrow_schema::{Field, Fields, TimeUnit};
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use datafusion::logical_expr::{Expr, Operator, binary_expr};
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
@@ -753,5 +763,202 @@ mod tests {
             .unwrap();
         assert_eq!(once, expected, "{filter}");
         assert_eq!(planner.optimize_expr(once.clone()).unwrap(), once);
+    }
+
+    /// The reproducer from review: the bounds of a `NOT BETWEEN` on an
+    /// explicitly cast column were lowered through one cast only and then
+    /// truncated.
+    #[test]
+    fn nested_cast_not_between() {
+        let ts = TimestampSecondArray::from(vec![Some(0), Some(1), Some(2), None]);
+        let batch = RecordBatch::try_from_iter(vec![("ts", Arc::new(ts) as ArrayRef)]).unwrap();
+        let planner = Planner::new(batch.schema());
+        let filter = "CAST(ts AS TIMESTAMP(3)) NOT BETWEEN TIMESTAMP '1969-12-31 23:59:59.9995' \
+                      AND TIMESTAMP '1970-01-01 00:00:01.0005'";
+        let expr = planner.parse_filter(filter).unwrap();
+        assert_eq!(
+            evaluate(&planner, &batch, expr),
+            vec![Some(false), Some(false), Some(true), None]
+        );
+    }
+
+    /// Three-valued logic over `Option<bool>`.
+    fn not3(value: Option<bool>) -> Option<bool> {
+        value.map(|value| !value)
+    }
+
+    fn and3(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+        match (left, right) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        }
+    }
+
+    fn or3(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+        not3(and3(not3(left), not3(right)))
+    }
+
+    fn compare3(op: &str, value: Option<i128>, operand: Option<i128>) -> Option<bool> {
+        match op {
+            "IS DISTINCT FROM" => return Some(value != operand),
+            "IS NOT DISTINCT FROM" => return Some(value == operand),
+            _ => {}
+        }
+        let (value, operand) = (value?, operand?);
+        Some(match op {
+            "=" => value == operand,
+            "!=" => value != operand,
+            "<" => value < operand,
+            "<=" => value <= operand,
+            ">" => value > operand,
+            ">=" => value >= operand,
+            _ => unreachable!("{op}"),
+        })
+    }
+
+    /// A timestamp literal of `precision` fractional digits, `nanos` after the
+    /// epoch, as SQL.
+    fn sql_literal(precision: u32, nanos: Option<i128>) -> String {
+        let Some(nanos) = nanos else {
+            return format!("CAST(NULL AS TIMESTAMP({precision}))");
+        };
+        let time = DateTime::from_timestamp_nanos(i64::try_from(nanos).unwrap());
+        let text = time.format("%Y-%m-%d %H:%M:%S%.9f");
+        format!("CAST('{text}' AS TIMESTAMP({precision}))")
+    }
+
+    /// Every comparison form, on every shape of the column side, against
+    /// results computed exactly in nanoseconds with three-valued logic, for
+    /// operands exact and inexact in each finer unit, on both sides of the
+    /// epoch.
+    #[rstest]
+    #[case::column("ts")]
+    #[case::millis("CAST(ts AS TIMESTAMP(3))")]
+    #[case::micros("CAST(ts AS TIMESTAMP(6))")]
+    #[case::nested("CAST(CAST(ts AS TIMESTAMP(3)) AS TIMESTAMP(6))")]
+    #[case::nested_try("TRY_CAST(CAST(ts AS TIMESTAMP(3)) AS TIMESTAMP(9))")]
+    #[case::struct_field("event.ts")]
+    #[case::struct_field_cast("CAST(event.ts AS TIMESTAMP(3))")]
+    fn matches_exact_oracle(#[case] column: &str) {
+        const SECOND: i128 = 1_000_000_000;
+        let seconds = vec![Some(-2), Some(-1), Some(0), Some(1), Some(2), None];
+        let ts: ArrayRef = Arc::new(TimestampSecondArray::from(seconds.clone()));
+        let fields = Fields::from(vec![Field::new("ts", ts.data_type().clone(), true)]);
+        let event = StructArray::new(fields, vec![ts.clone()], None);
+        let batch =
+            RecordBatch::try_from_iter(vec![("ts", ts), ("event", Arc::new(event) as ArrayRef)])
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+        let values: Vec<Option<i128>> = seconds
+            .iter()
+            .map(|value| value.map(|value| i128::from(value) * SECOND))
+            .collect();
+
+        // (precision, nanoseconds): whole seconds, and values a unit of each
+        // precision or half a second away from them, on both sides of zero.
+        let mut operands: Vec<(u32, Option<i128>)> = vec![(3, None), (6, Some(0))];
+        for sign in [-1, 1] {
+            operands.extend([
+                (3, Some(sign * SECOND)),
+                (3, Some(sign * (SECOND + 1_000_000))),
+                (3, Some(sign * SECOND / 2)),
+                (6, Some(sign * (SECOND - 1_000))),
+                (9, Some(sign * (SECOND + 1))),
+                (9, Some(sign)),
+            ]);
+        }
+        let pairs: Vec<_> = operands
+            .iter()
+            .step_by(2)
+            .flat_map(|low| {
+                operands
+                    .iter()
+                    .skip(1)
+                    .step_by(2)
+                    .map(move |high| (*low, *high))
+            })
+            .collect();
+
+        let mut checked = 0;
+        let mut check = |filter: String, expected: &dyn Fn(Option<i128>) -> Option<bool>| {
+            let expr = planner.parse_filter(&filter).unwrap();
+            let plan = planner.optimize_expr(expr.clone()).unwrap();
+            let expected: Vec<_> = values.iter().map(|value| expected(*value)).collect();
+            assert_eq!(
+                evaluate(&planner, &batch, expr),
+                expected,
+                "{filter}\nplan: {plan}"
+            );
+            // The scan path optimizes the filter twice. `simplify` expands an
+            // `IN` list with a NULL item into an OR chain whose `= NULL` it
+            // only folds on the next pass, as for any column type, so only the
+            // answer is compared there.
+            let again = planner.optimize_expr(plan.clone()).unwrap();
+            if filter.contains(" IN (") && filter.contains("NULL") {
+                assert_eq!(
+                    evaluate(&planner, &batch, again),
+                    expected,
+                    "{filter} optimized twice"
+                );
+            } else {
+                assert_eq!(again, plan, "optimizing {filter} again changed its plan");
+            }
+            checked += 1;
+        };
+
+        let reversed = |op: &'static str| match op {
+            "<" => ">",
+            "<=" => ">=",
+            ">" => "<",
+            ">=" => "<=",
+            op => op,
+        };
+        for &(precision, operand) in &operands {
+            let literal = sql_literal(precision, operand);
+            for op in ["=", "!=", "<", "<=", ">", ">="] {
+                check(format!("{column} {op} {literal}"), &|value| {
+                    compare3(op, value, operand)
+                });
+                check(format!("{literal} {} {column}", reversed(op)), &|value| {
+                    compare3(op, value, operand)
+                });
+                check(format!("NOT ({column} {op} {literal})"), &|value| {
+                    not3(compare3(op, value, operand))
+                });
+            }
+            for op in ["IS DISTINCT FROM", "IS NOT DISTINCT FROM"] {
+                check(format!("{column} {op} {literal}"), &|value| {
+                    compare3(op, value, operand)
+                });
+                check(format!("NOT ({column} {op} {literal})"), &|value| {
+                    not3(compare3(op, value, operand))
+                });
+            }
+        }
+        for &((low_precision, low), (high_precision, high)) in &pairs {
+            let low_sql = sql_literal(low_precision, low);
+            let high_sql = sql_literal(high_precision, high);
+            let between = |value| and3(compare3(">=", value, low), compare3("<=", value, high));
+            let within = |value| or3(compare3("=", value, low), compare3("=", value, high));
+            check(
+                format!("{column} BETWEEN {low_sql} AND {high_sql}"),
+                &between,
+            );
+            check(
+                format!("{column} NOT BETWEEN {low_sql} AND {high_sql}"),
+                &|value| not3(between(value)),
+            );
+            check(
+                format!("NOT ({column} BETWEEN {low_sql} AND {high_sql})"),
+                &|value| not3(between(value)),
+            );
+            check(format!("{column} IN ({low_sql}, {high_sql})"), &within);
+            check(
+                format!("{column} NOT IN ({low_sql}, {high_sql})"),
+                &|value| not3(within(value)),
+            );
+        }
+        assert!(checked > 500, "only {checked} filters were checked");
     }
 }
