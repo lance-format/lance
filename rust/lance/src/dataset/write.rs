@@ -1404,6 +1404,11 @@ pub(crate) async fn cleanup_data_fragments(
 /// must never take it. Explicit IDs are reserved before any automatic ID is
 /// chosen, which keeps the result independent of the order the caller lists
 /// the bases in. Existing manifest bindings are reserved for the same reason.
+///
+/// Automatic IDs start after the highest existing ID, or at 1 when there are
+/// no existing bases, so previously valid requests keep the IDs they received.
+/// That range skips explicit IDs; once it is exhausted, allocation falls back
+/// to the lowest free ID.
 fn assign_initial_base_ids(
     initial_bases: &mut [BasePath],
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
@@ -1433,14 +1438,43 @@ fn assign_initial_base_ids(
     }
 
     used_ids.extend(explicit_ids);
+    let mut next_above_max = existing_base_paths
+        .and_then(|bases| bases.keys().max().copied())
+        .map_or(Some(1), |max_id| max_id.checked_add(1));
     for base_path in initial_bases.iter_mut() {
-        if base_path.id == PRIMARY_BASE_ID {
-            let id = BasePath::unused_id(used_ids.iter().copied())?;
-            base_path.id = id;
-            used_ids.insert(id);
+        if base_path.id != PRIMARY_BASE_ID {
+            continue;
         }
+        let id = match next_above_max.and_then(|start| first_unused_at_or_above(start, &used_ids)) {
+            Some(id) => {
+                next_above_max = id.checked_add(1);
+                id
+            }
+            None => {
+                // No ID above the highest existing one remains, so the free
+                // IDs can only be below that range.
+                next_above_max = None;
+                BasePath::unused_id(used_ids.iter().copied())?
+            }
+        };
+        base_path.id = id;
+        used_ids.insert(id);
     }
     Ok(())
+}
+
+/// Find the first ID at or above `start` that is not in `used_ids`.
+///
+/// Returns `None` when every ID from `start` through `u32::MAX` is used.
+fn first_unused_at_or_above(start: u32, used_ids: &BTreeSet<u32>) -> Option<u32> {
+    let mut candidate = start;
+    for &used_id in used_ids.range(start..) {
+        if used_id != candidate {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
+    Some(candidate)
 }
 
 pub async fn validate_and_resolve_target_bases(
