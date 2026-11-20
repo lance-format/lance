@@ -13,6 +13,7 @@ use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrowPrimitiveType, RecordBatch, UInt32Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::RecordBatchExt;
+use lance_arrow::list::ListArrayExt;
 use num_traits::Float;
 
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
@@ -286,7 +287,7 @@ impl Transformer for Flatten {
             DataType::FixedSizeList(_, _) => Ok(batch.clone()),
             DataType::List(_) => {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let vectors = arr.as_list::<i32>();
+                let vectors = arr.as_list::<i32>().filter_garbage_nulls();
 
                 let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
                     |(row_id, multivector)| {
@@ -297,7 +298,7 @@ impl Transformer for Flatten {
                     },
                 );
                 let row_ids = UInt64Array::from_iter_values(row_ids);
-                let vectors = vectors.values().as_fixed_size_list().clone();
+                let vectors = vectors.trimmed_values().as_fixed_size_list().clone();
                 let schema = Arc::new(Schema::new(vec![
                     ROW_ID_FIELD.clone(),
                     Field::new(self.column.as_str(), vectors.data_type().clone(), true),
@@ -317,6 +318,57 @@ impl Transformer for Flatten {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::slice(false, 1, 1, vec![11])]
+    #[case::hidden_null_children(true, 0, 3, vec![10, 12])]
+    #[case::empty_slice(false, 1, 0, vec![])]
+    #[case::only_null_parent(true, 1, 1, vec![])]
+    fn flatten_visible_children(
+        #[case] hidden: bool,
+        #[case] offset: usize,
+        #[case] len: usize,
+        #[case] expected: Vec<u64>,
+    ) {
+        let values = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1., 2., 3., 4., 5., 6.]),
+            2,
+        )
+        .unwrap();
+        let lists = arrow_array::ListArray::new(
+            Arc::new(Field::new("item", values.data_type().clone(), true)),
+            arrow::buffer::OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+            Arc::new(values),
+            hidden.then(|| NullBuffer::from(vec![true, false, true])),
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from(vec![10, 11, 12])) as ArrayRef,
+            ),
+            ("v", Arc::new(lists) as ArrayRef),
+        ])
+        .unwrap()
+        .slice(offset, len);
+        let result = Flatten::new("v").transform(&batch).unwrap();
+        assert_eq!(
+            result[ROW_ID].as_primitive::<UInt64Type>(),
+            &UInt64Array::from(expected.clone())
+        );
+        let vectors = result["v"].as_fixed_size_list();
+        for (i, row_id) in expected.into_iter().enumerate() {
+            assert_eq!(
+                vectors
+                    .value(i)
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .as_ref(),
+                &[
+                    (row_id - 10) as f32 * 2. + 1.,
+                    (row_id - 10) as f32 * 2. + 2.
+                ]
+            );
+        }
+    }
     use super::*;
 
     use approx::assert_relative_eq;

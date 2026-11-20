@@ -612,20 +612,14 @@ impl ::prost::Name for RemoveFragment {
 ///
 /// Set (replace) a fragment's deletion file.
 ///
-/// Reference-stable: the fragment id is committed and physical row offsets are
-/// stable, so the post-image deletion file is safe to store. The newly-deleted
-/// rows (the delta used for rebase and conflict) are derived by diffing against
-/// the read-version deletion file and are not serialized here.
+/// For committed fragments, physical row offsets are stable, so the
+/// post-image deletion file is safe to store. The newly-deleted rows (the delta
+/// used for rebase and conflict) are derived by diffing against the read-version
+/// deletion file and are not serialized here.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetDeletionFile {
-    /// The fragment, by committed id: unlike the sibling fragment actions this
-    /// takes no Ref, because the deletion file's path embeds the fragment id
-    /// (`_deletions/{fragment_id}-{read_version}-{id}.{ext}`) and apply does no
-    /// IO, so it cannot rename the file once a minted id is known. Deleting from
-    /// a fragment minted in the same operation needs a ReserveFragmentIds commit
-    /// first.
-    #[prost(uint64, tag = "1")]
-    pub fragment: u64,
+    #[prost(message, optional, tag = "1")]
+    pub fragment: ::core::option::Option<Ref>,
     /// The deletion file. Its `base_id` must be unset; apply stamps it from `base`.
     #[prost(message, optional, tag = "2")]
     pub deletion_file: ::core::option::Option<crate::format::pb::DeletionFile>,

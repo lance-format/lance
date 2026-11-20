@@ -456,6 +456,78 @@ fn test_balanced_query_ranges(
     }
 }
 
+/// A cached state carries its quantizer from the moment it is exported or
+/// decoded, so the cache charges for it on admission and a later
+/// reconstruction neither rebuilds it nor grows the entry.
+#[tokio::test]
+async fn test_state_entry_carries_quantizer_before_admission() {
+    let (batch, schema) = make_seeded_vector_batch(PQ_MATRIX_NUM_ROWS);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+    ivf.max_iters = 2;
+    ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        ivf,
+        lightweight_pq_params_with_bits(8),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let uuid = dataset.load_indices_by_name("vector_idx").await.unwrap()[0].uuid;
+    let index = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+    let exported = index.to_state_entry();
+    let codec = lance_core::cache::CacheCodec::from_impl::<IvfStateEntryBox>();
+    let mut encoded = Vec::new();
+    codec
+        .serialize(
+            &(Arc::new(IvfStateEntryBox(exported.0.clone())) as lance_core::cache::CacheEntry),
+            &mut encoded,
+        )
+        .unwrap();
+    let decoded = codec
+        .deserialize(&bytes::Bytes::from(encoded))
+        .hit()
+        .unwrap()
+        .downcast::<IvfStateEntryBox>()
+        .unwrap();
+    for entry in [Arc::new(exported), decoded] {
+        // Without this the size check below would also hold for an entry that
+        // never got a quantizer.
+        assert!(entry.0.has_quantizer());
+        let charged = entry.deep_size_of();
+        entry
+            .0
+            .reconstruct(
+                dataset.object_store.clone(),
+                dataset.metadata_cache.as_ref(),
+                LanceCache::no_cache(),
+                None,
+                super::IvfOpenContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entry.deep_size_of(), charged);
+    }
+}
+
 #[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
@@ -4276,6 +4348,58 @@ async fn test_raw_index_commit_opens_legacy_v1_segments(
             "{err}"
         );
     }
+}
+
+/// A legacy IVF_HNSW_PQ segment has no incremental writer: optimize refuses
+/// it with an error naming the index type, and the retrain the error suggests
+/// rebuilds it as one current-format segment over every fragment.
+#[tokio::test]
+async fn test_optimize_legacy_v1_hnsw_pq_refuses_incremental_optimize_and_retrains() {
+    let dataset = write_legacy_v1_dataset("memory://").await;
+    let segment = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0, 1]).await;
+    let dataset = commit_raw_index_segments(&dataset, vec![("shared", segment)], vec![], false)
+        .await
+        .unwrap();
+    let appended = gen_batch()
+        .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_batch_rows(RowCount::from(64))
+        .unwrap();
+    let mut dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    let err = dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::NotSupported { .. }),
+        "expected NotSupported, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("IVF_HNSW_PQ") && err.to_string().contains("retrain"),
+        "{err}"
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::retrain())
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("shared").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert!(matches!(
+        index_file_version(&dataset, &segments[0]).await,
+        (0, 3) | (2, _)
+    ));
+    assert_eq!(
+        segments[0].fragment_bitmap.as_ref().unwrap(),
+        dataset.fragment_bitmap.as_ref()
+    );
 }
 
 #[tokio::test]

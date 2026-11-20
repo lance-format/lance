@@ -1094,6 +1094,47 @@ async fn test_strict_batch_size() {
     assert_eq!(batch_sizes, vec![10, 10, 1]);
 }
 
+/// `batch_size` caps the rows per batch when a filter is followed by a
+/// late-materialization take, which merges the small filtered batches
+#[rstest]
+#[tokio::test]
+async fn test_filtered_late_materialization_respects_batch_size(
+    #[values(7, 10, 20)] batch_size: usize,
+    #[values(MaterializationStyle::AllLate, MaterializationStyle::Heuristic)]
+    style: MaterializationStyle,
+) {
+    let dataset = lance_datagen::gen_batch()
+        .col("id", array::step::<Int64Type>())
+        .col("v", array::cycle::<Int64Type>(vec![0, 1, 2, 3, 4]))
+        .col("s", array::rand_utf8(ByteCount::from(32), false))
+        .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.batch_size(batch_size)
+        .project(&["s"])
+        .unwrap()
+        .filter("v = 2")
+        .unwrap()
+        .materialization_style(style);
+
+    let batches = scan
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+    assert_eq!(batch_sizes.iter().sum::<usize>(), 60);
+    assert!(
+        batch_sizes.iter().all(|&rows| rows <= batch_size),
+        "batch sizes {batch_sizes:?} exceed batch_size={batch_size}"
+    );
+}
+
 #[tokio::test]
 async fn test_column_not_exist() {
     let dataset = lance_datagen::gen_batch()

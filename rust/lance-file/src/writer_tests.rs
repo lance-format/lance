@@ -26,6 +26,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
+    use futures::TryStreamExt;
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
@@ -1003,6 +1004,91 @@ mod tests {
     }
 
     #[rstest]
+    #[case::mismatched_first(true)]
+    #[case::mismatched_unused(false)]
+    #[tokio::test]
+    async fn test_writer_checks_first_duplicate_column_type(
+        #[case] mismatched_first: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let expected =
+            arrow_array::record_batch!(("b", Int32, [7, 8]), ("a", Int32, [11, 12])).unwrap();
+        let schema = LanceSchema::try_from(expected.schema().as_ref()).unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![11, 12]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["first", "second"]));
+        let (first, second) = if mismatched_first {
+            (strings, values)
+        } else {
+            (values, strings)
+        };
+        let duplicate = RecordBatch::try_from_iter(vec![
+            ("a", first),
+            ("a", second),
+            ("b", expected["b"].clone()),
+        ])
+        .unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if mismatched_first {
+                let mismatch =
+                    field_type_mismatch(writer.write_batch(&duplicate).await.unwrap_err());
+                assert_eq!(mismatch.field_path, "a");
+                assert!(mismatch.to_string().contains("field `a` does not match"));
+                assert_eq!(mismatch.expected.data_type(), &DataType::Int32);
+                assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+                writer.write_batch(&expected).await.unwrap();
+            } else {
+                writer.write_batch(&duplicate).await.unwrap();
+            }
+        }
+        assert_eq!(writer.finish().await.unwrap().num_rows, 4);
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&expected.schema(), &batches).unwrap();
+        let expected =
+            arrow_select::concat::concat_batches(&expected.schema(), &[expected.clone(), expected])
+                .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_write_column_rejects_mismatched_type(
         #[values(
@@ -1193,6 +1279,183 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    fn packed_metadata() -> HashMap<String, String> {
+        HashMap::from([(PACKED_STRUCT_META_KEY.to_owned(), "true".to_owned())])
+    }
+
+    /// A packed `{a: Int32, <name>: child}` struct of three rows.
+    fn packed_struct_with_child(name: &str, child: ArrayRef) -> StructArray {
+        let fields = ArrowFields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new(name, child.data_type().clone(), true),
+        ]);
+        StructArray::new(
+            fields,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), child],
+            None,
+        )
+    }
+
+    fn int32_lists() -> ListArray {
+        ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![]),
+            Some(vec![Some(2), Some(3)]),
+        ])
+    }
+
+    async fn write_single_column(
+        fs: &FsFixture,
+        field: ArrowField,
+        column: ArrayRef,
+        version: ConcreteFileVersion,
+    ) -> lance_core::Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await?,
+            LanceSchema::try_from(schema.as_ref())?,
+            version,
+            FileWriterOptions::default(),
+        )?;
+        writer.write_batch(&batch).await?;
+        writer.finish().await?;
+        Ok(())
+    }
+
+    /// Packed structs are encoded as one primitive column, so a list-like
+    /// child, even inside a nested struct, is rejected with an error naming the
+    /// child instead of panicking while the column is converted to a data block.
+    #[rstest]
+    #[case::list("l", "List", false)]
+    #[case::large_list("l", "LargeList", false)]
+    #[case::map("m", "Map", false)]
+    #[case::nested_struct("inner.l", "List", false)]
+    #[case::packed_struct_in_list("l", "List", true)]
+    #[tokio::test]
+    async fn test_writer_rejects_packed_struct_with_list_child(
+        #[case] child_path: &str,
+        #[case] child_type: &str,
+        #[case] in_list: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        use arrow_array::LargeListArray;
+        use arrow_array::builder::MapBuilder;
+
+        let child: ArrayRef = match (child_path, child_type) {
+            (_, "LargeList") => Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(1)]), Some(vec![]), Some(vec![Some(2)])],
+            )),
+            (_, "Map") => {
+                let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+                for i in 0..3 {
+                    builder.keys().append_value(i);
+                    builder.values().append_value(i * 10);
+                    builder.append(true).unwrap();
+                }
+                Arc::new(builder.finish())
+            }
+            ("inner.l", _) => {
+                let lists: ArrayRef = Arc::new(int32_lists());
+                Arc::new(StructArray::new(
+                    ArrowFields::from(vec![
+                        ArrowField::new("b", DataType::Int32, true),
+                        ArrowField::new("l", lists.data_type().clone(), true),
+                    ]),
+                    vec![Arc::new(Int32Array::from(vec![4, 5, 6])), lists],
+                    None,
+                ))
+            }
+            _ => Arc::new(int32_lists()),
+        };
+        let top_name = child_path.split('.').next().unwrap();
+        let packed = packed_struct_with_child(top_name, child);
+        let packed_name = if in_list { "item" } else { "s" };
+        let packed_field = ArrowField::new(packed_name, packed.data_type().clone(), true)
+            .with_metadata(packed_metadata());
+        let (field, column): (ArrowField, ArrayRef) = if in_list {
+            let list = ListArray::new(
+                Arc::new(packed_field),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 3])),
+                Arc::new(packed),
+                None,
+            );
+            (
+                ArrowField::new("s", list.data_type().clone(), true),
+                Arc::new(list),
+            )
+        } else {
+            (packed_field, Arc::new(packed))
+        };
+
+        let fs = FsFixture::default();
+        let error = write_single_column(&fs, field, column, version)
+            .await
+            .expect_err("a packed struct with a list-like child was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Packed struct field '{packed_name}'")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("child '{child_path}' of type {child_type}(")),
+            "{message}"
+        );
+    }
+
+    /// Packed structs whose children are values still round-trip: fixed-width
+    /// children on every version and variable-width children from 2.2 on.
+    #[rstest]
+    #[case::fixed_v2_0(ConcreteFileVersion::V2_0, false)]
+    #[case::fixed_v2_1(ConcreteFileVersion::V2_1, false)]
+    #[case::fixed_v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::fixed_v2_3(ConcreteFileVersion::V2_3, false)]
+    #[case::variable_v2_2(ConcreteFileVersion::V2_2, true)]
+    #[case::variable_v2_3(ConcreteFileVersion::V2_3, true)]
+    #[tokio::test]
+    async fn test_packed_struct_with_value_children_round_trips(
+        #[case] version: ConcreteFileVersion,
+        #[case] variable: bool,
+    ) {
+        let child: ArrayRef = if variable {
+            Arc::new(StringArray::from(vec!["x", "", "yz"]))
+        } else {
+            Arc::new(arrow_array::Float64Array::from(vec![0.5, 1.5, 2.5]))
+        };
+        let packed = packed_struct_with_child("c", child);
+        let field =
+            ArrowField::new("s", packed.data_type().clone(), true).with_metadata(packed_metadata());
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let expected = RecordBatch::try_new(schema.clone(), vec![Arc::new(packed)]).unwrap();
+
+        let fs = FsFixture::default();
+        crate::testing::write_lance_file(
+            arrow_array::RecordBatchIterator::new(vec![Ok(expected.clone())], schema.clone()),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let output = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let actual = arrow_select::concat::concat_batches(&schema, &output).unwrap();
+        assert_eq!(actual.column(0), expected.column(0));
     }
 
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
@@ -3165,5 +3428,93 @@ mod tests {
         )
         .await;
         assert_eq!(read.to_data(), array.to_data());
+    }
+    #[rstest]
+    #[case::mixed(false)]
+    #[case::all_null(true)]
+    #[tokio::test]
+    async fn test_write_fixed_size_list_masked_struct_nulls(
+        #[case] all_null: bool,
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(false, true)] sliced: bool,
+        #[values(false, true)] column_write: bool,
+    ) {
+        let valid = if all_null {
+            vec![false; 4]
+        } else {
+            vec![true, false, true, false]
+        };
+        let child_valid: Vec<bool> = valid.iter().flat_map(|valid| [*valid; 2]).collect();
+        let values = Int32Array::from(
+            child_valid
+                .iter()
+                .enumerate()
+                .map(|(i, valid)| valid.then_some(i as i32))
+                .collect::<Vec<_>>(),
+        );
+        let entries = Arc::new(StructArray::new(
+            vec![ArrowField::new("value", DataType::Int32, false)].into(),
+            vec![Arc::new(values)],
+            Some(NullBuffer::from(child_valid)),
+        ));
+        let lists = FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", entries.data_type().clone(), false)),
+            2,
+            entries,
+            Some(NullBuffer::from(valid)),
+        )
+        .unwrap();
+        let lists = if sliced { lists.slice(1, 2) } else { lists };
+        let batch =
+            RecordBatch::try_from_iter(vec![("lists", Arc::new(lists) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(batch.schema().as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        if column_write {
+            writer
+                .write_column(0, batch["lists"].clone())
+                .await
+                .unwrap();
+        } else {
+            writer.write_batch(&batch).await.unwrap();
+        }
+        assert_eq!(
+            writer.finish().await.unwrap().num_rows,
+            batch.num_rows() as u64
+        );
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, batch);
     }
 }

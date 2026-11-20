@@ -47,9 +47,10 @@ pub struct OptimizeOptions {
     ///
     /// This is useful when the data distribution has changed significantly,
     /// and we want to retrain the index to improve the search quality.
-    /// This would be faster than re-create the index from scratch.
+    /// The index is rebuilt from the source data.
     ///
-    /// NOTE: this option is only supported for v3 vector indices.
+    /// NOTE: only vector indices are retrained; scalar and full-text search
+    /// indices are not.
     pub retrain: bool,
 
     /// Transaction properties to store with this commit.
