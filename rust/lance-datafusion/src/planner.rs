@@ -1210,7 +1210,7 @@ impl Planner {
     /// Note: the returned expression must be passed through `optimize_expr()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
-        let schema = Schema::try_from(self.schema.as_ref())?;
+        let schema = Schema::try_from_arrow_without_primary_key_validation(self.schema.as_ref())?;
         self.parse_filter_with_schema(filter, &schema)
     }
 
@@ -1275,7 +1275,7 @@ impl Planner {
         // Parse as SQL expression
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
-        let schema = Schema::try_from(self.schema.as_ref())?;
+        let schema = Schema::try_from_arrow_without_primary_key_validation(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema)?;
         Ok(resolved)
     }
@@ -1469,6 +1469,7 @@ mod tests {
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
+    use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
     use rstest::rstest;
 
     /// Literal spellings the planner has no mapping for, such as placeholders
@@ -2283,6 +2284,29 @@ mod tests {
         assert_eq!(
             predicates.into_array(batch.num_rows()).unwrap().as_ref(),
             &BooleanArray::from(vec![Some(true), Some(false), None, None])
+        );
+    }
+
+    #[rstest]
+    #[case::nullable_key(true, false)]
+    #[case::nullable_ancestor(false, true)]
+    fn test_plan_expression_with_nullable_primary_key(
+        #[case] is_key_nullable: bool,
+        #[case] is_ancestor_nullable: bool,
+    ) {
+        let key = Field::new("id", DataType::Utf8, is_key_nullable)
+            .with_metadata([(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())].into());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(Fields::from(vec![key])),
+            is_ancestor_nullable,
+        )]));
+        let planner = Planner::new(schema);
+        let key_expr = get_field(col("info"), "id");
+        assert_eq!(planner.parse_expr("info.id").unwrap(), key_expr);
+        assert_eq!(
+            planner.parse_filter("info.id = 'a'").unwrap(),
+            key_expr.eq(lit("a"))
         );
     }
 

@@ -2768,42 +2768,63 @@ async fn test_indexed_merge_insert_overlaid_keys(
     }
 }
 
-/// A conditional update on an indexed, non-nullable primary key used to fail
-/// with "Primary key column and all its ancestors must not be nullable".
+/// Outer-join nullability in the condition schema must not trigger primary-key
+/// validation, including when the primary key is nested.
 /// <https://github.com/lance-format/lance/issues/11211>
+/// <https://github.com/lance-format/lance/issues/11279>
+#[rstest::rstest]
+#[case::flat(false)]
+#[case::nested(true)]
 #[tokio::test]
-async fn test_indexed_merge_insert_update_if_primary_key() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false).with_metadata(
-            [(
-                lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
-                "true".to_string(),
-            )]
-            .into(),
-        ),
-        Field::new("ts", DataType::Int64, false),
-    ]));
-    let batch = |ids: &[&str], ts: i64| {
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids.to_vec())),
-                Arc::new(Int64Array::from(vec![ts; ids.len()])),
-            ],
-        )
-        .unwrap()
+async fn test_indexed_merge_insert_update_if_primary_key(#[case] is_nested: bool) {
+    let id_field = Field::new("id", DataType::Utf8, false).with_metadata(
+        [(
+            lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+            "true".to_string(),
+        )]
+        .into(),
+    );
+    let info_fields = arrow_schema::Fields::from(vec![id_field.clone()]);
+    // The nested case joins on a separate top-level column; nested join keys
+    // are not supported by merge_insert.
+    let join_key = if is_nested { "key" } else { "id" };
+    let mut fields = if is_nested {
+        vec![
+            Field::new(join_key, DataType::Utf8, false),
+            Field::new("info", DataType::Struct(info_fields.clone()), false),
+        ]
+    } else {
+        vec![id_field]
+    };
+    fields.push(Field::new("ts", DataType::Int64, false));
+    let schema = Arc::new(Schema::new(fields));
+    let batch = |ids: &[&str], timestamps: &[i64]| {
+        let ids = Arc::new(StringArray::from(ids.to_vec()));
+        let mut columns: Vec<ArrayRef> = vec![ids.clone()];
+        if is_nested {
+            columns.push(Arc::new(StructArray::new(
+                info_fields.clone(),
+                vec![ids],
+                None,
+            )));
+        }
+        columns.push(Arc::new(Int64Array::from(timestamps.to_vec())));
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
     };
 
-    let test_dir = TempStrDir::default();
     let mut ds = Dataset::write(
-        RecordBatchIterator::new([Ok(batch(&["a", "b"], 1))], schema.clone()),
-        &test_dir,
-        None,
+        RecordBatchIterator::new([Ok(batch(&["a", "b", "d"], &[1, 1, 1]))], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
+    assert_eq!(ds.get_fragments().len(), 3);
     ds.create_index(
-        &["id"],
+        &[join_key],
         IndexType::BTree,
         None,
         &ScalarIndexParams::default(),
@@ -2813,19 +2834,31 @@ async fn test_indexed_merge_insert_update_if_primary_key() {
     .unwrap();
     let ds = Arc::new(ds);
 
-    let (ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["id".to_string()])
+    let (ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec![join_key.to_string()])
         .unwrap()
         .when_matched(WhenMatched::update_if(&ds, "target.ts <= source.ts").unwrap())
         .when_not_matched(WhenNotMatched::InsertAll)
         .try_build()
         .unwrap()
         .execute_reader(Box::new(RecordBatchIterator::new(
-            [Ok(batch(&["b", "c"], 2))],
+            [Ok(batch(&["b", "c", "d"], &[2, 2, 0]))],
             schema.clone(),
         )))
         .await
         .unwrap();
     assert_eq!(stats.num_inserted_rows, 1);
     assert_eq!(stats.num_updated_rows, 1);
-    assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+    let actual = ds
+        .scan()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            join_key.to_string(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected = batch(&["a", "b", "c", "d"], &[1, 2, 2, 1]);
+    assert_eq!(actual.columns(), expected.columns());
+    ds.schema().verify_primary_key().unwrap();
+    assert_eq!(ds.schema().unenforced_primary_key().len(), 1);
 }

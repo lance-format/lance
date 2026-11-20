@@ -142,6 +142,41 @@ pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataTyp
 pub const NEW_TABLE_FIELD_ID_LIMIT: i32 = 1 << 30;
 
 impl Schema {
+    /// Convert an Arrow schema without checking primary-key constraints.
+    ///
+    /// This is intended for derived query schemas, where a primary-key field or
+    /// its ancestors may become nullable (for example, after an outer join).
+    /// Field IDs are assigned, metadata is preserved, and structural schema
+    /// validation still runs. Use [`Self::try_from`] for dataset schemas, which
+    /// must also satisfy [`Self::verify_primary_key`].
+    ///
+    /// ```
+    /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, Schema};
+    ///
+    /// let arrow = ArrowSchema::new(vec![
+    ///     Field::new("id", DataType::Utf8, true).with_metadata(
+    ///         [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())].into(),
+    ///     ),
+    /// ]);
+    /// let schema = Schema::try_from_arrow_without_primary_key_validation(&arrow).unwrap();
+    /// assert!(schema.field("id").unwrap().nullable);
+    /// assert!(schema.verify_primary_key().is_err());
+    /// ```
+    pub fn try_from_arrow_without_primary_key_validation(schema: &ArrowSchema) -> Result<Self> {
+        let mut schema = Self {
+            fields: schema
+                .fields
+                .iter()
+                .map(|f| Field::try_from(f.as_ref()))
+                .collect::<Result<_>>()?,
+            metadata: schema.metadata.clone(),
+        };
+        schema.try_set_field_id(None)?;
+        schema.validate()?;
+        Ok(schema)
+    }
+
     /// The unenforced primary key fields in the schema, ordered by position.
     ///
     /// Fields with explicit positions (1, 2, 3, ...) are ordered by their position value.
@@ -1122,19 +1157,8 @@ impl TryFrom<&ArrowSchema> for Schema {
     type Error = Error;
 
     fn try_from(schema: &ArrowSchema) -> Result<Self> {
-        let mut schema = Self {
-            fields: schema
-                .fields
-                .iter()
-                .map(|f| Field::try_from(f.as_ref()))
-                .collect::<Result<_>>()?,
-            metadata: schema.metadata.clone(),
-        };
-        schema.try_set_field_id(None)?;
-        schema.validate()?;
-
+        let schema = Self::try_from_arrow_without_primary_key_validation(schema)?;
         schema.verify_primary_key()?;
-
         Ok(schema)
     }
 }
@@ -3460,14 +3484,14 @@ mod tests {
         ];
 
         for (idx, case) in cases.into_iter().enumerate() {
-            let result = Schema::try_from(&case);
-            assert!(result.is_err());
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains(error_message_contains[idx])
-            );
+            let error = Schema::try_from(&case).unwrap_err();
+            assert!(matches!(error, Error::Schema { .. }));
+            assert!(error.to_string().contains(error_message_contains[idx]));
+
+            let schema = Schema::try_from_arrow_without_primary_key_validation(&case).unwrap();
+            let error = schema.verify_primary_key().unwrap_err();
+            assert!(matches!(error, Error::Schema { .. }));
+            assert!(error.to_string().contains(error_message_contains[idx]));
         }
     }
 
