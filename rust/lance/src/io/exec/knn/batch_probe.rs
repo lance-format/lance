@@ -30,7 +30,12 @@
 //! A scorer whose results depend on the rows already in a query's top-k, as
 //! multi-bit RQ's does, gets a different late search: each query searches its
 //! late range the way the single-query path does, sharing one top-k heap across
-//! its partitions (see [`late_scores_depend_on_heap`]).
+//! its partitions (see [`late_scores_depend_on_heap`]). The shared late search
+//! can't serve such a scorer, even by seeding each virtual query with its
+//! query's top-k: a round scores all of a query's wave partitions at once, one
+//! virtual query each, so a partition can't see the rows of the earlier
+//! partitions in the same wave, which the single-query path's heap already
+//! holds when it scores that partition.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1142,26 +1147,71 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_late_search_does_not_count_unowned_rows() {
-        let pre_filter = empty_prefilter().await;
-        let (mut first, _) = delta(vec![vec![], vec![10], vec![11]], 1, pre_filter.clone());
-        first.seg_mask = Some(Arc::new(RowAddrMask::from_allowed(
-            [12_u64].into_iter().collect::<RowAddrTreeMap>(),
-        )));
-        let (second, _) = delta(vec![vec![], vec![20], vec![21]], 1, pre_filter.clone());
-        let mut candidates = vec![TopHits::new(1)];
-        late_search(
-            &[first, second],
+    /// Run the late search of every query, through [`late_search`] or, when
+    /// `sequential`, straight through [`sequential_late_search`], which
+    /// `late_search` only picks for a scorer the mock index is not.
+    async fn run_late_search(
+        sequential: bool,
+        deltas: &[BatchDelta],
+        k: usize,
+        pre_filter: Arc<DatasetPreFilter>,
+        candidates: &mut [TopHits],
+    ) {
+        let metrics = prepared_metrics();
+        if !sequential {
+            late_search(deltas, 1, k, pre_filter, candidates, metrics.as_ref())
+                .await
+                .unwrap();
+            return;
+        }
+        pre_filter.wait_for_ready().await.unwrap();
+        let budget = LateSearchBudget::new(&pre_filter.mask(), k).stop_at();
+        let mut found: Vec<usize> = candidates.iter().map(|hits| k - hits.missing()).collect();
+        let is_active: Vec<bool> = found.iter().map(|&found| found < budget).collect();
+        sequential_late_search(
+            deltas,
             1,
-            1,
-            pre_filter,
-            &mut candidates,
-            prepared_metrics().as_ref(),
+            budget,
+            &mut found,
+            &is_active,
+            candidates,
+            metrics.as_ref(),
         )
         .await
         .unwrap();
-        assert_eq!(sorted_hits(&candidates[0]), vec![(1.0, 20)]);
+    }
+
+    /// Rows a restricted delta returns but its segment does not own count
+    /// toward no query's budget, so the search goes on to the next delta, while
+    /// rows the segment owns do count. The shared search takes the deltas'
+    /// partitions round-robin and the sequential search one delta after
+    /// another, so they stop at different partitions.
+    #[rstest]
+    #[case::shared_unowned(false, 12, vec![(1.0, 20)], vec![1], vec![1])]
+    #[case::shared_owned(false, 11, vec![(1.0, 20)], vec![1], vec![1])]
+    #[case::sequential_unowned(true, 12, vec![(1.0, 20)], vec![1, 2], vec![1])]
+    #[case::sequential_owned(true, 11, vec![(2.0, 11)], vec![1, 2], vec![])]
+    #[tokio::test]
+    async fn test_late_search_does_not_count_unowned_rows(
+        #[case] sequential: bool,
+        #[case] owned_row: u64,
+        #[case] expected_hits: Vec<(f32, u64)>,
+        #[case] expected_first_searched: Vec<usize>,
+        #[case] expected_second_searched: Vec<usize>,
+    ) {
+        let pre_filter = empty_prefilter().await;
+        let (mut first, first_searched) =
+            delta(vec![vec![], vec![10], vec![11]], 1, pre_filter.clone());
+        first.seg_mask = Some(Arc::new(RowAddrMask::from_allowed(
+            [owned_row].into_iter().collect::<RowAddrTreeMap>(),
+        )));
+        let (second, second_searched) =
+            delta(vec![vec![], vec![20], vec![21]], 1, pre_filter.clone());
+        let mut candidates = vec![TopHits::new(1)];
+        run_late_search(sequential, &[first, second], 1, pre_filter, &mut candidates).await;
+        assert_eq!(sorted_hits(&candidates[0]), expected_hits);
+        assert_eq!(*first_searched.lock().unwrap(), expected_first_searched);
+        assert_eq!(*second_searched.lock().unwrap(), expected_second_searched);
     }
 
     #[rstest]
@@ -1205,22 +1255,14 @@ mod tests {
         assert!(second_searched.lock().unwrap().is_empty());
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_late_search_skips_empty_ownership() {
+    async fn test_late_search_skips_empty_ownership(#[values(false, true)] sequential: bool) {
         let pre_filter = empty_prefilter().await;
         let (mut delta, searched) = delta(vec![vec![], vec![10]], 1, pre_filter.clone());
         delta.seg_mask = Some(Arc::new(RowAddrMask::allow_nothing()));
         let mut candidates = vec![TopHits::new(1)];
-        late_search(
-            &[delta],
-            1,
-            1,
-            pre_filter,
-            &mut candidates,
-            prepared_metrics().as_ref(),
-        )
-        .await
-        .unwrap();
+        run_late_search(sequential, &[delta], 1, pre_filter, &mut candidates).await;
         assert!(searched.lock().unwrap().is_empty());
         assert!(candidates[0].iter().next().is_none());
     }

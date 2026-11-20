@@ -319,7 +319,7 @@ async fn test_batch_knn_adaptive_distance_range_matches_single(
 #[rstest]
 #[tokio::test]
 async fn test_batch_knn_search_effort_matches_single(
-    #[values("IVF_FLAT", "IVF_PQ", "IVF_SQ")] index_type: &str,
+    #[values("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_RQ")] index_type: &str,
     #[values(0.0, 0.25, 0.75, 1.0)] effort: f64,
     #[values(None, Some("i % 97 = 0"))] filter: Option<&str>,
 ) {
