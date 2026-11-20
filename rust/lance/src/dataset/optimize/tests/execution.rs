@@ -357,12 +357,16 @@ async fn test_compact_many(
         .collect::<Vec<_>>();
     assert_eq!(fragment_ids, vec![3, 7, 8]);
 }
-/// Ten 100-row fragments plus a persisted `lance.layout.*` row target.
+/// Ten 100-row fragments plus the requested manifest config.
 ///
 /// `compact_files` takes already resolved options, so the config-aware entry
 /// point is [`CompactionOptions::from_dataset_config`], which is what the Python
 /// and Java wrappers call before `compact_files`.
-async fn dataset_with_persisted_layout(test_uri: &str, target_rows_per_fragment: &str) -> Dataset {
+async fn dataset_with_persisted_layout(
+    test_uri: &str,
+    target_rows_per_fragment: &str,
+    extra_config: &[(&str, &str)],
+) -> Dataset {
     let data = sample_data();
     let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1000))], data.schema());
     let mut dataset = Dataset::write(
@@ -377,59 +381,93 @@ async fn dataset_with_persisted_layout(test_uri: &str, target_rows_per_fragment:
     .unwrap();
     assert_eq!(dataset.get_fragments().len(), 10);
 
-    dataset
-        .update_config([(
-            "lance.layout.target_rows_per_fragment",
-            target_rows_per_fragment,
-        )])
-        .await
-        .unwrap();
+    let mut config = vec![(
+        "lance.layout.target_rows_per_fragment".to_string(),
+        target_rows_per_fragment.to_string(),
+    )];
+    config.extend(
+        extra_config
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+    );
+    dataset.update_config(config).await.unwrap();
     dataset
 }
 
+#[derive(Debug)]
+struct LayoutCompactionCase {
+    /// Manifest config written after the shared layout row target.
+    extra_config: &'static [(&'static str, &'static str)],
+    /// Replace the loaded row target with the option default after loading.
+    explicit_default: bool,
+    /// The row target `from_dataset_config` resolves from the manifest alone.
+    expected_loaded_target: usize,
+    /// Sorted physical row counts of the fragments compaction produces.
+    expected_fragments: &'static [usize],
+}
+
+/// The three ways the row target of a real compaction can be decided: the
+/// shared layout key, the compaction-specific key over it, and a caller's
+/// explicit value (here the option default) over both.
+#[rstest]
+#[case::shared_layout_target(LayoutCompactionCase {
+    extra_config: &[],
+    explicit_default: false,
+    expected_loaded_target: 250,
+    expected_fragments: &[300, 300, 400],
+})]
+#[case::legacy_key_wins_over_layout(LayoutCompactionCase {
+    extra_config: &[("lance.compaction.target_rows_per_fragment", "500")],
+    explicit_default: false,
+    expected_loaded_target: 500,
+    expected_fragments: &[500, 500],
+})]
+#[case::explicit_default_wins_over_both(LayoutCompactionCase {
+    extra_config: &[("lance.compaction.target_rows_per_fragment", "500")],
+    explicit_default: true,
+    expected_loaded_target: 500,
+    expected_fragments: &[1000],
+})]
 #[tokio::test]
-async fn test_compact_files_applies_layout_config_from_manifest() {
-    let layout_dir = TempStrDir::default();
-    let mut layout_dataset = dataset_with_persisted_layout(&layout_dir, "250").await;
+async fn test_compact_files_applies_layout_config_from_manifest(
+    #[case] case: LayoutCompactionCase,
+) {
+    let test_dir = TempStrDir::default();
+    let mut dataset = dataset_with_persisted_layout(&test_dir, "250", case.extra_config).await;
 
-    let layout_options = CompactionOptions::from_dataset_config(layout_dataset.config()).unwrap();
-    assert_eq!(layout_options.target_rows_per_fragment, 250);
-    compact_files(&mut layout_dataset, layout_options, None)
-        .await
-        .unwrap();
+    let mut options = CompactionOptions::from_dataset_config(dataset.config()).unwrap();
+    assert_eq!(
+        options.target_rows_per_fragment,
+        case.expected_loaded_target
+    );
+    if case.explicit_default {
+        options.target_rows_per_fragment = CompactionOptions::default().target_rows_per_fragment;
+    }
 
-    let mut layout_rows = layout_dataset
+    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    // A no-op leaves all ten source fragments in place and reports none removed.
+    assert_eq!(metrics.fragments_removed, 10, "{:?}", case);
+    assert_eq!(
+        metrics.fragments_added,
+        case.expected_fragments.len(),
+        "{:?}",
+        case
+    );
+
+    let mut rows = dataset
         .get_fragments()
         .iter()
         .map(|fragment| fragment.metadata.physical_rows.unwrap())
         .collect::<Vec<_>>();
-    layout_rows.sort_unstable();
-    // The 250-row target splits the rewrite instead of merging the whole table
-    // into one fragment.
-    assert!(layout_rows.len() > 1, "got {layout_rows:?}");
-    assert_eq!(layout_rows.iter().sum::<usize>(), 1000);
-    assert!(layout_rows.iter().all(|rows| *rows < 1000));
-
-    // A caller that applies its own option after loading the config wins, and
-    // an explicit value equal to the default is still an explicit choice.
-    let default_dir = TempStrDir::default();
-    let mut default_dataset = dataset_with_persisted_layout(&default_dir, "250").await;
-    let mut default_options =
-        CompactionOptions::from_dataset_config(default_dataset.config()).unwrap();
-    default_options.target_rows_per_fragment =
-        CompactionOptions::default().target_rows_per_fragment;
-    compact_files(&mut default_dataset, default_options, None)
-        .await
-        .unwrap();
-
-    assert_eq!(default_dataset.get_fragments().len(), 1);
-    assert_eq!(default_dataset.count_rows(None).await.unwrap(), 1000);
+    rows.sort_unstable();
+    assert_eq!(rows, case.expected_fragments, "{:?}", case);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1000);
 }
 
 #[tokio::test]
 async fn test_invalid_layout_config_fails_config_aware_compaction_without_a_new_version() {
     let test_dir = TempStrDir::default();
-    let mut dataset = dataset_with_persisted_layout(&test_dir, "0").await;
+    let mut dataset = dataset_with_persisted_layout(&test_dir, "0", &[]).await;
     let version = dataset.manifest.version;
 
     let error = CompactionOptions::from_dataset_config(dataset.config()).unwrap_err();

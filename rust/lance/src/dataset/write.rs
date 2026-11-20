@@ -624,13 +624,14 @@ pub struct WriteParams {
     /// this write only and the persisted config is left alone.
     ///
     /// The lowest tier exists because `max_rows_per_file` and
-    /// `max_bytes_per_file` are plain integers: a caller that leaves them alone
-    /// and one that sets them to their default are indistinguishable, and the
-    /// Python and Java bridges always pass both. This prototype therefore treats
-    /// those fields as defaults and keeps per-write control in this field.
-    /// Recognizing a non-default legacy value as an explicit choice, or making
-    /// the legacy fields optional, would change the public contract and is left
-    /// to upstream discussion.
+    /// `max_bytes_per_file` are plain integers, so a caller that leaves them alone
+    /// and one that sets them to their default are indistinguishable. The wrappers
+    /// do not preserve presence either: the Python writer fills both from its own
+    /// defaults, and the Java bridge passes JNI values as concrete numbers. This
+    /// prototype therefore treats those fields as defaults and keeps per-write
+    /// control in this field. Recognizing a non-default legacy value as an
+    /// explicit choice, or making the legacy fields optional, would change the
+    /// public contract and is left to upstream discussion.
     pub layout: TableLayoutConfig,
 
     /// Write mode
