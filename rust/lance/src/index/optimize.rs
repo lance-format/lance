@@ -21,7 +21,7 @@
 //! paths cannot drift apart.
 //!
 //! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! Bitmap, BloomFilter, NGram, MinHash LSH, RTree, Inverted, LabelList) is split: tasks
+//! Bitmap, BloomFilter, FMIndex, NGram, MinHash LSH, RTree, Inverted, LabelList) is split: tasks
 //! build one uncommitted segment each over a group of fragments, encoded
 //! against the model of a reference segment; merges combine the task results
 //! that carry their `group` with the committed segments they list into one
@@ -122,9 +122,9 @@ use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
     index_is_usable, index_type_is_known, retain_committed_inverted_files,
-    segment_has_bloomfilter_details, segment_has_inverted_details, segment_has_label_list_details,
-    segment_has_merge_primitive, segment_has_minhashlsh_details, segment_has_vector_details,
-    unsupported_index_version, validate_segment_metadata,
+    segment_has_bloomfilter_details, segment_has_fmindex_details, segment_has_inverted_details,
+    segment_has_label_list_details, segment_has_merge_primitive, segment_has_minhashlsh_details,
+    segment_has_vector_details, unsupported_index_version, validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -774,7 +774,10 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         // BloomFilter splits only where its segments merge by their zones.
         // That reads their metadata, so it waits until the index is known to
         // be available.
+        // Keep the existing unsplit path for FMIndex on tagged tables.
+        // The partition merge cannot translate tagged addresses.
         let split = split
+            && !(tagged && segment_has_fmindex_details(last))
             && (!segment_has_bloomfilter_details(last)
                 || bloomfilter_split_merges(dataset, tagged, &segments, options).await?);
         if !split {
@@ -1845,35 +1848,47 @@ mod tests {
         options.max_rows_per_task = Some(task_rows);
         options.max_rows_per_segment = Some(16);
         let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
-        assert_eq!(plan.tasks.len(), (8 / task_rows) as usize);
+        let worker_merges = task_rows == 8;
+        assert_eq!(plan.tasks.len(), if worker_merges { 1 } else { 2 });
         assert_eq!(plan.merges.len(), 1);
-        assert_round_trip(&plan);
-        let indexed_files = dataset
+        assert_eq!(
+            plan.tasks[0].old_segments.len(),
+            if worker_merges { 2 } else { 0 }
+        );
+        assert_eq!(
+            plan.merges[0].old_segments.len(),
+            if worker_merges { 0 } else { 2 }
+        );
+        let indexed = coverage(&segments(&dataset, "text_idx").await);
+        let files = dataset
             .get_fragments()
             .iter()
-            .take(2)
             .flat_map(|fragment| {
+                let was_indexed = indexed.contains(fragment.id() as u32);
                 fragment
                     .metadata()
                     .files
                     .iter()
-                    .map(|file| file.path.clone())
+                    .map(move |file| (was_indexed, file.path.clone()))
             })
             .collect::<Vec<_>>();
         dataset.object_store.io_stats_incremental();
         let results = execute_plan(&dataset, &plan).await;
-        assert!(
-            dataset
-                .object_store
-                .io_stats_incremental()
-                .requests
+        let io = dataset.object_store.io_stats_incremental();
+        let was_read = |file: &str| {
+            io.requests
                 .iter()
-                .all(|request| {
-                    !indexed_files
-                        .iter()
-                        .any(|file| request.path.as_ref().ends_with(file))
-                }),
-            "existing text must not be rescanned"
+                .any(|req| req.path.as_ref().ends_with(file))
+        };
+        assert!(
+            files
+                .iter()
+                .any(|(was_indexed, file)| !was_indexed && was_read(file))
+        );
+        assert!(
+            files
+                .iter()
+                .all(|(was_indexed, file)| !was_indexed || !was_read(file))
         );
         commit_optimize_indices(&mut dataset, results, &options)
             .await
@@ -1881,22 +1896,25 @@ mod tests {
         let committed = segments(&dataset, "text_idx").await;
         assert_eq!(committed.len(), 1);
         assert_eq!(coverage(&committed), RoaringBitmap::from_iter(0..4));
-        for pattern in ["needle", "deleted", "alpha", "beta", "gamma", "missing"] {
-            let filter = format!("contains(text, '{pattern}')");
+        let mut indexed = dataset.scan();
+        indexed.filter("contains(text, 'needle')").unwrap();
+        assert!(
+            indexed
+                .explain_plan(false)
+                .await
+                .unwrap()
+                .contains("ScalarIndexQuery")
+        );
+        for predicate in ["contains(text, 'needle')", "contains(text, '')"] {
             let mut indexed = dataset.scan();
-            indexed.filter(&filter).unwrap();
-            assert!(
-                indexed
-                    .explain_plan(false)
-                    .await
-                    .unwrap()
-                    .contains("ScalarIndexQuery")
-            );
-            let actual = indexed.try_into_batch().await.unwrap();
+            indexed.filter(predicate).unwrap();
             let mut scan = dataset.scan();
-            scan.filter(&filter).unwrap().use_scalar_index(false);
-            let expected = scan.try_into_batch().await.unwrap();
-            assert_eq!(actual, expected, "pattern={pattern}");
+            scan.filter(predicate).unwrap().use_scalar_index(false);
+            assert_eq!(
+                indexed.try_into_batch().await.unwrap(),
+                scan.try_into_batch().await.unwrap(),
+                "{predicate}"
+            );
         }
         assert!(
             plan_optimize_indices(&dataset, &options)

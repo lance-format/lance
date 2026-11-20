@@ -44,9 +44,11 @@ use lance_file::writer::FileWriterOptions;
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
-use crate::dataset::transaction::{DataOverlayGroup, Operation};
-use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
-use crate::index::frag_reuse_reader::tests::persist_fixture;
+use crate::dataset::transaction::{DataOverlayGroup, Operation, RewriteGroup, Transaction};
+use crate::dataset::{
+    CommitBuilder, NewColumnTransform, UpdateBuilder, WriteDestination, WriteParams,
+};
+use crate::index::frag_reuse_reader::tests::{persist_fixture, prepare_partition};
 use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
@@ -2176,8 +2178,7 @@ async fn substring_index_hits(dataset: &Dataset, pattern: &str) -> u64 {
     scalar_index_hits(dataset, "text", "text_idx", &query).await
 }
 
-/// Substring merge primitives get the stale rows too: the merged file holds the post-overlay
-/// text only and covers both fragments.
+/// Incremental substring merges replace stale row matches with post-overlay matches.
 #[rstest]
 #[case::ngram(IndexType::NGram)]
 #[case::fmindex(IndexType::Fm)]
@@ -2851,9 +2852,23 @@ async fn test_btree_physical_merge_preserves_overlay_staleness() {
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_fmindex_physical_merge_preserves_overlay_staleness() {
-    let mut dataset = create_text_dataset(true).await;
+async fn test_fmindex_physical_merge_preserves_overlay_staleness(
+    #[values(false, true)] tagged: bool,
+) {
+    // FMIndex is admitted on a tagged table without stable row IDs.
+    let mut dataset = create_text_dataset(!tagged).await;
+    if tagged {
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("i".into(), "id".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
     let source_version =
         commit_single_fragment_segments(&mut dataset, "text", IndexType::Fm, "text_idx").await;
     let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
@@ -2867,6 +2882,61 @@ async fn test_fmindex_physical_merge_preserves_overlay_staleness() {
     )
     .await;
     dataset.delete("id = 3").await.unwrap();
+    if tagged {
+        // Publish the overlay before tagging. Rewrite only an unindexed
+        // fragment, so the two FMIndex sources have an identity plan.
+        let appended = arrow_array::record_batch!(
+            ("id", Int32, [12, 13]),
+            ("text", Utf8, ["lime", "melon"]),
+            ("i", Int32, [12, 13])
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let old = dataset.fragments().last().unwrap().clone();
+        let reserved = Transaction::new(
+            dataset.manifest.version,
+            Operation::ReserveFragments { num_fragments: 2 },
+            None,
+        );
+        dataset
+            .apply_commit(reserved, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        let (transition, new_fragments) = prepare_partition(&dataset, &[old.id], old.id + 1).await;
+        let fri = crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap();
+        let rewrite = Transaction::new(
+            dataset.manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![old],
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(fri),
+            },
+            None,
+        );
+        dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(rewrite)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged),
+        tagged
+    );
     let merged = dataset
         .merge_existing_index_segments(segments)
         .await
@@ -2878,14 +2948,17 @@ async fn test_fmindex_physical_merge_preserves_overlay_staleness() {
         .unwrap();
     assert_ids_match_oracle(&dataset, "contains(text, 'apple')", &[0]).await;
     assert_ids_match_oracle(&dataset, "contains(text, 'mango')", &[1, 6]).await;
-    let mut restored = dataset.checkout_version(source_version).await.unwrap();
-    restored.restore().await.unwrap();
-    restored
-        .commit_existing_index_segments("text_idx", "text", vec![merged])
-        .await
-        .unwrap();
-    assert_ids_match_oracle(&restored, "contains(text, 'banana')", &[1, 3]).await;
-    assert_ids_match_oracle(&restored, "contains(text, 'mango')", &[6]).await;
+    if !tagged {
+        // A staged segment may be published after restoring its build
+        // snapshot on a table without tagged replay.
+        let mut restored = dataset.checkout_version(source_version).await.unwrap();
+        restored.restore().await.unwrap();
+        restored
+            .commit_existing_index_segments("text_idx", "text", vec![merged])
+            .await
+            .unwrap();
+        assert_ids_match_oracle(&restored, "contains(text, 'banana')", &[1, 3]).await;
+    }
 }
 
 #[tokio::test]

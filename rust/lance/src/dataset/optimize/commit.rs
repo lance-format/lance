@@ -207,11 +207,8 @@ async fn commit_rewrites(
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     // Address-style results require immediate index remapping unless it is
     // deferred. On a stable-row-id table, only an index whose type actually
-    // supports an eager remap (today, BTree) makes this worth attempting:
-    // ZoneMap/BloomFilter/FM always report `RemapResult::Drop`, so creating a
-    // remapper for them would materialize an old-to-new move for every
-    // rewritten row only to discard it -- on a large compaction, table-scale
-    // memory the rewrite files have already been written to produce.
+    // supports eager remap makes this worth attempting. Otherwise the move
+    // map would use memory proportional to the rewrite without being used.
     // `rewrite_files`'s capture decision already applies this same test
     // (`has_eager_remappable_index`), so this mostly re-confirms it; it
     // matters on its own in distributed mode, where a task can record moves

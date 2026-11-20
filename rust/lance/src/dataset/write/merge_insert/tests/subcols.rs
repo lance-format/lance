@@ -1863,7 +1863,7 @@ async fn test_merge_insert_key_only_concurrent_write(
         .unwrap();
     // Compaction physically rewrites fragments, and on a
     // stable-row-id dataset the "id" BTree index stores row
-    // addresses. Unlike ZoneMap/BloomFilter/FM, BTree supports remap,
+    // addresses. Unlike ZoneMap and BloomFilter, BTree supports remap,
     // so an eager compaction remaps it in place instead of dropping
     // its coverage of the rewritten fragment -- the in-place patch
     // below still finds the fragment covered and writes zero files.

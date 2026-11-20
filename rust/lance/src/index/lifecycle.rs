@@ -816,7 +816,23 @@ impl DatasetIndexExt for Dataset {
             )
             .await?
         } else if all_fmindex {
-            crate::index::scalar::fmindex::merge_segments(self, source_segments, staged).await?
+            // V0 remapping checks that every carried fragment's indexed values
+            // are current. A tagged plan can be identity and says nothing about
+            // newer overlays on those fragments.
+            let v0_remapped = staged.is_none() && has_remapped_source_coverage;
+            let dataset_version = if v0_remapped {
+                merged_dataset_version
+            } else {
+                source_dataset_version
+            };
+            crate::index::scalar::fmindex::merge_segments(
+                self,
+                source_segments,
+                dataset_version,
+                v0_remapped,
+                staged,
+            )
+            .await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments, staged).await?
         } else if all_bloomfilter {
@@ -840,7 +856,7 @@ impl DatasetIndexExt for Dataset {
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments, staged).await?
         };
-        if !all_ngram {
+        if !all_ngram && !all_fmindex {
             merged_segment.dataset_version = merged_dataset_version;
         }
         Ok(merged_segment)
