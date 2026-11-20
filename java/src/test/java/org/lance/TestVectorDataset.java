@@ -46,11 +46,17 @@ public class TestVectorDataset implements AutoCloseable {
   public static final String vectorColumnName = "vec";
   public static final String indexName = "idx";
   private final Path datasetPath;
+  private final int vectorOffsetPerFragment;
   private Schema schema;
   private BufferAllocator allocator;
 
   public TestVectorDataset(Path datasetPath) {
+    this(datasetPath, 0);
+  }
+
+  public TestVectorDataset(Path datasetPath, int vectorOffsetPerFragment) {
     this.datasetPath = datasetPath;
+    this.vectorOffsetPerFragment = vectorOffsetPerFragment;
   }
 
   public Dataset create() throws IOException {
@@ -103,13 +109,14 @@ public class TestVectorDataset implements AutoCloseable {
       FixedSizeListVector vecVector = (FixedSizeListVector) root.getVector(vectorColumnName);
       Float4Vector vecItemsVector = (Float4Vector) vecVector.getDataVector();
 
+      int vectorOffset = batchIndex * vectorOffsetPerFragment;
       for (int i = 0; i < 80; i++) {
         int value = batchIndex * 80 + i;
         iVector.setSafe(i, value);
         sVector.setSafe(i, new Text("s-" + value));
 
         for (int j = 0; j < 32; j++) {
-          vecItemsVector.setSafe(i * 32 + j, (float) (i * 32 + j));
+          vecItemsVector.setSafe(i * 32 + j, (float) (vectorOffset + i * 32 + j));
         }
         // Mark the fixed-size list value as non-null
         vecVector.setNotNull(i);
