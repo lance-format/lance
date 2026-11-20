@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -369,14 +370,26 @@ class LanceFragment(pa.dataset.Fragment):
         *,
         fragment: Optional[_Fragment] = None,
     ):
-        self._ds = dataset
+        # The native fragment keeps its own snapshot. Keep the same version for
+        # scanner replay and blob lookups even when the caller mutates the dataset.
+        self._ds = copy.copy(dataset)
         if fragment is None:
             if fragment_id is None:
                 raise ValueError("Either fragment or fragment_id must be specified")
-            fragment = dataset.get_fragment(fragment_id)._fragment
+            fragment = self._ds._ds.get_fragment(fragment_id)
+            if fragment is None:
+                raise ValueError(f"Fragment id does not exist: {fragment_id}")
         self._fragment: _Fragment = fragment
-        if self._fragment is None:
-            raise ValueError(f"Fragment id does not exist: {fragment_id}")
+
+    @classmethod
+    def _from_snapshot(
+        cls, snapshot: LanceDataset, fragment: _Fragment
+    ) -> LanceFragment:
+        """Wrap a native fragment looked up on the supplied dataset snapshot."""
+        instance = cls.__new__(cls)
+        instance._ds = snapshot
+        instance._fragment = fragment
+        return instance
 
     def __repr__(self):
         return self._fragment.__repr__()

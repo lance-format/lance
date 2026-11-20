@@ -1371,7 +1371,9 @@ class ScannerBuilder:
         return self
 
     def to_scanner(self) -> LanceScanner:
-        scanner = self.ds._ds.scanner(
+        # Blob exports replay the scan and resolve row addresses on this snapshot.
+        dataset = copy.copy(self.ds)
+        scanner = dataset._ds.scanner(
             self._columns,
             self._columns_with_transform,
             self._filter,
@@ -1408,7 +1410,7 @@ class ScannerBuilder:
             self._row_addr_blocklist,
             self._minhash_query,
         )
-        return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
+        return LanceScanner(scanner, dataset, _snapshot_scanner_builder(self))
 
 
 class LanceScanner(pa.dataset.Scanner):
