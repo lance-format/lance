@@ -4,10 +4,12 @@
 use arrow::compute::{CastOptions, can_cast_types};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float64Type;
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, BooleanArray};
+use arrow_buffer::BooleanBufferBuilder;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_cast::{cast, cast_with_options};
 use arrow_schema::DataType;
+use arrow_select::nullif::nullif;
 
 use crate::{Error, Result};
 
@@ -49,6 +51,9 @@ fn first_unrepresentable(original: &ArrayRef, casted: &ArrayRef) -> Result<Optio
             return first_unrepresentable(original, &cast(casted, value_type)?);
         }
         (Struct(_), Struct(_)) => {
+            // Arrow matches struct fields by name, but alter_columns only casts
+            // a struct as the wrapper of a rewritten nested field, so both sides
+            // are projections of one dataset schema and their fields line up.
             for (original, casted) in original
                 .as_struct()
                 .columns()
@@ -73,7 +78,10 @@ fn first_unrepresentable(original: &ArrayRef, casted: &ArrayRef) -> Result<Optio
                 _ => List(item.clone()),
             };
             let original = cast_with_options(original, &layout, &STRICT)?;
-            return first_unrepresentable(list_values(&original)?, list_values(casted)?);
+            let hidden = hidden_list_values(&original)?;
+            let original = mask(list_values(&original)?, &hidden)?;
+            let casted = mask(list_values(casted)?, &hidden)?;
+            return first_unrepresentable(&original, &casted);
         }
         (from, to) if from.is_floating() && to.is_floating() => {
             let original = cast(original, &Float64)?;
@@ -114,6 +122,63 @@ fn first_unrepresentable(original: &ArrayRef, casted: &ArrayRef) -> Result<Optio
             )
         })
         .transpose()
+}
+
+/// Returns `array` with the values marked in `hidden` set to null.
+fn mask(array: &ArrayRef, hidden: &BooleanArray) -> Result<ArrayRef> {
+    if hidden.true_count() == 0 {
+        return Ok(array.clone());
+    }
+    Ok(nullif(array.as_ref(), hidden)?)
+}
+
+/// Marks the items of a list that a reader cannot observe: the items of a null
+/// slot and, for a sliced list, the items outside the slice.
+///
+/// A fixed size list keeps the items of a null slot and arrow copies them when
+/// it casts, so they have to be skipped or `[null, [1.5, 2.5]]` would be
+/// refused for an infinity under the null.
+fn hidden_list_values(array: &ArrayRef) -> Result<BooleanArray> {
+    let values_len = list_values(array)?.len();
+    let mut hidden = BooleanBufferBuilder::new(values_len);
+    match array.data_type() {
+        DataType::List(_) | DataType::LargeList(_) => {
+            // A sliced list keeps its whole child array and only the offset
+            // window, so the items of the slots around the window are out of
+            // the array as well.
+            let offsets: Vec<usize> = match array.data_type() {
+                DataType::LargeList(_) => array
+                    .as_list::<i64>()
+                    .offsets()
+                    .iter()
+                    .map(|offset| *offset as usize)
+                    .collect(),
+                _ => array
+                    .as_list::<i32>()
+                    .offsets()
+                    .iter()
+                    .map(|offset| *offset as usize)
+                    .collect(),
+            };
+            hidden.append_n(offsets[0], true);
+            for slot in 0..array.len() {
+                hidden.append_n(offsets[slot + 1] - offsets[slot], array.is_null(slot));
+            }
+            hidden.append_n(values_len - offsets[array.len()], true);
+        }
+        DataType::FixedSizeList(_, _) => {
+            let size = array.as_fixed_size_list().value_length() as usize;
+            for slot in 0..array.len() {
+                hidden.append_n(size, array.is_null(slot));
+            }
+        }
+        other => {
+            return Err(Error::internal(format!(
+                "Expected a list array while checking a cast, got {other:?}"
+            )));
+        }
+    }
+    Ok(BooleanArray::new(hidden.finish(), None))
 }
 
 fn list_values(array: &ArrayRef) -> Result<&ArrayRef> {

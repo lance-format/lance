@@ -2002,11 +2002,12 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::Float64Type;
     use arrow_array::{
-        ArrayRef, BinaryArray, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
-        Int32Array, Int64Array, LargeStringArray, ListArray, RecordBatchIterator, StringArray,
-        StructArray, TimestampNanosecondArray, TimestampSecondArray, record_batch,
+        ArrayRef, BinaryArray, Date64Array, Decimal128Array, DictionaryArray, FixedSizeListArray,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
+        RecordBatchIterator, StringArray, StructArray, TimestampNanosecondArray,
+        TimestampSecondArray, record_batch,
     };
-    use arrow_buffer::OffsetBuffer;
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_cast::cast_with_options;
     use arrow_schema::TimeUnit;
     use lance_arrow::FixedSizeListArrayExt;
@@ -6367,6 +6368,29 @@ mod test {
         Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(values))
     }
 
+    fn dictionary_f64(keys: Vec<i32>, values: Vec<Option<f64>>) -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(Float64Array::from(values)) as ArrayRef,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn struct_f64(values: Vec<(Option<f64>, Option<f64>)>) -> ArrayRef {
+        Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("a", DataType::Float64, true)),
+                Arc::new(Float64Array::from_iter(values.iter().map(|v| v.0))) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("b", DataType::Float64, true)),
+                Arc::new(Float64Array::from_iter(values.iter().map(|v| v.1))) as ArrayRef,
+            ),
+        ]))
+    }
+
     // The first row is always representable, so the failure comes from a later
     // fragment after earlier ones have been rewritten.
     #[rstest]
@@ -6412,6 +6436,16 @@ mod test {
         Arc::new(Decimal128Array::from(vec![100, 250]).with_precision_and_scale(10, 2).unwrap()),
         DataType::Decimal128(10, 0),
         "value 2.50 cannot be represented"
+    )]
+    #[case::date64_time_of_day(
+        Arc::new(Date64Array::from(vec![86_400_000, 86_400_000 + 43_200_000])),
+        DataType::Date32,
+        "value 1970-01-02T12:00:00 cannot be represented"
+    )]
+    #[case::dictionary_value(
+        dictionary_f64(vec![0, 1], vec![Some(1.5), Some(1e300)]),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float32)),
+        "value 1e300 cannot be represented"
     )]
     #[tokio::test]
     async fn test_cast_column_rejects_unrepresentable_values(
@@ -6493,6 +6527,19 @@ mod test {
         ),
         DataType::FixedSizeList(Arc::new(ArrowField::new("item", DataType::Float16, true)), 2)
     )]
+    #[case::date64_whole_days(
+        Arc::new(Date64Array::from(vec![Some(0), Some(86_400_000), None])),
+        DataType::Date32
+    )]
+    // Only the values of the referenced entries are checked.
+    #[case::dictionary_value(
+        dictionary_f64(vec![0, 1], vec![Some(1.5), Some(2.5)]),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float32))
+    )]
+    #[case::dictionary_unused_value(
+        dictionary_f64(vec![0, 2], vec![Some(1.5), Some(1e300), Some(2.5)]),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float32))
+    )]
     #[tokio::test]
     async fn test_cast_column_keeps_representable_values(
         #[case] values: ArrayRef,
@@ -6509,6 +6556,160 @@ mod test {
         let data = dataset.scan().try_into_batch().await?;
         assert_eq!(data["x"].data_type(), &to_type);
         assert_eq!(&data["x"], &arrow_cast::cast(&values, &to_type)?);
+        Ok(())
+    }
+
+    /// A fixed size list keeps the items of a null slot, but a reader cannot
+    /// observe them, so they must not fail the cast. They are kept only when
+    /// the null slot shares a fragment with another row.
+    #[tokio::test]
+    async fn test_cast_column_ignores_items_of_a_null_list_slot() -> Result<()> {
+        let values = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(ArrowField::new("item", DataType::Float64, true)),
+                2,
+                Arc::new(Float64Array::from(vec![1e300, 0.5, 1.5, 2.5])) as ArrayRef,
+                Some(NullBuffer::from(vec![false, true])),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![values.clone()])?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            None,
+        )
+        .await?;
+        let to_type = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            2,
+        );
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).cast_to(to_type.clone())])
+            .await?;
+        dataset.validate().await?;
+
+        let dataset = Dataset::open(&test_dir).await?;
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data["x"].data_type(), &to_type);
+        assert!(data["x"].is_null(0));
+        assert_eq!(
+            arrow_cast::display::array_value_to_string(&data["x"], 1)?,
+            "[1.5, 2.5]"
+        );
+        Ok(())
+    }
+
+    /// A sliced list keeps the items outside its window, but a reader cannot
+    /// observe them, so they must not fail the cast. `alter_columns` reads
+    /// whole batches, so this guards the check itself rather than a dataset.
+    #[test]
+    fn test_cast_column_ignores_list_items_outside_the_slice() -> Result<()> {
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(1e300), Some(9.0)]),
+            Some(vec![Some(1.5)]),
+        ]);
+        let sliced: ArrayRef = Arc::new(list.slice(1, 1));
+        let to_type = DataType::new_list(DataType::Float32, true);
+
+        let casted = cast::cast_column("x", &sliced, &to_type)?;
+        assert_eq!(&casted, &arrow_cast::cast(&sliced, &to_type)?);
+        assert_eq!(
+            arrow_cast::display::array_value_to_string(&casted, 0)?,
+            "[1.5]"
+        );
+        Ok(())
+    }
+
+    /// Casting a nested field casts its struct wrapper. The sibling keeps its
+    /// type and its values.
+    #[tokio::test]
+    async fn test_cast_column_casts_one_struct_field() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let values = struct_f64(vec![(Some(1.5), Some(0.1)), (Some(2.5), Some(0.2))]);
+        let mut dataset = write_cast_source(values.clone(), &test_dir).await?;
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("x.a".into()).cast_to(DataType::Float32)])
+            .await?;
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let struct_array = data["x"].as_struct();
+        assert_eq!(
+            struct_array.data_type(),
+            &DataType::Struct(
+                vec![
+                    Arc::new(ArrowField::new("a", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("b", DataType::Float64, true)),
+                ]
+                .into()
+            )
+        );
+        assert_eq!(
+            struct_array.column(0),
+            &arrow_cast::cast(values.as_struct().column(0), &DataType::Float32)?
+        );
+        assert_eq!(struct_array.column(1), values.as_struct().column(1));
+        Ok(())
+    }
+
+    /// Casting two children in one call casts one struct holding both, so the
+    /// later child is checked too, and a failure leaves the table untouched.
+    #[tokio::test]
+    async fn test_cast_column_casts_struct_siblings() -> Result<()> {
+        let siblings = [
+            ColumnAlteration::new("x.a".into()).cast_to(DataType::Float32),
+            ColumnAlteration::new("x.b".into()).cast_to(DataType::Float32),
+        ];
+
+        let test_dir = TempStrDir::default();
+        let values = struct_f64(vec![(Some(1.5), Some(5.0)), (Some(2.5), Some(1e300))]);
+        let mut dataset = write_cast_source(values.clone(), &test_dir).await?;
+        let version = dataset.version().version;
+
+        let err = dataset.alter_columns(&siblings).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("value 1e300 cannot be represented"),
+            "unexpected error: {err}"
+        );
+        let dataset = Dataset::open(&test_dir).await?;
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(&dataset.scan().try_into_batch().await?["x"], &values);
+
+        let test_dir = TempStrDir::default();
+        let values = struct_f64(vec![(Some(1.5), Some(0.5)), (Some(2.5), Some(3.5))]);
+        let mut dataset = write_cast_source(values.clone(), &test_dir).await?;
+        dataset.alter_columns(&siblings).await?;
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let struct_array = data["x"].as_struct();
+        assert_eq!(
+            struct_array.data_type(),
+            &DataType::Struct(
+                vec![
+                    Arc::new(ArrowField::new("a", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("b", DataType::Float32, true)),
+                ]
+                .into()
+            )
+        );
+        for (child, original) in struct_array
+            .columns()
+            .iter()
+            .zip(values.as_struct().columns())
+        {
+            assert_eq!(child, &arrow_cast::cast(original, &DataType::Float32)?);
+        }
         Ok(())
     }
 
