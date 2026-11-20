@@ -25,11 +25,19 @@ impl MergeInsertBuilder {
     ///  - rows in the old data that do not match will be left as-is
     ///
     /// Use the methods on this builder to customize that behavior
+    ///
+    /// Join keys must identify top-level columns, including when inferred from
+    /// the schema's unenforced primary key.
     pub fn try_new(dataset: Arc<Dataset>, on: Vec<String>) -> Result<Self> {
         // Determine the join keys to use. If `on` is empty, fall back to the
         // schema's unenforced primary key (if configured).
+        let schema = dataset.schema();
+        let nested_key = |path: &str| {
+            Error::invalid_input(format!(
+                "Merge insert key '{path}' must be a top-level column"
+            ))
+        };
         let resolved_on = if on.is_empty() {
-            let schema = dataset.schema();
             let pk_fields = schema.unenforced_primary_key();
 
             if pk_fields.is_empty() {
@@ -40,23 +48,26 @@ impl MergeInsertBuilder {
 
             pk_fields
                 .iter()
-                .map(|field| schema.field_path(field.id))
+                .map(|field| {
+                    let path = schema.field_path(field.id)?;
+                    if field.parent_id >= 0 {
+                        return Err(nested_key(&path));
+                    }
+                    Ok(path)
+                })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            // Resolve column names using case-insensitive matching to handle
-            // lowercased column names from SQL parsing or user input
             on.iter()
-                .map(|col| {
-                    dataset
-                        .schema()
-                        .field_case_insensitive(col)
-                        .map(|f| f.name.clone())
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "Merge insert key column '{}' does not exist in schema",
-                                col
-                            ))
-                        })
+                .map(|path| {
+                    let fields = schema.resolve_case_insensitive(path).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Merge insert key column '{path}' does not exist in schema"
+                        ))
+                    })?;
+                    match fields.as_slice() {
+                        [field] => Ok(field.name.clone()),
+                        _ => Err(nested_key(path)),
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?
         };
