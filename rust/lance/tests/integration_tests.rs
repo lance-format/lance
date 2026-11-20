@@ -9,6 +9,7 @@ mod fts_plan_reconstruction;
 mod json_write;
 mod label_list_optimize;
 mod mem_wal;
+mod optimize_concurrency;
 mod prefilter_union;
 #[cfg(feature = "slow_tests")]
 mod query;

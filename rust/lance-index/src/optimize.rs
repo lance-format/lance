@@ -12,6 +12,17 @@ use crate::progress::{IndexBuildProgress, noop_progress};
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OptimizeOptions {
+    /// Maximum parallelism of compute-intensive stages during local index optimization.
+    ///
+    /// Must be greater than zero. `None` preserves the configured defaults.
+    /// This limits current vector partition builders and scalar index workers.
+    /// Legacy v1 vector writers retain their existing parallelism.
+    /// It does not impose a process-wide CPU or thread limit: independent
+    /// stages, I/O, and internal Rayon parallelism may still run concurrently.
+    /// Only used by `Dataset::optimize_indices`, not by individually executed
+    /// distributed planning, build, or merge tasks.
+    pub num_threads: Option<usize>,
+
     /// Number of delta indices to merge for one column. Default: None.
     ///
     /// If `num_indices_to_merge` is None, lance will create a new delta index if no partition is split, otherwise it will merge all delta indices.
@@ -106,6 +117,7 @@ pub struct OptimizeOptions {
 impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
+            num_threads: None,
             num_indices_to_merge: None,
             enable_partition_rebalancing: false,
             index_names: None,
@@ -121,6 +133,21 @@ impl Default for OptimizeOptions {
 }
 
 impl OptimizeOptions {
+    /// Limit compute-stage parallelism for local index optimization.
+    ///
+    /// See [`Self::num_threads`] for the scope of the limit. Zero is rejected
+    /// when optimization starts.
+    ///
+    /// ```
+    /// use lance_index::optimize::OptimizeOptions;
+    /// let options = OptimizeOptions::append().with_num_threads(2);
+    /// assert_eq!(options.num_threads, Some(2));
+    /// ```
+    pub fn with_num_threads(mut self, num_threads: usize) -> Self {
+        self.num_threads = Some(num_threads);
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

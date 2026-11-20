@@ -433,6 +433,20 @@ pub trait DatasetIndexExt {
     ) -> Result<Option<IndexMetadata>>;
 
     /// Optimize indices.
+    ///
+    /// [`OptimizeOptions::num_threads`] limits compute-stage parallelism during
+    /// this call, including planning and training. Other operations keep their
+    /// configured parallelism. It is not a process-wide thread or CPU limit,
+    /// and legacy v1 vector writers retain their existing parallelism.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::DatasetIndexExt};
+    /// # use lance_index::optimize::OptimizeOptions;
+    /// # async fn optimize(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.optimize_indices(&OptimizeOptions::append().with_num_threads(2)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()>;
 
     /// Find an index with the given name and return its serialized statistics.

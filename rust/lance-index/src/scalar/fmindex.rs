@@ -36,7 +36,9 @@ use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::{
+    get_global_num_compute_intensive_cpus, limit_compute_concurrency, spawn_cpu,
+};
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_index_core::remapping::RowAddrTranslator;
 use roaring::RoaringBitmap;
@@ -91,7 +93,7 @@ const SA_SAMPLE_RATE: usize = 32;
 
 static LANCE_FMINDEX_NUM_WORKERS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("LANCE_FMINDEX_NUM_WORKERS")
-        .unwrap_or_else(|_| get_num_compute_intensive_cpus().to_string())
+        .unwrap_or_else(|_| get_global_num_compute_intensive_cpus().to_string())
         .parse()
         .expect("failed to parse LANCE_FMINDEX_NUM_WORKERS")
 });
@@ -1761,7 +1763,7 @@ impl FMIndexPartitionConfig {
 
     fn normalized(self) -> Self {
         Self {
-            num_workers: self.num_workers.max(1),
+            num_workers: limit_compute_concurrency(self.num_workers.max(1)),
             max_rows: self.max_rows.max(1),
             max_bytes: self.max_bytes.max(1),
             queue_size: self.queue_size.max(1),
@@ -2410,10 +2412,11 @@ mod tests {
     use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, UInt64Array};
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::utils::tokio::with_compute_concurrency;
     use lance_core::{ROW_ADDR, cache::LanceCache};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
-    use std::sync::Arc;
+    use std::{num::NonZeroUsize, sync::Arc};
 
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::lookup_test_util::CompactedToFragmentOne;
@@ -3031,8 +3034,13 @@ mod tests {
         assert!(error.to_string().contains("patterns containing NUL bytes"));
     }
 
+    #[rstest::rstest]
+    #[case::default(None)]
+    #[case::single_worker(Some(NonZeroUsize::new(1).unwrap()))]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_stream_train_splits_partition_by_bytes() {
+    async fn test_stream_train_splits_partition_by_bytes(
+        #[case] concurrency: Option<NonZeroUsize>,
+    ) {
         let docs = vec!["abcd", "efgh", "ijkl"];
         let row_addrs: Vec<u64> = vec![0, 1, 2];
         let schema = Arc::new(arrow_schema::Schema::new(vec![
@@ -3061,19 +3069,29 @@ mod tests {
         ));
 
         let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
-        let files = write_partitioned_fmindex_stream_with_config(
+        let config = FMIndexPartitionConfig {
+            num_workers: 2,
+            max_rows: 100,
+            max_bytes: 5,
+            queue_size: 1,
+            resume_existing: false,
+        };
+        let build = Box::pin(write_partitioned_fmindex_stream_with_config(
             Box::pin(stream),
             store.as_ref(),
-            FMIndexPartitionConfig {
-                num_workers: 2,
-                max_rows: 100,
-                max_bytes: 5,
-                queue_size: 1,
-                resume_existing: false,
-            },
-        )
-        .await
+            config,
+        ));
+        let files = if let Some(concurrency) = concurrency {
+            with_compute_concurrency(concurrency, async {
+                assert_eq!(config.normalized().num_workers, 1);
+                build.await
+            })
+            .await
+        } else {
+            build.await
+        }
         .unwrap();
+        assert_eq!(config.normalized().num_workers, 2);
 
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].path, fmindex_partition_path(0));
