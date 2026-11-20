@@ -26,25 +26,40 @@
 //! to a strict total probe cap across all queries and deltas. Rounds admit whole
 //! queries, so a query's rows do not depend on the rest of the batch unless its
 //! own waves exceed the cap.
+//!
+//! A scorer whose results depend on the rows already in a query's top-k, as
+//! multi-bit RQ's does, gets a different late search: each query searches its
+//! late range the way the single-query path does, sharing one top-k heap across
+//! its partitions (see [`late_scores_depend_on_heap`]). The shared late search
+//! can't serve such a scorer, even by seeding each virtual query with its
+//! query's top-k: a round scores all of a query's wave partitions at once, one
+//! virtual query each, so a partition can't see the rows of the earlier
+//! partitions in the same wave, which the single-query path's heap already
+//! holds when it scores that partition.
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt32Array, cast::AsArray};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use futures::{StreamExt, TryStreamExt};
 use lance_core::ROW_ID;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::minhash_lsh::{MinHashHit, TopHits};
 use lance_index::vector::graph::OrderedFloat;
-use lance_index::vector::{DIST_COL, Query, VectorIndex};
+use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::{DIST_COL, PartitionSearchControl, Query, VectorIndex};
 use lance_select::RowAddrMask;
 use roaring::RoaringBitmap;
 
 use super::adaptive_probe::AutoProbePolicy;
-use super::{AnnIndexMetrics, LateSearchBudget, restrict_to_segment, segment_owns_rows};
+use super::{
+    AnnIndexMetrics, LateSearchBudget, num_rows_in_segment, restrict_to_segment, segment_owns_rows,
+};
 use crate::index::prefilter::DatasetPreFilter;
 
 /// One query's probe plan against one index delta.
@@ -256,6 +271,129 @@ pub(super) async fn search_batch(
         .collect()
 }
 
+/// Whether `index` scores a partition depending on the rows already in the
+/// query's top-k. Multi-bit RQ does: it computes a row's full distance only when
+/// a probabilistic bound on it beats the current k-th distance. Searching each
+/// late partition with a heap of its own, as the shared late search does, then
+/// returns other distances than the single-query path, which keeps one heap
+/// across a query's late partitions.
+fn late_scores_depend_on_heap(index: &dyn VectorIndex) -> bool {
+    index.sub_index_type().1 == QuantizationType::Rabit
+}
+
+/// Late search for a scorer whose results depend on the query's top-k
+/// ([`late_scores_depend_on_heap`]). Each active query searches its late range
+/// in every delta it joins with `search_partitions`, as the single-query path
+/// does, so its partitions share one top-k heap and it stops at the same
+/// partition. Each partition's rows go straight into the query's bounded
+/// candidates as they arrive, so the search holds at most `k` rows per query.
+/// Deltas are searched in order; queries run in parallel.
+async fn sequential_late_search(
+    deltas: &[BatchDelta],
+    dim: usize,
+    budget: usize,
+    found: &mut [usize],
+    is_active: &[bool],
+    candidates: &mut [TopHits],
+    metrics: &AnnIndexMetrics,
+) -> DataFusionResult<()> {
+    let mut searches = Vec::new();
+    for (query_index, (hits, found)) in candidates.iter_mut().zip(found.iter_mut()).enumerate() {
+        if is_active[query_index] {
+            searches.push(sequential_late_search_of_query(
+                deltas,
+                dim,
+                budget,
+                query_index,
+                hits,
+                found,
+                metrics,
+            ));
+        }
+    }
+    futures::stream::iter(searches)
+        .buffer_unordered(get_num_compute_intensive_cpus().max(1))
+        .try_for_each(|()| async { Ok(()) })
+        .await
+}
+
+/// One query's part of [`sequential_late_search`]: its late range in every delta
+/// it joins, with its rows going into `hits` and its row count into `found`.
+async fn sequential_late_search_of_query(
+    deltas: &[BatchDelta],
+    dim: usize,
+    budget: usize,
+    query_index: usize,
+    hits: &mut TopHits,
+    found: &mut usize,
+    metrics: &AnnIndexMetrics,
+) -> DataFusionResult<()> {
+    let query_found = Arc::new(AtomicUsize::new(*found));
+    for delta in deltas
+        .iter()
+        .filter(|delta| delta.joins_late_search(query_index))
+    {
+        if query_found.load(Ordering::Relaxed) >= budget {
+            break;
+        }
+        let plan = &delta.plans[query_index];
+        let mut query = delta.query.clone();
+        query.key = delta.query.key.slice(query_index * dim, dim);
+        let control: Arc<dyn PartitionSearchControl> = Arc::new(BatchLateSearchControl {
+            found: query_found.clone(),
+            max_results: budget,
+            seg_mask: delta.seg_mask.clone(),
+        });
+        let index_metrics: Arc<dyn MetricsCollector> = Arc::new(metrics.index_metrics.clone());
+        let mut stream = delta
+            .index
+            .clone()
+            .search_partitions(
+                query,
+                plan.partitions.clone(),
+                plan.q_c_dists.clone(),
+                plan.early_end,
+                plan.late_end,
+                delta.pre_filter.clone(),
+                Some(control),
+                index_metrics,
+            )
+            .await?;
+        while let Some(batch) = stream.next().await {
+            metrics.partitions_searched.add(1);
+            let batch = restrict_to_segment(batch?, delta.seg_mask.as_deref())?;
+            if batch.num_rows() > 0 {
+                append_candidates(&batch, hits)?;
+            }
+        }
+    }
+    *found = query_found.load(Ordering::Relaxed);
+    Ok(())
+}
+
+/// Stops a query's sequential late search at its budget, counting the rows of
+/// each partition that the delta's segment owns, like the single-query path's
+/// late search control.
+struct BatchLateSearchControl {
+    found: Arc<AtomicUsize>,
+    max_results: usize,
+    seg_mask: Option<Arc<RowAddrMask>>,
+}
+
+impl PartitionSearchControl for BatchLateSearchControl {
+    fn should_stop(&self) -> bool {
+        self.found.load(Ordering::Relaxed) >= self.max_results
+    }
+
+    fn record_batch(&self, batch: &RecordBatch) {
+        let num_rows = match self.seg_mask.as_ref() {
+            Some(seg_mask) => num_rows_in_segment(batch, seg_mask),
+            None => batch.num_rows(),
+        };
+        self.found.fetch_add(num_rows, Ordering::Relaxed);
+    }
+}
+
 /// Upper bound on (query, partition) probes issued in one late-search round.
 ///
 /// Each probe copies its query vector into the round's key array and returns up
@@ -443,6 +581,16 @@ pub(super) async fn late_search(
             continue;
         }
         is_active.push(found[query_index] < budget);
+    }
+
+    if deltas
+        .iter()
+        .any(|delta| late_scores_depend_on_heap(delta.index.as_ref()))
+    {
+        return sequential_late_search(
+            deltas, dim, budget, &mut found, &is_active, candidates, metrics,
+        )
+        .await;
     }
 
     let max_wave = get_num_compute_intensive_cpus().max(1);
@@ -936,26 +1084,134 @@ mod tests {
         assert_eq!(rows, vec![10, 12, 13, 15]);
     }
 
+    /// The per-query late search of a heap-dependent scorer stops at the same
+    /// cut as the shared one: partition 2 meets k, so partition 3 is not read.
     #[tokio::test]
-    async fn test_late_search_does_not_count_unowned_rows() {
+    async fn test_sequential_late_search_stops_at_the_cut() {
         let pre_filter = empty_prefilter().await;
-        let (mut first, _) = delta(vec![vec![], vec![10], vec![11]], 1, pre_filter.clone());
-        first.seg_mask = Some(Arc::new(RowAddrMask::from_allowed(
-            [12_u64].into_iter().collect::<RowAddrTreeMap>(),
-        )));
-        let (second, _) = delta(vec![vec![], vec![20], vec![21]], 1, pre_filter.clone());
-        let mut candidates = vec![TopHits::new(1)];
-        late_search(
-            &[first, second],
-            1,
+        let (delta, searched) = delta(
+            vec![vec![], vec![10], vec![12, 13, 15, 16], vec![14]],
             1,
             pre_filter,
+        );
+        let mut candidates = vec![TopHits::new(4)];
+        let mut found = vec![0];
+        sequential_late_search(
+            &[delta],
+            1,
+            4,
+            &mut found,
+            &[true],
             &mut candidates,
             prepared_metrics().as_ref(),
         )
         .await
         .unwrap();
-        assert_eq!(sorted_hits(&candidates[0]), vec![(1.0, 20)]);
+        let rows: Vec<_> = sorted_hits(&candidates[0])
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect();
+        assert_eq!(rows, vec![10, 12, 13, 15]);
+        assert_eq!(*searched.lock().unwrap(), vec![1, 2]);
+        assert_eq!(found, vec![5]);
+    }
+
+    /// Empty partitions leave nothing behind: every query probes every late
+    /// partition and keeps only its bounded candidates.
+    #[tokio::test]
+    async fn test_sequential_late_search_over_empty_partitions() {
+        let (query_count, partition_count) = (32, 256);
+        let pre_filter = empty_prefilter().await;
+        let (delta, searched) = delta(vec![vec![]; partition_count], query_count, pre_filter);
+        let mut candidates: Vec<_> = (0..query_count).map(|_| TopHits::new(1)).collect();
+        let metrics = prepared_metrics();
+        sequential_late_search(
+            &[delta],
+            1,
+            1,
+            &mut vec![0; query_count],
+            &vec![true; query_count],
+            &mut candidates,
+            metrics.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(candidates.iter().all(|hits| hits.missing() == 1));
+        assert_eq!(
+            searched.lock().unwrap().len(),
+            query_count * (partition_count - 1)
+        );
+        assert_eq!(
+            metrics.partitions_searched.value(),
+            query_count * (partition_count - 1)
+        );
+    }
+
+    /// Run the late search of every query, through [`late_search`] or, when
+    /// `sequential`, straight through [`sequential_late_search`], which
+    /// `late_search` only picks for a scorer the mock index is not.
+    async fn run_late_search(
+        sequential: bool,
+        deltas: &[BatchDelta],
+        k: usize,
+        pre_filter: Arc<DatasetPreFilter>,
+        candidates: &mut [TopHits],
+    ) {
+        let metrics = prepared_metrics();
+        if !sequential {
+            late_search(deltas, 1, k, pre_filter, candidates, metrics.as_ref())
+                .await
+                .unwrap();
+            return;
+        }
+        pre_filter.wait_for_ready().await.unwrap();
+        let budget = LateSearchBudget::new(&pre_filter.mask(), k).stop_at();
+        let mut found: Vec<usize> = candidates.iter().map(|hits| k - hits.missing()).collect();
+        let is_active: Vec<bool> = found.iter().map(|&found| found < budget).collect();
+        sequential_late_search(
+            deltas,
+            1,
+            budget,
+            &mut found,
+            &is_active,
+            candidates,
+            metrics.as_ref(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Rows a restricted delta returns but its segment does not own count
+    /// toward no query's budget, so the search goes on to the next delta, while
+    /// rows the segment owns do count. The shared search takes the deltas'
+    /// partitions round-robin and the sequential search one delta after
+    /// another, so they stop at different partitions.
+    #[rstest]
+    #[case::shared_unowned(false, 12, vec![(1.0, 20)], vec![1], vec![1])]
+    #[case::shared_owned(false, 11, vec![(1.0, 20)], vec![1], vec![1])]
+    #[case::sequential_unowned(true, 12, vec![(1.0, 20)], vec![1, 2], vec![1])]
+    #[case::sequential_owned(true, 11, vec![(2.0, 11)], vec![1, 2], vec![])]
+    #[tokio::test]
+    async fn test_late_search_does_not_count_unowned_rows(
+        #[case] sequential: bool,
+        #[case] owned_row: u64,
+        #[case] expected_hits: Vec<(f32, u64)>,
+        #[case] expected_first_searched: Vec<usize>,
+        #[case] expected_second_searched: Vec<usize>,
+    ) {
+        let pre_filter = empty_prefilter().await;
+        let (mut first, first_searched) =
+            delta(vec![vec![], vec![10], vec![11]], 1, pre_filter.clone());
+        first.seg_mask = Some(Arc::new(RowAddrMask::from_allowed(
+            [owned_row].into_iter().collect::<RowAddrTreeMap>(),
+        )));
+        let (second, second_searched) =
+            delta(vec![vec![], vec![20], vec![21]], 1, pre_filter.clone());
+        let mut candidates = vec![TopHits::new(1)];
+        run_late_search(sequential, &[first, second], 1, pre_filter, &mut candidates).await;
+        assert_eq!(sorted_hits(&candidates[0]), expected_hits);
+        assert_eq!(*first_searched.lock().unwrap(), expected_first_searched);
+        assert_eq!(*second_searched.lock().unwrap(), expected_second_searched);
     }
 
     #[rstest]
@@ -999,22 +1255,14 @@ mod tests {
         assert!(second_searched.lock().unwrap().is_empty());
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_late_search_skips_empty_ownership() {
+    async fn test_late_search_skips_empty_ownership(#[values(false, true)] sequential: bool) {
         let pre_filter = empty_prefilter().await;
         let (mut delta, searched) = delta(vec![vec![], vec![10]], 1, pre_filter.clone());
         delta.seg_mask = Some(Arc::new(RowAddrMask::allow_nothing()));
         let mut candidates = vec![TopHits::new(1)];
-        late_search(
-            &[delta],
-            1,
-            1,
-            pre_filter,
-            &mut candidates,
-            prepared_metrics().as_ref(),
-        )
-        .await
-        .unwrap();
+        run_late_search(sequential, &[delta], 1, pre_filter, &mut candidates).await;
         assert!(searched.lock().unwrap().is_empty());
         assert!(candidates[0].iter().next().is_none());
     }
