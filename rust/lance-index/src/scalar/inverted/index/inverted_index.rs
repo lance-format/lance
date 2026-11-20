@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::RowAddrTranslatorRef;
 use crate::scalar::inverted::documents::DocumentRemapping;
-use crate::scalar::{IndexFile, RowAddrTranslatorRef};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 
@@ -74,18 +74,6 @@ impl InvertedIndex {
             ) => 0,
             (_, format_version) => format_version.index_version(),
         }
-    }
-
-    fn created_index(&self, files: Vec<IndexFile>) -> Result<CreatedIndex> {
-        // The persisted tokenizer params omit the posting format. Maintenance keeps
-        // the source's physical format, including when it differs from today's default.
-        let details =
-            pbold::InvertedIndexDetails::from_params(&self.params, self.format_version())?;
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details)?,
-            index_version: self.index_version(),
-            files,
-        })
     }
 
     fn posting_tail_codec(&self) -> PostingTailCodec {
@@ -237,25 +225,24 @@ impl InvertedIndex {
             }
             _ => false,
         };
+        let mut builder;
         let files = if can_update {
             // A single unchanged partition has nothing to merge yet. Copy it
             // and consolidate with the new tail once, instead of decoding and
             // writing the old postings before decoding them again at finalize.
-            first
-                .to_builder()
-                .with_progress(progress)
-                .update(new_data, dest_store, None)
-                .await?
+            builder = first.to_builder().with_progress(progress);
+            builder.update(new_data, dest_store, None).await?
         } else {
-            InvertedIndexBuilder::new(first.params.clone())
+            builder = InvertedIndexBuilder::new(first.params.clone())
                 .with_progress(progress)
                 .with_token_set_format(first.token_set_format)
-                .with_format_version(first.format_version())
+                .with_format_version(first.format_version());
+            builder
                 .update_from_segments(new_data, dest_store, segments, old_data_filters)
                 .await?
         };
 
-        first.created_index(files)
+        builder.into_created_index(files, first.index_version())
     }
 }
 
@@ -1131,12 +1118,12 @@ impl InvertedIndex {
         mapping: RowAddrTranslatorRef<'_>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let files = self
-            .to_builder()
+        let mut builder = self.to_builder();
+        let files = builder
             .remap_with(mapping, self.store.clone(), dest_store)
             .await?;
 
-        self.created_index(files)
+        builder.into_created_index(files, self.index_version())
     }
 }
 
@@ -1198,12 +1185,12 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let files = self
-            .to_builder()
+        let mut builder = self.to_builder();
+        let files = builder
             .update(new_data, dest_store, old_data_filter)
             .await?;
 
-        self.created_index(files)
+        builder.into_created_index(files, self.index_version())
     }
 
     fn update_criteria(&self) -> UpdateCriteria {

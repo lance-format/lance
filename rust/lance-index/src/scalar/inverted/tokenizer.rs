@@ -404,15 +404,6 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
     type Error = Error;
 
     fn try_from(params: &InvertedIndexParams) -> Result<Self> {
-        Self::from_params(params, params.resolved_format_version())
-    }
-}
-
-impl pbold::InvertedIndexDetails {
-    pub(super) fn from_params(
-        params: &InvertedIndexParams,
-        format_version: InvertedListFormatVersion,
-    ) -> Result<Self> {
         Ok(Self {
             base_tokenizer: Some(params.base_tokenizer.clone()),
             language: serde_json::to_string(&params.language)?,
@@ -435,7 +426,7 @@ impl pbold::InvertedIndexDetails {
                 },
             ),
             document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
-            posting_format_version: Some(format_version.index_version()),
+            posting_format_version: Some(params.resolved_format_version().index_version()),
         })
     }
 }
