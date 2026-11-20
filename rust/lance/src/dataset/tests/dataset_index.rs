@@ -76,7 +76,9 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::json::ARROW_JSON_EXT_NAME;
-use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsQuery, MultiMatchQuery};
+use lance_index::scalar::inverted::query::{
+    CombinedFieldsQuery, FtsCorpusScope, FtsQuery, MultiMatchQuery,
+};
 use lance_table::format::BasePath;
 use lance_testing::datagen::generate_random_array;
 use rand::Rng;
@@ -4957,6 +4959,86 @@ async fn test_fts_9058_default_match_uses_global_corpus(#[case] offset: i64) {
     }
 }
 
+/// `FtsCorpusScope::Scanned` restores the pre-#9243 behavior: the filter is pushed
+/// into the unindexed scan. Indexed rows score against the index's statistics
+/// alone, while unindexed rows score against the index's statistics plus the
+/// unindexed rows that pass the filter.
+#[tokio::test]
+async fn test_fts_scanned_corpus_scope_counts_only_filtered_unindexed_rows() {
+    let raw_rows: Vec<_> = [(0, "alpha"), (1, "beta")]
+        .into_iter()
+        .chain((2..12).map(|id| (id, "alpha")))
+        .collect();
+    let fragments = [&raw_rows[..2], &raw_rows[2..]]
+        .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect());
+    let dataset = restricted_match_dataset(&fragments, 1, false).await;
+
+    let (_, indexed_expected) = raw_match_oracle(&raw_rows[..2], "alpha beta");
+    // The filter admits rows 2 and 3 of the unindexed tail.
+    let (_, mut expected) = raw_match_oracle(&raw_rows[..4], "alpha beta");
+    expected.retain(|(id, _)| *id >= 2);
+    expected.extend(indexed_expected);
+    expected.sort_by_key(|(id, _)| *id);
+
+    let query = MatchQuery::new("alpha beta".to_owned()).with_column(Some("text".to_owned()));
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(query.into()).corpus_scope(FtsCorpusScope::Scanned),
+        )
+        .unwrap()
+        .prefilter(true)
+        .filter("id < 4")
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert_not_contains!(&plan, "MatchCorpus");
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    let mut actual: Vec<_> = batch["id"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            batch[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect();
+    actual.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        actual.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        "{plan}"
+    );
+    for ((id, score), (_, expected_score)) in actual.iter().zip(&expected) {
+        assert!(
+            (f64::from(*score) - expected_score).abs() < 1e-5,
+            "row {id}: score {score} differs from {expected_score}; {plan}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fts_scanned_corpus_scope_rejects_combined_fields() {
+    let fragments = [vec![(0, Some("alpha"))], vec![(1, Some("alpha"))]];
+    let dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let query = CombinedFieldsQuery::try_new("alpha".to_owned(), vec!["text".to_owned()]).unwrap();
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(
+            FullTextSearchQuery::new_query(query.into()).corpus_scope(FtsCorpusScope::Scanned),
+        )
+        .unwrap();
+    let err = scanner.try_into_batch().await.unwrap_err();
+    assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    assert_contains!(err.to_string(), "combined_fields");
+}
+
 #[rstest]
 #[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 1]), &[0, 1, 2, 3, 4])]
 #[case::residual_fragment(RestrictedMatchDomain::Fragments(&[2]), &[5, 6, 7])]
@@ -9458,6 +9540,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9474,6 +9557,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9492,6 +9576,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9510,6 +9595,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9528,6 +9614,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9546,6 +9633,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9587,6 +9675,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9604,6 +9693,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9621,6 +9711,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9638,6 +9729,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9703,6 +9795,7 @@ async fn test_json_inverted_flat_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9742,6 +9835,7 @@ async fn test_json_inverted_phrase_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9759,6 +9853,7 @@ async fn test_json_inverted_phrase_query() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9801,6 +9896,7 @@ async fn test_json_inverted_multimatch_query() {
         }),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -9849,6 +9945,7 @@ async fn test_json_inverted_boolean_query() {
         }),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()
@@ -10406,6 +10503,7 @@ async fn test_auto_infer_lance_tokenizer() {
         ),
         limit: None,
         wand_factor: None,
+        corpus_scope: Default::default(),
     };
     let batch = dataset
         .scan()

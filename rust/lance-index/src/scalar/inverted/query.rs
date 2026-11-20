@@ -72,6 +72,34 @@ pub struct FtsSearchParams {
     pub phrase_slop: Option<u32>,
     /// The number of beginning characters being unchanged for fuzzy matching.
     pub prefix_length: u32,
+    #[serde(default)]
+    pub corpus_scope: FtsCorpusScope,
+}
+
+/// Which documents count toward the BM25 corpus statistics (document count,
+/// average length, document frequencies) when a table is only partially indexed.
+///
+/// Indexed documents always contribute the statistics stored in the index. This
+/// setting decides which unindexed documents contribute too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum FtsCorpusScope {
+    /// Count every unindexed document, regardless of the filter or fragment
+    /// selection. A document's score does not depend on the filter or on how
+    /// much of the table is indexed, but every query reads and tokenizes the
+    /// text of all unindexed rows.
+    ///
+    /// Applies to exact single-column match and phrase queries. Other query
+    /// shapes keep their existing scoring.
+    #[default]
+    Global,
+    /// Count only the unindexed documents this query reads, after the prefilter
+    /// and fragment selection. Indexed documents are scored against the index's
+    /// statistics alone. Cheaper when the filter is selective, but scores change
+    /// with the filter and with index coverage.
+    ///
+    /// Not yet supported for `combined_fields` queries.
+    Scanned,
 }
 
 impl FtsSearchParams {
@@ -83,6 +111,7 @@ impl FtsSearchParams {
             max_expansions: 50,
             phrase_slop: None,
             prefix_length: 0,
+            corpus_scope: FtsCorpusScope::Global,
         }
     }
 
@@ -113,6 +142,11 @@ impl FtsSearchParams {
 
     pub fn with_prefix_length(mut self, prefix_length: u32) -> Self {
         self.prefix_length = prefix_length;
+        self
+    }
+
+    pub fn with_corpus_scope(mut self, corpus_scope: FtsCorpusScope) -> Self {
+        self.corpus_scope = corpus_scope;
         self
     }
 }

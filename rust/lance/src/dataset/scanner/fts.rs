@@ -36,8 +36,8 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{
-    CombinedFieldsQuery, FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery,
-    fill_fts_query_column,
+    CombinedFieldsQuery, FtsCorpusScope, FtsQuery, FtsSearchParams, MatchQuery, Operator,
+    PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{
     CombinedFieldsBM25Scorer, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
@@ -1866,6 +1866,7 @@ impl Scanner {
             && self.filter.query_filter.is_none();
         if !is_primary_fts
             || self.fast_search
+            || params.corpus_scope == FtsCorpusScope::Scanned
             || params.wand_factor != 1.0
             || params.phrase_slop.is_some()
             || match_query.document_granularity != Some(DocumentGranularity::Row)
@@ -2354,6 +2355,11 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if params.corpus_scope == FtsCorpusScope::Scanned {
+            return Err(Error::not_supported(
+                "FtsCorpusScope::Scanned is not supported for combined_fields queries",
+            ));
+        }
         let target_fragments: &[Fragment] = self
             .fragments
             .as_deref()
