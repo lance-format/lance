@@ -1326,3 +1326,124 @@ def test_keys_only_index_transactions_with_older_release(venv_factory, tmp_path)
     venv_factory.get_venv("13.0.0").execute_method(
         case, "check_commit_then_drop_transactions"
     )
+
+
+@compat_test(min_version="0.39.0")
+class InvertedRowAddressDomainIndex(UpgradeDowngradeTest):
+    """Test Inverted (FTS) forward/backward compatibility across the
+    row-address-domain format change.
+
+    min_version is 0.39.0, not FtsIndex's 0.36.0, for the same reason as
+    NgramRowAddressDomainIndex above: this test's whole point is an old
+    build correctly ignoring an index format version newer than it
+    understands, and that mechanism was only introduced in 0.39.0 (#4906).
+
+    Inverted was the last builtin scalar index type still in the row-id
+    domain; it was changed to store physical row addresses in `docs.lance`'s
+    identity column instead, which bumped its index_version to 4
+    (`INVERTED_ROW_ADDR_DOMAIN_VERSION`). This dataset enables stable row
+    ids, so the two domains genuinely differ and updating a pre-change
+    segment must rebuild it rather than merge new data into it. This test
+    checks the full story:
+
+    - An old-format (row-id domain) Inverted index is loaded and used
+      correctly by the current build.
+    - Updating it (inserting rows, then optimizing) with the current build
+      keeps both old and new rows queryable.
+    - Stable readers that do not support the updated index must ignore it and
+      answer correctly via a full scan. Readers from 15.0.0 onward must use
+      it. Stable writers without the row-address capability must reject
+      inserts and unsafe updates without changing the dataset.
+
+    Without stable row ids the current build keeps writing the legacy
+    posting-format version, which FtsIndex above checks every build keeps
+    using.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def _supports_row_address_index(self) -> bool:
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "15.0.0"
+        )
+
+    def create(self):
+        """Create a stable-row-id dataset with an Inverted (FTS) index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "text": pa.array(
+                    [f"document with words {i} and more text" for i in range(1000)]
+                ),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+            enable_stable_row_ids=True,
+        )
+        dataset.create_scalar_index("text", "INVERTED")
+
+    def _assert_queryable(self, expect_index_used: bool):
+        ds = lance.dataset(self.path)
+        match_table = ds.to_table(
+            full_text_query={"query": "words 7", "columns": ["text"]}
+        )
+        assert match_table.num_rows > 0
+        assert 7 in match_table.column("idx").to_pylist()
+
+        explain = ds.scanner(
+            full_text_query={"query": "words 7", "columns": ["text"]}
+        ).explain_plan()
+        # "FlatMatchQuery" (the brute-force fallback) also contains
+        # "MatchQuery" as a substring, so check its absence too.
+        used_index = "MatchQuery" in explain and "FlatMatchQuery" not in explain
+        if expect_index_used:
+            assert used_index, "expected the Inverted index to be used"
+        else:
+            assert not used_index, (
+                "an older build must not use an Inverted index in a format "
+                "it does not understand -- it should fall back to a full scan"
+            )
+
+    def check_read(self):
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
+
+    def check_write(self):
+        """Fence old writers; verify current writes and index maintenance."""
+        ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
+        data = pa.table(
+            {
+                "idx": pa.array([new_key]),
+                "text": pa.array([f"brand new document {new_key}"]),
+            }
+        )
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
+            _assert_row_address_writes_fenced(ds, data, self.compat_version)
+            return
+        ds.insert(data)
+        # For the current build updating a legacy row-id-domain segment,
+        # this must rebuild (not merge) the index -- see the class docstring.
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        # A row-count match alone would still pass if the rebuild silently
+        # left the column unindexed (a full scan gives the same counts), so
+        # also check the rebuilt index is actually used.
+        self._assert_queryable(expect_index_used=True)
+        ds = lance.dataset(self.path)
+        match_table = ds.to_table(
+            full_text_query={
+                "query": f"brand new document {new_key}",
+                "columns": ["text"],
+            }
+        )
+        assert new_key in match_table.column("idx").to_pylist()

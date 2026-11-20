@@ -22,7 +22,7 @@ use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
 use crate::io::exec::PreFilterSource;
-use crate::io::exec::utils::{PreFilterMasks, build_prefilter};
+use crate::io::exec::utils::{PreFilterMasks, build_prefilter_in_domain};
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::query::{
     FtsSearchParams, PhraseQuery, try_collect_query_tokens,
@@ -36,7 +36,10 @@ use uuid::Uuid;
 use super::corpus::SharedFtsScorer;
 use super::matches::scored_documents_batch;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
-use super::segments::{open_fts_segments, search_segments, segments_the_prefilter_may_match};
+use super::segments::{
+    fts_row_addr_to_row_id, fts_segments_are_address_domain, open_fts_segments, search_segments,
+    segments_the_prefilter_may_match,
+};
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
 /// Indexed phrase search with an explicit document boundary and candidate scope.
@@ -529,12 +532,12 @@ impl ExecutionPlan for PhraseQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
-            let address_domain = !ds.manifest.uses_stable_row_ids();
+            let address_domain = fts_segments_are_address_domain(&ds, &segments);
             let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter_in_domain(
                 context.clone(),
                 partition,
                 &prefilter_source,
@@ -545,7 +548,9 @@ impl ExecutionPlan for PhraseQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-            )?;
+                address_domain,
+            )
+            .await?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -600,6 +605,7 @@ impl ExecutionPlan for PhraseQueryExec {
             .await;
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, indices.first()).await?;
             let documents = search_segments(
                 &indices,
                 tokens,
@@ -612,7 +618,7 @@ impl ExecutionPlan for PhraseQueryExec {
             )
             .await?;
             metrics.baseline_metrics.record_output(documents.len());
-            let batch = scored_documents_batch(schema, documents)?;
+            let batch = scored_documents_batch(schema, documents, row_addr_to_row_id.as_deref())?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(

@@ -2898,15 +2898,24 @@ async fn test_a_detached_commit_does_not_erase_an_unsupported_index() {
 /// Both sides therefore have to count the same indices: planning from the
 /// filtered view while the commit carries the complete one makes compaction
 /// fail outright on a dataset holding an index from a newer build.
+///
+/// Every scalar index type is now address-domain (Inverted's migration to
+/// `INVERTED_ROW_ADDR_DOMAIN_VERSION` was the last one), so none of them can
+/// "just follow" a stable-row-id rewrite the way a row-id-domain index once
+/// could: an unreadable instance cannot be opened to remap it, and this
+/// build cannot tell that from metadata alone (its type still reports
+/// `supports_eager_remap`), so the covered group rewrites anyway and the
+/// commit drops the index's coverage of it instead of claiming rows it can
+/// no longer resolve (see `drop_rewritten_fragments`) -- the scanner falls
+/// back to a full scan for those rows rather than compaction being blocked.
 #[tokio::test]
-async fn test_compaction_survives_an_unsupported_index() {
+async fn test_compaction_drops_coverage_of_an_unsupported_index_it_rewrites() {
     let test_dir = tempfile::tempdir().unwrap();
     let test_uri = test_dir.path().to_str().unwrap();
 
-    // A text column alongside `two_column_reader`'s numeric ones: the only
-    // remaining row-id-domain scalar index type (Inverted) requires text;
-    // the others moved to row-address domain and no longer exercise this
-    // test.
+    // A text column alongside `two_column_reader`'s numeric ones: Inverted
+    // requires text, and every other scalar index type exercises this same
+    // drop-coverage path too now that all of them are address-domain.
     fn three_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
         lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
@@ -2925,10 +2934,6 @@ async fn test_compaction_survives_an_unsupported_index() {
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
 
-    // Row-id-domain: its coverage is recalculated (not dropped) across a
-    // rewrite under stable row ids, which is exactly the property this test
-    // checks. The other scalar index types moved to row-address domain and
-    // no longer exercise it.
     let inverted_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
     dataset
         .create_index_builder(&["text"], IndexType::Inverted, &inverted_params)
@@ -2956,8 +2961,9 @@ async fn test_compaction_survives_an_unsupported_index() {
         .await
         .unwrap();
 
-    // Without a real rewrite the assertions below hold vacuously: an empty
-    // plan commits nothing and re-reads the manifest it started from.
+    // Both the covered fragments and the uncovered ones rewrite, in separate
+    // groups (coverage was never split): compaction is not blocked by the
+    // unreadable index.
     assert_eq!(metrics.fragments_removed, 4);
     assert_eq!(dataset.get_fragments().len(), 2);
 
@@ -2970,8 +2976,9 @@ async fn test_compaction_survives_an_unsupported_index() {
         .map(|f| f.id() as u32)
         .collect::<RoaringBitmap>();
     assert!(
-        !after.fragment_bitmap.unwrap().is_disjoint(&live),
-        "the surviving index covers only fragments the rewrite deleted"
+        after.fragment_bitmap.unwrap().is_disjoint(&live),
+        "an unreadable address-domain index cannot be remapped eagerly, so its coverage of the \
+         rewritten fragments should have been dropped rather than claimed"
     );
 }
 

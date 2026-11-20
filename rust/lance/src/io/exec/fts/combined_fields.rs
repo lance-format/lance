@@ -24,9 +24,10 @@ use crate::Dataset;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::utils::{
-    PreFilterMasks, build_prefilter, build_prefilter_restricted_to_fragments,
+    PreFilterMasks, build_prefilter_in_domain, build_prefilter_restricted_to_fragments_in_domain,
 };
 use lance_index::prefilter::PreFilter;
+use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::inverted::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsSearchParams, Tokens, try_collect_query_tokens,
@@ -40,7 +41,10 @@ use tracing::instrument;
 
 use super::corpus::SharedFtsScorer;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
-use super::segments::{combined_columns_the_prefilter_may_match, open_fts_segments};
+use super::segments::{
+    combined_columns_the_prefilter_may_match, fts_row_addr_to_row_id,
+    fts_segments_are_address_domain, open_fts_segments, translate_row_ids_and_scores,
+};
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
 /// Cross-field BM25F full-text search (`combined_fields`).
@@ -380,14 +384,31 @@ pub(super) async fn open_combined_fields_scan(
             }
             None => Vec::new(),
         };
+        // `stale_rows` is built by the scanner in row-id domain (the
+        // convention every prefilter source and external mask follows), but
+        // it is checked here against this column's own index directly --
+        // `bm25_row_stats_for_terms` compares it to the index's stored
+        // identifiers, physical addresses for the address-domain index every
+        // fresh build now produces (see `INVERTED_ROW_ADDR_DOMAIN_VERSION`).
+        let column_stale_rows = match stale_rows.get(slot).filter(|rows| !rows.is_empty()) {
+            Some(rows)
+                if !dataset.manifest.uses_stable_row_ids()
+                    || indices
+                        .first()
+                        .is_some_and(|index| index.results_are_row_addresses()) =>
+            {
+                Some(Arc::new(
+                    crate::io::exec::utils::translate_treemap_to_row_addr_domain(dataset, rows)
+                        .await?,
+                ))
+            }
+            other => other.cloned(),
+        };
         columns.push(CombinedFieldColumn {
             column: column.to_string(),
             weight,
             indices,
-            stale_rows: stale_rows
-                .get(slot)
-                .filter(|rows| !rows.is_empty())
-                .cloned(),
+            stale_rows: column_stale_rows,
         });
     }
     validate_combined_tokenizers(&columns)?;
@@ -493,7 +514,6 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let address_domain = !ds.manifest.uses_stable_row_ids();
             let ds_for_scope = ds.clone();
 
             let CombinedFieldsScan {
@@ -513,30 +533,45 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 metrics.as_ref(),
             )
             .await?;
+            let representative_index = columns
+                .iter()
+                .flat_map(|column| column.indices.first())
+                .next();
+            let row_addr_to_row_id =
+                fts_row_addr_to_row_id(&ds_for_scope, representative_index).await?;
+            let address_domain = fts_segments_are_address_domain(&ds_for_scope, &all_segments);
 
             // With mixed coverage the planner supplies the fragments every target
             // column indexes, and the scan is restricted to exactly those: the
             // rest go to the flat sibling. Otherwise the prefilter spans the union
             // of the target columns' segments.
             let mut pre_filter = match covered_fragments {
-                Some(covered) => build_prefilter_restricted_to_fragments(
-                    context.clone(),
-                    partition,
-                    &prefilter_source,
-                    ds,
-                    covered,
-                    masks,
-                    &exec_metrics,
-                )?,
-                None => build_prefilter(
-                    context.clone(),
-                    partition,
-                    &prefilter_source,
-                    ds,
-                    &all_segments,
-                    masks,
-                    &exec_metrics,
-                )?,
+                Some(covered) => {
+                    build_prefilter_restricted_to_fragments_in_domain(
+                        context.clone(),
+                        partition,
+                        &prefilter_source,
+                        ds,
+                        covered,
+                        masks,
+                        &exec_metrics,
+                        address_domain,
+                    )
+                    .await?
+                }
+                None => {
+                    build_prefilter_in_domain(
+                        context.clone(),
+                        partition,
+                        &prefilter_source,
+                        ds,
+                        &all_segments,
+                        masks,
+                        &exec_metrics,
+                        address_domain,
+                    )
+                    .await?
+                }
             };
             let deleted_fragments = columns.iter().flat_map(|column| &column.indices).fold(
                 roaring::RoaringBitmap::new(),
@@ -594,6 +629,8 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 metrics.as_ref(),
             )
             .await?;
+            let (doc_ids, scores) =
+                translate_row_ids_and_scores(doc_ids, scores, row_addr_to_row_id.as_deref());
             metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(

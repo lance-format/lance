@@ -93,7 +93,7 @@ async fn test_prefilter_skips_excluded_partition_postings(
     let remapper =
         translated.then(|| Arc::new(OffsetBatchRemapper::default()) as Arc<dyn BatchRowIdRemapper>);
     let reference =
-        InvertedIndex::load_with_remapping(store, remapper.clone(), &LanceCache::no_cache())
+        InvertedIndex::load_with_remapping(store, remapper.clone(), &LanceCache::no_cache(), true)
             .await
             .unwrap();
     let tokens = Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text);
@@ -145,7 +145,7 @@ async fn test_prefilter_skips_excluded_partition_postings(
         posting_file: posting_file_path(1),
         counter: counter.clone(),
     });
-    let index = InvertedIndex::load_with_remapping(store, remapper, &LanceCache::no_cache())
+    let index = InvertedIndex::load_with_remapping(store, remapper, &LanceCache::no_cache(), true)
         .await
         .unwrap();
     // Statistics still cover both partitions. Only candidate posting reads may be skipped.
@@ -221,12 +221,13 @@ async fn test_single_partition_merge_preserves_remapping_and_filtering(
         TokenSetFormat::default(),
         "hit",
         100,
+        true,
     )
     .await?;
     let remapper =
         translated.then(|| Arc::new(OffsetBatchRemapper::default()) as Arc<dyn BatchRowIdRemapper>);
     let index =
-        InvertedIndex::load_with_remapping(source, remapper, &LanceCache::no_cache()).await?;
+        InvertedIndex::load_with_remapping(source, remapper, &LanceCache::no_cache(), true).await?;
     let old_row = if translated { 1100 } else { 100 };
     let filter = keep_old.map(|keep| {
         crate::scalar::OldIndexDataFilter::RowIds(if keep {
@@ -235,7 +236,7 @@ async fn test_single_partition_merge_preserves_remapping_and_filtering(
             RowAddrTreeMap::new()
         })
     });
-    let batch = arrow_array::record_batch!(("doc", Utf8, ["hit"]), ("_rowid", UInt64, [200]))?;
+    let batch = arrow_array::record_batch!(("doc", Utf8, ["hit"]), ("_rowaddr", UInt64, [200]))?;
     let input = Box::pin(RecordBatchStreamAdapter::new(
         batch.schema(),
         stream::iter([Ok(batch)]),
@@ -250,7 +251,7 @@ async fn test_single_partition_merge_preserves_remapping_and_filtering(
     .await?;
     // Reload without any translator: maintenance must have persisted the
     // current old address, while leaving the newly appended address alone.
-    let updated = InvertedIndex::load(dest, None, &LanceCache::no_cache()).await?;
+    let updated = InvertedIndex::load(dest, None, &LanceCache::no_cache(), true).await?;
     let (mut row_ids, _) = updated
         .bm25_search(
             Arc::new(Tokens::new(vec!["hit".to_owned()], DocType::Text)),
@@ -287,6 +288,7 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
         TokenSetFormat::default(),
         "hit",
         100,
+        true,
     )
     .await
     .unwrap();
@@ -294,7 +296,7 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     let remapper = Arc::new(OffsetBatchRemapper::default());
     let remapper_weak = Arc::downgrade(&remapper);
     let cache = LanceCache::with_capacity(1 << 20);
-    let index = InvertedIndex::load_with_remapping(store, Some(remapper.clone()), &cache)
+    let index = InvertedIndex::load_with_remapping(store, Some(remapper.clone()), &cache, true)
         .await
         .unwrap();
     index.prewarm().await.unwrap();
@@ -410,8 +412,10 @@ async fn test_request_wrappers_preserve_prewarmed_index_state() {
                 None,
                 &cache,
                 async move {
-                    Ok(InvertedIndex::load(load_store, None, &load_cache).await?
-                        as Arc<dyn ScalarIndex>)
+                    Ok(
+                        InvertedIndex::load(load_store, None, &load_cache, true).await?
+                            as Arc<dyn ScalarIndex>,
+                    )
                 }
                 .boxed(),
             )
@@ -452,7 +456,9 @@ async fn test_request_wrappers_preserve_prewarmed_index_state() {
             Some((4, 2, vec![2, 1]))
         );
     }
-    let independently_loaded = InvertedIndex::load(store, None, &cache).await.unwrap();
+    let independently_loaded = InvertedIndex::load(store, None, &cache, true)
+        .await
+        .unwrap();
     assert!(
         !first
             .unwrap()
@@ -583,7 +589,7 @@ async fn test_write_many_posting_list_batches_preserves_all_batches() {
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -642,7 +648,7 @@ async fn test_and_query_skips_partition_missing_required_term() {
 
     write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -696,7 +702,7 @@ async fn test_fuzzy_and_groups_expansions_by_original_position() {
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
     let params = Arc::new(
@@ -791,7 +797,7 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query(
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
     let partition = index.partitions[0].clone();
@@ -906,7 +912,7 @@ async fn load_test_index(
     partition_ids: Vec<u64>,
 ) -> Arc<InvertedIndex> {
     write_test_metadata(&store, partition_ids, InvertedIndexParams::default()).await;
-    InvertedIndex::load(store, None, &LanceCache::with_capacity(4096))
+    InvertedIndex::load(store, None, &LanceCache::with_capacity(4096), true)
         .await
         .unwrap()
 }
@@ -960,7 +966,7 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
     .await;
     write_test_metadata(&first_store, vec![0], InvertedIndexParams::default()).await;
     let first_cache = Arc::new(LanceCache::with_capacity(4096));
-    let first = InvertedIndex::load(first_store, None, first_cache.as_ref())
+    let first = InvertedIndex::load(first_store, None, first_cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -973,7 +979,7 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
     write_pair_partition(&second_store, 0, &[("alpha", "beta", 200)]).await;
     write_test_metadata(&second_store, vec![0], InvertedIndexParams::default()).await;
     let second_cache = Arc::new(LanceCache::with_capacity(4096));
-    let second = InvertedIndex::load(second_store, None, second_cache.as_ref())
+    let second = InvertedIndex::load(second_store, None, second_cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -1135,7 +1141,9 @@ async fn load_prewarmed_index(
 ) -> (Arc<InvertedIndex>, LanceCache) {
     write_test_metadata(&store, partition_ids, params).await;
     let cache = LanceCache::with_capacity(1 << 20);
-    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    let index = InvertedIndex::load(store, None, &cache, true)
+        .await
+        .unwrap();
     index
         .prewarm_with_options(&FtsPrewarmOptions::default())
         .await
@@ -1688,7 +1696,7 @@ async fn test_fuzzy_expansion_cap_is_global_across_partitions() {
     write_variant_partition(&store, 1, &["alphc", "alphd"], &[102, 103]).await;
     write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -1811,7 +1819,9 @@ async fn test_fuzzy_results_independent_of_partition_shape() {
     let mut results = Vec::new();
     for store in [single_store, split_store] {
         let cache = LanceCache::with_capacity(4096);
-        let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+        let index = InvertedIndex::load(store, None, &cache, true)
+            .await
+            .unwrap();
         let tokens = Arc::new(Tokens::new(vec!["alphx".to_owned()], DocType::Text));
         let (row_ids, scores) = index
             .bm25_search(
@@ -1877,7 +1887,7 @@ async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -1936,7 +1946,7 @@ async fn test_grouped_scoring_keeps_exact_winner_outside_proxy_window(#[case] op
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -1997,7 +2007,7 @@ async fn test_fuzzy_and_grouped_rescore_keeps_wand_limit_bounded() {
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -2093,7 +2103,7 @@ async fn test_phrase_query_reads_legacy_per_doc_positions() {
     writer.finish_with_metadata(metadata).await.unwrap();
 
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 

@@ -858,7 +858,7 @@ async fn test_build_search_uses_configured_posting_block_size() {
     write_test_metadata(&store, vec![0], params).await;
 
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
     assert_eq!(index.partitions[0].inverted_list.block_size(), block_size);
