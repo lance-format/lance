@@ -11,8 +11,20 @@ from pathlib import Path
 
 import pytest
 from compat import compat_decorator
+from packaging.version import Version
 
 TESTS_DIR = Path(__file__).resolve().parent
+
+
+@pytest.fixture
+def snapshot_releases(monkeypatch):
+    """Serve the given stable releases and restore the cached snapshot after."""
+
+    def use(*releases):
+        monkeypatch.setattr(compat_decorator, "_SNAPSHOT", {"stable": list(releases)})
+
+    return use
+
 
 # Returns an extra release on gw1 only, so a worker that resolves the list itself
 # parametrizes differently from the controller and from its sibling.
@@ -31,7 +43,14 @@ from compat import compat_decorator
 def _fetch_stable_versions():
     extra = ["8.0.0"] if os.environ.get("PYTEST_XDIST_WORKER") == "gw1" else []
     return sorted(Version(v) for v in ["6.0.0", "7.0.0", *extra])
+
+
+def _source_version():
+    return Version("9.0.0")
+
+
 compat_decorator._fetch_stable_versions = _fetch_stable_versions
+compat_decorator._source_version = _source_version
 """
 
 # Not run with --run-compat: the generated cases stay collected but skipped, which
@@ -128,19 +147,17 @@ def test_stable_release_discovery_excludes_prereleases(monkeypatch):
     assert [str(v) for v in compat_decorator._fetch_stable_versions()] == ["14.0.0"]
 
 
-def test_version_snapshot_rejects_prereleases():
-    compat_decorator.use_version_snapshot({"stable": ["14.0.0", "15.0.0b8"]})
-    try:
-        with pytest.raises(ValueError, match="only stable releases"):
-            compat_decorator.pylance_stable_versions()
-    finally:
-        compat_decorator.use_version_snapshot({"stable": []})
+def test_version_snapshot_rejects_prereleases(snapshot_releases):
+    snapshot_releases("14.0.0", "15.0.0b8")
+    with pytest.raises(ValueError, match="only stable releases"):
+        compat_decorator.pylance_stable_versions()
 
 
-def test_compat_versions_select_recent_stable_majors():
-    compat_decorator.use_version_snapshot(
-        {"stable": ["0.39.0", "12.0.0", "13.0.0", "14.0.0", "14.0.2"]}
-    )
+def test_compat_versions_select_recent_stable_majors(snapshot_releases, monkeypatch):
+    # Pin the checkout version so the selection under test does not depend on
+    # which branch this file runs from.
+    monkeypatch.setattr(compat_decorator, "_source_version", lambda: Version("15.0.0"))
+    snapshot_releases("0.39.0", "12.0.0", "13.0.0", "14.0.0", "14.0.2")
     assert compat_decorator.compat_versions() == ["14.0.2", "13.0.0", "12.0.0"]
 
 
@@ -148,3 +165,28 @@ def test_compat_versions_select_recent_stable_majors():
 def test_compat_test_rejects_prerelease_minimum(version):
     with pytest.raises(ValueError, match="only stable releases"):
         compat_decorator.compat_test(min_version=version)
+
+
+def test_compat_versions_skip_releases_newer_than_the_source(snapshot_releases):
+    newer = f"{compat_decorator._source_version().major + 1}.0.0"
+    snapshot_releases("13.0.0", newer)
+    assert compat_decorator.compat_versions() == ["13.0.0"]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # A pre-release checkout predates the release it leads to, so a stable
+        # build of that release may write data this checkout cannot read.
+        ("15.0.0-beta.25", ["14.0.2"]),
+        ("15.0.0-rc.1", ["14.0.2"]),
+        # A checkout at a stable version does test against that release.
+        ("15.0.0", ["15.0.0", "14.0.2"]),
+    ],
+)
+def test_compat_versions_bound_releases_by_checkout_version(
+    source, expected, snapshot_releases, monkeypatch
+):
+    monkeypatch.setattr(compat_decorator, "_source_version", lambda: Version(source))
+    snapshot_releases("14.0.2", "15.0.0")
+    assert compat_decorator.compat_versions() == expected
