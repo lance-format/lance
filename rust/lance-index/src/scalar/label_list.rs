@@ -1241,13 +1241,13 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::SchemaRef;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
     use std::sync::atomic::Ordering;
 
     use arrow_array::builder::{GenericListBuilder, LargeListBuilder, ListBuilder, StringBuilder};
+    use arrow_schema::SchemaRef;
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
@@ -2386,15 +2386,8 @@ mod tests {
         );
     }
 
-    /// A null *element* inside a list, a null *list*, and an empty list are three
-    /// different things and must land in three different places. `unnest_labels`
-    /// runs ahead of the unnest, where the list column's validity is still present,
-    /// which is the only reason they are separable -- after unnesting, a null list
-    /// and an empty list are both zero rows.
-    ///
-    /// Asserted through every path that writes an index, so moving the unnest
-    /// upstream of the null tracking fails here rather than silently misfiling
-    /// rows and breaking NOT filters on nullable list columns.
+    /// A null element has a posting, a null list is recorded in the list-null
+    /// bitmap, and an empty list contributes to neither.
     #[rstest]
     #[case::build("build")]
     #[case::update("update")]
