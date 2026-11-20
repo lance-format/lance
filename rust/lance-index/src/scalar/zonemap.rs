@@ -51,7 +51,7 @@ use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ParallelZoneTrainer, ZoneBound, ZoneProcessor, search_zones};
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map::Entry};
 
 /// `rows` without the positions of `fragments`.
 fn without_fragments(
@@ -1459,7 +1459,46 @@ pub async fn merge_zonemap_indices(
     dest_store: &dyn IndexStore,
     fragment_filter: &RoaringBitmap,
 ) -> Result<CreatedIndex> {
-    let first = source_indices.first().ok_or_else(|| {
+    let sources = source_indices
+        .iter()
+        .map(|&index| (index, fragment_filter))
+        .collect::<Vec<_>>();
+    merge_zonemap_indices_with_scan(
+        &sources,
+        dest_store,
+        &RoaringBitmap::new(),
+        ScannedZones::default(),
+    )
+    .await
+}
+
+/// Merge retained zones with complete replacement zones trained from the current snapshot.
+/// Each source filter selects the zones and null positions to retain from that source.
+/// `replaced_fragments` names every fragment scanned in full, including those with no
+/// surviving rows. It must be disjoint from every source filter.
+/// The result has an exact null bitmap when each input that contributes zones provides one.
+///
+/// # Examples
+///
+/// ```no_run
+/// use lance_index::scalar::IndexStore;
+/// use lance_index::scalar::zonemap::{ScannedZones, ZoneMapIndex, merge_zonemap_indices_with_scan};
+/// use roaring::RoaringBitmap;
+///
+/// async fn merge(sources: &[(&ZoneMapIndex, &RoaringBitmap)],
+///                replaced: &RoaringBitmap, replacements: ScannedZones,
+///                dest: &dyn IndexStore) -> lance_core::Result<()> {
+///     merge_zonemap_indices_with_scan(sources, dest, replaced, replacements).await?;
+///     Ok(())
+/// }
+/// ```
+pub async fn merge_zonemap_indices_with_scan(
+    sources: &[(&ZoneMapIndex, &RoaringBitmap)],
+    dest_store: &dyn IndexStore,
+    replaced_fragments: &RoaringBitmap,
+    scanned: ScannedZones,
+) -> Result<CreatedIndex> {
+    let &(first, _) = sources.first().ok_or_else(|| {
         Error::invalid_input("merge_zonemap_indices requires at least one source index")
     })?;
     let rows_per_zone = first.rows_per_zone;
@@ -1470,10 +1509,7 @@ pub async fn merge_zonemap_indices(
     // to upgrade a version 0 segment with, so mixed inputs are refused
     // before anything is written.
     let version = first.version;
-    if let Some(other) = source_indices
-        .iter()
-        .find(|source| source.version != version)
-    {
+    if let Some((other, _)) = sources.iter().find(|(source, _)| source.version != version) {
         return Err(Error::not_supported_source(
             format!(
                 "cannot merge ZoneMap segments of different file versions ({} and {}); \
@@ -1484,10 +1520,26 @@ pub async fn merge_zonemap_indices(
         ));
     }
 
-    let mut zones = Vec::new();
-    let mut merged_null_rows = RowAddrTreeMap::new();
-    let mut any_missing_bitmap = false;
-    for source in source_indices {
+    for (_, retained) in sources {
+        if !retained.is_disjoint(replaced_fragments) {
+            let overlap = *retained & replaced_fragments;
+            return Err(Error::invalid_input(format!(
+                "ZoneMap fragments cannot be both retained and replaced: {overlap:?}"
+            )));
+        }
+    }
+    for zone in &scanned.zones {
+        let id = zone.bound.fragment_id;
+        if !u32::try_from(id).is_ok_and(|id| replaced_fragments.contains(id)) {
+            return Err(Error::invalid_input(format!(
+                "ZoneMap scan contains fragment {id} outside the replacement set"
+            )));
+        }
+    }
+    let (targets, mut merged_null_rows) =
+        scanned.into_target_zones(HashMap::new(), rows_per_zone)?;
+    let mut zones: Vec<_> = targets.collect();
+    for &(source, fragment_filter) in sources {
         if source.batch_remapper.is_some() {
             return Err(Error::not_supported(
                 "this index maintenance operation does not support asynchronous row-ID remapping",
@@ -1511,12 +1563,16 @@ pub async fn merge_zonemap_indices(
                 store_null_bitmap, source.store_null_bitmap
             )));
         }
+        if fragment_filter.is_empty() {
+            continue;
+        }
         let remapped_null_rows = source.null_rows.as_ref().map(|null_rows| {
             source.fri.as_deref().map_or_else(
                 || null_rows.clone(),
                 |remapper| remapper.remap_row_addrs_tree_map(null_rows),
             )
         });
+        let previous_zone_count = zones.len();
         for zone in &source.zones {
             let source_zones = source.fri.as_deref().map_or_else(
                 || Ok(vec![zone.clone()]),
@@ -1542,20 +1598,21 @@ pub async fn merge_zonemap_indices(
                 zones.push(remapped);
             }
         }
-        match remapped_null_rows {
-            Some(mut filtered) => {
-                filtered.retain_fragments(fragment_filter.iter());
-                merged_null_rows |= &filtered;
-            }
-            None => any_missing_bitmap = true,
+        if zones.len() == previous_zone_count {
+            continue;
         }
+        let retained_null_rows = remapped_null_rows.map(|mut rows| {
+            rows.retain_fragments(fragment_filter.iter());
+            rows
+        });
+        merged_null_rows = union_null_positions(merged_null_rows, retained_null_rows);
     }
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
     let mut builder =
         ZoneMapIndexBuilder::try_new(first.builder_params(), data_type)?.with_version(version);
     builder.maps = zones;
-    builder.set_null_rows((!any_missing_bitmap).then_some(merged_null_rows));
+    builder.set_null_rows(merged_null_rows);
     let has_null_bitmap = builder.null_rows.is_some();
     let files = builder.write_index(dest_store).await?;
 
@@ -3624,20 +3681,62 @@ impl ZoneMapSegmentBase<'_> {
     }
 }
 
-/// Zone statistics produced by scanning rows, ready to complete the zones
-/// of [`ReusedZones`]: a zone fed partly from seeds receives the scanned
-/// rows' piece, a zone with no seed is the scanned piece.
-#[derive(Debug, Default)]
+/// Pieces of target zones produced by scanning rows. Disjoint scans and
+/// [`ReusedZones`] can each supply part of the same zone.
+#[derive(Debug)]
 pub struct ScannedZones {
     zones: Vec<ZoneMapStatistics>,
-    null_rows: RowAddrTreeMap,
+    /// Exact positions for every scanned row, or `None` when they were not collected.
+    null_rows: Option<RowAddrTreeMap>,
+}
+
+impl Default for ScannedZones {
+    fn default() -> Self {
+        Self {
+            zones: Vec::new(),
+            null_rows: Some(RowAddrTreeMap::new()),
+        }
+    }
+}
+
+/// A union is exact only when both of its inputs are exact.
+fn union_null_positions(
+    left: Option<RowAddrTreeMap>,
+    right: Option<RowAddrTreeMap>,
+) -> Option<RowAddrTreeMap> {
+    Some(left? | right?)
 }
 
 impl ScannedZones {
     /// Append another scan's pieces; the two cover disjoint rows.
     pub fn merge(&mut self, other: Self) {
         self.zones.extend(other.zones);
-        self.null_rows |= &other.null_rows;
+        self.null_rows = union_null_positions(self.null_rows.take(), other.null_rows);
+    }
+
+    fn into_target_zones(
+        self,
+        mut targets: HashMap<(u64, u64), ZoneMapStatistics>,
+        rows_per_zone: u64,
+    ) -> Result<(
+        impl Iterator<Item = ZoneMapStatistics>,
+        Option<RowAddrTreeMap>,
+    )> {
+        for piece in self.zones {
+            let key = (piece.bound.fragment_id, piece.bound.start / rows_per_zone);
+            match targets.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    let zone = entry.get_mut();
+                    // Without a fragment row count, each scan infers the end from its last row.
+                    zone.bound.length = zone.bound.length.max(piece.bound.length);
+                    fold_zone_stats(zone, &piece)?;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(piece);
+                }
+            }
+        }
+        Ok((targets.into_values(), self.null_rows))
     }
 }
 
@@ -3659,7 +3758,10 @@ pub async fn train_zonemap_scan(
     .with_null_tracking(keep_positions)
     .aligned_to(physical_rows);
     let (zones, null_rows) = trainer.train(scan).await?;
-    Ok(ScannedZones { zones, null_rows })
+    Ok(ScannedZones {
+        null_rows: (keep_positions || zones.is_empty()).then_some(null_rows),
+        zones,
+    })
 }
 
 /// [`write_zonemap_segment`] after training `scan`, when there is one.
@@ -3711,7 +3813,7 @@ pub async fn build_zonemap_segment(
 /// update, the base index's previous zones and null positions for them are
 /// superseded (a column replacement retires the values they described).
 /// When the base keeps exact null positions, `reused` must have been built
-/// with `need_null_positions` and the scan collects positions too.
+/// with `need_null_positions`. A scan without positions makes the result inexact for nulls.
 pub async fn write_zonemap_segment(
     base: ZoneMapSegmentBase<'_>,
     data_type: &DataType,
@@ -3758,7 +3860,7 @@ pub async fn write_zonemap_segment(
                 .collect()
         })
         .unwrap_or_default();
-    let mut null_rows = keep_positions.then(|| {
+    let null_rows = keep_positions.then(|| {
         let mut rows = existing
             .and_then(|index| index.null_rows.as_ref())
             .map(|rows| without_fragments(rows, refreshed.iter().copied()))
@@ -3766,23 +3868,10 @@ pub async fn write_zonemap_segment(
         rows |= &reused.null_rows;
         rows
     });
-    let mut targets = reused.zones;
-    for piece in scanned.zones {
-        let key = (
-            piece.bound.fragment_id,
-            piece.bound.start / params.rows_per_zone,
-        );
-        match targets.get_mut(&key) {
-            Some(zone) => fold_zone_stats(zone, &piece)?,
-            None => {
-                targets.insert(key, piece);
-            }
-        }
-    }
-    if let Some(rows) = null_rows.as_mut() {
-        *rows |= &scanned.null_rows;
-    }
-    zones.extend(targets.into_values());
+    let (targets, scanned_null_rows) =
+        scanned.into_target_zones(reused.zones, params.rows_per_zone)?;
+    let null_rows = union_null_positions(null_rows, scanned_null_rows);
+    zones.extend(targets);
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
     let rows_per_zone = params.rows_per_zone;

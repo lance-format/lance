@@ -11,7 +11,7 @@ use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
-use lance_select::{RowAddrSelection, RowAddrTreeMap};
+use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use lance_table::{
     format::{
         Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
@@ -273,13 +273,19 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
         };
         let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
 
+        let deletion_vector = file_fragment.get_deletion_vector().await?;
         match selection {
             RowAddrSelection::Full => {
-                // The whole fragment is selected: every live row's id qualifies.
-                row_ids |= RowAddrTreeMap::from(sequence.as_ref());
+                let mut fragment_ids = RowAddrTreeMap::from(sequence.as_ref());
+                if let Some(deletions) = deletion_vector {
+                    let offsets = deletions.to_sorted_iter().map(|offset| offset as usize);
+                    for deleted_id in sequence.select(offsets) {
+                        fragment_ids.remove(deleted_id);
+                    }
+                }
+                row_ids |= fragment_ids;
             }
             RowAddrSelection::Partial(offsets) => {
-                let deletion_vector = file_fragment.get_deletion_vector().await?;
                 for physical_offset in offsets.iter() {
                     // A deletion does not compact the row id sequence; the deleted row keeps
                     // its slot (the deletion vector tracks it separately). So a physical offset

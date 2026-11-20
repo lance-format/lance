@@ -22,11 +22,15 @@ use lance_core::{
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
+    DocumentGranularity, InvertedIndex, InvertedIndexParams, InvertedIndexPlugin,
+    doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{IndexFile, IndexStore, index_files_to_table};
+use lance_index::scalar::{
+    IndexFile, IndexStore, OldIndexDataFilter, TrainingCriteria, TrainingOrdering,
+    index_files_to_table,
+};
 use lance_table::format::IndexMetadata;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -937,15 +941,14 @@ pub(crate) async fn finalize_segment_files_if_needed(
 }
 
 /// A lone staged segment is the merged segment as it stands only while its
-/// files hold live row addresses: no reuse mapping moved its coverage and no
-/// tagged plan asks to translate it. Anything else must be rewritten.
+/// files already hold the rows and addresses the output will publish.
 fn single_segment_keeps_row_addresses(
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
     uuid: &Uuid,
-    source_coverage_moved: bool,
+    requires_rewrite: bool,
 ) -> bool {
     use crate::index::frag_reuse::SegmentRemappingPlan;
-    if source_coverage_moved {
+    if requires_rewrite {
         return false;
     }
     match staged.and_then(|plans| plans.get(uuid)) {
@@ -989,11 +992,12 @@ async fn promote_finalized_segment(
 }
 
 /// Merge one caller-defined group of source FTS segments into a single segment.
-pub(crate) async fn merge_segments(
+pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
-    source_coverage_moved: bool,
+    requires_rewrite: bool,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -1022,67 +1026,100 @@ pub(crate) async fn merge_segments(
     load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
 
     if let [segment] = segments.as_slice()
-        && single_segment_keeps_row_addresses(staged, &segment.uuid, source_coverage_moved)
+        && segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|covered| !covered.is_empty())
+        && refresh.is_empty()
+        && single_segment_keeps_row_addresses(staged, &segment.uuid, requires_rewrite)
     {
         return promote_finalized_segment(dataset, segment, details).await;
     }
 
-    let mut source_indices = Vec::with_capacity(segments.len());
-    let mut fragment_bitmap = RoaringBitmap::new();
-    for segment in &segments {
-        finalize_segment_files_if_needed(dataset, segment).await?;
-        fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
-            Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            ))
-        })?;
-        if !segment.declares_same_fields(&segments[0]) {
-            return Err(Error::invalid_input(format!(
-                "FTS index {} has inconsistent fields across segments",
-                segments[0].name
-            )));
-        }
-        let scalar_index = super::open_scalar_index_with_plan(
-            dataset,
-            &resolved.canonical_path,
-            segment,
-            staged.and_then(|plans| plans.get(&segment.uuid)),
-            crate::index::frag_reuse::OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
-        )
+    // The caller has already projected staged coverage into this snapshot.
+    let refs = segments.iter().collect::<Vec<_>>();
+    let (fragment_bitmap, old_data_filters, selection) = refresh
+        .row_merge_inputs(dataset, &refs, None, &[], false)
         .await?;
-        let inverted_index = scalar_index
-            .as_any()
-            .downcast_ref::<InvertedIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected inverted segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        source_indices.push(Arc::new(inverted_index.clone()));
-    }
 
-    // Like the BTree merge, each source keeps only its rows still stored in the
-    // fragments it covers, so a stale posting for a row that moved into another
-    // source's fragment is not carried into the merged segment.
-    let segment_refs = segments.iter().collect::<Vec<_>>();
-    let (_, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+    let mut source_indices = Vec::with_capacity(segments.len());
+    let mut retained_filters = Vec::with_capacity(segments.len());
+    let mut merge_params: Option<InvertedIndexParams> = None;
+    for (segment, filter) in segments.iter().zip(old_data_filters) {
+        let params = if filter
+            .as_ref()
+            .is_some_and(OldIndexDataFilter::has_empty_allowlist)
+        {
+            let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+            InvertedIndex::load_build_params(&store, document_granularity).await?
+        } else {
+            finalize_segment_files_if_needed(dataset, segment).await?;
+            let scalar_index = super::open_scalar_index_with_plan(
+                dataset,
+                &resolved.canonical_path,
+                segment,
+                staged.and_then(|plans| plans.get(&segment.uuid)),
+                crate::index::frag_reuse::OpenPurpose::Maintenance,
+                &NoOpMetricsCollector,
+            )
             .await?;
-
+            let inverted_index = scalar_index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "merge_existing_index_segments: expected inverted segment {}, got {:?}",
+                        segment.uuid,
+                        scalar_index.index_type()
+                    ))
+                })?;
+            source_indices.push(Arc::new(inverted_index.clone()));
+            retained_filters.push(filter);
+            inverted_index.params().clone()
+        };
+        if let Some(reference) = &merge_params {
+            if !reference.same_tokenization(&params) {
+                return Err(Error::invalid_input(format!(
+                    "FTS index {} has inconsistent tokenization across segments",
+                    segment.name
+                )));
+            }
+        } else {
+            merge_params = Some(params);
+        }
+    }
+    let params =
+        merge_params.ok_or_else(|| Error::internal("FTS merge has no source parameters"))?;
+    let new_data = if refresh.is_empty() {
+        empty_inverted_update_stream(dataset, &resolved)?
+    } else {
+        super::load_fts_training_data(
+            dataset,
+            &resolved,
+            &TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            Some(selection),
+            true,
+            None,
+            &params,
+        )
+        .await?
+    };
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = InvertedIndex::merge_segments(
-        &source_indices,
-        empty_inverted_update_stream(dataset, &resolved)?,
-        &new_store,
-        &old_data_filters,
-        lance_index::progress::noop_progress(),
-    )
-    .await?;
+    let progress = lance_index::progress::noop_progress();
+    let created_index = if source_indices.is_empty() {
+        InvertedIndexPlugin::train_inverted_index(new_data, &new_store, params, None, progress)
+            .await?
+    } else {
+        InvertedIndex::merge_segments(
+            &source_indices,
+            new_data,
+            &new_store,
+            &retained_filters,
+            progress,
+        )
+        .await?
+    };
 
     Ok(IndexMetadata {
         uuid: new_uuid,

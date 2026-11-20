@@ -11,6 +11,7 @@ pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod label_list;
 pub(crate) mod list_element;
+pub(in crate::index) mod merge;
 pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
@@ -34,7 +35,7 @@ use crate::{
     Dataset,
     dataset::{
         index::LanceIndexStoreExt,
-        scanner::{ColumnOrdering, RowAddrMask, RowAddrTreeMap},
+        scanner::{ColumnOrdering, RowAddrTreeMap},
     },
 };
 use arrow_schema::DataType;
@@ -156,19 +157,26 @@ tokio::task_local! {
 pub(crate) enum TrainingRows {
     /// Every row of these fragments.
     Fragments(Vec<Fragment>),
-    /// Exactly these rows, keyed like `_rowid`: by address, or by row id under
-    /// stable row ids. The fragments to open follow from the keys. A segment
-    /// merge uses this to re-read the rows an overlay replaced after a source
-    /// segment was built, together with the appended fragments, in one sorted
-    /// scan.
-    Rows(RowAddrTreeMap),
+    /// Physical offsets by fragment, including whole fragments selected in the same scan.
+    RowAddrs(RowAddrTreeMap),
 }
 
-/// Optional row selection, progress, and decode concurrency for a training scan.
+/// The fragments with these ids, in id order, erroring on an unknown id.
+fn fragments_by_id(dataset: &Dataset, ids: Vec<u32>) -> Result<Vec<Fragment>> {
+    let ids: Vec<u32> = ids.into_iter().sorted().dedup().collect();
+    ids.iter()
+        .zip(dataset.get_frags_from_ordered_ids(&ids))
+        .map(|(id, fragment)| {
+            fragment.map(|f| f.metadata().clone()).ok_or_else(|| {
+                Error::invalid_input_source(format!("No fragment with id {}", id).into())
+            })
+        })
+        .collect()
+}
+
+/// Progress and decode concurrency for a training scan.
 #[derive(Default)]
 pub(crate) struct TrainingScanOptions {
-    /// Restricts the scan to these physical rows.
-    physical_rows: Option<RowAddrTreeMap>,
     /// Progress total when the caller already knows the selected row count.
     expected_rows: Option<u64>,
     /// Decoded batches that may be in flight ahead of the consumer.
@@ -180,8 +188,8 @@ pub(crate) struct TrainingScanOptions {
 /// by value when the index type needs it. The scan goes through the regular
 /// reader, so deletions and data overlays are already applied to what it
 /// yields. `selection` restricts the rows read; `None` reads the whole dataset.
-/// `expected_rows`, when the caller knows how many rows the selection
-/// holds, is the progress total; otherwise the whole dataset is counted.
+/// Progress for a selection uses the supplied count or the selected fragments' known
+/// row counts. Without an exact total it reports only the rows processed.
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
@@ -189,10 +197,21 @@ pub(crate) async fn scan_training_data(
     selection: Option<TrainingRows>,
     options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let num_rows = match options.expected_rows {
-        Some(rows) => rows as usize,
-        None => dataset.count_all_rows().await?,
+    let expected_rows = match (options.expected_rows, &selection) {
+        (None, None) => Some(dataset.count_all_rows().await? as u64),
+        (None, Some(TrainingRows::Fragments(fragments)))
+            if dataset.manifest.writer_version.is_some() =>
+        {
+            fragments
+                .iter()
+                .map(|f| f.num_rows().map(|rows| rows as u64))
+                .sum()
+        }
+        (expected, _) => expected,
     };
+    let total = expected_rows
+        .map(|rows| format!("/{rows}"))
+        .unwrap_or_default();
 
     let mut scan = dataset.scan();
     if let Some(batch_readahead) = options.batch_readahead {
@@ -226,16 +245,12 @@ pub(crate) async fn scan_training_data(
         Some(TrainingRows::Fragments(fragments)) => {
             scan.with_fragments(fragments);
         }
-        // The sort above still applies to what is read.
-        Some(TrainingRows::Rows(rows)) => {
-            scan.with_row_id_prefilter(RowAddrMask::from_allowed(rows));
+        Some(TrainingRows::RowAddrs(rows)) => {
+            let ids = rows.iter().map(|(id, _)| *id).collect();
+            scan.with_fragments(fragments_by_id(dataset, ids)?)
+                .with_physical_row_addr_prefilter(rows);
         }
         None => {}
-    }
-    // A physical selection restricts the scan to these rows of the selected
-    // fragments (the two intersect); the caller includes every row it wants.
-    if let Some(physical_rows) = options.physical_rows {
-        scan.with_physical_row_addr_prefilter(physical_rows);
     }
 
     let batches = scan
@@ -253,15 +268,12 @@ pub(crate) async fn scan_training_data(
         "Starting index training job with id {} on column {}",
         training_uuid, column
     );
-    info!("Training index (job_id={}): 0/{}", training_uuid, num_rows);
+    info!("Training index (job_id={training_uuid}): 0{total}");
     let batches = batches.map_ok(move |batch| {
         rows_processed += batch.num_rows();
         if rows_processed >= next_update {
             next_update += TRAINING_UPDATE_FREQ;
-            info!(
-                "Training index (job_id={}): {}/{}",
-                training_uuid, rows_processed, num_rows
-            );
+            info!("Training index (job_id={training_uuid}): {rows_processed}{total}");
         }
         batch
     });
@@ -273,7 +285,7 @@ pub(crate) async fn load_training_data(
     dataset: &Dataset,
     column: &str,
     criteria: &TrainingCriteria,
-    fragments: Option<Vec<Fragment>>,
+    selection: Option<TrainingRows>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     options: TrainingScanOptions,
@@ -291,29 +303,12 @@ pub(crate) async fn load_training_data(
     if train {
         // Use the training request to scan data with fragment filtering
         if let Some(ref fragment_ids) = training_request.fragment_ids {
-            let fragment_ids = fragment_ids
-                .clone()
-                .into_iter()
-                .sorted()
-                .dedup()
-                .collect_vec();
-            let frags = dataset.get_frags_from_ordered_ids(&fragment_ids);
-            let frags: Result<Vec<_>> = fragment_ids
-                .iter()
-                .zip(frags)
-                .map(|(id, frag)| {
-                    let Some(frag) = frag else {
-                        return Err(Error::invalid_input_source(
-                            format!("No fragment with id {}", id).into(),
-                        ));
-                    };
-                    Ok(frag.metadata().clone())
-                })
-                .collect();
-            let selection = Some(TrainingRows::Fragments(frags?));
+            let selection = Some(TrainingRows::Fragments(fragments_by_id(
+                dataset,
+                fragment_ids.clone(),
+            )?));
             scan_training_data(dataset, column, criteria, selection, options).await
         } else {
-            let selection = fragments.map(TrainingRows::Fragments);
             scan_training_data(dataset, column, criteria, selection, options).await
         }
     } else {
@@ -325,7 +320,7 @@ pub(crate) async fn load_fts_training_data(
     dataset: &Dataset,
     resolved: &inverted::ResolvedFtsField,
     criteria: &TrainingCriteria,
-    fragments: Option<Vec<Fragment>>,
+    selection: Option<TrainingRows>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     params: &InvertedIndexParams,
@@ -350,7 +345,7 @@ pub(crate) async fn load_fts_training_data(
         &dataset,
         scan_column,
         criteria,
-        fragments,
+        selection,
         train,
         fragment_ids,
         TrainingScanOptions {
@@ -1836,6 +1831,64 @@ mod tests {
 
         assert_eq!(indices.len(), 8);
         assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_current_source_preserves_compaction_rescan() {
+        let dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(1))
+            .await
+            .unwrap();
+        let mut source = make_index_metadata("values_idx", 0, Some(IndexType::BTree));
+        source.dataset_version = dataset.manifest.version;
+        source.fragment_bitmap = Some([0].into_iter().collect());
+        let rescan = [1].into_iter().collect::<roaring::RoaringBitmap>();
+        let refresh =
+            merge::MergeRefresh::collect(&dataset, &[&source], None, rescan.clone()).unwrap();
+        assert_eq!(refresh.fragments(), rescan);
+    }
+
+    #[tokio::test]
+    async fn test_selected_training_scan_skips_unrelated_file_with_unknown_row_count() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
+        fragments[1].physical_rows = None;
+        let unrelated_file = fragments[1].files[0].path.clone();
+        dataset.metadata_cache.clear().await;
+        dataset.object_store.io_stats_incremental();
+
+        let batches = scan_training_data(
+            &dataset,
+            "values",
+            &TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+            Some(TrainingRows::RowAddrs([1].into_iter().collect())),
+            TrainingScanOptions::default(),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0][ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[1]
+        );
+        let requests = dataset.object_store.io_stats_incremental().requests;
+        assert!(
+            !requests
+                .iter()
+                .any(|read| read.path.as_ref().ends_with(&unrelated_file)),
+            "local training scan read {unrelated_file}: {requests:?}"
+        );
     }
 
     #[tokio::test]

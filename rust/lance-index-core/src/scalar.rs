@@ -601,6 +601,23 @@ pub enum OldIndexDataFilter {
 }
 
 impl OldIndexDataFilter {
+    /// Whether the allow-list is empty, so the entire source index can be skipped.
+    ///
+    /// ```
+    /// use lance_index_core::scalar::OldIndexDataFilter;
+    ///
+    /// let filter = OldIndexDataFilter::RowIds(Default::default());
+    /// assert!(filter.has_empty_allowlist());
+    /// ```
+    pub fn has_empty_allowlist(&self) -> bool {
+        match self {
+            Self::Fragments { to_keep, .. } | Self::RowAddresses { to_keep, .. } => {
+                to_keep.is_empty()
+            }
+            Self::RowIds(ids) => ids.is_empty(),
+        }
+    }
+
     /// Build a boolean mask that keeps only row IDs selected by this filter.
     pub fn filter_row_ids(&self, row_ids: &UInt64Array) -> BooleanArray {
         match self {

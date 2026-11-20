@@ -4,6 +4,7 @@
 #![allow(clippy::redundant_pub_crate)]
 
 //! BTree-specific helpers for the segmented index workflow.
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use std::sync::Arc;
 
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -94,10 +95,11 @@ pub(crate) async fn open_and_merge_segments(
 
 /// Merge one caller-defined group of source BTree segments into a single
 /// physical segment.
-pub(crate) async fn merge_segments(
+pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -147,20 +149,25 @@ pub(crate) async fn merge_segments(
     let field_path = dataset.schema().field_path(field_id)?;
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
-            .await?;
+    let (fragment_bitmap, old_data_filters, new_data) = refresh
+        .staged_row_inputs(
+            dataset,
+            &segment_refs,
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+        )
+        .await?;
 
     let output_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
-    // Pure segment consolidation: no dataset scan, so `new_data` is an empty
-    // stream and the merge is driven entirely by the source page data.
-    let empty_new_data = empty_value_row_id_stream(dataset, field_id)?;
+    let new_data = match new_data {
+        Some(data) => data,
+        None => empty_value_row_id_stream(dataset, field_id)?,
+    };
     let created_index = open_and_merge_segments(
         dataset,
         &field_path,
         &segment_refs,
-        empty_new_data,
+        new_data,
         &new_store,
         &old_data_filters,
         staged,

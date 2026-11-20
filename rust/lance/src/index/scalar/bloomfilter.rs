@@ -24,6 +24,7 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -36,24 +37,46 @@ pub(in crate::index) async fn merge_segments(
         ))
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
-    let dataset_version = segments
-        .iter()
-        .map(|segment| segment.dataset_version)
-        .min()
-        .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
-    let fragment_filters = effective_coverage(dataset, &segment_refs)?;
+    let mut fragment_filters = effective_coverage(dataset, &segment_refs)?;
+    let refreshed = refresh.fragments();
     let fragment_bitmap = fragment_filters
         .iter()
-        .fold(RoaringBitmap::new(), |acc, effective| acc | effective);
-
+        .fold(refreshed.clone(), |acc, effective| acc | effective);
+    let new_data = if refreshed.is_empty() {
+        None
+    } else {
+        for filter in &mut fragment_filters {
+            *filter -= &refreshed;
+        }
+        let fragments = dataset
+            .fragments()
+            .iter()
+            .filter(|fragment| refreshed.contains(fragment.id as u32))
+            .cloned()
+            .collect();
+        let criteria = lance_index::scalar::TrainingCriteria::new(
+            lance_index::scalar::TrainingOrdering::Addresses,
+        )
+        .with_row_addr();
+        Some(
+            super::scan_training_data(
+                dataset,
+                &field_path,
+                &criteria,
+                Some(super::TrainingRows::Fragments(fragments)),
+                super::TrainingScanOptions::default(),
+            )
+            .await?,
+        )
+    };
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = open_and_merge_segments(
         dataset,
         &field_path,
         &segment_refs,
-        None,
+        new_data,
         &new_store,
         &fragment_filters,
         staged,
@@ -62,7 +85,7 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        dataset_version,
+        dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,

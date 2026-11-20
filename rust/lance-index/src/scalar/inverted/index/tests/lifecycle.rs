@@ -3,7 +3,7 @@
 
 use super::*;
 
-use crate::Index;
+use crate::{Index, pbold::InvertedIndexDetails};
 
 /// `calculate_included_frags` reports that coverage cannot be rebuilt from the
 /// index files rather than panicking (it was `unimplemented!()`): the posting
@@ -331,6 +331,13 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
     .await?;
 
     assert_eq!(created.index_version, 0);
+    assert_eq!(
+        created
+            .index_details
+            .to_msg::<InvertedIndexDetails>()?
+            .posting_format_version,
+        Some(INVERTED_INDEX_VERSION_V2),
+    );
     let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(merged.index_version(), 0);
     assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
@@ -347,13 +354,22 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
     Ok(())
 }
 
+enum Maintenance {
+    Merge,
+    Update,
+    Remap,
+}
+
 #[rstest::rstest]
-#[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
-#[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)]
-#[case::v3_128(InvertedListFormatVersion::V3, LEGACY_BLOCK_SIZE)]
-#[case::v3_256(InvertedListFormatVersion::V3, 256)]
+#[case::merge_v1(Maintenance::Merge, InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
+#[case::merge_v2(Maintenance::Merge, InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)]
+#[case::merge_v3_128(Maintenance::Merge, InvertedListFormatVersion::V3, LEGACY_BLOCK_SIZE)]
+#[case::merge_v3_256(Maintenance::Merge, InvertedListFormatVersion::V3, 256)]
+#[case::update_v1(Maintenance::Update, InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
+#[case::remap_v3_128(Maintenance::Remap, InvertedListFormatVersion::V3, LEGACY_BLOCK_SIZE)]
 #[tokio::test]
-async fn test_merge_segments_preserves_format_version(
+async fn test_maintenance_preserves_format_version(
+    #[case] operation: Maintenance,
     #[case] format_version: InvertedListFormatVersion,
     #[case] block_size: usize,
 ) -> Result<()> {
@@ -377,20 +393,42 @@ async fn test_merge_segments_preserves_format_version(
         write_single_partition_index(src_store, params, TokenSetFormat::Fst, "hello", 100).await?;
     assert_eq!(index.format_version(), format_version);
 
-    let created = InvertedIndex::merge_segments(
-        &[index],
-        empty_doc_stream(),
-        dest_store.as_ref(),
-        &[None],
-        crate::progress::noop_progress(),
-    )
-    .await?;
+    let created = match operation {
+        Maintenance::Merge => {
+            InvertedIndex::merge_segments(
+                &[index],
+                empty_doc_stream(),
+                dest_store.as_ref(),
+                &[None],
+                crate::progress::noop_progress(),
+            )
+            .await?
+        }
+        Maintenance::Update => {
+            index
+                .update(empty_doc_stream(), dest_store.as_ref(), None)
+                .await?
+        }
+        Maintenance::Remap => {
+            index
+                .remap(
+                    &RowAddrRemap::direct([(100, Some(101))].into()),
+                    dest_store.as_ref(),
+                )
+                .await?
+        }
+    };
     assert_eq!(created.index_version, format_version.index_version());
 
-    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-    assert_eq!(merged.format_version(), format_version);
-    assert_eq!(merged.index_version(), format_version.index_version());
+    let reopened = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    assert_eq!(reopened.format_version(), format_version);
+    assert_eq!(reopened.index_version(), format_version.index_version());
 
+    let details = created.index_details.to_msg::<InvertedIndexDetails>()?;
+    assert_eq!(
+        details.posting_format_version,
+        Some(reopened.format_version().index_version())
+    );
     Ok(())
 }
 
@@ -447,6 +485,13 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
     )
     .await?;
     assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V1);
+    assert_eq!(
+        created
+            .index_details
+            .to_msg::<InvertedIndexDetails>()?
+            .posting_format_version,
+        Some(INVERTED_INDEX_VERSION_V1),
+    );
 
     let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(merged.format_version(), InvertedListFormatVersion::V1);

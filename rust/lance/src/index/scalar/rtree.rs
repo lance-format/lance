@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use std::sync::Arc;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -19,6 +20,7 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -31,19 +33,18 @@ pub(in crate::index) async fn merge_segments(
         ))
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
-    let dataset_version = segments
-        .iter()
-        .map(|segment| segment.dataset_version)
-        .min()
-        .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
     // Without stable row ids the two domains coincide, so once a row-id-domain
     // segment is refused on a stable-row-id dataset the filters can always be
     // address-domain. `RTreeIndex::merge_segments` keeps the sources' own domain.
     super::shared_segment_domain(dataset, "RTree", &segment_refs)?;
-    let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
-            .await?;
+    let (fragment_bitmap, old_data_filters, new_data) = refresh
+        .staged_row_inputs(
+            dataset,
+            &segment_refs,
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+        )
+        .await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
@@ -51,7 +52,7 @@ pub(in crate::index) async fn merge_segments(
         dataset,
         &field_path,
         &segment_refs,
-        None,
+        new_data,
         &new_store,
         &old_data_filters,
         staged,
@@ -60,7 +61,7 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        dataset_version,
+        dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
