@@ -2042,6 +2042,92 @@ async fn test_dictionary_string_column_uses_scalar_index() {
     assert_eq!(count, 20);
 }
 
+/// A LIKE prefix on a dictionary column must return the same rows through a
+/// BTree index as through a scan.
+#[tokio::test]
+async fn test_like_prefix_on_dictionary_column_with_btree_index() {
+    use arrow_array::{DictionaryArray, types::Int16Type};
+
+    let fruits: DictionaryArray<Int16Type> = [
+        Some("apple"),
+        Some("apricot"),
+        None,
+        Some("banana"),
+        Some("app"),
+    ]
+    .into_iter()
+    .cycle()
+    .take(30)
+    .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("fruit", fruits.data_type().clone(), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..30)),
+            Arc::new(fruits),
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["fruit"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+
+    for filter in [
+        "fruit LIKE 'ap%'",
+        "fruit LIKE 'appl%'",
+        "fruit LIKE 'b%'",
+        "fruit LIKE 'c%'",
+    ] {
+        let mut full_scan = dataset.scan();
+        full_scan
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let full = full_scan.try_into_batch().await.unwrap();
+        let full_ids: Vec<i32> = full["id"].as_primitive::<Int32Type>().values().to_vec();
+
+        let mut indexed_scan = dataset.scan();
+        indexed_scan
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+            "filter {filter} must go through the BTree index: {plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        let indexed_ids: Vec<i32> = indexed["id"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(
+            indexed_ids, full_ids,
+            "indexed and unindexed scans disagree for filter {filter}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_like_prefix_with_segmented_zone_map() {
     use lance_index::scalar::BuiltinIndexType;
