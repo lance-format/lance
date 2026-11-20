@@ -1269,6 +1269,9 @@ impl Dataset {
                         DataType::List(field) => DataType::List(Arc::new(
                             field.as_ref().clone().with_data_type(DataType::UInt8),
                         )),
+                        DataType::LargeList(field) => DataType::LargeList(Arc::new(
+                            field.as_ref().clone().with_data_type(DataType::UInt8),
+                        )),
                         DataType::FixedSizeList(field, dimension) => DataType::FixedSizeList(
                             Arc::new(field.as_ref().clone().with_data_type(DataType::UInt8)),
                             *dimension,

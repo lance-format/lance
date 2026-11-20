@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     QueryVectorLike = Union[
         pd.Series,
         pa.Array,
+        pa.ChunkedArray,
         pa.Scalar,
         np.ndarray,
         Iterable[Union[float, Iterable[float]]],
@@ -418,11 +419,43 @@ def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
     return _serialize_row_addrs(list(addrs))
 
 
-def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
-    # if the query is a multivector, convert it to pa.ListArray
-    if hasattr(query, "__getitem__") and (
-        isinstance(query[0], (list, tuple, pa.Array))
-        or (_check_for_numpy(query[0]) and isinstance(query[0], np.ndarray))
+def _coerce_query_vector(
+    query: QueryVectorLike, *, target_element_type: Optional[pa.DataType] = None
+) -> tuple[pa.Array, int]:
+    if isinstance(query, pa.ChunkedArray):
+        query = query.combine_chunks()
+
+    if isinstance(query, (pa.ListArray, pa.LargeListArray, pa.FixedSizeListArray)):
+        value_type = query.type.value_type
+        if not (
+            pa.types.is_floating(value_type)
+            or pa.types.is_integer(value_type)
+            or pa.types.is_null(value_type)
+        ):
+            raise TypeError(f"Query vectors must contain numbers, got {value_type}")
+        value_field = query.type.value_field
+        if value_type != target_element_type:
+            value_field = value_field.with_type(pa.float32())
+        if isinstance(query, pa.FixedSizeListArray):
+            dim = query.type.list_size
+            return query.cast(pa.list_(value_field, dim)), dim
+        dim = query.offsets[1].as_py() - query.offsets[0].as_py() if len(query) else 0
+        query_type = (
+            pa.large_list(value_field)
+            if isinstance(query, pa.LargeListArray)
+            else pa.list_(value_field)
+        )
+        return query.cast(query_type), dim
+
+    # Convert nested Python inputs to a ListArray.
+    if (
+        hasattr(query, "__getitem__")
+        and hasattr(query, "__len__")
+        and len(query)
+        and (
+            isinstance(query[0], (list, tuple, pa.Array))
+            or (_check_for_numpy(query[0]) and isinstance(query[0], np.ndarray))
+        )
     ):
         dim = len(query[0])
         multivector_query = []
@@ -502,9 +535,11 @@ def _build_vector_search_query(
         The name of the vector column to search.
     q: QueryVectorLike
         The query vector. For fixed-size vector columns, this may be a 2-D
-        array-like or list-shaped batch of query vectors. Batch queries return up to
-        ``k`` rows per query vector and include Int32 non-null ``query_index`` as
-        the first output column.
+        array-like or an Arrow list, large-list, or fixed-size-list array of query
+        vectors. Arrow inputs may be chunked. Nested Arrow inputs keep their
+        element type when it matches the search column and use Float32 otherwise.
+        Batch queries return up to ``k`` rows per query vector and include a
+        non-null Int32 ``query_index`` as the first output column.
         Flattened 1-D inputs whose length is a multiple of the vector dimension are
         rejected. Datasets with an existing ``query_index`` column cannot be used for
         batch search. When ``use_index`` is true and a vector index is available,
@@ -610,15 +645,7 @@ def _build_vector_search_query(
     ScannerBuilder
         The scanner builder for method chaining.
     """
-    q, q_dim = _coerce_query_vector(q)
-    refine_args = (refine_column, refine_q, refine_metric)
-    if any(value is not None for value in refine_args):
-        if not all(value is not None for value in refine_args):
-            raise ValueError(
-                "refine_column, refine_q, and refine_metric must be provided together"
-            )
-        refine_q, _ = _coerce_query_vector(cast("QueryVectorLike", refine_q))
-
+    vector_type = None
     if dataset is not None:
         lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
         if lance_field is None:
@@ -629,20 +656,37 @@ def _build_vector_search_query(
         if hasattr(column_type, "storage_type"):
             column_type = column_type.storage_type
         if pa.types.is_fixed_size_list(column_type):
-            dim = column_type.list_size
+            vector_type = column_type
         elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
             column_type.value_type
         ):
-            dim = column_type.value_type.list_size
+            vector_type = column_type.value_type
         else:
             raise TypeError(
                 f"Query column {column} must be a vector. Got {column_field.type}."
             )
 
-        if q_dim != dim:
+    q, q_dim = _coerce_query_vector(
+        q,
+        target_element_type=vector_type.value_type if vector_type is not None else None,
+    )
+    refine_args = (refine_column, refine_q, refine_metric)
+    if any(value is not None for value in refine_args):
+        if not all(value is not None for value in refine_args):
             raise ValueError(
-                f"Query vector size {len(q)} does not match index column size {dim}"
+                "refine_column, refine_q, and refine_metric must be provided together"
             )
+        refine_q, _ = _coerce_query_vector(cast("QueryVectorLike", refine_q))
+
+    if (
+        vector_type is not None
+        and not pa.types.is_nested(q.type)
+        and q_dim != vector_type.list_size
+    ):
+        raise ValueError(
+            f"Query vector size {q_dim} does not match index column size "
+            f"{vector_type.list_size}"
+        )
 
     if k is not None and int(k) <= 0:
         raise ValueError(f"Nearest-K must be > 0 but got {k}")
