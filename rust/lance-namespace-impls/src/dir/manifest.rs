@@ -5528,6 +5528,63 @@ mod tests {
         assert_eq!(base_objects.get("other").cloned().unwrap(), None);
     }
 
+    /// A table layout that targets one row per file must not split the manifest
+    /// rewrite: its replacement indices address `(0 << 32) | offset`, so a
+    /// second fragment would make every indexed lookup read the wrong rows.
+    #[tokio::test]
+    async fn test_manifest_rewrite_ignores_table_layout_config() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace(temp_path, true).await;
+
+        {
+            let mut dataset = manifest_ns.manifest_dataset.get_mut().await.unwrap();
+            dataset
+                .update_config([("lance.layout.target_rows_per_fragment", "1")])
+                .await
+                .unwrap();
+        }
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![
+                    ManifestEntry {
+                        object_id: "table".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("table.lance".to_string()),
+                        metadata: None,
+                    },
+                    ManifestEntry {
+                        object_id: "other".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("other.lance".to_string()),
+                        metadata: None,
+                    },
+                ],
+                Some(vec!["base".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        let dataset_guard = manifest_ns.manifest_dataset.get().await.unwrap();
+        let fragments = dataset_guard.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].id(), 0);
+        // The rewrite keeps the config it rewrote under.
+        assert_eq!(
+            dataset_guard
+                .config()
+                .get("lance.layout.target_rows_per_fragment")
+                .map(String::as_str),
+            Some("1")
+        );
+        drop(dataset_guard);
+
+        // Indexed row-address lookups still resolve to the rewritten rows.
+        assert!(manifest_ns.manifest_contains_object("table").await.unwrap());
+        assert!(manifest_ns.manifest_contains_object("other").await.unwrap());
+    }
+
     #[tokio::test]
     async fn test_manifest_rewrite_replacement_indices_are_versioned() {
         let temp_dir = TempStdDir::default();

@@ -50,7 +50,7 @@ full set of metadata maps.
 | `lance.compaction.max_source_bytes`              | Non-negative integer                                                     | Maximum number of source bytes (data files and [data overlay files](data_overlay_file.md), excluding blob v2 payloads) to compact in a single run. Defaults to unlimited.                                                                                                                |
 | `lance.compaction.max_overlays_per_fragment`     | Non-negative integer or `none`                                          | Maximum number of [data overlay files](data_overlay_file.md) a fragment may carry before it is fully compacted (overlays and deletions materialized into the base data). Defaults to `10`. Set to `0` to compact every fragment with any overlay, or `none` to disable the trigger.     |
 | `lance.layout.target_rows_per_fragment`          | Positive integer, at most 4,294,967,295                                 | Target number of rows per data file. Writes use it as the per-file row limit; [compaction](../../guide/read_and_write.md#compact-data-files) uses it as the row target for the files it rewrites. Unset means the operation's own default. |
-| `lance.layout.max_bytes_per_file`                | Positive integer                                                        | Soft bound, in bytes, on one data file. Checked after each row group, so a file can exceed it by one row group plus its footer. Unset means the operation's own default. |
+| `lance.layout.max_bytes_per_file`                | Positive integer                                                        | Soft bound, in bytes, on one data file, compared with the bytes already written to it. A file closes at the next check after passing the bound: one row group for V1 files, one flushed encoding page for V2 files, plus the footer. Unset means the operation's own default. |
 
 </div>
 
@@ -62,4 +62,8 @@ The `lance.layout.*` keys are one description of how a table's data files should
 2. `lance.compaction.*` for the compaction-specific keys, then `lance.layout.*`;
 3. the operation's own default (for writes, the writer's `max_rows_per_file` and `max_bytes_per_file`).
 
-A setting that is absent never removes a lower-precedence value, and a setting whose value equals a default is still applied because presence, not the value, carries the precedence. Writes to a dataset persist `lance.layout.*` only when they create the table, in the same version as the first data files; later appends, overwrites and compaction read the persisted values without changing them.
+A setting that is absent never removes a lower-precedence value, and a setting whose value equals a default is still applied because presence, not the value, carries the precedence.
+
+The byte bound is a soft bound on the bytes a writer has emitted, not a promise about the final file size. A writer only checks it at a boundary it reaches anyway, so a file can be larger than the bound by one such boundary plus its footer, and a writer never adds a flush solely to honor the bound.
+
+The write-side precedence above starts at the per-write layout override because the existing writer sizing fields (`max_rows_per_file` and `max_bytes_per_file`) have no absent state: the Python and Java bridges always fill both. Treating a field whose value equals the default as absent, or making the fields optional, would change the public API, so this specification leaves the choice between them open and only requires that a per-write override is expressible. Writes to a dataset persist `lance.layout.*` only when they create the table, in the same version as the first data files; later appends, overwrites and compaction read the persisted values without changing them.

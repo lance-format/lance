@@ -539,6 +539,7 @@ mod test {
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
     use rstest::rstest;
@@ -608,62 +609,41 @@ mod test {
 
     #[tokio::test]
     async fn write_layout_sizes_files_by_bytes() {
-        // Ten batches of ten rows, written as V1 files so each row group is
-        // flushed to the file and the byte bound can be observed between them.
-        // The payloads are incompressible on purpose, so the encoded bytes track
-        // the input size.
-        let payload = 1024;
-        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-        let mut next_payload = || {
-            (0..payload)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    (state & 0xFF) as u8
-                })
-                .collect::<Vec<u8>>()
+        // The byte bound is compared with bytes the writer has already emitted,
+        // and the default V2 writer emits a page when its 8 MiB encoding buffer
+        // fills. Mirror `test_file_size` in `dataset::write`: 1 KiB values and two
+        // 10 MiB batches are enough to flush a page per batch.
+        let data = || {
+            Box::new(
+                gen_batch()
+                    .anon_col(array::rand_fsb(1024))
+                    .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
+            ) as Box<dyn RecordBatchReader + Send>
         };
-        let mut batches = Vec::with_capacity(10);
-        for _ in 0..10 {
-            let payloads = BinaryArray::from_iter_values((0..10).map(|_| next_payload()));
-            batches.push(
-                RecordBatch::try_from_iter([
-                    (
-                        "id",
-                        Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
-                    ),
-                    ("payload", Arc::new(payloads) as ArrayRef),
-                ])
-                .unwrap(),
-            );
-        }
+        let rows_written = 20 * 1024;
 
-        let max_bytes_per_file = 25 * 1024;
-        let v1_params = WriteParams {
-            data_storage_version: Some(LanceFileVersion::Legacy),
-            max_rows_per_group: 10,
-            ..Default::default()
-        };
-        // Control: the same input and file version without the layout bound write
-        // one file, so the split below is the bound's doing.
+        // Control: the same input without the layout key fits in one file.
         let unbounded = InsertBuilder::new("memory://")
-            .with_params(&v1_params)
-            .execute(batches.clone())
+            .execute_stream(data())
             .await
             .unwrap();
-        assert_eq!(fragment_row_counts(&unbounded), vec![100]);
+        assert_eq!(fragment_row_counts(&unbounded).len(), 1);
+        assert_eq!(
+            unbounded.count_rows(None).await.unwrap(),
+            rows_written as usize
+        );
 
+        let max_bytes_per_file = 2 * 1024;
         let params = WriteParams {
             layout: crate::dataset::TableLayoutConfig {
                 max_bytes_per_file: Some(max_bytes_per_file),
                 ..Default::default()
             },
-            ..v1_params
+            ..Default::default()
         };
         let dataset = InsertBuilder::new("memory://")
             .with_params(&params)
-            .execute(batches)
+            .execute_stream(data())
             .await
             .unwrap();
 
@@ -675,11 +655,48 @@ mod test {
                 .map(String::as_str),
             Some(persisted_max_bytes.as_str())
         );
-        // The bound is soft, so a file may pass it by one batch; what it must do
-        // is close files instead of writing the whole input as one.
+        // The bound is soft: what it must do is close a file at a reached
+        // boundary instead of writing the whole input as one.
         let fragment_rows = fragment_row_counts(&dataset);
         assert!(fragment_rows.len() > 1, "got {fragment_rows:?}");
-        assert_eq!(fragment_rows.iter().sum::<usize>(), 100);
+        assert_eq!(
+            dataset.count_rows(None).await.unwrap(),
+            rows_written as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_layout_config_fails_an_append_without_a_new_version() {
+        let dir = TempStrDir::default();
+        let mut dataset = InsertBuilder::new(dir.as_str())
+            .execute(vec![id_batch(100)])
+            .await
+            .unwrap();
+        dataset
+            .update_config([("lance.layout.target_rows_per_fragment", "0")])
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        let error = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![id_batch(10)])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("lance.layout.target_rows_per_fragment"),
+            "{error}"
+        );
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(reopened.manifest.version, 2);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 100);
     }
 
     #[tokio::test]

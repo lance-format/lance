@@ -2565,50 +2565,6 @@ fn test_compaction_config_wins_over_layout_per_field() {
     assert_eq!(opts.target_rows_per_fragment, 500_000);
     assert_eq!(opts.max_bytes_per_file, Some(1_048_576));
 }
-#[test]
-fn test_explicit_compaction_value_wins_over_layout() {
-    let config = HashMap::from([(
-        "lance.layout.target_rows_per_fragment".to_string(),
-        "250".to_string(),
-    )]);
-
-    let mut opts = CompactionOptions::from_dataset_config(&config).unwrap();
-    // The bindings apply their own arguments after reading the config. An
-    // explicit value equal to the default is still an explicit choice.
-    opts.target_rows_per_fragment = CompactionOptions::default().target_rows_per_fragment;
-
-    assert_eq!(
-        opts.target_rows_per_fragment,
-        CompactionOptions::default().target_rows_per_fragment
-    );
-}
-#[tokio::test]
-async fn test_plan_compaction_uses_layout_config_target() {
-    let test_dir = TempStrDir::default();
-    let mut dataset = dataset_with_ten_small_fragments(&test_dir).await;
-    dataset
-        .update_config([("lance.layout.target_rows_per_fragment", "250")])
-        .await
-        .unwrap();
-
-    let from_config = CompactionOptions::from_dataset_config(dataset.config()).unwrap();
-    let explicit = CompactionOptions {
-        target_rows_per_fragment: 250,
-        ..Default::default()
-    };
-    assert_eq!(from_config.target_rows_per_fragment, 250);
-
-    let from_config_plan = plan_compaction(&dataset, &from_config).await.unwrap();
-    let explicit_plan = plan_compaction(&dataset, &explicit).await.unwrap();
-    // A 250-row target splits the ten fragments into several tasks; the default
-    // million-row target would plan a single one.
-    assert!(
-        from_config_plan.num_tasks() > 1,
-        "expected the layout target to split the plan, got {} task(s)",
-        from_config_plan.num_tasks()
-    );
-    assert_eq!(from_config_plan.tasks(), explicit_plan.tasks());
-}
 #[tokio::test]
 async fn test_max_source_fragments() {
     let test_dir = TempStrDir::default();
