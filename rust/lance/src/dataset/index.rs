@@ -299,11 +299,9 @@ impl IndexRemapper for DatasetIndexRemapper {
         // On a stable-row-id table a row-id-domain index's ids survive the
         // rewrite untouched; translating them through an address map would
         // corrupt them. Of the address-domain indices, only a type that
-        // supports an eager remap is worth opening here: ZoneMap, BloomFilter
-        // and FM always report `RemapResult::Drop` below, so opening one
-        // only to immediately discard it would be wasted I/O; their fragment
-        // bitmaps are fixed up from manifest metadata alone instead (see
-        // `manifest_build.rs`'s stable-row-id `Operation::Rewrite` handler).
+        // supports eager remap is worth opening here. Other types have their
+        // coverage updated from manifest metadata alone (see the stable
+        // row ID rewrite handler in `manifest_build.rs`).
         let uses_stable_row_ids = self.dataset.manifest.uses_stable_row_ids();
         let mut affected_by_name = HashMap::<&str, Vec<&IndexMetadata>>::new();
         for index in self.indices.iter() {

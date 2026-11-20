@@ -2450,7 +2450,7 @@ pub async fn plan_compaction(
 /// Whether any non-system index on `dataset` both stores row addresses and
 /// its type supports being eagerly remapped onto them
 /// (`IndexMetadata::supports_eager_remap`). Metadata-only, no index opened:
-/// an index whose type can never remap (ZoneMap, BloomFilter, FM) does not
+/// an index whose type cannot eagerly remap (e.g. ZoneMap or BloomFilter) does not
 /// count, since an eager remap would do nothing for it but materialize and
 /// then discard an old-to-new move for every rewritten row -- on a large
 /// compaction, table-scale memory the rewrite files have already been

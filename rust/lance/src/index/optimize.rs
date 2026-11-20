@@ -21,7 +21,7 @@
 //! paths cannot drift apart.
 //!
 //! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! Bitmap, BloomFilter, NGram, MinHash LSH, RTree, Inverted, LabelList) is split: tasks
+//! Bitmap, BloomFilter, FMIndex, NGram, MinHash LSH, RTree, Inverted, LabelList) is split: tasks
 //! build one uncommitted segment each over a group of fragments, encoded
 //! against the model of a reference segment; merges combine the task results
 //! that carry their `group` with the committed segments they list into one
@@ -122,9 +122,9 @@ use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
     index_is_usable, index_type_is_known, retain_committed_inverted_files,
-    segment_has_bloomfilter_details, segment_has_inverted_details, segment_has_label_list_details,
-    segment_has_merge_primitive, segment_has_minhashlsh_details, segment_has_vector_details,
-    unsupported_index_version, validate_segment_metadata,
+    segment_has_bloomfilter_details, segment_has_fmindex_details, segment_has_inverted_details,
+    segment_has_label_list_details, segment_has_merge_primitive, segment_has_minhashlsh_details,
+    segment_has_vector_details, unsupported_index_version, validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -774,7 +774,10 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         // BloomFilter splits only where its segments merge by their zones.
         // That reads their metadata, so it waits until the index is known to
         // be available.
+        // Keep the existing unsplit path for FMIndex on tagged tables.
+        // The partition merge cannot translate tagged addresses.
         let split = split
+            && !(tagged && segment_has_fmindex_details(last))
             && (!segment_has_bloomfilter_details(last)
                 || bloomfilter_split_merges(dataset, tagged, &segments, options).await?);
         if !split {
@@ -1762,6 +1765,165 @@ mod tests {
     use crate::dataset::transaction::{UpdateMode, UpdatedFragmentOffsets};
     use crate::dataset::{UpdateBuilder, WriteParams};
     use crate::index::CreateIndexBuilder;
+
+    #[rstest::rstest]
+    #[case::worker_merge(8)]
+    #[case::coordinator_merge(4)]
+    #[tokio::test]
+    async fn test_fmindex_split_optimize(
+        #[case] task_rows: u64,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            (
+                "text",
+                Utf8,
+                [
+                    Some("alpha needle"),
+                    Some("deleted needle"),
+                    Some(""),
+                    None,
+                    Some("beta needle"),
+                    Some("other"),
+                    None,
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm)
+            .with_params(&serde_json::json!({"num_segments": 2}));
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Fm,
+                Some("text_idx".into()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(segments(&dataset, "text_idx").await.len(), 2);
+        dataset.delete("id = 1").await.unwrap();
+        // Two more fragments, including one containing only nulls.
+        let appended = arrow_array::record_batch!(
+            ("id", Int32, [8, 9, 10, 11, 12, 13, 14, 15]),
+            (
+                "text",
+                Utf8,
+                [
+                    Some("gamma needle"),
+                    Some(""),
+                    None,
+                    Some("delta needle"),
+                    None,
+                    None,
+                    None,
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                Some(params(4)),
+            )
+            .await
+            .unwrap();
+        let mut options = OptimizeOptions::default();
+        options.num_indices_to_merge = Some(2);
+        options.max_rows_per_task = Some(task_rows);
+        options.max_rows_per_segment = Some(16);
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        let worker_merges = task_rows == 8;
+        assert_eq!(plan.tasks.len(), if worker_merges { 1 } else { 2 });
+        assert_eq!(plan.merges.len(), 1);
+        assert_eq!(
+            plan.tasks[0].old_segments.len(),
+            if worker_merges { 2 } else { 0 }
+        );
+        assert_eq!(
+            plan.merges[0].old_segments.len(),
+            if worker_merges { 0 } else { 2 }
+        );
+        let indexed = coverage(&segments(&dataset, "text_idx").await);
+        let files = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| {
+                let was_indexed = indexed.contains(fragment.id() as u32);
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(move |file| (was_indexed, file.path.clone()))
+            })
+            .collect::<Vec<_>>();
+        dataset.object_store.io_stats_incremental();
+        let results = execute_plan(&dataset, &plan).await;
+        let io = dataset.object_store.io_stats_incremental();
+        let was_read = |file: &str| {
+            io.requests
+                .iter()
+                .any(|req| req.path.as_ref().ends_with(file))
+        };
+        assert!(
+            files
+                .iter()
+                .any(|(was_indexed, file)| !was_indexed && was_read(file))
+        );
+        assert!(
+            files
+                .iter()
+                .all(|(was_indexed, file)| !was_indexed || !was_read(file))
+        );
+        commit_optimize_indices(&mut dataset, results, &options)
+            .await
+            .unwrap();
+        let committed = segments(&dataset, "text_idx").await;
+        assert_eq!(committed.len(), 1);
+        assert_eq!(coverage(&committed), RoaringBitmap::from_iter(0..4));
+        let mut indexed = dataset.scan();
+        indexed.filter("contains(text, 'needle')").unwrap();
+        assert!(
+            indexed
+                .explain_plan(false)
+                .await
+                .unwrap()
+                .contains("ScalarIndexQuery")
+        );
+        for predicate in ["contains(text, 'needle')", "contains(text, '')"] {
+            let mut indexed = dataset.scan();
+            indexed.filter(predicate).unwrap();
+            let mut scan = dataset.scan();
+            scan.filter(predicate).unwrap().use_scalar_index(false);
+            assert_eq!(
+                indexed.try_into_batch().await.unwrap(),
+                scan.try_into_batch().await.unwrap(),
+                "{predicate}"
+            );
+        }
+        assert!(
+            plan_optimize_indices(&dataset, &options)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+    }
 
     const DIM: usize = 64;
     const VECTOR_INDEX: &str = "vector_idx";
