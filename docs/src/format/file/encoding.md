@@ -772,6 +772,44 @@ a u32 array and the maximum value is 5000 then we only need 13 bits to store eac
 When used in a mini-block context we always use 1024 values per block. In addition, we store the compressed bit
 width inline in the block itself.
 
+Lance 2.1 and later bitpack values whose `uncompressed_bits_per_value` is 8, 16, 32 or 64. Starting in 2.3,
+`InlineBitpacking` and `OutOfLineBitpacking` also allow `uncompressed_bits_per_value = 128`, which writers use for
+16-byte fixed-width values such as `Decimal128`. Readers of 2.1 and 2.2 files reject a bitpacking encoding whose
+`uncompressed_bits_per_value` is greater than 64.
+
+Values are packed in blocks of 1024. Every value in a block is below `2^w`, where `w` is the packed width. Values of
+8, 16, 32 and 64 bits use the transposed layout below with `k` equal to the value width. A 128-bit value is treated
+as an unsigned 128-bit integer, so a block that contains a negative `Decimal128` value has `w = 128`. A 128-bit
+block is `128 * w` bytes, laid out by `w`:
+
+| `w`       | Layout of a 128-bit packed block                                                                     |
+| --------- | ---------------------------------------------------------------------------------------------------- |
+| 0         | Empty. Every value is zero.                                                                          |
+| 1 to 64   | The low `k` bits of each value in the transposed layout, with `k = 32` when `w` is at most 32 and `k = 64` otherwise. |
+| 65 to 127 | The low 64 bits of the 1024 values as little-endian 64-bit words, followed by the high `w - 64` bits of each value in the transposed layout with `k = 64` at width `w - 64`. |
+| 128       | The 1024 values as little-endian 16-byte integers.                                                   |
+
+The transposed layout packs 1024 `k`-bit values at width `w` (`0 < w <= k`) into `w * 1024 / k` little-endian `k`-bit
+words. Let `L = 1024 / k` be the number of lanes. Lane `l` (from 0 to `L - 1`) owns words `j * L + l` for `j` from 0
+to `w - 1`. Taken in that order, least significant bit first, those words form a bit stream in which row `r` (from 0
+to `k - 1`) occupies bits `r * w` to `(r + 1) * w - 1`. Row `r` of lane `l` holds value
+`O[r / 8] * 16 + (r % 8) * 128 + l`, where `O = [0, 4, 2, 6, 1, 5, 3, 7]`. When `w = k` the block is still this
+permutation of the values, not a plain copy. A block with `w = 0` is empty.
+
+An `InlineBitpacking` buffer is a mini-block chunk, or a block of at most 1024 values. It is one word of the
+uncompressed width holding `w`, little-endian, followed by one packed block; for 128-bit values the header is 16 bytes
+and `w` is from 0 to 128. Each chunk has its own `w`. A buffer of fewer than 1024 values is zero-padded to 1024
+before packing, and readers keep the leading values. Readers reject a header above the uncompressed width and a
+packed block of any other length. Lance writers set `w` to the uncompressed width minus the leading zero bits of the
+bitwise OR of the chunk's values.
+
+An `OutOfLineBitpacking` payload of `n` values packs every block at one width: `w` is the `bits_per_value` of its
+`Flat` `values` encoding. The payload is `n / 1024` (rounded down) packed blocks back to back with no headers,
+followed by the remaining `t` values, if any. The tail is either zero-padded to 1024 values and packed, or stored as
+`t` raw little-endian values. Lance writers pack the tail only when the packed block is smaller than the raw values;
+for 128-bit values that is `128 * w < 16 * t`. Readers pick the tail layout from the payload length, treat the tail
+as raw when both lengths are equal, and reject any other length.
+
 Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
 off a few bits is unlikely to have any meaningful impact. Also, the full-zip context keeps things byte-aligned and
 so we would have to remove at least 8 bits per value.
