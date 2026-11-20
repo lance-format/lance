@@ -12,9 +12,10 @@ use url::Url;
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, ParsedHfUrl, StorageOptions, parse_hf_url,
-    resolve_hf_revision, validate_hf_revision_option,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    HfRevisionResolution, ObjectStore, ObjectStoreParams, ObjectStoreProvider, ParsedHfUrl,
+    StorageOptions, is_hf_repo_type_prefix, parse_hf_url, resolve_hf_revision,
+    resolve_hf_revision_inner, validate_hf_revision_option,
 };
 use lance_core::error::{Error, Result};
 
@@ -23,6 +24,11 @@ use super::opendal::finish_opendal_operator;
 /// Hugging Face object store provider backed by OpenDAL.
 #[derive(Default, Debug)]
 pub struct HuggingfaceStoreProvider;
+
+/// Internal endpoint override for tests. It is only compiled for crate tests
+/// or the `test-util` feature and never becomes a production storage option.
+#[cfg(any(test, feature = "test-util"))]
+const TEST_ENDPOINT_OPTION: &str = "__lance_hf_test_endpoint";
 
 fn build_hf_base_options(
     repo_type: &str,
@@ -127,6 +133,11 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
         config_map.insert("client_max_retries".to_string(), max_retries.clone());
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(endpoint) = options.get(TEST_ENDPOINT_OPTION) {
+        config_map.insert(TEST_ENDPOINT_OPTION.to_string(), endpoint.clone());
+    }
+
     Ok(config_map)
 }
 
@@ -151,6 +162,10 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     if let Some(token) = config_map.get("token") {
         builder = builder.token(token);
     }
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(endpoint) = config_map.get(TEST_ENDPOINT_OPTION) {
+        builder = builder.endpoint(endpoint);
+    }
     if let Some(download_mode) = config_map.get("download_mode") {
         builder = builder.download_mode(download_mode);
     }
@@ -171,9 +186,54 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     Ok(OpendalStore::new(operator))
 }
 
-#[async_trait::async_trait]
-impl ObjectStoreProvider for HuggingfaceStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+/// Repository identity used by the store prefix.
+///
+/// Before HF URL parsing was centralized, only the plural repository type
+/// prefixes used `owner/repo` in the prefix. Every other authority used the
+/// authority and the first path segment. Keep that identity so existing base
+/// URIs and their caches, including bucket and singular type URLs, are not
+/// reinterpreted.
+fn hf_prefix_repo_id(url: &Url, parsed: &ParsedHfUrl) -> String {
+    if matches!(url.authority(), "datasets" | "models" | "spaces") {
+        parsed.repo_id.clone()
+    } else if is_hf_repo_type_prefix(url.authority()) {
+        let first = parsed
+            .repo_id
+            .split_once('/')
+            .map(|(first, _)| first)
+            .unwrap_or(&parsed.repo_id);
+        format!("{}/{}", url.authority(), first)
+    } else {
+        parsed.repo_id.clone()
+    }
+}
+
+fn hf_object_store_prefix(url: &Url, parsed: &ParsedHfUrl, revision: Option<&str>) -> String {
+    let mut prefix = format!(
+        "{}${}@{}",
+        url.scheme(),
+        url.authority(),
+        hf_prefix_repo_id(url, parsed)
+    );
+    // Bucket repositories have no revision and kept the same prefix before HF
+    // URL parsing was centralized, including when a revision option was set.
+    if parsed.repo_type != "bucket"
+        && let Some(revision) = revision
+    {
+        prefix.push('@');
+        prefix.push_str(revision);
+    }
+    prefix
+}
+
+impl HuggingfaceStoreProvider {
+    async fn new_store_with_optional_endpoint(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_variables))]
+        test_endpoint: Option<&str>,
+    ) -> Result<ObjectStore> {
         let ParsedHfUrl {
             repo_type,
             repo_id,
@@ -196,10 +256,22 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
                 base_options.insert("hf_token".to_string(), token);
             }
         }
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(endpoint) = test_endpoint {
+            base_options.insert(TEST_ENDPOINT_OPTION.to_string(), endpoint.to_string());
+        }
 
         let accessor = params.get_accessor();
         let inner: Arc<dyn OSObjectStore> =
             if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
+                let mut protected_keys = vec!["repo_type", "repo_id"];
+                if revision.is_some() {
+                    protected_keys.extend(["revision", "hf_revision"]);
+                }
+                #[cfg(any(test, feature = "test-util"))]
+                if test_endpoint.is_some() {
+                    protected_keys.push(TEST_ENDPOINT_OPTION);
+                }
                 Arc::new(
                     DynamicOpenDalStore::new(
                         format!("hf:{}", base_path),
@@ -208,12 +280,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
                         normalize_hf_config,
                         build_hf_store,
                     )
-                    .with_protected_keys([
-                        "repo_type",
-                        "repo_id",
-                        "revision",
-                        "hf_revision",
-                    ]),
+                    .with_protected_keys(protected_keys),
                 )
             } else {
                 Arc::new(build_hf_store(normalize_hf_config(&base_options)?)?)
@@ -242,6 +309,28 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         })
     }
 
+    /// Build a store against an explicit local endpoint. This is a test-only
+    /// seam; it is not a production storage option.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn new_store_with_test_endpoint(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+        endpoint: &str,
+    ) -> Result<ObjectStore> {
+        self.new_store_with_optional_endpoint(base_path, params, Some(endpoint))
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for HuggingfaceStoreProvider {
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        self.new_store_with_optional_endpoint(base_path, params, None)
+            .await
+    }
+
     fn extract_path(&self, url: &Url) -> Result<Path> {
         let parsed = parse_hf_url(url)?;
         Path::from_url_path(&parsed.relative_path).map_err(|_| {
@@ -256,58 +345,63 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
     ) -> Result<String> {
         let parsed = parse_hf_url(url)?;
         let revision = resolve_hf_revision(parsed.revision.as_deref(), storage_options)?;
-        let mut prefix = format!("{}${}@{}", url.scheme(), url.authority(), parsed.repo_id);
-        if let Some(revision) = revision {
-            prefix.push('@');
-            prefix.push_str(&revision);
+        Ok(hf_object_store_prefix(url, &parsed, revision.as_deref()))
+    }
+
+    fn calculate_object_store_prefix_for_match(
+        &self,
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Option<String>> {
+        let parsed = parse_hf_url(url)?;
+        match resolve_hf_revision_inner(parsed.revision.as_deref(), storage_options)? {
+            HfRevisionResolution::Selected(revision) => Ok(Some(hf_object_store_prefix(
+                url,
+                &parsed,
+                revision.as_deref(),
+            ))),
+            HfRevisionResolution::Conflict { .. } => Ok(None),
         }
-        Ok(prefix)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
     use bytes::Bytes;
     use rstest::rstest;
-    use serial_test::serial;
     use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
 
     use crate::object_store::StorageOptionsAccessor;
     use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
 
-    /// Restore `HF_ENDPOINT` when dropped so the local mock cannot leak into
-    /// other tests.
-    struct RestoreHfEndpoint {
-        original: Option<OsString>,
-    }
+    const TEST_TOKEN: &str = "synthetic-test-token";
+    const TEST_AUTH: &str = "Bearer synthetic-test-token";
 
-    impl RestoreHfEndpoint {
-        fn set(value: &str) -> Self {
-            let original = std::env::var_os("HF_ENDPOINT");
-            // SAFETY: `#[serial(hf_endpoint_env)]` keeps the tests that use this
-            // guard from changing the environment at the same time. `set_var`
-            // also requires that no other thread reads or writes the environment
-            // outside `std::env` meanwhile, which this test binary does not
-            // guarantee; see the same caveat on the GooseFS test helper.
-            unsafe { std::env::set_var("HF_ENDPOINT", value) };
-            Self { original }
+    /// Records whether every mock request carried the synthetic test token.
+    #[derive(Clone, Default)]
+    struct RecordedAuth(Arc<std::sync::Mutex<Vec<bool>>>);
+
+    impl RecordedAuth {
+        fn record(&self, request: &MockRequest) {
+            let is_synthetic = request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some(TEST_AUTH);
+            self.0.lock().unwrap().push(is_synthetic);
         }
-    }
 
-    impl Drop for RestoreHfEndpoint {
-        fn drop(&mut self) {
-            // SAFETY: see `RestoreHfEndpoint::set`.
-            unsafe {
-                match &self.original {
-                    Some(value) => std::env::set_var("HF_ENDPOINT", value),
-                    None => std::env::remove_var("HF_ENDPOINT"),
-                }
-            }
+        fn assert_all_synthetic(&self) {
+            let values = self.0.lock().unwrap();
+            assert!(!values.is_empty(), "mock received no request");
+            assert!(
+                values.iter().all(|is_synthetic| *is_synthetic),
+                "mock request did not carry the synthetic test token"
+            );
         }
     }
 
@@ -351,6 +445,177 @@ mod tests {
                 revision: Some("0123".to_string()),
                 relative_path: "path/to/file".to_string(),
             }
+        );
+    }
+
+    #[rstest]
+    #[case::plural("hf://buckets/acme/repo/data/file.bin", "hf$buckets@buckets/acme")]
+    #[case::singular("hf://bucket/acme/repo/data/file.bin", "hf$bucket@bucket/acme")]
+    #[tokio::test]
+    async fn bucket_url_preserves_legacy_routing(#[case] uri: &str, #[case] prefix: &str) {
+        let url = Url::parse(uri).unwrap();
+        let parsed = parse_hf_url(&url).unwrap();
+        assert_eq!(parsed.repo_type, "bucket");
+        assert_eq!(parsed.repo_id, "acme/repo");
+        assert_eq!(parsed.revision, None);
+        assert_eq!(parsed.relative_path, "data/file.bin");
+
+        let provider = HuggingfaceStoreProvider;
+        assert_eq!(
+            provider.extract_path(&url).unwrap().to_string(),
+            "data/file.bin"
+        );
+        assert_eq!(
+            provider.calculate_object_store_prefix(&url, None).unwrap(),
+            prefix
+        );
+
+        let server = MockServer::start().await;
+        let auth = RecordedAuth::default();
+        let auth_in_mock = auth.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/buckets/acme/repo/resolve/data/file\.bin$"))
+            .respond_with(move |request: &MockRequest| {
+                auth_in_mock.record(request);
+                ResponseTemplate::new(200).set_body_bytes(b"bucket".to_vec())
+            })
+            .mount(&server)
+            .await;
+
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("hf_token".to_string(), TEST_TOKEN.to_string()),
+                    ("hf_download_mode".to_string(), "http".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let store = provider
+            .new_store_with_test_endpoint(url, &params, &server.uri())
+            .await
+            .unwrap();
+        assert_eq!(store.store_prefix, prefix);
+        assert_eq!(
+            store
+                .read_one_all(&Path::from("data/file.bin"))
+                .await
+                .unwrap(),
+            Bytes::from_static(b"bucket")
+        );
+        auth.assert_all_synthetic();
+    }
+
+    #[test]
+    fn singular_repo_type_preserves_legacy_prefix() {
+        let url = Url::parse("hf://dataset/acme/repo/data/file.bin").unwrap();
+        let parsed = parse_hf_url(&url).unwrap();
+        assert_eq!(parsed.repo_type, "dataset");
+        assert_eq!(parsed.repo_id, "acme/repo");
+        assert_eq!(parsed.relative_path, "data/file.bin");
+        assert_eq!(
+            HuggingfaceStoreProvider
+                .calculate_object_store_prefix(&url, None)
+                .unwrap(),
+            "hf$dataset@dataset/acme"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_url_preserves_repository_path_and_prefix() {
+        let url = Url::parse("hf://acme/repo/path/to/file").unwrap();
+        let parsed = parse_hf_url(&url).unwrap();
+        assert_eq!(parsed.repo_type, "model");
+        assert_eq!(parsed.repo_id, "acme/repo");
+        assert_eq!(parsed.revision, None);
+        assert_eq!(parsed.relative_path, "path/to/file");
+
+        let provider = HuggingfaceStoreProvider;
+        assert_eq!(
+            provider.extract_path(&url).unwrap().to_string(),
+            "path/to/file"
+        );
+        assert_eq!(
+            provider.calculate_object_store_prefix(&url, None).unwrap(),
+            "hf$acme@acme/repo"
+        );
+
+        let server = MockServer::start().await;
+        let auth = RecordedAuth::default();
+        let auth_in_mock = auth.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/acme/repo/resolve/main/path/to/file$"))
+            .respond_with(move |request: &MockRequest| {
+                auth_in_mock.record(request);
+                ResponseTemplate::new(200).set_body_bytes(b"legacy".to_vec())
+            })
+            .mount(&server)
+            .await;
+
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("hf_token".to_string(), TEST_TOKEN.to_string()),
+                    ("hf_download_mode".to_string(), "http".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let store = provider
+            .new_store_with_test_endpoint(url, &params, &server.uri())
+            .await
+            .unwrap();
+        assert_eq!(store.store_prefix, "hf$acme@acme/repo");
+        assert_eq!(
+            store
+                .read_one_all(&Path::from("path/to/file"))
+                .await
+                .unwrap(),
+            Bytes::from_static(b"legacy")
+        );
+        auth.assert_all_synthetic();
+    }
+
+    #[test]
+    fn prefix_for_match_treats_other_revision_as_non_match() {
+        let provider = HuggingfaceStoreProvider;
+        let options = HashMap::from([("hf_revision".to_string(), "commit-b".to_string())]);
+        let matched = provider
+            .calculate_object_store_prefix_for_match(
+                &Url::parse("hf://datasets/acme/repo@commit-a/data").unwrap(),
+                Some(&options),
+            )
+            .unwrap();
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn prefix_for_match_keeps_malformed_errors() {
+        let provider = HuggingfaceStoreProvider;
+        let options = HashMap::from([("hf_revision".to_string(), "commit-b".to_string())]);
+        let err = provider
+            .calculate_object_store_prefix_for_match(
+                &Url::parse("hf://datasets/acme/repo@/data").unwrap(),
+                Some(&options),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("revision"));
+    }
+
+    #[test]
+    fn prefix_for_match_still_matches_unrelated_options() {
+        let provider = HuggingfaceStoreProvider;
+        let options = HashMap::from([("hf_revision".to_string(), "commit-b".to_string())]);
+        assert_eq!(
+            provider
+                .calculate_object_store_prefix_for_match(
+                    &Url::parse("hf://datasets/acme/repo@commit-b/data").unwrap(),
+                    Some(&options),
+                )
+                .unwrap()
+                .as_deref(),
+            Some("hf$datasets@acme/repo@commit-b")
         );
     }
 
@@ -780,36 +1045,97 @@ mod tests {
         assert!(current_store.to_string().contains("Opendal"));
     }
 
+    #[rstest]
+    #[case::prefixed("hf_revision")]
+    #[case::unprefixed("revision")]
     #[tokio::test]
-    #[serial(hf_endpoint_env)]
-    async fn dynamic_refresh_cannot_override_url_revision() {
+    async fn dynamic_refresh_selects_unpinned_revision(#[case] key: &str) {
         let server = MockServer::start().await;
+        let auth = RecordedAuth::default();
+        let auth_in_mock = auth.clone();
         Mock::given(method("GET"))
             .and(path_regex(
-                r"^/datasets/acme/repo/resolve/pinned/payload\.bin$",
+                r"^/datasets/acme/repo/resolve/dynamic/payload\.bin$",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"pinned".to_vec()))
+            .respond_with(move |request: &MockRequest| {
+                auth_in_mock.record(request);
+                ResponseTemplate::new(200).set_body_bytes(b"dynamic".to_vec())
+            })
             .mount(&server)
             .await;
-        let _endpoint = RestoreHfEndpoint::set(&server.uri());
 
-        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
-            StaticMockStorageOptionsProvider {
-                options: HashMap::from([
-                    ("hf_revision".to_string(), "revised".to_string()),
-                    ("revision".to_string(), "other".to_string()),
-                    ("hf_download_mode".to_string(), "http".to_string()),
-                ]),
-            },
-        )));
+        let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            HashMap::from([
+                ("hf_download_mode".to_string(), "http".to_string()),
+                ("hf_token".to_string(), TEST_TOKEN.to_string()),
+                ("expires_at_millis".to_string(), "0".to_string()),
+            ]),
+            Arc::new(StaticMockStorageOptionsProvider {
+                options: HashMap::from([(key.to_string(), "dynamic".to_string())]),
+            }),
+        ));
         let params = ObjectStoreParams {
             storage_options_accessor: Some(accessor),
             ..Default::default()
         };
         let store = HuggingfaceStoreProvider
-            .new_store(
+            .new_store_with_test_endpoint(
+                Url::parse("hf://datasets/acme/repo/payload.bin").unwrap(),
+                &params,
+                &server.uri(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.store_prefix, "hf$datasets@acme/repo");
+        assert_eq!(
+            store
+                .read_one_all(&Path::from("payload.bin"))
+                .await
+                .unwrap(),
+            Bytes::from_static(b"dynamic")
+        );
+        auth.assert_all_synthetic();
+    }
+
+    #[tokio::test]
+    async fn dynamic_refresh_cannot_override_url_revision() {
+        let server = MockServer::start().await;
+        let auth = RecordedAuth::default();
+        let auth_in_mock = auth.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/datasets/acme/repo/resolve/pinned/payload\.bin$",
+            ))
+            .respond_with(move |request: &MockRequest| {
+                auth_in_mock.record(request);
+                ResponseTemplate::new(200).set_body_bytes(b"pinned".to_vec())
+            })
+            .mount(&server)
+            .await;
+
+        let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            HashMap::from([
+                ("hf_download_mode".to_string(), "http".to_string()),
+                ("hf_token".to_string(), TEST_TOKEN.to_string()),
+                ("expires_at_millis".to_string(), "0".to_string()),
+            ]),
+            Arc::new(StaticMockStorageOptionsProvider {
+                options: HashMap::from([
+                    ("hf_revision".to_string(), "revised".to_string()),
+                    ("revision".to_string(), "other".to_string()),
+                ]),
+            }),
+        ));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..Default::default()
+        };
+        let store = HuggingfaceStoreProvider
+            .new_store_with_test_endpoint(
                 Url::parse("hf://datasets/acme/repo@pinned/payload.bin").unwrap(),
                 &params,
+                &server.uri(),
             )
             .await
             .unwrap();
@@ -822,5 +1148,60 @@ mod tests {
                 .unwrap(),
             Bytes::from_static(b"pinned")
         );
+        auth.assert_all_synthetic();
+    }
+
+    #[tokio::test]
+    async fn dynamic_refresh_cannot_override_static_option_revision() {
+        let server = MockServer::start().await;
+        let auth = RecordedAuth::default();
+        let auth_in_mock = auth.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/datasets/acme/repo/resolve/static/payload\.bin$",
+            ))
+            .respond_with(move |request: &MockRequest| {
+                auth_in_mock.record(request);
+                ResponseTemplate::new(200).set_body_bytes(b"static".to_vec())
+            })
+            .mount(&server)
+            .await;
+
+        let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            HashMap::from([
+                ("hf_revision".to_string(), "static".to_string()),
+                ("hf_download_mode".to_string(), "http".to_string()),
+                ("hf_token".to_string(), TEST_TOKEN.to_string()),
+                ("expires_at_millis".to_string(), "0".to_string()),
+            ]),
+            Arc::new(StaticMockStorageOptionsProvider {
+                options: HashMap::from([
+                    ("hf_revision".to_string(), "revised".to_string()),
+                    ("revision".to_string(), "other".to_string()),
+                ]),
+            }),
+        ));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..Default::default()
+        };
+        let store = HuggingfaceStoreProvider
+            .new_store_with_test_endpoint(
+                Url::parse("hf://datasets/acme/repo/payload.bin").unwrap(),
+                &params,
+                &server.uri(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.store_prefix, "hf$datasets@acme/repo@static");
+        assert_eq!(
+            store
+                .read_one_all(&Path::from("payload.bin"))
+                .await
+                .unwrap(),
+            Bytes::from_static(b"static")
+        );
+        auth.assert_all_synthetic();
     }
 }

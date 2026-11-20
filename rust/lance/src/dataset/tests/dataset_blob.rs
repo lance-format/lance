@@ -68,7 +68,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 #[cfg(feature = "huggingface")]
-use serial_test::serial;
+use lance_io::object_store::{
+    ObjectStoreProvider, ObjectStoreRegistry, StorageOptionsAccessor,
+    providers::huggingface::HuggingfaceStoreProvider,
+};
 #[cfg(feature = "huggingface")]
 use wiremock::matchers::{method, path_regex};
 #[cfg(feature = "huggingface")]
@@ -3466,34 +3469,42 @@ async fn test_take_blob_v2_from_non_default_base_dedicated() {
 }
 
 #[cfg(feature = "huggingface")]
-struct RestoreHfEndpoint {
-    original: Option<std::ffi::OsString>,
+#[derive(Debug)]
+struct TestHfStoreProvider {
+    endpoint: String,
 }
 
 #[cfg(feature = "huggingface")]
-impl RestoreHfEndpoint {
-    fn set(value: &str) -> Self {
-        let original = std::env::var_os("HF_ENDPOINT");
-        // SAFETY: `#[serial(hf_endpoint_env)]` keeps the tests that use this
-        // guard from changing the environment at the same time. `set_var` also
-        // requires that no other thread reads or writes the environment outside
-        // `std::env` meanwhile, which this test binary does not guarantee; see
-        // the same caveat on the GooseFS test helper.
-        unsafe { std::env::set_var("HF_ENDPOINT", value) };
-        Self { original }
+#[async_trait::async_trait]
+impl ObjectStoreProvider for TestHfStoreProvider {
+    async fn new_store(
+        &self,
+        base_path: url::Url,
+        params: &ObjectStoreParams,
+    ) -> Result<ObjectStore> {
+        HuggingfaceStoreProvider
+            .new_store_with_test_endpoint(base_path, params, &self.endpoint)
+            .await
     }
-}
 
-#[cfg(feature = "huggingface")]
-impl Drop for RestoreHfEndpoint {
-    fn drop(&mut self) {
-        // SAFETY: see `RestoreHfEndpoint::set`.
-        unsafe {
-            match &self.original {
-                Some(value) => std::env::set_var("HF_ENDPOINT", value),
-                None => std::env::remove_var("HF_ENDPOINT"),
-            }
-        }
+    fn extract_path(&self, url: &url::Url) -> Result<object_store::path::Path> {
+        HuggingfaceStoreProvider.extract_path(url)
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &url::Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        HuggingfaceStoreProvider.calculate_object_store_prefix(url, storage_options)
+    }
+
+    fn calculate_object_store_prefix_for_match(
+        &self,
+        url: &url::Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Option<String>> {
+        HuggingfaceStoreProvider.calculate_object_store_prefix_for_match(url, storage_options)
     }
 }
 
@@ -3530,54 +3541,82 @@ fn hf_range_response(body: &[u8], request: &MockRequest) -> ResponseTemplate {
         .set_body_bytes(body[start..=end].to_vec())
 }
 
-/// Two commit-pinned bases of one Hugging Face repository keep the same
-/// relative descriptor path while resolving to different stores. A reader
+/// Absolute blob URIs for two commit-pinned bases of one Hugging Face
+/// repository resolve through their per-base revision options to different
+/// base IDs while keeping the same relative descriptor path. A reader
 /// interleaves ranges from both bases in one session and sees each commit's
 /// bytes.
 #[cfg(feature = "huggingface")]
 #[tokio::test]
-#[serial(hf_endpoint_env)]
 async fn test_blob_v2_revision_pinned_hf_bases_isolate_reads() {
     const COMMIT_A: &str = "1111111111111111111111111111111111111111";
     const COMMIT_B: &str = "2222222222222222222222222222222222222222";
+    const TEST_AUTH: &str = "Bearer synthetic-test-token";
     let body_a = Bytes::from_static(b"AAAA-1111-ZZZZ");
     let body_b = Bytes::from_static(b"BBBB-2222-YYYY");
 
     let server = MockServer::start().await;
+    let auth = Arc::new(std::sync::Mutex::new(Vec::new()));
     for (commit, body) in [(COMMIT_A, body_a.clone()), (COMMIT_B, body_b.clone())] {
+        let auth = auth.clone();
         let expected_path = format!(r"^/datasets/acme/repo/resolve/{commit}/data/payload\.bin$");
         Mock::given(method("GET"))
             .and(path_regex(expected_path))
-            .respond_with(move |request: &MockRequest| hf_range_response(&body, request))
+            .respond_with(move |request: &MockRequest| {
+                auth.lock().unwrap().push(
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(TEST_AUTH),
+                );
+                hf_range_response(&body, request)
+            })
             .mount(&server)
             .await;
     }
-    let _endpoint = RestoreHfEndpoint::set(&server.uri());
+
+    let registry = ObjectStoreRegistry::default();
+    registry.insert(
+        "hf",
+        Arc::new(TestHfStoreProvider {
+            endpoint: server.uri(),
+        }),
+    );
+    let session = Arc::new(crate::session::Session::new(0, 0, Arc::new(registry)));
 
     let dataset_dir = TempStrDir::default();
     let base_a = format!("hf://datasets/acme/repo@{COMMIT_A}/data");
     let base_b = format!("hf://datasets/acme/repo@{COMMIT_B}/data");
-    let mut blobs = BlobDescriptorArrayBuilder::new("blob");
-    for (base_id, size) in [(1, body_a.len() as u64), (2, body_b.len() as u64)] {
-        blobs
-            .push(BlobDescriptor::External {
-                base_id,
-                uri: "payload.bin".to_string(),
-                offset: 0,
-                size,
-            })
-            .unwrap();
-    }
-    let (field, blob_array) = blobs.finish().unwrap().into_parts();
+    let uri_a = format!("hf://datasets/acme/repo@{COMMIT_A}/data/payload.bin");
+    let uri_b = format!("hf://datasets/acme/repo@{COMMIT_B}/data/payload.bin");
+    let blob_array = complete_blob_v2_array(
+        vec![None, None],
+        vec![Some(uri_a), Some(uri_b)],
+        vec![Some(0), Some(0)],
+        vec![Some(body_a.len() as u64), Some(body_b.len() as u64)],
+        None,
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::UInt32, false),
-        field,
+        complete_blob_v2_field("blob", true),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(UInt32Array::from(vec![0, 1])), blob_array],
     )
     .unwrap();
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([
+                ("hf_token".to_string(), "synthetic-test-token".to_string()),
+                ("hf_download_mode".to_string(), "http".to_string()),
+                ("base_1.hf_revision".to_string(), COMMIT_A.to_string()),
+                ("base_2.hf_revision".to_string(), COMMIT_B.to_string()),
+            ]),
+        ))),
+        ..Default::default()
+    };
     let dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
         &dataset_dir,
@@ -3587,6 +3626,8 @@ async fn test_blob_v2_revision_pinned_hf_bases_isolate_reads() {
                 BasePath::new(1, base_a, None, false),
                 BasePath::new(2, base_b, None, false),
             ]),
+            store_params: Some(store_params.clone()),
+            session: Some(session.clone()),
             ..Default::default()
         }),
     )
@@ -3621,7 +3662,14 @@ async fn test_blob_v2_revision_pinned_hf_bases_isolate_reads() {
         ("payload.bin", "payload.bin")
     );
 
-    let dataset = Arc::new(Dataset::open(&dataset_dir).await.unwrap());
+    let dataset = Arc::new(
+        DatasetBuilder::from_uri(&dataset_dir)
+            .with_session(session)
+            .with_store_params(store_params)
+            .load()
+            .await
+            .unwrap(),
+    );
     let store_a = dataset.object_store(Some(1)).await.unwrap();
     let store_b = dataset.object_store(Some(2)).await.unwrap();
     assert_eq!(
@@ -3658,6 +3706,13 @@ async fn test_blob_v2_revision_pinned_hf_bases_isolate_reads() {
         );
         assert_eq!(blob_b.read_range(range).await.unwrap().as_ref(), expected_b);
     }
+
+    let auth = auth.lock().unwrap();
+    assert!(!auth.is_empty(), "mock received no range request");
+    assert!(
+        auth.iter().all(|is_synthetic| *is_synthetic),
+        "mock request did not carry the synthetic test token"
+    );
 }
 
 #[tokio::test]

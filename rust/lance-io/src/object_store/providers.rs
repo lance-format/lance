@@ -90,6 +90,23 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     ) -> Result<String> {
         Ok(format!("{}${}", url.scheme(), url.authority()))
     }
+
+    /// Calculate the prefix used to decide whether an absolute URI belongs to a
+    /// store configured with the given storage options.
+    ///
+    /// Unlike [`Self::calculate_object_store_prefix`], options that describe a
+    /// different scope of the same store return `Ok(None)` instead of an error.
+    /// This lets a base search skip unrelated bases, such as a different pinned
+    /// revision, while keeping malformed URIs and genuinely invalid
+    /// configurations as errors.
+    fn calculate_object_store_prefix_for_match(
+        &self,
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Option<String>> {
+        self.calculate_object_store_prefix(url, storage_options)
+            .map(Some)
+    }
 }
 
 /// Default smallest cache size at which [`ObjectStoreRegistry::get_store()`]
