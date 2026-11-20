@@ -46,6 +46,7 @@ pub mod inserted_rows;
 
 use inserted_rows::KeyExistenceFilter;
 
+use super::representation::TableRepresentation;
 use super::{
     TargetBaseInfo, WriteMode, WriteParams, validate_and_resolve_target_bases_with_primary,
 };
@@ -58,14 +59,17 @@ use crate::{
 };
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
+use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Column as DFColumn, TableReference};
 use datafusion::error::DataFusionError;
 use datafusion::{
-    catalog::{TableProvider, streaming::StreamingTable},
-    execution::context::SessionContext,
-    logical_expr::{self, Expr, JoinType},
+    catalog::{Session, TableProvider, streaming::StreamingTable},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{self, Expr, JoinType, TableType},
+    physical_expr::{EquivalenceProperties, PhysicalExpr},
     physical_plan::{
-        ExecutionPlan, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
         joins::{HashJoinExec, PartitionMode, SortMergeJoinExec},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
@@ -666,6 +670,142 @@ fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableP
     let schema = stream.schema();
     let partition = Arc::new(OneShotPartitionStream::new(stream));
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
+}
+
+/// Present a merge source with its string and binary columns in the target
+/// table's representations, converted as each scan reads them.
+///
+/// Returns the provider unchanged when no column needs converting, so a
+/// source that already matches keeps its statistics and filter pushdown.
+fn source_in_table_representation(
+    provider: Arc<dyn TableProvider>,
+    target: &lance_core::datatypes::Schema,
+) -> Result<Arc<dyn TableProvider>> {
+    let Some(representation) = TableRepresentation::try_new(provider.schema().as_ref(), target)
+    else {
+        return Ok(provider);
+    };
+    Ok(Arc::new(TableRepresentationProvider {
+        provider,
+        target: Arc::new(target.clone()),
+        schema: representation.schema().clone(),
+    }))
+}
+
+/// A merge source whose scans convert each batch to the target table's
+/// representations, partition by partition, so the order in which each
+/// partition's rows are read is the source's own.
+#[derive(Debug)]
+struct TableRepresentationProvider {
+    provider: Arc<dyn TableProvider>,
+    target: Arc<lance_core::datatypes::Schema>,
+    schema: Arc<Schema>,
+}
+
+#[async_trait]
+impl TableProvider for TableRepresentationProvider {
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.provider.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        // Filters stay above this scan: they are written against the
+        // converted types, which the source does not have.
+        let input = self.provider.scan(state, projection, &[], limit).await?;
+        match TableRepresentation::try_new(input.schema().as_ref(), &self.target) {
+            Some(representation) => Ok(Arc::new(TableRepresentationExec::new(
+                input,
+                representation,
+            ))),
+            None => Ok(input),
+        }
+    }
+}
+
+/// Converts each batch of every input partition to the target table's
+/// representations, keeping the input's partitioning and row order.
+#[derive(Debug)]
+struct TableRepresentationExec {
+    input: Arc<dyn ExecutionPlan>,
+    representation: TableRepresentation,
+    properties: Arc<PlanProperties>,
+}
+
+impl TableRepresentationExec {
+    fn new(input: Arc<dyn ExecutionPlan>, representation: TableRepresentation) -> Self {
+        let input_properties = input.properties();
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(representation.schema().clone()),
+            input_properties.output_partitioning().clone(),
+            input_properties.emission_type,
+            input_properties.boundedness,
+        ));
+        Self {
+            input,
+            representation,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for TableRepresentationExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "TableRepresentationExec")
+    }
+}
+
+impl ExecutionPlan for TableRepresentationExec {
+    fn name(&self) -> &str {
+        "TableRepresentationExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::common::Result<TreeNodeRecursion>,
+    ) -> datafusion::common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(
+            children[0].clone(),
+            self.representation.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        let input = self.input.execute(partition, context)?;
+        Ok(self.representation.clone().convert_stream(input))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
 }
 
 /// Scans source partitions sequentially and removes duplicate non-null keys.

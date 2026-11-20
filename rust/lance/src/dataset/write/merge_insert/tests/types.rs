@@ -1015,3 +1015,267 @@ async fn test_merge_insert_with_params_applies_file_options_on_every_path(
         if with_params { 3 } else { 1 }
     );
 }
+
+fn string_representation(data_type: &DataType, values: &[Option<&str>]) -> ArrayRef {
+    let strings: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
+    arrow_cast::cast(&strings, data_type).unwrap()
+}
+
+/// A merge source may hold the target's string columns, the join key
+/// included, in any string representation; matched and inserted rows are
+/// stored and read back as the target's.
+#[rstest::rstest]
+#[case::large_utf8(DataType::LargeUtf8)]
+#[case::utf8_view(DataType::Utf8View)]
+#[case::dictionary(DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::LargeUtf8)))]
+#[tokio::test]
+async fn test_merge_insert_converts_string_representations(
+    #[case] source_type: DataType,
+    #[values(false, true)] subschema: bool,
+    #[values(false, true)] batches: bool,
+) {
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Int64, true),
+    ]));
+    let target = RecordBatch::try_new(
+        target_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(StringArray::from(vec![Some("old a"), Some("old b")])),
+            Arc::new(Int64Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(target)], target_schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let mut source_fields = vec![
+        Field::new("key", source_type.clone(), false),
+        Field::new("name", source_type.clone(), true),
+    ];
+    let mut source_columns = vec![
+        string_representation(&source_type, &[Some("b"), Some("c")]),
+        string_representation(
+            &source_type,
+            &[None, Some("a value longer than twelve bytes")],
+        ),
+    ];
+    if !subschema {
+        source_fields.push(Field::new("score", DataType::Int64, true));
+        source_columns.push(Arc::new(Int64Array::from(vec![20, 30])));
+    }
+    let source_schema = Arc::new(Schema::new(source_fields));
+    let source = RecordBatch::try_new(source_schema.clone(), source_columns).unwrap();
+
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+    let (merged, stats) = if batches {
+        job.execute_batches(vec![source]).await.unwrap()
+    } else {
+        job.execute_reader(RecordBatchIterator::new(vec![Ok(source)], source_schema))
+            .await
+            .unwrap()
+    };
+    assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (1, 1));
+
+    assert_eq!(Schema::from(merged.schema()), *target_schema);
+    let result = merged
+        .scan()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "key".to_string(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.schema().fields(), target_schema.fields());
+    assert_eq!(
+        result["key"].as_string::<i32>().iter().collect::<Vec<_>>(),
+        [Some("a"), Some("b"), Some("c")]
+    );
+    assert_eq!(
+        result["name"].as_string::<i32>().iter().collect::<Vec<_>>(),
+        [
+            Some("old a"),
+            None,
+            Some("a value longer than twelve bytes")
+        ]
+    );
+    let expected_scores = if subschema {
+        [Some(1), Some(2), None]
+    } else {
+        [Some(1), Some(20), Some(30)]
+    };
+    assert_eq!(
+        result["score"]
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        expected_scores
+    );
+}
+
+/// A merge source column of another family is still rejected, naming it.
+#[tokio::test]
+async fn test_merge_insert_rejects_binary_source_for_string_column() {
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let target = RecordBatch::try_new(
+        target_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ],
+    )
+    .unwrap();
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(target)], target_schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("name", DataType::LargeBinary, true),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(arrow_array::LargeBinaryArray::from(vec![&b"b"[..]])),
+        ],
+    )
+    .unwrap();
+    let error = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![source])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("name"), "{error}");
+}
+
+/// Yields one batch after a delay, so partitions finish out of order.
+#[derive(Debug)]
+struct DelayedPartition {
+    batch: RecordBatch,
+    delay: std::time::Duration,
+}
+
+impl PartitionStream for DelayedPartition {
+    fn schema(&self) -> &Arc<Schema> {
+        self.batch.schema_ref()
+    }
+
+    fn execute(
+        &self,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> SendableRecordBatchStream {
+        let batch = self.batch.clone();
+        let delay = self.delay;
+        Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok(batch)
+            }),
+        ))
+    }
+}
+
+/// Converting a source keeps `FirstSeen` picking the row of the first
+/// partition, even when a later partition is ready sooner.
+#[rstest::rstest]
+#[case::unconverted(DataType::Utf8)]
+#[case::large_utf8(DataType::LargeUtf8)]
+#[case::utf8_view(DataType::Utf8View)]
+#[case::dictionary(DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)))]
+#[tokio::test]
+async fn test_merge_insert_conversion_keeps_first_seen_order(#[case] source_type: DataType) {
+    let target = record_batch!(("id", Int32, [1]), ("value", Utf8, [Some("old")])).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(target.clone())], target.schema()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("value", source_type.clone(), true),
+    ]));
+    let partitions = [("first", 80), ("second", 0)]
+        .into_iter()
+        .map(|(value, delay_ms)| {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    string_representation(&source_type, &[Some(value), Some(value)]),
+                ],
+            )
+            .unwrap();
+            Arc::new(DelayedPartition {
+                batch,
+                delay: std::time::Duration::from_millis(delay_ms),
+            }) as Arc<dyn PartitionStream>
+        })
+        .collect();
+    let provider = Arc::new(StreamingTable::try_new(schema, partitions).unwrap());
+
+    let (merged, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+        .try_build()
+        .unwrap()
+        .execute_provider(provider)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            stats.num_updated_rows,
+            stats.num_inserted_rows,
+            stats.num_skipped_duplicates
+        ),
+        (1, 1, 2)
+    );
+    let result = merged
+        .scan()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result["value"]
+            .as_string::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some("first"), Some("first")]
+    );
+}
