@@ -347,3 +347,492 @@ async fn test_indexed_partial_update_if_nested_subset(#[case] with_condition: bo
     assert_eq!(stats.num_updated_rows, 2);
     assert_cells_filled(&ds).await;
 }
+
+/// Six rows `id` 0..6 with `a = id * 10` and `b = "b{id}"` (or a struct `b` of
+/// `x = id`, `y = "b{id}"`), two rows per fragment, optionally with `id = 0`
+/// deleted, and a BTree index on `id`.
+async fn indexed_condition_dataset(
+    enable_stable_row_ids: bool,
+    with_deletions: bool,
+    struct_column: bool,
+) -> Dataset {
+    let ids = Int64Array::from_iter_values(0..6);
+    let a = Int64Array::from_iter_values((0..6).map(|id| id * 10));
+    let b = StringArray::from_iter_values((0..6).map(|id| format!("b{id}")));
+    let (b_field, b): (Field, ArrayRef) = if struct_column {
+        let s = StructArray::new(
+            vec![
+                Field::new("x", DataType::Int64, true),
+                Field::new("y", DataType::Utf8, true),
+            ]
+            .into(),
+            vec![Arc::new(ids.clone()), Arc::new(b)],
+            None,
+        );
+        (Field::new("b", s.data_type().clone(), true), Arc::new(s))
+    } else {
+        (Field::new("b", DataType::Utf8, true), Arc::new(b))
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("a", DataType::Int64, true),
+        b_field,
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(a), b]).unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if with_deletions {
+        ds.delete("id = 0").await.unwrap();
+    }
+    ds.create_index(
+        &["id"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    ds
+}
+
+/// `(id, a, b)` for every row, sorted by `id`; a struct `b` reports its `y`.
+async fn id_a_b_rows(ds: &Dataset) -> Vec<(i64, i64, String)> {
+    let batch = ds.scan().try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<arrow_array::types::Int64Type>();
+    let a = batch["a"].as_primitive::<arrow_array::types::Int64Type>();
+    let b = match batch["b"].data_type() {
+        DataType::Struct(_) => batch["b"].as_struct()["y"].clone(),
+        _ => batch["b"].clone(),
+    };
+    let b = b.as_string::<i32>();
+    let mut rows = (0..batch.num_rows())
+        .map(|i| (ids.value(i), a.value(i), b.value(i).to_string()))
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
+}
+
+/// The rows of [`indexed_condition_dataset`] from `first_id` through `last_id`,
+/// with `b` replaced by `B{id}` for each id in `updated`.
+fn expected_rows(first_id: i64, last_id: i64, updated: &[i64]) -> Vec<(i64, i64, String)> {
+    (first_id..=last_id)
+        .map(|id| {
+            let b = if updated.contains(&id) { "B" } else { "b" };
+            (id, id * 10, format!("{b}{id}"))
+        })
+        .collect()
+}
+
+fn when_matched_a_over_25(ds: &Dataset, condition: &str) -> WhenMatched {
+    match condition {
+        "expr" => {
+            WhenMatched::update_if_expr(logical_expr::col("target.a").gt(logical_expr::lit(25i64)))
+        }
+        condition => WhenMatched::update_if(ds, condition).unwrap(),
+    }
+}
+
+/// Merge `source` keyed on `id`, updating the matched rows `condition` accepts.
+async fn merge_on_id(
+    ds: &Dataset,
+    source: RecordBatch,
+    condition: &str,
+    insert: bool,
+    write_mode: MergeInsertWriteMode,
+    use_index: bool,
+) -> Result<(Arc<Dataset>, MergeStats)> {
+    let schema = source.schema();
+    MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".into()])?
+        .when_matched(when_matched_a_over_25(ds, condition))
+        .when_not_matched(if insert {
+            WhenNotMatched::InsertAll
+        } else {
+            WhenNotMatched::DoNothing
+        })
+        .write_mode(write_mode)
+        .use_index(use_index)
+        .try_build()?
+        .execute_reader(RecordBatchIterator::new([Ok(source)], schema))
+        .await
+}
+
+/// A partial source `(b, id)` with `b = "B{id}"`.
+fn partial_source(ids: Vec<i64>) -> RecordBatch {
+    let b = StringArray::from_iter_values(ids.iter().map(|id| format!("B{id}")));
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, true),
+        ])),
+        vec![Arc::new(b), Arc::new(Int64Array::from(ids))],
+    )
+    .unwrap()
+}
+
+/// An `update_if` condition may read a target column the partial-schema source
+/// omits. Creating a scalar index on the join key must not change that: the
+/// indexed join only took the source's columns from the target, so the
+/// condition failed to plan ("Field a not found in struct"). `RewriteRows` is
+/// left out: with a partial source it gives up the index for the v2 plan.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_indexed_partial_update_if_reads_omitted_column(
+    #[values("target.a > 25", "a > 25", "target.a > 25 AND source.b <> 'x'", "expr")]
+    condition: &str,
+    #[values(MergeInsertWriteMode::Auto, MergeInsertWriteMode::RewriteColumns)]
+    write_mode: MergeInsertWriteMode,
+    #[values((false, false), (true, true))] stable_row_ids_and_deletions: (bool, bool),
+) {
+    let (enable_stable_row_ids, with_deletions) = stable_row_ids_and_deletions;
+    let ds = indexed_condition_dataset(enable_stable_row_ids, with_deletions, false).await;
+    let source = partial_source(vec![1, 2, 3, 4, 9]);
+    let (ds, stats) = merge_on_id(&ds, source, condition, false, write_mode, true)
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    let first = i64::from(with_deletions);
+    assert_eq!(id_a_b_rows(&ds).await, expected_rows(first, 5, &[3, 4]));
+}
+
+/// The unindexed (v2) plan gives the same result for the same conditions.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_unindexed_partial_update_if_reads_omitted_column(
+    #[values("target.a > 25", "a > 25", "target.a > 25 AND source.b <> 'x'", "expr")]
+    condition: &str,
+) {
+    let ds = indexed_condition_dataset(false, false, false).await;
+    let source = partial_source(vec![1, 2, 3, 4, 9]);
+    let (ds, stats) = merge_on_id(
+        &ds,
+        source,
+        condition,
+        false,
+        MergeInsertWriteMode::Auto,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    assert_eq!(id_a_b_rows(&ds).await, expected_rows(0, 5, &[3, 4]));
+}
+
+/// Rows in a fragment written after the index are read by a fallback scan
+/// that is unioned with the indexed take, so that scan must carry the
+/// condition's column as well.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_indexed_partial_update_if_reads_omitted_column_in_unindexed_fragment(
+    #[values("target.a > 25", "expr")] condition: &str,
+    #[values(MergeInsertWriteMode::Auto, MergeInsertWriteMode::RewriteColumns)]
+    write_mode: MergeInsertWriteMode,
+) {
+    let mut ds = indexed_condition_dataset(false, false, false).await;
+    let appended = record_batch!(
+        ("id", Int64, [6, 7]),
+        ("a", Int64, [60, 70]),
+        ("b", Utf8, ["b6", "b7"])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    ds.append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    let source = partial_source(vec![2, 3, 7]);
+    let (ds, stats) = merge_on_id(&ds, source, condition, false, write_mode, true)
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    assert_eq!(id_a_b_rows(&ds).await, expected_rows(0, 7, &[3, 7]));
+}
+
+/// The indexed join of a full-schema source also runs through the merger: a
+/// `target.`-qualified DataFusion expression must resolve there as it does in
+/// the v2 plan.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_indexed_full_schema_update_if(
+    #[values("target.a > 25", "target.a > 25 AND source.id < 9", "expr")] condition: &str,
+    #[values(false, true)] insert: bool,
+) {
+    let ds = indexed_condition_dataset(false, true, false).await;
+    let source = record_batch!(
+        ("id", Int64, [1, 2, 3, 4, 9]),
+        ("a", Int64, [10, 20, 30, 40, 90]),
+        ("b", Utf8, ["B1", "B2", "B3", "B4", "B9"])
+    )
+    .unwrap();
+    let (ds, stats) = merge_on_id(
+        &ds,
+        source,
+        condition,
+        insert,
+        MergeInsertWriteMode::Auto,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    let mut expected = expected_rows(1, 5, &[3, 4]);
+    if insert {
+        expected.push((9, 90, "B9".into()));
+    }
+    assert_eq!(id_a_b_rows(&ds).await, expected);
+}
+
+/// A source that omits a nested child (`b.x`) is neither the full schema nor
+/// a top-level subset, so the merger handles it with or without the index.
+/// The condition reads the top-level column `a`, which the source also omits.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_nested_subset_update_if_reads_omitted_column(
+    #[values("target.a > 25", "target.a > 25 AND source.id < 9", "expr")] condition: &str,
+    #[values(false, true)] use_index: bool,
+) {
+    let ds = indexed_condition_dataset(false, true, true).await;
+    let b = StructArray::new(
+        vec![Field::new("y", DataType::Utf8, true)].into(),
+        vec![Arc::new(StringArray::from(vec![
+            "B1", "B2", "B3", "B4", "B9",
+        ]))],
+        None,
+    );
+    let source = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("b", b.data_type().clone(), true),
+        ])),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4, 9])), Arc::new(b)],
+    )
+    .unwrap();
+    let (ds, stats) = merge_on_id(
+        &ds,
+        source,
+        condition,
+        false,
+        MergeInsertWriteMode::Auto,
+        use_index,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    assert_eq!(id_a_b_rows(&ds).await, expected_rows(1, 5, &[3, 4]));
+}
+
+/// An unqualified column both sides carry is ambiguous, with or without the
+/// scalar index on the join key.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_update_if_unqualified_shared_column_is_ambiguous(
+    #[values(false, true)] partial: bool,
+    #[values(false, true)] use_index: bool,
+) {
+    let ds = indexed_condition_dataset(false, false, false).await;
+    let source = if partial {
+        partial_source(vec![3])
+    } else {
+        record_batch!(("id", Int64, [3]), ("a", Int64, [30]), ("b", Utf8, ["B3"])).unwrap()
+    };
+    let err = merge_on_id(
+        &ds,
+        source,
+        "b <> 'x'",
+        false,
+        MergeInsertWriteMode::Auto,
+        use_index,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("Ambiguous reference"), "{err}");
+}
+
+/// `list<struct<v>>` values with one element each.
+fn single_tag_lists(values: &[&str]) -> ArrayRef {
+    let mut builder = ListBuilder::new(arrow_array::builder::StructBuilder::from_fields(
+        vec![Field::new("v", DataType::Utf8, true)],
+        values.len(),
+    ));
+    for value in values {
+        builder
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value(*value);
+        builder.values().append(true);
+        builder.append(true);
+    }
+    Arc::new(builder.finish())
+}
+
+fn struct_of_x(xs: Vec<i64>) -> ArrayRef {
+    Arc::new(StructArray::new(
+        vec![Field::new("x", DataType::Int64, true)].into(),
+        vec![Arc::new(Int64Array::from(xs))],
+        None,
+    ))
+}
+
+/// Conditions over nested fields, inside function calls and in lambdas keep
+/// resolving on the indexed join, as they did before: `s` and `tags` are in
+/// the source, `a` is not. Rows 3 and 4 satisfy each condition; rows 1 and 2
+/// do not.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_indexed_update_if_nested_and_function_forms(
+    #[values(
+        "target.s.x > 2",
+        "coalesce(target.s.x, 0) > 2",
+        "target.s.x > 2 AND source.s.x > 0",
+        "array_any_match(target.tags, t -> t.v = 'hit')",
+        "coalesce(target.a, 0) > 25"
+    )]
+    condition: &str,
+) {
+    let target_tags = single_tag_lists(&["miss", "miss", "miss", "hit", "hit", "hit"]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("a", DataType::Int64, true),
+        Field::new("s", struct_of_x(vec![]).data_type().clone(), true),
+        Field::new("tags", target_tags.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..6)),
+            Arc::new(Int64Array::from_iter_values((0..6).map(|id| id * 10))),
+            struct_of_x((0..6).collect()),
+            target_tags,
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["id"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    let source_schema = Arc::new(schema.project(&[0, 2, 3]).unwrap());
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            struct_of_x(vec![101, 102, 103, 104]),
+            single_tag_lists(&["new", "new", "new", "new"]),
+        ],
+    )
+    .unwrap();
+    let (ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::update_if(&ds, condition).unwrap())
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new([Ok(source)], source_schema))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    let after = ds
+        .scan()
+        .project(&["id", "s"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = after["id"].as_primitive::<arrow_array::types::Int64Type>();
+    let xs = after["s"].as_struct()["x"].clone();
+    let xs = xs.as_primitive::<arrow_array::types::Int64Type>();
+    let mut rows = (0..after.num_rows())
+        .map(|i| (ids.value(i), xs.value(i)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![(0, 0), (1, 1), (2, 2), (3, 103), (4, 104), (5, 5)]
+    );
+}
+
+/// A literal compared with a `Float32` column the source omits is narrowed to
+/// the column's type, as for any filter: `score = 0.1` matches the stored
+/// `0.1f32`. An unqualified column only becomes a target field once bound, so
+/// the literal must be resolved against the bound condition. The name is also
+/// matched ignoring case, as the planner does.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_update_if_float32_omitted_column_literal(
+    #[values("target.score = 0.1", "score = 0.1", "SCORE = 0.1")] condition: &str,
+    #[values(false, true)] use_index: bool,
+) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("score", DataType::Float32, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..6)),
+            Arc::new(Float32Array::from_iter_values(
+                (0..6).map(|id| id as f32 / 10.0),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..6).map(|id| format!("b{id}")),
+            )),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["id"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    let source = partial_source(vec![1, 2]);
+    let schema = source.schema();
+    let (_, stats) = MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::update_if(&ds, condition).unwrap())
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .use_index(use_index)
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new([Ok(source)], schema))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+}

@@ -236,6 +236,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         be updated.  The SQL filter should use the prefix `target.` to refer to
         columns in the target table and the prefix `source.` to refer to columns
         in the source table.  For example, `source.last_update < target.last_update`.
+        An unqualified column refers to the target table when the source table
+        does not have it, and is rejected as ambiguous when it does.
 
         If a condition is specified and rows do not satisfy the condition then these
         rows will not be updated.  Failure to satisfy the filter does not cause
