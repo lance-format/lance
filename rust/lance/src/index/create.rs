@@ -3233,13 +3233,9 @@ mod tests {
             "unexpected merge error: {err}"
         );
 
-        let expected_dataset_version = staged
-            .iter()
-            .map(|segment| segment.dataset_version)
-            .min()
-            .unwrap();
+        let merge_version = dataset.manifest.version;
         let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-        assert_eq!(merged.dataset_version, expected_dataset_version);
+        assert_eq!(merged.dataset_version, merge_version);
         assert_eq!(
             merged.fragment_bitmap.as_ref().unwrap(),
             dataset.table_state.fragment_bitmap.as_ref()
@@ -3260,7 +3256,7 @@ mod tests {
             .load_indices_by_name("value_bloom_merged")
             .await
             .unwrap();
-        assert_eq!(committed[0].dataset_version, expected_dataset_version);
+        assert_eq!(committed[0].dataset_version, merge_version);
         let merged_logical = crate::index::scalar_logical::open_named_scalar_index(
             &dataset,
             "value",
