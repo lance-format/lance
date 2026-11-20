@@ -3125,7 +3125,9 @@ def dataset_for_pandas_no_blob_tests(tmp_path):
             "bin": pa.array([b"x", b"y", b"z"], pa.large_binary()),
         }
     )
-    return lance.write_dataset(table, tmp_path / "no_blob_pandas_ds")
+    return lance.write_dataset(
+        table, tmp_path / "no_blob_pandas_ds", max_rows_per_file=2
+    )
 
 
 def _lazy_blob_values(dataset):
@@ -3209,10 +3211,11 @@ def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
 ):
     kwargs = {"types_mapper": pd.ArrowDtype}
     ds = dataset_for_pandas_no_blob_tests
+    batch_size_bytes = 32
 
     if source == "dataset":
-        actual = ds.to_pandas(**kwargs)
-        expected = ds.to_table().to_pandas(**kwargs)
+        actual = ds.to_pandas(batch_size_bytes=batch_size_bytes, **kwargs)
+        expected = ds.to_table(batch_size_bytes=batch_size_bytes).to_pandas(**kwargs)
     elif source == "scanner":
         scanner = ds.scanner(
             columns=["id", "name"],
@@ -3220,6 +3223,7 @@ def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
             limit=2,
             offset=0,
             batch_size=1,
+            batch_size_bytes=batch_size_bytes,
         )
         actual = scanner.to_pandas(**kwargs)
         expected = scanner.to_table().to_pandas(**kwargs)
@@ -3231,6 +3235,7 @@ def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
             limit=2,
             offset=0,
             batch_size=1,
+            batch_size_bytes=batch_size_bytes,
             **kwargs,
         )
         expected = fragment.to_table(
@@ -3238,6 +3243,7 @@ def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
             filter="id >= 2",
             limit=2,
             offset=0,
+            batch_size_bytes=batch_size_bytes,
         ).to_pandas(**kwargs)
 
     pd.testing.assert_frame_equal(actual, expected)
