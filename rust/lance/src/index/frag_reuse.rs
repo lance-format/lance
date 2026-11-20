@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::index::frag_reuse_reader::SegmentPlanParts;
+use crate::index::frag_reuse_reader::{CoverageMembership, SegmentPlanParts};
 use crate::index::frag_reuse_v0_cache::{
     V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
 };
@@ -233,6 +233,28 @@ impl std::fmt::Display for MissingCoverageReason {
             Self::Corrupt => "its metadata cannot be interpreted",
             Self::Unverifiable => "its format marker could not be read",
         })
+    }
+}
+
+/// Why a [`CompositionPlanner`] leaves a segment out of coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoverageExclusion {
+    /// `Unsupported`: the segment needs translation and its index type has no
+    /// batch remapper in this build.
+    NoBatchRemapper,
+    /// `Unsupported`: the history carries transitions this build cannot
+    /// interpret.
+    UnsupportedHistory,
+    /// A reason specific to this segment's own files or details.
+    Segment(MissingCoverageReason),
+}
+
+impl CoverageExclusion {
+    pub(crate) fn reason(self) -> MissingCoverageReason {
+        match self {
+            Self::NoBatchRemapper | Self::UnsupportedHistory => MissingCoverageReason::Unsupported,
+            Self::Segment(reason) => reason,
+        }
     }
 }
 
@@ -599,22 +621,9 @@ pub(crate) async fn plan_staged_segments(
     dataset: &Dataset,
     segments: &[IndexMetadata],
 ) -> lance_core::Result<Option<StagedRemappingPlans>> {
-    let stored = super::loading::load_all_indices(dataset).await?;
-    let Some(fri) = stored
-        .iter()
-        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
-        .filter(|entry| entry.index_version != 0)
-    else {
+    let Some(mapping) = open_tagged_history(dataset).await? else {
         return Ok(None);
     };
-    if fri.index_version != 1 {
-        return Err(Error::not_supported(format!(
-            "FRI index_version {} is unsupported. Please upgrade to a newer version",
-            fri.index_version
-        )));
-    }
-    lance_index::scalar::check_batch_remapping_entry()?;
-    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
     let provenance: Vec<RoaringBitmap> = segments
         .iter()
         .map(|segment| {
@@ -643,6 +652,200 @@ pub(crate) async fn plan_staged_segments(
         plans.insert(segment.uuid, plan);
     }
     Ok(Some(plans))
+}
+
+/// The tagged history of this snapshot, for planning segment groups the
+/// manifest does not list; `None` on a table without one.
+async fn open_tagged_history(
+    dataset: &Dataset,
+) -> lance_core::Result<Option<Arc<super::frag_reuse_reader::FragmentReuseIndex>>> {
+    let Some(fri) = tagged_history_entry(dataset).await? else {
+        return Ok(None);
+    };
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, &fri).await?;
+    Ok(Some(mapping))
+}
+
+/// The tagged-history entry of this snapshot, read from the index listing
+/// alone; `None` on a table without one. Refuses a history this build cannot
+/// interpret.
+async fn tagged_history_entry(dataset: &Dataset) -> lance_core::Result<Option<IndexMetadata>> {
+    let stored = super::loading::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+        .filter(|entry| entry.index_version != 0)
+    else {
+        return Ok(None);
+    };
+    if fri.index_version != 1 {
+        return Err(Error::not_supported(format!(
+            "FRI index_version {} is unsupported. Please upgrade to a newer version",
+            fri.index_version
+        )));
+    }
+    lance_index::scalar::check_batch_remapping_entry()?;
+    Ok(Some(fri.clone()))
+}
+
+/// A tagged history whose mapping is opened only once a decision needs it.
+pub(crate) struct TaggedHistory {
+    entry: IndexMetadata,
+    planner: Option<CompositionPlanner>,
+}
+
+impl TaggedHistory {
+    /// `None` on a table without a tagged history.
+    pub(crate) async fn find(dataset: &Dataset) -> lance_core::Result<Option<Self>> {
+        Ok(tagged_history_entry(dataset).await?.map(|entry| Self {
+            entry,
+            planner: None,
+        }))
+    }
+
+    /// The planner over this history, opening the mapping on first use.
+    pub(crate) async fn planner(
+        &mut self,
+        dataset: &Dataset,
+    ) -> lance_core::Result<&mut CompositionPlanner> {
+        let planner = match self.planner.take() {
+            Some(planner) => planner,
+            None => CompositionPlanner {
+                mapping: super::frag_reuse_reader::FragmentReuseIndex::open(dataset, &self.entry)
+                    .await?,
+                classified: HashSet::new(),
+                exclusions: HashMap::new(),
+                read_errors: HashMap::new(),
+            },
+        };
+        Ok(self.planner.insert(planner))
+    }
+
+    /// [`CompositionPlanner::take_read_error`] when the mapping is open; an
+    /// unopened mapping recorded no read error.
+    pub(crate) fn take_read_error(&mut self, uuid: &Uuid) -> Option<Error> {
+        self.planner
+            .as_mut()
+            .and_then(|planner| planner.take_read_error(uuid))
+    }
+}
+
+/// Derives what one logical index would cover on this snapshot if it consisted
+/// of a given set of segments, committed or not: the composition a commit is
+/// about to publish, before it is in any manifest.
+///
+/// Uses the reader's own rules: the membership filter of the listing
+/// (`coverage_membership`) and the coverage backtrack (`segment_plans`), so a
+/// composition covers here exactly what it covers once committed.
+pub(crate) struct CompositionPlanner {
+    mapping: Arc<super::frag_reuse_reader::FragmentReuseIndex>,
+    /// Every segment passed to [`Self::classify`]; only exclusions are
+    /// recorded, so an unclassified segment would otherwise pass as a member.
+    classified: HashSet<Uuid>,
+    /// Why the reader leaves a classified segment out of its group's coverage.
+    exclusions: HashMap<Uuid, CoverageExclusion>,
+    /// The failed read behind each `Unverifiable` exclusion, kept apart from
+    /// the structural reasons so a refusal it causes reports the failure.
+    read_errors: HashMap<Uuid, Error>,
+}
+
+impl CompositionPlanner {
+    /// Decide once, for every segment in `segments`, whether the reader lets
+    /// it take part in coverage.
+    pub(crate) async fn classify(&mut self, dataset: &Dataset, segments: &[&IndexMetadata]) {
+        for segment in segments {
+            self.classified.insert(segment.uuid);
+            match super::frag_reuse_reader::coverage_membership(dataset, &self.mapping, segment)
+                .await
+            {
+                CoverageMembership::Member => {}
+                CoverageMembership::ExcludedNoBatchRemapper => {
+                    self.exclusions
+                        .insert(segment.uuid, CoverageExclusion::NoBatchRemapper);
+                }
+                CoverageMembership::ExcludedUnsupportedHistory => {
+                    self.exclusions
+                        .insert(segment.uuid, CoverageExclusion::UnsupportedHistory);
+                }
+                CoverageMembership::Excluded(reason) => {
+                    self.exclusions
+                        .insert(segment.uuid, CoverageExclusion::Segment(reason));
+                }
+                CoverageMembership::Unverifiable(error) => {
+                    log::warn!(
+                        "index {} (segment {}): could not read its format marker ({error}); \
+                         its coverage cannot be established for this commit",
+                        segment.name,
+                        segment.uuid,
+                    );
+                    self.exclusions.insert(
+                        segment.uuid,
+                        CoverageExclusion::Segment(MissingCoverageReason::Unverifiable),
+                    );
+                    self.read_errors.insert(segment.uuid, error);
+                }
+            }
+        }
+    }
+
+    /// Why the reader leaves `segment` out of coverage, or `None` when it
+    /// takes part. Only meaningful for a segment passed to [`Self::classify`].
+    pub(crate) fn exclusion(&self, segment: &IndexMetadata) -> Option<MissingCoverageReason> {
+        self.coverage_exclusion(segment)
+            .map(CoverageExclusion::reason)
+    }
+
+    /// [`Self::exclusion`], telling the missing batch remapper of the type and
+    /// an uninterpretable history apart from a reason specific to `segment`.
+    pub(crate) fn coverage_exclusion(&self, segment: &IndexMetadata) -> Option<CoverageExclusion> {
+        debug_assert!(
+            self.classified.contains(&segment.uuid),
+            "segment {} was not classified",
+            segment.uuid
+        );
+        self.exclusions.get(&segment.uuid).copied()
+    }
+
+    /// The failed read that left the segment `uuid` out of coverage, if a
+    /// read failure rather than a structural exclusion did.
+    pub(crate) fn take_read_error(&mut self, uuid: &Uuid) -> Option<Error> {
+        self.read_errors.remove(uuid)
+    }
+
+    /// The fragments of `stored` the history can still relate to the live
+    /// fragments; see `FragmentReuseIndex::traceable_fragments`.
+    pub(crate) fn traceable_fragments(&self, stored: &RoaringBitmap) -> RoaringBitmap {
+        self.mapping.traceable_fragments(stored)
+    }
+
+    /// The live fragments each of `segments` answers for when they are the
+    /// whole logical index, in order; empty for a segment the reader leaves
+    /// out. Every segment must have been passed to [`Self::classify`].
+    pub(crate) fn coverage(&self, segments: &[&IndexMetadata]) -> Vec<RoaringBitmap> {
+        debug_assert!(
+            segments
+                .iter()
+                .all(|segment| self.classified.contains(&segment.uuid)),
+            "coverage of a segment that was not classified"
+        );
+        let members: Vec<usize> = (0..segments.len())
+            .filter(|&position| !self.exclusions.contains_key(&segments[position].uuid))
+            .collect();
+        let provenance: Vec<RoaringBitmap> = members
+            .iter()
+            .map(|&position| {
+                segments[position]
+                    .fragment_bitmap
+                    .clone()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut coverage = vec![RoaringBitmap::new(); segments.len()];
+        for (&position, parts) in members.iter().zip(self.mapping.segment_plans(&provenance)) {
+            coverage[position] = parts.coverage;
+        }
+        coverage
+    }
 }
 
 /// Resolve the FRI remapper shared by scalar and vector index loading, with
