@@ -4651,6 +4651,7 @@ dependencies = [
  "tracking-allocator",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

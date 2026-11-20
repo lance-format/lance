@@ -67,6 +67,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
+#[cfg(feature = "huggingface")]
+use serial_test::serial;
+#[cfg(feature = "huggingface")]
+use wiremock::matchers::{method, path_regex};
+#[cfg(feature = "huggingface")]
+use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
+
 #[rstest]
 #[case::inline("blob.kind = 0", vec![Some(1), None, Some(2)])]
 #[case::null("blob.kind IS NULL", vec![Some(1), Some(0), Some(0), Some(2), Some(0)])]
@@ -3456,6 +3463,201 @@ async fn test_take_blob_v2_from_non_default_base_dedicated() {
         blob.read().await.unwrap().as_ref(),
         fixture.expected.as_slice()
     );
+}
+
+#[cfg(feature = "huggingface")]
+struct RestoreHfEndpoint {
+    original: Option<std::ffi::OsString>,
+}
+
+#[cfg(feature = "huggingface")]
+impl RestoreHfEndpoint {
+    fn set(value: &str) -> Self {
+        let original = std::env::var_os("HF_ENDPOINT");
+        // SAFETY: `#[serial(hf_endpoint_env)]` keeps the tests that use this
+        // guard from changing the environment at the same time. `set_var` also
+        // requires that no other thread reads or writes the environment outside
+        // `std::env` meanwhile, which this test binary does not guarantee; see
+        // the same caveat on the GooseFS test helper.
+        unsafe { std::env::set_var("HF_ENDPOINT", value) };
+        Self { original }
+    }
+}
+
+#[cfg(feature = "huggingface")]
+impl Drop for RestoreHfEndpoint {
+    fn drop(&mut self) {
+        // SAFETY: see `RestoreHfEndpoint::set`.
+        unsafe {
+            match &self.original {
+                Some(value) => std::env::set_var("HF_ENDPOINT", value),
+                None => std::env::remove_var("HF_ENDPOINT"),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "huggingface")]
+fn hf_range_response(body: &[u8], request: &MockRequest) -> ResponseTemplate {
+    let Some(range) = request
+        .headers
+        .get("range")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    let Some((start, end)) = range
+        .strip_prefix("bytes=")
+        .and_then(|range| range.split_once('-'))
+    else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    let Ok(start) = start.parse::<usize>() else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    if start >= body.len() {
+        return ResponseTemplate::new(416);
+    }
+    let end = end
+        .parse::<usize>()
+        .unwrap_or(body.len() - 1)
+        .min(body.len() - 1);
+    ResponseTemplate::new(206)
+        .insert_header(
+            "content-range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        )
+        .set_body_bytes(body[start..=end].to_vec())
+}
+
+/// Two commit-pinned bases of one Hugging Face repository keep the same
+/// relative descriptor path while resolving to different stores. A reader
+/// interleaves ranges from both bases in one session and sees each commit's
+/// bytes.
+#[cfg(feature = "huggingface")]
+#[tokio::test]
+#[serial(hf_endpoint_env)]
+async fn test_blob_v2_revision_pinned_hf_bases_isolate_reads() {
+    const COMMIT_A: &str = "1111111111111111111111111111111111111111";
+    const COMMIT_B: &str = "2222222222222222222222222222222222222222";
+    let body_a = Bytes::from_static(b"AAAA-1111-ZZZZ");
+    let body_b = Bytes::from_static(b"BBBB-2222-YYYY");
+
+    let server = MockServer::start().await;
+    for (commit, body) in [(COMMIT_A, body_a.clone()), (COMMIT_B, body_b.clone())] {
+        let expected_path = format!(r"^/datasets/acme/repo/resolve/{commit}/data/payload\.bin$");
+        Mock::given(method("GET"))
+            .and(path_regex(expected_path))
+            .respond_with(move |request: &MockRequest| hf_range_response(&body, request))
+            .mount(&server)
+            .await;
+    }
+    let _endpoint = RestoreHfEndpoint::set(&server.uri());
+
+    let dataset_dir = TempStrDir::default();
+    let base_a = format!("hf://datasets/acme/repo@{COMMIT_A}/data");
+    let base_b = format!("hf://datasets/acme/repo@{COMMIT_B}/data");
+    let mut blobs = BlobDescriptorArrayBuilder::new("blob");
+    for (base_id, size) in [(1, body_a.len() as u64), (2, body_b.len() as u64)] {
+        blobs
+            .push(BlobDescriptor::External {
+                base_id,
+                uri: "payload.bin".to_string(),
+                offset: 0,
+                size,
+            })
+            .unwrap();
+    }
+    let (field, blob_array) = blobs.finish().unwrap().into_parts();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        field,
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from(vec![0, 1])), blob_array],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dataset_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![
+                BasePath::new(1, base_a, None, false),
+                BasePath::new(2, base_b, None, false),
+            ]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let descriptors = dataset
+        .scan()
+        .project(&["blob"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let descriptor = descriptors.column(0).as_struct();
+    let kinds = descriptor
+        .column_by_name("kind")
+        .unwrap()
+        .as_primitive::<UInt8Type>();
+    let base_ids = descriptor
+        .column_by_name("blob_id")
+        .unwrap()
+        .as_primitive::<UInt32Type>();
+    let uris = descriptor
+        .column_by_name("blob_uri")
+        .unwrap()
+        .as_string::<i32>();
+    assert_eq!(kinds.value(0), BlobKind::External as u8);
+    assert_eq!(kinds.value(1), BlobKind::External as u8);
+    assert_eq!((base_ids.value(0), base_ids.value(1)), (1, 2));
+    assert_eq!(
+        (uris.value(0), uris.value(1)),
+        ("payload.bin", "payload.bin")
+    );
+
+    let dataset = Arc::new(Dataset::open(&dataset_dir).await.unwrap());
+    let store_a = dataset.object_store(Some(1)).await.unwrap();
+    let store_b = dataset.object_store(Some(2)).await.unwrap();
+    assert_eq!(
+        store_a.store_prefix,
+        format!("hf$datasets@acme/repo@{COMMIT_A}")
+    );
+    assert_eq!(
+        store_b.store_prefix,
+        format!("hf$datasets@acme/repo@{COMMIT_B}")
+    );
+    assert!(
+        !Arc::ptr_eq(&store_a, &store_b),
+        "commit-pinned bases of one repository must not share a cached store"
+    );
+
+    let blobs = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    let blob_a = blobs[0].as_ref().unwrap();
+    let blob_b = blobs[1].as_ref().unwrap();
+    assert_eq!(blob_a.data_path().to_string(), "data/payload.bin");
+    assert_eq!(blob_b.data_path().to_string(), "data/payload.bin");
+
+    for (range, expected_a, expected_b) in [
+        (0..4, &body_a[0..4], &body_b[0..4]),
+        (5..9, &body_a[5..9], &body_b[5..9]),
+        (10..14, &body_a[10..14], &body_b[10..14]),
+        (0..4, &body_a[0..4], &body_b[0..4]),
+    ] {
+        assert_eq!(
+            blob_a.read_range(range.clone()).await.unwrap().as_ref(),
+            expected_a
+        );
+        assert_eq!(blob_b.read_range(range).await.unwrap().as_ref(), expected_b);
+    }
 }
 
 #[tokio::test]
