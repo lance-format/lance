@@ -241,8 +241,9 @@ async fn test_optimize_ivf_hnsw_records_actual_file_sizes() {
 }
 
 /// A released 0.11.0 IVF_HNSW_SQ index is a legacy (0, 2) file. There is no
-/// incremental legacy HNSW writer, so optimize must refuse it with the existing
-/// NotSupported guidance before creating any output or publishing a version.
+/// incremental legacy HNSW writer, so optimize must refuse it before creating
+/// any output or publishing a version. Retraining is not a recovery here, so
+/// the error directs users to drop the segment and rebuild from the data.
 #[tokio::test]
 async fn test_optimize_legacy_hnsw_sq_refuses_before_writing() {
     let test_dir = copy_test_data_to_tmp("v0.11.0/legacy_hnsw_sq").unwrap();
@@ -302,17 +303,91 @@ async fn test_optimize_legacy_hnsw_sq_refuses_before_writing() {
     );
     let message = error.to_string();
     assert!(message.contains("IVF_HNSW_SQ"), "{message}");
-    assert!(message.contains("retrain"), "{message}");
+    assert!(
+        message.contains("drop_index") && message.contains("create_index"),
+        "the error must say how to rebuild the index: {message}"
+    );
+    assert!(
+        !message.contains("retrain"),
+        "retraining this released fixture fails, so the error must not suggest it: {message}"
+    );
     assert_eq!(
         dataset.version().version,
         version,
         "the rejected optimize must not publish a version"
     );
-    assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+    assert_eq!(dataset.load_indices().await.unwrap()[0].uuid, legacy_uuid);
+    assert_eq!(
+        index_file_version(&dataset, &legacy_uuid).await,
+        (0, 2),
+        "the rejected optimize must leave the legacy file untouched"
+    );
     assert_eq!(
         index_dir_count(),
         index_dirs_before,
         "the rejected optimize must not allocate an index output directory"
+    );
+
+    // Dropping the legacy segment removes it from the rebuild's source scan.
+    // Recreating from the data then includes the appended fragment in a
+    // current-format segment.
+    dataset.drop_index("vector_idx").await.unwrap();
+    let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+        MetricType::L2,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+        SQBuildParams::default(),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let rebuilt = dataset.load_indices().await.unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    assert_ne!(rebuilt[0].uuid, legacy_uuid);
+    assert!(
+        matches!(
+            index_file_version(&dataset, &rebuilt[0].uuid).await,
+            (0, 3) | (2, _)
+        ),
+        "the rebuilt index must use the current file format"
+    );
+    assert!(
+        dataset
+            .unindexed_fragments("vector_idx")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the rebuilt index must cover the appended fragment"
+    );
+    let appended_vector = vector_for_id(&dataset, 319).await;
+    assert!(
+        nearest_ids(&dataset, &appended_vector, 10)
+            .await
+            .contains(&319),
+        "the rebuilt index must serve an appended row"
+    );
+
+    // The rebuilt format and the appended row must survive reopen.
+    let reopened = Dataset::open(&uri).await.unwrap();
+    let reopened_segments = reopened.load_indices().await.unwrap();
+    assert_eq!(reopened_segments.len(), 1);
+    assert!(matches!(
+        index_file_version(&reopened, &reopened_segments[0].uuid).await,
+        (0, 3) | (2, _)
+    ));
+    let appended_vector = vector_for_id(&reopened, 319).await;
+    assert!(
+        nearest_ids(&reopened, &appended_vector, 10)
+            .await
+            .contains(&319),
+        "the reopened index must serve an appended row"
     );
 }
 
@@ -838,6 +913,8 @@ async fn nearest_ids(dataset: &Dataset, query: &Float32Array, k: usize) -> Vec<i
         .use_index(true)
         .project(&["id"])
         .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ANNIvfPartition"), "{plan}");
     let result = scanner.try_into_batch().await.unwrap();
     result["id"]
         .as_primitive::<arrow_array::types::Int64Type>()

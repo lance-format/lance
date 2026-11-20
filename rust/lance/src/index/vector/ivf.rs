@@ -1051,9 +1051,20 @@ pub(crate) async fn optimize_vector_indices(
     // index and auxiliary writers before failing.
     if !first_idx.sub_index.as_any().is::<PQIndex>() {
         let (sub_index_type, quantization_type) = first_idx.sub_index.sub_index_type();
+        // Retraining a released 0.11 HNSW_SQ segment fails while it scans the
+        // vector column: without index details, the planner mistakes the legacy
+        // vector index for a scalar one and looks for page_lookup.lance.
+        let rebuild = if matches!(
+            (sub_index_type, quantization_type),
+            (SubIndexType::Hnsw, QuantizationType::Scalar)
+        ) {
+            "drop it with drop_index and rebuild it from the data with create_index"
+        } else {
+            "set retrain to rebuild it in the current format"
+        };
         return Err(Error::not_supported(format!(
             "optimizing vector index: a legacy-format {} index cannot be optimized \
-             incrementally; set retrain to rebuild it in the current format",
+             incrementally; {rebuild}",
             index_type_string(sub_index_type, quantization_type)
         )));
     }
