@@ -270,11 +270,11 @@ mod tests {
     use super::*;
     use crate::format::Manifest;
     use crate::transaction::action::test_support::{
-        added_field, apply, backed_manifest, footprint,
+        added_field, apply, backed_manifest, footprint, unbacked_manifest,
     };
     use crate::transaction::action::{Action, AddField, DropField};
     use crate::transaction::update_map::UpdateMapEntry;
-    use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+    use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
     use lance_core::datatypes::Schema;
     use std::sync::Arc;
 
@@ -698,5 +698,99 @@ mod tests {
         // A different reserved key, or plain metadata, is a different thing.
         assert!(!primary_key(1).conflicts_with(&clustering_key));
         assert!(!primary_key(1).conflicts_with(&comment));
+    }
+
+    fn mark_blob(field: FieldRef) -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            field_metadata: vec![FieldMetadataUpdate {
+                field,
+                updates: merge(&[(BLOB_META_KEY, Some("true"))]),
+            }],
+            ..Default::default()
+        })
+    }
+
+    /// Data files keep the layout they were written with, so the action path
+    /// refuses metadata that would decode an existing column differently,
+    /// stored or not, as the named metadata update does.
+    #[test]
+    fn test_config_update_rejects_a_decoding_change_to_an_existing_field() {
+        for manifest in [backed_manifest(), unbacked_manifest()] {
+            let error = apply(&manifest, vec![mark_blob(FieldRef::Committed(0))]).unwrap_err();
+
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains(BLOB_META_KEY), "{error}");
+        }
+    }
+
+    /// A field minted in the same operation takes its layout from its first
+    /// write.
+    #[test]
+    fn test_config_update_sets_the_decoding_of_a_field_minted_in_the_same_operation() {
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("fresh"),
+                }),
+                mark_blob(FieldRef::Local(0)),
+            ],
+        )
+        .unwrap();
+
+        assert!(next.schema.field("fresh").unwrap().is_blob());
+    }
+
+    /// A table whose only column is the packed struct `s`, with the children
+    /// `children`, and the id of `s`.
+    fn packed_struct_manifest(children: Vec<arrow_schema::Field>) -> (Manifest, i32) {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        let s = ArrowField::new("s", DataType::Struct(children.into()), true).with_metadata(
+            std::collections::HashMap::from([("packed".to_string(), "true".to_string())]),
+        );
+        let mut manifest = backed_manifest();
+        manifest.schema = Schema::try_from(&ArrowSchema::new(vec![s])).unwrap();
+        manifest.fragments = Arc::new(Vec::new());
+        let id = manifest.schema.field("s").unwrap().id;
+        (manifest, id)
+    }
+
+    /// Changing a packed struct's children leaves its own markers alone, so it
+    /// is not a decoding change of the struct. Dropping the last child is
+    /// refused for the schema it leaves, not as a decoding change; an empty
+    /// struct, which only a table whose schema already fails that check can
+    /// hold, may take a first child.
+    #[test]
+    fn test_changing_a_packed_structs_children_keeps_its_decoding() {
+        use arrow_schema::{DataType, Field as ArrowField};
+        let (manifest, _) =
+            packed_struct_manifest(vec![ArrowField::new("a", DataType::Int32, true)]);
+        let child = manifest.schema.field("s.a").unwrap().id;
+        let error = apply(
+            &manifest,
+            vec![Action::DropField(DropField {
+                field: FieldRef::Committed(child),
+            })],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("takes at least one child"),
+            "{error}"
+        );
+
+        let (manifest, parent) = packed_struct_manifest(Vec::new());
+        let next = apply(
+            &manifest,
+            vec![Action::AddField(AddField {
+                local: 0,
+                parent: Some(FieldRef::Committed(parent)),
+                def: added_field("a"),
+            })],
+        )
+        .unwrap();
+        assert!(next.schema.field("s.a").is_some());
+        assert!(next.schema.field("s").unwrap().is_packed_struct());
     }
 }

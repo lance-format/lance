@@ -11,6 +11,7 @@ use crate::format::{Fragment, Manifest};
 use crate::io::deletion::relative_deletion_file_path;
 use crate::transaction::action::Action;
 use crate::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
@@ -1126,6 +1127,80 @@ fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
     } else {
         Some(changes.join(", "))
     }
+}
+
+/// Whether a nested field is packed into a single column, as each reader sees
+/// it. They disagree on the values that mark it: the Lance schema, which the
+/// 2.0 column mapping and the writers follow, accepts any truthy value, while
+/// the Arrow-level check the 2.1+ struct decoder uses accepts only `true`.
+///
+/// Whether the field can be packed comes from its type rather than its
+/// children, so a struct that gains its first child or loses its last one
+/// keeps its markers. Leaves ignore them.
+fn packed_markers(field: &Field) -> (bool, bool) {
+    let logical_type = &field.logical_type;
+    let is_nested = logical_type.is_struct()
+        || logical_type.is_list()
+        || logical_type.is_large_list()
+        || logical_type.is_fixed_size_list_struct()
+        || logical_type.is_map();
+    if !is_nested {
+        return (false, false);
+    }
+    let marked_true = ["packed", "lance-encoding:packed"].iter().any(|key| {
+        field
+            .metadata
+            .get(*key)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    });
+    (field.is_packed_struct(), marked_true)
+}
+
+/// The metadata through which `after` would decode its stored data
+/// differently from `before`, if any. Readers take each of these from the
+/// field's metadata: whether a nested field is packed into a single column,
+/// whether it holds Blob v2 descriptors, and whether it holds blobs.
+fn changed_decoding_key(before: &Field, after: &Field) -> Option<String> {
+    if packed_markers(before) != packed_markers(after) {
+        Some("packed marker ('packed' / 'lance-encoding:packed')".to_string())
+    } else if before.is_blob_v2() != after.is_blob_v2() {
+        Some(format!(
+            "Blob v2 marker ('{ARROW_EXT_NAME_KEY}', or '{BLOB_META_KEY}' on a Blob v2 \
+             descriptor)"
+        ))
+    } else if before.is_blob() != after.is_blob() {
+        Some(format!("blob marker ('{BLOB_META_KEY}')"))
+    } else {
+        None
+    }
+}
+
+/// Reject a field metadata update that changes how a field of `before`
+/// decodes, `after` being the schema the update produces. Fields only `after`
+/// has are new, and take their layout from their first write.
+///
+/// A data file keeps the layout it was written with, so such a change makes
+/// existing data read back wrong, a struct as all nulls, or not at all. It is
+/// refused for every existing field, stored or not: a writer that read the old
+/// schema can still be committing a file in the old layout, and nothing here
+/// sees it until after the update lands.
+pub(super) fn check_field_decoding_unchanged(before: &Schema, after: &Schema) -> Result<()> {
+    for field in after.fields_pre_order() {
+        let Some(previous) = before.field_by_id(field.id) else {
+            continue;
+        };
+        if let Some(marker) = changed_decoding_key(previous, field) {
+            return Err(Error::invalid_input(format!(
+                "Cannot update the metadata of field '{}': changing its {marker} would \
+                 change how the field's data decodes, so existing data would read back \
+                 wrong or fail to read. Keep that metadata as it is (a replace must restate \
+                 it). To use another encoding, add a new column with it, or overwrite a \
+                 table that holds no data yet with the schema you want",
+                after.field_path(field.id)?
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2747,5 +2822,89 @@ mod tests {
         // This should succeed — the old manifest's LEGACY format should not
         // cause strict validation of the new STABLE fragments.
         validate_operation(Some(&legacy_manifest), &operation).unwrap();
+    }
+
+    /// `arrow` as a Lance field carrying `metadata`, set after the conversion so
+    /// no key is interpreted on the way in.
+    fn field_with(arrow: ArrowField, metadata: &[(&str, &str)]) -> LanceCoreField {
+        let mut field = LanceCoreField::try_from(&arrow).unwrap();
+        field.metadata = metadata
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        field
+    }
+
+    fn a_struct() -> ArrowField {
+        ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, true)].into()),
+            true,
+        )
+    }
+
+    fn a_list() -> ArrowField {
+        ArrowField::new_list("l", ArrowField::new_list_field(DataType::Int32, true), true)
+    }
+
+    fn binary() -> ArrowField {
+        ArrowField::new("b", DataType::LargeBinary, true)
+    }
+
+    #[rstest::rstest]
+    #[case::same_value(a_struct(), &[("packed", "true")], &[("packed", "true")], None)]
+    #[case::case_change(a_struct(), &[("packed", "true")], &[("packed", "TRUE")], None)]
+    #[case::alias(a_struct(), &[("packed", "true")], &[("lance-encoding:packed", "true")], None)]
+    #[case::false_added(a_struct(), &[], &[("packed", "false")], None)]
+    #[case::unrelated_key(a_struct(), &[("packed", "true")], &[("packed", "true"), ("k", "v")], None)]
+    #[case::leaf_ignores_packed(binary(), &[], &[("packed", "true")], None)]
+    #[case::mark_struct_packed(a_struct(), &[], &[("packed", "true")], Some("packed"))]
+    #[case::drop_packed(a_struct(), &[("packed", "true")], &[], Some("packed"))]
+    // The Lance schema calls "1" packed, the 2.1+ struct decoder does not.
+    #[case::truthy_only(a_struct(), &[], &[("packed", "1")], Some("packed"))]
+    #[case::true_to_truthy(a_struct(), &[("packed", "true")], &[("packed", "1")], Some("packed"))]
+    #[case::mark_list_packed(a_list(), &[], &[("packed", "true")], Some("packed"))]
+    #[case::mark_blob(binary(), &[], &[(BLOB_META_KEY, "true")], Some(BLOB_META_KEY))]
+    #[case::drop_blob(binary(), &[(BLOB_META_KEY, "true")], &[], Some(BLOB_META_KEY))]
+    #[case::blob_value_ignored(
+        binary(),
+        &[(BLOB_META_KEY, "true")],
+        &[(BLOB_META_KEY, "false")],
+        None
+    )]
+    #[case::mark_blob_v2(
+        a_struct(),
+        &[],
+        &[(ARROW_EXT_NAME_KEY, lance_arrow::BLOB_V2_EXT_NAME)],
+        Some(ARROW_EXT_NAME_KEY)
+    )]
+    fn test_changed_decoding_key(
+        #[case] arrow: ArrowField,
+        #[case] before: &[(&str, &str)],
+        #[case] after: &[(&str, &str)],
+        #[case] expected: Option<&str>,
+    ) {
+        let before = field_with(arrow.clone(), before);
+        let after = field_with(arrow, after);
+        let changed = changed_decoding_key(&before, &after);
+        match expected {
+            None => assert_eq!(changed, None),
+            Some(key) => {
+                let changed = changed.expect("a decoding change");
+                assert!(changed.contains(key), "{changed}");
+            }
+        }
+    }
+
+    /// A struct keeps its packed markers when it loses its last child or gains
+    /// its first: only the metadata decides them.
+    #[test]
+    fn test_packed_markers_do_not_depend_on_children() {
+        let packed = field_with(a_struct(), &[("packed", "true")]);
+        let mut childless = packed.clone();
+        childless.children.clear();
+
+        assert_eq!(changed_decoding_key(&packed, &childless), None);
+        assert_eq!(changed_decoding_key(&childless, &packed), None);
     }
 }
