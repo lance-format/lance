@@ -57,10 +57,10 @@ import java.util.stream.Collectors;
  * Its segments must match the identifier domain written by the dataset; incompatible groups use one
  * unsplit task instead.
  *
- * <p>ZoneMap reuses compatible v1 segments and distributes rebuilding of v0 or incompatible
- * segments without pending remaps. Pending remaps retain old segments and only index new data;
- * tagged fragment reuse follows the same skip/error policy as other split indices. Fragments are
- * indivisible.
+ * <p>ZoneMap reuses compatible v1 segments and distributes rebuilds of v0 or incompatible segments.
+ * If a selected live segment has a separate base path or a pending legacy remap, the plan only
+ * indexes new fragments. With tagged fragment reuse, bounded optimize skips ZoneMap unless
+ * explicitly named, which fails instead. Fragments are indivisible.
  *
  * <p>An ordinary commit publishes every merged segment in one transaction anchored at the plan's
  * read version, so conflict detection covers everything committed since the plan was made. Results

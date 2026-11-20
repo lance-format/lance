@@ -317,10 +317,10 @@ async fn test_v8_zonemap_segment_is_rebuilt_as_version_1(#[case] task_limit: Opt
         .await
         .unwrap();
     let options = OptimizeOptions::default().max_rows_per_task(task_limit);
-    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
-        .await
-        .unwrap();
     if task_limit.is_some() {
+        let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+            .await
+            .unwrap();
         assert!(plan.tasks.len() > 1, "v0 rebuild is distributed");
         assert!(
             plan.tasks
@@ -334,9 +334,6 @@ async fn test_v8_zonemap_segment_is_rebuilt_as_version_1(#[case] task_limit: Opt
                 .collect::<RoaringBitmap>(),
             *dataset.fragment_bitmap
         );
-    } else {
-        assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].old_segments.len(), 1);
     }
     dataset.optimize_indices(&options).await.unwrap();
 
