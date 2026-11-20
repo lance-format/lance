@@ -8,8 +8,7 @@ use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
     utils::{
-        filter_finite_training_data, infer_vector_dim, maybe_sample_ivf_training_data,
-        sample_unseen_training_data,
+        filter_finite_training_data, maybe_sample_ivf_training_data, sample_unseen_training_data,
     },
 };
 use super::{
@@ -17,9 +16,7 @@ use super::{
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
-use crate::dataset::transaction::Operation;
 use crate::index::DatasetIndexExt;
-use crate::index::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
@@ -45,19 +42,17 @@ use arrow_buffer::MutableBuffer;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::{FutureExt, TryFutureExt};
+use futures::TryFutureExt;
 use futures::{
     Stream, TryStreamExt,
     stream::{self, StreamExt},
 };
-use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
-    traits::DatasetTakeRows,
     utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
@@ -113,7 +108,7 @@ use lance_index::{
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::{CachedFileSize, read_last_block, read_version};
+use lance_io::utils::CachedFileSize;
 use lance_io::{
     ReadBatchParams,
     local::to_local_path,
@@ -136,7 +131,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     any::Any,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     future::Future,
     ops::Range,
     pin::Pin,
@@ -147,12 +142,14 @@ use tracing::instrument;
 use uuid::Uuid;
 
 pub mod builder;
+mod compatibility;
 mod coreset_algo;
 pub mod io;
 mod partition_serde;
 mod streaming_hamming;
 pub mod v2;
 
+pub(crate) use compatibility::{VectorQueryContract, validate_committed_vector_segments};
 use coreset_algo::{FloatCoresetAlgorithm, HammingCoresetAlgorithm, StreamingCoresetAlgorithm};
 
 // Cache wrapper for vector index trait objects
@@ -429,6 +426,14 @@ pub(crate) fn select_steady_state_rebalance(
     let mut join_threshold = None;
 
     for (metadata, index) in logical_index.segments() {
+        // The legacy writer keeps the partitions it is given, so rebalancing a
+        // legacy segment would rewrite the same file on every optimize.
+        // An index with a legacy segment never joins either: its segments do
+        // not share a storage format, or all are legacy and leave no join
+        // threshold.
+        if index.as_any().is::<IVFIndex>() {
+            continue;
+        }
         let index_type = index_type_for_segmented_optimize(index.as_ref())?;
         let target_partition_size = metadata
             .index_details
@@ -564,255 +569,6 @@ pub(crate) fn validate_vector_query_compatibility(
     }
 
     Ok(())
-}
-
-/// What a search ranks a vector segment by: its metric and its index type.
-/// Merging the distances of segments that differ in either ranks part of the
-/// data by the wrong one.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct VectorQueryContract {
-    metric: DistanceType,
-    /// `IndexType::Vector` for an index extension, which names no type this
-    /// build knows; it matches only another such segment.
-    index_type: IndexType,
-}
-
-impl VectorQueryContract {
-    /// The contract of an opened segment, from the two accessors every
-    /// vector index implements, legacy ones included.
-    pub(crate) fn of_index(index: &dyn VectorIndex) -> Self {
-        Self {
-            metric: index.metric_type(),
-            index_type: index.index_type(),
-        }
-    }
-
-    /// The contract an index file of the current format records in its
-    /// schema: the type the opener dispatches on, and the metric the opened
-    /// index ranks by.
-    fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
-        let index_type = IndexType::try_from(metadata.index_type.as_str())?;
-        // The opener opens these files only as one of the IVF types.
-        if !index_type.is_vector() || index_type == IndexType::Vector {
-            return Err(Error::index(format!(
-                "Unsupported index type: {}",
-                metadata.index_type
-            )));
-        }
-        Ok(Self {
-            metric: DistanceType::try_from(metadata.distance_type.as_str())?,
-            index_type,
-        })
-    }
-}
-
-impl std::fmt::Display for VectorQueryContract {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.index_type {
-            // Its `Display` says IVF_PQ.
-            IndexType::Vector => write!(f, "metric {:?}, an index extension's type", self.metric),
-            index_type => write!(f, "metric {:?}, type {index_type}", self.metric),
-        }
-    }
-}
-
-/// Refuses a `CreateIndex` that would leave the segments of one index name
-/// keyed on different columns, or its vector segments under different query
-/// contracts. The index APIs compare the contracts of opened segments with
-/// [`validate_vector_query_compatibility`]; a raw transaction reaches the
-/// commit without them, so each commit attempt compares every segment the new
-/// manifest keeps under each name the transaction adds to, retained ones
-/// included, whatever their details say: a search merges all of them once it
-/// picks the name, and one this build would leave out as too new, a newer
-/// build merges. The caller of a raw transaction sets every field of the
-/// segment metadata, so each contract is read from the segment's own index
-/// file, and a file that cannot be read refuses the commit.
-///
-/// A search opens every segment of the name it picks as a vector segment, so
-/// when some segments of a name have an index file, all of them need one: a
-/// scalar segment on the same column, or a vector segment whose file is gone,
-/// would fail every search. A name none of whose segments has one, such as a
-/// zone map on a vector-typed column, is not a vector index.
-pub(crate) async fn validate_committed_vector_segments(
-    dataset: &Dataset,
-    operation: &Operation,
-    proposed_indices: &[TableIndexMetadata],
-) -> Result<()> {
-    let Operation::CreateIndex { new_indices, .. } = operation else {
-        return Ok(());
-    };
-    let mut segments_by_name: BTreeMap<&str, Vec<&TableIndexMetadata>> = new_indices
-        .iter()
-        .map(|index| (index.name.as_str(), Vec::new()))
-        .collect();
-    for segment in proposed_indices {
-        if let Some(segments) = segments_by_name.get_mut(segment.name.as_str()) {
-            segments.push(segment);
-        }
-    }
-
-    for (name, segments) in segments_by_name {
-        // A search picks a name by a segment keyed on the queried vector
-        // column, then merges the other segments of that name with it.
-        let keyed_on_a_vector_column = segments.iter().any(|segment| {
-            segment
-                .fields
-                .first()
-                .and_then(|&field_id| dataset.schema().field_by_id(field_id))
-                .is_some_and(|field| infer_vector_dim(&field.data_type()).is_ok())
-        });
-        if segments.len() < 2 || !keyed_on_a_vector_column {
-            continue;
-        }
-        let first = segments[0];
-        if let Some(other) = segments
-            .iter()
-            .find(|segment| segment.keyed_fields() != first.keyed_fields())
-        {
-            let columns = |segment: &TableIndexMetadata| {
-                segment
-                    .keyed_fields()
-                    .iter()
-                    .map(|&field_id| {
-                        dataset
-                            .schema()
-                            .field_path(field_id)
-                            .unwrap_or_else(|_| format!("field {field_id}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segments {} (on {}) and {} (on {}) would both remain in index \
-                 '{name}'; a search reads every segment of an index as keyed on the queried \
-                 column, so all of them must be keyed on the same columns",
-                first.uuid,
-                columns(first),
-                other.uuid,
-                columns(other),
-            )));
-        }
-        // Boxed and collected first: reading a segment is a large future, and
-        // mapping these references inside the stream makes rustc report the
-        // commit future's `Send` as "not general enough".
-        let contracts = segments
-            .into_iter()
-            .map(|segment| {
-                async move {
-                    let contract =
-                        vector_segment_contract(dataset, segment)
-                            .await
-                            .map_err(|error| {
-                                Error::io(format!(
-                                    "CreateIndex: cannot read vector segment {} to check that \
-                                     index '{}' keeps one metric and index type: {error}",
-                                    segment.uuid, segment.name
-                                ))
-                            })?;
-                    Ok::<_, Error>((segment, contract))
-                }
-                .boxed()
-            })
-            .collect::<Vec<_>>();
-        let mut contracts = stream::iter(contracts).buffered(dataset.object_store.io_parallelism());
-        let mut reference: Option<(&TableIndexMetadata, VectorQueryContract)> = None;
-        let mut without_index_file = None;
-        while let Some((segment, contract)) = contracts.try_next().await? {
-            match contract {
-                None => {
-                    without_index_file.get_or_insert(segment);
-                }
-                Some(contract) => match &reference {
-                    None => reference = Some((segment, contract)),
-                    Some((first, expected)) if *expected != contract => {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: vector segments {} ({expected}) and {} ({contract}) \
-                             would both remain in index '{name}'; a search ranks every segment \
-                             of an index by one metric and index type, so replace all of its \
-                             segments in one commit",
-                            first.uuid, segment.uuid,
-                        )));
-                    }
-                    Some(_) => {}
-                },
-            }
-            if let (Some((first, expected)), Some(other)) = (&reference, without_index_file) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: vector segment {} ({expected}) and segment {}, which has no \
-                     vector index file, would both remain in index '{name}'; a search opens \
-                     every segment of an index as a vector segment",
-                    first.uuid, other.uuid,
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A vector segment's contract, read from its own index file. A file of the
-/// current format records it in its schema, read the way the opener reads it
-/// before loading any centroid; a file of an older format, or an index
-/// extension's, is opened on the identity plan, since a staged segment is in
-/// no listing a query plan covers, and a plan translates row addresses, never
-/// a metric or a type.
-///
-/// `None` when the segment has no index file: the files it records name
-/// none, or it records no files and the store has none.
-async fn vector_segment_contract(
-    dataset: &Dataset,
-    segment: &TableIndexMetadata,
-) -> Result<Option<VectorQueryContract>> {
-    // Not asked of the store: a missing key costs a request and its retries
-    // per segment, and a store may answer it with a denial instead.
-    if segment
-        .files
-        .as_ref()
-        .is_some_and(|files| !files.iter().any(|file| file.path == INDEX_FILE_NAME))
-    {
-        return Ok(None);
-    }
-    let object_store = dataset.object_store_for_index(segment).await?;
-    let index_file = dataset
-        .indice_files_dir(segment)?
-        .join(segment.uuid.to_string())
-        .join(INDEX_FILE_NAME);
-    let file_sizes = segment.file_size_map();
-    let version = async {
-        let reader = open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?;
-        read_version(&read_last_block(reader.as_ref()).await?)
-    };
-    let version = match version.await {
-        Ok(version) => version,
-        Err(error) if error.is_not_found() => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if matches!(version, (0, 3) | (2, _)) {
-        let metadata = dataset
-            .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
-            .await?;
-        return VectorQueryContract::from_file_metadata(&metadata).map(Some);
-    }
-    let field_id = segment
-        .fields
-        .first()
-        .ok_or_else(|| Error::invalid_input("the segment names no indexed column".to_string()))?;
-    let column = dataset.schema().field_path(*field_id)?;
-    let index = dataset
-        .open_vector_index_from_metadata_with_plan(
-            &column,
-            segment,
-            Some(&SegmentRemappingPlan::Identity),
-            OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
-        )
-        .await?;
-    Ok(Some(VectorQueryContract::of_index(index.as_ref())))
 }
 
 fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
@@ -1033,6 +789,47 @@ pub(crate) async fn optimize_vector_indices(
         .await;
     }
 
+    let first_idx = existing_indices[0]
+        .as_any()
+        .downcast_ref::<IVFIndex>()
+        .ok_or(Error::index(
+            "optimizing vector index: the first index isn't IVF".to_string(),
+        ))?;
+    // Only the legacy IVF_PQ writer exists. Reject every other legacy
+    // sub-index before creating any output file: the HNSW partition writer
+    // rejects scalar quantization, so allowing it here would create empty
+    // index and auxiliary writers before failing.
+    if !first_idx.sub_index.as_any().is::<PQIndex>() {
+        let (sub_index_type, quantization_type) = first_idx.sub_index.sub_index_type();
+        // Retraining a released 0.11 HNSW_SQ segment fails while it scans the
+        // vector column: without index details, the planner mistakes the legacy
+        // vector index for a scalar one and looks for page_lookup.lance.
+        let rebuild = if matches!(
+            (sub_index_type, quantization_type),
+            (SubIndexType::Hnsw, QuantizationType::Scalar)
+        ) {
+            "drop it with drop_index and rebuild it from the data with create_index"
+        } else {
+            "set retrain to rebuild it in the current format"
+        };
+        return Err(Error::not_supported(format!(
+            "optimizing vector index: a legacy-format {} index cannot be optimized \
+             incrementally; {rebuild}",
+            index_type_string(sub_index_type, quantization_type)
+        )));
+    }
+    // The legacy writers keep every posting of the segments they merge. With
+    // stable row ids an updated row keeps its id in its new fragment, so its
+    // old entry would stay in the index next to the new one.
+    if dataset.manifest.uses_stable_row_ids() && options.num_indices_to_merge != Some(0) {
+        return Err(Error::not_supported(
+            "optimizing vector index: a legacy-format vector index cannot merge segments on a \
+             table with stable row ids; set num_indices_to_merge to 0 to append a segment, or \
+             set retrain to rebuild the index in the current format"
+                .to_string(),
+        ));
+    }
+
     let new_uuid = Uuid::new_v4();
     let object_store = dataset.object_store.as_ref();
     let index_file = dataset
@@ -1041,58 +838,30 @@ pub(crate) async fn optimize_vector_indices(
         .join(INDEX_FILE_NAME);
     let writer = object_store.create(&index_file).await?;
 
-    let first_idx = existing_indices[0]
+    let pq_index = first_idx
+        .sub_index
         .as_any()
-        .downcast_ref::<IVFIndex>()
-        .ok_or(Error::index(
-            "optimizing vector index: the first index isn't IVF".to_string(),
-        ))?;
-
-    let (merged, files) =
-        if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
-            let (merged, file) = optimize_ivf_pq_indices(
-                first_idx,
-                pq_index,
-                vector_column,
-                unindexed,
-                &existing_indices,
-                options,
-                writer,
-                dataset.version().version,
+        .downcast_ref::<PQIndex>()
+        .ok_or_else(|| {
+            Error::internal(
+                "optimizing vector index: the legacy sub index was checked above".to_string(),
             )
-            .await?;
-            (merged, vec![file])
-        } else if let Some(hnsw_sq) = first_idx
-            .sub_index
-            .as_any()
-            .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
-        {
-            let aux_file = dataset
-                .indices_dir()
-                .join(new_uuid.to_string())
-                .join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_writer = object_store.create(&aux_file).await?;
-            optimize_ivf_hnsw_indices(
-                Arc::new(dataset),
-                first_idx,
-                hnsw_sq,
-                vector_column,
-                unindexed,
-                &existing_indices,
-                options,
-                writer,
-                aux_writer,
-            )
-            .await?
-        } else {
-            return Err(Error::index(
-                "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
-            ));
-        };
+        })?;
+    let (merged, file) = optimize_ivf_pq_indices(
+        first_idx,
+        pq_index,
+        vector_column,
+        unindexed,
+        &existing_indices,
+        options,
+        writer,
+        dataset.version().version,
+    )
+    .await?;
 
     // never change the index version,
     // because we won't update the legacy vector index format
-    Ok((new_uuid, merged, files))
+    Ok((new_uuid, merged, vec![file]))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -1294,6 +1063,27 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .await?
             }
         }
+        // IVF_HNSW_FLAT (binary vectors)
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                derive_hnsw_params(reference_index.as_ref()),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_index_sources(existing_indices.clone())
+            .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
+            .shuffle_data_input(unindexed)
+            .build()
+            .await?
+        }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
@@ -1356,13 +1146,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .shuffle_data_input(unindexed)
             .build()
             .await?
-        }
-        (sub_index_type, quantization_type) => {
-            unimplemented!(
-                "unsupported index type: {}, {}",
-                sub_index_type,
-                quantization_type
-            )
         }
     };
 
@@ -1456,172 +1239,6 @@ async fn optimize_ivf_pq_indices(
             size_bytes,
             file_metadata_size_bytes: None,
         },
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn optimize_ivf_hnsw_indices<Q: Quantization>(
-    dataset: Arc<dyn DatasetTakeRows>,
-    first_idx: &IVFIndex,
-    hnsw_index: &HNSWIndex<Q>,
-    vector_column: &str,
-    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn VectorIndex>],
-    options: &OptimizeOptions,
-    writer: Box<dyn Writer>,
-    aux_writer: Box<dyn Writer>,
-) -> Result<(usize, Vec<IndexFile>)> {
-    let distance_type = first_idx.metric_type;
-    let quantizer = hnsw_index.quantizer().clone();
-    let ivf = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
-        first_idx.ivf.centroids.clone().unwrap(),
-        distance_type,
-        vector_column,
-        quantizer.clone(),
-        None,
-    )?;
-
-    // Shuffled un-indexed data with partition.
-    let unindexed_data = match unindexed {
-        Some(unindexed) => Some(
-            shuffle_dataset(
-                unindexed,
-                Arc::new(ivf),
-                None,
-                first_idx.ivf.num_partitions() as u32,
-                10000,
-                2,
-                None,
-            )
-            .await?,
-        ),
-        None => None,
-    };
-
-    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
-
-    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
-    let start_pos = if num_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - num_to_merge
-    };
-
-    let indices_to_merge = existing_indices[start_pos..]
-        .iter()
-        .map(|idx| {
-            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
-                "optimizing vector index: it is not a IVF index".to_string(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Prepare the HNSW writer
-    let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer =
-        V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())?;
-    writer.add_metadata(
-        INDEX_METADATA_SCHEMA_KEY,
-        json!(IndexMetadata {
-            index_type: format!("IVF_HNSW_{}", quantizer.quantization_type()),
-            distance_type: distance_type.to_string(),
-        })
-        .to_string()
-        .as_str(),
-    );
-
-    // Prepare the quantization storage writer
-    let schema = Schema::new(vec![
-        ROW_ID_FIELD.clone(),
-        arrow_schema::Field::new(
-            quantizer.column(),
-            DataType::FixedSizeList(
-                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                quantizer.code_dim() as i32,
-            ),
-            false,
-        ),
-    ]);
-    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        V1FileWriter::with_object_writer(aux_writer, schema, &V1FileWriterOptions::default())?;
-    aux_writer.add_metadata(
-        INDEX_METADATA_SCHEMA_KEY,
-        json!(IndexMetadata {
-            index_type: quantizer.quantization_type().to_string(),
-            distance_type: distance_type.to_string(),
-        })
-        .to_string()
-        .as_str(),
-    );
-
-    // Write the metadata of quantizer
-    let quantization_metadata = match &quantizer {
-        Quantizer::Product(pq) => {
-            let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
-            let codebook_pos = aux_writer.tell().await?;
-            aux_writer
-                .object_writer
-                .write_protobuf(&codebook_tensor)
-                .await?;
-
-            Some(QuantizationMetadata {
-                codebook_position: Some(codebook_pos),
-                ..Default::default()
-            })
-        }
-        _ => None,
-    };
-
-    aux_writer.add_metadata(
-        quantizer.metadata_key(),
-        quantizer
-            .metadata(quantization_metadata)?
-            .to_string()
-            .as_str(),
-    );
-
-    let hnsw_params = &hnsw_index.metadata().params;
-    let (hnsw_metadata, aux_ivf) = write_hnsw_quantization_index_partitions(
-        dataset,
-        vector_column,
-        distance_type,
-        hnsw_params,
-        &mut writer,
-        Some(&mut aux_writer),
-        &mut ivf_mut,
-        quantizer,
-        unindexed_data,
-        Some(&indices_to_merge),
-    )
-    .await?;
-
-    // Add the metadata of HNSW partitions
-    let hnsw_metadata_json = json!(hnsw_metadata);
-    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
-
-    ivf_mut.write(&mut writer).await?;
-    // `finish` writes the footer and returns the authoritative on-disk size.
-    let index_size = writer.finish().await?.size_bytes;
-
-    // Write the aux file
-    aux_ivf.write(&mut aux_writer).await?;
-    let aux_size = aux_writer.finish().await?.size_bytes;
-
-    Ok((
-        existing_indices.len() - start_pos,
-        vec![
-            IndexFile {
-                path: INDEX_FILE_NAME.to_string(),
-                size_bytes: index_size,
-                file_metadata_size_bytes: None,
-            },
-            IndexFile {
-                path: INDEX_AUXILIARY_FILE_NAME.to_string(),
-                size_bytes: aux_size,
-                file_metadata_size_bytes: None,
-            },
-        ],
     ))
 }
 
@@ -1915,7 +1532,9 @@ impl VectorIndex for IVFIndex {
     }
 
     fn quantizer(&self) -> Quantizer {
-        unimplemented!("only for v2 IVFIndex")
+        // A legacy index keeps its quantizer on the sub-index. The shared-model
+        // check in `optimize_vector_indices` reads it before the v1/v2 dispatch.
+        self.sub_index.quantizer()
     }
 
     fn partition_size(&self, part_id: usize) -> usize {
@@ -1924,7 +1543,7 @@ impl VectorIndex for IVFIndex {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
-        unimplemented!("only for v2 IVFIndex")
+        self.sub_index.sub_index_type()
     }
 
     fn metric_type(&self) -> MetricType {

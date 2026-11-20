@@ -40,6 +40,7 @@ use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::details::{
     target_partition_size_from_details, vector_index_details_default,
 };
+use crate::index::vector::ivf::compatibility::{VectorQueryContract, vector_segment_contract};
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
@@ -4199,8 +4200,6 @@ async fn test_vector_segment_contract_read_from_file_metadata(
     #[case] params: VectorIndexParams,
     #[case] index_type: IndexType,
 ) {
-    use crate::index::vector::ivf::{VectorQueryContract, vector_segment_contract};
-
     let mut dataset = write_small_vector_dataset("memory://").await;
     let segment = dataset
         .create_index_builder(&["vector"], IndexType::Vector, &params)
@@ -4348,6 +4347,58 @@ async fn test_raw_index_commit_opens_legacy_v1_segments(
             "{err}"
         );
     }
+}
+
+/// A legacy IVF_HNSW_PQ segment has no incremental writer: optimize refuses
+/// it with an error naming the index type, and the retrain the error suggests
+/// rebuilds it as one current-format segment over every fragment.
+#[tokio::test]
+async fn test_optimize_legacy_v1_hnsw_pq_refuses_incremental_optimize_and_retrains() {
+    let dataset = write_legacy_v1_dataset("memory://").await;
+    let segment = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0, 1]).await;
+    let dataset = commit_raw_index_segments(&dataset, vec![("shared", segment)], vec![], false)
+        .await
+        .unwrap();
+    let appended = gen_batch()
+        .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_batch_rows(RowCount::from(64))
+        .unwrap();
+    let mut dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    let err = dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::NotSupported { .. }),
+        "expected NotSupported, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("IVF_HNSW_PQ") && err.to_string().contains("retrain"),
+        "{err}"
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::retrain())
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("shared").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert!(matches!(
+        index_file_version(&dataset, &segments[0]).await,
+        (0, 3) | (2, _)
+    ));
+    assert_eq!(
+        segments[0].fragment_bitmap.as_ref().unwrap(),
+        dataset.fragment_bitmap.as_ref()
+    );
 }
 
 #[tokio::test]

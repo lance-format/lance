@@ -7903,6 +7903,33 @@ def test_late_materialization_batch_size(tmp_path: Path):
         assert batch.num_rows == 32
 
 
+@pytest.mark.parametrize("batch_size", [7, 10, 20])
+@pytest.mark.parametrize("late_materialization", [None, True])
+def test_late_materialization_max_batch_size(
+    tmp_path: Path, batch_size: int, late_materialization
+):
+    n = 300
+    table = pa.table(
+        {
+            "id": pa.array(range(n), pa.int64()),
+            "v": pa.array([i % 5 for i in range(n)], pa.int64()),
+            "s": pa.array([str(i) * 3 for i in range(n)]),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=100)
+    sizes = [
+        batch.num_rows
+        for batch in dataset.to_batches(
+            columns=["s"],
+            filter="v = 2",
+            batch_size=batch_size,
+            late_materialization=late_materialization,
+        )
+    ]
+    assert sum(sizes) == n // 5
+    assert all(rows <= batch_size for rows in sizes), sizes
+
+
 def test_batch_size_bytes_chopping_fallback(tmp_path: Path):
     # Write rows with large strings (~10KiB each). The file reader's byte-size
     # estimation is based on on-disk size which, for strings, can differ

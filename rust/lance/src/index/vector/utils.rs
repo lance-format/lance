@@ -54,10 +54,11 @@ fn training_sample_readahead(
 }
 
 /// Sets how many consecutive rows each random draw of a FixedSizeList IVF
-/// training sample reads. Quantizer samples are too small to stay
-/// representative in runs, so they always draw independent rows. Unset or `1` samples rows independently. A larger value reads
-/// the same number of rows as contiguous runs, which object storage serves in
-/// about one request per run, at the cost of a sample correlated within a run.
+/// training sample reads. Unset or `1` samples rows independently. A larger
+/// value reads the same number of rows as contiguous runs, which object storage
+/// serves in about one request per run, at the cost of a sample correlated
+/// within a run. Quantizer samples are too small to stay representative in
+/// runs, so they always draw independent rows.
 const IVF_TRAINING_SAMPLE_BLOCK_ROWS_ENV: &str = "LANCE_IVF_TRAINING_SAMPLE_BLOCK_ROWS";
 
 /// Parse the value of [`IVF_TRAINING_SAMPLE_BLOCK_ROWS_ENV`]; `None` means unset.

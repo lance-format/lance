@@ -23,21 +23,31 @@ use futures::{
     stream::{self},
 };
 use lance_arrow::SchemaExt;
+use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD, Result};
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use roaring::RoaringTreemap;
+use std::sync::{Arc, Mutex};
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
 // we wrap the left side and the right side in a struct and make a single "combined schema"
 fn combined_schema(source: &Schema, target: &Schema) -> Schema {
+    // The fields become nullable children of a struct, which a primary key may
+    // not be, so the primary-key markers are dropped; the planner otherwise
+    // rejects the schema when it converts it to a Lance schema.
     let nullable = |schema: &Schema| -> Fields {
         schema
             .fields
             .iter()
-            .map(|f| f.as_ref().clone().with_nullable(true))
+            .map(|f| {
+                let mut metadata = f.metadata().clone();
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+                f.as_ref()
+                    .clone()
+                    .with_nullable(true)
+                    .with_metadata(metadata)
+            })
             .collect()
     };
     Schema::new(vec![
@@ -118,7 +128,7 @@ pub(super) struct Merger {
     /// Whether to enable stable row ids
     enable_stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
-    processed_row_ids: Arc<Mutex<HashSet<u64>>>,
+    processed_row_ids: Arc<Mutex<RoaringTreemap>>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
     processed_insert_keys: Arc<Mutex<InsertedKeyTracker>>,
     /// Inserted keys for declared primary-key conflict detection; absent otherwise.
@@ -204,7 +214,7 @@ impl Merger {
             with_row_id,
             output_schema,
             enable_stable_row_ids,
-            processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
+            processed_row_ids: Arc::new(Mutex::new(RoaringTreemap::new())),
             processed_insert_keys: Arc::new(Mutex::new(InsertedKeyTracker::default())),
             inserted_rows_filter: Arc::new(Mutex::new(inserted_rows_filter)),
         })
