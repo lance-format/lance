@@ -59,6 +59,60 @@ address (`fragment_id << 32 | offset`) of each vector in `_rowaddr` instead of t
 dataset's logical row id in `_rowid`. A segment persisted below version 3 stores
 row ids throughout, and merging never combines segments of differing domain.
 
+## Coarse-routing fingerprint
+
+Each segment's manifest `VectorIndexDetails` may contain
+`coarse_quantizer_fingerprint` (optional bytes, field 10): the raw 32-byte output
+of unkeyed BLAKE3, not hexadecimal text. It identifies the final persisted IVF
+coarse-routing state, not the entire index, quantization codebook compatibility,
+or eligibility for physical segment merging.
+
+Writers must recompute the fingerprint when routing state changes, and omit or
+clear it when no reliable fingerprint can be computed. An unchanged routing
+state may retain its fingerprint.
+
+### Encoding
+
+Hash the concatenation of the following bytes, in this order, without padding,
+length prefixes other than the two dimensions below, or a trailing terminator:
+
+1. The ASCII bytes `lance.coarse_quantizer.v1` (no NUL terminator).
+2. One metric byte: L2 = 1, cosine = 2, dot product = 3, Hamming = 4.
+   These tags are specific to this encoding, not protobuf enum numbers. Use the
+   index's metric, so cosine remains distinct from L2 even when routing evaluates
+   L2 distances on normalized query vectors.
+3. The number of centroids as an unsigned 64-bit little-endian integer.
+4. The centroid dimension as an unsigned 64-bit little-endian integer.
+5. One scalar-type byte: float16 = 1, float32 = 2, float64 = 3, uint8 = 4,
+   int8 = 5.
+6. All centroid scalar values, in partition-ID order, with coordinates in their
+   stored order within each centroid. There are exactly centroid-count times
+   dimension values. Floating-point values use their raw IEEE-754 binary16,
+   binary32, or binary64 bit representation, in little-endian order. Unsigned
+   8-bit values use their single byte; signed 8-bit values use their two's
+   complement byte. Do not round, cast, reorder, or normalize values while
+   hashing; signed zeros and NaN payloads retain their distinct bit patterns.
+
+Only the inputs above are hashed; Arrow metadata, storage layout, training loss,
+and quantization state are excluded. Writers omit the field for missing centroids,
+null rows or scalar values, unlisted scalar types, or additional routing state
+not covered by this encoding, such as a query pre-transform or coarse-search graph.
+
+### Compatibility
+
+Readers may reuse routing among segments with equal, exactly 32-byte fingerprints;
+each segment still searches its own partitions. Missing fields, undecodable vector
+metadata, or other byte lengths require independent routing for that segment,
+without preventing reuse among the remaining compatible segments. Unequal
+fingerprints must not share routing. The fingerprint is a writer assertion,
+not an index-file integrity checksum.
+
+Older readers may ignore the optional field; existing indices need no rewrite
+and use independent routing when it is absent. This encoding must not be
+repurposed for different routing semantics. Future encodings require a separately
+specified domain and must not make incompatible routing states compare equal.
+The stored digest has no separate version byte.
+
 ## PCA Pre-transform
 
 !!! warning "Experimental"
