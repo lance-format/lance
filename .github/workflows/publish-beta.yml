@@ -65,21 +65,19 @@ jobs:
       run: |
         RELEASE_NOTES_FROM="${{ steps.publish.outputs.RELEASE_NOTES_FROM }}"
         BETA_TAG="${{ steps.publish.outputs.BETA_TAG }}"
+        NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
 
         if [ -n "${RELEASE_NOTES_FROM}" ]; then
           echo "Generating release notes from ${RELEASE_NOTES_FROM} to ${BETA_TAG}"
-          NOTES=$(python ci/generate_release_notes.py ${RELEASE_NOTES_FROM} ${BETA_TAG})
+          python ci/generate_release_notes.py "${RELEASE_NOTES_FROM}" "${BETA_TAG}" > "${NOTES_FILE}"
         else
           echo "No release-root tag found, using automatic generation"
-          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+          gh api repos/${{ github.repository }}/releases/generate-notes \
             -f tag_name="${BETA_TAG}" \
-            --jq .body)
+            --jq .body > "${NOTES_FILE}"
         fi
 
-        # Save to output
-        echo "notes<<EOF" >> $GITHUB_OUTPUT
-        echo "$NOTES" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+        echo "notes_file=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
 
     - name: Create GitHub Pre-Release (if not dry run)
       if: ${{ !inputs.dry_run }}
@@ -89,7 +87,7 @@ jobs:
         name: ${{ steps.publish.outputs.BETA_TAG }}
         draft: false
         prerelease: true
-        body: ${{ steps.beta_release_notes.outputs.notes }}
+        body_path: ${{ steps.beta_release_notes.outputs.notes_file }}
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
 
     - name: Summary

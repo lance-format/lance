@@ -75,21 +75,19 @@ jobs:
       run: |
         PREVIOUS_TAG="${{ steps.create_branch.outputs.PREVIOUS_TAG }}"
         RC_TAG="${{ steps.create_branch.outputs.RC_TAG }}"
+        NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
 
         if [ -n "${PREVIOUS_TAG}" ]; then
           echo "Generating release notes from ${PREVIOUS_TAG} to ${RC_TAG}"
-          NOTES=$(python ci/generate_release_notes.py ${PREVIOUS_TAG} ${RC_TAG})
+          python ci/generate_release_notes.py "${PREVIOUS_TAG}" "${RC_TAG}" > "${NOTES_FILE}"
         else
           echo "No previous tag found, using automatic generation"
-          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+          gh api repos/${{ github.repository }}/releases/generate-notes \
             -f tag_name="${RC_TAG}" \
-            --jq .body)
+            --jq .body > "${NOTES_FILE}"
         fi
 
-        # Save to output
-        echo "notes<<EOF" >> $GITHUB_OUTPUT
-        echo "$NOTES" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+        echo "notes_file=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
 
     - name: Create GitHub Pre-Release (if not dry run)
       if: ${{ !inputs.dry_run }}
@@ -99,7 +97,7 @@ jobs:
         name: ${{ steps.create_branch.outputs.RC_TAG }}
         draft: false
         prerelease: true
-        body: ${{ steps.rc_release_notes.outputs.notes }}
+        body_path: ${{ steps.rc_release_notes.outputs.notes_file }}
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
 
     - name: Create GitHub Discussion for RC Vote (if not dry run)
