@@ -17,7 +17,7 @@ use super::{
     resolve_target_bases, target_blob_handling, uncommitted_transaction,
 };
 use super::{analysis, row_ids};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::row_ids_to_row_addrs;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::write::cleanup_data_fragments;
 use crate::dataset::write::retry::{RetryConfig, RetryExecutor, execute_with_retry};
@@ -1566,18 +1566,10 @@ impl MergeInsertJob {
             debug_assert!(drained.is_empty(), "delete-only merge must not emit rows");
 
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
-            let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    let mut addresses = Vec::with_capacity(removed_row_ids.len());
-                    for id in &removed_row_ids {
-                        if let Some(address) = row_id_index.get(*id)? {
-                            addresses.push(address.into());
-                        }
-                    }
-                    addresses
-                } else {
-                    removed_row_ids
-                };
+            let removed_row_addr_vec = row_ids_to_row_addrs(&self.dataset, &removed_row_ids)
+                .await?
+                .into_iter()
+                .flatten();
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec);
 
             let (updated_fragments, removed_fragment_ids) =
@@ -1728,18 +1720,10 @@ impl MergeInsertJob {
                 // Apply deletions
                 let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
-                let removed_row_addr_vec =
-                    if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                        let mut addresses: Vec<u64> = Vec::with_capacity(removed_row_ids.len());
-                        for id in &removed_row_ids {
-                            if let Some(address) = row_id_index.get(*id)? {
-                                addresses.push(address.into());
-                            }
-                        }
-                        addresses
-                    } else {
-                        removed_row_ids
-                    };
+                let removed_row_addr_vec = row_ids_to_row_addrs(&self.dataset, &removed_row_ids)
+                    .await?
+                    .into_iter()
+                    .flatten();
 
                 Ok(RoaringTreemap::from_iter(removed_row_addr_vec))
             }
