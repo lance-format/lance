@@ -13,7 +13,7 @@ use std::{
 };
 
 use arrow::array::AsArray;
-use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,6 +26,7 @@ use datafusion_physical_plan::{
 };
 use futures::{StreamExt, TryStream, TryStreamExt, future::Either, stream::BoxStream};
 use lance_arrow::deepcopy::deep_copy_batch_sliced;
+use lance_arrow::list::ListArrayExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder, LanceCache,
@@ -383,29 +384,19 @@ impl ScalarIndex for LabelListIndex {
     }
 }
 
-fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
-    if let Some(list_arr) = list_arr.as_list_opt::<i32>() {
-        let mut indices = Vec::with_capacity(list_arr.values().len());
-        let offsets = list_arr.value_offsets();
-        for (offset_idx, w) in offsets.windows(2).enumerate() {
-            let size = (w[1] - w[0]) as u64;
-            indices.extend((0..size).map(|_| offset_idx as u64));
+fn flatten_labels<O: OffsetSizeTrait>(lists: &GenericListArray<O>) -> (ArrayRef, UInt64Array) {
+    let mut labels = lists.trimmed_values();
+    let mut parent_indices = Vec::with_capacity(labels.len());
+    for (row, len) in lists.offsets().lengths().enumerate() {
+        if lists.is_valid(row) {
+            parent_indices.extend(std::iter::repeat_n(row as u64, len));
         }
-        UInt64Array::from(indices)
-    } else if let Some(list_arr) = list_arr.as_list_opt::<i64>() {
-        let mut indices = Vec::with_capacity(list_arr.values().len());
-        let offsets = list_arr.value_offsets();
-        for (offset_idx, w) in offsets.windows(2).enumerate() {
-            let size = (w[1] - w[0]) as u64;
-            indices.extend((0..size).map(|_| offset_idx as u64));
-        }
-        UInt64Array::from(indices)
-    } else {
-        unreachable!(
-            "Should verify that the first column is a list earlier. Got array of type: {}",
-            list_arr.data_type()
-        )
     }
+    // A null list may own physical child slots. Only then does flattening need to copy labels.
+    if parent_indices.len() != labels.len() {
+        labels = lists.filter_garbage_nulls().trimmed_values();
+    }
+    (labels, UInt64Array::from(parent_indices))
 }
 
 /// Collect row_ids for list-level NULLs before unnest; unnest drops NULL lists entirely.
@@ -494,28 +485,13 @@ fn unnest_batch(
         remaining_cols,
     )?;
 
-    let flatten_indices = extract_flatten_indices(key_col.as_ref());
-
-    let flattened_remaining =
-        arrow_select::take::take_record_batch(&remaining_batch, &flatten_indices)?;
-
-    let new_key_values = if let Some(key_list) = key_col.as_list_opt::<i32>() {
-        let value_start = key_list.value_offsets()[key_list.offset()] as usize;
-        let value_stop = key_list.value_offsets()[key_list.len()] as usize;
-        key_list
-            .values()
-            .slice(value_start, value_stop - value_start)
-            .clone()
-    } else if let Some(key_list) = key_col.as_list_opt::<i64>() {
-        let value_start = key_list.value_offsets()[key_list.offset()] as usize;
-        let value_stop = key_list.value_offsets()[key_list.len()] as usize;
-        key_list
-            .values()
-            .slice(value_start, value_stop - value_start)
-            .clone()
-    } else {
-        unreachable!("Should verify that the first column is a list earlier")
+    let (new_key_values, parent_indices) = match key_col.data_type() {
+        DataType::List(_) => flatten_labels(key_col.as_list::<i32>()),
+        DataType::LargeList(_) => flatten_labels(key_col.as_list::<i64>()),
+        other => unreachable!("LabelList requires a List or LargeList, got {other}"),
     };
+    let flattened_remaining =
+        arrow_select::take::take_record_batch(&remaining_batch, &parent_indices)?;
 
     let all_columns = vec![new_key_values]
         .into_iter()
@@ -1253,6 +1229,7 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
+    use arrow_array::builder::{GenericListBuilder, LargeListBuilder, ListBuilder, StringBuilder};
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
@@ -2282,6 +2259,45 @@ mod tests {
             build_label_list_index(&all).await,
             read_index_contents(merged_store.as_ref()).await,
             "merging an unsorted segment diverged from a full build"
+        );
+    }
+
+    #[rstest]
+    #[case::list(ListBuilder::new(StringBuilder::new()))]
+    #[case::large_list(LargeListBuilder::new(StringBuilder::new()))]
+    #[tokio::test]
+    async fn test_build_ignores_children_of_null_lists<O: OffsetSizeTrait>(
+        #[case] mut lists: GenericListBuilder<O, StringBuilder>,
+    ) {
+        lists.values().append_value("outside slice");
+        lists.append(true);
+        lists.values().append_value("hidden");
+        lists.append(false);
+        lists.append(true);
+        lists.values().append_null();
+        lists.values().append_value("visible");
+        lists.append(true);
+
+        let lists = lists.finish().slice(1, 3);
+        let batch = RecordBatch::try_from_iter([
+            (VALUE_COLUMN_NAME, Arc::new(lists) as ArrayRef),
+            (ROW_ADDR, Arc::new(UInt64Array::from(vec![10, 11, 12]))),
+        ])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let (_dir, store) = test_util::index_store();
+        train_label_list_index(stream, store.as_ref(), &NoopIndexBuildProgress)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_index_contents(store.as_ref()).await,
+            IndexContents {
+                labels: vec![(None, vec![12]), (Some("visible".into()), vec![12])],
+                list_nulls: vec![10],
+            }
         );
     }
 
