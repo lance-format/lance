@@ -20,8 +20,8 @@ import java.util.Optional;
 
 /**
  * SQ8 build parameters. Defaults to 8 bits and a training sample rate of 256 (up to 256 * 256
- * vectors). A supplied model skips training and must match the vector dimension and numBits. Use
- * the same distance metric for training and building.
+ * vectors). A supplied model skips training and must match the vector dimension, numBits, and input
+ * space (normalized for cosine, raw for L2 and dot product).
  */
 public class SQBuildParams {
   private final short numBits;

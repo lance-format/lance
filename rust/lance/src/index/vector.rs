@@ -801,10 +801,6 @@ async fn prepare_vector_segment_build(
         validate_supported_rq_num_bits(rq_params.num_bits)?;
     }
 
-    if let Some(StageParams::SQ(sq_params)) = stages.last() {
-        sq_params.validate(utils::get_vector_dim(dataset.schema(), column)?)?;
-    }
-
     let num_partitions = match (ivf_params0.num_partitions, ivf_params0.centroids.as_ref()) {
         (Some(num_partitions), Some(centroids)) if num_partitions != centroids.len() => {
             return Err(Error::index(format!(
@@ -863,6 +859,7 @@ pub(crate) async fn build_distributed_vector_index(
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
+    sq_quantizer: Option<ScalarQuantizer>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
@@ -1036,7 +1033,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -1046,11 +1043,15 @@ pub(crate) async fn build_distributed_vector_index(
                 Some(sq_params.clone()),
                 (),
                 frag_reuse_index,
-            )?
-            .with_fragment_filter(fragment_filter)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            )?;
+            if let Some(quantizer) = sq_quantizer {
+                builder.with_quantizer(quantizer);
+            }
+            let summary = builder
+                .with_fragment_filter(fragment_filter)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
             return Ok((segment_uuid, summary.files));
         }
 
@@ -1155,7 +1156,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -1165,11 +1166,15 @@ pub(crate) async fn build_distributed_vector_index(
                 Some(sq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
-            )?
-            .with_fragment_filter(fragment_filter)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            )?;
+            if let Some(quantizer) = sq_quantizer {
+                builder.with_quantizer(quantizer);
+            }
+            let summary = builder
+                .with_fragment_filter(fragment_filter)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
             return Ok((segment_uuid, summary.files));
         }
 
@@ -1258,6 +1263,7 @@ pub(crate) struct BuiltVectorSegment {
 }
 
 /// Build a Vector Index
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn build_vector_index(
     dataset: &Dataset,
@@ -1267,6 +1273,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
+    sq_quantizer: Option<ScalarQuantizer>,
 ) -> Result<BuiltVectorSegment> {
     build_vector_index_impl(
         dataset,
@@ -1278,6 +1285,7 @@ pub(crate) async fn build_vector_index(
         progress,
         None,
         false,
+        sq_quantizer,
     )
     .await
 }
@@ -1309,6 +1317,7 @@ pub(crate) async fn build_vector_model_segment(
         progress,
         fragment_ids,
         true,
+        None,
     )
     .await
 }
@@ -1324,6 +1333,7 @@ pub(crate) async fn build_filtered_vector_index(
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
+    sq_quantizer: Option<ScalarQuantizer>,
 ) -> Result<BuiltVectorSegment> {
     build_vector_index_impl(
         dataset,
@@ -1335,6 +1345,7 @@ pub(crate) async fn build_filtered_vector_index(
         progress,
         Some(fragment_ids),
         false,
+        sq_quantizer,
     )
     .await
 }
@@ -1350,6 +1361,7 @@ async fn build_vector_index_impl(
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
     train_only: bool,
+    sq_quantizer: Option<ScalarQuantizer>,
 ) -> Result<BuiltVectorSegment> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
@@ -1495,22 +1507,26 @@ async fn build_vector_index_impl(
                 )));
             };
 
-            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().clone().join(uuid.to_string()),
+                dataset.indices_dir().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
                 Some(sq_params.clone()),
                 (),
                 frag_reuse_index,
-            )?
-            .with_optional_fragment_filter(fragment_ids)
-            .with_train_only(train_only)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            )?;
+            if let Some(quantizer) = sq_quantizer {
+                builder.with_quantizer(quantizer);
+            }
+            let summary = builder
+                .with_optional_fragment_filter(fragment_ids)
+                .with_train_only(train_only)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
             Ok(summary)
         }
         IndexType::IvfRq => {
@@ -1634,22 +1650,26 @@ async fn build_vector_index_impl(
                     stages
                 )));
             };
-            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().clone().join(uuid.to_string()),
+                dataset.indices_dir().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
                 Some(sq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
-            )?
-            .with_optional_fragment_filter(fragment_ids)
-            .with_train_only(train_only)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            )?;
+            if let Some(quantizer) = sq_quantizer {
+                builder.with_quantizer(quantizer);
+            }
+            let summary = builder
+                .with_optional_fragment_filter(fragment_ids)
+                .with_train_only(train_only)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
             Ok(summary)
         }
         IndexType::IvfHnswRq => {
@@ -2494,7 +2514,6 @@ fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
     SQBuildParams {
         num_bits: sq_quantizer.num_bits(),
         sample_rate: 256, // Default
-        model: None,
     }
 }
 
@@ -3664,6 +3683,7 @@ mod tests {
             None,
             &[invalid_id],
             noop_progress(),
+            None,
         )
         .await;
 
@@ -3717,6 +3737,7 @@ mod tests {
             None,
             &fragments,
             noop_progress(),
+            None,
         )
         .await
         .unwrap_err();
@@ -3772,6 +3793,7 @@ mod tests {
             None,
             &[],
             noop_progress(),
+            None,
         )
         .await;
 
@@ -3844,6 +3866,7 @@ mod tests {
             &params,
             None,
             progress.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -3915,6 +3938,7 @@ mod tests {
             None,
             &[valid_id],
             noop_progress(),
+            None,
         )
         .await;
 

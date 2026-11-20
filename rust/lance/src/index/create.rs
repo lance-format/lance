@@ -18,6 +18,7 @@ use crate::{
         memory_progress::{ObservedBuild, ObservedOperation, index_type_label},
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::details::{vector_index_details, vector_index_details_default},
+        vector::sq::SqModel,
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
@@ -85,6 +86,7 @@ pub struct CreateIndexBuilder<'a> {
     train: bool,
     fragments: Option<Vec<u32>>,
     index_uuid: Option<Uuid>,
+    sq_model: Option<SqModel>,
     preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
     /// `None` when the build is part of an operation it would misreport.
@@ -113,6 +115,7 @@ impl<'a> CreateIndexBuilder<'a> {
             train: true,
             fragments: None,
             index_uuid: None,
+            sq_model: None,
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
             memory_operation: Some(ObservedOperation::CreateIndex),
@@ -150,6 +153,15 @@ impl<'a> CreateIndexBuilder<'a> {
 
     pub fn index_uuid(mut self, uuid: Uuid) -> Self {
         self.index_uuid = Some(uuid);
+        self
+    }
+
+    /// Reuse a trained SQ8 model for an IVF_SQ or IVF_HNSW_SQ build.
+    ///
+    /// The model replaces SQ sampling and training for this build. See
+    /// [`crate::index::vector::sq::build_sq_model`] for an example.
+    pub fn with_sq_model(mut self, model: SqModel) -> Self {
+        self.sq_model = Some(model);
         self
     }
 
@@ -355,6 +367,36 @@ impl<'a> CreateIndexBuilder<'a> {
             column,
         )
         .await?;
+
+        let sq_quantizer = if let Some(model) = &self.sq_model {
+            let Some(params) = self
+                .params
+                .as_any()
+                .downcast_ref::<VectorIndexParams>()
+                .filter(|_| is_builtin_vector_index(self.index_type, self.params))
+            else {
+                return Err(Error::invalid_input(
+                    "A shared SQ model requires an SQ vector index",
+                ));
+            };
+            let Some(StageParams::SQ(sq_params)) = params.stages.last() else {
+                return Err(Error::invalid_input(
+                    "A shared SQ model requires an SQ vector index",
+                ));
+            };
+            if !train {
+                return Err(Error::invalid_input("A shared SQ model requires a data build"));
+            }
+            model.validate_for_build(
+                self.dataset.schema(),
+                column,
+                params.metric_type,
+                sq_params,
+            )?;
+            Some(model.quantizer())
+        } else {
+            None
+        };
 
         if !train {
             // A partition count is not among the settings a definition records,
@@ -616,6 +658,7 @@ impl<'a> CreateIndexBuilder<'a> {
                                 fri,
                                 fragments,
                                 progress.clone(),
+                                sq_quantizer,
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
@@ -630,6 +673,7 @@ impl<'a> CreateIndexBuilder<'a> {
                                 fri,
                                 fragments,
                                 progress.clone(),
+                                sq_quantizer,
                             ))
                             .await?;
                             (built.files, built.target_partition_size)
@@ -644,6 +688,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             vec_params,
                             fri,
                             progress.clone(),
+                            sq_quantizer,
                         ))
                         .await?;
                         (built.files, built.target_partition_size)

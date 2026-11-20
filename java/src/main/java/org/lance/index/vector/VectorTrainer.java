@@ -117,8 +117,8 @@ public final class VectorTrainer {
   /**
    * Train shared scalar quantization bounds from up to {@code sampleRate * 256} vectors. Null and
    * non-finite vectors are excluded; an empty usable sample is rejected. Cosine normalizes training
-   * vectors; L2 and dot use original values. Hamming is unsupported. The metric must match
-   * subsequent builds. A supplied model is validated and returned without sampling.
+   * vectors; L2 and dot use original values. Hamming is unsupported. Subsequent builds must use the
+   * same input space. A supplied model is validated and returned without sampling.
    *
    * @param dataset dataset to sample
    * @param column vector column

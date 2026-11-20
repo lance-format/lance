@@ -41,7 +41,6 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -571,10 +570,10 @@ public class VectorIndexTest {
   }
 
   @ParameterizedTest
-  @CsvSource({"IVF_RQ,L2", "IVF_SQ,L2", "IVF_SQ,Cosine", "IVF_SQ,Dot"})
+  @CsvSource({"IVF_RQ,L2", "IVF_SQ,L2", "IVF_SQ,Cosine", "IVF_SQ,Dot", "IVF_HNSW_SQ,L2"})
   public void testSharedModelEnablesPhysicalMerge(
       IndexType indexType, DistanceType metric, @TempDir Path tempDir) throws Exception {
-    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("ivf_rq_shared_model"));
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("shared_vector_model"));
         Dataset dataset = fixture.create()) {
       List<Fragment> fragments = dataset.getFragments();
       IvfBuildParams training =
@@ -611,6 +610,9 @@ public class VectorIndexTest {
         // A worker with a model must not sample or retrain, even with sampleRate=0.
         vectorParams.setSqParams(
             new SQBuildParams.Builder().setSampleRate(0).setModel(restored).build());
+      }
+      if (indexType == IndexType.IVF_HNSW_SQ) {
+        vectorParams.setHnswParams(new HnswBuildParams.Builder().build());
       }
       IndexParams params = IndexParams.builder().setVectorIndexParams(vectorParams.build()).build();
 
@@ -816,23 +818,21 @@ public class VectorIndexTest {
   @EnumSource(
       value = IndexType.class,
       names = {"IVF_SQ", "IVF_HNSW_SQ"})
-  public void testSqRejectsDifferentModelsAndInvalidSettings(
+  public void testSqRejectsIncompatibleModelsAndInvalidSettings(
       IndexType indexType, @TempDir Path tempDir) throws Exception {
     try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("sq_model_validation"));
         Dataset dataset = fixture.create()) {
       String column = TestVectorDataset.vectorColumnName;
       SQBuildParams defaults = new SQBuildParams.Builder().build();
       SQModel raw = VectorTrainer.trainSqModel(dataset, column, defaults);
-      SQModel normalized =
-          VectorTrainer.trainSqModel(dataset, column, defaults, DistanceType.Cosine);
-      assertFalse(Arrays.equals(raw.toBytes(), normalized.toBytes()));
       assertThrows(IllegalArgumentException.class, () -> SQModel.fromBytes(new byte[0]));
       assertThrows(
           IllegalArgumentException.class, () -> SQModel.fromBytes(new byte[] {(byte) 255}));
       for (SQBuildParams invalid :
           List.of(
               new SQBuildParams.Builder().setNumBits((short) 4).setModel(raw).build(),
-              new SQBuildParams.Builder().setSampleRate(0).build())) {
+              new SQBuildParams.Builder().setSampleRate(0).build(),
+              new SQBuildParams.Builder().setSampleRate(-1).build())) {
         assertThrows(
             IllegalArgumentException.class,
             () -> VectorTrainer.trainSqModel(dataset, column, invalid));
@@ -845,30 +845,25 @@ public class VectorIndexTest {
       IvfBuildParams ivf =
           new IvfBuildParams.Builder()
               .setNumPartitions(1)
-              .setCentroids(VectorTrainer.trainIvfCentroids(dataset, column, training))
+              .setCentroids(
+                  VectorTrainer.trainIvfCentroids(dataset, column, training, DistanceType.Cosine))
               .build();
-      List<Fragment> fragments = dataset.getFragments();
-      List<SQModel> models = List.of(raw, normalized);
-      List<Index> segments = new ArrayList<>();
-      for (int i = 0; i < 2; i++) {
-        VectorIndexParams.Builder vectorParams =
-            new VectorIndexParams.Builder(ivf)
-                .setSqParams(new SQBuildParams.Builder().setModel(models.get(i)).build());
-        if (indexType == IndexType.IVF_HNSW_SQ) {
-          vectorParams.setHnswParams(new HnswBuildParams.Builder().build());
-        }
-        IndexParams params =
-            IndexParams.builder().setVectorIndexParams(vectorParams.build()).build();
-        segments.add(
-            dataset.createIndex(
-                IndexOptions.builder(List.of(column), indexType, params)
-                    .withIndexName(TestVectorDataset.indexName)
-                    .withFragmentIds(List.of(fragments.get(i).getId()))
-                    .build()));
+      VectorIndexParams.Builder vectorParams =
+          new VectorIndexParams.Builder(ivf)
+              .setDistanceType(DistanceType.Cosine)
+              .setSqParams(
+                  new SQBuildParams.Builder().setModel(SQModel.fromBytes(raw.toBytes())).build());
+      if (indexType == IndexType.IVF_HNSW_SQ) {
+        vectorParams.setHnswParams(new HnswBuildParams.Builder().build());
       }
-      RuntimeException error =
-          assertThrows(RuntimeException.class, () -> dataset.mergeExistingIndexSegments(segments));
-      assertTrue(causeChainContains(error, "quantizer"), error.toString());
+      IndexParams params = IndexParams.builder().setVectorIndexParams(vectorParams.build()).build();
+      IndexOptions options =
+          IndexOptions.builder(List.of(column), indexType, params)
+              .withFragmentIds(List.of(dataset.getFragments().get(0).getId()))
+              .build();
+      IllegalArgumentException error =
+          assertThrows(IllegalArgumentException.class, () -> dataset.createIndex(options));
+      assertTrue(causeChainContains(error, "cannot encode vectors"), error.toString());
     }
   }
 

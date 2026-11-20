@@ -10,12 +10,16 @@ use jni::{
     objects::{JByteArray, JClass, JObject},
     sys::jintArray,
 };
-use lance_index::vector::sq::{builder::SQBuildParams, storage::ScalarQuantizationMetadata};
+use lance::index::vector::sq::SqModel;
+use lance_index::{
+    pb::VectorMetricType,
+    vector::sq::{builder::SQBuildParams, storage::ScalarQuantizationMetadata},
+};
 use prost::Message;
 
 // This message is a same-SDK transfer handle, not an on-disk index format.
 #[derive(Clone, PartialEq, Message)]
-struct SqModel {
+struct SqModelProto {
     #[prost(uint32, tag = "1")]
     dimension: u32,
     #[prost(uint32, tag = "2")]
@@ -24,22 +28,31 @@ struct SqModel {
     lower_bound: Option<f64>,
     #[prost(double, optional, tag = "4")]
     upper_bound: Option<f64>,
+    #[prost(enumeration = "VectorMetricType", optional, tag = "5")]
+    distance_type: Option<i32>,
 }
 
-pub(crate) fn serialize_sq_model(model: &ScalarQuantizationMetadata) -> Result<Vec<u8>> {
-    model.validate_for_build()?;
-    Ok(SqModel {
-        dimension: model.dim as u32,
-        num_bits: model.num_bits as u32,
-        lower_bound: Some(model.bounds.start),
-        upper_bound: Some(model.bounds.end),
+pub(crate) fn serialize_sq_model(model: &SqModel) -> Vec<u8> {
+    let metadata = model.metadata();
+    SqModelProto {
+        dimension: metadata.dim as u32,
+        num_bits: metadata.num_bits as u32,
+        lower_bound: Some(metadata.bounds.start),
+        upper_bound: Some(metadata.bounds.end),
+        distance_type: Some(VectorMetricType::from(model.distance_type()) as i32),
     }
-    .encode_to_vec())
+    .encode_to_vec()
 }
 
-fn parse_sq_model(bytes: &[u8]) -> Result<ScalarQuantizationMetadata> {
-    let model =
-        SqModel::decode(bytes).map_err(|e| Error::input_error(format!("Invalid SQ model: {e}")))?;
+fn parse_sq_model(bytes: &[u8]) -> Result<SqModel> {
+    let model = SqModelProto::decode(bytes)
+        .map_err(|e| Error::input_error(format!("Invalid SQ model: {e}")))?;
+    let metric = model
+        .distance_type
+        .and_then(|value| VectorMetricType::try_from(value).ok())
+        .ok_or_else(|| {
+            Error::input_error("SQ model has a missing or invalid distance type".into())
+        })?;
     let num_bits = u16::try_from(model.num_bits).map_err(|_| {
         Error::input_error(format!(
             "SQ model num_bits must be 8, got {}",
@@ -56,21 +69,32 @@ fn parse_sq_model(bytes: &[u8]) -> Result<ScalarQuantizationMetadata> {
                 .upper_bound
                 .ok_or_else(|| Error::input_error("SQ model upper_bound is missing".into()))?,
     };
-    model.validate_for_build()?;
-    Ok(model)
+    Ok(SqModel::try_new(model, metric.into())?)
 }
 
-pub(crate) fn extract_sq_build_params(env: &mut JNIEnv, sq_obj: JObject) -> Result<SQBuildParams> {
+pub(crate) fn extract_sq_build_params(
+    env: &mut JNIEnv,
+    sq_obj: JObject,
+) -> Result<(SQBuildParams, Option<SqModel>)> {
     let num_bits = env.call_method(&sq_obj, "getNumBits", "()S", &[])?.s()? as u16;
-    let sample_rate = env.get_int_as_usize_from_method(&sq_obj, "getSampleRate")?;
     let model = env.get_optional_from_method(&sq_obj, "getModel", |env, model| {
         parse_sq_model(&env.get_vec_u8_from_method(&model, "toBytes")?)
     })?;
-    Ok(SQBuildParams {
-        num_bits,
-        sample_rate,
+    let sample_rate = if model.is_some() {
+        0
+    } else {
+        let rate = env.call_method(&sq_obj, "getSampleRate", "()I", &[])?.i()?;
+        usize::try_from(rate).map_err(|_| {
+            Error::input_error(format!("SQ sampleRate must be non-negative, got {rate}"))
+        })?
+    };
+    Ok((
+        SQBuildParams {
+            num_bits,
+            sample_rate,
+        },
         model,
-    })
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -91,6 +115,7 @@ fn inner_inspect<'local>(
     bytes: JByteArray,
 ) -> Result<jni::objects::JIntArray<'local>> {
     let model = parse_sq_model(&env.convert_byte_array(&bytes)?)?;
+    let model = model.metadata();
     let result = env.new_int_array(2)?;
     env.set_int_array_region(&result, 0, &[model.dim as i32, model.num_bits as i32])?;
     Ok(result)
@@ -102,36 +127,41 @@ mod tests {
 
     #[test]
     fn test_sq_model_transfer() {
-        let model = ScalarQuantizationMetadata {
+        let metadata = ScalarQuantizationMetadata {
             dim: 32,
             num_bits: 8,
             bounds: -0.123456789012345..9.87654321098765,
         };
-        let bytes = serialize_sq_model(&model).unwrap();
-        assert_eq!(parse_sq_model(&bytes).unwrap(), model);
+        let model = SqModel::try_new(metadata.clone(), VectorMetricType::Cosine.into()).unwrap();
+        let restored = parse_sq_model(&serialize_sq_model(&model)).unwrap();
+        assert_eq!(restored.metadata(), &metadata);
+        assert_eq!(restored.distance_type(), model.distance_type());
         for bytes in [
             vec![],
             vec![255],
             vec![8, 32, 16, 8],
-            SqModel {
+            SqModelProto {
                 dimension: 0,
                 num_bits: 8,
                 lower_bound: Some(0.0),
                 upper_bound: Some(1.0),
+                distance_type: Some(VectorMetricType::L2 as i32),
             }
             .encode_to_vec(),
-            SqModel {
+            SqModelProto {
                 dimension: 32,
                 num_bits: 65544,
                 lower_bound: Some(0.0),
                 upper_bound: Some(1.0),
+                distance_type: Some(VectorMetricType::L2 as i32),
             }
             .encode_to_vec(),
-            SqModel {
+            SqModelProto {
                 dimension: 32,
                 num_bits: 8,
                 lower_bound: Some(f64::NAN),
                 upper_bound: Some(1.0),
+                distance_type: Some(VectorMetricType::L2 as i32),
             }
             .encode_to_vec(),
         ] {

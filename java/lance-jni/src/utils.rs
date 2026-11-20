@@ -13,11 +13,10 @@ use lance::dataset::optimize::{
     CompactionMode, CompactionOptions, CompactionScope, SourceBudgetMode,
 };
 use lance::dataset::{WriteMode, WriteParams};
-use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
+use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams, sq::SqModel};
 use lance::io::ObjectStoreParams;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
-use lance_index::IndexParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -406,7 +405,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
 pub fn get_vector_index_params(
     env: &mut JNIEnv,
     index_params_obj: JObject,
-) -> Result<Box<dyn IndexParams>> {
+) -> Result<(VectorIndexParams, Option<SqModel>)> {
     let vector_index_params_option = env.get_optional_from_method(
         &index_params_obj,
         "getVectorIndexParams",
@@ -575,9 +574,12 @@ pub fn get_vector_index_params(
                 extract_sq_build_params,
             )?;
 
-            if let Some(sq_params) = sq_params {
+            let sq_model = if let Some((sq_params, model)) = sq_params {
                 stages.push(StageParams::SQ(sq_params));
-            }
+                model
+            } else {
+                None
+            };
 
             // Parse RQBuildParams
             let rq_params = env.get_optional_from_method(
@@ -590,18 +592,18 @@ pub fn get_vector_index_params(
                 stages.push(StageParams::RQ(rq_params));
             }
 
-            Ok(VectorIndexParams {
+            Ok((VectorIndexParams {
                 metric_type: distance_type,
                 stages,
                 version: IndexFileVersion::V3,
                 skip_transpose: false,
                 runtime_hints: Default::default(),
-            })
+            }, sq_model))
         },
     )?;
 
     match vector_index_params_option {
-        Some(params) => Ok(Box::new(params) as Box<dyn IndexParams>),
+        Some(params) => Ok(params),
         None => Err(Error::input_error(
             "VectorIndexParams not present".to_string(),
         )),

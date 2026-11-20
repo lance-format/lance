@@ -14,10 +14,10 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JFloatArray, JObject, JString};
 use jni::sys::{jbyteArray, jfloatArray};
 use lance::index::NoopIndexBuildProgress;
+use lance::index::vector::sq::build_sq_model;
 use lance::index::vector::utils::get_vector_dim;
 use lance_index::vector::ivf::builder::IvfBuildParams as RustIvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams as RustPQBuildParams;
-use lance_index::vector::quantizer::Quantization;
 use lance_linalg::distance::MetricType;
 
 /// Flatten a FixedSizeList<Float32> into a contiguous Vec<f32>.
@@ -235,18 +235,29 @@ fn inner_train_sq_model<'local>(
     distance_type_jstr: JString<'local>,
 ) -> Result<JByteArray<'local>> {
     let column: String = env.get_string(&column_jstr)?.into();
-    let params = extract_sq_build_params(env, sq_params_obj)?;
+    let (params, model) = extract_sq_build_params(env, sq_params_obj)?;
     let distance_type = parse_distance_type(env, &distance_type_jstr)?;
     let bytes = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(dataset_obj, NATIVE_DATASET) }?;
-        let model = block_on(lance::index::vector::sq::build_sq_model(
-            &dataset_guard.inner,
-            &column,
-            distance_type,
-            &params,
-        ))?;
-        serialize_sq_model(&model.metadata(None))?
+        let model = match model {
+            Some(model) => {
+                model.validate_for_build(
+                    dataset_guard.inner.schema(),
+                    &column,
+                    distance_type,
+                    &params,
+                )?;
+                model
+            }
+            None => block_on(build_sq_model(
+                &dataset_guard.inner,
+                &column,
+                distance_type,
+                &params,
+            ))?,
+        };
+        serialize_sq_model(&model)
     };
     Ok(env.byte_array_from_slice(&bytes)?)
 }
