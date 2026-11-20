@@ -8,6 +8,57 @@ use crate::session::index_caches::{
 };
 
 #[rstest]
+#[case::btree("lance.table.BTreeIndexDetails")]
+#[case::btree_alias("lance.index.pb.BTreeIndexDetails")]
+#[case::bitmap("lance.table.BitmapIndexDetails")]
+#[case::bitmap_alias("lance.index.pb.BitmapIndexDetails")]
+#[case::label_list("lance.table.LabelListIndexDetails")]
+#[case::label_list_alias("lance.index.pb.LabelListIndexDetails")]
+#[case::ngram("lance.table.NGramIndexDetails")]
+#[case::ngram_alias("lance.index.pb.NGramIndexDetails")]
+#[case::inverted("lance.table.InvertedIndexDetails")]
+#[case::inverted_alias("lance.index.pb.InvertedIndexDetails")]
+#[case::zonemap("lance.table.ZoneMapIndexDetails")]
+#[case::zonemap_alias("lance.index.pb.ZoneMapIndexDetails")]
+#[case::bloomfilter("lance.index.pb.BloomFilterIndexDetails")]
+#[case::fm("lance.index.pb.FmIndexDetails")]
+#[case::json("lance.index.pb.JsonIndexDetails")]
+#[case::list_element("lance.index.pb.ListElementIndexDetails")]
+#[case::minhash("lance.index.pb.MinHashLshIndexDetails")]
+#[case::vector("lance.index.pb.VectorIndexDetails")]
+#[case::legacy_vector("lance.index.VectorIndexDetails")]
+#[cfg_attr(feature = "geo", case::rtree("lance.index.pb.RTreeIndexDetails"))]
+fn test_fragment_bitmap_rewrite_versions_match_readers(#[case] details_type: &str) {
+    let details = Arc::new(prost_types::Any {
+        type_url: format!("type.googleapis.com/{details_type}"),
+        value: vec![],
+    });
+    let max_version = crate::index::scalar::IndexDetails(details.clone())
+        .index_version()
+        .unwrap() as i32;
+    let mut index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        fields: vec![0],
+        covering_fields: vec![],
+        name: "idx".into(),
+        dataset_version: 1,
+        fragment_bitmap: None,
+        index_details: Some(details),
+        index_version: max_version,
+        created_at: None,
+        base_id: None,
+        files: None,
+        clustering_id: None,
+        metadata: HashMap::new(),
+    };
+    assert!(index.supports_fragment_bitmap_rewrite());
+    index.index_version += 1;
+    assert!(!index.supports_fragment_bitmap_rewrite());
+    index.index_version = -1;
+    assert!(!index.supports_fragment_bitmap_rewrite());
+}
+
+#[rstest]
 #[case::v1("v3.0.1/fts_v1", INVERTED_INDEX_VERSION_V1)]
 #[case::v2("v4.0.1/fts_v2", INVERTED_INDEX_VERSION_V2)]
 #[tokio::test]
