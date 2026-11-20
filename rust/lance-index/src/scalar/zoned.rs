@@ -578,9 +578,11 @@ fn process_zone<P: ZoneProcessor>(
         let values = batch.column(0);
         processor.process_chunk(values)?;
 
+        // Logical nulls: a `NullArray` has no validity buffer, so `nulls()` is
+        // `None` although every value is NULL.
         if track_null_rows
-            && values.null_count() > 0
-            && let Some(nulls) = values.nulls()
+            && let Some(nulls) = values.logical_nulls()
+            && nulls.null_count() > 0
         {
             let row_addrs = row_addr_column(batch)?;
             null_rows.extend(
@@ -1546,6 +1548,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(null_rows, RowAddrTreeMap::new());
+    }
+
+    /// A `NullArray` has no validity buffer; every one of its rows is still a
+    /// NULL row.
+    #[tokio::test]
+    async fn parallel_trainer_tracks_logical_null_rows() {
+        #[derive(Debug)]
+        struct RowCounter(usize);
+
+        impl ZoneProcessor for RowCounter {
+            type ZoneStatistics = (usize, ZoneBound);
+
+            fn process_chunk(&mut self, values: &ArrayRef) -> Result<()> {
+                self.0 += values.len();
+                Ok(())
+            }
+
+            fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+                Ok((self.0, bound))
+            }
+
+            fn reset(&mut self) -> Result<()> {
+                self.0 = 0;
+                Ok(())
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Null, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::NullArray::new(4)),
+                Arc::new(UInt64Array::from(vec![7, 9, 11, (1 << 32) | 2])),
+            ],
+        )
+        .unwrap();
+        let trainer = ParallelZoneTrainer::new(|| Ok(RowCounter(0)), 2).unwrap();
+        let (zones, null_rows) = trainer
+            .train(stream_from_batches(vec![input]))
+            .await
+            .unwrap();
+        assert_eq!(zones.iter().map(|(rows, _)| *rows).sum::<usize>(), 4);
+        assert_eq!(
+            null_rows,
+            RowAddrTreeMap::from_iter([7, 9, 11, (1 << 32) | 2])
+        );
     }
 
     #[tokio::test]
