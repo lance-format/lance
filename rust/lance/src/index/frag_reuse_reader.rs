@@ -4,6 +4,7 @@
 //! Compose mapping readers along fragment lineage to reach live fragments.
 
 use crate::Dataset;
+use crate::index::frag_reuse::MissingCoverageReason;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_table::format::IndexMetadata;
@@ -67,49 +68,31 @@ pub(super) async fn load_indices(
                 .push((position, index));
         }
     }
-    // Third state, decided once: a dropped unknown transition loses the record
-    // of which fragments it touched, so no user-index segment's stored
-    // addresses can be proven translatable (supporting the remap plugin is
-    // necessary but not sufficient when the mapping itself is gone). Exclude
-    // every such segment up front (no coverage, scan fallback) rather than grant
-    // coverage a translator cannot honor, which would drop rows silently. System
-    // indices were already passed through above, and `may_need_translation`
-    // reports true in this state as well, so this is the same decision made
-    // explicitly here without consulting the plugin registry per segment.
-    let unsupported_history = mapping.ledger.has_unsupported_transitions();
     let mut unverifiable = BTreeSet::new();
     for members in groups.into_values() {
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
-            if unsupported_history {
-                continue;
-            }
-            if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
-                // A probe that cannot reach the segment's format marker says
-                // nothing about its format, and planning every query on the
-                // table must not fail for it. Treat it as unknown for THIS
+            match coverage_membership(dataset, &mapping, index).await {
+                CoverageMembership::Member => supported.push((position, index)),
+                CoverageMembership::ExcludedNoBatchRemapper
+                | CoverageMembership::ExcludedUnsupportedHistory
+                | CoverageMembership::Excluded(_) => {}
+                // Planning every query on the table must not fail for an
+                // unreadable marker. Treat the segment as unknown for THIS
                 // call only (no coverage, scan fallback) and mark the listing
                 // for re-derivation, so the next call reclassifies once the
                 // store answers again.
-                let can_remap = match segment_supports_batch_remapping(dataset, index).await {
-                    Ok(can_remap) => can_remap.unwrap_or(false),
-                    Err(error) => {
-                        log::warn!(
-                            "index {} (segment {}): could not read its format marker ({error}); \
-                             excluding it from coverage for this query, its fragments are \
-                             scanned until the read succeeds",
-                            index.name,
-                            index.uuid,
-                        );
-                        unverifiable.insert(index.name.clone());
-                        false
-                    }
-                };
-                if index.fragment_bitmap.is_none() || !can_remap {
-                    continue;
+                CoverageMembership::Unverifiable(error) => {
+                    log::warn!(
+                        "index {} (segment {}): could not read its format marker ({error}); \
+                         excluding it from coverage for this query, its fragments are \
+                         scanned until the read succeeds",
+                        index.name,
+                        index.uuid,
+                    );
+                    unverifiable.insert(index.name.clone());
                 }
             }
-            supported.push((position, index));
         }
         // Only usable segments may establish coverage. A destination needs all
         // contributing sources; every retained contributing segment must be queried.
@@ -147,6 +130,71 @@ impl FragmentReuseIndex {
     pub(crate) fn has_unsupported_transitions(&self) -> bool {
         self.ledger.has_unsupported_transitions()
     }
+}
+
+/// Whether the tagged reader lets a user-index segment establish coverage for
+/// its logical index. None of the exclusions is a verdict that the segment
+/// covers nothing: each says this build cannot vouch for its translation.
+pub(super) enum CoverageMembership {
+    Member,
+    /// `Unsupported` because its stored addresses need translation and its
+    /// index type has no batch remapper in this build, whatever its files.
+    ExcludedNoBatchRemapper,
+    /// `Unsupported` because the history carries transitions this build
+    /// cannot interpret, so no user-index segment can be translated.
+    ExcludedUnsupportedHistory,
+    /// A reason specific to this segment: this build cannot translate its
+    /// files (`Unsupported`), or its details cannot be interpreted
+    /// (`Corrupt`).
+    Excluded(MissingCoverageReason),
+    /// Its format marker could not be read, so whether it can be translated
+    /// is unknown.
+    Unverifiable(Error),
+}
+
+/// The membership rule [`load_indices`] applies to every user-index segment,
+/// shared with callers that plan a composition the manifest does not list.
+pub(super) async fn coverage_membership(
+    dataset: &Dataset,
+    mapping: &FragmentReuseIndex,
+    index: &IndexMetadata,
+) -> CoverageMembership {
+    // A dropped unknown transition loses the record of which fragments it
+    // touched, so no user-index segment's stored addresses can be proven
+    // translatable (supporting the remap plugin is necessary but not
+    // sufficient when the mapping itself is gone). Exclude every such segment
+    // rather than grant coverage a translator cannot honor, which would drop
+    // rows silently. `may_need_translation` reports true in this state as
+    // well, so this is the same decision made without consulting the plugin
+    // registry per segment.
+    if !super::segment::index_is_usable(index) {
+        return CoverageMembership::Excluded(MissingCoverageReason::Unsupported);
+    }
+    if mapping.ledger.has_unsupported_transitions() {
+        return CoverageMembership::ExcludedUnsupportedHistory;
+    }
+    if !mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
+        return CoverageMembership::Member;
+    }
+    match segment_supports_batch_remapping(dataset, index).await {
+        Ok(Some(true)) if index.fragment_bitmap.is_some() => CoverageMembership::Member,
+        Ok(Some(false)) if batch_remapping_is_decided_by_type(index) => {
+            CoverageMembership::ExcludedNoBatchRemapper
+        }
+        Ok(Some(_)) => CoverageMembership::Excluded(MissingCoverageReason::Unsupported),
+        Ok(None) => CoverageMembership::Excluded(MissingCoverageReason::Corrupt),
+        Err(error) => CoverageMembership::Unverifiable(error),
+    }
+}
+
+/// Whether [`segment_supports_batch_remapping`] answers for `index`'s type
+/// rather than for its own files: vector and inverted segments are decided by
+/// their file format, the other scalar types by their plugin.
+fn batch_remapping_is_decided_by_type(index: &IndexMetadata) -> bool {
+    index.index_details.as_ref().is_some_and(|details| {
+        !super::segment::segment_has_vector_details(index)
+            && !details.type_url.ends_with("InvertedIndexDetails")
+    })
 }
 
 /// Whether this build can translate `index`'s stored addresses in batches:
@@ -243,6 +291,24 @@ impl FragmentReuseIndex {
                     .iter()
                     .any(|fragment| self.ledger.contains_fragment(fragment))
         })
+    }
+
+    /// The fragments of `stored` a reader can still relate to the live
+    /// fragments: those that are live or take part in a retained transition.
+    /// Any other was deleted outright off the history, and no reader translates
+    /// it. While the history carries transitions this build cannot interpret,
+    /// a fragment the retained ledger does not name may belong to a dropped
+    /// one, so all of `stored` is returned.
+    pub(crate) fn traceable_fragments(&self, stored: &RoaringBitmap) -> RoaringBitmap {
+        if self.ledger.has_unsupported_transitions() {
+            return stored.clone();
+        }
+        stored
+            .iter()
+            .filter(|&fragment| {
+                self.live_fragments.contains(fragment) || self.ledger.contains_fragment(fragment)
+            })
+            .collect()
     }
 
     /// Resolve each live fragment backwards to the nearest available index coverage.
@@ -1761,6 +1827,85 @@ pub mod tests {
         assert_eq!(
             reader.segment_coverage(&bitmaps(provenance)),
             bitmaps(expected)
+        );
+    }
+
+    /// Live {4, 5}; the history names 0 to 5. Fragment 9 is neither: it was
+    /// deleted outright and is left out.
+    #[tokio::test]
+    async fn an_off_history_deleted_fragment_is_not_traceable() {
+        let reader = chain_reader().await;
+        assert_eq!(
+            reader.traceable_fragments(&RoaringBitmap::from_iter([0, 4, 9])),
+            RoaringBitmap::from_iter([0, 4])
+        );
+        assert!(
+            reader
+                .traceable_fragments(&RoaringBitmap::from_iter([9]))
+                .is_empty()
+        );
+    }
+
+    /// [`chain_reader`]'s history with {0, 1} -> {2, 3} recorded as a legacy
+    /// version and lifted, then the tagged {2, 3} -> {4, 5}; live {4, 5}. The
+    /// retired sources of the lifted record are traceable like any other;
+    /// fragment 9 is not.
+    #[tokio::test]
+    async fn a_retired_source_of_a_lifted_record_is_traceable() {
+        let digest = |id: u32| FragmentDigest {
+            id: u64::from(id),
+            physical_rows: 1,
+            num_deleted_rows: 0,
+        };
+        let changed_row_addrs = |sources: &[u32]| {
+            let mut bytes = Vec::new();
+            roaring::RoaringTreemap::from_iter(
+                sources
+                    .iter()
+                    .map(|&source| u64::from(RowAddress::new_from_parts(source, 0))),
+            )
+            .serialize_into(&mut bytes)
+            .unwrap();
+            bytes
+        };
+        let details = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(
+                1,
+                &InlineContent {
+                    legacy_versions: vec![pb::fragment_reuse_index_details::Version {
+                        dataset_version: 1,
+                        groups: vec![pb::fragment_reuse_index_details::Group {
+                            changed_row_addrs: changed_row_addrs(&[0, 1]),
+                            old_fragments: vec![digest(0), digest(1)],
+                            new_fragments: vec![digest(2), digest(3)],
+                        }],
+                    }],
+                    transitions: vec![Transition {
+                        sources: vec![digest(2), digest(3)],
+                        destinations: vec![digest(4), digest(5)],
+                        mapping: Some(transition::Mapping::OrderedCompaction(
+                            pb::fragment_reuse_index_details::OrderedCompaction {
+                                changed_row_addrs: changed_row_addrs(&[2, 3]),
+                            },
+                        )),
+                    }],
+                }
+                .encode_to_vec(),
+            ),
+        };
+        let ledger = FragReuseLedger::decode(1, &details, |_| async { panic!("inline history") })
+            .await
+            .unwrap();
+        assert!(!ledger.has_unsupported_transitions());
+        let reader = FragmentReuseIndex {
+            ledger: Arc::new(ledger),
+            live_fragments: Arc::new(RoaringBitmap::from_iter([4, 5])),
+            readers: vec![],
+        };
+        assert_eq!(
+            reader.traceable_fragments(&RoaringBitmap::from_iter([0, 1, 4, 9])),
+            RoaringBitmap::from_iter([0, 1, 4])
         );
     }
 

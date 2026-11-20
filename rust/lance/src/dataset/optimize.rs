@@ -233,4 +233,4 @@ pub async fn compact_files_with_planner(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

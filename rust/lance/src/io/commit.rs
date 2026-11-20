@@ -1810,6 +1810,154 @@ async fn record_successful_commit(
     dataset.ensure_branch_exists().await
 }
 
+/// The source of the retryable conflict a conditional commit reports when
+/// another writer committed first: the latest version had moved past the
+/// expected one, or the handler reported the target version taken. A write
+/// that failed on its own reports its error as the source instead.
+#[derive(Debug)]
+pub(crate) struct ConcurrentVersion(String);
+
+impl ConcurrentVersion {
+    pub(crate) fn conflict(version: u64, message: String) -> Error {
+        Error::retryable_commit_conflict_source(version, Box::new(Self(message)))
+    }
+
+    /// Whether `error` is a conditional commit's loss to another writer.
+    pub(crate) fn caused(error: &Error) -> bool {
+        matches!(
+            error.find_root(),
+            Error::RetryableCommitConflict { source, .. }
+                if source.downcast_ref::<Self>().is_some()
+        )
+    }
+}
+
+impl std::fmt::Display for ConcurrentVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConcurrentVersion {}
+
+/// The attempts `commit_config` allows a commit that rebases.
+pub(crate) fn commit_attempt_budget(commit_config: &CommitConfig) -> u32 {
+    std::cmp::max(commit_config.num_retries, 1)
+}
+
+/// The read-version schema whose field identity every transaction in an
+/// allocating clustering submission's window is judged against; see
+/// `refuse_field_identity_change`. `None` when no such judgement applies.
+fn clustering_identity_fence(
+    read_version_dataset: &Dataset,
+    write_config: &ManifestWriteConfig,
+) -> Option<lance_core::datatypes::Schema> {
+    (!read_version_dataset.manifest.uses_non_reusable_field_ids()
+        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+    .then(|| read_version_dataset.schema().clone())
+}
+
+/// Checks `transaction` against every version committed after `dataset` by
+/// the ordinary conflict rules. Returns the latest dataset those checks
+/// covered and the rebase to finish against it; writes nothing.
+#[allow(clippy::too_many_arguments)]
+async fn check_commit_window<'a>(
+    original_dataset: &Dataset,
+    dataset: &Dataset,
+    read_version_dataset: &Dataset,
+    read_version: u64,
+    transaction: Transaction,
+    affected_rows: Option<&'a RowAddrTreeMap>,
+    identity_fence: Option<&lance_core::datatypes::Schema>,
+) -> Result<(Dataset, TransactionRebase<'a>)> {
+    let checked_since = dataset.manifest.version;
+    let (dataset, other_transactions) = load_and_sort_new_transactions(dataset).await?;
+
+    ensure_can_write_manifest(&dataset.manifest)?;
+
+    // See if we can retry the commit. Try to account for all
+    // transactions that have been committed since the read_version.
+    // Use small amount of backoff to handle transactions that all
+    // started at exact same time better.
+
+    let mut rebase = TransactionRebase::try_new(original_dataset, transaction, affected_rows)
+        .await?
+        .with_read_version_dataset(read_version_dataset);
+    rebase.load_current_lineage(&dataset).await?;
+    let seen = other_transactions
+        .iter()
+        .map(|(version, _)| *version)
+        .collect::<HashSet<_>>();
+    let missing = (checked_since + 1..=dataset.manifest.version)
+        .filter(|version| !seen.contains(version))
+        .collect::<Vec<_>>();
+    rebase.check_missing_versions(
+        &missing,
+        dataset.manifest.version,
+        read_version_dataset.schema(),
+        dataset.schema(),
+    )?;
+    // A retry's window starts after its previous attempt, so it would
+    // miss the moves recorded there; not tracking only costs coverage.
+    if checked_since == read_version && missing.is_empty() {
+        rebase.track_moved_files();
+    }
+    // A cleaned-up version may have replaced a key field; an identity
+    // window with a hole cannot be judged, so it is refused.
+    if identity_fence.is_some() && !missing.is_empty() {
+        return Err(Error::commit_conflict_source(
+            dataset.manifest.version,
+            format!(
+                "versions {missing:?} between this submission's read version and the \
+                 latest were cleaned up, so the field identity of its clustering keys \
+                 cannot be checked; reload the table and rebuild the list"
+            )
+            .into(),
+        ));
+    }
+
+    for (other_version, other_transaction) in other_transactions.iter() {
+        if let Some(read_schema) = identity_fence {
+            conflict_resolver::refuse_field_identity_change(
+                read_schema,
+                other_transaction,
+                *other_version,
+            )?;
+        }
+        rebase.check_txn(other_transaction, *other_version)?;
+    }
+    Ok((dataset, rebase))
+}
+
+/// Checks `transaction`, read from `dataset`, against every version
+/// committed since by the rules [`commit_transaction`] applies before it
+/// rebases, and returns the latest dataset those checks covered. Writes
+/// nothing.
+pub(crate) async fn check_versions_since_read(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+) -> Result<Dataset> {
+    if dataset.manifest.version != transaction.read_version {
+        return Err(Error::internal(format!(
+            "the versions since read version {} must be checked from that version, not {}",
+            transaction.read_version, dataset.manifest.version
+        )));
+    }
+    let identity_fence = clustering_identity_fence(dataset, write_config);
+    let (latest, _) = check_commit_window(
+        dataset,
+        dataset,
+        dataset,
+        transaction.read_version,
+        transaction.clone(),
+        None,
+        identity_fence.as_ref(),
+    )
+    .await?;
+    Ok(latest)
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -1879,7 +2027,7 @@ pub(crate) async fn commit_transaction(
     let num_attempts = if conditional_commit {
         1
     } else {
-        std::cmp::max(commit_config.num_retries, 1)
+        commit_attempt_budget(commit_config)
     };
     let mut backoff = SlotBackoff::default();
     // `retry_timeout` bounds the conflict-retry phase, which starts once the
@@ -1898,9 +2046,7 @@ pub(crate) async fn commit_transaction(
     // `refuse_field_identity_change`. Decided from the version the transaction
     // read, not from the handle it was submitted through, which may already
     // be at a later, activated version.
-    let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
-        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
-    .then(|| read_version_dataset.schema().clone());
+    let identity_fence = clustering_identity_fence(&read_version_dataset, write_config);
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -1913,76 +2059,27 @@ pub(crate) async fn commit_transaction(
             ensure_can_write_manifest(&dataset.manifest)?;
             let (latest_manifest, _) = dataset.latest_manifest().await?;
             if latest_manifest.version != expected_version {
-                return Err(Error::retryable_commit_conflict_source(
+                return Err(ConcurrentVersion::conflict(
                     expected_version,
                     format!(
                         "latest version advanced from the expected {expected_version} to {} \
-                         before the conditional restore could commit",
+                         before the conditional commit could be applied",
                         latest_manifest.version
-                    )
-                    .into(),
+                    ),
                 ));
             }
         } else if !strict_overwrite {
-            let checked_since = dataset.manifest.version;
-            let (loaded_dataset, other_transactions) =
-                load_and_sort_new_transactions(&dataset).await?;
+            let (loaded_dataset, rebase) = check_commit_window(
+                &original_dataset,
+                &dataset,
+                &read_version_dataset,
+                read_version,
+                transaction,
+                affected_rows,
+                identity_fence.as_ref(),
+            )
+            .await?;
             dataset = loaded_dataset;
-
-            ensure_can_write_manifest(&dataset.manifest)?;
-
-            // See if we can retry the commit. Try to account for all
-            // transactions that have been committed since the read_version.
-            // Use small amount of backoff to handle transactions that all
-            // started at exact same time better.
-
-            let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
-                    .await?
-                    .with_read_version_dataset(&read_version_dataset);
-            rebase.load_current_lineage(&dataset).await?;
-            let seen = other_transactions
-                .iter()
-                .map(|(version, _)| *version)
-                .collect::<HashSet<_>>();
-            let missing = (checked_since + 1..=dataset.manifest.version)
-                .filter(|version| !seen.contains(version))
-                .collect::<Vec<_>>();
-            rebase.check_missing_versions(
-                &missing,
-                dataset.manifest.version,
-                read_version_dataset.schema(),
-                dataset.schema(),
-            )?;
-            // A retry's window starts after its previous attempt, so it would
-            // miss the moves recorded there; not tracking only costs coverage.
-            if checked_since == read_version && missing.is_empty() {
-                rebase.track_moved_files();
-            }
-            // A cleaned-up version may have replaced a key field; an identity
-            // window with a hole cannot be judged, so it is refused.
-            if identity_fence.is_some() && !missing.is_empty() {
-                return Err(Error::commit_conflict_source(
-                    dataset.manifest.version,
-                    format!(
-                        "versions {missing:?} between this submission's read version and the \
-                         latest were cleaned up, so the field identity of its clustering keys \
-                         cannot be checked; reload the table and rebuild the list"
-                    )
-                    .into(),
-                ));
-            }
-
-            for (other_version, other_transaction) in other_transactions.iter() {
-                if let Some(read_schema) = &identity_fence {
-                    conflict_resolver::refuse_field_identity_change(
-                        read_schema,
-                        other_transaction,
-                        *other_version,
-                    )?;
-                }
-                rebase.check_txn(other_transaction, *other_version)?;
-            }
 
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
@@ -2312,11 +2409,10 @@ pub(crate) async fn commit_transaction(
         "Failed to commit the transaction after {} retries.",
         commit_config.num_retries
     );
+    // A conditional commit makes one attempt and reaches this point only
+    // after the handler reported the target version taken.
     if conditional_commit {
-        Err(Error::retryable_commit_conflict_source(
-            target_version,
-            message.into(),
-        ))
+        Err(ConcurrentVersion::conflict(target_version, message))
     } else {
         Err(Error::commit_conflict_source(
             target_version,

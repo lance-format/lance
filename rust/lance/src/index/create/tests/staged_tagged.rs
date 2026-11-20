@@ -13,20 +13,26 @@
 
 use super::*;
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+use crate::dataset::optimize::tests::undeferrable_withdrawal::open_with_failing_reads;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::CommitBuilder;
 use crate::index::frag_reuse_reader::tests as reader_tests;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::Fragment;
 use lance_table::transaction::{Operation, RewriteGroup, Transaction};
+use prost::Message;
 use roaring::RoaringBitmap;
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use uuid::Uuid;
 #[cfg(feature = "geo")]
 use {
     crate::utils::test::geo,
     arrow_array::{Int32Array, RecordBatch, RecordBatchIterator},
     arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema},
-    lance_index::metrics::NoOpMetricsCollector,
 };
 
 /// Two fragments of four rows: `i` 0..8, a constant `text` and a payload
@@ -112,6 +118,8 @@ async fn staged_segment(
     CreateIndexBuilder::new(dataset, &[column], index_type, &params)
         .name("staged".to_string())
         .fragments(fragments)
+        // Later segments join an index that already has committed segments.
+        .replace(true)
         .execute_uncommitted()
         .await
         .unwrap()
@@ -2448,5 +2456,2046 @@ async fn staged_rtree_segments_merge_after_stable_partition() {
         index.statistics().unwrap()["num_items"].as_u64().unwrap(),
         (ROWS_PER_FRAGMENT * 2) as u64,
         "the merged index must hold every row of the fragments it claims"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Committing a segment next to historical segments: segments whose stored
+// fragments were all retired by a rewrite but which still serve the rewrite's
+// destinations through the tagged history.
+// ---------------------------------------------------------------------------
+
+/// Index `staged` with segment P over fragment 0 and Q over fragment 1, a
+/// stable partition of {0, 1} into {10, 11} that P and Q serve together
+/// through the history, and one unrelated live fragment appended after it.
+/// Returns the dataset, the uuids of P and Q, and the appended fragment.
+async fn historical_fixture(
+    uri: &str,
+    column: &str,
+    index_type: IndexType,
+) -> (Dataset, [Uuid; 2], u32) {
+    let mut dataset = disk_fixture(uri).await;
+    let p = staged_segment(&mut dataset, column, index_type, vec![0]).await;
+    let q = staged_segment(&mut dataset, column, index_type, vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", column, vec![p.clone(), q.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    let dataset = append_scalar_rows(dataset, 8, 4).await;
+    let mut fragments = fragment_ids(&dataset);
+    fragments.sort_unstable();
+    let appended = *fragments.last().unwrap();
+    assert_eq!(fragments, vec![10, 11, appended]);
+    (dataset, [p.uuid, q.uuid], appended)
+}
+
+async fn stored_uuids(dataset: &Dataset, name: &str) -> HashSet<Uuid> {
+    stored_segments(dataset, name)
+        .await
+        .iter()
+        .map(|segment| segment.uuid)
+        .collect()
+}
+
+async fn unindexed_fragment_ids(dataset: &Dataset, name: &str) -> Vec<u32> {
+    dataset
+        .unindexed_fragments(name)
+        .await
+        .unwrap()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect()
+}
+
+async fn transition_count(dataset: &Dataset) -> usize {
+    match fri_entry(dataset).await {
+        None => 0,
+        Some(entry) => crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, &entry)
+            .await
+            .unwrap()
+            .transitions()
+            .len(),
+    }
+}
+
+/// A segment over an unrelated fragment leaves the destinations to the
+/// historical segments: P and Q are kept and still serve {10, 11}, so the
+/// trim keeps the transition. Once a segment covers the destinations
+/// directly, it replaces P and Q and the trim releases the transition.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn partial_commit_keeps_historical_segments_that_serve_destinations() {
+    let dir = TempStrDir::default();
+    let (mut dataset, [p, q], appended) =
+        historical_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, vec![appended]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+
+    let mut dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([p, q, incoming.uuid]),
+        "the historical segments still serve the destinations"
+    );
+    assert!(unindexed_fragment_ids(&dataset, "staged").await.is_empty());
+    let derived = dataset.load_indices().await.unwrap();
+    assert_eq!(
+        derived
+            .iter()
+            .find(|idx| idx.uuid == incoming.uuid)
+            .and_then(|idx| idx.fragment_bitmap.clone()),
+        Some(RoaringBitmap::from_iter([appended]))
+    );
+    assert_queries_match_scans(&dataset, true).await;
+    assert_eq!(values(&dataset, Some("i = 9"), true).await, vec![9]);
+
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([p, q, incoming.uuid]),
+        "the trim prunes no segment that still serves a destination"
+    );
+    assert_eq!(transition_count(&dataset).await, 1);
+
+    let direct = staged_segment(&mut dataset, "i", IndexType::BTree, vec![10, 11]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![direct.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([incoming.uuid, direct.uuid])
+    );
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(transition_count(&dataset).await, 0);
+    assert_queries_match_scans(&dataset, true).await;
+}
+
+/// A commit covering everything the historical segments serve replaces them,
+/// whether it covers only the destinations or every live fragment.
+#[rstest::rstest]
+#[case::destinations(false)]
+#[case::every_live_fragment(true)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn commit_covering_the_destinations_replaces_historical_segments(
+    #[case] covers_appended: bool,
+) {
+    let dir = TempStrDir::default();
+    let (mut dataset, _, appended) = historical_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let mut fragments = vec![10, 11];
+    if covers_appended {
+        fragments.push(appended);
+    }
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, fragments.clone()).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([incoming.uuid])
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(fragments.into_iter().collect::<RoaringBitmap>())
+    );
+    assert_queries_match_scans(&dataset, true).await;
+}
+
+/// A type without a batch remapper cannot translate through the history, so
+/// the rewrite withdraws its coverage of the retired fragments: the
+/// historical segments are left with empty stored bitmaps and serve nothing.
+/// A partial commit removes them like any definition-only segment, and the
+/// destinations stay unindexed.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn partial_commit_removes_historical_segments_whose_coverage_was_withdrawn() {
+    let dir = TempStrDir::default();
+    let (mut dataset, [p, q], appended) =
+        historical_fixture(dir.as_str(), "text", IndexType::Fm).await;
+    let historical: Vec<_> = stored_segments(&dataset, "staged")
+        .await
+        .into_iter()
+        .filter(|segment| segment.uuid == p || segment.uuid == q)
+        .collect();
+    assert_eq!(historical.len(), 2);
+    assert!(
+        historical.iter().all(|segment| segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(RoaringBitmap::is_empty)),
+        "the rewrite withdraws coverage an FM segment cannot translate"
+    );
+
+    let incoming = staged_segment(&mut dataset, "text", IndexType::Fm, vec![appended]).await;
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([incoming.uuid])
+    );
+    let mut unindexed = unindexed_fragment_ids(&dataset, "staged").await;
+    unindexed.sort_unstable();
+    assert_eq!(unindexed, vec![10, 11]);
+}
+
+/// A kept historical segment outlives the commit, so the incoming segments
+/// must declare the same fields as it does.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn partial_commit_refuses_a_declaration_a_historical_segment_does_not_share() {
+    let dir = TempStrDir::default();
+    let (mut dataset, [p, q], appended) =
+        historical_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let w = dataset.schema().field_id("w").unwrap();
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, vec![appended]).await;
+    let incoming = IndexMetadata {
+        covering_fields: vec![w],
+        ..incoming
+    };
+
+    let error = dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot mix declarations"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([p, q])
+    );
+}
+
+/// Without a fragment reuse history a segment over deleted fragments covers
+/// nothing, and a partial commit removes it.
+#[tokio::test]
+async fn partial_commit_removes_a_segment_over_deleted_fragments_without_history() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let old = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![old])
+        .await
+        .unwrap();
+    dataset.delete("i < 4").await.unwrap();
+    let mut dataset = append_scalar_rows(dataset, 8, 4).await;
+    assert!(!fragment_ids(&dataset).contains(&0));
+    assert_eq!(fragment_ids(&dataset).len(), 2);
+
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert!(fri_entry(&dataset).await.is_none());
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([incoming.uuid])
+    );
+}
+
+/// The segments a commit removes are chosen at its read version; a stable
+/// partition of the destinations commits before it. A commit that only adds
+/// a segment rebases: the kept historical segments serve the new destinations
+/// through both transitions. A commit whose removal was chosen from derived
+/// coverage does not land on the newer version; within the same call the
+/// choice is made afresh on it and the replacing segment carries its own
+/// coverage across the new transition. Either way nothing the index covered
+/// before the commit loses coverage.
+#[rstest::rstest]
+#[case::kept(false)]
+#[case::replaced(true)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn historical_segment_selection_survives_a_concurrent_stable_partition(
+    #[case] covers_destinations: bool,
+) {
+    let dir = TempStrDir::default();
+    let (dataset, [p, q], appended) = historical_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let mut stale = dataset.clone();
+    let fragments = if covers_destinations {
+        vec![10, 11]
+    } else {
+        vec![appended]
+    };
+    let incoming = staged_segment(&mut stale, "i", IndexType::BTree, fragments).await;
+
+    let mut latest = dataset;
+    reserve_fragments(&mut latest, 20).await;
+    let latest = commit_stable_partition(latest, &[10, 11], 30).await;
+    let covered_before = derived_union(&latest, "staged").await;
+    assert_eq!(covered_before, RoaringBitmap::from_iter([30u32, 31]));
+    stale
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert_eq!(stale.manifest.version, latest.manifest.version + 1);
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert!(
+        covered_before.is_subset(&derived_union(&dataset, "staged").await),
+        "the commit must not lose coverage the index had on the version it landed on"
+    );
+    assert_each_row_served_once(&dataset, "staged").await;
+    let mut fragments = fragment_ids(&dataset);
+    fragments.sort_unstable();
+    let mut expected_fragments = vec![appended, 30, 31];
+    expected_fragments.sort_unstable();
+    assert_eq!(fragments, expected_fragments);
+    let (expected_segments, expected_unindexed) = if covers_destinations {
+        (HashSet::from([incoming.uuid]), vec![appended])
+    } else {
+        (HashSet::from([p, q, incoming.uuid]), vec![])
+    };
+    assert_eq!(stored_uuids(&dataset, "staged").await, expected_segments);
+    assert_eq!(
+        unindexed_fragment_ids(&dataset, "staged").await,
+        expected_unindexed
+    );
+    assert_queries_match_scans(&dataset, true).await;
+}
+
+// ---------------------------------------------------------------------------
+// A partial commit beside segments that serve other fragments through the
+// tagged history: segments are kept or removed whole, and a commit that would
+// leave a covered live fragment without coverage is refused.
+// ---------------------------------------------------------------------------
+
+/// [`disk_fixture`] with four fragments: `i` 0..16.
+async fn four_fragment_fixture(uri: &str) -> Dataset {
+    lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "text",
+            lance_datagen::array::fill_utf8("document".to_string()),
+        )
+        .col("w", lance_datagen::array::step::<Int32Type>())
+        .into_dataset(uri, FragmentCount::from(4), FragmentRowCount::from(4))
+        .await
+        .unwrap()
+}
+
+/// A staged inverted segment that joins an index with committed segments.
+async fn staged_fts_segment(
+    dataset: &mut Dataset,
+    column: &str,
+    fragments: Vec<u32>,
+) -> IndexMetadata {
+    let params = analyzed_params();
+    CreateIndexBuilder::new(dataset, &[column], IndexType::Inverted, &params)
+        .name("staged".to_string())
+        .fragments(fragments)
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap()
+}
+
+async fn staged_of_type(
+    dataset: &mut Dataset,
+    column: &str,
+    index_type: IndexType,
+    fragments: Vec<u32>,
+) -> IndexMetadata {
+    if index_type == IndexType::Inverted {
+        staged_fts_segment(dataset, column, fragments).await
+    } else {
+        staged_segment(dataset, column, index_type, fragments).await
+    }
+}
+
+/// Index `staged` with A over {0, 2} and B over {1, 3}, then stable-partition
+/// {0, 1} into {10, 11}. Every destination holds rows of both sources, so A
+/// and B serve 10 and 11 only together, while A alone serves 2 and B alone 3.
+/// Returns the dataset and the uuids of A and B.
+async fn mixed_destination_fixture(
+    uri: &str,
+    column: &str,
+    index_type: IndexType,
+) -> (Dataset, [Uuid; 2]) {
+    let mut dataset = four_fragment_fixture(uri).await;
+    let a = staged_of_type(&mut dataset, column, index_type, vec![0, 2]).await;
+    let b = staged_of_type(&mut dataset, column, index_type, vec![1, 3]).await;
+    dataset
+        .commit_existing_index_segments("staged", column, vec![a.clone(), b.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    let mut fragments = fragment_ids(&dataset);
+    fragments.sort_unstable();
+    assert_eq!(fragments, vec![2, 3, 10, 11]);
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+    (dataset, [a.uuid, b.uuid])
+}
+
+/// The live fragments the reader derives coverage for, over every segment of
+/// the logical index `name`.
+async fn derived_union(dataset: &Dataset, name: &str) -> RoaringBitmap {
+    dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == name)
+        .filter_map(|idx| idx.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap)
+}
+
+/// The row addresses each BTree segment of `name` on `i` answers with on this
+/// snapshot, through the reader's own translation. A query unions these sets,
+/// so a row two segments both serve is invisible in query results; this is
+/// what tells them apart.
+async fn segment_contributions(dataset: &Dataset, name: &str) -> Vec<(Uuid, Vec<u64>)> {
+    let segments: Vec<Uuid> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == name)
+        .map(|idx| idx.uuid)
+        .collect();
+    let mut contributions = Vec::with_capacity(segments.len());
+    for uuid in segments {
+        let index = dataset
+            .open_scalar_index("i", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let SearchResult::Exact(rows) = index
+            .search(
+                &SargableQuery::Range(
+                    std::ops::Bound::Included(ScalarValue::Int32(Some(i32::MIN))),
+                    std::ops::Bound::Included(ScalarValue::Int32(Some(i32::MAX))),
+                ),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected an exact result");
+        };
+        let addrs: Vec<u64> = rows
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
+            .collect();
+        contributions.push((uuid, addrs));
+    }
+    contributions
+}
+
+/// Every live row of a covered fragment is answered by exactly one segment of
+/// `name`, and no segment answers with a row that is not live.
+async fn assert_each_row_served_once(dataset: &Dataset, name: &str) {
+    let live: std::collections::HashMap<u64, i32> = row_addrs_by_i(dataset)
+        .await
+        .into_iter()
+        .map(|(value, addr)| (addr, value))
+        .collect();
+    let mut served: std::collections::HashMap<u64, Vec<Uuid>> = Default::default();
+    for (uuid, addrs) in segment_contributions(dataset, name).await {
+        for addr in addrs {
+            served.entry(addr).or_default().push(uuid);
+        }
+    }
+    for (addr, segments) in &served {
+        let Some(value) = live.get(addr) else {
+            panic!("segments {segments:?} answer with row address {addr}, which is not live");
+        };
+        assert_eq!(
+            segments.len(),
+            1,
+            "the row i = {value} is answered by segments {segments:?}"
+        );
+    }
+    let covered = derived_union(dataset, name).await;
+    for (addr, value) in &live {
+        let fragment = lance_core::utils::address::RowAddress::from(*addr).fragment_id();
+        if covered.contains(fragment) {
+            assert!(
+                served.contains_key(addr),
+                "the row i = {value} of covered fragment {fragment} is answered by no segment"
+            );
+        }
+    }
+}
+
+/// Every live `i` is found through the index, exactly once.
+async fn assert_indexed_lookups(dataset: &Dataset) {
+    for value in values(dataset, None, false).await {
+        let predicate = format!("i = {value}");
+        let plan = dataset
+            .scan()
+            .filter(&predicate)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        assert_eq!(
+            values(dataset, Some(&predicate), true).await,
+            vec![value],
+            "{predicate}"
+        );
+    }
+}
+
+/// C over {2, 10} would remove A (its live fragment 2 is rebuilt) and with it
+/// the source-0 rows 11 needs from A: refused, the manifest untouched, and
+/// the index still covers 11.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn partial_commit_refuses_to_lose_coverage_another_fragment_depends_on() {
+    let dir = TempStrDir::default();
+    let (mut dataset, [a, b]) =
+        mixed_destination_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let version = dataset.manifest.version;
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, vec![2, 10]).await;
+
+    let error = dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::InvalidInput { .. }),
+        "unexpected error: {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "segment {a} (live fragments the incoming segments overlap: [2])"
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("leave live fragments [11] without"),
+        "{message}"
+    );
+    assert!(!message.contains(&b.to_string()), "{message}");
+
+    assert_eq!(dataset.manifest.version, version);
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version);
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([a, b])
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+    assert!(unindexed_fragment_ids(&dataset, "staged").await.is_empty());
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+}
+
+/// C over {10} only overlaps neither A's nor B's live fragments: both stay
+/// whole, and every row is answered by exactly one segment, on the session
+/// that warmed the old snapshot, after a reopen, and after a later rewrite of
+/// {2, 11} that no index remap follows (A's file still holds its rows of
+/// fragment 2, which now translate into the rewrite's destinations).
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn partial_commit_beside_a_partly_live_segment_serves_each_row_once() {
+    let dir = TempStrDir::default();
+    let (dataset, [a, b]) = mixed_destination_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    drop(dataset);
+    let mut dataset = fresh_session(dir.as_str()).await;
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, vec![10]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    let all = HashSet::from([a, b, incoming.uuid]);
+    assert_eq!(stored_uuids(&dataset, "staged").await, all);
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+
+    let mut dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[2, 11], 30).await;
+    let mut fragments = fragment_ids(&dataset);
+    fragments.sort_unstable();
+    assert_eq!(fragments, vec![3, 10, 30, 31]);
+    assert_eq!(stored_uuids(&dataset, "staged").await, all);
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([3u32, 10, 30, 31])
+    );
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+}
+
+/// C over {2, 10, 11} rebuilds A's live fragment and every destination A
+/// serves: A is removed, B stays for 3, and nothing loses coverage.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn partial_commit_over_a_segment_and_its_destinations_replaces_it() {
+    let dir = TempStrDir::default();
+    let (mut dataset, [_, b]) =
+        mixed_destination_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, vec![2, 10, 11]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert_each_row_served_once(&dataset, "staged").await;
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([b, incoming.uuid])
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+    assert!(unindexed_fragment_ids(&dataset, "staged").await.is_empty());
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+}
+
+/// A staged segment built over source 0 before {0, 1} was partitioned shares
+/// provenance with E over {0, 1}: keeping E whole would answer source 0's rows
+/// twice, and removing it loses source 1's contribution to 10 and 11. Refused.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn retired_staged_provenance_cannot_replace_part_of_a_historical_segment() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let e = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0, 1]).await;
+    let retired = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![e.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    let version = dataset.manifest.version;
+
+    let error = dataset
+        .commit_existing_index_segments("staged", "i", vec![retired])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::InvalidInput { .. }),
+        "unexpected error: {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "segment {} (live fragments the incoming segments overlap: [])",
+            e.uuid
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("leave live fragments [10, 11] without"),
+        "{message}"
+    );
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version);
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([e.uuid])
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([10u32, 11])
+    );
+    assert_queries_match_scans(&dataset, true).await;
+}
+
+/// P over 0 is committed alone and Q over 1 later, after {0, 1} was
+/// partitioned: P derives nothing before the commit (10 and 11 lack source 1),
+/// and P and Q serve both destinations together after it. P stays.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_segment_completing_a_historical_segment_keeps_it() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let p = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0]).await;
+    let q = staged_segment(&mut dataset, "i", IndexType::BTree, vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![p.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    assert!(derived_union(&dataset, "staged").await.is_empty());
+
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![q.clone()])
+        .await
+        .unwrap();
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([p.uuid, q.uuid])
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([10u32, 11])
+    );
+    assert!(unindexed_fragment_ids(&dataset, "staged").await.is_empty());
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_queries_match_scans(&dataset, true).await;
+}
+
+/// The relative path of a segment's inverted metadata file (its format
+/// marker), as the index store reads it.
+fn fts_marker_suffix(segment: Uuid) -> String {
+    format!(
+        "{}/{}",
+        segment,
+        lance_index::scalar::inverted::METADATA_FILE
+    )
+}
+
+/// FTS segments P over 0 and Q over 1, a stable partition of {0, 1} into
+/// {10, 11}, and a segment C over {10, 11} staged from that version. With
+/// every format marker readable, C supersedes P and Q and the partial commit
+/// removes them. When P's marker cannot be read in a fresh session, P's
+/// derived coverage is unknown, which also leaves Q's absent coverage
+/// unproven: both stay, and are still there once the store answers again.
+#[rstest::rstest]
+#[case::readable(false)]
+#[case::unreadable(true)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn an_unreadable_format_marker_keeps_historical_segments_on_a_partial_commit(
+    #[case] fails: bool,
+) {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let mut dataset = disk_fixture(path).await;
+    let p = staged_fts_segment(&mut dataset, "text", vec![0]).await;
+    let q = staged_fts_segment(&mut dataset, "text", vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![p.clone(), q.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    let mut dataset = append_scalar_rows(dataset, 8, 4).await;
+    let appended = *fragment_ids(&dataset).iter().max().unwrap();
+    let incoming = staged_fts_segment(&mut dataset, "text", vec![10, 11]).await;
+    drop(dataset);
+
+    let (mut dataset, failing) = open_with_failing_reads(path, fts_marker_suffix(p.uuid)).await;
+    failing.store(fails, Ordering::SeqCst);
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    failing.store(false, Ordering::SeqCst);
+
+    let dataset = fresh_session(path).await;
+    let expected = if fails {
+        HashSet::from([p.uuid, q.uuid, incoming.uuid])
+    } else {
+        HashSet::from([incoming.uuid])
+    };
+    assert_eq!(stored_uuids(&dataset, "staged").await, expected);
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([10u32, 11])
+    );
+    assert_eq!(
+        unindexed_fragment_ids(&dataset, "staged").await,
+        vec![appended]
+    );
+}
+
+/// FTS segments A over {0, 2} and B over {1, 3} as in
+/// [`mixed_destination_fixture`]. C over {2, 10, 11} replaces A when every
+/// marker is readable; with A's marker unreadable whether removing A loses
+/// coverage cannot be established, so the commit fails with the read error
+/// itself and the manifest is untouched. Once the store answers, the same
+/// commit lands.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn an_unreadable_format_marker_refuses_an_unproven_replacement() {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let (mut dataset, [a, b]) = mixed_destination_fixture(path, "text", IndexType::Inverted).await;
+    let version = dataset.manifest.version;
+    let incoming = staged_fts_segment(&mut dataset, "text", vec![2, 10, 11]).await;
+    drop(dataset);
+    let segments_before = stored_bitmaps(&fresh_session(path).await, "staged").await;
+
+    let (mut dataset, failing) = open_with_failing_reads(path, fts_marker_suffix(a)).await;
+    failing.store(true, Ordering::SeqCst);
+    let error = dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::IO { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        format!("{error:?}").contains("injected transient read failure"),
+        "{error:?}"
+    );
+    assert_eq!(dataset.manifest.version, version);
+    let untouched = fresh_session(path).await;
+    assert_eq!(untouched.manifest.version, version);
+    assert_eq!(
+        stored_uuids(&untouched, "staged").await,
+        HashSet::from([a, b])
+    );
+    assert_eq!(stored_bitmaps(&untouched, "staged").await, segments_before);
+
+    failing.store(false, Ordering::SeqCst);
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(path).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([b, incoming.uuid])
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+}
+
+/// C over {2, 10, 11} is staged at the fixture's version and replaces A
+/// there, B staying for its live fragment 3. A stable partition of {3, 11}
+/// commits first. The replacement was chosen from coverage derived at the
+/// read version, so it does not land on the newer one; within the same call
+/// the choice is made again on the latest version: A is still replaced, and
+/// B, whose fragments are all retired by now, stays because together with C
+/// it serves the new destinations. Nothing the index covered at the latest
+/// version loses coverage.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn coverage_dependent_commit_is_decided_again_after_a_concurrent_stable_partition() {
+    let dir = TempStrDir::default();
+    let (dataset, [a, b]) = mixed_destination_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let mut stale = dataset.clone();
+    let incoming = staged_segment(&mut stale, "i", IndexType::BTree, vec![2, 10, 11]).await;
+    assert!(requires_unchanged_snapshot(&stale, "i", vec![incoming.clone()]).await);
+
+    let mut latest = dataset;
+    reserve_fragments(&mut latest, 20).await;
+    let latest = commit_stable_partition(latest, &[3, 11], 30).await;
+    let covered_before = derived_union(&latest, "staged").await;
+    assert_eq!(covered_before, RoaringBitmap::from_iter([2u32, 10, 30, 31]));
+
+    stale
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert_eq!(stale.manifest.version, latest.manifest.version + 1);
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, latest.manifest.version + 1);
+    let stored = stored_uuids(&dataset, "staged").await;
+    assert!(!stored.contains(&a), "{a} is replaced");
+    assert_eq!(stored, HashSet::from([b, incoming.uuid]));
+    assert!(covered_before.is_subset(&derived_union(&dataset, "staged").await));
+    assert!(unindexed_fragment_ids(&dataset, "staged").await.is_empty());
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+}
+
+/// C over {2, 10, 11} is staged at the fixture's version, where it replaces
+/// A. Before it commits, the index is rebuilt as D over every live fragment,
+/// also replacing A. The ordinary conflict rules refuse C over the rebuild,
+/// so the call returns a retryable conflict without deciding again: the
+/// manifest stays at D's version and the caller's dataset is back at the
+/// version it was called with. Repeated on the latest version, C would leave
+/// D's fragment 3 without coverage, so the request is refused.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn coverage_dependent_commit_after_a_concurrent_rebuild_conflicts_then_is_refused() {
+    let dir = TempStrDir::default();
+    let (dataset, _) = mixed_destination_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let mut stale = dataset.clone();
+    let incoming = staged_segment(&mut stale, "i", IndexType::BTree, vec![2, 10, 11]).await;
+
+    let mut latest = dataset;
+    let rebuilt = staged_segment(&mut latest, "i", IndexType::BTree, vec![2, 3, 10, 11]).await;
+    latest
+        .commit_existing_index_segments("staged", "i", vec![rebuilt.clone()])
+        .await
+        .unwrap();
+    let before = stored_bitmaps(&latest, "staged").await;
+    let called_at = stale.manifest.version;
+    assert!(called_at < latest.manifest.version);
+
+    let error = stale
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap_err();
+    assert_eq!(stale.manifest.version, called_at);
+    assert!(
+        matches!(error, crate::Error::RetryableCommitConflict { .. }),
+        "unexpected error: {error:?}"
+    );
+    let untouched = fresh_session(dir.as_str()).await;
+    assert_eq!(untouched.manifest.version, latest.manifest.version);
+    assert_eq!(stored_bitmaps(&untouched, "staged").await, before);
+
+    stale.checkout_latest().await.unwrap();
+    let error = stale
+        .commit_existing_index_segments("staged", "i", vec![incoming])
+        .await
+        .unwrap_err();
+    assert_eq!(stale.manifest.version, latest.manifest.version);
+    assert!(
+        matches!(error, crate::Error::InvalidInput { .. }),
+        "unexpected error: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "would orphan fragments [3] from existing segment {}",
+            rebuilt.uuid
+        )),
+        "{message}"
+    );
+    let untouched = fresh_session(dir.as_str()).await;
+    assert_eq!(untouched.manifest.version, latest.manifest.version);
+    assert_eq!(stored_bitmaps(&untouched, "staged").await, before);
+}
+
+/// C over {2, 10, 11} is staged at the fixture's version, where it replaces
+/// A. Before it commits, the index is dropped. The ordinary conflict rules
+/// refuse C over the drop, so the call returns a retryable conflict: the
+/// index stays dropped, no manifest is written for the request and the
+/// caller's dataset is back at the version it was called with.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn coverage_dependent_commit_conflicts_with_a_concurrent_drop() {
+    let dir = TempStrDir::default();
+    let (dataset, _) = mixed_destination_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    let mut stale = dataset.clone();
+    let incoming = staged_segment(&mut stale, "i", IndexType::BTree, vec![2, 10, 11]).await;
+
+    let mut latest = dataset;
+    latest.drop_index("staged").await.unwrap();
+    let called_at = stale.manifest.version;
+    assert!(called_at < latest.manifest.version);
+
+    let error = stale
+        .commit_existing_index_segments("staged", "i", vec![incoming])
+        .await
+        .unwrap_err();
+    assert_eq!(stale.manifest.version, called_at);
+    assert!(
+        matches!(error, crate::Error::RetryableCommitConflict { .. }),
+        "unexpected error: {error:?}"
+    );
+    let untouched = fresh_session(dir.as_str()).await;
+    assert_eq!(untouched.manifest.version, latest.manifest.version);
+    assert!(stored_uuids(&untouched, "staged").await.is_empty());
+}
+
+/// C over {2, 10, 11} is staged at the fixture's version, where it replaces
+/// A. Before it commits, a different index is dropped. The ordinary conflict
+/// rules accept C over that drop, so within the same call the choice is made
+/// again on the latest version and C lands there.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn coverage_dependent_commit_is_decided_again_after_a_concurrent_drop_of_another_index() {
+    let dir = TempStrDir::default();
+    let (mut dataset, [a, b]) =
+        mixed_destination_fixture(dir.as_str(), "i", IndexType::BTree).await;
+    dataset
+        .create_index(
+            &["w"],
+            IndexType::BTree,
+            Some("other".into()),
+            &ScalarIndexParams::for_builtin(IndexType::BTree.try_into().unwrap()),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut stale = dataset.clone();
+    let incoming = staged_segment(&mut stale, "i", IndexType::BTree, vec![2, 10, 11]).await;
+
+    let mut latest = dataset;
+    latest.drop_index("other").await.unwrap();
+
+    stale
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert_eq!(stale.manifest.version, latest.manifest.version + 1);
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, latest.manifest.version + 1);
+    let stored = stored_uuids(&dataset, "staged").await;
+    assert!(!stored.contains(&a), "{a} is replaced");
+    assert_eq!(stored, HashSet::from([b, incoming.uuid]));
+    assert!(stored_uuids(&dataset, "other").await.is_empty());
+}
+
+/// FTS segments A over {0, 2} and B over {1, 3}, and C over {0, 2} staged
+/// before {0, 1} is partitioned into {10, 11}, then C committed with its
+/// format marker unreadable. The read failure surfaces before the commit
+/// decides which segments stay, so nothing is committed.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn an_unreadable_incoming_marker_commits_nothing() {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let mut dataset = four_fragment_fixture(path).await;
+    let a = staged_fts_segment(&mut dataset, "text", vec![0, 2]).await;
+    let b = staged_fts_segment(&mut dataset, "text", vec![1, 3]).await;
+    let incoming = staged_fts_segment(&mut dataset, "text", vec![0, 2]).await;
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![a.clone(), b.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    let version = dataset.manifest.version;
+    drop(dataset);
+    let segments_before = segment_bitmaps(&fresh_session(path).await, "staged").await;
+
+    let (mut dataset, failing) =
+        open_with_failing_reads(path, fts_marker_suffix(incoming.uuid)).await;
+    failing.store(true, Ordering::SeqCst);
+    let result = dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await;
+    failing.store(false, Ordering::SeqCst);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, crate::Error::IO { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        format!("{error:?}").contains("injected transient read failure"),
+        "{error:?}"
+    );
+    assert_eq!(dataset.manifest.version, version);
+
+    let dataset = fresh_session(path).await;
+    assert_eq!(dataset.manifest.version, version);
+    assert_eq!(segment_bitmaps(&dataset, "staged").await, segments_before);
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([a.uuid, b.uuid])
+    );
+}
+
+/// Each segment of `name` with the fragment bitmap the reader loads for it.
+async fn segment_bitmaps(
+    dataset: &Dataset,
+    name: &str,
+) -> std::collections::BTreeMap<Uuid, Option<RoaringBitmap>> {
+    dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == name)
+        .map(|idx| (idx.uuid, idx.fragment_bitmap.clone()))
+        .collect()
+}
+
+/// Each stored segment of `name` with the fragment bitmap the manifest
+/// records for it, including segments the reader leaves out of the listing.
+async fn stored_bitmaps(
+    dataset: &Dataset,
+    name: &str,
+) -> std::collections::BTreeMap<Uuid, Option<RoaringBitmap>> {
+    stored_segments(dataset, name)
+        .await
+        .into_iter()
+        .map(|idx| (idx.uuid, idx.fragment_bitmap))
+        .collect()
+}
+
+/// Segments P over 0 and Q over 1, then a history whose only transition (of
+/// {0, 1} into {10, 11}) this build cannot interpret, and one appended
+/// fragments a1 and a2. The reader lets no user segment take part in
+/// coverage. A segment T over {a1, a2} commits beside P and Q, which stay with
+/// their stored bitmaps. U over {a1, a2} would remove T, whose coverage this
+/// build cannot establish under that history, and is refused with every
+/// segment left as it was, although U stores all of T's fragments again.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn an_unsupported_history_keeps_segments_and_refuses_an_unproven_removal() {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let mut dataset = disk_fixture(path).await;
+    let p = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0]).await;
+    let q = staged_segment(&mut dataset, "i", IndexType::BTree, vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![p.clone(), q.clone()])
+        .await
+        .unwrap();
+    let (mut transition, destinations) = reader_tests::prepare(&dataset).await;
+    transition.mapping = None;
+    let mut raw = transition.encode_to_vec();
+    raw.extend(reader_tests::field(17, b"future mapping"));
+    reader_tests::install(
+        &mut dataset,
+        reader_tests::field(2, &raw),
+        destinations,
+        false,
+    )
+    .await;
+    let indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    reader_tests::persist_fixture(&mut dataset, indices).await;
+    let dataset = append_scalar_rows(dataset, 8, 4).await;
+    let a1 = *fragment_ids(&dataset).iter().max().unwrap();
+    let mut dataset = append_scalar_rows(dataset, 12, 4).await;
+    let a2 = *fragment_ids(&dataset).iter().max().unwrap();
+    assert!(a2 > a1);
+    let appended = RoaringBitmap::from_iter([a1, a2]);
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|idx| idx.name != "staged")
+    );
+    let historical = stored_bitmaps(&dataset, "staged").await;
+    assert_eq!(
+        historical,
+        std::collections::BTreeMap::from([
+            (p.uuid, Some(RoaringBitmap::from_iter([0u32]))),
+            (q.uuid, Some(RoaringBitmap::from_iter([1u32]))),
+        ])
+    );
+
+    let t = staged_segment(&mut dataset, "i", IndexType::BTree, vec![a1, a2]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![t.clone()])
+        .await
+        .unwrap();
+    let mut expected = historical.clone();
+    expected.insert(t.uuid, Some(appended.clone()));
+    let reopened = fresh_session(path).await;
+    assert_eq!(reopened.manifest.version, dataset.manifest.version);
+    assert_eq!(stored_bitmaps(&reopened, "staged").await, expected);
+
+    let version = dataset.manifest.version;
+    let u = staged_segment(&mut dataset, "i", IndexType::BTree, vec![a1, a2]).await;
+    let error = dataset
+        .commit_existing_index_segments("staged", "i", vec![u])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::InvalidInput { .. }),
+        "unexpected error: {error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("cannot establish"), "{message}");
+    assert!(
+        message.contains("this build cannot translate it"),
+        "{message}"
+    );
+    assert!(message.contains(&t.uuid.to_string()), "{message}");
+    assert_eq!(dataset.manifest.version, version);
+    let untouched = fresh_session(path).await;
+    assert_eq!(untouched.manifest.version, version);
+    assert_eq!(stored_bitmaps(&untouched, "staged").await, expected);
+}
+
+/// A over {0, 2} and B over {1, 3}, and C over {0} and D over {2} staged
+/// before {0, 1} is partitioned into {10, 11}. Neither C nor D alone stores
+/// every fragment A stores; together they do, and with B they serve 10 and
+/// 11. One commit of C and D replaces A, and every row is answered once.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn incoming_segments_together_resupply_a_removed_segment() {
+    let dir = TempStrDir::default();
+    let mut dataset = four_fragment_fixture(dir.as_str()).await;
+    let a = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0, 2]).await;
+    let b = staged_segment(&mut dataset, "i", IndexType::BTree, vec![1, 3]).await;
+    let c = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0]).await;
+    let d = staged_segment(&mut dataset, "i", IndexType::BTree, vec![2]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![a.clone(), b.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![c.clone(), d.clone()])
+        .await
+        .unwrap();
+    assert_each_row_served_once(&dataset, "staged").await;
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([b.uuid, c.uuid, d.uuid])
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+    assert!(unindexed_fragment_ids(&dataset, "staged").await.is_empty());
+    assert_each_row_served_once(&dataset, "staged").await;
+    assert_indexed_lookups(&dataset).await;
+}
+
+/// A over {0, 2} and B over {1, 3}, and C over {0} staged before {0, 1} is
+/// partitioned into {10, 11}. C overlaps none of A's live fragments but
+/// shares A's rewritten source 0, so keeping both would answer source 0's
+/// rows twice. Refused with the shared source named, the manifest untouched.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn retired_staged_provenance_shared_with_a_live_segment_is_refused() {
+    let dir = TempStrDir::default();
+    let mut dataset = four_fragment_fixture(dir.as_str()).await;
+    let a = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0, 2]).await;
+    let b = staged_segment(&mut dataset, "i", IndexType::BTree, vec![1, 3]).await;
+    let incoming = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![a.clone(), b.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    let version = dataset.manifest.version;
+
+    let error = dataset
+        .commit_existing_index_segments("staged", "i", vec![incoming])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::InvalidInput { .. }),
+        "unexpected error: {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "existing segment {} for 'staged' shares already-rewritten source fragments [0]",
+            a.uuid
+        )),
+        "{message}"
+    );
+    assert!(message.contains("live fragments [2]"), "{message}");
+    assert!(!message.contains("orphan"), "{message}");
+    assert!(!message.contains(&b.uuid.to_string()), "{message}");
+
+    assert_eq!(dataset.manifest.version, version);
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version);
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([a.uuid, b.uuid])
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+    assert_each_row_served_once(&dataset, "staged").await;
+}
+
+/// Data fragments {0, 1} partitioned into {10, 11}.
+async fn partitioned_fixture(uri: &str) -> Dataset {
+    let mut dataset = disk_fixture(uri).await;
+    reserve_fragments(&mut dataset, 20).await;
+    commit_stable_partition(dataset, &[0, 1], 10).await
+}
+
+/// Data fragments {0, 1} partitioned into {10, 11}, then an FM segment S over
+/// destination 10 alone built and committed at the current version. The
+/// history records 10, so S may need translation, and the reader leaves it
+/// out of coverage because FM has no batch remapper. Returns the dataset and
+/// S.
+async fn fm_segment_over_a_destination(uri: &str) -> (Dataset, IndexMetadata) {
+    let mut dataset = partitioned_fixture(uri).await;
+    let s = staged_segment(&mut dataset, "text", IndexType::Fm, vec![10]).await;
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![s.clone()])
+        .await
+        .unwrap();
+    (dataset, s)
+}
+
+async fn assert_replaced_by(dir: &str, version: u64, s: Uuid, incoming: &IndexMetadata) {
+    let dataset = fresh_session(dir).await;
+    assert!(dataset.manifest.version > version);
+    let stored = stored_segments(&dataset, "staged").await;
+    assert_eq!(
+        stored
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>(),
+        HashSet::from([incoming.uuid]),
+        "{s} is replaced"
+    );
+    assert_eq!(stored[0].fragment_bitmap, incoming.fragment_bitmap);
+    // The incoming segment stores destination 10, which the history records,
+    // and FM cannot translate, so the reader lists no coverage for it.
+    assert_eq!(derived_coverage(&dataset, "staged").await, None);
+}
+
+/// I over {10} replaces S over {10}. The reader leaves both out of coverage
+/// for lacking a batch remapper; the replacement is accepted because S is in
+/// that same class and I stores all of S's fragments again.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_segment_without_a_batch_remapper_can_still_be_replaced_over_the_same_fragments() {
+    let dir = TempStrDir::default();
+    let (mut dataset, s) = fm_segment_over_a_destination(dir.as_str()).await;
+    let version = dataset.manifest.version;
+    let incoming = staged_segment(&mut dataset, "text", IndexType::Fm, vec![10]).await;
+    assert_eq!(
+        incoming.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([10u32]))
+    );
+
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert_replaced_by(dir.as_str(), version, s.uuid, &incoming).await;
+}
+
+/// I over {10, appended} replaces S over {10} the same way.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_segment_without_a_batch_remapper_can_be_replaced_by_one_over_more_fragments() {
+    let dir = TempStrDir::default();
+    let (dataset, s) = fm_segment_over_a_destination(dir.as_str()).await;
+    let mut dataset = append_scalar_rows(dataset, 8, 4).await;
+    let appended = *fragment_ids(&dataset).iter().max().unwrap();
+    assert!(appended > 11);
+    let version = dataset.manifest.version;
+    let incoming = staged_segment(&mut dataset, "text", IndexType::Fm, vec![10, appended]).await;
+    assert_eq!(
+        incoming.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([10u32, appended]))
+    );
+
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert_replaced_by(dir.as_str(), version, s.uuid, &incoming).await;
+}
+
+/// Appends one fragment of four rows and returns its id, which lies outside
+/// the history.
+async fn append_live_fragment(dataset: Dataset, start: i32) -> (Dataset, u32) {
+    let dataset = append_scalar_rows(dataset, start, 4).await;
+    let appended = *fragment_ids(&dataset).iter().max().unwrap();
+    assert!(appended > 11);
+    (dataset, appended)
+}
+
+/// Asserts a refused commit left the version and every stored bitmap as they
+/// were.
+async fn assert_refused_unchanged(
+    error: crate::Error,
+    dir: &str,
+    dataset: &Dataset,
+    version: u64,
+    before: &std::collections::BTreeMap<Uuid, Option<RoaringBitmap>>,
+    removed_member: Uuid,
+) {
+    assert!(
+        matches!(error, crate::Error::InvalidInput { .. }),
+        "unexpected error: {error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("cannot establish"), "{message}");
+    assert!(message.contains(&removed_member.to_string()), "{message}");
+    assert_eq!(dataset.manifest.version, version);
+    let untouched = fresh_session(dir).await;
+    assert_eq!(untouched.manifest.version, version);
+    assert_eq!(&stored_bitmaps(&untouched, "staged").await, before);
+}
+
+/// On {0, 1} partitioned into {10, 11} and an appended fragment 12, FM
+/// segment R over {12} needs no translation, so it takes part in coverage and
+/// directly covers 12. Incoming I over {12, 10} meets the history and FM has
+/// no batch remapper, so the reader leaves I out. Replacing R by I would lose
+/// the indexed coverage of 12, so the commit is refused and nothing changes.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_member_is_not_replaced_by_a_segment_without_a_batch_remapper() {
+    let dir = TempStrDir::default();
+    let dataset = partitioned_fixture(dir.as_str()).await;
+    let (mut dataset, appended) = append_live_fragment(dataset, 8).await;
+    let r = staged_segment(&mut dataset, "text", IndexType::Fm, vec![appended]).await;
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![r.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([appended]))
+    );
+    let version = dataset.manifest.version;
+    let before = stored_bitmaps(&dataset, "staged").await;
+    assert_eq!(
+        before,
+        std::collections::BTreeMap::from([(r.uuid, Some(RoaringBitmap::from_iter([appended])))])
+    );
+
+    let incoming = staged_segment(&mut dataset, "text", IndexType::Fm, vec![appended, 10]).await;
+    let error = dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming])
+        .await
+        .unwrap_err();
+    assert_refused_unchanged(error, dir.as_str(), &dataset, version, &before, r.uuid).await;
+}
+
+/// FM segments S over {10} (left out: it meets the history and FM has no
+/// batch remapper) and M over two appended fragments {a1, a2} (a member).
+/// Returns the dataset, S, M and the appended ids.
+async fn fm_member_beside_an_excluded_segment(
+    uri: &str,
+) -> (Dataset, IndexMetadata, IndexMetadata, [u32; 2]) {
+    let (dataset, s) = fm_segment_over_a_destination(uri).await;
+    let (dataset, a1) = append_live_fragment(dataset, 8).await;
+    let (mut dataset, a2) = append_live_fragment(dataset, 12).await;
+    let m = staged_segment(&mut dataset, "text", IndexType::Fm, vec![a1, a2]).await;
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![m.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([s.uuid, m.uuid])
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([a1, a2]))
+    );
+    (dataset, s, m, [a1, a2])
+}
+
+/// Incoming J over {a1, a2} (a member) supplies M again; incoming K over {10}
+/// (left out for the same missing batch remapper) supplies S again. Both
+/// removals are decided on their own and the commit lands.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn mixed_removals_land_when_each_is_supplied_again() {
+    let dir = TempStrDir::default();
+    let (mut dataset, s, m, [a1, a2]) = fm_member_beside_an_excluded_segment(dir.as_str()).await;
+    let version = dataset.manifest.version;
+    let j = staged_segment(&mut dataset, "text", IndexType::Fm, vec![a1, a2]).await;
+    let k = staged_segment(&mut dataset, "text", IndexType::Fm, vec![10]).await;
+
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![j.clone(), k.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version + 1);
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([
+            (j.uuid, j.fragment_bitmap.clone()),
+            (k.uuid, k.fragment_bitmap.clone()),
+        ]),
+        "{} and {} are replaced",
+        s.uuid,
+        m.uuid
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([a1, a2]))
+    );
+}
+
+/// Incoming J over {a1} (a member) and K over {10, a2} (left out): S would be
+/// supplied again by the exception, but M's a2 is stored again only by K,
+/// which cannot stand in for a member. The commit is refused and nothing
+/// changes.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn mixed_removals_are_refused_when_a_member_is_not_supplied_again() {
+    let dir = TempStrDir::default();
+    let (mut dataset, _s, m, [a1, a2]) = fm_member_beside_an_excluded_segment(dir.as_str()).await;
+    let version = dataset.manifest.version;
+    let before = stored_bitmaps(&dataset, "staged").await;
+    let j = staged_segment(&mut dataset, "text", IndexType::Fm, vec![a1]).await;
+    let k = staged_segment(&mut dataset, "text", IndexType::Fm, vec![10, a2]).await;
+
+    let error = dataset
+        .commit_existing_index_segments("staged", "text", vec![j, k])
+        .await
+        .unwrap_err();
+    assert_refused_unchanged(error, dir.as_str(), &dataset, version, &before, m.uuid).await;
+}
+
+/// I over {10} replaces S over {10} only by the exception for a type without
+/// a batch remapper, which rests on this snapshot's classification. An
+/// append commits first, so the replacement does not land on the newer
+/// version; within the same call it is decided again on the latest version
+/// and lands there.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_replacement_by_the_exception_is_decided_again_after_a_concurrent_append() {
+    let dir = TempStrDir::default();
+    let (dataset, s) = fm_segment_over_a_destination(dir.as_str()).await;
+    let mut stale = dataset.clone();
+    let incoming = staged_segment(&mut stale, "text", IndexType::Fm, vec![10]).await;
+    let latest = append_scalar_rows(dataset, 8, 4).await;
+
+    stale
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    assert_eq!(stale.manifest.version, latest.manifest.version + 1);
+    assert_replaced_by(dir.as_str(), latest.manifest.version, s.uuid, &incoming).await;
+}
+
+/// The same replacement through a store whose manifest write fails without
+/// landing, or lands with an outcome that cannot be read back. Neither is
+/// another writer's commit: the failure is returned with its source and the
+/// decision is not made again.
+#[rstest::rstest]
+#[case::failed_write(crate::utils::test::AmbiguousFailure::FailOutright)]
+#[case::unknown_outcome(crate::utils::test::AmbiguousFailure::LandAndErrorWithoutVerification)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_failed_conditional_write_is_returned_not_decided_again(
+    #[case] failure: crate::utils::test::AmbiguousFailure,
+) {
+    let dir = TempStrDir::default();
+    let (dataset, s) = fm_segment_over_a_destination(dir.as_str()).await;
+    let version = dataset.manifest.version;
+    drop(dataset);
+    let handler = Arc::new(crate::utils::test::AmbiguousCommitHandler::default());
+    let mut dataset = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+        .with_commit_handler(handler.clone())
+        .load()
+        .await
+        .unwrap();
+    let incoming = staged_segment(&mut dataset, "text", IndexType::Fm, vec![10]).await;
+
+    handler.fail_next(failure);
+    let error = dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap_err();
+    handler.fail_resolve.store(false, Ordering::SeqCst);
+    assert_eq!(dataset.manifest.version, version);
+    if failure == crate::utils::test::AmbiguousFailure::FailOutright {
+        assert!(
+            matches!(error, crate::Error::RetryableCommitConflict { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            format!("{error:?}").contains("simulated outright commit failure"),
+            "{error:?}"
+        );
+        assert!(
+            !error.to_string().contains("another commit landed first"),
+            "{error}"
+        );
+        let untouched = fresh_session(dir.as_str()).await;
+        assert_eq!(untouched.manifest.version, version);
+        assert_eq!(
+            stored_uuids(&untouched, "staged").await,
+            HashSet::from([s.uuid])
+        );
+
+        dataset
+            .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+            .await
+            .unwrap();
+    } else {
+        assert!(error.is_commit_status_unknown(), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("simulated ambiguous commit failure"),
+            "{error:?}"
+        );
+        // The write landed; nothing was committed after it.
+        assert_eq!(
+            fresh_session(dir.as_str()).await.manifest.version,
+            version + 1
+        );
+    }
+    assert_replaced_by(dir.as_str(), version, s.uuid, &incoming).await;
+}
+
+/// Appends fragments a1 and a2 to {0, 1} partitioned into {10, 11}, commits a
+/// segment S of `index_type` on `column` over {a1, a2}, then deletes every row
+/// of a2. S still stores a2, which is neither live nor named by the history.
+/// Returns the dataset, S and a1.
+async fn segment_over_an_outright_deleted_fragment(
+    uri: &str,
+    column: &str,
+    index_type: IndexType,
+) -> (Dataset, IndexMetadata, u32) {
+    let dataset = partitioned_fixture(uri).await;
+    let (dataset, a1) = append_live_fragment(dataset, 8).await;
+    let (mut dataset, a2) = append_live_fragment(dataset, 12).await;
+    let s = staged_segment(&mut dataset, column, index_type, vec![a1, a2]).await;
+    dataset
+        .commit_existing_index_segments("staged", column, vec![s.clone()])
+        .await
+        .unwrap();
+    dataset.delete("i >= 12").await.unwrap();
+    assert!(!fragment_ids(&dataset).contains(&a2));
+    assert!(fragment_ids(&dataset).contains(&a1));
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([(s.uuid, Some(RoaringBitmap::from_iter([a1, a2])))])
+    );
+    (dataset, s, a1)
+}
+
+/// FM has no batch remapper. I over {a1} replaces S over {a1, a2} after a2
+/// was deleted outright: a2 carries no coverage, so I supplies S again.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_rebuild_after_an_outright_delete_replaces_a_segment_without_a_batch_remapper() {
+    let dir = TempStrDir::default();
+    let (mut dataset, s, a1) =
+        segment_over_an_outright_deleted_fragment(dir.as_str(), "text", IndexType::Fm).await;
+    let version = dataset.manifest.version;
+    let incoming = staged_segment(&mut dataset, "text", IndexType::Fm, vec![a1]).await;
+
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version + 1);
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([(incoming.uuid, incoming.fragment_bitmap.clone())]),
+        "{} is replaced",
+        s.uuid
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([a1]))
+    );
+}
+
+/// The same replacement for BTree rests on no derived coverage, so it rebases
+/// past an append that commits between the build and the commit.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_rebuild_after_an_outright_delete_rebases_past_a_concurrent_append() {
+    let dir = TempStrDir::default();
+    let (dataset, s, a1) =
+        segment_over_an_outright_deleted_fragment(dir.as_str(), "i", IndexType::BTree).await;
+    let mut stale = dataset.clone();
+    let incoming = staged_segment(&mut stale, "i", IndexType::BTree, vec![a1]).await;
+    let latest = append_scalar_rows(dataset, 20, 4).await;
+
+    stale
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, latest.manifest.version + 1);
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([(incoming.uuid, incoming.fragment_bitmap.clone())]),
+        "{} is replaced",
+        s.uuid
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([a1]))
+    );
+}
+
+/// On {0, 1} partitioned into {10, 11}, segments M over appended a1 and D over
+/// appended a2 of `index_type` on `column`; then every row of a2 is deleted
+/// and a3 appended. D stores only a2, which is neither live nor named by the
+/// history. Returns the dataset, M, D, a1 and a3.
+async fn segment_over_only_an_outright_deleted_fragment(
+    uri: &str,
+    column: &str,
+    index_type: IndexType,
+) -> (Dataset, IndexMetadata, IndexMetadata, u32, u32) {
+    let dataset = partitioned_fixture(uri).await;
+    let (dataset, a1) = append_live_fragment(dataset, 8).await;
+    let (mut dataset, a2) = append_live_fragment(dataset, 12).await;
+    let m = staged_segment(&mut dataset, column, index_type, vec![a1]).await;
+    let d = staged_segment(&mut dataset, column, index_type, vec![a2]).await;
+    dataset
+        .commit_existing_index_segments("staged", column, vec![m.clone(), d.clone()])
+        .await
+        .unwrap();
+    dataset.delete("i >= 12").await.unwrap();
+    assert!(!fragment_ids(&dataset).contains(&a2));
+    let (dataset, a3) = append_live_fragment(dataset, 16).await;
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([
+            (m.uuid, Some(RoaringBitmap::from_iter([a1]))),
+            (d.uuid, Some(RoaringBitmap::from_iter([a2]))),
+        ])
+    );
+    (dataset, m, d, a1, a3)
+}
+
+/// Sorted live `i` values of [`segment_over_only_an_outright_deleted_fragment`]
+/// plus `appended` rows from 20.
+fn live_values_after_the_outright_delete(appended: i32) -> Vec<i32> {
+    (0..12).chain(16..20 + appended).collect()
+}
+
+/// Whether committing `segments` as `staged` on `column` is decided to land
+/// only on `dataset`'s snapshot.
+async fn requires_unchanged_snapshot(
+    dataset: &Dataset,
+    column: &str,
+    segments: Vec<IndexMetadata>,
+) -> bool {
+    let segments = segments
+        .into_iter()
+        .map(crate::index::api::IntoIndexSegment::into_index_segment)
+        .collect::<crate::Result<Vec<_>>>()
+        .unwrap();
+    crate::index::lifecycle::decide_segment_commit(dataset, "staged", column, segments)
+        .await
+        .unwrap()
+        .1
+}
+
+/// FM has no batch remapper. D serves nothing: its only stored fragment was
+/// deleted outright. I over a3 removes it like a segment storing no fragment
+/// and keeps M: the decision needs no coverage proof, so it does not require
+/// an unchanged snapshot. The manifest cleanup is what this asserts; the
+/// scans afterwards only check that no row was lost.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_partial_commit_removes_a_segment_over_only_an_outright_deleted_fragment() {
+    let dir = TempStrDir::default();
+    let (mut dataset, m, d, a1, a3) =
+        segment_over_only_an_outright_deleted_fragment(dir.as_str(), "text", IndexType::Fm).await;
+    let version = dataset.manifest.version;
+    let incoming = staged_segment(&mut dataset, "text", IndexType::Fm, vec![a3]).await;
+    assert!(!requires_unchanged_snapshot(&dataset, "text", vec![incoming.clone()]).await);
+
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version + 1);
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([
+            (m.uuid, m.fragment_bitmap.clone()),
+            (incoming.uuid, incoming.fragment_bitmap.clone()),
+        ]),
+        "{} is removed",
+        d.uuid
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([a1, a3])
+    );
+    let mut unindexed = unindexed_fragment_ids(&dataset, "staged").await;
+    unindexed.sort_unstable();
+    assert_eq!(unindexed, vec![10, 11]);
+    let expected = live_values_after_the_outright_delete(0);
+    assert_eq!(values(&dataset, None, true).await, expected);
+    assert_eq!(
+        values(&dataset, Some("text = 'document'"), true).await,
+        expected
+    );
+}
+
+/// The same removal for BTree rests on no derived coverage either, so it does
+/// not require an unchanged snapshot and rebases past an append that commits
+/// between the build and the commit.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_removal_over_only_an_outright_deleted_fragment_rebases_past_a_concurrent_append() {
+    let dir = TempStrDir::default();
+    let (dataset, m, d, a1, a3) =
+        segment_over_only_an_outright_deleted_fragment(dir.as_str(), "i", IndexType::BTree).await;
+    let mut stale = dataset.clone();
+    let incoming = staged_segment(&mut stale, "i", IndexType::BTree, vec![a3]).await;
+    assert!(!requires_unchanged_snapshot(&stale, "i", vec![incoming.clone()]).await);
+    let latest = append_scalar_rows(dataset, 20, 4).await;
+
+    stale
+        .commit_existing_index_segments("staged", "i", vec![incoming.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, latest.manifest.version + 1);
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([
+            (m.uuid, m.fragment_bitmap.clone()),
+            (incoming.uuid, incoming.fragment_bitmap.clone()),
+        ]),
+        "{} is removed",
+        d.uuid
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([a1, a3])
+    );
+    assert_each_row_served_once(&dataset, "staged").await;
+    let expected = live_values_after_the_outright_delete(4);
+    assert_eq!(values(&dataset, None, true).await, expected);
+    for value in expected {
+        assert_eq!(
+            values(&dataset, Some(&format!("i = {value}")), true).await,
+            vec![value]
+        );
+    }
+}
+
+/// FTS segments A over {0, 2} and B over {1, 3} as in
+/// [`mixed_destination_fixture`], and D over an appended fragment whose rows
+/// are then all deleted: D serves nothing. C over {2, 10, 11} replaces A,
+/// which rests on the coverage proof. D's unreadable format marker does not
+/// leave that proof unproven: D takes no part in it, so the commit lands and
+/// removes A and D.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_segment_serving_nothing_does_not_leave_a_replacement_unproven() {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let (dataset, [a, b]) = mixed_destination_fixture(path, "text", IndexType::Inverted).await;
+    let (mut dataset, deleted) = append_live_fragment(dataset, 16).await;
+    let d = staged_fts_segment(&mut dataset, "text", vec![deleted]).await;
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![d.clone()])
+        .await
+        .unwrap();
+    dataset.delete("i >= 16").await.unwrap();
+    assert!(!fragment_ids(&dataset).contains(&deleted));
+    let incoming = staged_fts_segment(&mut dataset, "text", vec![2, 10, 11]).await;
+    let version = dataset.manifest.version;
+    drop(dataset);
+
+    let (mut dataset, failing) = open_with_failing_reads(path, fts_marker_suffix(d.uuid)).await;
+    failing.store(true, Ordering::SeqCst);
+    assert!(requires_unchanged_snapshot(&dataset, "text", vec![incoming.clone()]).await);
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![incoming.clone()])
+        .await
+        .unwrap();
+    failing.store(false, Ordering::SeqCst);
+
+    let dataset = fresh_session(path).await;
+    assert_eq!(dataset.manifest.version, version + 1);
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([b, incoming.uuid]),
+        "{a} and {} are removed",
+        d.uuid
+    );
+    assert_eq!(
+        derived_union(&dataset, "staged").await,
+        RoaringBitmap::from_iter([2u32, 3, 10, 11])
+    );
+}
+
+/// Fragments {0, 1} of 64 rows each, then {0} partitioned into {10, 11}, and
+/// a legacy IVF_PQ segment H committed over {1, 10, 11}. This build has no
+/// batch remapper for H's file. A second partition retires every fragment H
+/// covers, so the rewrite withdraws H's coverage of them in the same commit.
+/// A vector segment over a fragment appended afterwards then commits beside
+/// H: H stores nothing, so the commit removes it.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_disjoint_vector_commit_beside_a_legacy_segment_after_a_rewrite() {
+    let dir = TempStrDir::default();
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .col("w", lance_datagen::array::step::<Int32Type>())
+        .into_dataset(
+            dir.as_str(),
+            FragmentCount::from(2),
+            FragmentRowCount::from(64),
+        )
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 40).await;
+    let mut dataset = commit_stable_partition(dataset, &[0], 10).await;
+    let mut legacy_params = crate::index::vector::VectorIndexParams::ivf_pq(
+        1,
+        4,
+        2,
+        lance_linalg::distance::DistanceType::L2,
+        10,
+    );
+    legacy_params.version(crate::index::vector::IndexFileVersion::Legacy);
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("staged".to_string()),
+            &legacy_params,
+            true,
+        )
+        .await
+        .unwrap();
+    let h = stored_segment(&dataset, "staged").await;
+    assert_eq!(
+        h.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([1u32, 10, 11]))
+    );
+
+    let dataset = commit_stable_partition(dataset, &[1, 10, 11], 30).await;
+    assert_eq!(
+        stored_bitmaps(&dataset, "staged").await,
+        std::collections::BTreeMap::from([(h.uuid, Some(RoaringBitmap::new()))])
+    );
+    let mut dataset = append_vector_rows(dataset, 128, 64).await;
+    let appended = *fragment_ids(&dataset).iter().max().unwrap();
+    let centroids = arrow_array::FixedSizeListArray::try_new_from_values(
+        arrow_array::Float32Array::from(vec![0.0f32; 4]),
+        4,
+    )
+    .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        lance_index::vector::ivf::IvfBuildParams::try_with_centroids(1, Arc::new(centroids))
+            .unwrap(),
+    );
+    let incoming = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+        .name("staged".to_string())
+        .fragments(vec![appended])
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    dataset
+        .commit_existing_index_segments("staged", "vector", vec![incoming.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([incoming.uuid])
+    );
+}
+
+/// A staged IVF_FLAT segment of `staged` over `fragments`, on one fixed
+/// centroid so every such segment shares the query contract.
+async fn staged_vector_segment(dataset: &mut Dataset, fragments: Vec<u32>) -> IndexMetadata {
+    let centroids = arrow_array::FixedSizeListArray::try_new_from_values(
+        arrow_array::Float32Array::from(vec![0.0f32; 4]),
+        4,
+    )
+    .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        lance_index::vector::ivf::IvfBuildParams::try_with_centroids(1, Arc::new(centroids))
+            .unwrap(),
+    );
+    CreateIndexBuilder::new(dataset, &["vector"], IndexType::Vector, &params)
+        .name("staged".to_string())
+        .fragments(fragments)
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap()
+}
+
+/// A vector segment P over {0}, then {0} stable-partitioned. P stores only
+/// the retired 0, so a partial commit of Q over {1} keeps it whenever its
+/// coverage cannot be ruled out, and then has to check P against Q. With P's
+/// index file unreadable that check cannot run: the commit fails with the
+/// read failure itself and commits nothing. Once the store answers, the same
+/// commit keeps P beside Q.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn a_partial_vector_commit_beside_an_unreadable_retained_segment_commits_nothing() {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let mut dataset = vector_fixture(path).await;
+    let p = staged_vector_segment(&mut dataset, vec![0]).await;
+    dataset
+        .commit_existing_index_segments("staged", "vector", vec![p.clone()])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0], 10).await;
+    assert!(!fragment_ids(&dataset).contains(&0));
+    let q = staged_vector_segment(&mut dataset, vec![1]).await;
+    let version = dataset.manifest.version;
+    drop(dataset);
+    let before = stored_bitmaps(&fresh_session(path).await, "staged").await;
+
+    let (mut dataset, failing) =
+        open_with_failing_reads(path, format!("{}/{}", p.uuid, lance_index::INDEX_FILE_NAME)).await;
+    failing.store(true, Ordering::SeqCst);
+    let result = dataset
+        .commit_existing_index_segments("staged", "vector", vec![q.clone()])
+        .await;
+    failing.store(false, Ordering::SeqCst);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, crate::Error::IO { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        format!("{error:?}").contains("injected transient read failure"),
+        "{error:?}"
+    );
+    assert_eq!(dataset.manifest.version, version);
+    let untouched = fresh_session(path).await;
+    assert_eq!(untouched.manifest.version, version);
+    assert_eq!(stored_bitmaps(&untouched, "staged").await, before);
+
+    dataset
+        .commit_existing_index_segments("staged", "vector", vec![q.clone()])
+        .await
+        .unwrap();
+    let dataset = fresh_session(path).await;
+    assert_eq!(dataset.manifest.version, version + 1);
+    assert_eq!(
+        stored_uuids(&dataset, "staged").await,
+        HashSet::from([p.uuid, q.uuid])
     );
 }

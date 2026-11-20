@@ -21,15 +21,18 @@ use lance_index::{
     metrics::NoOpMetricsCollector, optimize::OptimizeOptions,
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::io::commit::CommitConfig;
 use roaring::RoaringBitmap;
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::dataset::ManifestWriteConfig;
 use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
 use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use crate::index::append;
 use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse;
+use crate::index::frag_reuse::{CoverageExclusion, MissingCoverageReason};
 use crate::index::frag_reuse_reader;
 use crate::index::frag_reuse_with_stable_row_ids::{
     has_frag_reuse_with_stable_row_ids, is_hidden_by_frag_reuse,
@@ -55,6 +58,7 @@ use crate::index::statistics::{
 };
 use crate::index::vector;
 use crate::index::vector::details::needs_vector_details_inference;
+use crate::io::commit::{ConcurrentVersion, check_versions_since_read, commit_attempt_budget};
 use crate::session::index_caches::{
     DerivedIndexListingKey, QueryIndexListing, QueryIndexListingKey,
 };
@@ -366,6 +370,809 @@ fn filter_unusable(indices: Arc<Vec<IndexMetadata>>) -> Arc<Vec<IndexMetadata>> 
             .cloned()
             .collect(),
     )
+}
+
+/// A same-name segment a partial commit on a tagged history may keep whole
+/// although none of its stored fragments is live: its stored bitmap is
+/// provenance the reader still translates to the live fragments rewrites
+/// produced. One whose provenance meets the incoming segments' is not a
+/// candidate: kept whole, it would contribute those source rows a second time.
+/// Nor is one none of whose stored fragments the history names (see
+/// `CompositionPlanner::traceable_fragments`): they were deleted outright, so
+/// it is removed like a segment that stores no fragment. That last test needs
+/// the mapping, so the caller makes it on the segments passing this one.
+fn is_historical_candidate(
+    idx: &IndexMetadata,
+    live: &RoaringBitmap,
+    incoming_fragments: &RoaringBitmap,
+) -> bool {
+    idx.fragment_bitmap.as_ref().is_some_and(|stored| {
+        !stored.is_empty() && stored.is_disjoint(live) && stored.is_disjoint(incoming_fragments)
+    })
+}
+
+/// A retained segment outlives the commit, so its declaration has to match
+/// what is being written: `IndexDescriptionImpl::try_new` requires the same
+/// keyed and carried fields across the segments of one logical index. Nothing
+/// before this catches a disagreement, because `keyed_fields` is the prefix
+/// left after the carried ones -- a segment carrying columns keys on exactly
+/// what a plain one keys on, and both pass the keyed-field guard.
+fn check_retained_declaration(
+    index_name: &str,
+    expected: &IndexMetadata,
+    idx: &IndexMetadata,
+) -> Result<()> {
+    if idx.declares_same_fields(expected) {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
+         but retained segment {} declares fields {:?} and covering_fields {:?}; \
+         a logical index cannot mix declarations - rebuild every segment in one commit",
+        index_name,
+        expected.fields,
+        expected.covering_fields,
+        idx.uuid,
+        idx.fields,
+        idx.covering_fields
+    )))
+}
+
+fn covered_by(coverage: &[RoaringBitmap]) -> RoaringBitmap {
+    coverage
+        .iter()
+        .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap)
+}
+
+/// Which removed segments the incoming segments supply again.
+struct Resupply<'a> {
+    /// Removed segments whose stored fragments are not supplied again.
+    unresupplied: Vec<&'a IndexMetadata>,
+    /// At least one removal was supplied again only by the exception for a
+    /// type without a batch remapper, which rests on this snapshot's
+    /// classification.
+    by_exception: bool,
+}
+
+/// Decide, per removed segment, whether the incoming segments supply its
+/// stored fragments again.
+///
+/// A removed segment is supplied again when incoming segments taking part in
+/// coverage store all its fragments: each destination it contributed to
+/// resolves through them instead. As an exception, a removed segment the
+/// reader leaves out because its type has no batch remapper derives nothing
+/// in this build, so it is also supplied again when incoming segments that
+/// take part or are left out for that same reason store all its fragments.
+/// The exception never applies to a removed segment that takes part in
+/// coverage, nor to any other reason (segment-specific, unreadable marker,
+/// uninterpretable history).
+///
+/// Only the stored fragments `traceable` keeps count: one that is neither live
+/// nor named by the history was deleted outright, no reader translates it, so
+/// it carries no coverage to supply again.
+fn unresupplied_removals<'a>(
+    removed: &'a [IndexMetadata],
+    incoming: &[IndexMetadata],
+    exclusion: impl Fn(&IndexMetadata) -> Option<CoverageExclusion>,
+    traceable: impl Fn(&RoaringBitmap) -> RoaringBitmap,
+) -> Resupply<'a> {
+    let stored_by = |admit: &dyn Fn(Option<CoverageExclusion>) -> bool| {
+        incoming
+            .iter()
+            .filter(|idx| admit(exclusion(idx)))
+            .filter_map(|idx| idx.fragment_bitmap.as_ref())
+            .fold(RoaringBitmap::new(), |supplied, stored| supplied | stored)
+    };
+    let by_members = stored_by(&|reason| reason.is_none());
+    let by_members_or_no_remapper =
+        stored_by(&|reason| matches!(reason, None | Some(CoverageExclusion::NoBatchRemapper)));
+    let mut resupply = Resupply {
+        unresupplied: Vec::new(),
+        by_exception: false,
+    };
+    for idx in removed {
+        let Some(stored) = idx.fragment_bitmap.as_ref() else {
+            resupply.unresupplied.push(idx);
+            continue;
+        };
+        let stored = traceable(stored);
+        if stored.is_subset(&by_members) {
+            continue;
+        }
+        if exclusion(idx) == Some(CoverageExclusion::NoBatchRemapper)
+            && stored.is_subset(&by_members_or_no_remapper)
+        {
+            resupply.by_exception = true;
+            continue;
+        }
+        resupply.unresupplied.push(idx);
+    }
+    resupply
+}
+
+/// Every decision of a commit that has to land on the version it was decided
+/// on lost that version to another writer; `source` is the last loss.
+#[derive(Debug)]
+struct NotAppliedAtReadVersion {
+    index_name: String,
+    read_version: u64,
+    attempts: u32,
+    source: Error,
+}
+
+impl std::fmt::Display for NotAppliedAtReadVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CreateIndex: the segments of '{}' this commit keeps and removes were chosen from \
+             the coverage derived at the version they were to land on, and another commit \
+             landed first each of {} times; the last decision, made at version {}, could not \
+             be applied there because a newer version exists; commit the segments again so the \
+             choice is made against the latest version: {}",
+            self.index_name, self.attempts, self.read_version, self.source
+        )
+    }
+}
+
+impl std::error::Error for NotAppliedAtReadVersion {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Whether a commit that has to land on the version it was decided on decides
+/// again on the latest version after its conditional attempt `attempt`
+/// (counted from 1) of `budget` ended in `outcome`: only when another writer
+/// committed first and an attempt is left. A failed write, an unknown outcome
+/// or any other result is returned as it is.
+fn decides_again(outcome: &Result<()>, attempt: u32, budget: u32) -> bool {
+    attempt < budget && matches!(outcome, Err(error) if ConcurrentVersion::caused(error))
+}
+
+/// This build refuses to open a segment a commit would retain, so its
+/// compatibility with the incoming segments cannot be checked.
+#[derive(Debug)]
+struct RetainedSegmentUnopenable {
+    index_name: String,
+    segment: Uuid,
+    source: Error,
+}
+
+impl std::fmt::Display for RetainedSegmentUnopenable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CreateIndex: this build cannot open segment {} of index '{}', which this commit \
+             would retain, to check that it is compatible with the incoming segments; nothing \
+             was committed. Replacing every segment of the index over the current fragments in \
+             one commit does not retain it: {}",
+            self.segment, self.index_name, self.source
+        )
+    }
+}
+
+impl std::error::Error for RetainedSegmentUnopenable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The error for retained segment `segment` of `index_name` failing to open
+/// with `error`. When classifying it already failed to read (`read_error`)
+/// and the open was refused as not supported, that read failure is what keeps
+/// it closed and is returned unchanged; any other refusal by this build stays
+/// `NotSupported` and names the segment; anything else is returned unchanged.
+fn retained_segment_unopenable(
+    index_name: &str,
+    segment: Uuid,
+    error: Error,
+    read_error: Option<Error>,
+) -> Error {
+    let refused = matches!(error.find_root(), Error::NotSupported { .. });
+    if let Some(read_error) = read_error.filter(|_| refused) {
+        log::warn!(
+            "CreateIndex: nothing was committed for '{index_name}': retained segment {segment} \
+             could not be opened to check its compatibility ({error}) because a read failed"
+        );
+        return read_error;
+    }
+    if refused {
+        return Error::not_supported_source(Box::new(RetainedSegmentUnopenable {
+            index_name: index_name.to_owned(),
+            segment,
+            source: error,
+        }));
+    }
+    log::warn!(
+        "CreateIndex: nothing was committed for '{index_name}': retained segment {segment} \
+         could not be opened to check its compatibility"
+    );
+    error
+}
+
+/// What a partial commit on a tagged history does with the segments whose
+/// fate depends on derived coverage.
+struct PartialCommitDecision {
+    /// Historical candidates that stay.
+    retained: HashSet<Uuid>,
+    /// Historical candidates the published composition derives nothing for.
+    dropped: Vec<IndexMetadata>,
+    /// The decision rests on coverage or classification derived from this
+    /// snapshot: a removed segment's traceable provenance is not wholly
+    /// supplied again by incoming coverage members, or a historical candidate
+    /// was dropped. Such a commit must land on the snapshot it was decided on.
+    requires_unchanged_snapshot: bool,
+}
+
+/// Whether a refusal over unproven coverage is reported as the failed read:
+/// only when every unproven segment (`read_failed`, one per segment, at least
+/// one) is unproven because its read failed: after the read recovers the
+/// decision is made again.
+fn refusal_is_the_read_error(read_failed: impl IntoIterator<Item = bool>) -> bool {
+    let mut any = false;
+    for failed in read_failed {
+        if !failed {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Decide a partial commit on a tagged history against the composition it
+/// would publish, and refuse one that would lose coverage.
+///
+/// Segments are kept or removed whole; a stored bitmap is never narrowed. A
+/// historical candidate stays when the published composition (the kept
+/// siblings, every candidate and the incoming segments, under the reader's
+/// membership rule) still derives coverage for it, so an incoming segment
+/// completing a destination together with it keeps it. The commit is then
+/// refused when a live fragment the logical index covers now would be left
+/// uncovered by the published composition.
+///
+/// A segment the reader leaves out of coverage (no batch remapper, details
+/// it cannot interpret, an unreadable format marker, a segment this build
+/// cannot open) makes every sibling's derived coverage unproven. Then every
+/// candidate stays, and a removal whose provenance the incoming segments do
+/// not wholly supply again is refused: neither is decided from coverage
+/// nobody could derive. A removed segment left out because its type has no
+/// batch remapper may be supplied again by incoming segments left out for the
+/// same reason (see [`unresupplied_removals`]); a commit relying on that lands
+/// only on the snapshot it was decided on. The refusal is the failed read
+/// itself only when every unproven segment is unproven because a read failed,
+/// since after the read recovers the decision is made again; otherwise it is
+/// invalid input naming each segment's reason, read failures included.
+///
+/// A removed segment that stores a bitmap none of whose fragments the history
+/// traces serves nothing: it is removed, but neither classified nor counted in
+/// any coverage, so it never leaves the decision unproven. Without candidates
+/// and other removals nothing is classified, and when no removal stores a
+/// fragment the mapping is not opened at all.
+#[allow(clippy::too_many_arguments)]
+async fn decide_partial_composition(
+    dataset: &Dataset,
+    history: &mut frag_reuse::TaggedHistory,
+    index_name: &str,
+    existing: &[IndexMetadata],
+    incoming: &[IndexMetadata],
+    removed: &[IndexMetadata],
+    candidates: &HashSet<Uuid>,
+    incoming_fragments: &RoaringBitmap,
+) -> Result<PartialCommitDecision> {
+    let decided_without_coverage = |requires_unchanged_snapshot| PartialCommitDecision {
+        retained: HashSet::new(),
+        dropped: Vec::new(),
+        requires_unchanged_snapshot,
+    };
+    // Removing only segments that store no fragment depends on no coverage
+    // and needs no mapping; a segment without a stored bitmap is not one.
+    let removes_no_provenance = removed.iter().all(|idx| {
+        idx.fragment_bitmap
+            .as_ref()
+            .is_some_and(RoaringBitmap::is_empty)
+    });
+    if candidates.is_empty() && removes_no_provenance {
+        return Ok(decided_without_coverage(false));
+    }
+    let planner = history.planner(dataset).await?;
+    // A removed segment none of whose stored fragments the history traces
+    // serves nothing: it takes no part in the coverage decision, so its own
+    // exclusion cannot leave the rest unproven. It is still removed.
+    let serves_nothing: HashSet<Uuid> = removed
+        .iter()
+        .filter(|idx| {
+            idx.fragment_bitmap
+                .as_ref()
+                .is_some_and(|stored| planner.traceable_fragments(stored).is_empty())
+        })
+        .map(|idx| idx.uuid)
+        .collect();
+    let relevant = |segments: &[IndexMetadata]| -> Vec<IndexMetadata> {
+        segments
+            .iter()
+            .filter(|idx| !serves_nothing.contains(&idx.uuid))
+            .cloned()
+            .collect()
+    };
+    let removed = relevant(removed);
+    let existing = relevant(existing);
+    if candidates.is_empty() && removed.is_empty() {
+        return Ok(decided_without_coverage(false));
+    }
+
+    let group: Vec<&IndexMetadata> = existing.iter().chain(incoming.iter()).collect();
+    planner.classify(dataset, &group).await;
+    let Resupply {
+        unresupplied,
+        by_exception,
+    } = unresupplied_removals(
+        &removed,
+        incoming,
+        |idx| planner.coverage_exclusion(idx),
+        |stored| planner.traceable_fragments(stored),
+    );
+    if candidates.is_empty() && unresupplied.is_empty() {
+        return Ok(decided_without_coverage(by_exception));
+    }
+    let unproven: Vec<(Uuid, MissingCoverageReason)> = group
+        .iter()
+        .filter_map(|idx| planner.exclusion(idx).map(|reason| (idx.uuid, reason)))
+        .collect();
+    if !unproven.is_empty() {
+        if !unresupplied.is_empty() {
+            let mut read_errors: HashMap<Uuid, Error> = unproven
+                .iter()
+                .filter_map(|(uuid, _)| planner.take_read_error(uuid).map(|error| (*uuid, error)))
+                .collect();
+            // A failed read says nothing about the request: when it is the only
+            // obstacle it is reported as is, keeping its own classification,
+            // and after the read recovers the decision is made again.
+            if refusal_is_the_read_error(
+                unproven
+                    .iter()
+                    .map(|(uuid, _)| read_errors.contains_key(uuid)),
+            ) && let Some(error) = unproven
+                .iter()
+                .find_map(|(uuid, _)| read_errors.remove(uuid))
+            {
+                log::warn!(
+                    "CreateIndex: nothing was committed for '{}': removing segments {:?} \
+                     depends on coverage a failed read left unknown",
+                    index_name,
+                    unresupplied.iter().map(|idx| idx.uuid).collect::<Vec<_>>(),
+                );
+                return Err(error);
+            }
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: cannot establish that committing these segments for '{}' keeps \
+                 the index's coverage: coverage cannot be established for {}, so removing \
+                 segments {:?}, whose fragments the incoming segments that can stand in for \
+                 them do not all store, could lose coverage nobody can see. Nothing was \
+                 committed; build the incoming segments over fragments that do not overlap \
+                 the segments being removed, or replace every segment of the index in one \
+                 commit",
+                index_name,
+                unproven
+                    .iter()
+                    .map(|(uuid, reason)| match read_errors.get(uuid) {
+                        Some(error) => format!("segment {uuid} (read failed: {error})"),
+                        None => format!("segment {uuid} ({reason})"),
+                    })
+                    .join(", "),
+                unresupplied.iter().map(|idx| idx.uuid).collect::<Vec<_>>(),
+            )));
+        }
+        return Ok(PartialCommitDecision {
+            retained: candidates.clone(),
+            dropped: Vec::new(),
+            requires_unchanged_snapshot: by_exception,
+        });
+    }
+
+    let removed_uuids: HashSet<Uuid> = removed.iter().map(|idx| idx.uuid).collect();
+    let kept: Vec<&IndexMetadata> = existing
+        .iter()
+        .filter(|idx| !removed_uuids.contains(&idx.uuid))
+        .chain(incoming.iter())
+        .collect();
+    let mut retained = HashSet::new();
+    let mut dropped = Vec::new();
+    for (idx, coverage) in kept.iter().zip(planner.coverage(&kept)) {
+        if !candidates.contains(&idx.uuid) {
+            continue;
+        }
+        if coverage.is_empty() {
+            dropped.push((*idx).clone());
+        } else {
+            retained.insert(idx.uuid);
+        }
+    }
+
+    let published: Vec<&IndexMetadata> = kept
+        .iter()
+        .copied()
+        .filter(|idx| !dropped.iter().any(|gone| gone.uuid == idx.uuid))
+        .collect();
+    let existing_refs: Vec<&IndexMetadata> = existing.iter().collect();
+    let before_by_segment = planner.coverage(&existing_refs);
+    let lost = covered_by(&before_by_segment) - covered_by(&planner.coverage(&published));
+    if !lost.is_empty() {
+        let live = dataset.fragment_bitmap.as_ref();
+        let gone = |uuid: &Uuid| {
+            removed_uuids.contains(uuid) || dropped.iter().any(|gone| gone.uuid == *uuid)
+        };
+        let culprits = existing
+            .iter()
+            .zip(&before_by_segment)
+            .filter(|(idx, coverage)| gone(&idx.uuid) && !coverage.is_disjoint(&lost))
+            .map(|(idx, _)| {
+                let overlap = idx
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|stored| stored & live & incoming_fragments)
+                    .unwrap_or_default();
+                format!(
+                    "segment {} (live fragments the incoming segments overlap: {:?})",
+                    idx.uuid,
+                    overlap.iter().collect::<Vec<_>>()
+                )
+            })
+            .join(", ");
+        return Err(Error::invalid_input(format!(
+            "CreateIndex: committing these segments for '{}' would remove {} and leave live \
+             fragments {:?} without the index coverage they have now. Nothing was committed; \
+             build the incoming segments over fragments that do not overlap those segments' \
+             live fragments, or also over every fragment listed",
+            index_name,
+            culprits,
+            lost.iter().collect::<Vec<_>>()
+        )));
+    }
+
+    Ok(PartialCommitDecision {
+        retained,
+        requires_unchanged_snapshot: by_exception
+            || !unresupplied.is_empty()
+            || !dropped.is_empty(),
+        dropped,
+    })
+}
+
+/// Decides, on `dataset`'s snapshot, the CreateIndex transaction committing
+/// `segments` as `index_name` on `column`, and whether it has to land on that
+/// snapshot unchanged: true when which segments stay rests on coverage
+/// derived from it, which the commit loop's rebase does not derive again.
+/// Every check runs on this snapshot, starting from the segments as their
+/// builds produced them.
+pub(in crate::index) async fn decide_segment_commit(
+    dataset: &Dataset,
+    index_name: &str,
+    column: &str,
+    segments: Vec<IndexSegment>,
+) -> Result<(Transaction, bool)> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Err(Error::index(format!(
+            "CreateIndex: column '{column}' does not exist"
+        )));
+    };
+
+    let dataset_fragments = dataset.fragment_bitmap.as_ref().clone();
+    if segments.first().is_some_and(|segment| {
+        segment
+            .index_details()
+            .type_url
+            .ends_with("NGramIndexDetails")
+    }) {
+        let has_retired_coverage = segments
+            .iter()
+            .any(|segment| !(segment.fragment_bitmap() - &dataset_fragments).is_empty());
+        let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+        let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
+            segments.iter().any(|segment| {
+                append::fragment_reuse_affects_segment(
+                    frag_reuse_index,
+                    segment.fragment_bitmap(),
+                    segment.dataset_version(),
+                )
+            })
+        });
+        if has_retired_coverage || requires_rebuild {
+            return Err(Error::invalid_input(
+                "CreateIndex: NGram segments built before compaction must be rebuilt or merged \
+                 with merge_existing_index_segments before commit"
+                    .to_string(),
+            ));
+        }
+    }
+    // On a tagged table the segments are first validated against this
+    // snapshot (`replay_staged_segments`): a rewrite since their build
+    // keeps their provenance translating, an in-place column rewrite
+    // withdraws the affected coverage, a rewrite they cannot be carried
+    // across says to rebuild. The commit then reads from this snapshot,
+    // and the commit loop carries the segments across anything newer
+    // through the same rules.
+    let segments = replay_staged_segments(
+        dataset,
+        segments
+            .into_iter()
+            .map(|segment| segment.into_metadata(index_name))
+            .collect(),
+    )
+    .await?
+    .into_iter()
+    .map(IntoIndexSegment::into_index_segment)
+    .collect::<Result<Vec<_>>>()?;
+    let new_indices =
+        build_index_metadata_from_segments(dataset, index_name, field.id, segments).await?;
+    validate_segment_metadata(index_name, &new_indices)?;
+    validate_segment_index_details(index_name, &new_indices)?;
+
+    let incoming_type_url = new_indices[0]
+        .index_details
+        .as_ref()
+        .map(|details| details.type_url.clone());
+    let mut incoming_fragments = RoaringBitmap::new();
+    for segment in &new_indices {
+        if let Some(fragment_bitmap) = &segment.fragment_bitmap {
+            incoming_fragments |= fragment_bitmap.clone();
+        }
+    }
+
+    let existing_named_indices = load_all_indices_by_name(dataset, index_name).await?;
+    if existing_named_indices.iter().any(|idx| {
+        // Field order is part of a plugin scope's identity. Covered
+        // single-column indices still compare only their keyed prefix.
+        idx.keyed_fields() != new_indices[0].keyed_fields()
+    }) {
+        return Err(Error::index(format!(
+            "Index name '{index_name}' already exists with different fields, \
+            please specify a different name"
+        )));
+    }
+    let existing_different_type_url = existing_named_indices.iter().find_map(|idx| {
+        // Legacy metadata may omit index details. Its type cannot be proven
+        // compatible, so only a full replacement is safe.
+        let Some(existing_details) = idx.index_details.as_ref() else {
+            return Some("<unknown>".to_owned());
+        };
+        let existing_type_url = existing_details.type_url.as_str();
+        (Some(existing_type_url) != incoming_type_url.as_deref())
+            .then(|| existing_type_url.to_owned())
+    });
+    let missing_fragments = &dataset_fragments - &incoming_fragments;
+    if let Some(existing_type_url) = &existing_different_type_url
+        && !missing_fragments.is_empty()
+    {
+        return Err(Error::invalid_input(format!(
+            "CreateIndex: cannot change index '{}' from type '{}' to type '{}' with partial fragment coverage; incoming segments are missing current fragments {:?}",
+            index_name,
+            existing_type_url,
+            incoming_type_url.as_deref().unwrap_or("<missing>"),
+            missing_fragments.iter().collect::<Vec<_>>()
+        )));
+    }
+
+    let is_index_type_change = existing_different_type_url.is_some();
+    // A partial commit on a tagged history is decided on the coverage the
+    // reader derives for the composition it publishes. A replacement of
+    // every live fragment, or a type change, replaces every segment.
+    let mut history = if is_index_type_change || missing_fragments.is_empty() {
+        None
+    } else {
+        frag_reuse::TaggedHistory::find(dataset).await?
+    };
+    let is_tagged_partial = history.is_some();
+    let mut historical_candidates: HashSet<Uuid> = HashSet::new();
+    if let Some(history) = history.as_mut() {
+        let zero_live: Vec<&IndexMetadata> = existing_named_indices
+            .iter()
+            .filter(|idx| is_historical_candidate(idx, &dataset_fragments, &incoming_fragments))
+            .collect();
+        if !zero_live.is_empty() {
+            let planner = history.planner(dataset).await?;
+            historical_candidates = zero_live
+                .into_iter()
+                .filter(|idx| {
+                    idx.fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|stored| !planner.traceable_fragments(stored).is_empty())
+                })
+                .map(|idx| idx.uuid)
+                .collect();
+        }
+    }
+    let existing_snapshot = existing_named_indices.clone();
+    // What a retained sibling has to agree with. Every incoming segment
+    // already declares the same fields: `build_index_metadata_from_segments`
+    // compares them against each other before this point.
+    let expected = &new_indices[0];
+    let mut removed_indices = existing_named_indices
+        .into_iter()
+        .map(|idx| -> Result<Option<IndexMetadata>> {
+            // A logical index cannot combine segment types. Full current-fragment
+            // coverage was verified above, so a type change replaces every segment.
+            if is_index_type_change {
+                return Ok(Some(idx));
+            }
+
+            let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
+            else {
+                if incoming_fragments != dataset_fragments {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
+                        idx.uuid, index_name
+                    )));
+                }
+                return Ok(Some(idx));
+            };
+
+            // A zero-fragment segment can be used to create an index while
+            // deferring the actual build. Such a segment is disjoint from every
+            // other segment but should still be removed. So is a segment whose
+            // fragments were all retired, unless it is a historical candidate:
+            // whether that one stays is decided on the published composition
+            // below.
+            if existing_fragments.is_empty() {
+                if historical_candidates.contains(&idx.uuid) {
+                    return Ok(None);
+                }
+                return Ok(Some(idx));
+            }
+
+            // On a tagged history the stored bitmap is provenance: a segment
+            // sharing a retired source with the incoming segments would
+            // contribute those rows a second time, so it is replaced.
+            let shares_provenance = is_tagged_partial
+                && idx
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|stored| !stored.is_disjoint(&incoming_fragments));
+            if existing_fragments.is_disjoint(&incoming_fragments) && !shares_provenance {
+                check_retained_declaration(index_name, expected, &idx)?;
+                return Ok(None);
+            }
+
+            // Only the shared provenance sent a segment with disjoint live
+            // fragments here.
+            if existing_fragments.is_disjoint(&incoming_fragments) {
+                let shared = idx
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|stored| stored & &incoming_fragments)
+                    .unwrap_or_default();
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: existing segment {} for '{}' shares already-rewritten \
+                     source fragments {:?} with the incoming segments; keeping both would \
+                     serve those rows twice. Nothing was committed; the incoming segments \
+                     must also cover its live fragments {:?}, or not include the shared \
+                     sources",
+                    idx.uuid,
+                    index_name,
+                    shared.iter().collect::<Vec<_>>(),
+                    existing_fragments.iter().collect::<Vec<_>>()
+                )));
+            }
+            let uncovered = existing_fragments - &incoming_fragments;
+            if !uncovered.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: incoming segments for '{}' would orphan fragments {:?} from existing segment {}",
+                    index_name,
+                    uncovered.iter().collect::<Vec<_>>(),
+                    idx.uuid
+                )));
+            }
+
+            Ok(Some(idx))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut requires_unchanged_snapshot = false;
+    if let Some(history) = history.as_mut() {
+        let decision = decide_partial_composition(
+            dataset,
+            history,
+            index_name,
+            &existing_snapshot,
+            &new_indices,
+            &removed_indices,
+            &historical_candidates,
+            &incoming_fragments,
+        )
+        .await?;
+        for idx in existing_snapshot
+            .iter()
+            .filter(|idx| decision.retained.contains(&idx.uuid))
+        {
+            check_retained_declaration(index_name, expected, idx)?;
+        }
+        removed_indices.extend(decision.dropped);
+        requires_unchanged_snapshot = decision.requires_unchanged_snapshot;
+    }
+    // Segments that stay together must be compatible under the plugin's
+    // rules (for example identical hash parameters). Segments this commit
+    // removes are not consulted, so a full rebuild may change parameters.
+    let retained_indices: Vec<IndexMetadata> = existing_snapshot
+        .into_iter()
+        .filter(|idx| {
+            !removed_indices
+                .iter()
+                .any(|removed| removed.uuid == idx.uuid)
+        })
+        .collect();
+    validate_segment_params_compatible(&retained_indices, &new_indices)?;
+
+    let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
+    if segment_has_inverted_details(&new_indices[0]) {
+        // Apply the merge/query semantic contract only to segments that will
+        // coexist, so a full rebuild can change the analyzer settings.
+        let segments = coexisting_indices.clone().cloned().collect::<Vec<_>>();
+        scalar::inverted::load_segment_details(dataset, column, &segments).await?;
+    }
+
+    // The query planner ranks coexisting vector segments under one contract.
+    // Validate after replacement selection so a full rebuild may change it.
+    let vector_segment_count = coexisting_indices
+        .clone()
+        .filter(|segment| segment_has_vector_details(segment))
+        .count();
+    if vector_segment_count > 1 {
+        // Only the query contract is compared, never a row: a staged
+        // segment is not in the manifest, so it opens on an identity plan,
+        // and a retained one opens for maintenance so that a segment the
+        // tagged reader excludes from the listing still takes part.
+        let mut vector_indices = Vec::with_capacity(vector_segment_count);
+        for segment in coexisting_indices {
+            let staged_plan = new_indices
+                .iter()
+                .any(|staged| staged.uuid == segment.uuid)
+                .then_some(&frag_reuse::SegmentRemappingPlan::Identity);
+            let opened = dataset
+                .open_vector_index_from_metadata_with_plan(
+                    column,
+                    segment,
+                    staged_plan,
+                    frag_reuse::OpenPurpose::Maintenance,
+                    &NoOpMetricsCollector,
+                )
+                .await;
+            // A retained segment that cannot be checked is neither skipped
+            // nor removed: the commit is refused.
+            let index = match opened {
+                Ok(index) => index,
+                Err(error) if staged_plan.is_none() => {
+                    let read_error = history
+                        .as_mut()
+                        .and_then(|history| history.take_read_error(&segment.uuid));
+                    return Err(retained_segment_unopenable(
+                        index_name,
+                        segment.uuid,
+                        error,
+                        read_error,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            vector_indices.push(index);
+        }
+        vector::ivf::validate_vector_query_compatibility(
+            &vector_indices,
+            &format!("CreateIndex: index '{index_name}'"),
+        )
+        .map_err(|error| Error::invalid_input(error.to_string()))?;
+    }
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        },
+        None,
+    );
+
+    Ok((transaction, requires_unchanged_snapshot))
 }
 
 #[async_trait]
@@ -852,260 +1659,92 @@ impl DatasetIndexExt for Dataset {
         Ok(merged_segment)
     }
 
+    /// A decision that depends on derived coverage is made again on the latest
+    /// version when another commit lands first, a bounded number of times and
+    /// without waiting between attempts, so it improves progress but does not
+    /// guarantee it under continuous writes. A decision is made again only
+    /// when the ordinary conflict rules accept the intervening commits. On
+    /// error the dataset is left at
+    /// the version it was called with.
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()> {
-        let Some(field) = self.schema().field(column) else {
-            return Err(Error::index(format!(
-                "CreateIndex: column '{column}' does not exist"
-            )));
-        };
-
         let segments = segments
             .into_iter()
             .map(IntoIndexSegment::into_index_segment)
             .collect::<Result<Vec<_>>>()?;
-        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
-        if segments.first().is_some_and(|segment| {
-            segment
-                .index_details()
-                .type_url
-                .ends_with("NGramIndexDetails")
-        }) {
-            let has_retired_coverage = segments
-                .iter()
-                .any(|segment| !(segment.fragment_bitmap() - &dataset_fragments).is_empty());
-            let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-            let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
-                segments.iter().any(|segment| {
-                    append::fragment_reuse_affects_segment(
-                        frag_reuse_index,
-                        segment.fragment_bitmap(),
-                        segment.dataset_version(),
-                    )
-                })
-            });
-            if has_retired_coverage || requires_rebuild {
-                return Err(Error::invalid_input(
-                    "CreateIndex: NGram segments built before compaction must be rebuilt or merged \
-                     with merge_existing_index_segments before commit"
-                        .to_string(),
-                ));
-            }
-        }
-        // On a tagged table the segments are first validated against this
-        // snapshot (`replay_staged_segments`): a rewrite since their build
-        // keeps their provenance translating, an in-place column rewrite
-        // withdraws the affected coverage, a rewrite they cannot be carried
-        // across says to rebuild. The commit then reads from this snapshot,
-        // and the commit loop carries the segments across anything newer
-        // through the same rules.
-        let segments = replay_staged_segments(
-            self,
-            segments
-                .into_iter()
-                .map(|segment| segment.into_metadata(index_name))
-                .collect(),
-        )
-        .await?
-        .into_iter()
-        .map(IntoIndexSegment::into_index_segment)
-        .collect::<Result<Vec<_>>>()?;
-        let new_indices =
-            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
-        validate_segment_metadata(index_name, &new_indices)?;
-        validate_segment_index_details(index_name, &new_indices)?;
-
-        let incoming_type_url = new_indices[0]
-            .index_details
-            .as_ref()
-            .map(|details| details.type_url.clone());
-        let mut incoming_fragments = RoaringBitmap::new();
-        for segment in &new_indices {
-            if let Some(fragment_bitmap) = &segment.fragment_bitmap {
-                incoming_fragments |= fragment_bitmap.clone();
-            }
-        }
-
-        let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
-        if existing_named_indices.iter().any(|idx| {
-            // Field order is part of a plugin scope's identity. Covered
-            // single-column indices still compare only their keyed prefix.
-            idx.keyed_fields() != new_indices[0].keyed_fields()
-        }) {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists with different fields, \
-                please specify a different name"
-            )));
-        }
-        let existing_different_type_url = existing_named_indices.iter().find_map(|idx| {
-            // Legacy metadata may omit index details. Its type cannot be proven
-            // compatible, so only a full replacement is safe.
-            let Some(existing_details) = idx.index_details.as_ref() else {
-                return Some("<unknown>".to_owned());
-            };
-            let existing_type_url = existing_details.type_url.as_str();
-            (Some(existing_type_url) != incoming_type_url.as_deref())
-                .then(|| existing_type_url.to_owned())
-        });
-        let missing_fragments = &dataset_fragments - &incoming_fragments;
-        if let Some(existing_type_url) = &existing_different_type_url
-            && !missing_fragments.is_empty()
-        {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: cannot change index '{}' from type '{}' to type '{}' with partial fragment coverage; incoming segments are missing current fragments {:?}",
-                index_name,
-                existing_type_url,
-                incoming_type_url.as_deref().unwrap_or("<missing>"),
-                missing_fragments.iter().collect::<Vec<_>>()
-            )));
-        }
-
-        let is_index_type_change = existing_different_type_url.is_some();
-        let existing_snapshot = existing_named_indices.clone();
-        // What a retained sibling has to agree with. Every incoming segment
-        // already declares the same fields: `build_index_metadata_from_segments`
-        // compares them against each other before this point.
-        let expected = &new_indices[0];
-        let removed_indices = existing_named_indices
-            .into_iter()
-            .map(|idx| -> Result<Option<IndexMetadata>> {
-                // A logical index cannot combine segment types. Full current-fragment
-                // coverage was verified above, so a type change replaces every segment.
-                if is_index_type_change {
-                    return Ok(Some(idx));
+        let entry = self.clone();
+        // A commit whose choice of segments rests on coverage derived from
+        // its snapshot lands only on that snapshot. When another writer
+        // commits first, the whole decision is made again on the latest
+        // version from the original segments, within the attempts the commit
+        // loop allows a rebasing commit.
+        let budget = commit_attempt_budget(&CommitConfig::default());
+        let result = async {
+            let mut attempt = 1;
+            loop {
+                let (transaction, requires_unchanged_snapshot) =
+                    decide_segment_commit(self, index_name, column, segments.clone()).await?;
+                if !requires_unchanged_snapshot {
+                    // The attempts left after earlier decisions, so all of
+                    // them share one budget.
+                    let commit_config = if attempt == 1 {
+                        CommitConfig::default()
+                    } else {
+                        CommitConfig {
+                            num_retries: budget - attempt + 1,
+                            ..CommitConfig::default()
+                        }
+                    };
+                    return self
+                        .apply_commit(transaction, &Default::default(), &commit_config)
+                        .await;
                 }
-
-                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
-                else {
-                    if incoming_fragments != dataset_fragments {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
-                            idx.uuid, index_name
-                        )));
+                let read_version = self.manifest.version;
+                let write_config = ManifestWriteConfig::default();
+                let outcome = self
+                    .apply_commit_with_expected_latest_version(
+                        transaction.clone(),
+                        &write_config,
+                        &Default::default(),
+                        Some(read_version),
+                    )
+                    .await;
+                if decides_again(&outcome, attempt, budget) {
+                    attempt += 1;
+                    // The next decision runs on exactly the versions checked
+                    // here; a conflict ends the call.
+                    *self = check_versions_since_read(self, &transaction, &write_config).await?;
+                    continue;
+                }
+                return match outcome {
+                    Err(error) if ConcurrentVersion::caused(&error) => {
+                        let version = match error.find_root() {
+                            Error::RetryableCommitConflict { version, .. } => *version,
+                            _ => read_version,
+                        };
+                        Err(Error::retryable_commit_conflict_source(
+                            version,
+                            Box::new(NotAppliedAtReadVersion {
+                                index_name: index_name.to_owned(),
+                                read_version,
+                                attempts: attempt,
+                                source: error,
+                            }),
+                        ))
                     }
-                    return Ok(Some(idx));
+                    other => other,
                 };
-
-                // A zero-fragment segment can be used to create an index while
-                // deferring the actual build. Such a segment is disjoint from every
-                // other segment but should still be removed.
-                if existing_fragments.is_empty() {
-                    return Ok(Some(idx));
-                }
-
-                if existing_fragments.is_disjoint(&incoming_fragments) {
-                    // Retained, so its declaration outlives this commit and has
-                    // to match what is being written: `IndexDescriptionImpl::try_new`
-                    // requires the same keyed and carried fields across the segments
-                    // of one logical index. Nothing above catches a disagreement, because
-                    // `keyed_fields` is the prefix left after the carried ones -- a
-                    // segment carrying columns keys on exactly what a plain one
-                    // keys on, and both pass the keyed-field guard.
-                    if !idx.declares_same_fields(expected) {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
-                             but retained segment {} declares fields {:?} and covering_fields {:?}; \
-                             a logical index cannot mix declarations - rebuild every segment in one commit",
-                            index_name,
-                            expected.fields,
-                            expected.covering_fields,
-                            idx.uuid,
-                            idx.fields,
-                            idx.covering_fields
-                        )));
-                    }
-                    return Ok(None);
-                }
-
-                let uncovered = existing_fragments - &incoming_fragments;
-                if !uncovered.is_empty() {
-                    return Err(Error::invalid_input(format!(
-                        "CreateIndex: incoming segments for '{}' would orphan fragments {:?} from existing segment {}",
-                        index_name,
-                        uncovered.iter().collect::<Vec<_>>(),
-                        idx.uuid
-                    )));
-                }
-
-                Ok(Some(idx))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        // Segments that stay together must be compatible under the plugin's
-        // rules (for example identical hash parameters). Segments this commit
-        // removes are not consulted, so a full rebuild may change parameters.
-        let retained_indices: Vec<IndexMetadata> = existing_snapshot
-            .into_iter()
-            .filter(|idx| {
-                !removed_indices
-                    .iter()
-                    .any(|removed| removed.uuid == idx.uuid)
-            })
-            .collect();
-        validate_segment_params_compatible(&retained_indices, &new_indices)?;
-
-        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
-        if segment_has_inverted_details(&new_indices[0]) {
-            // Apply the merge/query semantic contract only to segments that will
-            // coexist, so a full rebuild can change the analyzer settings.
-            let segments = coexisting_indices.clone().cloned().collect::<Vec<_>>();
-            scalar::inverted::load_segment_details(self, column, &segments).await?;
-        }
-
-        // The query planner ranks coexisting vector segments under one contract.
-        // Validate after replacement selection so a full rebuild may change it.
-        let vector_segment_count = coexisting_indices
-            .clone()
-            .filter(|segment| segment_has_vector_details(segment))
-            .count();
-        if vector_segment_count > 1 {
-            // Only the query contract is compared, never a row: a staged
-            // segment is not in the manifest, so it opens on an identity plan,
-            // and a retained one opens for maintenance so that a segment the
-            // tagged reader excludes from the listing still takes part.
-            let mut vector_indices = Vec::with_capacity(vector_segment_count);
-            for segment in coexisting_indices {
-                let staged_plan = new_indices
-                    .iter()
-                    .any(|staged| staged.uuid == segment.uuid)
-                    .then_some(&frag_reuse::SegmentRemappingPlan::Identity);
-                let index = self
-                    .open_vector_index_from_metadata_with_plan(
-                        column,
-                        segment,
-                        staged_plan,
-                        frag_reuse::OpenPurpose::Maintenance,
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
-                vector_indices.push(index);
             }
-            vector::ivf::validate_vector_query_compatibility(
-                &vector_indices,
-                &format!("CreateIndex: index '{index_name}'"),
-            )
-            .map_err(|error| Error::invalid_input(error.to_string()))?;
         }
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            },
-            None,
-        );
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+        .await;
+        if result.is_err() {
+            *self = entry;
+        }
+        result
     }
 
     async fn load_scalar_index<'a, 'b>(
@@ -1316,5 +1955,380 @@ impl DatasetIndexExt for Dataset {
 
         // Without results this still commits when MemWAL catch-up needs it.
         optimize::commit_optimize_indices(self, merged, options).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_is_the_read_error_only_when_every_unproven_segment_failed_a_read() {
+        assert!(refusal_is_the_read_error([true]));
+        assert!(refusal_is_the_read_error([true, true]));
+        assert!(!refusal_is_the_read_error([true, false]));
+        assert!(!refusal_is_the_read_error([false, true]));
+        assert!(!refusal_is_the_read_error([false]));
+        assert!(!refusal_is_the_read_error([]));
+    }
+
+    fn segment(stored: &[u32]) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![0],
+            covering_fields: vec![],
+            name: "i".into(),
+            dataset_version: 1,
+            fragment_bitmap: Some(stored.iter().copied().collect()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// The removed segments not supplied again, and whether the exception
+    /// was relied on.
+    fn resupply(
+        removed: &[IndexMetadata],
+        incoming: &[IndexMetadata],
+        exclusion: impl Fn(&IndexMetadata) -> Option<CoverageExclusion>,
+    ) -> (Vec<Uuid>, bool) {
+        resupply_tracing(removed, incoming, exclusion, RoaringBitmap::clone)
+    }
+
+    /// [`resupply`] counting only the stored fragments `traceable` keeps.
+    fn resupply_tracing(
+        removed: &[IndexMetadata],
+        incoming: &[IndexMetadata],
+        exclusion: impl Fn(&IndexMetadata) -> Option<CoverageExclusion>,
+        traceable: impl Fn(&RoaringBitmap) -> RoaringBitmap,
+    ) -> (Vec<Uuid>, bool) {
+        let resupply = unresupplied_removals(removed, incoming, exclusion, traceable);
+        (
+            resupply.unresupplied.iter().map(|idx| idx.uuid).collect(),
+            resupply.by_exception,
+        )
+    }
+
+    /// Looks a segment's classification up by UUID; unlisted segments take
+    /// part in coverage.
+    fn classified(
+        classes: &[(Uuid, CoverageExclusion)],
+    ) -> impl Fn(&IndexMetadata) -> Option<CoverageExclusion> + '_ {
+        move |idx| {
+            classes
+                .iter()
+                .find(|(uuid, _)| *uuid == idx.uuid)
+                .map(|(_, exclusion)| *exclusion)
+        }
+    }
+
+    /// R over {5} removed, I over {5, 7} incoming, both taking part in
+    /// coverage: the ordinary path, which rests on no classification.
+    #[test]
+    fn a_member_supplies_a_removed_member_again() {
+        let removed = vec![segment(&[5])];
+        let incoming = vec![segment(&[5, 7])];
+
+        assert_eq!(resupply(&removed, &incoming, |_| None), (vec![], false));
+    }
+
+    /// R and I both left out because the type has no batch remapper: R
+    /// derives nothing in this build, and I stores all of it again.
+    #[test]
+    fn a_removed_segment_without_a_batch_remapper_is_supplied_by_the_same_class() {
+        let removed = vec![segment(&[5])];
+        let incoming = vec![segment(&[5, 7])];
+
+        assert_eq!(
+            resupply(&removed, &incoming, |_| Some(
+                CoverageExclusion::NoBatchRemapper
+            )),
+            (vec![], true)
+        );
+    }
+
+    /// R takes part in coverage and directly covers 5; I is left out because
+    /// the type has no batch remapper. Removing R would lose that coverage.
+    #[test]
+    fn a_removed_member_is_not_supplied_by_a_segment_without_a_batch_remapper() {
+        let removed = vec![segment(&[5])];
+        let incoming = vec![segment(&[5, 7])];
+        let i = incoming[0].uuid;
+
+        assert_eq!(
+            resupply(
+                &removed,
+                &incoming,
+                classified(&[(i, CoverageExclusion::NoBatchRemapper)])
+            ),
+            (vec![removed[0].uuid], false)
+        );
+    }
+
+    /// R is left out because the type has no batch remapper, but I is left
+    /// out for a reason of its own or an unreadable marker: I supplies
+    /// nothing.
+    #[test]
+    fn a_segment_specific_incoming_exclusion_supplies_nothing() {
+        let removed = vec![segment(&[5])];
+        let incoming = vec![segment(&[5, 7])];
+        let r = removed[0].uuid;
+        let i = incoming[0].uuid;
+
+        for reason in [
+            MissingCoverageReason::Corrupt,
+            MissingCoverageReason::Unverifiable,
+            MissingCoverageReason::Unsupported,
+        ] {
+            assert_eq!(
+                resupply(
+                    &removed,
+                    &incoming,
+                    classified(&[
+                        (r, CoverageExclusion::NoBatchRemapper),
+                        (i, CoverageExclusion::Segment(reason)),
+                    ])
+                ),
+                (vec![r], false),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// Under a history this build cannot interpret no exception applies,
+    /// whatever the incoming segment's class.
+    #[test]
+    fn an_unsupported_history_grants_no_exception() {
+        let removed = vec![segment(&[5])];
+        let incoming = vec![segment(&[5, 7])];
+        let r = removed[0].uuid;
+        let i = incoming[0].uuid;
+
+        for incoming_class in [
+            CoverageExclusion::UnsupportedHistory,
+            CoverageExclusion::NoBatchRemapper,
+        ] {
+            assert_eq!(
+                resupply(
+                    &removed,
+                    &incoming,
+                    classified(&[
+                        (r, CoverageExclusion::UnsupportedHistory),
+                        (i, incoming_class),
+                    ])
+                ),
+                (vec![r], false),
+                "{incoming_class:?}"
+            );
+        }
+        assert_eq!(
+            resupply(
+                &removed,
+                &incoming,
+                classified(&[
+                    (r, CoverageExclusion::NoBatchRemapper),
+                    (i, CoverageExclusion::UnsupportedHistory),
+                ])
+            ),
+            (vec![r], false)
+        );
+    }
+
+    /// R stores {5, 6}; an incoming segment over {5} alone does not store all
+    /// of it again, on either path.
+    #[test]
+    fn a_partial_superset_does_not_resupply() {
+        let removed = vec![segment(&[5, 6])];
+        let incoming = vec![segment(&[5])];
+
+        for exclusion in [None, Some(CoverageExclusion::NoBatchRemapper)] {
+            assert_eq!(
+                resupply(&removed, &incoming, |_| exclusion),
+                (vec![removed[0].uuid], false),
+                "{exclusion:?}"
+            );
+        }
+    }
+
+    /// R stores {5, 6}; 6 was deleted outright and the history does not name
+    /// it. An incoming segment over {5} supplies R again, as a member or by
+    /// the exception.
+    #[test]
+    fn a_stored_fragment_off_the_history_and_not_live_is_ignored() {
+        let removed = vec![segment(&[5, 6])];
+        let incoming = vec![segment(&[5])];
+        let traceable = |stored: &RoaringBitmap| stored - &RoaringBitmap::from_iter([6u32]);
+
+        assert_eq!(
+            resupply_tracing(&removed, &incoming, |_| None, traceable),
+            (vec![], false)
+        );
+        assert_eq!(
+            resupply_tracing(
+                &removed,
+                &incoming,
+                |_| Some(CoverageExclusion::NoBatchRemapper),
+                traceable
+            ),
+            (vec![], true)
+        );
+    }
+
+    /// R stores only {6}, deleted outright off the history: nothing it stores
+    /// needs supplying again.
+    #[test]
+    fn a_removed_segment_with_nothing_traceable_is_supplied_again() {
+        let removed = vec![segment(&[6])];
+        let incoming = vec![segment(&[5])];
+
+        assert_eq!(
+            resupply_tracing(&removed, &incoming, |_| None, |_| RoaringBitmap::new()),
+            (vec![], false)
+        );
+    }
+
+    /// Only a loss to another writer's commit is decided again, and only
+    /// while an attempt is left: the last loss, a write that failed on its
+    /// own, an unknown outcome and a success are returned.
+    #[test]
+    fn only_a_lost_version_with_an_attempt_left_is_decided_again() {
+        let lost = || -> Result<()> {
+            Err(ConcurrentVersion::conflict(
+                3,
+                "latest version advanced".to_owned(),
+            ))
+        };
+        let budget = 3;
+        assert!(decides_again(&lost(), 1, budget));
+        assert!(decides_again(&lost(), 2, budget));
+        assert!(!decides_again(&lost(), 3, budget));
+
+        let failed_write = Err(Error::retryable_commit_conflict_source(
+            3,
+            Box::new(Error::io("manifest write failed")),
+        ));
+        assert!(!decides_again(&failed_write, 1, budget));
+        let unknown = Err(Error::commit_status_unknown_source(
+            3,
+            "the outcome could not be read back".into(),
+        ));
+        assert!(!decides_again(&unknown, 1, budget));
+        assert!(!decides_again(&Ok(()), 1, budget));
+    }
+
+    /// A retained segment that fails to open is refused with the failure
+    /// classified as it was: this build's refusal stays `NotSupported` and
+    /// names the segment, a read failure that caused the refusal is returned
+    /// unchanged, and an unrelated open failure is not masked by it.
+    #[test]
+    fn a_retained_segment_that_cannot_be_opened_keeps_its_classification() {
+        let segment = Uuid::new_v4();
+        let refused = retained_segment_unopenable(
+            "idx",
+            segment,
+            Error::not_supported("this file version is not readable"),
+            None,
+        );
+        assert!(matches!(refused, Error::NotSupported { .. }), "{refused:?}");
+        let message = refused.to_string();
+        assert!(message.contains(&segment.to_string()), "{message}");
+        assert!(message.contains("'idx'"), "{message}");
+        assert!(
+            message.contains("this file version is not readable"),
+            "{message}"
+        );
+        assert!(
+            std::error::Error::source(&refused)
+                .and_then(|source| source.downcast_ref::<RetainedSegmentUnopenable>())
+                .is_some_and(|unopenable| matches!(unopenable.source, Error::NotSupported { .. })),
+            "{refused:?}"
+        );
+
+        let read_failed = retained_segment_unopenable(
+            "idx",
+            segment,
+            Error::not_supported("format marker could not be read"),
+            Some(Error::io("injected read failure")),
+        );
+        assert!(matches!(read_failed, Error::IO { .. }), "{read_failed:?}");
+        assert!(
+            read_failed.to_string().contains("injected read failure"),
+            "{read_failed}"
+        );
+
+        let unrelated = retained_segment_unopenable(
+            "idx",
+            segment,
+            Error::io("open timed out"),
+            Some(Error::io("injected read failure")),
+        );
+        assert!(
+            unrelated.to_string().contains("open timed out"),
+            "{unrelated}"
+        );
+
+        let io = retained_segment_unopenable("idx", segment, Error::io("timed out"), None);
+        assert!(matches!(io, Error::IO { .. }), "{io:?}");
+        assert!(io.to_string().contains("timed out"), "{io}");
+    }
+
+    /// Incoming segments together supply a removed segment's sources; one
+    /// excluded for a reason of its own does not count towards that.
+    #[test]
+    fn only_resupplying_incoming_segments_count_towards_a_removed_segment() {
+        let removed = vec![segment(&[0, 2])];
+        let incoming = vec![segment(&[0]), segment(&[2])];
+        let excluded = incoming[1].uuid;
+
+        assert_eq!(resupply(&removed, &incoming, |_| None), (vec![], false));
+        assert_eq!(
+            resupply(
+                &removed,
+                &incoming,
+                classified(&[(
+                    excluded,
+                    CoverageExclusion::Segment(MissingCoverageReason::Corrupt)
+                )])
+            ),
+            (vec![removed[0].uuid], false)
+        );
+    }
+
+    /// Removed M takes part and is supplied by incoming member J; removed S,
+    /// left out for the missing batch remapper, is supplied by J and K of the
+    /// same class. Each removal is decided on its own.
+    #[test]
+    fn mixed_removals_are_decided_per_removed_segment() {
+        let m = segment(&[12]);
+        let s = segment(&[10]);
+        let s_uuid = s.uuid;
+        let removed = vec![m, s];
+        let j = segment(&[12]);
+        let k = segment(&[10]);
+        let k_uuid = k.uuid;
+        let classes = [
+            (s_uuid, CoverageExclusion::NoBatchRemapper),
+            (k_uuid, CoverageExclusion::NoBatchRemapper),
+        ];
+
+        assert_eq!(
+            resupply(&removed, &[j, k.clone()], classified(&classes)),
+            (vec![], true)
+        );
+        // Without J, M is offered only K's {10, 12}, which cannot stand in for
+        // a member.
+        let k_over_both = IndexMetadata {
+            fragment_bitmap: Some(RoaringBitmap::from_iter([10u32, 12])),
+            ..k
+        };
+        assert_eq!(
+            resupply(&removed, &[k_over_both], classified(&classes)),
+            (vec![removed[0].uuid], true)
+        );
     }
 }

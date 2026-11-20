@@ -1655,7 +1655,7 @@ async fn tagged_with_fts_index(path: &str) -> Dataset {
 
 /// Reopens `path` through a store that fails reads of `suffix` while the
 /// returned flag is set.
-async fn open_with_failing_reads(path: &str, suffix: String) -> (Dataset, Arc<AtomicBool>) {
+pub async fn open_with_failing_reads(path: &str, suffix: String) -> (Dataset, Arc<AtomicBool>) {
     let failing = Arc::new(AtomicBool::new(false));
     let dataset = DatasetBuilder::from_uri(path)
         .with_store_params(ObjectStoreParams {
