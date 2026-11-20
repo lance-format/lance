@@ -12,6 +12,7 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, bfloat16::B
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::cosine::{Cosine, cosine_distance_batch_into};
 use lance_linalg::distance::cosine_u8::{cosine_u8, cosine_u8_scalar};
+use lance_linalg::kernels::normalize_fsl;
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]
@@ -137,17 +138,51 @@ fn bench_distance(c: &mut Criterion) {
     }
 }
 
+/// f32 cosine at common embedding widths, and the normalization a cosine index
+/// applies to every vector. The `scaled 1e20` vectors square past `f32::MAX`.
+fn bench_f32_dimensions(c: &mut Criterion) {
+    const TOTAL: usize = 4 * 1024 * 1024;
+
+    let target = generate_random_array_with_seed::<Float32Type>(TOTAL, [42; 32]);
+    let scaled = target.values().iter().map(|v| v * 1e20).collect::<Vec<_>>();
+    for dimension in [128, 768, 1536] {
+        let key = generate_random_array_with_seed::<Float32Type>(dimension, [0; 32]);
+        let len = TOTAL / dimension * dimension;
+        let mut distances = vec![0.0; TOTAL / dimension];
+        for (suffix, values) in [
+            ("", &target.values()[..len]),
+            (", scaled 1e20", &scaled[..len]),
+        ] {
+            c.bench_function(&format!("Cosine(f32, dim {dimension}{suffix})"), |b| {
+                b.iter(|| {
+                    cosine_distance_batch_into(key.values(), values, dimension, &mut distances);
+                    black_box(&mut distances);
+                })
+            });
+
+            let vectors = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(values.to_vec()),
+                dimension as i32,
+            )
+            .unwrap();
+            c.bench_function(&format!("Normalize(f32, dim {dimension}{suffix})"), |b| {
+                b.iter(|| black_box(normalize_fsl(&vectors).unwrap()))
+            });
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_distance);
+    targets = bench_distance, bench_f32_dimensions);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_distance);
+    targets = bench_distance, bench_f32_dimensions);
 criterion_main!(benches);
