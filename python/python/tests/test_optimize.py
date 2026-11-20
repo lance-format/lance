@@ -13,9 +13,11 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.file import LanceFileReader
 from lance.lance import Compaction
 from lance.optimize import (
     CompactionOptions,
+    CompactionTask,
     OptimizeIndexMerge,
     OptimizeIndexTask,
     OptimizeIndices,
@@ -52,6 +54,71 @@ def test_dataset_optimize(tmp_path: Path):
 def test_compaction_options_keys_are_optional():
     assert CompactionOptions.__required_keys__ == frozenset()
     assert "source_budget_mode" in CompactionOptions.__optional_keys__
+    assert "data_cache_bytes" in CompactionOptions.__optional_keys__
+
+
+@pytest.mark.parametrize("api", ["optimizer", "execute", "plan"])
+@pytest.mark.parametrize(
+    "data_cache_bytes,expected_pages", [(None, 1), (0, 8), (1024, 8)]
+)
+def test_compaction_data_cache_bytes(
+    tmp_path: Path, api, data_cache_bytes, expected_pages
+):
+    data = pa.table({"a": pa.array(range(2048), type=pa.int64())})
+    base_dir = tmp_path / "dataset"
+    dataset = lance.write_dataset(
+        data, base_dir, max_rows_per_file=1024, data_storage_version="2.2"
+    )
+    assert len(dataset.get_fragments()) == 2
+    options = dict(
+        target_rows_per_fragment=2048,
+        batch_size=256,
+        compaction_mode="reencode",
+    )
+    if data_cache_bytes is not None:
+        options["data_cache_bytes"] = data_cache_bytes
+
+    if api == "optimizer":
+        dataset.optimize.compact_files(**options)
+    elif api == "execute":
+        Compaction.execute(dataset, options)
+    else:
+        plan = Compaction.plan(dataset, options)
+        assert plan.num_tasks() == 1
+        task = pickle.loads(pickle.dumps(plan.tasks[0]))
+        task_json = json.loads(task.json())
+        assert task_json["options"]["data_cache_bytes"] == data_cache_bytes
+        if data_cache_bytes is None:
+            # Tasks created before this option was added use the Rust default.
+            del task_json["options"]["data_cache_bytes"]
+            task = CompactionTask.from_json(json.dumps(task_json))
+        result = task.execute(dataset)
+        Compaction.commit(dataset, [result], options)
+
+    dataset = lance.dataset(base_dir)
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 1
+    file = fragments[0].metadata.files[0]
+    reader = LanceFileReader(str(base_dir / "data" / file.path))
+    # A 256-row Int64 batch (2 KiB) overflows a 1 KiB cache.
+    assert len(reader.metadata().columns[0].pages) == expected_pages
+    assert reader.read_all().to_table() == data
+    assert dataset.to_table() == data
+
+
+@pytest.mark.parametrize("api", ["optimizer", "execute", "plan"])
+def test_compaction_data_cache_bytes_validation(tmp_path: Path, api):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(4)}), tmp_path / "dataset", max_rows_per_file=2
+    )
+    options = dict(target_rows_per_fragment=4, data_cache_bytes=-1)
+    with pytest.raises(OverflowError):
+        if api == "optimizer":
+            dataset.optimize.compact_files(**options)
+        elif api == "execute":
+            Compaction.execute(dataset, options)
+        else:
+            Compaction.plan(dataset, options)
 
 
 @pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
@@ -1608,3 +1675,25 @@ def test_optimize_indices_consolidate(tmp_path: Path, distributed: bool):
         columns=["id"], nearest={"column": "vector", "q": vector.as_py(), "k": 1}
     )
     assert nearest["id"].to_pylist() == [175]
+
+
+def test_read_transaction_of_a_compaction_that_rewrites_an_index(tmp_path: Path):
+    # Compacting a stable-row-id table rewrites its BTREE index; the commit's
+    # transaction must read back with every RewrittenIndex field.
+    data = pa.table({"id": pa.array(range(64), pa.int64())})
+    ds = lance.write_dataset(
+        data, tmp_path, enable_stable_row_ids=True, max_rows_per_file=16
+    )
+    ds.create_scalar_index("id", "BTREE")
+    ds.optimize.compact_files(target_rows_per_fragment=64)
+
+    ds = lance.dataset(tmp_path)
+    transaction = ds.read_transaction(ds.version)
+
+    assert isinstance(transaction.operation, lance.LanceOperation.Rewrite)
+    (rewritten,) = transaction.operation.rewritten_indices
+    (index,) = ds.describe_indices()
+    assert rewritten.new_id == index.segments[0].uuid
+    assert rewritten.new_details_type_url == index.type_url
+    assert isinstance(rewritten.new_details_value, bytes)
+    assert rewritten.new_index_version == index.segments[0].index_version

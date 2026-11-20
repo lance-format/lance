@@ -350,7 +350,8 @@ impl ::prost::Name for FieldCoverage {
 }
 /// Deletion File
 ///
-/// The path of the deletion file is constructed as:
+/// The path of the deletion file is `{root}/{path}` when `path` is set, where
+/// `path` is a normalized relative path under `_deletions/`, or constructed as:
 ///    {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
 /// where {extension} depends on DeletionFileType.
 ///
@@ -371,6 +372,13 @@ pub struct DeletionFile {
     /// The number of rows that are marked as deleted.
     #[prost(uint64, tag = "4")]
     pub num_deleted_rows: u64,
+    /// Normalized relative path under `_deletions/` from the dataset root selected
+    /// by `base_id`, ending in `.arrow` or `.bin` to match `file_type`. Cannot be
+    /// set together with `inline`. Requires `FLAG_DELETION_FILE_PATHS` (1 << 21)
+    /// in both reader and writer feature flags while present, and the writer flag
+    /// remains set on subsequent versions.
+    #[prost(string, optional, tag = "5")]
+    pub path: ::core::option::Option<::prost::alloc::string::String>,
     /// The deletion vector itself, stored in the manifest instead of in a file.
     /// Always the BITMAP encoding (a serialized Roaring bitmap of deleted row
     /// offsets), whatever `file_type` says. A reader that reads one request per
@@ -893,7 +901,7 @@ pub struct Manifest {
     ///    derived snapshots, including clone and restore, because data files may
     ///    retain version 1 seeds. Legacy seeds may coexist and must be decoded
     ///    with their original semantics.
-    /// * 1 << 21: some index has a predicate (see IndexPredicate). Both feature
+    /// * 1 << 23: some index has a predicate (see IndexPredicate). Both feature
     ///    words must carry the bit while any index in the manifest has one. A
     ///    reader or writer that ignores it would treat a partial index as covering
     ///    every row.
@@ -1183,6 +1191,10 @@ pub struct IndexMetadata {
     pub dataset_version: u64,
     /// A bitmap of the included fragment ids.
     ///
+    /// Stores committed dataset fragment IDs, not local IDs stored inside index
+    /// files. When `local_fragment_aliases` is used, a commit or rebase updates
+    /// this bitmap and the aliases together without rewriting the index files.
+    ///
     /// This may by used to determine how much of the dataset is covered by the
     /// index. This information can be retrieved from the dataset by looking at
     /// the dataset at `dataset_version`. However, since the old version may be
@@ -1265,11 +1277,30 @@ pub struct IndexMetadata {
     #[prost(map = "string, string", tag = "13")]
     pub metadata:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Sparse map from fragment IDs stored in this segment's files to committed
+    /// fragment IDs. An empty map means no mapping. Unmapped IDs keep their
+    /// value. Each stored ID is translated once.
+    ///
+    /// Applies to every fragment ID referenced by the segment's files, such as the
+    /// fragment half of a physical row address or a zone's fragment ID. A row
+    /// address keeps its row offset. Stable logical row IDs and user column values
+    /// are not translated.
+    ///
+    /// Keys and values must be less than 2^32 - 1. u32::MAX (2^32 - 1) is
+    /// reserved for RowAddress::TOMBSTONE_FRAG. Two referenced fragment IDs must
+    /// not resolve to the same final fragment ID.
+    ///
+    /// Requires flag 1 << 20 (FLAG_LOCAL_FRAGMENT_ALIASES) in both reader and
+    /// writer feature flags while nonempty. Both bits are cleared when no
+    /// retained segment has a nonempty map. Reserved until readers and index
+    /// maintenance support aliases.
+    #[prost(map = "uint32, uint32", tag = "14")]
+    pub local_fragment_aliases: ::std::collections::HashMap<u32, u32>,
     /// Restricts the index to rows where this predicate is TRUE. Absent means
     /// the index covers every live row of the fragments in fragment_bitmap.
-    /// Requires feature flag 1 << 21 in both reader_feature_flags and
+    /// Requires feature flag 1 << 23 in both reader_feature_flags and
     /// writer_feature_flags while any index in the manifest sets this field.
-    #[prost(message, optional, tag = "14")]
+    #[prost(message, optional, tag = "15")]
     pub predicate: ::core::option::Option<IndexPredicate>,
 }
 impl ::prost::Name for IndexMetadata {

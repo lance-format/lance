@@ -193,8 +193,7 @@ async fn test_create_table_version_on_branch() {
     let versions_dir = branch_ds.versions_dir();
     let store = branch_ds.object_store(None).await.unwrap();
     let existing = store
-        .inner
-        .list(Some(&versions_dir))
+        .list_objects(Some(&versions_dir))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -207,15 +206,14 @@ async fn test_create_table_version_on_branch() {
         })
         .expect("a branch manifest");
     let bytes = store
-        .inner
-        .get(&existing.location)
+        .read_object(&existing.location)
         .await
         .unwrap()
         .bytes()
         .await
         .unwrap();
     let staging = versions_dir.join("staging_manifest");
-    store.inner.put(&staging, bytes.into()).await.unwrap();
+    store.put_payload(&staging, bytes.into()).await.unwrap();
 
     let main_before = list_versions(&namespace, "users", None)
         .await
@@ -569,8 +567,7 @@ async fn test_branch_ops_reject_zombie_branch() {
     let dataset = open_dataset(&namespace, "users").await;
     let store = dataset.object_store(None).await.unwrap();
     let manifest = store
-        .inner
-        .list(Some(&dataset.versions_dir()))
+        .list_objects(Some(&dataset.versions_dir()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -583,8 +580,7 @@ async fn test_branch_ops_reject_zombie_branch() {
         })
         .expect("a manifest");
     let bytes = store
-        .inner
-        .get(&manifest.location)
+        .read_object(&manifest.location)
         .await
         .unwrap()
         .bytes()
@@ -597,7 +593,7 @@ async fn test_branch_ops_reject_zombie_branch() {
         .path
         .join(VERSIONS_DIR)
         .join(manifest.location.filename().unwrap());
-    store.inner.put(&zombie, bytes.into()).await.unwrap();
+    store.put_payload(&zombie, bytes.into()).await.unwrap();
 
     assert!(dataset.branches().get("ghost").await.is_err());
 
@@ -1216,8 +1212,7 @@ async fn test_managed_branch_open_and_commit() {
     let store = branch_ds.object_store(None).await.unwrap();
     let branch_data = branch_base.clone().join("data");
     let branch_files = store
-        .inner
-        .list(Some(&branch_data))
+        .list_objects(Some(&branch_data))
         .try_collect::<Vec<_>>()
         .await
         .unwrap();

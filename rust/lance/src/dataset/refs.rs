@@ -1576,9 +1576,8 @@ fn is_dataset_dir(segment: &str) -> bool {
         || is_mem_wal_dir_name(segment)
 }
 
-// Local atomic creation appends `.json.tmp.<32-hex UUID>#1` (44 bytes) to the
-// encoded name and requires the result to fit the file's 255-byte filename
-// limit.
+// Keep the portable admission limit for branch reference filenames. Local
+// staging uses a fixed-length basename independent of the branch name.
 const MAX_BRANCH_NAME_BYTES: usize = 211;
 
 /// Restrict storage length and reserved directories only for new branches so
