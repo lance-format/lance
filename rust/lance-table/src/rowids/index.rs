@@ -495,10 +495,10 @@ impl RowIdIndex {
                 .map(FragmentIdentity::new)
                 .collect::<Vec<_>>(),
         );
-        let chunks = sources
-            .iter()
-            .flat_map(decompose_sequence)
-            .collect::<Vec<_>>();
+        let mut chunks = Vec::new();
+        for source in sources {
+            chunks.extend(decompose_sequence(source)?);
+        }
 
         let mut final_chunks = Vec::new();
         for processed_chunk in prep_index_chunks(chunks) {
@@ -541,7 +541,7 @@ impl RowIdIndex {
         if let Some(merged) = &self.merged {
             return Ok(merged_get(merged, row_id));
         }
-        self.probe(row_id)
+        self.probe(row_id, &|_| true)
     }
 
     /// Get addresses for many row ids, preserving input order and duplicates.
@@ -557,6 +557,34 @@ impl RowIdIndex {
     /// Returns an error if any requested row id is live in more than one
     /// fragment, which means the stable row ids are corrupt.
     pub fn get_many(&self, row_ids: &[u64]) -> Result<Vec<Option<RowAddress>>> {
+        self.get_many_with_filter(row_ids, |_| true)
+    }
+
+    /// Look up row IDs with an additional physical-address visibility filter.
+    ///
+    /// The filter runs before checking for duplicate live IDs in a probe index.
+    /// This lets snapshots share an immutable lookup while applying their own
+    /// deletions. It cannot restore rows excluded when this index was built.
+    /// Input order and duplicate requests are preserved, as with [`Self::get_many`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a requested ID has multiple visible addresses.
+    ///
+    /// ```
+    /// # use lance_table::rowids::RowIdIndex;
+    /// # fn example(index: &RowIdIndex) -> lance_core::Result<()> {
+    /// let addresses = index.get_many_with_filter(&[10, 20], |address| {
+    ///     address.row_offset() != 3
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_many_with_filter(
+        &self,
+        row_ids: &[u64],
+        is_visible: impl Fn(RowAddress) -> bool,
+    ) -> Result<Vec<Option<RowAddress>>> {
         let n = row_ids.len();
         let mut out = vec![None; n];
         if n == 0 {
@@ -569,13 +597,34 @@ impl RowIdIndex {
         let Some(merged) = &self.merged else {
             if n < batch::LANES {
                 for (id, orig_idx) in sorted {
-                    out[orig_idx] = self.probe(id)?;
+                    out[orig_idx] = self.probe(id, &is_visible)?;
                 }
             } else {
-                self.probe_many(&sorted, &mut out)?;
+                self.probe_many(&sorted, &mut out, &is_visible)?;
             }
             return Ok(out);
         };
+
+        // A prepared fragment commonly has one sparse merged chunk. Advance
+        // independent searches together instead of serializing their memory
+        // loads. Keep positions as usize: a complete merged index can span
+        // more than one fragment's u32 address space.
+        if n >= batch::LANES
+            && merged.len() == 1
+            && let Some((_, chunk)) = merged.iter().next()
+            && let U64Segment::SortedArray(ids) = &chunk.segments.0
+        {
+            batch::search_encoded(ids, &sorted, &mut |_, ordinal, position| {
+                if let Some(addr) = chunk.segments.1.get(position) {
+                    let address = RowAddress::from(addr);
+                    if is_visible(address) {
+                        out[ordinal] = Some(address);
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(out);
+        }
 
         let mut chunks = merged.iter().peekable();
         for (id, orig_idx) in sorted {
@@ -597,7 +646,10 @@ impl RowIdIndex {
             if let Some(pos) = row_id_seg.position(id)
                 && let Some(addr) = addr_seg.get(pos)
             {
-                out[orig_idx] = Some(RowAddress::from(addr));
+                let address = RowAddress::from(addr);
+                if is_visible(address) {
+                    out[orig_idx] = Some(address);
+                }
             }
         }
         Ok(out)
@@ -608,7 +660,11 @@ impl RowIdIndex {
     ///
     /// Visits every candidate rather than stopping at the first hit, and
     /// errors when a second fragment holds the id live.
-    fn probe(&self, row_id: u64) -> Result<Option<RowAddress>> {
+    fn probe(
+        &self,
+        row_id: u64,
+        is_visible: &impl Fn(RowAddress) -> bool,
+    ) -> Result<Option<RowAddress>> {
         let probes = self.probes.len();
         if probes == 0 {
             return Ok(None);
@@ -638,6 +694,7 @@ impl RowIdIndex {
                 if let Some(probe) = self.probes.get(lo)
                     && let Some(candidate) = self.fragments[probe.fragment as usize]
                         .resolve_segment(probe.segment as usize, row_id)
+                    && is_visible(candidate)
                 {
                     if found.is_some() {
                         return Err(Error::internal(format!(
@@ -1029,63 +1086,65 @@ impl DeepSizeOf for RowIdIndex {
     }
 }
 
-fn decompose_sequence(
-    frag_index: &FragmentRowIdIndex,
-) -> Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))> {
+fn decompose_sequence(frag_index: &FragmentRowIdIndex) -> Result<Vec<IndexChunk>> {
     let mut start_address: u64 = RowAddress::first_row(frag_index.fragment_id).into();
     let mut current_offset = 0u32;
-    let no_deletions = frag_index.deletion_vector.is_empty();
-
-    frag_index
-        .row_id_sequence
-        .0
-        .iter()
-        .filter_map(|segment| {
-            let segment_len = segment.len();
-
-            let result = if no_deletions {
-                decompose_segment_no_deletions(segment, start_address)
-            } else {
-                decompose_segment_with_deletions(
-                    segment,
-                    start_address,
-                    current_offset,
-                    &frag_index.deletion_vector,
-                )
-            };
-
-            current_offset += segment_len as u32;
-            start_address += segment_len as u64;
-
-            result
-        })
-        .collect()
+    let mut chunks = Vec::with_capacity(frag_index.row_id_sequence.0.len());
+    for segment in &frag_index.row_id_sequence.0 {
+        let chunk = if frag_index.deletion_vector.is_empty() {
+            decompose_segment_no_deletions(segment, start_address)?
+        } else {
+            decompose_segment_with_deletions(
+                segment,
+                start_address,
+                current_offset,
+                &frag_index.deletion_vector,
+            )?
+        };
+        let segment_len = segment.len();
+        current_offset += segment_len as u32;
+        start_address += segment_len as u64;
+        if let Some(chunk) = chunk {
+            chunks.push(chunk);
+        }
+    }
+    Ok(chunks)
 }
 
 /// Build an IndexChunk from a list of (row_id, address) pairs.
-fn build_chunk_from_pairs(mut pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
+fn build_chunk_from_pairs(mut pairs: Vec<(u64, u64)>) -> Result<Option<IndexChunk>> {
     if pairs.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Sorted, so the row id segment encodes as one a lookup can search rather
     // than an `Array` it has to scan. The address segment follows the pairing.
     pairs.sort_unstable_by_key(|(row_id, _)| *row_id);
+    if let Some(pair) = pairs.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(Error::internal(format!(
+            "row id index corrupt: stable row id {} has multiple physical positions",
+            pair[0].0
+        )));
+    }
     let (row_ids, addresses): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
     let row_id_segment = U64Segment::from_iter(row_ids);
     let address_segment = U64Segment::from_iter(addresses);
-    let coverage = row_id_segment.range()?;
-    Some((coverage, (row_id_segment, address_segment)))
+    Ok(row_id_segment
+        .range()
+        .map(|coverage| (coverage, (row_id_segment, address_segment))))
 }
 
 /// Fast path: no deletions. O(1) for Range segments.
-fn decompose_segment_no_deletions(segment: &U64Segment, start_address: u64) -> Option<IndexChunk> {
+fn decompose_segment_no_deletions(
+    segment: &U64Segment,
+    start_address: u64,
+) -> Result<Option<IndexChunk>> {
     match segment {
         U64Segment::Range(range) if !range.is_empty() => {
             let len = range.end - range.start;
             let row_id_segment = U64Segment::Range(range.clone());
             let address_segment = U64Segment::Range(start_address..start_address + len);
             let coverage = range.start..=range.end - 1;
-            Some((coverage, (row_id_segment, address_segment)))
+            Ok(Some((coverage, (row_id_segment, address_segment))))
         }
         U64Segment::Ranges { .. } if !segment.is_empty() => {
             // Without deletions, a live ID's position is also its physical
@@ -1093,10 +1152,12 @@ fn decompose_segment_no_deletions(segment: &U64Segment, start_address: u64) -> O
             let row_id_segment = segment.clone();
             let address_segment =
                 U64Segment::Range(start_address..start_address + row_id_segment.len() as u64);
-            let coverage = row_id_segment.range()?;
-            Some((coverage, (row_id_segment, address_segment)))
+            let Some(coverage) = row_id_segment.range() else {
+                return Ok(None);
+            };
+            Ok(Some((coverage, (row_id_segment, address_segment))))
         }
-        _ if segment.is_empty() => None,
+        _ if segment.is_empty() => Ok(None),
         _ => {
             // Non-Range segments: must iterate to build address mapping.
             let pairs: Vec<(u64, u64)> = segment
@@ -1115,7 +1176,7 @@ fn decompose_segment_with_deletions(
     start_address: u64,
     current_offset: u32,
     deletion_vector: &DeletionVector,
-) -> Option<IndexChunk> {
+) -> Result<Option<IndexChunk>> {
     let pairs: Vec<(u64, u64)> = segment
         .iter()
         .enumerate()
