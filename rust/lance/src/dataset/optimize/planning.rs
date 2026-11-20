@@ -188,8 +188,10 @@ pub struct CompactionOptions {
     /// [`crate::dataset::Scanner::batch_size`]) will be used.
     pub batch_size: Option<usize>,
     /// The number of bytes to allow to queue up in the I/O buffer when scanning
-    /// the input fragments.  If not specified then the default (see
-    /// [`crate::dataset::Scanner::io_buffer_size`]) will be used.
+    /// the input fragments.  Column repacks read with it too; binary-copy
+    /// rewrites do not (see `binary_copy_read_batch_bytes`).  If not specified
+    /// then the default (see [`crate::dataset::Scanner::io_buffer_size`]) will
+    /// be used.
     ///
     /// Increasing this can avoid a deadlock that occurs when a single batch of
     /// data is larger than the I/O buffer size.

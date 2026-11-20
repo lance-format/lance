@@ -323,8 +323,10 @@ async fn discard(dataset: &Dataset, fragment_id: u64, files: Vec<DataFile>) {
     cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &[partial]).await;
 }
 
-/// How a repack task reads its fragment: through one scheduler for all of its
-/// files, sized from `io_buffer_size` the way a rewrite's scan is.
+/// How a repack task reads its fragment: through one scheduler for the
+/// dataset's own files and one per base for files in other bases, such as the
+/// source of a shallow clone, each sized from `io_buffer_size` the way a
+/// rewrite's scan is.
 fn task_read_config(dataset: &Dataset, options: &CompactionOptions) -> FragReadConfig {
     FragReadConfig::default()
         .with_scan_scheduler(make_scan_scheduler(dataset, options.io_buffer_size))

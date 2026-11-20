@@ -2672,8 +2672,9 @@ impl FileFragment {
     }
 
     /// Like [`Self::updater`], but writes `write_version` files and reads the
-    /// fragment with `read_config`. The row id and row address flags of
-    /// `read_config` are replaced by what `columns` asks for.
+    /// fragment with `read_config`, of which callers set only `scan_scheduler`,
+    /// `base_schedulers`, `reader_priority` and `file_reader_options`: the row
+    /// id and row address flags follow `columns`.
     pub(crate) async fn updater_with_version<T: AsRef<str>>(
         &self,
         columns: Option<&[T]>,
