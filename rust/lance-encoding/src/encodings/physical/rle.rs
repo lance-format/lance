@@ -60,7 +60,8 @@ use log::trace;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{
-    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, levels::LevelDecodePlan,
+    require_block_payload,
 };
 use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
@@ -74,6 +75,9 @@ use crate::format::metadata::CompressiveEncoding;
 use crate::statistics::Stat;
 
 use lance_core::{Error, Result};
+
+mod admitted;
+mod unsigned;
 
 /// Width used to encode RLE run lengths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1447,6 +1451,11 @@ impl BlockCompressor for RleEncoder {
 }
 
 /// RLE decompressor for miniblock format
+///
+/// Flat value and run-length children support [`MiniBlockDecompressor::plan_range`]
+/// and admitted range decoding. Only selected output is allocated; encoded input
+/// owners must be charged separately. Compressed children require their own
+/// admission plan and return `NotSupported` from these opt-in methods.
 #[derive(Debug)]
 pub struct RleDecompressor {
     bits_per_value: u64,
@@ -2114,6 +2123,29 @@ impl RleDecompressor {
 }
 
 impl MiniBlockDecompressor for RleDecompressor {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        admitted::layout(self)
+    }
+
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self, data, num_values, range)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         2
     }
@@ -2143,6 +2175,25 @@ impl MiniBlockDecompressor for RleDecompressor {
 }
 
 impl BlockDecompressor for RleDecompressor {
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<LevelDecodePlan<'a>> {
+        if self.bits_per_value != 16 {
+            return Err(Error::invalid_input(format!(
+                "RLE structural levels require 16-bit values, got {}",
+                self.bits_per_value
+            )));
+        }
+        if !self.values.is_identity() || !self.run_lengths.is_identity() {
+            return Err(Error::not_supported_source(
+                "Admitted RLE structural levels require flat value and run-length children".into(),
+            ));
+        }
+        LevelDecodePlan::rle(data, num_values, self.run_length_width)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "RLE")?;
         let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
@@ -2623,6 +2674,16 @@ impl BlockRleDecompressor {
 }
 
 impl BlockDecompressor for BlockRleDecompressor {
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        unsigned::visit(self, data, bits_per_value, num_values, visitor)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         if num_values == 0 {
             return Err(Error::invalid_input(
@@ -2713,6 +2774,23 @@ fn infer_generic_run_count(
     bits_per_value: u64,
     num_values: u64,
 ) -> Result<u64> {
+    infer_generic_run_count_from_sizes(
+        source,
+        values_payload.map(|p| p.len() as u64),
+        lengths_payload.map(|p| p.len() as u64),
+        bits_per_value,
+        num_values,
+    )
+}
+
+/// Recover cardinality from framing without retaining the child payloads.
+pub(crate) fn infer_generic_run_count_from_sizes(
+    source: BlockRleRunCount,
+    values_payload: Option<u64>,
+    lengths_payload: Option<u64>,
+    bits_per_value: u64,
+    num_values: u64,
+) -> Result<u64> {
     let run_count = match source {
         BlockRleRunCount::ConstantRunLength(length) => {
             if length == 0 || !num_values.is_multiple_of(length) {
@@ -2789,20 +2867,18 @@ fn infer_generic_run_count(
 }
 
 fn flat_generic_run_count(
-    payload: &LanceBuffer,
+    payload_bytes: u64,
     bits_per_value: u64,
     max_runs: u64,
     label: &str,
 ) -> Result<u64> {
-    let bytes_per_value = usize::try_from(bits_per_value / 8)
-        .map_err(|_| Error::invalid_input("RLE child width does not fit usize"))?;
-    if bytes_per_value == 0 || !payload.len().is_multiple_of(bytes_per_value) {
+    let bytes_per_value = bits_per_value / 8;
+    if bytes_per_value == 0 || !payload_bytes.is_multiple_of(bytes_per_value) {
         return Err(Error::invalid_input(format!(
-            "RLE {label} payload has {} bytes, not divisible by {bytes_per_value}",
-            payload.len()
+            "RLE {label} payload has {payload_bytes} bytes, not divisible by {bytes_per_value}"
         )));
     }
-    let run_count = (payload.len() / bytes_per_value) as u64;
+    let run_count = payload_bytes / bytes_per_value;
     if run_count > max_runs {
         return Err(Error::invalid_input(format!(
             "RLE {label} payload contains {run_count} runs, exceeding {max_runs}"
@@ -2893,11 +2969,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::compression::{
-        DecompressionStrategy, DefaultDecompressionStrategy, create_rle_decompressor,
-    };
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    use crate::compression::create_rle_decompressor;
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
+    use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
     use crate::data::DataBlock;
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
     use crate::encodings::physical::block::{CompressionConfig, CompressionScheme};
     use crate::{
         buffer::LanceBuffer,
@@ -3356,6 +3434,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn repeating_runs(num_runs: usize, run_length: usize) -> Vec<i32> {
         let mut values = Vec::with_capacity(num_runs * run_length);
         for run in 0..num_runs {
@@ -3364,6 +3443,7 @@ mod tests {
         values
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn expect_rle(encoding: &CompressiveEncoding) -> &crate::format::metadata::Rle {
         match encoding.compression.as_ref().unwrap() {
             crate::format::metadata::compressive_encoding::Compression::Rle(rle) => rle,
@@ -3371,6 +3451,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn assert_decoded_i32_eq(decoded: DataBlock, expected: &[i32]) {
         match decoded {
             DataBlock::FixedWidth(block) => {
@@ -3478,6 +3559,7 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn decompress_i32_chunks(
         compressed: &MiniBlockCompressed,
         encoding: &CompressiveEncoding,

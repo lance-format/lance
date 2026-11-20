@@ -15,6 +15,7 @@ use std::ops::{Range, RangeInclusive};
 // TODO: replace this with Arrow BooleanBuffer.
 
 // These are all internal data structures, and are private.
+mod admitted;
 mod bitmap;
 mod encoded_array;
 mod index;

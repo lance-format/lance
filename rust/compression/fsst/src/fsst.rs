@@ -58,6 +58,8 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::io;
 use std::ptr;
 
+mod value;
+
 #[inline(always)]
 fn fsst_unaligned_load_unchecked(v: *const u8) -> u64 {
     // SAFETY: the caller must guarantee that `v` points to at least 8 readable bytes. All callers

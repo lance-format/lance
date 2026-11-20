@@ -20,7 +20,7 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, utils::allocation::ReservedBuffer};
 use object_store::path::Path;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
@@ -31,6 +31,8 @@ use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::object_writer::WriteResult;
 use crate::traits::{ByteStream, Reader, Writer};
 use crate::utils::tracking_store::IOTracker;
+
+mod admitted_read;
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
 pub fn to_local_path(path: &Path) -> String {
@@ -241,6 +243,9 @@ pub struct LocalObjectReader {
     /// File handler.
     file: Arc<File>,
 
+    /// Lazy coordination for owned reads; ordinary reads bypass it.
+    admitted_read: admitted_read::ReadGate,
+
     /// Fie path.
     path: Path,
 
@@ -303,6 +308,7 @@ impl LocalObjectReader {
             let size = OnceCell::new_with(known_size);
             Ok(Box::new(Self {
                 file: Arc::new(file),
+                admitted_read: Default::default(),
                 block_size,
                 size,
                 path,
@@ -376,6 +382,97 @@ impl Reader for LocalObjectReader {
             }
 
             result
+        })
+    }
+
+    fn get_range_into(
+        &self,
+        range: Range<usize>,
+        mut output: ReservedBuffer,
+    ) -> BoxFuture<'_, Result<ReservedBuffer>> {
+        let file = self.file.clone();
+        let io_tracker = self.io_tracker.clone();
+        let path = self.path.clone();
+        Box::pin(async move {
+            if range.end.checked_sub(range.start) != Some(output.capacity()) {
+                return Err(Error::invalid_input(
+                    "read range does not match reserved payload",
+                ));
+            }
+            let bytes = range.len() as u64;
+            let range_u64 = range.start as u64..range.end as u64;
+            let metrics = io_tracker.begin_io("get");
+            // The blocking operation owns the reservation. Dropping the async
+            // waiter must not refund memory while the read still writes into it.
+            let result = self
+                .admitted_read
+                .run(
+                    file,
+                    admitted_read::ReadRanges::Single(range.clone()),
+                    move |file| {
+                        #[cfg(unix)]
+                        file.read_exact_at(output.as_mut(), range.start as u64)?;
+                        #[cfg(windows)]
+                        read_exact_at(file, output.as_mut(), range.start as u64)?;
+                        Ok(output)
+                    },
+                )
+                .await;
+            metrics.record(&result, bytes);
+            if result.is_ok() {
+                io_tracker.record_read("get_range_into", path, bytes, Some(range_u64));
+            }
+            Ok(result?)
+        })
+    }
+
+    fn get_ranges_into(
+        &self,
+        requests: Vec<(Range<usize>, ReservedBuffer)>,
+    ) -> BoxFuture<'_, Result<Vec<ReservedBuffer>>> {
+        let file = self.file.clone();
+        let io_tracker = self.io_tracker.clone();
+        let path = self.path.clone();
+        Box::pin(async move {
+            for (range, output) in &requests {
+                if range.end.checked_sub(range.start) != Some(output.capacity()) {
+                    return Err(Error::invalid_input(
+                        "read range does not match reserved payload",
+                    ));
+                }
+            }
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            let ranges = admitted_read::ReadRanges::Batch(
+                requests.iter().map(|(range, _)| range.clone()).collect(),
+            );
+            // One blocking dispatch, still one positional read and metric per
+            // range. The closure owns every buffer even if its waiter is dropped.
+            Ok(self
+                .admitted_read
+                .run(file, ranges, move |file| {
+                    let mut outputs = Vec::with_capacity(requests.len());
+                    for (range, mut output) in requests {
+                        let metrics = io_tracker.begin_io("get");
+                        #[cfg(unix)]
+                        let result = file.read_exact_at(output.as_mut(), range.start as u64);
+                        #[cfg(windows)]
+                        let result =
+                            read_exact_at(file.clone(), output.as_mut(), range.start as u64);
+                        metrics.record(&result, range.len() as u64);
+                        result?;
+                        io_tracker.record_read(
+                            "get_range_into",
+                            path.clone(),
+                            range.len() as u64,
+                            Some(range.start as u64..range.end as u64),
+                        );
+                        outputs.push(output);
+                    }
+                    Ok(outputs)
+                })
+                .await?)
         })
     }
 

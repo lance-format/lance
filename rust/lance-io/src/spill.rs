@@ -1645,8 +1645,17 @@ mod tests {
             assert_eq!(store.metrics().snapshot().bytes_read, 0);
             release.send(()).unwrap();
             blocker.await.unwrap();
+            // Quota is refunded before the separate observational metrics update.
+            // Wait for both instead of treating quota release as an I/O join.
             tokio::time::timeout(Duration::from_secs(1), async {
-                while quota.used.load(Ordering::Relaxed) != 0 {
+                loop {
+                    let usage = store.metrics().snapshot();
+                    if quota.used.load(Ordering::Relaxed) == 0
+                        && usage.bytes_read == 100
+                        && usage.charged_bytes == 0
+                    {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                 }
             })
@@ -1689,8 +1698,18 @@ mod tests {
             assert_eq!(pending.live_files, 1);
             release.send(()).unwrap();
             blocker.await.unwrap();
+            // Quota and metrics are separate atomics, so zero quota alone does
+            // not mean the detached write has finished publishing its metrics.
             tokio::time::timeout(Duration::from_secs(1), async {
-                while quota.used.load(Ordering::Relaxed) != 0 {
+                loop {
+                    let usage = store.metrics().snapshot();
+                    if quota.used.load(Ordering::Relaxed) == 0
+                        && usage.bytes_written == 100
+                        && usage.charged_bytes == 0
+                        && usage.live_files == 0
+                    {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                 }
             })

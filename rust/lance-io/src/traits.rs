@@ -11,7 +11,7 @@ use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use lance_core::Result;
+use lance_core::{Error, Result, utils::allocation::ReservedBuffer};
 
 use crate::object_writer::WriteResult;
 
@@ -149,6 +149,77 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// TODO: change to read_at()?
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>>;
+
+    /// Fill an already admitted owned payload without detaching its credit.
+    /// The default copies streamed transport chunks; transport allocations are not
+    /// covered by the payload reservation. Readers with direct read-into support
+    /// should override this to avoid the intermediate buffer. Cancellation must
+    /// keep `output` alive until any underlying operation has stopped using it.
+    /// On Linux, local owned reads coordinate by opened device/inode across
+    /// readers, waiting only for earlier overlapping owned ranges. Disjoint
+    /// ranges can progress independently. Waiting is asynchronous, and a detached
+    /// filesystem operation retains both its permit and payload until I/O ends.
+    /// Ordinary local reads bypass this coordination.
+    /// Gate metadata is outside the payload budget; no payload is cached.
+    fn get_range_into(
+        &self,
+        range: Range<usize>,
+        mut output: ReservedBuffer,
+    ) -> BoxFuture<'_, Result<ReservedBuffer>> {
+        Box::pin(async move {
+            if range.end.checked_sub(range.start) != Some(output.capacity()) {
+                return Err(Error::invalid_input(
+                    "read range does not match reserved payload",
+                ));
+            }
+            if range.is_empty() {
+                return Ok(output);
+            }
+            let mut body = self.get_range_stream(range.clone()).await?;
+            let mut offset = 0;
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk?;
+                if chunk.len() > range.len() - offset {
+                    return Err(Error::io(format!(
+                        "body for {} range {range:?} exceeds requested length",
+                        self.path()
+                    )));
+                }
+                output.as_mut()[offset..offset + chunk.len()].copy_from_slice(&chunk);
+                offset += chunk.len();
+            }
+            if offset != range.len() {
+                return Err(Error::io(format!(
+                    "body for {} range {range:?} has {offset} bytes, expected {}",
+                    self.path(),
+                    range.len()
+                )));
+            }
+            Ok(output)
+        })
+    }
+
+    /// Fill independent caller-owned allocations in request order.
+    ///
+    /// This default preserves the single-read contract and performs reads
+    /// sequentially. A backend may combine dispatch, but must preserve every
+    /// allocation and retain all buffers until access stops on cancellation.
+    /// No coalescing, payload allocation or budget acquisition is permitted.
+    /// On Linux, the local backend retains one coordination permit covering all
+    /// batch ranges until the complete blocking batch ends. Disjoint ranges,
+    /// including gaps between batch ranges, and ordinary reads remain independent.
+    fn get_ranges_into(
+        &self,
+        requests: Vec<(Range<usize>, ReservedBuffer)>,
+    ) -> BoxFuture<'_, Result<Vec<ReservedBuffer>>> {
+        Box::pin(async move {
+            let mut outputs = Vec::with_capacity(requests.len());
+            for (range, output) in requests {
+                outputs.push(self.get_range_into(range, output).await?);
+            }
+            Ok(outputs)
+        })
+    }
 
     /// Read all bytes from the object.
     ///

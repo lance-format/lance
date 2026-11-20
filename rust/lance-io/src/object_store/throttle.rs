@@ -595,6 +595,7 @@ impl AimdThrottleState {
 #[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 /// A cache entry of [`SHARED_THROTTLE_STATES`]: alive exactly as long as some
 /// store still holds the budgets, since a store keeps all four.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 struct WeakThrottleState {
     read: Weak<OperationThrottle>,
     write: Weak<OperationThrottle>,

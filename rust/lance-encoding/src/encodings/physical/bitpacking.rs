@@ -38,6 +38,8 @@ use crate::format::{EncodingUtils, metadata};
 use crate::statistics::{GetStat, Stat};
 use bytemuck::Pod;
 
+mod admitted;
+
 pub(crate) const LOG_ELEMS_PER_CHUNK: u8 = 10;
 /// Number of values encoded in each inline bitpacking chunk.
 pub const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
@@ -217,6 +219,20 @@ impl InlineBitpacking {
         data: &[u8],
         num_values: u64,
     ) -> Result<(usize, Cow<'_, [T]>)> {
+        let bit_width_value = Self::validate_chunk::<T>(data, num_values)?;
+        let chunk_words = if data.as_ptr().align_offset(std::mem::align_of::<T>()) == 0 {
+            Cow::Borrowed(bytemuck::cast_slice::<u8, T>(data))
+        } else {
+            Cow::Owned(bytemuck::pod_collect_to_vec::<u8, T>(data))
+        };
+        Ok((bit_width_value, chunk_words))
+    }
+
+    // Validate before any alignment repair allocates, including on admitted paths.
+    pub(crate) fn validate_chunk<T: ArrowNativeType + BitPackingUninit + Pod>(
+        data: &[u8],
+        num_values: u64,
+    ) -> Result<usize> {
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
         let word_size = std::mem::size_of::<T>();
 
@@ -250,12 +266,7 @@ impl InlineBitpacking {
             ));
         }
 
-        let chunk_words = if data.as_ptr().align_offset(std::mem::align_of::<T>()) == 0 {
-            Cow::Borrowed(bytemuck::cast_slice::<u8, T>(data))
-        } else {
-            Cow::Owned(bytemuck::pod_collect_to_vec::<u8, T>(data))
-        };
-        let bit_width_value = chunk_words[0].as_usize();
+        let bit_width_value = bytemuck::pod_read_unaligned::<T>(&data[..word_size]).as_usize();
         if bit_width_value > uncompressed_bit_width {
             return Err(Error::corrupt_file_named(
                 "inline_bitpacking",
@@ -265,7 +276,6 @@ impl InlineBitpacking {
                 ),
             ));
         }
-        let chunk = &chunk_words[1..];
         // bit_width_value has already been verified to be <= uncompressed_bit_width
         // (8/16/32/64), so bit_width_value * ELEMS_PER_CHUNK (1024) can never
         // overflow usize on supported targets. Keep checked_mul as defense in depth.
@@ -281,7 +291,7 @@ impl InlineBitpacking {
                 )
             })?;
         let expected_num_bytes = expected_num_bits / 8;
-        let actual_num_bytes = std::mem::size_of_val(chunk);
+        let actual_num_bytes = data.len() - word_size;
         if actual_num_bytes != expected_num_bytes {
             return Err(Error::corrupt_file_named(
                 "inline_bitpacking",
@@ -292,7 +302,7 @@ impl InlineBitpacking {
             ));
         }
 
-        Ok((bit_width_value, chunk_words))
+        Ok(bit_width_value)
     }
 
     fn unchunk<T: ArrowNativeType + BitPackingUninit + Pod>(
@@ -560,6 +570,37 @@ impl BlockCompressor for InlineBitpacking {
 }
 
 impl MiniBlockDecompressor for InlineBitpacking {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        Ok(crate::compression::MiniBlockOutputLayout::FixedWidth {
+            bits_per_value: self.uncompressed_bit_width,
+        })
+    }
+
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self.uncompressed_bit_width, data, num_values, range)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(
+            self.uncompressed_bit_width,
+            data,
+            num_values,
+            range,
+            workspace,
+        )
+    }
+
     fn allocates_output(&self) -> bool {
         true
     }
@@ -629,6 +670,20 @@ impl MiniBlockDecompressor for InlineBitpacking {
 }
 
 impl BlockDecompressor for InlineBitpacking {
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<crate::compression::levels::LevelDecodePlan<'a>> {
+        if self.uncompressed_bit_width != 16 {
+            return Err(Error::invalid_input(format!(
+                "Inline bitpacking structural levels require 16-bit values, got {}",
+                self.uncompressed_bit_width
+            )));
+        }
+        crate::compression::levels::LevelDecodePlan::inline_bitpacked(data, num_values)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Inline bitpacking")?;
         if num_values == 0 {
@@ -926,6 +981,69 @@ impl BlockCompressor for OutOfLineBitpacking {
 }
 
 impl BlockDecompressor for OutOfLineBitpacking {
+    fn unsigned_value_at(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        index: u64,
+    ) -> Result<u64> {
+        if bits != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(
+                "unsigned bitpacking lookup width mismatch",
+            ));
+        }
+        let data = data
+            .ok_or_else(|| Error::invalid_input("unsigned bitpacking lookup requires payload"))?;
+        crate::compression::unsigned::bitpacked_at(
+            data,
+            bits,
+            self.compressed_bit_width,
+            count,
+            index,
+        )
+    }
+
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        if bits != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(
+                "unsigned bitpacking visitor width mismatch",
+            ));
+        }
+        let data = data
+            .ok_or_else(|| Error::invalid_input("unsigned bitpacking visitor requires payload"))?;
+        crate::compression::unsigned::bitpacked(
+            data,
+            bits,
+            self.compressed_bit_width,
+            count,
+            visitor,
+        )
+    }
+
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<crate::compression::levels::LevelDecodePlan<'a>> {
+        if self.uncompressed_bit_width != 16 {
+            return Err(Error::invalid_input(
+                "structural levels require u16 bitpacking output",
+            ));
+        }
+        crate::compression::levels::LevelDecodePlan::bitpacked(
+            data,
+            num_values,
+            self.compressed_bit_width,
+        )
+    }
+
     fn infer_u16_wrapped_count(
         &self,
         data: &LanceBuffer,

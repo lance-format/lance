@@ -6,7 +6,10 @@
 use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
-use lance_core::{Error, Result, utils::bit::is_pwr_two};
+use lance_core::{
+    Error, Result,
+    utils::{allocation::Reservation, bit::is_pwr_two},
+};
 use std::borrow::Cow;
 
 /// A copy-on-write byte buffer.
@@ -57,6 +60,83 @@ impl LanceBuffer {
             data.extend_from_slice(buffer.as_ref());
         }
         Self(Buffer::from_vec(data))
+    }
+
+    /// Concatenate into an admitted, Arrow-aligned allocation. Inputs remain alive
+    /// while the full output is charged. `None` means the caller must drain/replan;
+    /// it never means EOF. Input allocations must already be accounted separately.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::buffer::LanceBuffer;
+    /// let budget = AllocationBudget::new(3);
+    /// let mut workspace = budget.try_reserve(3).unwrap();
+    /// let inputs = [LanceBuffer::from(vec![1_u8, 2]), LanceBuffer::from(vec![3_u8])];
+    /// let output = LanceBuffer::try_concat_in(&inputs, &mut workspace).unwrap().unwrap();
+    /// assert_eq!(output.as_ref(), &[1, 2, 3]);
+    /// assert_eq!(budget.reserved(), 3); // The example's input Vecs are outside this budget.
+    /// drop(output);
+    /// assert_eq!(budget.reserved(), 0);
+    /// ```
+    pub fn try_concat_in(buffers: &[Self], workspace: &mut Reservation) -> Result<Option<Self>> {
+        let total_len = buffers.iter().try_fold(0_usize, |total, buffer| {
+            total
+                .checked_add(buffer.len())
+                .ok_or_else(|| Error::invalid_input("concatenated buffer size overflow"))
+        })?;
+        let Some(mut output) = workspace.try_allocate(total_len)? else {
+            return Ok(None);
+        };
+        let mut remaining = output.as_mut();
+        for buffer in buffers {
+            let (next, tail) = remaining.split_at_mut(buffer.len());
+            next.copy_from_slice(buffer);
+            remaining = tail;
+        }
+        Ok(Some(Self(Buffer::from(output.freeze()))))
+    }
+
+    /// Convert bytes without an unadmitted alignment copy. `alignment` must be a
+    /// power of two no greater than Arrow's native allocation alignment. An aligned
+    /// input stays zero-copy; otherwise the full copy must fit in `workspace`.
+    /// Refusal leaves the input and workspace unchanged for draining/replanning.
+    ///
+    /// This accounts only new copies. The input's physical backing owner must already
+    /// carry its reservation, e.g. from an admitted read; its visible length cannot
+    /// establish that charge. Empty inputs also produce a correctly aligned pointer.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::buffer::LanceBuffer;
+    /// let budget = AllocationBudget::new(8);
+    /// let mut workspace = budget.try_reserve(8).unwrap();
+    /// let input = workspace.try_allocate(8).unwrap().unwrap().freeze();
+    /// let output = LanceBuffer::try_from_bytes_in(&input, 8, &mut workspace).unwrap().unwrap();
+    /// assert_eq!(output.as_ptr(), input.as_ptr());
+    /// drop(input);
+    /// assert_eq!(budget.reserved(), 8);
+    /// drop(output);
+    /// assert_eq!(budget.reserved(), 0);
+    /// ```
+    pub fn try_from_bytes_in(
+        bytes: &bytes::Bytes,
+        alignment: usize,
+        workspace: &mut Reservation,
+    ) -> Result<Option<Self>> {
+        if !alignment.is_power_of_two() || alignment > arrow_buffer::alloc::ALIGNMENT {
+            return Err(Error::invalid_input(format!(
+                "buffer alignment {alignment} must be a power of two no greater than {}",
+                arrow_buffer::alloc::ALIGNMENT
+            )));
+        }
+        if bytes.as_ptr().align_offset(alignment) == 0 {
+            return Ok(Some(Self(Buffer::from(bytes.clone()))));
+        }
+        let Some(mut output) = workspace.try_allocate(bytes.len())? else {
+            return Ok(None);
+        };
+        output.as_mut().copy_from_slice(bytes);
+        Ok(Some(Self(Buffer::from(output.freeze()))))
     }
 
     /// Converts the buffer into a hex string, inserting a space
@@ -408,10 +488,114 @@ impl IntoIterator for LanceBuffer {
 
 #[cfg(test)]
 mod tests {
-    use arrow_buffer::Buffer;
-    use lance_core::Error;
+    use arrow_array::Float64Array;
+    use arrow_buffer::{Buffer, ScalarBuffer};
+    use lance_core::{Error, utils::allocation::AllocationBudget};
+    use rstest::rstest;
 
     use super::LanceBuffer;
+
+    #[rstest]
+    #[case::zero_copy(false)]
+    #[case::alignment_copy(true)]
+    fn admitted_conversion_preserves_backing_owner_and_overlap(#[case] unaligned: bool) {
+        let budget = AllocationBudget::new(25);
+        let mut workspace = budget.try_reserve(25).unwrap();
+        let mut source = workspace.try_allocate(17).unwrap().unwrap();
+        let offset = usize::from(unaligned);
+        source.as_mut()[offset..offset + 8].copy_from_slice(&3.5_f64.to_ne_bytes());
+        let source = source.freeze();
+        let input = source.slice(offset..offset + 8);
+        drop(source);
+        assert_eq!(budget.reserved(), 25);
+        // No remaining credit may be silently replaced with an uncharged copy.
+        let mut no_headroom = workspace.try_split(0).unwrap();
+        let refused = LanceBuffer::try_from_bytes_in(&input, 8, &mut no_headroom).unwrap();
+        assert_eq!(refused.is_none(), unaligned);
+        drop(refused);
+        let output = LanceBuffer::try_from_bytes_in(&input, 8, &mut workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.as_ptr() == input.as_ptr(), !unaligned);
+        assert_eq!(output.as_ptr().align_offset(8), 0);
+        assert_eq!(workspace.len(), if unaligned { 0 } else { 8 });
+        let array = Float64Array::new(ScalarBuffer::new(output.into_buffer(), 0, 1), None);
+        assert_eq!(array, Float64Array::from(vec![3.5]));
+        let last = array.slice(0, 1);
+        drop(array);
+        drop(workspace);
+        assert_eq!(budget.reserved(), if unaligned { 25 } else { 17 });
+        drop(input);
+        assert_eq!(budget.reserved(), if unaligned { 8 } else { 17 });
+        drop(last);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn admitted_concat_counts_shared_inputs_once_and_keeps_full_output_owner() {
+        let budget = AllocationBudget::new(16);
+        let mut workspace = budget.try_reserve(16).unwrap();
+        let mut source = workspace.try_allocate(8).unwrap().unwrap();
+        source.as_mut().copy_from_slice(b"abcdefgh");
+        let source = source.freeze();
+        let inputs = [
+            LanceBuffer::try_from_bytes_in(&source.slice(4..8), 1, &mut workspace)
+                .unwrap()
+                .unwrap(),
+            LanceBuffer::try_from_bytes_in(&source.slice(0..4), 1, &mut workspace)
+                .unwrap()
+                .unwrap(),
+        ];
+        drop(source);
+        let mut short_workspace = workspace.try_split(7).unwrap();
+        assert!(
+            LanceBuffer::try_concat_in(&inputs, &mut short_workspace)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(short_workspace.len(), 7);
+        drop(short_workspace);
+        // The refused request did not allocate or detach either input's owner.
+        assert_eq!(budget.reserved(), 9);
+        drop(workspace);
+        let mut workspace = budget.try_reserve(8).unwrap();
+        let output = LanceBuffer::try_concat_in(&inputs, &mut workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.as_ref(), b"efghabcd");
+        assert_eq!(budget.reserved(), 16);
+        let last = output.into_buffer().slice_with_length(1, 1);
+        drop(inputs);
+        assert_eq!(budget.reserved(), 8);
+        assert!(budget.try_reserve(9).is_none());
+        assert_eq!(last.as_slice(), b"f");
+        drop(last);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn admitted_empty_buffers_are_typed_and_invalid_alignment_preserves_credit() {
+        let budget = AllocationBudget::new(0);
+        let mut workspace = budget.try_reserve(0).unwrap();
+        let bytes = bytes::Bytes::new();
+        for alignment in [0, 3, arrow_buffer::alloc::ALIGNMENT * 2] {
+            let error =
+                LanceBuffer::try_from_bytes_in(&bytes, alignment, &mut workspace).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("buffer alignment"));
+        }
+        let converted = LanceBuffer::try_from_bytes_in(&bytes, 8, &mut workspace)
+            .unwrap()
+            .unwrap();
+        let concatenated = LanceBuffer::try_concat_in(&[], &mut workspace)
+            .unwrap()
+            .unwrap();
+        for output in [converted, concatenated] {
+            let array = Float64Array::new(ScalarBuffer::new(output.into_buffer(), 0, 0), None);
+            assert!(array.is_empty());
+        }
+        assert_eq!(budget.reserved(), 0);
+    }
 
     #[test]
     fn test_eq() {

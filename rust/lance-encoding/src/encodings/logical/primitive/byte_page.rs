@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Explicit dispatch for admitted byte arrays, without ordinary decoder fallback.
+
+use std::{future::Future, ops::Range, sync::Arc};
+
+use arrow_array::ArrayRef;
+use arrow_schema::DataType;
+use lance_core::{
+    Result,
+    utils::allocation::{Reservation, ReservedBuffer},
+};
+
+use super::{
+    FullZipArrayInput, FullZipScheduler,
+    constant::{ConstantArrayInput, ConstantArrayScheduler},
+    miniblock_decode::{MiniBlockArrayInput, MiniBlockArrayScheduler},
+    sparse::admitted_lists::{NullListInput, NullListScheduler},
+};
+use crate::{
+    compression::DecompressionStrategy,
+    decoder::{PageEncoding, PageInfo},
+    format::metadata::page_layout::Layout,
+};
+
+mod all_null;
+use all_null::{AllNullInput, AllNullScheduler};
+
+#[derive(Debug)]
+enum Scheduler {
+    NullList(NullListScheduler),
+    AllNull(AllNullScheduler),
+    FullZip(Arc<FullZipScheduler>),
+    Constant(Arc<ConstantArrayScheduler>),
+    MiniBlock(MiniBlockArrayScheduler),
+}
+
+/// Metadata-only dispatch for admitted byte/string pages.
+/// MiniBlock byte/string pages, including List/LargeList nesting, use bounded
+/// chunk-metadata and two-word repetition-index windows and read only selected chunks.
+/// Full index traversal validates the row/item/data domain; selected repetition
+/// summaries are checked against charged decoded levels before reconstruction.
+/// Raw variable-width page dictionaries validate offsets in bounded windows and
+/// expand only selected entries, with indices, selected ranges, I/O scratch and
+/// output sharing the original workspace. Default LZ4 dictionaries use two full
+/// streaming passes with at most 64 KiB history and 4 KiB input scratch, retaining
+/// only selected records and values. This trades extra I/O/CPU for bounded payload
+/// storage; performance is not yet qualified. Other dictionary codecs and deeper
+/// repetition-index formats are not supported. Dictionary index decoding runs
+/// on the CPU pool before dependent async value reads; reconstruction stays in the
+/// caller's final decode job. No CPU job waits on I/O or additional credit.
+/// Dense FullZip and Constant pages support List/LargeList nesting. Flat all-null
+/// pages require metadata-only validity. V2_3 List chains with null byte leaves
+/// support metadata or Flat/Bitpacked/Delta parent validity, nonempty positions,
+/// and counts. RLE counts support windowable unsigned value/run-length children.
+/// Dictionary counts charge their bounded lookup table and windowed child input.
+/// The leaf must still prove all-null from metadata. Payloads use
+/// bounded I/O windows; selected positions, validity and prefixes remain charged
+/// alongside output construction. Position capacity is bounded by selected parent rows.
+/// Empty/null/nonempty parents stay distinct. Other layouts return an error without
+/// unadmitted decoding fallback. Metadata itself is not charged.
+#[derive(Debug)]
+pub struct AdmittedBytePageScheduler(Scheduler);
+
+impl AdmittedBytePageScheduler {
+    /// Validate the stored layout before payload reads. Use with
+    /// [`Self::prepare_array_range_in`] inside an existing operation reservation.
+    pub fn try_from_page(page: &PageInfo, codecs: &dyn DecompressionStrategy) -> Result<Self> {
+        if let Some(scheduler) = NullListScheduler::try_from_page(page)? {
+            return Ok(Self(Scheduler::NullList(scheduler)));
+        }
+        if let Some(scheduler) = AllNullScheduler::try_from_page(page)? {
+            return Ok(Self(Scheduler::AllNull(scheduler)));
+        }
+        let planar;
+        let layout = match &page.encoding {
+            PageEncoding::Structural(layout) => Some(layout),
+            PageEncoding::Planar(layout) if layout.sparse().is_none() => {
+                planar = layout.dense_execution_layout()?;
+                Some(&planar)
+            }
+            _ => None,
+        };
+        if let Some(Layout::ConstantLayout(layout)) =
+            layout.and_then(|layout| layout.layout.as_ref())
+        {
+            Ok(Self(Scheduler::Constant(Arc::new(
+                ConstantArrayScheduler::try_new(page, layout)?,
+            ))))
+        } else if let Some(Layout::MiniBlockLayout(layout)) =
+            layout.and_then(|layout| layout.layout.as_ref())
+        {
+            Ok(Self(Scheduler::MiniBlock(
+                MiniBlockArrayScheduler::try_new(page, layout, codecs)?,
+            )))
+        } else {
+            Ok(Self(Scheduler::FullZip(Arc::new(
+                FullZipScheduler::try_from_page(page, codecs)?,
+            ))))
+        }
+    }
+
+    /// Check the projected Arrow shape without payload I/O or allocation.
+    pub fn validate_array_type(&self, data_type: &DataType) -> Result<()> {
+        match &self.0 {
+            Scheduler::NullList(scheduler) => scheduler.validate_array_type(data_type),
+            Scheduler::AllNull(scheduler) => scheduler.validate_array_type(data_type),
+            Scheduler::FullZip(scheduler) => scheduler.validate_array_type(data_type),
+            Scheduler::Constant(scheduler) => scheduler.validate_array_type(data_type),
+            Scheduler::MiniBlock(scheduler) => scheduler.validate_array_type(data_type),
+        }
+    }
+
+    /// Prepare two to sixteen independent small FullZip selections in two I/O
+    /// phases: index endpoints, then selected payloads. Requests share one file
+    /// and priority established by the caller; returned inputs retain order.
+    ///
+    /// `None` means this optimization does not apply, with all scratch returned
+    /// to the original workspace. The caller may then prepare ranges singly.
+    /// It is not EOF. Errors/cancellation discard the entire compound attempt.
+    /// No payload copy, read-ahead, new admission or persistent cache is added.
+    /// Output reconstruction still needs headroom in the same workspace.
+    /// Callbacks must return the supplied allocations unchanged and in order;
+    /// transport and bounded request metadata are outside payload accounting.
+    ///
+    /// ```
+    /// use std::{ops::Range, sync::Arc};
+    /// use arrow_schema::DataType;
+    /// use lance_core::{Result, utils::allocation::Reservation};
+    /// use lance_encoding::{EncodingsIo, encodings::logical::primitive::AdmittedBytePageScheduler};
+    /// async fn prepare(pages: &[(Arc<AdmittedBytePageScheduler>, Range<u64>, DataType)],
+    ///     io: &dyn EncodingsIo, work: &mut Reservation) -> Result<()> {
+    ///     let inputs = AdmittedBytePageScheduler::try_prepare_fullzip_batch_in(
+    ///         pages, work, |requests| io.submit_many_into(requests, 0)).await?;
+    ///     drop(inputs); // Or decode with this same workspace.
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn try_prepare_fullzip_batch_in<F, Fut>(
+        requests: &[(Arc<Self>, Range<u64>, DataType)],
+        workspace: &mut Reservation,
+        read: F,
+    ) -> Result<Option<Vec<AdmittedBytePageInput>>>
+    where
+        F: FnMut(Vec<(Range<u64>, ReservedBuffer)>) -> Fut,
+        Fut: Future<Output = Result<Vec<ReservedBuffer>>>,
+    {
+        if !(2..=16).contains(&requests.len()) {
+            return Ok(None);
+        }
+        let mut fullzip = Vec::with_capacity(requests.len());
+        for (page, rows, data_type) in requests {
+            let Scheduler::FullZip(scheduler) = &page.0 else {
+                return Ok(None);
+            };
+            fullzip.push((scheduler.clone(), rows.clone(), data_type.clone()));
+        }
+        Ok(
+            super::fullzip_decode::array_admitted::batch::prepare(fullzip, workspace, read)
+                .await?
+                .map(|inputs| {
+                    inputs
+                        .into_iter()
+                        .map(|input| AdmittedBytePageInput(Input::FullZip(input)))
+                        .collect()
+                }),
+        )
+    }
+
+    /// Prepare one exact nonempty page-local range using caller-owned I/O buffers.
+    /// `None` requires dropping/replanning the complete attempt. All input, output
+    /// and assembly must use this same reservation; no additional credit is awaited.
+    /// Constant list boundaries use bounded scratch, not a whole-page level cache.
+    /// Transport/cache and metadata overhead are outside this payload accounting.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_schema::DataType;
+    /// use lance_core::{Result, utils::allocation::Reservation};
+    /// use lance_encoding::{EncodingsIo, encodings::logical::primitive::AdmittedBytePageScheduler};
+    /// async fn prepare(page: &AdmittedBytePageScheduler, io: Arc<dyn EncodingsIo>,
+    ///     work: &mut Reservation) -> Result<()> {
+    ///     let input = page.prepare_array_range_in(0..1, DataType::Binary, work,
+    ///         |range, buffer| io.submit_single_into(range, 0, buffer)).await?;
+    ///     drop(input); // or move into the caller's one outer CPU decode job
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn prepare_array_range_in<F, Fut>(
+        &self,
+        rows: Range<u64>,
+        data_type: DataType,
+        workspace: &mut Reservation,
+        read: F,
+    ) -> Result<Option<AdmittedBytePageInput>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        Ok(match &self.0 {
+            Scheduler::NullList(scheduler) => scheduler
+                .prepare(rows, data_type, workspace, read)
+                .await?
+                .map(|input| AdmittedBytePageInput(Input::NullList(input))),
+            Scheduler::AllNull(scheduler) => Some(AdmittedBytePageInput(Input::AllNull(
+                scheduler.prepare(rows, data_type)?,
+            ))),
+            Scheduler::FullZip(scheduler) => scheduler
+                .clone()
+                .prepare_array_range_in(rows, data_type, workspace, read)
+                .await?
+                .map(|input| AdmittedBytePageInput(Input::FullZip(input))),
+            Scheduler::MiniBlock(scheduler) => scheduler
+                .prepare(rows, data_type, workspace, read)
+                .await?
+                .map(|input| AdmittedBytePageInput(Input::MiniBlock(input))),
+            Scheduler::Constant(scheduler) => scheduler
+                .prepare(rows, data_type, workspace, read)
+                .await?
+                .map(|input| AdmittedBytePageInput(Input::Constant(input))),
+        })
+    }
+}
+
+#[derive(Debug)]
+enum Input {
+    NullList(NullListInput),
+    AllNull(AllNullInput),
+    FullZip(FullZipArrayInput),
+    Constant(ConstantArrayInput),
+    MiniBlock(MiniBlockArrayInput),
+}
+
+/// Charged page input prepared by [`AdmittedBytePageScheduler`].
+/// Dropping it releases its physical buffers, including on cancellation.
+#[derive(Debug)]
+pub struct AdmittedBytePageInput(Input);
+
+impl AdmittedBytePageInput {
+    /// Estimate byte-pass work for shallow, uncompressed FullZip input only.
+    /// `None` leaves scheduling to the CPU pool. The estimate includes structural
+    /// passes and row/array overhead; it is not an allocation or duration bound.
+    /// It never decodes payload or replaces [`Self::decode_in`]'s validation.
+    ///
+    /// ```
+    /// use lance_encoding::encodings::logical::primitive::AdmittedBytePageInput;
+    /// fn known_work(input: &AdmittedBytePageInput) -> Option<usize> {
+    ///     input.decode_work_estimate()
+    /// }
+    /// ```
+    pub fn decode_work_estimate(&self) -> Option<usize> {
+        match &self.0 {
+            Input::FullZip(input) => input.decode_work_estimate(),
+            _ => None,
+        }
+    }
+
+    /// Consume input and reconstruct Arrow within its original workspace.
+    /// Pure CPU work: no I/O, nested dispatch, additional admission or waits.
+    /// `None` means discard/replan the whole operation, never partial success.
+    pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<ArrayRef>> {
+        match self.0 {
+            Input::NullList(input) => input.decode_in(workspace),
+            Input::AllNull(input) => input.decode_in(workspace),
+            Input::FullZip(input) => input.decode_in(workspace),
+            Input::Constant(input) => input.decode_in(workspace),
+            Input::MiniBlock(input) => input.decode_in(workspace),
+        }
+    }
+}

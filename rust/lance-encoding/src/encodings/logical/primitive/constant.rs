@@ -27,6 +27,10 @@ use crate::{
     repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level},
 };
 
+mod admitted;
+mod admitted_input;
+pub(super) use admitted_input::{ConstantArrayInput, ConstantArrayScheduler};
+
 pub(crate) fn encode_constant_page(
     column_idx: u32,
     scalar: ArrayRef,
@@ -513,6 +517,13 @@ impl DecodeConstantTask {
 }
 
 impl crate::decoder::DecodePageTask for DecodeConstantTask {
+    fn try_decode_in(
+        &self,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<crate::decoder::DecodedPage>> {
+        admitted::decode(self, workspace)
+    }
+
     fn decode(self: Box<Self>) -> Result<crate::decoder::DecodedPage> {
         let rep = Self::slice_levels(&self.rep, &self.level_slices);
         let def = Self::slice_levels(&self.def, &self.level_slices);

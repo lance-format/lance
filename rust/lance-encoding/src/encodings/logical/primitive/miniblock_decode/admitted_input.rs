@@ -1,0 +1,479 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Prepare selected MiniBlock chunks without an uncharged page index/cache.
+
+use std::{future::Future, ops::Range, sync::Arc};
+
+use arrow_array::ArrayRef;
+use arrow_schema::DataType;
+use lance_core::{
+    Error, Result,
+    utils::{
+        allocation::{Reservation, ReservedBuffer},
+        tokio::spawn_cpu,
+    },
+};
+
+use super::{
+    ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, LoadedChunk,
+    MINIBLOCK_ALIGNMENT, MiniBlockScheduler, PreambleAction,
+};
+use crate::{
+    buffer::LanceBuffer,
+    compression::DecompressionStrategy,
+    decoder::{DecodedPage, PageInfo},
+    encodings::logical::primitive::fullzip_decode::array_admitted::Shape,
+    format::metadata::MiniBlockLayout,
+    repdef::{RepDefUnraveler, max_visible_level},
+};
+
+mod dictionary;
+mod nested;
+
+use dictionary::Dictionary;
+
+use nested::RepetitionSummary;
+
+fn corrupt(message: &str) -> Error {
+    Error::corrupt_file_named("MiniBlock input", message)
+}
+
+#[derive(Debug)]
+pub(in super::super) struct MiniBlockArrayScheduler {
+    decoder: Arc<MiniBlockScheduler>,
+    metadata: Range<u64>,
+    data: Range<u64>,
+    rows: u64,
+    items: u64,
+    repetition: Option<Range<u64>>,
+    dictionary: Option<Dictionary>,
+}
+
+#[derive(Debug)]
+struct Selection {
+    index: usize,
+    bytes: Range<u64>,
+    items: u64,
+    rows: Range<u64>,
+    preamble: PreambleAction,
+    take_trailer: bool,
+    repetition: Option<RepetitionSummary>,
+}
+
+impl MiniBlockArrayScheduler {
+    pub(in super::super) fn try_new(
+        page: &PageInfo,
+        layout: &MiniBlockLayout,
+        codecs: &dyn DecompressionStrategy,
+    ) -> Result<Self> {
+        if layout.repetition_index_depth > 1 {
+            return Err(Error::not_supported(
+                "admitted MiniBlock input does not yet support deeper repetition indexes",
+            ));
+        }
+        let nested = layout.repetition_index_depth == 1;
+        if nested != layout.rep_compression.is_some() {
+            return Err(corrupt(
+                "repetition index and level codec must appear together",
+            ));
+        }
+        if page.buffer_offsets_and_sizes.len()
+            != 2 + usize::from(nested) + usize::from(layout.dictionary.is_some())
+            || layout.num_buffers == 0
+            || layout.value_compression.is_none()
+            || (!nested && layout.num_items != page.num_rows)
+            || page.num_rows == 0
+            || layout.num_items == 0
+        {
+            return Err(corrupt(
+                "page requires metadata/data buffers, a value codec, nonzero row/item counts and an index buffer only for nested pages",
+            ));
+        }
+        let mut ranges = page.buffer_offsets_and_sizes.iter().map(|(start, len)| {
+            start
+                .checked_add(*len)
+                .map(|end| *start..end)
+                .ok_or_else(|| corrupt("buffer range overflows"))
+        });
+        let metadata = ranges.next().ok_or_else(|| corrupt("missing metadata"))??;
+        let data = ranges.next().ok_or_else(|| corrupt("missing data"))??;
+        let dictionary = layout
+            .dictionary
+            .as_ref()
+            .map(|encoding| {
+                let range = ranges
+                    .next()
+                    .ok_or_else(|| corrupt("missing dictionary buffer"))??;
+                Dictionary::try_new(encoding, range, layout.num_dictionary_items)
+            })
+            .transpose()?;
+        let repetition = ranges.next().transpose()?;
+        let width = if layout.has_large_chunk { 4 } else { 2 };
+        if metadata.is_empty() || (metadata.end - metadata.start) % width != 0 {
+            return Err(corrupt(
+                "metadata must contain complete nonempty chunk words",
+            ));
+        }
+        if repetition.as_ref().is_some_and(|range| {
+            ((metadata.end - metadata.start) / width).checked_mul(16)
+                != Some(range.end - range.start)
+        }) {
+            return Err(corrupt(
+                "repetition index must have two u64 words per chunk",
+            ));
+        }
+        let decoder = MiniBlockScheduler::try_new(
+            &page.buffer_offsets_and_sizes,
+            page.priority,
+            layout.num_items,
+            layout,
+            codecs,
+        )?;
+        RepDefUnraveler::validate_dense_levels(None, None, &decoder.def_meaning)?;
+        if !nested && (decoder.def_meaning.len() != 1 || decoder.def_meaning[0].is_list()) {
+            return Err(Error::not_supported(
+                "admitted flat MiniBlock input requires one non-list layer",
+            ));
+        }
+        Ok(Self {
+            decoder: Arc::new(decoder),
+            metadata,
+            data,
+            rows: page.num_rows,
+            items: layout.num_items,
+            repetition,
+            dictionary,
+        })
+    }
+
+    pub(in super::super) fn validate_array_type(&self, data_type: &DataType) -> Result<()> {
+        Shape::from_layers(data_type, &self.decoder.def_meaning, None).map(|_| ())
+    }
+
+    // Validate every metadata word, including the unselected suffix. Retain only
+    // selected routing descriptors; payload scratch never grows with page size.
+    async fn selections<F, Fut>(
+        &self,
+        rows: &Range<u64>,
+        work: &mut Reservation,
+        read: &mut F,
+    ) -> Result<Option<Vec<Selection>>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        let width = if self.decoder.has_large_chunk { 4 } else { 2 };
+        let count = (self.metadata.end - self.metadata.start) / width;
+        let mut position = self.metadata.start;
+        let mut index = 0_u64;
+        let mut item = 0_u64;
+        let mut byte = self.data.start;
+        let mut selected = Vec::new();
+        let available = work.len() as u64;
+        let mut selected_bytes = 0_u64;
+        let mut fits = true;
+        while position < self.metadata.end {
+            let len = (self.metadata.end - position).min(4096) as usize;
+            let Some(scratch) = work.try_allocate(len)? else {
+                return Ok(None);
+            };
+            let scratch = read(position..position + len as u64, scratch).await?;
+            if scratch.as_ref().len() != len {
+                return Err(corrupt("metadata read length mismatch"));
+            }
+            for word in scratch.as_ref().chunks_exact(width as usize) {
+                let mut bytes = [0; 4];
+                bytes[..word.len()].copy_from_slice(word);
+                let word = u32::from_le_bytes(bytes);
+                let log = word & 15;
+                let items = if index + 1 == count {
+                    let remainder = self
+                        .rows
+                        .checked_sub(item)
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| corrupt("chunk item counts exceed page rows"))?;
+                    if log != 0 && (1_u64 << log) != remainder {
+                        return Err(corrupt("final chunk count disagrees with page rows"));
+                    }
+                    remainder
+                } else {
+                    if log == 0 {
+                        return Err(corrupt("non-final chunk has zero count exponent"));
+                    }
+                    1_u64 << log
+                };
+                let end_item = item
+                    .checked_add(items)
+                    .filter(|n| *n <= self.rows)
+                    .ok_or_else(|| corrupt("chunk item counts exceed page rows"))?;
+                let size = (u64::from(word >> 4) + 1) * MINIBLOCK_ALIGNMENT as u64;
+                let end_byte = byte
+                    .checked_add(size)
+                    .filter(|n| *n <= self.data.end)
+                    .ok_or_else(|| corrupt("chunk byte sizes exceed data buffer"))?;
+                let start = rows.start.max(item);
+                let end = rows.end.min(end_item);
+                if start < end {
+                    selected_bytes = selected_bytes
+                        .checked_add(size)
+                        .ok_or_else(|| corrupt("selected input size overflows"))?;
+                    if fits && selected_bytes > available {
+                        // Continue validating the suffix, without retaining a routing
+                        // table for an attempt that cannot admit its selected input.
+                        selected.clear();
+                        fits = false;
+                    }
+                }
+                if start < end && fits {
+                    selected.push(Selection {
+                        index: usize::try_from(index)
+                            .map_err(|_| corrupt("chunk index exceeds usize"))?,
+                        bytes: byte..end_byte,
+                        items,
+                        rows: start - item..end - item,
+                        preamble: PreambleAction::Absent,
+                        take_trailer: false,
+                        repetition: None,
+                    });
+                }
+                item = end_item;
+                byte = end_byte;
+                index += 1;
+            }
+            scratch.recycle(work)?;
+            position += len as u64;
+            // Cached/in-memory I/O can complete immediately across every window.
+            tokio::task::yield_now().await;
+        }
+        if byte != self.data.end || item != self.rows {
+            return Err(corrupt(
+                "chunk metadata does not cover the exact data/row domain",
+            ));
+        }
+        Ok(fits.then_some(selected))
+    }
+
+    pub(in super::super) async fn prepare<F, Fut>(
+        &self,
+        rows: Range<u64>,
+        data_type: DataType,
+        work: &mut Reservation,
+        mut read: F,
+    ) -> Result<Option<MiniBlockArrayInput>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        self.validate_array_type(&data_type)?;
+        if rows.start >= rows.end || rows.end > self.rows {
+            return Err(Error::invalid_input(
+                "MiniBlock input range must be nonempty and within page rows",
+            ));
+        }
+        let selected = if let Some(repetition) = &self.repetition {
+            self.nested_selections(&rows, repetition, work, &mut read)
+                .await?
+        } else {
+            self.selections(&rows, work, &mut read).await?
+        };
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let required = selected.iter().try_fold(0_usize, |sum, chunk| {
+            usize::try_from(chunk.bytes.end - chunk.bytes.start)
+                .ok()
+                .and_then(|bytes| sum.checked_add(bytes))
+                .ok_or_else(|| corrupt("selected input size overflows"))
+        })?;
+        if required > work.len() {
+            return Ok(None);
+        }
+        let mut instructions = Vec::with_capacity(selected.len());
+        let mut repetition = Vec::new();
+        for chunk in selected {
+            let len = usize::try_from(chunk.bytes.end - chunk.bytes.start)
+                .map_err(|_| corrupt("chunk length exceeds usize"))?;
+            let output = work
+                .try_allocate(len)?
+                .ok_or_else(|| Error::internal("MiniBlock input preflight changed"))?;
+            let output = read(chunk.bytes.clone(), output).await?;
+            if output.as_ref().len() != len {
+                return Err(corrupt("chunk read length mismatch"));
+            }
+            let take = chunk.rows.end - chunk.rows.start;
+            if let Some(summary) = chunk.repetition {
+                repetition.push(summary);
+            }
+            instructions.push((
+                ChunkDrainInstructions {
+                    chunk_instructions: ChunkInstructions {
+                        chunk_idx: chunk.index,
+                        preamble: chunk.preamble,
+                        rows_to_skip: chunk.rows.start,
+                        rows_to_take: take,
+                        take_trailer: chunk.take_trailer,
+                    },
+                    rows_to_skip: 0,
+                    rows_to_take: take,
+                    preamble_action: chunk.preamble,
+                },
+                LoadedChunk {
+                    data: LanceBuffer::from_bytes(output.freeze(), 1),
+                    items_in_chunk: chunk.items,
+                    byte_range: chunk.bytes,
+                    chunk_idx: chunk.index,
+                },
+            ));
+        }
+        let input = EncodedArrayInput {
+            task: DecodeMiniBlockTask {
+                structural_projection: None,
+                dictionary_data: None,
+                rep_decompressor: self.decoder.rep_decompressor.clone(),
+                def_decompressor: self.decoder.def_decompressor.clone(),
+                value_decompressor: self.decoder.value_decompressor.clone(),
+                def_meaning: self.decoder.def_meaning.clone(),
+                num_buffers: self.decoder.num_buffers,
+                max_visible_level: max_visible_level(&self.decoder.def_meaning),
+                instructions,
+                has_large_chunk: self.decoder.has_large_chunk,
+            },
+            data_type,
+            count: rows.end - rows.start,
+            repetition,
+        };
+        let Some(dictionary) = &self.dictionary else {
+            return Ok(Some(MiniBlockArrayInput::Encoded(input)));
+        };
+        let data_type = input.data_type.clone();
+        let count = input.count;
+        let meanings = input.task.def_meaning.clone();
+        let shape = Shape::from_layers(&data_type, &meanings, None)?;
+        let output_bits = match shape.leaf {
+            DataType::Binary | DataType::Utf8 => 32,
+            _ => 64, // Shape has already rejected every other leaf type.
+        };
+        // Move the existing credit across the CPU boundary; no second admission
+        // can wait while these inputs are retained. Cancellation keeps ownership
+        // with the real CPU job until it finishes.
+        let empty = work
+            .try_split(0)
+            .ok_or_else(|| Error::internal("zero-credit transfer failed"))?;
+        let mut owned = std::mem::replace(work, empty);
+        let (page, returned) = spawn_cpu(move || {
+            let page = input.decode_page(&mut owned);
+            Ok::<_, Error>((page, owned))
+        })
+        .await?;
+        *work = returned;
+        let Some(mut page) = page? else {
+            return Ok(None);
+        };
+        let crate::data::DataBlock::FixedWidth(indices) = &page.data else {
+            return Err(corrupt(
+                "dictionary chunk decoder must produce fixed-width indices",
+            ));
+        };
+        let Some(data) = dictionary
+            .expand(indices, output_bits, work, &mut read)
+            .await?
+        else {
+            return Ok(None);
+        };
+        page.data = data;
+        Ok(Some(MiniBlockArrayInput::Decoded {
+            page,
+            data_type,
+            count,
+            meanings,
+        }))
+    }
+}
+
+pub(in super::super) enum MiniBlockArrayInput {
+    Encoded(EncodedArrayInput),
+    Decoded {
+        page: DecodedPage,
+        data_type: DataType,
+        count: u64,
+        meanings: Arc<[crate::repdef::DefinitionInterpretation]>,
+    },
+}
+
+impl std::fmt::Debug for MiniBlockArrayInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Encoded(_) => "MiniBlockArrayInput::Encoded",
+            Self::Decoded { .. } => "MiniBlockArrayInput::Decoded",
+        })
+    }
+}
+
+impl MiniBlockArrayInput {
+    pub(in super::super) fn decode_in(self, work: &mut Reservation) -> Result<Option<ArrayRef>> {
+        let (page, data_type, count, meanings) = match self {
+            Self::Encoded(input) => {
+                let data_type = input.data_type.clone();
+                let count = input.count;
+                let meanings = input.task.def_meaning.clone();
+                let Some(page) = input.decode_page(work)? else {
+                    return Ok(None);
+                };
+                (page, data_type, count, meanings)
+            }
+            Self::Decoded {
+                page,
+                data_type,
+                count,
+                meanings,
+            } => (page, data_type, count, meanings),
+        };
+        Shape::from_layers(&data_type, &meanings, None)?.finish(page, count, work)
+    }
+}
+
+#[derive(Debug)]
+pub(in super::super) struct EncodedArrayInput {
+    task: DecodeMiniBlockTask,
+    data_type: DataType,
+    count: u64,
+    repetition: Vec<RepetitionSummary>,
+}
+
+impl EncodedArrayInput {
+    fn decode_page(self, work: &mut Reservation) -> Result<Option<DecodedPage>> {
+        if !self.repetition.is_empty() && self.repetition.len() != self.task.instructions.len() {
+            return Err(corrupt("nested input summary count mismatch"));
+        }
+        for (_, chunk) in &self.task.instructions {
+            let sections = DecodeMiniBlockTask::split_miniblock_chunk(
+                &chunk.data,
+                self.task.rep_decompressor.is_some(),
+                self.task.def_decompressor.is_some(),
+                self.task.num_buffers,
+                self.task.has_large_chunk,
+            )?;
+            // The count is meaningful only with structural buffers: the writer
+            // emits zero when rep/def are absent. With flat definition levels,
+            // chunk metadata independently proves the possibly wrapped u16 count.
+            if self.task.rep_decompressor.is_none()
+                && self.task.def_decompressor.is_some()
+                && u64::from(sections.num_levels) != chunk.items_in_chunk % 65536
+            {
+                return Err(corrupt("chunk level header disagrees with flat item count"));
+            }
+        }
+        let validate = |index, levels: Option<&[u16]>| self.validate_repetition(index, levels);
+        let validator: Option<&super::admitted::ValidateRepetition<'_>> =
+            (!self.repetition.is_empty()).then_some(&validate);
+        let page = super::admitted::decode(&self.task, work, validator)?;
+        // Shared raw output may still retain a chunk owner. Never refund input
+        // credit to this workspace while an output alias can keep it alive.
+        drop(self.task);
+        Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod tests;

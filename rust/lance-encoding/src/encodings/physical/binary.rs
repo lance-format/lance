@@ -15,8 +15,9 @@ use byteorder::{ByteOrder, LittleEndian};
 use prost::Message;
 
 use crate::compression::{
-    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
-    create_fixed_width_block_decompressor, infer_fixed_width_block_bits, require_block_payload,
+    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, PerValueDecodeBudget,
+    VariablePerValueDecompressor, create_fixed_width_block_decompressor,
+    infer_fixed_width_block_bits, require_block_payload,
 };
 
 use crate::buffer::LanceBuffer;
@@ -32,6 +33,7 @@ use crate::format::metadata::CompressiveEncoding;
 use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 
+use lance_core::utils::allocation::Reservation;
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
 
@@ -625,6 +627,16 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     }
 }
 
+mod admitted;
+
+/// Binary MiniBlock decoder. Flat offsets, still emitted by the current writer,
+/// support admitted range decoding with copied values and normalized offsets.
+/// Metadata-only Range, Constant and Delta(Constant) offsets are evaluated without
+/// expanding the complete offset array. Flat and out-of-line bitpacked payloads,
+/// including their Delta composition, are visited without alignment or decoded
+/// offset buffers. Input ownership is charged separately. Other offset codecs
+/// remain unsupported by the opt-in admission API.
+/// Ordinary decoding is unchanged.
 #[derive(Debug)]
 pub struct BinaryMiniBlockDecompressor {
     layout: BinaryMiniBlockLayout,
@@ -868,6 +880,61 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
 }
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
+    fn visit_binary_values(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        admitted::visit(self, data, num_values, visitor)
+    }
+
+    fn try_prepare_range_in<'a>(
+        &'a self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<crate::compression::PreparedMiniBlockRange<'a>>> {
+        admitted::prepared::prepare(self, data, num_values, range, workspace)
+    }
+
+    fn try_prepare_and_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        match self.try_prepare_range_in(data, num_values, range, workspace)? {
+            Some(plan) => plan.try_decode(workspace),
+            None => Ok(None),
+        }
+    }
+
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        admitted::layout(self)
+    }
+
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        Ok(admitted::plan(self, data, num_values, range)?.budget)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         match self.layout {
             BinaryMiniBlockLayout::Legacy { .. } => 1,
@@ -1226,6 +1293,38 @@ impl PerValueCompressor for VariableEncoder {
 pub struct VariableDecoder {}
 
 impl VariablePerValueDecompressor for VariableDecoder {
+    fn is_identity(&self) -> bool {
+        true
+    }
+
+    fn supports_direct_byte_materialization(&self) -> bool {
+        true
+    }
+
+    fn try_reuse_admitted_input(&self, data: &VariableWidthBlock) -> Result<Option<DataBlock>> {
+        crate::compression::variable::reuse(data)
+    }
+
+    fn plan_decode(&self, data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
+        crate::compression::variable::plan(data)
+    }
+
+    fn try_decompress_in(
+        &self,
+        data: &VariableWidthBlock,
+        workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        crate::compression::variable::decode(data, workspace)
+    }
+
+    fn visit_binary_values(
+        &self,
+        data: &VariableWidthBlock,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        crate::compression::variable::visit(data, visitor)
+    }
+
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         Ok(DataBlock::VariableWidth(data))
     }
@@ -1396,6 +1495,9 @@ impl BlockDecompressor for BinaryBlockDecompressor {
         }))
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 #[cfg(test)]
 mod tests {

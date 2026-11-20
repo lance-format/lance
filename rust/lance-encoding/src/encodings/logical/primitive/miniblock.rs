@@ -88,6 +88,7 @@ impl MiniBlockCompressionContext {
         self.allow_generic_offsets
     }
 
+    #[cfg(feature = "pcodec")]
     pub(crate) fn supports_large_chunk(self) -> bool {
         self.support_large_chunk
     }

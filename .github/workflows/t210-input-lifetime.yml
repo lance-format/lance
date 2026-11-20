@@ -1,0 +1,46 @@
+name: T210 input lifetime qualification
+
+on:
+  push:
+    branches: [yang/t210-miniblock-input-lifetime-20261114]
+
+permissions:
+  contents: read
+
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04-8x
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc for Lance all-features lint
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Verify exact source
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Verify benchmark feature graph
+        run: |
+          cargo tree --locked -p lance-examples -e features -f '{p} features=[{f}]' > benchmark-features.txt
+          python3 - <<'PYFEATURES'
+          from pathlib import Path
+          lines = Path("benchmark-features.txt").read_text().splitlines()
+          io = [line for line in lines if "lance-io v" in line and "features=[" in line]
+          assert io, "missing lance-io feature evidence"
+          assert all("test-util" not in line.split("features=[", 1)[1].split("]", 1)[0].split(",") for line in io), io
+          print(io[0])
+          print("lance-examples benchmark has no lance-io/test-util feature")
+          PYFEATURES
+      - name: Verify consumer cancellation isolation and complete outputs
+        env:
+          LANCE_CPU_THREADS: 1
+        run: cargo test --profile ci --locked -p lance-examples --example admitted_dataset -- --nocapture
+      - name: Lint benchmark paths
+        if: ${{ !cancelled() }}
+        run: cargo clippy --profile ci --locked -p lance-examples --example admitted_dataset --no-deps -- -D warnings

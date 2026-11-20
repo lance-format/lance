@@ -6,7 +6,7 @@ use arrow_buffer::{BooleanBufferBuilder, bit_util};
 use crate::buffer::LanceBuffer;
 use crate::compression::{
     BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
-    require_block_payload,
+    MiniBlockOutputLayout, require_block_payload,
 };
 use crate::data::{
     AllNullDataBlock, BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
@@ -22,6 +22,8 @@ use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::metadata::{self, CompressiveEncoding};
 
 use lance_core::{Error, Result};
+
+mod admitted;
 
 /// A compression strategy that writes fixed-width data as-is (no compression)
 #[derive(Debug, Default)]
@@ -614,6 +616,53 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
+    fn unsigned_value_at(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        index: u64,
+    ) -> Result<u64> {
+        if bits != self.bits_per_value || !self.layers.is_empty() {
+            return Err(Error::invalid_input(
+                "unsigned Flat lookup width or layout mismatch",
+            ));
+        }
+        let data =
+            data.ok_or_else(|| Error::invalid_input("unsigned Flat lookup requires payload"))?;
+        crate::compression::unsigned::flat_at(data, bits, count, index)
+    }
+
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        if bits != self.bits_per_value || !self.layers.is_empty() {
+            return Err(Error::invalid_input(
+                "unsigned Flat visitor width or layout mismatch",
+            ));
+        }
+        let data =
+            data.ok_or_else(|| Error::invalid_input("unsigned Flat visitor requires payload"))?;
+        crate::compression::unsigned::flat(data, bits, count, visitor)
+    }
+
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<crate::compression::levels::LevelDecodePlan<'a>> {
+        if self.bits_per_value != 16 || !self.layers.is_empty() {
+            return Err(Error::invalid_input(
+                "structural levels require flat u16 values",
+            ));
+        }
+        crate::compression::levels::LevelDecodePlan::flat(data, num_values)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Flat block")?;
         if !self.layers.is_empty() {
@@ -645,6 +694,42 @@ impl BlockDecompressor for ValueDecompressor {
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
+    fn admitted_output_layout(&self) -> Result<MiniBlockOutputLayout> {
+        let mut layout = MiniBlockOutputLayout::FixedWidth {
+            bits_per_value: self.bits_per_item,
+        };
+        for layer in self.layers.iter().rev() {
+            if layer.has_validity {
+                layout = MiniBlockOutputLayout::Nullable(Box::new(layout));
+            }
+            layout = MiniBlockOutputLayout::FixedSizeList {
+                dimension: layer.dimension,
+                child: Box::new(layout),
+            };
+        }
+        layout.payload_bytes(0)?;
+        Ok(layout)
+    }
+
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self, data, num_values, range).map(|plan| plan.budget)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         1 + self
             .layers

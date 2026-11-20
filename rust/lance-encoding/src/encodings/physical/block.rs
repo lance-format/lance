@@ -23,6 +23,7 @@
 
 use arrow_buffer::ArrowNativeType;
 use futures::{FutureExt, future::BoxFuture, future::join_all};
+use lance_core::utils::allocation::{Reservation, ReservedBuffer};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 
@@ -42,6 +43,9 @@ use crate::{
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
 };
+
+mod admitted;
+pub(crate) mod per_value_admitted;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompressionConfig {
@@ -145,6 +149,39 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+
+    /// Decode exactly `expected_bytes` into admitted, exclusive payload storage.
+    /// Inputs must already carry their physical owner charge. `Ok(None)` means
+    /// the complete output/codec workspace does not fit; it is not EOF. Refusal
+    /// and errors preserve the supplied workspace. Unsupported codecs return
+    /// `NotSupported`, never fall back to an allocating decoder.
+    ///
+    /// The result can be recycled as scratch or frozen for shared consumption.
+    /// Inner decoding, concatenation and typed output need separate admission
+    /// while this buffer remains live. This does not bound other pipeline stages.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::encodings::physical::block::{BufferCompressor, NoopBufferCompressor};
+    /// let budget = AllocationBudget::new(3);
+    /// let mut workspace = budget.try_reserve(3).unwrap();
+    /// let decoded = NoopBufferCompressor::default()
+    ///     .try_decompress_exact_in(&[1, 2, 3], 3, &mut workspace).unwrap().unwrap();
+    /// assert_eq!(decoded.as_ref(), &[1, 2, 3]);
+    /// assert_eq!(budget.reserved(), 3);
+    /// decoded.recycle(&mut workspace).unwrap();
+    /// assert_eq!(workspace.len(), 3);
+    /// ```
+    fn try_decompress_exact_in(
+        &self,
+        _input_buf: &[u8],
+        _expected_bytes: usize,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<ReservedBuffer>> {
+        Err(Error::not_supported(
+            "buffer codec has no admitted exact decoder",
+        ))
+    }
 
     fn decompress_exact(
         &self,
@@ -266,7 +303,7 @@ mod zstd {
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
-        fn is_raw_stream_format(&self, input_buf: &[u8]) -> bool {
+        pub(super) fn is_raw_stream_format(&self, input_buf: &[u8]) -> bool {
             if input_buf.len() < 8 {
                 return true; // can't be length prefixed format if less than 8 bytes
             }
@@ -450,6 +487,15 @@ mod lz4 {
     pub struct Lz4BufferCompressor {}
 
     impl BufferCompressor for Lz4BufferCompressor {
+        fn try_decompress_exact_in(
+            &self,
+            input_buf: &[u8],
+            expected_bytes: usize,
+            workspace: &mut Reservation,
+        ) -> Result<Option<ReservedBuffer>> {
+            admitted::lz4(input_buf, expected_bytes, workspace)
+        }
+
         fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             // Remember the starting position
             let start_pos = output_buf.len();
@@ -590,6 +636,15 @@ mod lz4 {
 pub struct NoopBufferCompressor {}
 
 impl BufferCompressor for NoopBufferCompressor {
+    fn try_decompress_exact_in(
+        &self,
+        input_buf: &[u8],
+        expected_bytes: usize,
+        workspace: &mut Reservation,
+    ) -> Result<Option<ReservedBuffer>> {
+        admitted::copy(input_buf, expected_bytes, workspace)
+    }
+
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
         output_buf.extend_from_slice(input_buf);
         Ok(())
@@ -1109,6 +1164,31 @@ impl PerValueCompressor for CompressedBufferEncoder {
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
+    fn direct_byte_compression(&self) -> Option<CompressionScheme> {
+        let scheme = self.compressor.config().scheme();
+        match scheme {
+            CompressionScheme::None | CompressionScheme::Zstd | CompressionScheme::Lz4 => {
+                Some(scheme)
+            }
+            CompressionScheme::Fsst => None,
+        }
+    }
+
+    fn plan_decode(
+        &self,
+        data: &VariableWidthBlock,
+    ) -> Result<crate::compression::PerValueDecodeBudget> {
+        per_value_admitted::plan(self.compressor.config().scheme(), data)
+    }
+
+    fn try_decompress_in(
+        &self,
+        data: &VariableWidthBlock,
+        workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        per_value_admitted::decode(self.compressor.config().scheme(), data, workspace)
+    }
+
     fn allocates_output(&self) -> bool {
         true
     }
@@ -1252,8 +1332,6 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
-
     #[rstest::rstest]
     #[case::small_page(PARALLEL_MIN_BYTES - 1, 1, 64, 1)]
     #[case::alone(64 << 20, 1, 8, 8)]
@@ -1293,20 +1371,16 @@ mod tests {
             encoder.compressor.compress(v, out)
         })
         .unwrap();
-        let data_block = DataBlock::VariableWidth(VariableWidthBlock {
+        let data_block = VariableWidthBlock {
             data: LanceBuffer::from(data.clone()),
             offsets: LanceBuffer::reinterpret_vec(offsets.clone()),
             bits_per_offset,
             num_values: (offsets.len() - 1) as u64,
             block_info: BlockInfo::new(),
-        });
-        let (compressed, _) =
-            PerValueCompressor::compress_with_validity_async(Arc::new(encoder), data_block, None)
-                .await
-                .unwrap();
-        let PerValueDataBlock::Variable(compressed) = compressed else {
-            panic!("expected variable-width output");
         };
+        // Compare the parallel payload kernel directly. Without codec features
+        // the default is Noop, which has no General wire descriptor to serialize.
+        let compressed = encoder.per_value_compress_async(data_block).await.unwrap();
         assert_eq!(seq, compressed.data.as_ref());
         assert_eq!(
             seq_offsets.borrow_to_typed_slice::<T>().as_ref(),
@@ -1362,6 +1436,7 @@ mod tests {
         use std::sync::Arc;
 
         use super::*;
+        use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
 
         #[test]
         fn test_compress_zstd_with_length_prefixed() {

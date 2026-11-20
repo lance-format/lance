@@ -29,7 +29,9 @@ use crate::{
 use crate::format::EncodingUtils;
 
 pub mod blob;
+mod byte_page;
 mod chunk_index;
+pub use byte_page::{AdmittedBytePageInput, AdmittedBytePageScheduler};
 pub mod constant;
 pub mod dict;
 pub mod fullzip;
@@ -53,7 +55,9 @@ pub use field::{
     StructuralCompositeDecodeArrayTask, StructuralPrimitiveFieldDecoder,
     StructuralPrimitiveFieldScheduler,
 };
-pub use fullzip_decode::FullZipScheduler;
+pub use fullzip_decode::{
+    DecodedFullZipPrefix, FullZipArrayInput, FullZipArrayPrefix, FullZipScheduler,
+};
 pub use miniblock_decode::MiniBlockScheduler;
 pub use structural_encoder::{PrimitivePageEncoding, PrimitiveStructuralEncoder};
 

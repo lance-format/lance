@@ -22,6 +22,7 @@ pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 #[cfg(feature = "pcodec")]
 use crate::encodings::physical::pcodec::{PcodecMiniBlockDecompressor, PcodecMiniBlockEncoder};
+pub use crate::encodings::physical::sequence::SequenceMetadata;
 use crate::{
     buffer::LanceBuffer,
     compression_config::{AlpMode, BssMode, CompressionFieldParams},
@@ -81,11 +82,49 @@ use crate::{
     statistics::{GetStat, Stat},
 };
 
-use arrow_array::{cast::AsArray, types::UInt64Type};
+#[cfg(feature = "bitpacking")]
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
+use lance_core::utils::allocation::Reservation;
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 use std::{ops::Range, str::FromStr, sync::Arc};
+
+mod layout;
+pub mod levels;
+pub(crate) mod prepared;
+pub(crate) mod prepared_unsigned;
+pub(crate) mod unsigned;
+pub(crate) mod variable;
+pub use layout::MiniBlockOutputLayout;
+pub use prepared::PreparedMiniBlockRange;
+pub use prepared_unsigned::PreparedUnsigned;
+
+/// Payload required by one validated MiniBlock range operation.
+///
+/// Input owners are excluded and must already be charged. These sizes exclude
+/// allocator/plan metadata and later typed or structural reconstruction. A plan
+/// applies only to the codec, immutable input buffers and range it validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiniBlockDecodeBudget {
+    /// Bytes retained by the result after codec scratch is recycled.
+    pub output_bytes: usize,
+    /// Maximum additional bytes simultaneously needed, including output and scratch.
+    pub workspace_bytes: usize,
+}
+
+/// Payload required to decode an already unzipped variable-width block.
+/// Input allocations must already be charged, including offsets and any shared
+/// backing storage. This excludes unzipping, structural reconstruction and
+/// allocator/codec metadata. The plan applies only to the validated codec/input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PerValueDecodeBudget {
+    /// Bytes retained by the decoded values and their offsets.
+    pub output_bytes: usize,
+    /// Maximum additional payload bytes needed, including output and scratch.
+    pub workspace_bytes: usize,
+}
 
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
 ///
@@ -291,6 +330,8 @@ fn rle_beats_raw_and_bitpacking(
         return false;
     }
 
+    #[cfg(not(feature = "bitpacking"))]
+    let _ = data;
     #[cfg(feature = "bitpacking")]
     {
         if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data).map(u128::from)
@@ -526,6 +567,12 @@ fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
     u64::try_from(estimated_bytes).ok()
 }
 
+#[cfg(not(feature = "bitpacking"))]
+fn try_bitpack_for_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn BlockCompressor>> {
+    None
+}
+
+#[cfg(feature = "bitpacking")]
 fn try_bitpack_for_block(data: &FixedWidthDataBlock) -> Option<Box<dyn BlockCompressor>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
@@ -1248,6 +1295,196 @@ pub fn try_fixed_size_list_block(
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Visit each binary value in order without allocating decoded payload.
+    /// Complete framing must be validated before the first callback. The callback
+    /// borrows each value only for the call and is responsible for its own work.
+    /// Unsupported codecs return an error instead of allocating an intermediate
+    /// array. This lets an outer codec price expansion before output admission.
+    ///
+    /// ```
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::binary::BinaryMiniBlockDecompressor};
+    /// let mut frame = [12_u32, 13, 15].into_iter()
+    ///     .flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    /// frame.extend_from_slice(b"abc\0"); // Four-byte frame alignment.
+    /// let mut lengths = Vec::new();
+    /// BinaryMiniBlockDecompressor::new(32).unwrap().visit_binary_values(
+    ///     &[LanceBuffer::from(frame)], 2, &mut |value| {
+    ///         lengths.push(value.len()); Ok(())
+    ///     }).unwrap();
+    /// assert_eq!(lengths, [1, 2]);
+    /// ```
+    fn visit_binary_values(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "mini-block codec has no borrowed binary traversal",
+        ))
+    }
+
+    /// Describe the physical output shape of every admitted range from this codec.
+    /// This capability permits planning concatenation before decoding any values.
+    /// Implementations must return the same shape for empty and nonempty ranges;
+    /// [`Self::plan_range`] must validate all payload-dependent errors first.
+    /// Variable-width payload sizes come from the validated range plan. Unsupported
+    /// shapes return an error by default.
+    fn admitted_output_layout(&self) -> Result<MiniBlockOutputLayout> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted concat layout",
+        ))
+    }
+
+    /// Validate a range and price its complete output/scratch without allocating
+    /// payload. This is the same preflight used by [`Self::try_decompress_range_in`].
+    /// Unsupported codecs return an error rather than an estimate or an ordinary
+    /// decode fallback. No credit is consumed by planning.
+    ///
+    /// For a sequence, keep earlier output charges while admitting each next
+    /// `workspace_bytes`. Concatenation needs its own output allocation while the
+    /// decoded inputs are still alive. Structural levels and input owners also
+    /// need separate admission; summing only the retained outputs is insufficient.
+    ///
+    /// ```
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::value::ValueDecompressor, format::metadata};
+    /// let codec = ValueDecompressor::from_flat(&metadata::Flat {
+    ///     bits_per_value: 32, data: None,
+    /// });
+    /// let input = [LanceBuffer::from(vec![0_u8; 16])];
+    /// let plan = codec.plan_range(&input, 4, 1..3).unwrap();
+    /// assert_eq!(plan.output_bytes, 8);
+    /// assert_eq!(plan.workspace_bytes, 8); // Raw extraction needs no scratch.
+    /// ```
+    fn plan_range(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _range: Range<u64>,
+    ) -> Result<MiniBlockDecodeBudget> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted range plan",
+        ))
+    }
+
+    /// Decode a selected range only after all output and codec scratch fit in the
+    /// supplied workspace. Inputs must already carry their physical allocation charge.
+    /// `Ok(None)` refuses admission without allocating or changing the workspace;
+    /// the caller must drain/replan rather than treat refusal as EOF or a result cap.
+    /// Completed scratch is recycled to the workspace and output retains its credit.
+    ///
+    /// The default returns `NotSupported`, never calls an unaccounted decoder. This
+    /// opt-in capability does not change existing scan paths or bound other stages.
+    /// Later typed Arrow conversion, rep/def reconstruction and builder allocations
+    /// need their own admission; for example, expanded byte booleans need a new bitmap.
+    ///
+    /// ```
+    /// # #[cfg(feature = "bitpacking")]
+    /// # fn example() -> lance_core::Result<()> {
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::bitpacking::InlineBitpacking};
+    /// let budget = AllocationBudget::new(12);
+    /// let mut workspace = budget.try_reserve(12).unwrap();
+    /// // A zero-width u32 chunk has only its four-byte zero header.
+    /// let input = workspace.try_allocate(4)?.unwrap().freeze();
+    /// let buffers = [LanceBuffer::from_bytes(input, 4)];
+    /// let output = InlineBitpacking::new(32)
+    ///     .try_decompress_range_in(&buffers, 1024, 3..5, &mut workspace)?.unwrap();
+    /// assert_eq!(output.num_values(), 2);
+    /// assert_eq!(budget.reserved(), 12);
+    /// # Ok(()) }
+    /// ```
+    fn try_decompress_range_in(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _range: Range<u64>,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted range decoder",
+        ))
+    }
+
+    /// Retain validated input preparation until a complete task can be admitted.
+    /// Unlike [`Self::plan_range`], this may allocate admitted preparation scratch.
+    /// The returned budget excludes that already-charged scratch. No value output
+    /// is published. On refusal/error, exclusive preparation returns to this
+    /// workspace. Unsupported compositions fail without an ordinary fallback.
+    /// Codecs with pure preflight only retain input metadata by default.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::{block::{CompressionConfig, CompressionScheme},
+    ///         general::GeneralMiniBlockDecompressor, value::ValueDecompressor},
+    ///     format::metadata};
+    /// let codec = GeneralMiniBlockDecompressor::new(
+    ///     Box::new(ValueDecompressor::from_flat(&metadata::Flat {
+    ///         bits_per_value: 8, data: None,
+    ///     })), CompressionConfig::new(CompressionScheme::None, None));
+    /// let pool = AllocationBudget::new(8);
+    /// let mut work = pool.try_reserve(8).unwrap();
+    /// let input = [LanceBuffer::from_bytes(work.try_allocate(3).unwrap().unwrap().freeze(), 1)];
+    /// let plan = codec.try_prepare_range_in(&input, 3, 1..3, &mut work).unwrap().unwrap();
+    /// assert_eq!(work.len(), 2); // Three input bytes and three preparation bytes live.
+    /// assert_eq!(plan.budget().workspace_bytes, 2);
+    /// plan.recycle(&mut work).unwrap(); // A later instruction can refuse the whole task.
+    /// assert_eq!(work.len(), 5);
+    /// ```
+    fn try_prepare_range_in<'a>(
+        &'a self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<PreparedMiniBlockRange<'a>>> {
+        PreparedMiniBlockRange::direct(self, data, num_values, range).map(Some)
+    }
+
+    /// Decode a range whose preflight may itself need admitted preparation scratch.
+    /// Unlike [`Self::plan_range`], this can decompress input before its inner layout
+    /// is known. Preparation and output must fit together in the supplied workspace;
+    /// refusal recycles preparation and returns `None` for drain/replan, never EOF.
+    /// Inputs must already be charged. Scratch remains charged through inner decode.
+    /// Inner codecs must not retain temporary input aliases beyond the call, including
+    /// in their output. Unsupported compositions return an error, without fallback.
+    /// This does not make the codec available to allocation-free multi-range planning.
+    /// Codecs needing no preparation use [`Self::try_decompress_range_in`] by default.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::{block::{CompressionConfig, CompressionScheme},
+    ///         general::GeneralMiniBlockDecompressor, value::ValueDecompressor},
+    ///     format::metadata};
+    /// let codec = GeneralMiniBlockDecompressor::new(
+    ///     Box::new(ValueDecompressor::from_flat(&metadata::Flat {
+    ///         bits_per_value: 8, data: None,
+    ///     })), CompressionConfig::new(CompressionScheme::None, None));
+    /// let pool = AllocationBudget::new(8); // 3 input + 3 scratch + 2 output
+    /// let mut work = pool.try_reserve(8).unwrap();
+    /// let mut input = work.try_allocate(3).unwrap().unwrap();
+    /// input.as_mut().copy_from_slice(&[1, 2, 3]);
+    /// let input = [LanceBuffer::from_bytes(input.freeze(), 1)];
+    /// let output = codec.try_prepare_and_decompress_range_in(&input, 3, 1..3, &mut work)
+    ///     .unwrap().unwrap();
+    /// assert_eq!(output.num_values(), 2);
+    /// assert_eq!(work.len(), 3); // Scratch returned to this workspace.
+    /// ```
+    fn try_prepare_and_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+        workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        self.try_decompress_range_in(data, num_values, range, workspace)
+    }
+
     /// Decompress only `range` (`0 <= range.start <= range.end <= num_values`) from a mini-block
     /// chunk containing `num_values` items.
     ///
@@ -1360,8 +1597,117 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
 }
 
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
+    /// Whether values are already decoded and work is linear in input bytes.
+    /// Used only for bounded inline scheduling, never to skip validation or
+    /// admission. Unknown/custom codecs default to CPU-pool scheduling.
+    fn is_identity(&self) -> bool {
+        false
+    }
+
+    /// Whether framed values can be copied directly into Arrow byte buffers.
+    /// Opting in asserts that the bytes are already decoded and that no extra
+    /// codec validation or transformation is required beyond checked framing,
+    /// signed offsets and Arrow type validation. This is stronger than the
+    /// scheduling hint [`Self::is_identity`]. Custom codecs default to their
+    /// existing admitted decode path, including any codec-specific validation.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     encodings::physical::binary::VariableDecoder};
+    /// assert!(VariableDecoder::default().supports_direct_byte_materialization());
+    /// ```
+    fn supports_direct_byte_materialization(&self) -> bool {
+        false
+    }
+
+    /// Identify the independent frame format for direct admitted Arrow output.
+    /// `None` preserves the codec's ordinary admitted block path. Opting in
+    /// requires exactly the named general codec's framing and validation, with
+    /// no additional dictionary, transformation or codec-specific checks.
+    /// Identity implementations inherit their explicit direct-copy guarantee.
+    /// This is not an inline scheduling hint: compressed work stays on the CPU pool.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     encodings::physical::{binary::VariableDecoder, block::CompressionScheme}};
+    /// assert_eq!(VariableDecoder::default().direct_byte_compression(),
+    ///     Some(CompressionScheme::None));
+    /// ```
+    fn direct_byte_compression(&self) -> Option<CompressionScheme> {
+        self.supports_direct_byte_materialization()
+            .then_some(CompressionScheme::None)
+    }
+
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
+
+    /// Validate and reuse input that is already decoded, without allocating payload.
+    /// `None` means this codec cannot reuse it; errors still reject corrupt input.
+    /// Unlike `try_decompress_in`, this may retain the entire physical input owner,
+    /// including bytes outside the visible slices. The caller must keep that owner
+    /// charged until every output alias drops. Use only for a compact, admitted
+    /// intermediate when retaining its complete backing allocation is acceptable.
+    /// The default does not invoke the ordinary allocating decoder.
+    ///
+    /// ```
+    /// use lance_core::Result;
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     data::{DataBlock, VariableWidthBlock}};
+    /// fn reuse(codec: &dyn VariablePerValueDecompressor,
+    ///     charged: &VariableWidthBlock) -> Result<Option<DataBlock>> {
+    ///     codec.try_reuse_admitted_input(charged)
+    /// }
+    /// ```
+    fn try_reuse_admitted_input(&self, _data: &VariableWidthBlock) -> Result<Option<DataBlock>> {
+        Ok(None)
+    }
+
+    /// Visit decoded binary values without allocating payload or alignment copies.
+    /// Validate the complete offset table before invoking any callback. Offsets
+    /// start at zero, have the declared signed width and exactly `num_values + 1`
+    /// entries; trailing unused data is allowed. Borrowed values last only for the
+    /// callback. Unsupported codecs must not fall back to allocating decode.
+    fn visit_binary_values(
+        &self,
+        _data: &VariableWidthBlock,
+        _visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "per-value codec has no borrowed binary traversal",
+        ))
+    }
+
+    /// Validate all values and price complete output/scratch without allocating payload.
+    fn plan_decode(&self, _data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
+        Err(Error::not_supported("per-value codec has no admitted plan"))
+    }
+
+    /// Decode into an explicit workspace. Insufficient credit returns `None`,
+    /// preserving the input and workspace. Published aliases retain their charge
+    /// until final drop; exclusive scratch is recycled on refusal/error. Input
+    /// allocations must already be charged. Ordinary decode is never a fallback.
+    ///
+    /// ```
+    /// use lance_core::{Result, utils::allocation::AllocationBudget};
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     data::{DataBlock, VariableWidthBlock}};
+    /// fn decode(codec: &dyn VariablePerValueDecompressor, input: &VariableWidthBlock)
+    ///     -> Result<Option<DataBlock>> {
+    ///     let plan = codec.plan_decode(input)?;
+    ///     let pool = AllocationBudget::new(plan.workspace_bytes);
+    ///     let mut work = pool.try_reserve(plan.workspace_bytes).unwrap();
+    ///     codec.try_decompress_in(input, &mut work)
+    /// }
+    /// ```
+    fn try_decompress_in(
+        &self,
+        _data: &VariableWidthBlock,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        Err(Error::not_supported(
+            "per-value codec has no admitted decoder",
+        ))
+    }
 
     /// Whether every buffer returned by `decompress` is newly allocated, never a
     /// view of the input, on all paths.
@@ -1406,6 +1752,158 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Prepare an unsigned traversal using only admitted payload scratch.
+    /// Input owners must already be charged. `None` refuses admission without
+    /// consuming workspace; the caller must drain/replan, never treat it as EOF.
+    /// The default retains input metadata and delegates to [`Self::visit_unsigned`].
+    /// Unsupported traversal remains an error, without ordinary decode fallback.
+    /// Validate the complete visitor before dependent output admission/publication.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    ///     format::EncodingUtils};
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 0, 3)).unwrap();
+    /// let pool = AllocationBudget::new(0);
+    /// let mut work = pool.try_reserve(0).unwrap();
+    /// let prepared = codec.try_prepare_unsigned_in(None, 32, 4, &mut work).unwrap().unwrap();
+    /// let mut sum = 0;
+    /// prepared.visit(&mut |value| { sum += value; Ok(()) }).unwrap();
+    /// assert_eq!(sum, 18);
+    /// prepared.recycle(&mut work).unwrap();
+    /// assert_eq!(pool.reserved(), 0);
+    /// ```
+    fn try_prepare_unsigned_in<'a>(
+        &'a self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<PreparedUnsigned<'a>>> {
+        Ok(Some(PreparedUnsigned::direct(
+            self,
+            data,
+            bits_per_value,
+            num_values,
+        )))
+    }
+
+    /// Read one unsigned value without allocating decoded or alignment buffers.
+    /// Supported leaf codecs validate framing and use constant-time lookup;
+    /// unsupported codecs never scan or decompress the sequence as a fallback.
+    /// `index` must be less than the container's `num_values`.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    ///     format::EncodingUtils};
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 10, 3)).unwrap();
+    /// assert_eq!(codec.unsigned_value_at(None, 32, 4, 2).unwrap(), 16);
+    /// assert!(codec.unsigned_value_at(None, 32, 4, 4).is_err());
+    /// ```
+    fn unsigned_value_at(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        index: u64,
+    ) -> Result<u64> {
+        if index >= num_values {
+            return Err(Error::invalid_input(
+                "unsigned lookup index exceeds value count",
+            ));
+        }
+        if data.is_some() {
+            return Err(Error::not_supported("codec has no unsigned payload lookup"));
+        }
+        match self.plan_unsigned_metadata(bits_per_value, num_values)? {
+            SequenceMetadata::Empty => Err(Error::invalid_input("unsigned lookup has no values")),
+            SequenceMetadata::Constant(value) => Ok(value),
+            SequenceMetadata::Range { start, step } => Ok(start + index * step),
+        }
+    }
+
+    /// Visit an unsigned sequence without allocating decoded or alignment buffers.
+    /// The callback owns any allocations it makes. An error may follow a visited
+    /// prefix: callers must discard partial work and validate before publishing.
+    /// Unsupported codecs never fall back to ordinary allocating decompression.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    ///     format::EncodingUtils};
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 0, 3)).unwrap();
+    /// let mut sum = 0;
+    /// codec.visit_unsigned(None, 32, 4, &mut |value| { sum += value; Ok(()) }).unwrap();
+    /// assert_eq!(sum, 18);
+    /// ```
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        if data.is_some() {
+            return Err(Error::not_supported(
+                "codec has no unsigned payload visitor",
+            ));
+        }
+        match self.plan_unsigned_metadata(bits_per_value, num_values)? {
+            SequenceMetadata::Empty => Ok(()),
+            SequenceMetadata::Constant(value) => {
+                for _ in 0..num_values {
+                    visitor(value)?;
+                }
+                Ok(())
+            }
+            SequenceMetadata::Range { start, step } => {
+                for i in 0..num_values {
+                    visitor(start + i * step)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Validate an unsigned metadata-only sequence without expanding its values.
+    /// Width, cardinality and arithmetic must match the ordinary decoder. Callers
+    /// must separately reject unexpected payload buffers. Unsupported codecs or
+    /// shapes return an error; this must never call ordinary allocating decode.
+    ///
+    /// ```
+    /// use lance_encoding::{
+    ///     compression::{DecompressionStrategy, DefaultDecompressionStrategy, SequenceMetadata},
+    ///     format::EncodingUtils,
+    /// };
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 0, 3)).unwrap();
+    /// assert_eq!(codec.plan_unsigned_metadata(32, 4).unwrap(),
+    ///     SequenceMetadata::Range { start: 0, step: 3 });
+    /// ```
+    fn plan_unsigned_metadata(
+        &self,
+        _bits_per_value: u64,
+        _num_values: u64,
+    ) -> Result<SequenceMetadata> {
+        Err(Error::not_supported("codec has no unsigned metadata plan"))
+    }
+
+    /// Validate a dense u16 structural stream and plan all decoded payload/scratch
+    /// before allocation. The input owner must already be charged. Unsupported
+    /// codecs return an error instead of invoking ordinary, unaccounted decode.
+    /// See [`levels::LevelDecodePlan`] and its admission example.
+    fn plan_levels<'a>(
+        &self,
+        _data: &'a LanceBuffer,
+        _num_values: u64,
+    ) -> Result<levels::LevelDecodePlan<'a>> {
+        Err(Error::not_supported(
+            "codec has no admitted structural-level decoder",
+        ))
+    }
 
     /// Whether this codec consumes one payload buffer.
     fn requires_payload(&self) -> bool {
@@ -1764,9 +2262,16 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Error::invalid_input("Block encoding is missing its compression variant")
         })?;
         match compression {
+            #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(inline_bitpacking) => Ok(Box::new(
                 InlineBitpacking::from_description(inline_bitpacking),
             )),
+            #[cfg(not(feature = "bitpacking"))]
+            Compression::InlineBitpacking(_) | Compression::OutOfLineBitpacking(_) => {
+                Err(Error::not_supported_source(
+                    "this runtime was not built with bitpacking support".into(),
+                ))
+            }
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::Constant(constant) => {
                 let scalar = constant
@@ -1779,6 +2284,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::FixedSizeList(fsl) => {
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())?))
             }
+            #[cfg(feature = "bitpacking")]
             Compression::OutOfLineBitpacking(out_of_line) => {
                 let values = out_of_line.values.as_ref().ok_or_else(|| {
                     Error::invalid_input("OutOfLineBitpacking is missing its values encoding")
@@ -2412,6 +2918,7 @@ mod tests {
     use crate::buffer::LanceBuffer;
     use crate::compression_config::CompressionParams;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    #[cfg(all(feature = "lz4", feature = "zstd"))]
     use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
     use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
     use crate::format::EncodingUtils;
@@ -2607,6 +3114,7 @@ mod tests {
         run_lengths.bits_per_value
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn expect_rle_encoding(encoding: &CompressiveEncoding) -> &crate::format::metadata::Rle {
         match encoding.compression.as_ref().unwrap() {
             Compression::Rle(rle) => rle,

@@ -77,6 +77,50 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
             .boxed()
     }
 
+    /// Fill one caller-owned allocation through this service's scheduling policy.
+    ///
+    /// The allocation must already be admitted and exactly match the range length.
+    /// Return it unchanged and exclusive, so a decoder can recycle it into its
+    /// workspace. Cancellation must keep it alive until underlying I/O stops using
+    /// it. No new payload allocation, coalescing or splitting is implied by this API;
+    /// opaque transport/cache allocations remain outside the caller's budget.
+    /// Implementations may defer scheduling until the future is polled. Callers
+    /// must drive each dependent read rather than relying on eager submission.
+    ///
+    /// Services must opt in explicitly. Falling back to `submit_single` would both
+    /// allocate an unadmitted payload and lose exclusive ownership accounting.
+    fn submit_single_into(
+        &self,
+        _range: Range<u64>,
+        _priority: u64,
+        output: lance_core::utils::allocation::ReservedBuffer,
+    ) -> BoxFuture<'static, Result<lance_core::utils::allocation::ReservedBuffer>> {
+        drop(output);
+        futures::future::ready(Err(lance_core::Error::not_supported(
+            "encoding I/O does not support admitted reads",
+        )))
+        .boxed()
+    }
+
+    /// Fill independent admitted allocations in order, with one common priority.
+    ///
+    /// Backends may batch dispatch while preserving individual scheduling credit
+    /// and the ownership contract of [`Self::submit_single_into`]. The default
+    /// drives each read sequentially. Request metadata is outside payload credit.
+    fn submit_many_into(
+        &self,
+        requests: Vec<(Range<u64>, lance_core::utils::allocation::ReservedBuffer)>,
+        priority: u64,
+    ) -> BoxFuture<'_, Result<Vec<lance_core::utils::allocation::ReservedBuffer>>> {
+        Box::pin(async move {
+            let mut outputs = Vec::with_capacity(requests.len());
+            for (range, output) in requests {
+                outputs.push(self.submit_single_into(range, priority, output).await?);
+            }
+            Ok(outputs)
+        })
+    }
+
     /// Returns a version of this I/O service that bypasses backpressure for all requests.
     ///
     /// This is intended for indirect I/O (e.g. fetching items after decoding offsets) where

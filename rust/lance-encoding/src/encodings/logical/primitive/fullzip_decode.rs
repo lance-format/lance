@@ -23,7 +23,9 @@ use crate::compression::{
     DecompressionStrategy, FixedPerValueDecompressor, VariablePerValueDecompressor,
 };
 use crate::data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock, VariableWidthBlock};
-use crate::decoder::{DecodePageTask, DecodedPage, ListReadMode, StructuralPageDecoder};
+use crate::decoder::{
+    DecodePageTask, DecodedPage, ListReadMode, PageEncoding, PageInfo, StructuralPageDecoder,
+};
 use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{
@@ -37,7 +39,14 @@ use super::{
     StructuralPageScheduler,
 };
 
+mod admitted;
+pub(super) mod array_admitted;
+mod read_admitted;
 mod structure;
+mod unzip_admitted;
+
+pub use array_admitted::{FullZipArrayInput, FullZipArrayPrefix};
+pub use read_admitted::DecodedFullZipPrefix;
 
 #[derive(Debug, Clone, Copy)]
 struct FullZipRepIndexDetails {
@@ -168,6 +177,40 @@ pub struct FullZipScheduler {
 }
 
 impl FullZipScheduler {
+    /// Construct a raw leaf-page decoder from current-format file metadata.
+    ///
+    /// Dense structural and planar FullZip layouts are supported. Other layouts
+    /// return an error; this never switches to an ordinary allocating decoder.
+    /// Callers supply their decompression strategy and must use the I/O service
+    /// for the same file. Row ranges on this decoder are page-local top-level
+    /// rows, not leaf values or file row IDs. Projection, filtering and Arrow
+    /// reconstruction remain the caller's responsibility. This does not apply a
+    /// reader's structural-only projection or initialize a full-page index cache.
+    pub fn try_from_page(
+        page: &PageInfo,
+        decompressors: &dyn DecompressionStrategy,
+    ) -> Result<Self> {
+        let planar;
+        let layout = match &page.encoding {
+            PageEncoding::Structural(layout) => layout,
+            PageEncoding::Planar(layout) if layout.sparse().is_none() => {
+                planar = layout.dense_execution_layout()?;
+                &planar
+            }
+            _ => return Err(Error::not_supported("expected a dense FullZip page")),
+        };
+        let Some(metadata::page_layout::Layout::FullZipLayout(layout)) = &layout.layout else {
+            return Err(Error::not_supported("expected a dense FullZip page"));
+        };
+        Self::try_new(
+            &page.buffer_offsets_and_sizes,
+            page.priority,
+            page.num_rows,
+            layout,
+            decompressors,
+        )
+    }
+
     pub(super) fn try_new(
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
@@ -1790,6 +1833,13 @@ struct VariableFullZipDecodeTask {
 }
 
 impl DecodePageTask for VariableFullZipDecodeTask {
+    fn try_decode_in(
+        &self,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DecodedPage>> {
+        admitted::decode(self, workspace)
+    }
+
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let block = VariableWidthBlock {
             data: self.data,

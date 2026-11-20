@@ -3,6 +3,8 @@
 
 //! Wraps a Fragment of the dataset.
 
+mod admitted;
+pub use admitted::{AdmittedFragmentScan, AdmittedFragmentScanOutcome};
 mod aligned_update;
 pub mod session;
 pub mod write;
@@ -76,7 +78,7 @@ use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::writer::{OverlayWriter, WriteOverlayError};
 use crate::dataset::overlay::{
-    OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
+    OverlayReadPlanner, OverlayReadSelection, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
 use crate::dataset::{Dataset, UpdateJoinOptions};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -187,6 +189,28 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         projection: Arc<lance_core::datatypes::Schema>,
         take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
+
+    /// Prepare exact sorted unique physical rows in an existing reservation.
+    ///
+    /// Opt-in supported pages/null placeholders; unsupported readers return an
+    /// error without falling back to ordinary decoding. Inputs, decoded output
+    /// and downstream assembly
+    /// must fit the original operation admission. `None` requires dropping the
+    /// whole attempt before replanning. See
+    /// [`FragmentReader::try_take_admitted_fullzip`] for an end-to-end example.
+    fn prepare_admitted_fullzip_take<'a>(
+        &'a self,
+        _indices: &'a [u32],
+        _projection: Arc<Schema>,
+        _workspace: &'a mut lance_core::utils::allocation::Reservation,
+    ) -> BoxFuture<'a, Result<Option<lance_file::reader::PreparedFullZipTake>>> {
+        async {
+            Err(Error::not_supported(
+                "this file reader does not support admitted FullZip take",
+            ))
+        }
+        .boxed()
+    }
 
     /// Return the number of rows in the file
     fn len(&self) -> u32;
@@ -659,6 +683,25 @@ mod v2_adapter {
     }
 
     impl GenericFileReader for Reader {
+        fn prepare_admitted_fullzip_take<'a>(
+            &'a self,
+            indices: &'a [u32],
+            projection: Arc<Schema>,
+            workspace: &'a mut lance_core::utils::allocation::Reservation,
+        ) -> BoxFuture<'a, Result<Option<lance_file::reader::PreparedFullZipTake>>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    &projection,
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                self.reader
+                    .prepare_admitted_fullzip_take_in(indices, Some(projection), workspace)
+                    .await
+            }
+            .boxed()
+        }
+
         fn read_range_tasks(
             &self,
             range: Range<u64>,
@@ -812,6 +855,28 @@ impl NullReader {
 }
 
 impl GenericFileReader for NullReader {
+    fn prepare_admitted_fullzip_take<'a>(
+        &'a self,
+        indices: &'a [u32],
+        projection: Arc<Schema>,
+        _workspace: &'a mut lance_core::utils::allocation::Reservation,
+    ) -> BoxFuture<'a, Result<Option<lance_file::reader::PreparedFullZipTake>>> {
+        async move {
+            if indices.windows(2).any(|pair| pair[0] >= pair[1])
+                || indices.last().is_some_and(|&row| row >= self.num_rows)
+            {
+                return Err(Error::invalid_input(
+                    "admitted null take requires sorted unique in-range physical offsets",
+                ));
+            }
+            Ok(Some(lance_file::reader::PreparedFullZipTake::all_null(
+                Self::nullable_schema(&projection),
+                indices.len(),
+            )))
+        }
+        .boxed()
+    }
+
     fn read_range_tasks(
         &self,
         range: Range<u64>,
@@ -4012,22 +4077,12 @@ impl FragmentReader {
         let Some(overlay) = &self.overlay else {
             return Ok(merged);
         };
-        // The offset_in_frag of every row this read will return, materialized once.
-        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
-        // it lets us both prune overlays to the read and slice each batch's offsets
-        // below without reading any data. Only paid when the fragment has overlays.
-        //
-        // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
-        // yield a coverage bitmap directly (for pruning) and to slice per batch (for
-        // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
-        // wholesale — a larger refactor tracked separately.
-        let offsets_in_frag: Arc<Vec<u32>> =
-            Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
+        let selection = Arc::new(OverlayReadSelection::new(params, total_num_rows)?);
 
         // Open only the overlay readers this read touches (pruned by row selection).
         let plans = resolve_overlays(
             &overlay.planner,
-            &offsets_in_frag,
+            &selection,
             &overlay.fragment,
             &overlay.read_config,
         )
@@ -4038,21 +4093,22 @@ impl FragmentReader {
         let plans = Arc::new(plans);
 
         // Batches arrive in physical read order, so a running total of the rows seen
-        // so far gives each batch its starting offset_in_batch into `offsets_in_frag`.
+        // so far identifies its selection slice. Materialize only the batch's
+        // offsets when its future is polled, not while scheduling the whole read.
         let mut rows_seen = 0usize;
         let stream = merged
             .map(move |task| {
                 let num_rows = task.num_rows;
                 let start = rows_seen;
                 rows_seen += num_rows as usize;
-                let offsets_in_frag = offsets_in_frag.clone();
+                let selection = selection.clone();
                 let plans = plans.clone();
                 let inner = task.task;
                 ReadBatchTask {
                     num_rows,
                     task: async move {
-                        let batch_offsets = &offsets_in_frag[start..start + num_rows as usize];
-                        merge_overlay_batch(inner, batch_offsets, &plans).await
+                        let batch_selection = selection.batch(start, num_rows as usize)?;
+                        merge_overlay_batch(inner, &batch_selection, &plans).await
                     }
                     .boxed(),
                 }
@@ -4475,6 +4531,8 @@ impl FragmentReader {
 
 #[cfg(test)]
 mod tests {
+    mod admitted_ranges;
+
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, UInt64Type};
@@ -4581,6 +4639,7 @@ mod tests {
     /// written, committed via the `DataOverlay` transaction, and then resolved on
     /// the `take` and scan read paths.
     mod overlay_read {
+        mod admitted;
         use std::sync::Arc;
 
         use arrow_array::{
@@ -4588,6 +4647,7 @@ mod tests {
         };
         use arrow_buffer::NullBuffer;
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use futures::{StreamExt, TryStreamExt};
         use lance_core::datatypes::Schema;
         use lance_file::version::LanceFileVersion;
         use lance_file::writer::FileWriterOptions;
@@ -4598,6 +4658,7 @@ mod tests {
         use roaring::RoaringBitmap;
         use rstest::rstest;
 
+        use crate::dataset::fragment::FragReadConfig;
         use crate::dataset::transaction::{DataOverlayGroup, Operation};
         use crate::dataset::{Dataset, WriteDestination, WriteParams};
 
@@ -5498,12 +5559,19 @@ mod tests {
         /// scan test uses single-batch fragments, so this is the only guard for the
         /// cross-batch (`start > 0`) path.
         #[rstest]
+        #[case::full(None)]
+        #[case::ranges(Some(vec![1..6, 8..10]))]
         #[tokio::test]
         async fn test_scan_multi_batch_overlay_slicing(
-            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+            #[values(
+                LanceFileVersion::V2_0,
+                LanceFileVersion::V2_1,
+                LanceFileVersion::V2_2,
+                LanceFileVersion::V2_3
+            )]
+            version: LanceFileVersion,
+            #[case] ranges: Option<Vec<std::ops::Range<u64>>>,
         ) {
-            use futures::TryStreamExt;
-
             // One fragment of 10 rows so the read can be chunked below.
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("id", DataType::Int32, true),
@@ -5543,15 +5611,37 @@ mod tests {
             .await;
 
             let frag = dataset.get_fragment(0).unwrap();
-            let mut scanner = frag.scan();
-            scanner.batch_size(4).project(&["val"]).unwrap();
-            let batches: Vec<RecordBatch> = scanner
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
+            let expected_rows: Vec<i32> = ranges.as_ref().map_or_else(
+                || (0..10).collect(),
+                |ranges| {
+                    ranges
+                        .iter()
+                        .flat_map(|r| r.clone().map(|i| i as i32))
+                        .collect()
+                },
+            );
+            let batches: Vec<RecordBatch> = if let Some(ranges) = ranges {
+                frag.open(&full_schema(&dataset), FragReadConfig::default())
+                    .await
+                    .unwrap()
+                    .read_ranges(ranges.into(), 4)
+                    .await
+                    .unwrap()
+                    .buffered(2)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            } else {
+                let mut scanner = frag.scan();
+                scanner.batch_size(4).project(&["val"]).unwrap();
+                scanner
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap()
+            };
             // Guard the guard: the read must actually span multiple batches, else
             // this would not exercise the cross-batch slice at all.
             assert!(
@@ -5562,7 +5652,8 @@ mod tests {
 
             let merged =
                 arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
-            let expected: Vec<i32> = (0..10)
+            let expected: Vec<i32> = expected_rows
+                .into_iter()
                 .map(|i| match i {
                     1 => 111,
                     5 => 555,

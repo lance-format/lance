@@ -41,6 +41,18 @@ use crate::{
     statistics::{ComputeStat, Stat},
 };
 
+mod admitted;
+mod concat;
+mod interleave;
+mod struct_splice;
+
+pub use interleave::{
+    try_concat_nested_binary_in, try_interleave_binary_in, try_interleave_nested_binary_in,
+};
+pub use struct_splice::{
+    StructValiditySelection, try_replace_struct_validities_in, try_splice_struct_in,
+};
+
 /// A data block with no buffers where everything is null
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated

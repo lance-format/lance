@@ -14,6 +14,8 @@ use crate::{
 };
 use lance_core::{Error, Result};
 
+mod unsigned;
+
 pub(crate) const MAX_BLOCK_DICTIONARY_ITEMS: usize = 4096;
 const BLOCK_FRAME_BYTES: usize = 16;
 
@@ -148,6 +150,16 @@ impl BlockDictionaryDecompressor {
 }
 
 impl BlockDecompressor for BlockDictionaryDecompressor {
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        unsigned::visit(self, data, bits_per_value, num_values, visitor)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let indices_have_payload = self.indices.requires_payload();
         let items_have_payload = self.items.requires_payload();

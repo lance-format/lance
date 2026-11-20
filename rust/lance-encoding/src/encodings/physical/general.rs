@@ -26,6 +26,9 @@ use crate::{
 use arrow_buffer::ArrowNativeType;
 use lance_core::Error;
 
+mod admitted;
+mod unsigned;
+
 /// Compress fixed-width rows independently, retaining their logical type description.
 #[derive(Debug)]
 pub(crate) struct FixedWidthGeneralPerValueCompressor {
@@ -230,6 +233,16 @@ impl FixedWidthGeneralBlockDecompressor {
 }
 
 impl BlockDecompressor for FixedWidthGeneralBlockDecompressor {
+    fn try_prepare_unsigned_in<'a>(
+        &'a self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<crate::compression::PreparedUnsigned<'a>>> {
+        unsigned::prepare(self, data, bits_per_value, num_values, workspace)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "General fixed-width block")?;
         let expected_bytes = usize::try_from(num_values)
@@ -360,6 +373,33 @@ impl GeneralMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        self.inner.admitted_output_layout()
+    }
+
+    fn try_prepare_range_in<'a>(
+        &'a self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<crate::compression::PreparedMiniBlockRange<'a>>> {
+        admitted::prepare(self, data, num_values, range, workspace)
+    }
+
+    fn try_prepare_and_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        match self.try_prepare_range_in(data, num_values, range, workspace)? {
+            Some(prepared) => prepared.try_decode(workspace),
+            None => Ok(None),
+        }
+    }
+
     fn num_buffers(&self) -> usize {
         self.inner.num_buffers()
     }

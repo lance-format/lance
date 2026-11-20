@@ -30,6 +30,8 @@ use std::{
     time::Instant,
 };
 
+use super::read_into::IoBuffer;
+#[cfg(test)]
 use bytes::Bytes;
 use lance_core::{Error, Result};
 
@@ -38,7 +40,7 @@ use super::{
     SchedulerStateEvent, emit_scheduler_state_event,
 };
 
-type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send>> + Send>;
+type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<IoBuffer>> + Send>> + Send>;
 
 /// The state of an I/O task
 ///
@@ -62,11 +64,11 @@ enum TaskState {
     },
     Running {
         backpressure_reservation: BackpressureReservation,
-        inner: Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>,
+        inner: Pin<Box<dyn Future<Output = Result<IoBuffer>> + Send>>,
     },
     Finished {
         backpressure_reservation: BackpressureReservation,
-        data: Result<Bytes>,
+        data: Result<IoBuffer>,
     },
 }
 
@@ -221,7 +223,7 @@ impl IoTask {
         }
     }
 
-    fn consume(self) -> Result<(Result<Bytes>, BackpressureReservation)> {
+    fn consume(self) -> Result<(Result<IoBuffer>, BackpressureReservation)> {
         let TaskState::Finished {
             data,
             backpressure_reservation,
@@ -649,7 +651,7 @@ impl IoQueue {
         result
     }
 
-    fn poll(&self, task_id: u64, cx: &mut Context<'_>) -> Poll<Result<Bytes>> {
+    fn poll(&self, task_id: u64, cx: &mut Context<'_>) -> Poll<Result<IoBuffer>> {
         let mut state = self.state.lock().unwrap();
         let Some(task) = state.tasks.get_mut(&task_id) else {
             // This should never happen and indicates a bug
@@ -711,7 +713,7 @@ pub(super) struct TaskHandle {
 }
 
 impl Future for TaskHandle {
-    type Output = Result<Bytes>;
+    type Output = Result<IoBuffer>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.queue.poll(self.task_id, cx)
     }
@@ -743,7 +745,7 @@ mod tests {
             |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
                 Box::new(move || {
                     order.lock().unwrap().push(prio);
-                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                    Box::pin(async move { Ok(IoBuffer::Bytes(rx.await.unwrap())) })
                 })
             };
 
@@ -846,7 +848,7 @@ mod tests {
             |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
                 Box::new(move || {
                     order.lock().unwrap().push(prio);
-                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                    Box::pin(async move { Ok(IoBuffer::Bytes(rx.await.unwrap())) })
                 })
             };
 
@@ -888,7 +890,7 @@ mod tests {
             |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
                 Box::new(move || {
                     order.lock().unwrap().push(prio);
-                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                    Box::pin(async move { Ok(IoBuffer::Bytes(rx.await.unwrap())) })
                 })
             };
 

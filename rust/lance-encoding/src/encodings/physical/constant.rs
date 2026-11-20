@@ -112,6 +112,30 @@ impl ConstantBlockDecompressor {
 }
 
 impl BlockDecompressor for ConstantBlockDecompressor {
+    fn plan_unsigned_metadata(
+        &self,
+        bits: u64,
+        count: u64,
+    ) -> Result<super::sequence::SequenceMetadata> {
+        if bits != self.bits_per_value || !matches!(bits, 32 | 64) {
+            return Err(Error::invalid_input(
+                "Constant metadata width disagrees with requested width",
+            ));
+        }
+        if self.value.is_none() != (count == 0) {
+            return Err(Error::invalid_input(
+                "Constant scalar must be absent exactly when cardinality is zero",
+            ));
+        }
+        match self.value {
+            Some(value) if bits == 32 && value > u32::MAX as u64 => {
+                Err(Error::invalid_input("Constant value exceeds u32::MAX"))
+            }
+            Some(value) => Ok(super::sequence::SequenceMetadata::Constant(value)),
+            None => Ok(super::sequence::SequenceMetadata::Empty),
+        }
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         require_no_block_payload(data, "Constant")?;
         if self.value.is_none() != (num_values == 0) {
