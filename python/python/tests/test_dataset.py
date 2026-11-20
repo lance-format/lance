@@ -751,6 +751,26 @@ def test_asof_checkout(tmp_path: Path):
     assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
 
 
+def test_asof_preserves_default_scan_options(tmp_path: Path):
+    first = lance.write_dataset(
+        pa.table({"id": range(4)}), tmp_path, max_rows_per_file=2
+    )
+    latest = lance.write_dataset(pa.table({"id": [4, 5]}), tmp_path, mode="append")
+    cutoff = latest.versions()[-1]["timestamp"]
+    options = {"with_row_address": True, "filter": "id >= 2"}
+
+    historical = lance.dataset(tmp_path, asof=cutoff, default_scan_options=options)
+    explicit = lance.dataset(
+        tmp_path, version=first.version, default_scan_options=options
+    )
+
+    assert historical.version == explicit.version == first.version
+    assert historical.schema.names == ["id", "_rowaddr"]
+    expected = explicit.to_table()
+    assert expected["id"].to_pylist() == [2, 3]
+    assert historical.to_table().equals(expected)
+
+
 class _NoOffsetTzInfo(tzinfo):
     """A tzinfo without a UTC offset; Python treats such datetimes as naive."""
 
