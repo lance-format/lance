@@ -20,12 +20,14 @@ use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
 pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
+#[cfg(feature = "pcodec")]
+use crate::encodings::physical::pcodec::{PcodecMiniBlockDecompressor, PcodecMiniBlockEncoder};
 use crate::{
     buffer::LanceBuffer,
     compression_config::{AlpMode, BssMode, CompressionFieldParams},
     constants::{
         ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
-        RLE_THRESHOLD_META_KEY,
+        PCODEC_COMPRESSION, RLE_THRESHOLD_META_KEY,
     },
     data::{
         DataBlock, DataBlockBuilder, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock,
@@ -742,6 +744,56 @@ pub fn try_alp_miniblock(
     try_alp_for_mini_block(field, data, params)
 }
 
+/// Select pcodec compression when the field requests `compression=pcodec`.
+///
+/// pcodec applies to float16/float32/float64 values and fixed-size lists of them. A
+/// request for any other type is rejected instead of silently ignored.
+pub fn try_pcodec_miniblock(
+    field: &Field,
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn MiniBlockCompressor>>> {
+    if params.compression.as_deref() != Some(PCODEC_COMPRESSION) {
+        return Ok(None);
+    }
+    let mut item_type = field.data_type();
+    while let DataType::FixedSizeList(item, _) = item_type {
+        item_type = item.data_type().clone();
+    }
+    if !matches!(
+        item_type,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
+        return Err(Error::invalid_input(format!(
+            "pcodec compression requires float16, float32 or float64 values or fixed-size lists of them, \
+             but field '{}' has type {}",
+            field.name,
+            field.data_type()
+        )));
+    }
+    if let DataBlock::FixedSizeList(fsl) = data
+        && fsl.clone().try_into_flat().is_none()
+    {
+        log::warn!(
+            "Field '{}' requests pcodec but has null list items; storing the page uncompressed",
+            field.name
+        );
+        return Ok(None);
+    }
+    #[cfg(feature = "pcodec")]
+    {
+        Ok(Some(Box::new(PcodecMiniBlockEncoder::try_new(
+            params.compression_level,
+        )?)))
+    }
+    #[cfg(not(feature = "pcodec"))]
+    {
+        Err(Error::not_supported_source(
+            "package was not built with pcodec support".into(),
+        ))
+    }
+}
+
 /// Select the original fixed-u8 RLE miniblock grammar.
 pub fn try_fixed_u8_rle_miniblock(
     data: &DataBlock,
@@ -912,6 +964,63 @@ pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>
         _ => false,
     };
     raw.then(|| Box::new(ValueEncoder::default()) as _)
+}
+
+/// Reject a packed struct whose children cannot be stored as one packed value.
+///
+/// Packed structs are encoded as a single primitive column, so every child,
+/// including the children of nested structs and fixed-size lists, must be a
+/// value type. A list, map or similar child would otherwise panic while the
+/// column is converted into a data block, so this runs when the encoder is
+/// created, before any data is written.
+pub fn validate_packed_struct_children(field: &Field) -> Result<()> {
+    fn find_unsupported<'a>(
+        path: &mut Vec<&'a str>,
+        name: &'a str,
+        data_type: &'a DataType,
+    ) -> Option<&'a DataType> {
+        path.push(name);
+        let found = match data_type {
+            DataType::Struct(fields) => fields
+                .iter()
+                .find_map(|child| find_unsupported(path, child.name(), child.data_type())),
+            DataType::FixedSizeList(item, _) => {
+                find_unsupported(path, item.name(), item.data_type())
+            }
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::Map(_, _)
+            | DataType::RunEndEncoded(_, _)
+            | DataType::Union(_, _) => Some(data_type),
+            _ => None,
+        };
+        if found.is_none() {
+            path.pop();
+        }
+        found
+    }
+
+    let DataType::Struct(fields) = field.data_type() else {
+        return Ok(());
+    };
+    let mut path = Vec::new();
+    if let Some(data_type) = fields
+        .iter()
+        .find_map(|child| find_unsupported(&mut path, child.name(), child.data_type()))
+    {
+        return Err(Error::not_supported_source(
+            format!(
+                "Packed struct field '{}' has a child '{}' of type {}, which packed struct encoding does not support",
+                field.name,
+                path.join("."),
+                data_type,
+            )
+            .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {
@@ -1466,8 +1575,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::Alp(description) => Ok(Box::new(
                 AlpMiniBlockDecompressor::from_description(description)?,
             )),
+            #[cfg(feature = "pcodec")]
+            Compression::Pcodec(description) => Ok(Box::new(
+                PcodecMiniBlockDecompressor::from_description(description)?,
+            )),
+            #[cfg(not(feature = "pcodec"))]
             Compression::Pcodec(_) => Err(Error::not_supported_source(
-                "pcodec decoding is not yet implemented".into(),
+                "package was not built with pcodec support".into(),
             )),
             Compression::General(general) => {
                 // Create inner decompressor

@@ -229,6 +229,8 @@ object's resolved dataset. A set `base_id` matches `BasePath.id` in this Version
 Manifest's `base_paths`. The same inheritance rule applies to deletion files, overlays,
 and other fragment-owned files. A null `base_id` in a buffered mutation
 inherits the resolved dataset of the structure containing that mutation.
+A deletion file's `path`, when set, resolves under the dataset this rule
+selects, as in a Version Manifest.
 
 Counts in a leaf are known. `physical_rows` of 0 is zero rows. A deletion file
 must carry `num_deleted_rows`, which must not exceed `physical_rows`.

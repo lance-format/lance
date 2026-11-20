@@ -166,6 +166,7 @@ impl SimpleIndex {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (res, _) = match &self.store {
             SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,

@@ -138,6 +138,13 @@ class BatchUDFCheckpoint:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS fragments (fragment_id INT, data BLOB)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS batches_lookup "
+                "ON batches(fragment_id, batch_index)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS fragments_lookup ON fragments(fragment_id)"
+            )
             conn.commit()
 
     def cleanup(self):

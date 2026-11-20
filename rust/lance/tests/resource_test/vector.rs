@@ -101,7 +101,11 @@ fn random_vector_batch(schema: &Arc<Schema>, num_rows: usize, dim: i32, seed: u8
     RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
 }
 
+// Too slow for PR CI (~100s); the nightly job runs it. The unit tests of
+// `raw_vector_fetch_shape`, `fetch_in_chunks` and `slice_evenly` guard the
+// same bound on every PR.
 #[tokio::test]
+#[ignore = "https://github.com/lance-format/lance/issues/10973"]
 async fn test_ivf_split_reshuffle_memory_stays_bounded() {
     // A split re-reads the raw vectors of every partition it touches. With two
     // partitions of ~64Ki rows each and a target of 8Ki rows, both are split

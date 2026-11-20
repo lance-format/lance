@@ -52,7 +52,10 @@ public class Compaction {
           compactionOptions.getMaxSourceBytes(),
           compactionOptions.getExcludedFragmentIds(),
           compactionOptions.getDataStorageVersion(),
-          compactionOptions.getSourceBudgetMode());
+          compactionOptions.getSourceBudgetMode(),
+          compactionOptions.getMaxDataFilesPerFragment(),
+          compactionOptions.getScope(),
+          compactionOptions.getDataCacheBytes());
     }
   }
 
@@ -159,5 +162,8 @@ public class Compaction {
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
       Optional<String> dataStorageVersion,
-      Optional<String> sourceBudgetMode);
+      Optional<String> sourceBudgetMode,
+      Optional<Long> maxDataFilesPerFragment,
+      Optional<String> scope,
+      Optional<Long> dataCacheBytes);
 }

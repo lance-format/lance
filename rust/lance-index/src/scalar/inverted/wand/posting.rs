@@ -9,8 +9,6 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::sync::Arc;
-#[cfg(target_arch = "x86_64")]
-use std::sync::LazyLock;
 
 use arrow::array::AsArray;
 use arrow::datatypes::Int32Type;
@@ -34,10 +32,6 @@ use crate::scalar::inverted::{
 use super::TERMINATED_DOC_ID;
 
 const LINEAR_BLOCK_SKIP_LIMIT: usize = 8;
-
-#[cfg(target_arch = "x86_64")]
-pub(super) static HAS_AVX2: LazyLock<bool> =
-    LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
 /// First index in `[pos, end)` where `docs[index] >= target` (scalar).
 #[inline]
@@ -95,25 +89,80 @@ pub(super) unsafe fn find_next_geq_avx2(
     }
 }
 
-#[inline]
-pub(super) unsafe fn find_next_geq(docs: *const u32, pos: usize, end: usize, target: u32) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    if *HAS_AVX2 {
-        return unsafe { find_next_geq_avx2(docs, pos, end, target) };
-    }
-    unsafe { find_next_geq_scalar(docs, pos, end, target) }
+/// First index in `[pos, docs.len())` where `docs[index] >= target`, or
+/// `docs.len()` if there is none; `docs[pos..]` must be sorted.
+type FindNextGeqFn = unsafe fn(&[u32], usize, u32) -> usize;
+
+lance_core::dispatch! {
+    pub(super) static FIND_NEXT_GEQ: Dispatch<FindNextGeqFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[FIND_NEXT_GEQ_LINEAR_AVX2, FIND_NEXT_GEQ_LINEAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[FIND_NEXT_GEQ_LINEAR]
+        }
+    };
 }
 
-/// Search a sorted posting block using AVX2 when available. Keep the binary
-/// search fallback because linear catch-up is slower on targets without AVX2.
+lance_core::dispatch! {
+    /// For a whole posting block. Without AVX2, a binary search beats the
+    /// linear catch-up.
+    pub(super) static FIND_NEXT_GEQ_IN_BLOCK: Dispatch<FindNextGeqFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[FIND_NEXT_GEQ_LINEAR_AVX2, FIND_NEXT_GEQ_BINARY]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[FIND_NEXT_GEQ_BINARY]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(FIND_NEXT_GEQ_LINEAR: FindNextGeqFn)]
+    fn find_next_geq_linear(docs: &[u32], pos: usize, target: u32) -> usize {
+        // SAFETY: the scalar search reads only `docs[pos..docs.len()]`.
+        unsafe { find_next_geq_scalar(docs.as_ptr(), pos, docs.len(), target) }
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(FIND_NEXT_GEQ_BINARY: FindNextGeqFn)]
+    fn find_next_geq_binary(docs: &[u32], pos: usize, target: u32) -> usize {
+        pos + docs[pos..].partition_point(|&doc_id| doc_id < target)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(FIND_NEXT_GEQ_LINEAR_AVX2: FindNextGeqFn)]
+    fn find_next_geq_linear_avx2(docs: &[u32], pos: usize, target: u32) -> usize {
+        // SAFETY: the AVX2 search reads only `docs[pos..docs.len()]`.
+        unsafe { find_next_geq_avx2(docs.as_ptr(), pos, docs.len(), target) }
+    }
+}
+
+/// # Safety
+/// `docs` points at `end` readable values.
+#[inline]
+pub(super) unsafe fn find_next_geq(docs: *const u32, pos: usize, end: usize, target: u32) -> usize {
+    // SAFETY: guaranteed by the caller.
+    let docs = unsafe { std::slice::from_raw_parts(docs, end) };
+    FIND_NEXT_GEQ.get().call(docs, pos, target)
+}
+
+/// Search a sorted posting block for the first doc at or after `pos` that is
+/// `>= target`.
 #[inline]
 pub(super) fn find_next_geq_in_block(docs: &[u32], pos: usize, target: u32) -> usize {
     debug_assert!(pos <= docs.len());
-    #[cfg(target_arch = "x86_64")]
-    if *HAS_AVX2 {
-        return unsafe { find_next_geq_avx2(docs.as_ptr(), pos, docs.len(), target) };
-    }
-    pos + docs[pos..].partition_point(|&doc_id| doc_id < target)
+    FIND_NEXT_GEQ_IN_BLOCK.get().call(docs, pos, target)
 }
 
 #[inline]

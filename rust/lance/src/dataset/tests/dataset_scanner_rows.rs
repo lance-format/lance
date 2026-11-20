@@ -19,7 +19,7 @@ use arrow_select::take;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::col;
 use futures::TryStreamExt;
-use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt, SchemaExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -43,6 +43,7 @@ use rstest::rstest;
 mod mask_replay;
 
 use crate::Error;
+use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::scanner::test_dataset::{TestVectorDataset, batch_row_ids};
 use crate::dataset::scanner::{
     ColumnOrdering, FragmentSlice, RowAddrMask, RowAddrTreeMap, Scanner,
@@ -54,6 +55,7 @@ use crate::dataset::{
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+use lance_core::datatypes::BlobHandling;
 
 #[rstest]
 #[case::without_stable_row_ids(false)]
@@ -1973,6 +1975,57 @@ async fn test_limit_with_ordering_not_pushed_down() {
     assert_eq!(unsorted_values[2], 80);
 }
 
+#[rstest]
+#[case::plain(None, false, None)]
+#[case::filtered(Some("id > 2"), false, None)]
+#[case::full_text(None, true, None)]
+#[case::full_text_candidates(None, true, Some(4))]
+#[tokio::test]
+async fn test_zero_limit_with_ordering(
+    #[case] filter: Option<&str>,
+    #[case] has_full_text_query: bool,
+    #[case] candidate_limit: Option<i64>,
+    #[values(None, Some(0), Some(2))] offset: Option<i64>,
+    #[values(false, true)] is_sort_column_projected: bool,
+) {
+    let dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("text", array::cycle_utf8_literals(&["needle"]))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+        .await
+        .unwrap();
+
+    let columns = if is_sort_column_projected {
+        vec!["id", "text"]
+    } else {
+        vec!["text"]
+    };
+    let mut scanner = dataset.scan();
+    scanner.project(&columns).unwrap();
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+        .unwrap();
+    if let Some(filter) = filter {
+        scanner.filter(filter).unwrap();
+    }
+    if has_full_text_query {
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("needle".into())
+                    .with_column("text".into())
+                    .unwrap()
+                    .limit(candidate_limit),
+            )
+            .unwrap();
+    }
+    let expected_schema = scanner.schema().await.unwrap();
+    scanner.limit(Some(0), offset).unwrap();
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema(), expected_schema);
+}
+
 #[tokio::test]
 async fn test_scan_with_version_columns() {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
@@ -2154,5 +2207,83 @@ async fn test_scalar_indexed_filter_with_unprojected_sort(
     assert_eq!(
         limited["id"].as_string::<i32>(),
         &StringArray::from(vec!["d", "b"])
+    );
+}
+
+#[rstest]
+#[case::created("_row_created_at_version")]
+#[case::updated("_row_last_updated_at_version")]
+#[tokio::test]
+async fn test_take_filter_version_columns(
+    #[case] version_column: &str,
+    #[values(false, true)] shortcut: bool,
+) {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(6), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let selection = if shortcut { "_rowid" } else { "i" };
+    let mut scan = dataset.scan();
+    scan.project(&["i"]).unwrap();
+    scan.filter(&format!("{selection} IN (1, 4) AND {version_column} = 1"))
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch["i"].as_primitive::<Int32Type>().values(), &[1, 4]);
+}
+
+#[rstest]
+#[case::inline("b.kind = 0", &[1])]
+#[case::null("b.kind IS NULL", &[4])]
+#[case::with_version("b.kind = 0 AND _row_created_at_version = 1", &[1])]
+#[tokio::test]
+async fn test_take_filter_blob_description(#[case] predicate: &str, #[case] expected: &[i32]) {
+    let mut blobs = BlobArrayBuilder::new(6);
+    for i in 0..6 {
+        if i == 4 {
+            blobs.push_null().unwrap();
+        } else {
+            blobs.push_bytes(vec![i as u8]).unwrap();
+        }
+    }
+    let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3, 4, 5]))
+        .unwrap()
+        .try_with_column(blob_field("b", true), blobs.finish().unwrap())
+        .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let mut scan = dataset.scan();
+    scan.project(&["i"])
+        .unwrap()
+        .blob_handling(BlobHandling::AllBinary)
+        .filter(&format!("_rowid IN (1, 4) AND {predicate}"))
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_columns(), 1);
+    assert_eq!(
+        batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+        expected
     );
 }

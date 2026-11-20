@@ -18,7 +18,10 @@ def test_compaction_json_types(tmp_path: Path) -> None:
     dataset = lance.write_dataset(
         pa.table({"a": range(4)}), tmp_path / "dataset", max_rows_per_file=2
     )
-    plan = Compaction.plan(dataset, {"target_rows_per_fragment": 4, "num_threads": 1})
+    plan = Compaction.plan(
+        dataset,
+        {"target_rows_per_fragment": 4, "num_threads": 1, "data_cache_bytes": None},
+    )
 
     # Annotated locals pin the JSON helpers' return types in pyright.
     plan_json: str = plan.json()

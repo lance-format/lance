@@ -5,7 +5,7 @@
 //! peak memory over windows of time.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Once, PoisonError, Weak};
 use std::time::Duration;
 
@@ -13,7 +13,8 @@ use super::proc::{ProcessMemory, read_process_memory};
 use crate::utils::parse::str_to_bool;
 use crate::{Error, Result};
 
-/// Environment variable that turns memory observation on.
+/// Environment variable that turns memory observation on, until the process
+/// calls [`set_observation`].
 ///
 /// It takes a boolean such as `1`/`0`, `true`/`false`, `on`/`off` or
 /// `yes`/`no`, in any case; unset or empty means off. Any other value makes
@@ -31,6 +32,44 @@ static OBSERVE_FLAG: LazyLock<std::result::Result<bool, String>> =
         Err(std::env::VarError::NotUnicode(value)) => Err(invalid_flag_message(&value)),
     });
 
+const UNSET: u8 = 0;
+const OFF: u8 = 1;
+const ON: u8 = 2;
+
+/// What [`set_observation`] last set, or `UNSET` before its first call. It
+/// never returns to `UNSET`, so once a call has made the switch valid, it stays
+/// valid.
+static SWITCH: AtomicU8 = AtomicU8::new(UNSET);
+
+/// Switches memory observation on or off for this process, in place of
+/// [`OBSERVE_ENV_VAR`].
+///
+/// Until the first call, the variable decides; from then on, for the rest of
+/// the process, the latest call does, whatever the variable holds, so an
+/// invalid value no longer fails anything. An operation, such as an index
+/// build, checks the switch once, before its first stage: switched off later,
+/// it still reports in full, and one that checked while observation was off
+/// reports nothing. In the same way, the component gauge counts the I/O
+/// schedulers, DataFusion pools and MemWAL writers created while observation
+/// is on, never one created before. While observation is off,
+/// [`refresh_metrics`](super::refresh_metrics) leaves the gauges at their last
+/// values.
+///
+/// The setting belongs to this process: a child created with `fork` starts
+/// with it, and any other child process follows its own environment.
+///
+/// ```
+/// # fn observe_some_builds() {
+/// lance_core::memory::set_observation(true);
+/// // ... the operations to observe ...
+/// lance_core::memory::set_observation(false);
+/// # }
+/// ```
+pub fn set_observation(enabled: bool) {
+    // Nothing else is published through the switch, so relaxed ordering suffices.
+    SWITCH.store(if enabled { ON } else { OFF }, Ordering::Relaxed);
+}
+
 fn parse_observe_flag(value: Option<&str>) -> std::result::Result<bool, String> {
     let Some(value) = value else {
         return Ok(false);
@@ -45,16 +84,24 @@ fn invalid_flag_message(value: &(impl fmt::Debug + ?Sized)) -> String {
     format!("{OBSERVE_ENV_VAR}={value:?} is invalid, expected a boolean such as 1/0 or true/false")
 }
 
-/// Whether [`OBSERVE_ENV_VAR`] turns observation on, read once per process.
+/// Whether observation is on: as [`set_observation`] last set it or, before its
+/// first call, as [`OBSERVE_ENV_VAR`] sets it, read once per process.
 pub(super) fn observe_flag() -> Result<bool> {
-    OBSERVE_FLAG.clone().map_err(Error::invalid_input)
+    match SWITCH.load(Ordering::Relaxed) {
+        UNSET => OBSERVE_FLAG.clone().map_err(Error::invalid_input),
+        switch => Ok(switch == ON),
+    }
 }
 
-/// Whether [`OBSERVE_ENV_VAR`] turns observation on, without the error: cheap
-/// enough for paths that create many objects. An invalid value counts as off.
+/// Whether observation is on, as [`observe_flag`] decides, without the error:
+/// cheap enough for paths that create many objects. An invalid
+/// [`OBSERVE_ENV_VAR`] counts as off.
 #[cfg(feature = "metrics")]
 pub(super) fn observing() -> bool {
-    matches!(*OBSERVE_FLAG, Ok(true))
+    match SWITCH.load(Ordering::Relaxed) {
+        UNSET => matches!(*OBSERVE_FLAG, Ok(true)),
+        switch => switch == ON,
+    }
 }
 
 /// Logs once that the switch is on where the process cannot be read.
@@ -63,13 +110,14 @@ pub(super) fn warn_unsupported() {
     UNSUPPORTED.call_once(|| {
         if cfg!(feature = "metrics") {
             tracing::warn!(
-                "{OBSERVE_ENV_VAR} is set, but the process gauges and the index build peaks \
-                 need Linux and stay off; lance_memory_component_bytes is still reported"
+                "Memory observation is switched on, but the process gauges and the index \
+                 build peaks need Linux and stay off; lance_memory_component_bytes is still \
+                 reported"
             );
         } else {
             tracing::warn!(
-                "{OBSERVE_ENV_VAR} is set, but Lance is built without the `metrics` feature, \
-                 so no memory metric is reported"
+                "Memory observation is switched on, but Lance is built without the `metrics` \
+                 feature, so no memory metric is reported"
             );
         }
     });
@@ -189,8 +237,8 @@ pub struct MemoryObserver {
 }
 
 impl MemoryObserver {
-    /// The process-wide observer, or `None` unless [`OBSERVE_ENV_VAR`] turns
-    /// observation on.
+    /// The process-wide observer, or `None` while observation is off (see
+    /// [`set_observation`]).
     ///
     /// Observation also needs Linux; elsewhere this logs a warning once and
     /// returns `None`.
@@ -198,7 +246,7 @@ impl MemoryObserver {
     /// # Errors
     ///
     /// Returns an invalid-input error when [`OBSERVE_ENV_VAR`] holds something
-    /// other than a boolean.
+    /// other than a boolean and [`set_observation`] has not been called.
     ///
     /// ```
     /// # use lance_core::memory::MemoryObserver;
@@ -475,6 +523,67 @@ mod tests {
             "this test needs {OBSERVE_ENV_VAR} unset"
         );
         assert!(MemoryObserver::global().unwrap().is_none());
+    }
+
+    /// Set in the child process that `test_set_observation_takes_over` runs, to
+    /// what the variable alone decides there: `invalid` or `on`.
+    const SWITCH_CHILD: &str = "LANCE_MEMORY_SWITCH_TEST_CHILD";
+
+    #[rstest]
+    #[case::invalid("maybe", "invalid", true)]
+    #[case::on("1", "on", true)]
+    // A wrong premise must fail the child, which shows that its body runs.
+    #[case::wrong_premise("1", "invalid", false)]
+    fn test_set_observation_takes_over(
+        #[case] variable: &str,
+        #[case] premise: &str,
+        #[case] child_passes: bool,
+    ) {
+        // Other tests in this process need observation off, so the switch is
+        // flipped in a child process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "memory::observer::tests::test_set_observation_takes_over_child",
+            ])
+            .env(SWITCH_CHILD, premise)
+            .env(OBSERVE_ENV_VAR, variable)
+            .output()
+            .unwrap();
+        let summary = if child_passes {
+            "test result: ok. 1 passed;"
+        } else {
+            "test result: FAILED. 0 passed; 1 failed;"
+        };
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(summary),
+            "expected {summary:?} from the child process: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_set_observation_takes_over_child() {
+        let Some(premise) = std::env::var_os(SWITCH_CHILD) else {
+            return;
+        };
+        // Until the first call the variable decides.
+        match premise.to_str() {
+            Some("invalid") => assert!(observe_flag().is_err()),
+            Some("on") => assert!(observe_flag().unwrap()),
+            other => panic!("unknown premise {other:?}"),
+        }
+        #[cfg(feature = "metrics")]
+        assert_eq!(observing(), premise == "on");
+        for enabled in [true, false, true] {
+            set_observation(enabled);
+            assert_eq!(observe_flag().unwrap(), enabled);
+            #[cfg(feature = "metrics")]
+            assert_eq!(observing(), enabled);
+            assert_eq!(
+                MemoryObserver::global().unwrap().is_some(),
+                enabled && cfg!(target_os = "linux")
+            );
+        }
     }
 
     #[test]

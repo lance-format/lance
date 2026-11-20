@@ -227,7 +227,7 @@ class TestDescribeTable:
 
     @pytest.mark.parametrize("use_request_model", [False, True], ids=["dict", "model"])
     def test_describe_table_version(self, rest_namespace, use_request_model):
-        """Describe version responses match the request representation."""
+        """Describe version responses are always response models."""
         rest_namespace.create_namespace(CreateNamespaceRequest(id=["workspace"]))
         table_id = ["workspace", "test_table"]
         ipc_data = table_to_ipc_bytes(create_test_data())
@@ -238,12 +238,9 @@ class TestDescribeTable:
             request if use_request_model else {"id": table_id, "version": 1}
         )
 
-        if use_request_model:
-            assert isinstance(response, DescribeTableVersionResponse)
-            assert response.version.version == 1
-        else:
-            assert isinstance(response, dict)
-            assert response.get("version")["version"] == 1
+        assert isinstance(response, DescribeTableVersionResponse)
+        assert response.version.version == 1
+        assert response.model_dump()["version"]["version"] == 1
 
 
 class TestTableOperations:

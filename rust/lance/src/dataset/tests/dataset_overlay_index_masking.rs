@@ -47,6 +47,7 @@ use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
 use crate::index::frag_reuse_reader::tests::persist_fixture;
+use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
@@ -397,6 +398,12 @@ fn string_lists(rows: &[&[&str]]) -> ArrayRef {
         }
         builder.append(true);
     }
+    Arc::new(builder.finish())
+}
+
+fn null_string_list() -> ArrayRef {
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    builder.append_null();
     Arc::new(builder.finish())
 }
 
@@ -752,6 +759,58 @@ async fn test_overlay_matches_respect_physical_row_selection(
         ids_from_batches(&[scanner.try_into_batch().await.unwrap()]),
         vec![1]
     );
+}
+
+/// A column repack moves base values without changing them, so an overlay on
+/// the fragment keeps shadowing the base it was written over.
+#[tokio::test]
+async fn repack_columns_preserves_data_overlay() {
+    let mut dataset = create_base_dataset().await;
+    // A backfill gives each fragment a second file, so a limit of 1 repacks.
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "ext".into(),
+                "id + 1".into(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // Fragment 0, offset 1 is id=1, age=10; the overlay changes its age to 999.
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Merge both files, `age`, the overlaid column, included. Its values only
+    // moved, so the overlay on `age` must survive and keep shadowing the base.
+    let options = crate::dataset::optimize::CompactionOptions {
+        max_data_files_per_fragment: Some(1),
+        scope: crate::dataset::optimize::CompactionScope::RepackColumns,
+        ..Default::default()
+    };
+    crate::dataset::optimize::compact_files(&mut dataset, options, None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragment(0).unwrap().metadata().files.len(), 1);
+
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1,
+        "the data overlay must survive the rewrite"
+    );
+    // The overlaid value still shadows the base: age=999 for id=1, old 10 gone.
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    dataset.validate().await.unwrap();
 }
 
 /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is
@@ -2410,7 +2469,7 @@ async fn test_remapping_merge_rescans_overlay_stale_rows_off_fragment_zero(
     assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
 }
 
-/// `id` 0..6 with a `List<Utf8>` `tags` column, three rows per fragment (fragments 0 and 1).
+/// `id` 0..6 with a nullable `List<Utf8>` `tags` column, three rows per fragment (fragments 0 and 1).
 async fn create_tags_dataset() -> Dataset {
     let ids = Arc::new(Int32Array::from_iter_values(0..6)) as ArrayRef;
     let tags = string_lists(&[
@@ -2421,8 +2480,15 @@ async fn create_tags_dataset() -> Dataset {
         &["blue", "small"],
         &["red"],
     ]);
-    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
-    let schema = batch.schema();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new(
+            "tags",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, tags]).unwrap();
     Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
         "memory://",
@@ -2499,6 +2565,94 @@ async fn test_label_list_update_rescans_overlay_stale_fragment() {
     assert_ids_match_oracle(&dataset, "array_has_any(tags, ['tiny'])", &[1, 7]).await;
     assert_ids_match_oracle(&dataset, "array_has_any(tags, ['green'])", &[1, 3]).await;
     assert_ids_match_oracle(&dataset, "array_has_all(tags, ['red', 'big'])", &[0]).await;
+    assert_answered_by_index(&dataset, "array_has_any(tags, ['tiny'])").await;
+}
+
+/// Bounded optimize keeps the old LabelList segment in the merge stage while a
+/// task builds the appended fragment. The pure merge must not hide the overlay
+/// mask: stale value and list-null postings stay excluded from index results and
+/// their rows are re-evaluated against the current values on the flat path.
+#[tokio::test]
+async fn test_label_list_bounded_merge_preserves_overlay_masking() {
+    let mut dataset = create_tags_dataset().await;
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::LabelList,
+            Some("tags_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Fragment 0 offset 1 (id 1): ["blue"] -> ["green", "tiny"].
+    let dataset = commit_overlay(
+        dataset,
+        "tags_overlay_replaced",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![string_lists(&[&["green", "tiny"]])],
+    )
+    .await;
+    // Fragment 1 offset 1 (id 4): ["blue", "small"] -> NULL.
+    let mut dataset = commit_overlay(
+        dataset,
+        "tags_overlay_null",
+        1,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![null_string_list()],
+    )
+    .await;
+
+    // Fragment 2: ids 6, 7, 8.
+    let ids = Arc::new(Int32Array::from_iter_values(6..9)) as ArrayRef;
+    let tags = string_lists(&[&["blue"], &["tiny"], &["red"]]);
+    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+
+    let options = OptimizeOptions::merge(1).max_rows_per_task(Some(3));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].fragments, vec![2]);
+    assert!(plan.tasks[0].old_segments.is_empty());
+    assert_eq!(plan.merges.len(), 1);
+    assert_eq!(plan.merges[0].old_segments.len(), 1);
+
+    let mut built = Vec::new();
+    for task in &plan.tasks {
+        built.extend(task.execute(&dataset).await.unwrap());
+    }
+    let mut merged = Vec::new();
+    for merge in &plan.merges {
+        merged.extend(merge.execute(&dataset, &built).await.unwrap());
+    }
+    commit_optimize_indices(&mut dataset, merged, &options)
+        .await
+        .unwrap();
+
+    let committed = dataset.load_indices_by_name("tags_idx").await.unwrap();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(
+        committed[0].fragment_bitmap,
+        Some(RoaringBitmap::from_iter(0u32..3))
+    );
+    for (filter, expected) in [
+        ("array_has_any(tags, ['blue'])", vec![6]),
+        ("array_has_any(tags, ['tiny'])", vec![1, 7]),
+        ("array_has_any(tags, ['green'])", vec![1, 3]),
+        ("array_has_any(tags, ['small'])", vec![]),
+        ("array_has_all(tags, ['red', 'big'])", vec![0]),
+        ("tags IS NULL", vec![4]),
+    ] {
+        assert_ids_match_oracle(&dataset, filter, &expected).await;
+    }
     assert_answered_by_index(&dataset, "array_has_any(tags, ['tiny'])").await;
 }
 
@@ -5035,11 +5189,16 @@ async fn minhash_ids(dataset: &Dataset, text: &str, fast_search: bool) -> crate:
 }
 
 #[rstest]
+#[case::single_task(2, 1)]
+#[case::multiple_tasks(1, 2)]
 #[tokio::test]
 async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
     #[values(false, true)] stable_row_ids: bool,
+    #[case] task_limit: u64,
+    #[case] task_count: usize,
 ) {
     let mut dataset = create_text_dataset(stable_row_ids).await;
+    let index_name = "text_idx";
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::MinHashLsh)
         .with_params(&serde_json::json!({"num_hashes": 32, "num_bands": 8, "shingle_size": 1}));
     dataset
@@ -5051,6 +5210,7 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         1
     );
 
+    let source_version = dataset.load_indices_by_name(index_name).await.unwrap()[0].dataset_version;
     let dataset = commit_overlay(
         dataset,
         "minhash_row_level",
@@ -5112,4 +5272,59 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         ids_from_batches(&[scan.try_into_batch().await.unwrap()]),
         vec![8]
     );
+
+    // The single task refreshes old signatures as it absorbs the source.
+    // Multiple tasks pass the source to a physical merge that preserves its version.
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let added = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![12, 13])),
+            Arc::new(StringArray::from(vec!["olive brine", "papaya lime"])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(added)], schema),
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let options = OptimizeOptions::merge(1).max_rows_per_task(Some(task_limit));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), task_count);
+    let single_task = task_count == 1;
+    dataset.object_store.io_stats_incremental();
+    dataset.optimize_indices(&options).await.unwrap();
+    let merged = dataset.load_indices_by_name(index_name).await.unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].dataset_version,
+        if single_task {
+            plan.read_version
+        } else {
+            source_version
+        }
+    );
+    if !single_task {
+        let requests = dataset.object_store.io_stats_incremental().requests;
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path.as_ref().ends_with("minhash_row_level.lance"))
+        );
+    }
+
+    let ids = minhash_ids(&dataset, "apple banana", false).await.unwrap();
+    assert!(!ids.contains(&1), "{ids:?}");
+    let hits = minhash_ids(&dataset, "cherry mango", single_task)
+        .await
+        .unwrap();
+    assert_eq!(hits.first(), Some(&1), "{hits:?}");
 }

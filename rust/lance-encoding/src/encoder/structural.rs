@@ -10,6 +10,7 @@ use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 
 pub use crate::encodings::logical::primitive::PrimitivePageEncoding;
 
+use crate::compression::validate_packed_struct_children;
 use crate::encodings::logical::{
     blob::{BlobStructuralEncoder, BlobV2StructuralEncoder},
     fixed_size_list::FixedSizeListStructuralEncoder,
@@ -123,6 +124,9 @@ impl PrimitiveFieldEncoding {
                 ));
             }
             return Ok(None);
+        }
+        if field.is_packed_struct() {
+            validate_packed_struct_children(field)?;
         }
 
         Ok(Some(self.create_at(

@@ -49,7 +49,9 @@ mod index;
 mod tests;
 
 pub use builder::MinHashLshIndexBuilder;
-pub use index::{MinHashLshIndex, merge_minhash_indices};
+pub use index::MinHashLshIndex;
+#[allow(deprecated)]
+pub use index::merge_minhash_indices;
 
 use builder::{RowIdTransform, SignatureSource};
 
@@ -850,7 +852,7 @@ impl BasicTrainer for MinHashLshIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn Any>)
             .downcast::<MinHashLshTrainingRequest>()
@@ -860,7 +862,9 @@ impl BasicTrainer for MinHashLshIndexPlugin {
                 )
             })?;
         let builder = MinHashLshIndexBuilder::try_new(request.params.clone())?;
-        let files = builder.train(data, index_store).await?;
+        let files = builder
+            .train_with_progress(data, index_store, progress.as_ref())
+            .await?;
         Ok(CreatedIndex {
             index_details: request.params.details_any()?,
             index_version: MINHASH_LSH_INDEX_VERSION,
