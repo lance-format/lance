@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::vector::kmeans::emeans::{EMeansParams, train_emeans};
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::array::PrimitiveBuilder;
 use arrow::compute::cast;
@@ -33,10 +34,12 @@ pub struct PQBuildParams {
     /// The number of bits to present one PQ centroid.
     pub num_bits: usize,
 
-    /// The max number of iterations for kmeans training.
+    /// The max number of iterations for kmeans training. Only Lloyd uses it:
+    /// L2 codebooks trained from scratch use e-means, see
+    /// [`PQBuildParams::build`].
     pub max_iters: usize,
 
-    /// Run kmeans `REDOS` times and take the best result.
+    /// Run kmeans `REDOS` times and take the best result. Only Lloyd uses it.
     /// Default to 1.
     pub kmeans_redos: usize,
 
@@ -152,6 +155,22 @@ impl PQBuildParams {
             .into_par_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
+                // e-means reaches the codebook loss of 50 Lloyd iterations at a
+                // small fraction of the cost. Lloyd stays for refining a
+                // supplied codebook and for distances e-means does not support.
+                if self.codebook.is_none() && distance_type == DistanceType::L2 {
+                    let sub_vec = FixedSizeListArray::try_new_from_values(
+                        sub_vec,
+                        sub_vector_dimension as i32,
+                    )?;
+                    // Seeded per sub-vector so a rebuild trains the same codebook.
+                    let params = EMeansParams {
+                        seed: Some(sub_vec_idx as u64),
+                        ..Default::default()
+                    };
+                    return train_emeans(&sub_vec, num_centroids, &params)
+                        .map(|kmeans| kmeans.centroids);
+                }
                 let params = KMeansParams::new(
                     self.codebook.as_ref().map(|cb| {
                         let sub_vec_centroids = FixedSizeListArray::try_new_from_values(
@@ -239,6 +258,9 @@ impl PQBuildParams {
 
     /// Build a [ProductQuantizer] from the given data.
     ///
+    /// Each sub-vector codebook is trained with e-means under L2 when no
+    /// codebook is supplied, and with Lloyd ([`Self::max_iters`]) otherwise.
+    ///
     /// If the [`DistanceType`] is [`DistanceType::Cosine`], the input data will be normalized.
     pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
@@ -291,6 +313,8 @@ impl PQBuildParams {
 mod tests {
     use super::*;
     use arrow_array::Float32Array;
+    use lance_linalg::distance::l2::l2;
+    use rand::prelude::*;
 
     #[test]
     fn test_build_samples_before_materializing_subvectors() {
@@ -353,6 +377,93 @@ mod tests {
         assert_eq!(
             pq.codebook.values().as_primitive::<Float32Type>().values(),
             expected.as_slice()
+        );
+    }
+
+    /// L2 codebooks trained from scratch come from e-means and quantize about
+    /// as well as the Lloyd training they replace.
+    #[rstest::rstest]
+    #[case::few_rows_per_code(4_096)]
+    #[case::many_rows_per_code(16_384)]
+    fn test_build_trains_l2_codebook_with_emeans_close_to_lloyd(#[case] num_rows: usize) {
+        const DIM: usize = 32;
+        const NUM_SUB_VECTORS: usize = 4;
+        const NUM_BITS: usize = 8;
+        const SUB_DIM: usize = DIM / NUM_SUB_VECTORS;
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        let centers: Vec<f32> = (0..64 * DIM)
+            .map(|_| rng.random_range(-10.0..10.0))
+            .collect();
+        let values = Float32Array::from_iter((0..num_rows).flat_map(|row| {
+            let center = &centers[(row % 64) * DIM..][..DIM];
+            center
+                .iter()
+                .map(|c| c + rng.random_range(-1.0..1.0))
+                .collect::<Vec<_>>()
+        }));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let distortion = |codebook: &[f32]| -> f64 {
+            fsl.values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .chunks_exact(DIM)
+                .map(|row| {
+                    (0..NUM_SUB_VECTORS)
+                        .map(|s| {
+                            let sub = &row[s * SUB_DIM..][..SUB_DIM];
+                            codebook[s * 256 * SUB_DIM..][..256 * SUB_DIM]
+                                .chunks_exact(SUB_DIM)
+                                .map(|c| l2(sub, c) as f64)
+                                .fold(f64::INFINITY, f64::min)
+                        })
+                        .sum::<f64>()
+                })
+                .sum()
+        };
+
+        let emeans = PQBuildParams::new(NUM_SUB_VECTORS, NUM_BITS)
+            .build(&fsl, DistanceType::L2)
+            .unwrap();
+        // The Lloyd training L2 codebooks used before: 50 iterations per
+        // sub-vector from a random start.
+        let lloyd: Vec<f32> = (0..NUM_SUB_VECTORS)
+            .flat_map(|s| {
+                let sub_values: Vec<f32> = fsl
+                    .values()
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .chunks_exact(DIM)
+                    .flat_map(|row| row[s * SUB_DIM..][..SUB_DIM].to_vec())
+                    .collect();
+                let params = KMeansParams::new(None, 50, 1, DistanceType::L2).with_seed(s as u64);
+                train_kmeans::<Float32Type>(
+                    &Float32Array::from(sub_values),
+                    params,
+                    SUB_DIM,
+                    256,
+                    256,
+                )
+                .unwrap()
+                .centroids
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec()
+            })
+            .collect();
+
+        let codebook = |pq: &ProductQuantizer| {
+            pq.codebook
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec()
+        };
+        let (emeans, lloyd) = (distortion(&codebook(&emeans)), distortion(&lloyd));
+        assert!(
+            emeans <= lloyd * 1.02,
+            "e-means distortion {emeans} exceeds Lloyd distortion {lloyd} by more than 2%"
         );
     }
 
