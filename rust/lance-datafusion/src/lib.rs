@@ -30,5 +30,6 @@ pub mod spill;
 pub mod sql;
 #[cfg(feature = "substrait")]
 pub mod substrait;
+mod timestamp_coercion;
 pub mod udf;
 pub use lance_datafusion_exec::utils;

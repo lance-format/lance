@@ -148,6 +148,42 @@ def test_timestamp_pyarrow_predicates(tmp_path: Path, unit: str, timezone: str |
         assert dataset.to_table(filter=expr) == table.filter(expr)
 
 
+@pytest.mark.parametrize("unit", ["s", "ms", "us"])
+def test_timestamp_filters_with_finer_literals(tmp_path: Path, unit: str):
+    # A literal finer than the column's unit used to be truncated to that unit, so
+    # `ts >= <12:00:00.5>` also matched the row at 12:00:00.
+    start = datetime(2021, 1, 1, 12)
+    table = pa.table(
+        {
+            "id": range(3),
+            "ts": pa.array(
+                [start + timedelta(seconds=i) for i in range(3)], pa.timestamp(unit)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path / unit)
+
+    # Half of the column's unit past row 0.
+    fraction = {"s": "5", "ms": "0005", "us": "0000005"}[unit]
+    literal = f"CAST('2021-01-01 12:00:00.{fraction}' AS TIMESTAMP(9))"
+    expected = {
+        f"ts >= {literal}": [1, 2],
+        f"ts > {literal}": [1, 2],
+        f"ts < {literal}": [0],
+        f"ts <= {literal}": [0],
+        f"ts = {literal}": [],
+        f"ts != {literal}": [0, 1, 2],
+        f"ts IN ({literal})": [],
+    }
+    for predicate, ids in expected.items():
+        assert dataset.to_table(filter=predicate)["id"].to_pylist() == ids, predicate
+        assert dataset.count_rows(predicate) == len(ids), predicate
+
+    # Deleting from the bound on must keep the row before it.
+    dataset.delete(f"ts >= {literal}")
+    assert dataset.to_table()["id"].to_pylist() == [0]
+
+
 def test_sql_current_date(tmp_path: Path):
     table = pa.table(
         {"date": pa.array([date(2020, 1, 1), date(2020, 1, 2)], type=pa.date32())}

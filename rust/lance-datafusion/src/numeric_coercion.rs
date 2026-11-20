@@ -36,7 +36,7 @@ fn int_bounds(data_type: &DataType) -> Option<(f64, f64)> {
     Some((if signed { -upper } else { 0.0 }, upper))
 }
 
-fn extract_literal(expr: &Expr) -> Option<ScalarValue> {
+pub fn extract_literal(expr: &Expr) -> Option<ScalarValue> {
     match expr {
         Expr::Literal(value, _) => Some(value.clone()),
         Expr::Cast(cast) => extract_literal(&cast.expr)?
@@ -51,7 +51,7 @@ fn extract_literal(expr: &Expr) -> Option<ScalarValue> {
 }
 
 /// A comparison of a column against one operand, lowered to the column type.
-enum Comparison {
+pub enum Comparison {
     Literal(Operator, ScalarValue),
     /// Always true or false for non-null rows.
     Constant(bool),
@@ -65,7 +65,11 @@ struct Lowered {
     needs_rewrite: bool,
 }
 
-fn comparison_expr(column: &Expr, data_type: &DataType, comparison: Comparison) -> Option<Expr> {
+pub fn comparison_expr(
+    column: &Expr,
+    data_type: &DataType,
+    comparison: Comparison,
+) -> Option<Expr> {
     let (op, value) = match comparison {
         Comparison::Literal(op, value) => (op, value),
         // Domain bounds keep NULL rows NULL and stay indexable.
