@@ -22,9 +22,10 @@ use lance_file::writer::FileWriterOptions;
 use lance_table::format::{DataFile, Fragment};
 
 use super::{CompactionMetrics, CompactionOptions, RepackedFiles, RewriteResult, TaskData};
-use crate::dataset::fragment::FileFragment;
+use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::transaction::{DataReplacementGroup, Operation, TransactionBuilder};
 use crate::dataset::{Dataset, cleanup_data_fragments, versions};
+use crate::io::exec::filtered_read::{make_base_schedulers, make_scan_scheduler};
 use crate::{Error, Result};
 
 /// The ids of the leaf fields at and beneath `field`. The planner places a
@@ -258,6 +259,7 @@ pub(super) async fn execute_repack(
     let schema = dataset.schema();
     let batch_size = options.batch_size.map(|size| size as u32);
     let file_writer_options = options.file_writer_options();
+    let read_config = task_read_config(dataset, options);
 
     let mut written: Vec<DataFile> = Vec::with_capacity(files.len());
     for column_ids in files {
@@ -274,6 +276,7 @@ pub(super) async fn execute_repack(
             batch_size,
             write_version,
             &file_writer_options,
+            &read_config,
         )
         .await;
         match file {
@@ -320,6 +323,14 @@ async fn discard(dataset: &Dataset, fragment_id: u64, files: Vec<DataFile>) {
     cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &[partial]).await;
 }
 
+/// How a repack task reads its fragment: through one scheduler for all of its
+/// files, sized from `io_buffer_size` the way a rewrite's scan is.
+fn task_read_config(dataset: &Dataset, options: &CompactionOptions) -> FragReadConfig {
+    FragReadConfig::default()
+        .with_scan_scheduler(make_scan_scheduler(dataset, options.io_buffer_size))
+        .with_base_schedulers(make_base_schedulers(options.io_buffer_size))
+}
+
 /// Write `columns` of `source` to one new data file.
 async fn write_one_file(
     source: &FileFragment,
@@ -328,6 +339,7 @@ async fn write_one_file(
     batch_size: Option<u32>,
     write_version: ConcreteFileVersion,
     file_writer_options: &FileWriterOptions,
+    read_config: &FragReadConfig,
 ) -> Result<DataFile> {
     let write_schema = schema.project(columns)?;
     let mut updater = source
@@ -337,6 +349,7 @@ async fn write_one_file(
             batch_size,
             None,
             write_version,
+            read_config.clone(),
         )
         .await?;
     updater.set_file_writer_options(file_writer_options.clone());

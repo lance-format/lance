@@ -2660,10 +2660,20 @@ impl FileFragment {
             .manifest
             .data_storage_format
             .lance_file_format();
-        self.updater_with_version(columns, schemas, batch_size, blob_handling, write_version)
-            .await
+        self.updater_with_version(
+            columns,
+            schemas,
+            batch_size,
+            blob_handling,
+            write_version,
+            FragReadConfig::default(),
+        )
+        .await
     }
 
+    /// Like [`Self::updater`], but writes `write_version` files and reads the
+    /// fragment with `read_config`. The row id and row address flags of
+    /// `read_config` are replaced by what `columns` asks for.
     pub(crate) async fn updater_with_version<T: AsRef<str>>(
         &self,
         columns: Option<&[T]>,
@@ -2671,6 +2681,7 @@ impl FileFragment {
         batch_size: Option<u32>,
         blob_handling: Option<BlobHandling>,
         write_version: ConcreteFileVersion,
+        read_config: FragReadConfig,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
@@ -2703,7 +2714,7 @@ impl FileFragment {
 
         let reader = self.open(
             &schema,
-            FragReadConfig::default()
+            read_config
                 .with_row_address(with_row_addr)
                 .with_row_id(with_row_id),
         );

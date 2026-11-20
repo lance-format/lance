@@ -1217,6 +1217,95 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
     );
 }
 
+/// The `io_buffer_size_bytes` of every I/O scheduler state event fired while
+/// it is the default subscriber.
+#[derive(Clone, Default)]
+struct SchedulerBudgets(Arc<std::sync::Mutex<Vec<u64>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SchedulerBudgets {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Budget(Option<u64>);
+        impl tracing::field::Visit for Budget {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                if field.name() == "io_buffer_size_bytes" {
+                    self.0 = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        if event.metadata().target() != "lance_io::scheduler::state" {
+            return;
+        }
+        let mut budget = Budget(None);
+        event.record(&mut budget);
+        self.0.lock().unwrap().extend(budget.0);
+    }
+}
+
+/// A repack reads with `io_buffer_size`, as a rewrite does, both the files of
+/// the dataset and, in a shallow clone, the source files it references.
+#[rstest]
+#[case::own_files(false)]
+#[case::shallow_clone(true)]
+#[tokio::test]
+async fn repack_reads_with_io_buffer_size(#[case] shallow_clone: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let source_dir = TempStrDir::default();
+    let mut dataset = write(&source_dir, LanceFileVersion::V2_0).await;
+    for (name, expr) in [("d", "a + 1"), ("e", "a + 2")] {
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(name.into(), expr.into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let clone_dir = TempStrDir::default();
+    if shallow_clone {
+        dataset
+            .tags()
+            .create("to_clone", dataset.version().version)
+            .await
+            .unwrap();
+        dataset = dataset
+            .shallow_clone(&clone_dir, "to_clone", None)
+            .await
+            .unwrap();
+        let files = &dataset.manifest.fragments[0].files;
+        assert!(files.iter().all(|file| file.base_id.is_some()), "{files:?}");
+    }
+
+    let io_buffer_size = 3 * 1024 * 1024 + 1;
+    let options = CompactionOptions {
+        io_buffer_size: Some(io_buffer_size),
+        ..repack_options(Some(1))
+    };
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let task = plan.compaction_tasks().next().unwrap();
+
+    // tracing caches each callsite's interest while exactly one dispatcher is
+    // registered; a second one makes it consult this thread-local one.
+    let budgets = SchedulerBudgets::default();
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    {
+        let subscriber = tracing_subscriber::registry().with(budgets.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = task.execute(&dataset).await.unwrap();
+        assert!(result.repacked_files.is_some(), "{result:?}");
+    }
+
+    let budgets = budgets.0.lock().unwrap();
+    assert!(!budgets.is_empty(), "the task read nothing");
+    assert!(
+        budgets.iter().all(|budget| *budget == io_buffer_size),
+        "{budgets:?}"
+    );
+}
+
 /// A fragment both rewritten and repacked is refused before either commit.
 #[tokio::test]
 async fn commit_rejects_a_fragment_in_both_kinds_of_task() {

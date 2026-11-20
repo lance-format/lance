@@ -640,6 +640,32 @@ impl std::fmt::Debug for FilteredReadStream {
     }
 }
 
+/// Create the I/O scheduler for a read (explicit `io_buffer_size` → env
+/// override → max bandwidth)
+pub(crate) fn make_scan_scheduler(
+    dataset: &Dataset,
+    io_buffer_size: Option<u64>,
+) -> Arc<ScanScheduler> {
+    let obj_store = dataset.object_store.clone();
+    let scheduler_config = if let Some(io_buffer_size_bytes) =
+        io_buffer_size.or_else(get_default_io_buffer_size_override)
+    {
+        SchedulerConfig::new(io_buffer_size_bytes)
+    } else {
+        SchedulerConfig::max_bandwidth(obj_store.as_ref())
+    };
+    ScanScheduler::new(obj_store, scheduler_config)
+}
+
+/// Create the per-base scheduler cache for a read, sized like the scan
+/// scheduler (explicit `io_buffer_size` → env override → max bandwidth)
+pub(crate) fn make_base_schedulers(io_buffer_size: Option<u64>) -> BaseSchedulers {
+    match io_buffer_size.or_else(get_default_io_buffer_size_override) {
+        Some(io_buffer_size_bytes) => BaseSchedulers::new(io_buffer_size_bytes),
+        None => BaseSchedulers::max_bandwidth(),
+    }
+}
+
 impl FilteredReadStream {
     /// Create a new FilteredReadStream from a pre-computed internal plan.
     /// Fragment handles are constructed I/O-free from the manifest
@@ -660,10 +686,10 @@ impl FilteredReadStream {
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
     ) -> Result<Self> {
-        let scan_scheduler =
-            scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
+        let scan_scheduler = scan_scheduler
+            .unwrap_or_else(|| make_scan_scheduler(&dataset, options.io_buffer_size_bytes));
         let base_schedulers =
-            base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
+            base_schedulers.unwrap_or_else(|| make_base_schedulers(options.io_buffer_size_bytes));
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -802,33 +828,6 @@ impl FilteredReadStream {
             .try_buffered(io_parallelism)
             .try_collect::<Vec<_>>()
             .await
-    }
-
-    /// Create the I/O scheduler for a read (explicit option → env override →
-    /// max bandwidth)
-    fn make_scan_scheduler(dataset: &Dataset, options: &FilteredReadOptions) -> Arc<ScanScheduler> {
-        let obj_store = dataset.object_store.clone();
-        let scheduler_config = if let Some(io_buffer_size_bytes) = options
-            .io_buffer_size_bytes
-            .or_else(get_default_io_buffer_size_override)
-        {
-            SchedulerConfig::new(io_buffer_size_bytes)
-        } else {
-            SchedulerConfig::max_bandwidth(obj_store.as_ref())
-        };
-        ScanScheduler::new(obj_store, scheduler_config)
-    }
-
-    /// Create the per-base scheduler cache for a read, sized like the scan
-    /// scheduler (explicit option → env override → max bandwidth)
-    fn make_base_schedulers(options: &FilteredReadOptions) -> BaseSchedulers {
-        match options
-            .io_buffer_size_bytes
-            .or_else(get_default_io_buffer_size_override)
-        {
-            Some(io_buffer_size_bytes) => BaseSchedulers::new(io_buffer_size_bytes),
-            None => BaseSchedulers::max_bandwidth(),
-        }
     }
 
     async fn load_fragment(
@@ -3295,8 +3294,8 @@ impl RowStreamRead {
         materialization_context: Arc<BlobMaterializationContext>,
     ) -> Self {
         let scan_scheduler =
-            FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
-        let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options);
+            make_scan_scheduler(&dataset, source.read_options.io_buffer_size_bytes);
+        let base_schedulers = make_base_schedulers(source.read_options.io_buffer_size_bytes);
         Self {
             dataset,
             source,
@@ -5447,8 +5446,8 @@ mod tests {
             fixture.dataset.fragments(),
             &fixture.dataset,
             &options,
-            FilteredReadStream::make_scan_scheduler(&fixture.dataset, &options),
-            FilteredReadStream::make_base_schedulers(&options),
+            make_scan_scheduler(&fixture.dataset, options.io_buffer_size_bytes),
+            make_base_schedulers(options.io_buffer_size_bytes),
         )
         .unwrap();
         assert_eq!(scoped.len(), 3);
@@ -7336,8 +7335,8 @@ mod tests {
                 scan_range_after_filter: None,
             };
             let options = FilteredReadOptions::basic_full_read(dataset);
-            let scheduler = FilteredReadStream::make_scan_scheduler(dataset, &options);
-            let base_schedulers = FilteredReadStream::make_base_schedulers(&options);
+            let scheduler = make_scan_scheduler(dataset, options.io_buffer_size_bytes);
+            let base_schedulers = make_base_schedulers(options.io_buffer_size_bytes);
 
             let scoped = FilteredReadStream::plan_to_scoped_fragments(
                 &plan,
@@ -7390,8 +7389,8 @@ mod tests {
                 scan_range_after_filter: None,
             };
             let options = FilteredReadOptions::basic_full_read(&cloned);
-            let scheduler = FilteredReadStream::make_scan_scheduler(&cloned, &options);
-            let base_schedulers = FilteredReadStream::make_base_schedulers(&options);
+            let scheduler = make_scan_scheduler(&cloned, options.io_buffer_size_bytes);
+            let base_schedulers = make_base_schedulers(options.io_buffer_size_bytes);
             let scoped = FilteredReadStream::plan_to_scoped_fragments(
                 &plan,
                 &descriptors,

@@ -14,7 +14,11 @@ use crate::dataset::write::{
 use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
-    dataset::{fragment::FileFragment, transaction::UpdatedFragmentOffsets, versions},
+    dataset::{
+        fragment::{FileFragment, FragReadConfig},
+        transaction::UpdatedFragmentOffsets,
+        versions,
+    },
 };
 use arrow_array::{RecordBatch, RecordBatchIterator, UInt64Array};
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -463,6 +467,7 @@ impl MergeInsertJob {
                             None,
                             None,
                             write_version,
+                            FragReadConfig::default(),
                         )
                         .await?;
 
