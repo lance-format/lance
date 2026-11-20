@@ -3228,13 +3228,14 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: fragment_id,
+                fragment: Ref::Committed(fragment_id),
                 deletion_file: DeletionFile {
                     read_version,
                     id: 1,
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(2),
                     base_id: None,
+                    path: None,
                     inline: None,
                 },
                 data_change: true,
@@ -3325,13 +3326,14 @@ mod composite {
             composite_txn(
                 read_version,
                 vec![Action::SetDeletionFile(SetDeletionFile {
-                    fragment: fragment_id,
+                    fragment: Ref::Committed(fragment_id),
                     deletion_file: DeletionFile {
                         read_version,
                         id,
                         file_type: DeletionFileType::Array,
                         num_deleted_rows: Some(1),
                         base_id: None,
+                        path: None,
                         inline: None,
                     },
                     data_change: true,
@@ -5473,13 +5475,14 @@ mod composite {
         let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
             vec![
                 Action::SetDeletionFile(SetDeletionFile {
-                    fragment,
+                    fragment: Ref::Committed(fragment),
                     deletion_file: DeletionFile {
                         read_version,
                         id: 1,
                         file_type: DeletionFileType::Array,
                         num_deleted_rows: Some(1),
                         base_id: None,
+                        path: None,
                         inline: None,
                     },
                     data_change: true,

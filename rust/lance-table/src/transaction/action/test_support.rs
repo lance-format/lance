@@ -219,6 +219,7 @@ pub(super) fn any_deletion_file() -> DeletionFile {
         file_type: DeletionFileType::Array,
         num_deleted_rows: Some(1),
         base_id: None,
+        path: None,
         inline: None,
     }
 }

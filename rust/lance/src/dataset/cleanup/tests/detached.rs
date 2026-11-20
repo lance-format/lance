@@ -390,6 +390,7 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
         file_type: DeletionFileType::Array,
         num_deleted_rows: Some(1),
         base_id: None,
+        path: None,
         inline: None,
     });
     assert!(!removed(&dataset, &deleted).await);

@@ -376,7 +376,7 @@ explains how the index version and `FLAG_BTREE_KEY_LAYOUT` fence them.
 
 By default, a writer builds a single-column index without a `key_layout`.
 
-A writer must set `FLAG_BTREE_KEY_LAYOUT` (`2^20`) in the writer
+A writer must set `FLAG_BTREE_KEY_LAYOUT` (`2^22`) in the writer
 [feature flags](../../table/versioning.md#current-feature-flags) of every
 manifest it publishes, including by clone and restore, exactly when the
 manifest's index section has a segment with a `key_layout`. It must not set the
@@ -408,7 +408,7 @@ then maintain the segment as follows:
 ### Encoding Stability
 
 The bytes of `arrow_row` version 1 are the bytes that the `RowConverter` of the
-Arrow Rust crate `arrow-row` 58.4.0 writes for the admitted types. Arrow does
+Arrow Rust crate `arrow-row` 59.3.3 writes for the admitted types. Arrow does
 not promise to keep those bytes across releases, so this page, not the crate,
 defines version 1. If a later `arrow-row` release writes different bytes for an
 admitted type, Lance keeps writing version 1 bytes for that type by vendoring
