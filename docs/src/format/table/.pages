@@ -1,6 +1,7 @@
 nav:
   - index.md
   - Schema: schema.md
+  - JSONB: jsonb.md
   - Blob v2: blob.md
   - Table Config: table_config.md
   - Versioning: versioning.md
