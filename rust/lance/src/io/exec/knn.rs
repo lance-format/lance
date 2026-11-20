@@ -2076,12 +2076,16 @@ fn effective_query_parallelism(
 /// The session's `target_partitions` when a caller set it, `None` when a Lance
 /// session left it at DataFusion's default.
 ///
-/// A session Lance did not build carries no marker, so its value counts as set.
+/// A session Lance did not build carries no marker, so its value counts as set,
+/// and so does a value changed after Lance built the session. A later change
+/// to the default value itself cannot be told apart; set
+/// `LanceExecutionOptions::target_partition` to limit a session reliably.
 fn explicit_target_partitions(config: &SessionConfig) -> Option<usize> {
-    config
+    let target = config.target_partitions();
+    let is_default = config
         .get_extension::<DefaultTargetPartitions>()
-        .is_none()
-        .then(|| config.target_partitions())
+        .is_some_and(|default| default.0 == target);
+    (!is_default).then_some(target)
 }
 
 /// Caps the CPU pool at `target_partitions` only when a caller set it (#7087).
@@ -3279,8 +3283,11 @@ mod tests {
         let cores = SessionConfig::new().target_partitions();
         let explicit = SessionConfig::new().with_target_partitions(cores);
         assert_eq!(explicit_target_partitions(&explicit), Some(cores));
-        let default = SessionConfig::new().with_extension(Arc::new(DefaultTargetPartitions));
+        let default = SessionConfig::new().with_extension(Arc::new(DefaultTargetPartitions(cores)));
         assert_eq!(explicit_target_partitions(&default), None);
+        // A target changed after the session was built is explicit again.
+        let changed = default.with_target_partitions(cores + 1);
+        assert_eq!(explicit_target_partitions(&changed), Some(cores + 1));
     }
 
     #[test]

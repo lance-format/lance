@@ -18,7 +18,7 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
-use super::opendal::finish_opendal_operator;
+use super::opendal::finish_huggingface_operator;
 
 /// Hugging Face object store provider backed by OpenDAL.
 #[derive(Default, Debug)]
@@ -155,6 +155,21 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
 }
 
 fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
+    build_hf_store_inner(config_map, None)
+}
+
+#[cfg(test)]
+fn build_hf_store_with_endpoint(
+    config_map: HashMap<String, String>,
+    endpoint: &str,
+) -> Result<OpendalStore> {
+    build_hf_store_inner(config_map, Some(endpoint))
+}
+
+fn build_hf_store_inner(
+    config_map: HashMap<String, String>,
+    endpoint: Option<&str>,
+) -> Result<OpendalStore> {
     let storage_options = StorageOptions(config_map);
     let max_retries = storage_options.client_max_retries();
     let config_map = &storage_options.0;
@@ -175,6 +190,9 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     if let Some(token) = config_map.get("token") {
         builder = builder.token(token);
     }
+    if let Some(endpoint) = endpoint {
+        builder = builder.endpoint(endpoint);
+    }
     if let Some(download_mode) = config_map.get("download_mode") {
         builder = builder.download_mode(download_mode);
     }
@@ -190,14 +208,18 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     let operator = Operator::new(builder).map_err(|e| {
         Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
     })?;
-    let operator = finish_opendal_operator(operator, max_retries);
+    let operator = finish_huggingface_operator(operator, max_retries);
 
-    Ok(OpendalStore::new(operator))
+    Ok(OpendalStore::new_huggingface(operator))
 }
 
-#[async_trait::async_trait]
-impl ObjectStoreProvider for HuggingfaceStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+impl HuggingfaceStoreProvider {
+    async fn new_store_impl(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+        #[cfg_attr(not(test), allow(unused_variables))] endpoint: Option<&str>,
+    ) -> Result<ObjectStore> {
         let ParsedHfUrl {
             repo_type, repo_id, ..
         } = parse_hf_url(&base_path)?;
@@ -230,7 +252,15 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
                     .with_protected_keys(["repo_type", "repo_id"]),
                 )
             } else {
-                Arc::new(build_hf_store(normalize_hf_config(&base_options)?)?)
+                let config_map = normalize_hf_config(&base_options)?;
+                #[cfg(test)]
+                let store = match endpoint {
+                    Some(endpoint) => build_hf_store_with_endpoint(config_map, endpoint)?,
+                    None => build_hf_store(config_map)?,
+                };
+                #[cfg(not(test))]
+                let store = build_hf_store(config_map)?;
+                Arc::new(store)
             };
 
         Ok(ObjectStore {
@@ -254,6 +284,23 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             // Listed in full: no paginated lister covers OpenDAL yet.
             paginated_lister: None,
         })
+    }
+
+    #[cfg(test)]
+    async fn new_store_with_endpoint(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+        endpoint: &str,
+    ) -> Result<ObjectStore> {
+        self.new_store_impl(base_path, params, Some(endpoint)).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for HuggingfaceStoreProvider {
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        self.new_store_impl(base_path, params, None).await
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -446,6 +493,294 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.get("client_max_retries").unwrap(), "5");
+    }
+
+    async fn hf_store(server: &wiremock::MockServer, options: &[(&str, &str)]) -> ObjectStore {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            ))),
+            ..Default::default()
+        };
+        HuggingfaceStoreProvider
+            .new_store_with_endpoint(
+                Url::parse("hf://datasets/acme/repo").unwrap(),
+                &params,
+                &server.uri(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hf_store_honors_retry_after_before_first_retry() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request_times = Arc::new(Mutex::new(Vec::new()));
+        let responder = {
+            let calls = calls.clone();
+            let request_times = request_times.clone();
+            move |_request: &wiremock::Request| {
+                request_times
+                    .lock()
+                    .unwrap()
+                    .push(std::time::Instant::now());
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(429).insert_header("retry-after", "1")
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"hf-data".to_vec())
+                }
+            }
+        };
+        Mock::given(method("GET"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+
+        let store = hf_store(&server, &[("client_max_retries", "3")]).await;
+
+        let data = store
+            .inner
+            .get_opts(&Path::from("frames.lance"), Default::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(data.as_ref(), b"hf-data");
+
+        let request_times = request_times.lock().unwrap();
+        assert_eq!(request_times.len(), 2);
+        assert!(
+            request_times[1] - request_times[0] >= std::time::Duration::from_secs(1),
+            "the first retry must not start before Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn hf_store_mixed_responses_share_retry_budget() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request_times = Arc::new(Mutex::new(Vec::new()));
+        let responder = {
+            let calls = calls.clone();
+            let request_times = request_times.clone();
+            move |_request: &wiremock::Request| {
+                request_times
+                    .lock()
+                    .unwrap()
+                    .push(std::time::Instant::now());
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(429).insert_header("retry-after", "1"),
+                    1 => ResponseTemplate::new(500),
+                    2 => ResponseTemplate::new(429).insert_header("retry-after", "1"),
+                    _ => ResponseTemplate::new(200).set_body_bytes(b"hf-data".to_vec()),
+                }
+            }
+        };
+        Mock::given(method("GET"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+
+        // Two retries: 429 (wait), 500, then 429 (wait, terminal). The terminal
+        // 429 must not start a fourth request after OpenDAL's budget is spent.
+        let store = hf_store(&server, &[("client_max_retries", "2")]).await;
+        let err = store
+            .inner
+            .get_opts(&Path::from("frames.lance"), Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("RateLimited"),
+            "unexpected error: {err}"
+        );
+
+        let request_times = request_times.lock().unwrap();
+        assert_eq!(request_times.len(), 3);
+        assert!(
+            request_times[1] - request_times[0] >= std::time::Duration::from_secs(1),
+            "the retry after the first 429 must wait for Retry-After"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hf_store_retains_retries_for_other_transient_errors() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hf-data".to_vec()))
+            .mount(&server)
+            .await;
+
+        let store = hf_store(&server, &[("client_max_retries", "3")]).await;
+
+        let data = store
+            .inner
+            .get_opts(&Path::from("frames.lance"), Default::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(data.as_ref(), b"hf-data");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hf_store_retries_429_without_retry_after() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hf-data".to_vec()))
+            .mount(&server)
+            .await;
+
+        let store = hf_store(&server, &[("client_max_retries", "3")]).await;
+
+        let data = store
+            .inner
+            .get_opts(&Path::from("frames.lance"), Default::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(data.as_ref(), b"hf-data");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hf_store_bounds_retry_after_retries() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let store = hf_store(&server, &[("client_max_retries", "2")]).await;
+
+        let err = store
+            .inner
+            .get_opts(&Path::from("frames.lance"), Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("RateLimited"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hf_store_zero_retries_makes_one_request() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .mount(&server)
+            .await;
+
+        let store = hf_store(&server, &[("client_max_retries", "0")]).await;
+
+        let start = tokio::time::Instant::now();
+        assert!(
+            store
+                .inner
+                .get_opts(&Path::from("frames.lance"), Default::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "a zero retry budget must not wait for Retry-After"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    async fn hf_store_with_terminal_rate_limit(server: &wiremock::MockServer) -> ObjectStore {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "3600"))
+            .mount(server)
+            .await;
+        hf_store(server, &[("client_max_retries", "3")]).await
+    }
+
+    #[tokio::test]
+    async fn hf_reader_get_range_stops_after_terminal_rate_limit() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let store = hf_store_with_terminal_rate_limit(&server).await;
+        let reader = store.open(&Path::from("frames.lance")).await.unwrap();
+
+        let err = reader.get_range(0..4).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the 300s retry bound"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("RateLimited"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hf_recursive_list_stops_after_terminal_rate_limit() {
+        use futures::TryStreamExt as _;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let store = hf_store_with_terminal_rate_limit(&server).await;
+
+        let err = store.list(None).try_next().await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the 300s retry bound"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("RateLimited"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
