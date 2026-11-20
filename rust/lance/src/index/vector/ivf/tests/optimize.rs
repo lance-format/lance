@@ -4,6 +4,7 @@
 //! Tests for optimizing IVF indices.
 
 use super::*;
+use lance_io::utils::{read_last_block, read_version};
 
 /// Building a merge filter loads a row-id sequence per covered fragment under
 /// stable row ids, and an optimize pass that only appends a delta reads no existing
