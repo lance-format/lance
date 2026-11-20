@@ -51,6 +51,8 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
         "lance_memory_cgroup_bytes",
         "lance_memory_cgroup_limit_bytes",
         "lance_memory_component_bytes",
+        "lance_memory_heap_in_use_bytes",
+        "lance_memory_heap_free_bytes",
     ):
         assert catalog[name].kind == "gauge"
     assert catalog["lance_memory_stage_peak_bytes"].kind == "histogram"
@@ -102,6 +104,7 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
 
 
 _OBSERVED_BUILD = """
+import ctypes
 import sys
 
 import lance
@@ -122,6 +125,14 @@ for resource_metrics in reader.get_metrics_data().resource_metrics:
             points[metric.name] = list(metric.data.data_points)
 
 assert points["lance_memory_rss_bytes"][0].value > 0
+heap_in_use = points.get("lance_memory_heap_in_use_bytes", [])
+heap_free = points.get("lance_memory_heap_free_bytes", [])
+if hasattr(ctypes.CDLL(None), "mallinfo2"):
+    assert len(heap_in_use) == 1 and heap_in_use[0].value > 0, heap_in_use
+    assert len(heap_free) == 1 and heap_free[0].value >= 0, heap_free
+else:
+    assert not heap_in_use, heap_in_use
+    assert not heap_free, heap_free
 build = {"operation": "create_index", "index_type": "btree"}
 builds = [
     point.value
@@ -155,6 +166,7 @@ def test_instrument_lance_metrics_exports_memory_while_observed(tmp_path):
 
 
 _NATIVE_MEMORY_SNAPSHOT_BUILD = """
+import ctypes
 import sys
 
 import lance
@@ -175,6 +187,16 @@ rss = by_name["lance_memory_rss_bytes"]
 assert len(rss) == 1 and rss[0].value > 0, rss
 peak = by_name["lance_memory_rss_peak_bytes"]
 assert len(peak) == 1 and peak[0].value >= rss[0].value, peak
+heap_available = hasattr(ctypes.CDLL(None), "mallinfo2")
+heap_in_use = by_name.get("lance_memory_heap_in_use_bytes")
+heap_free = by_name.get("lance_memory_heap_free_bytes")
+if heap_available:
+    assert len(heap_in_use) == 1 and heap_in_use[0].value > 0, heap_in_use
+    assert len(heap_free) == 1 and heap_free[0].value >= 0, heap_free
+    heap_before = heap_in_use[0].value
+else:
+    assert heap_in_use is None, heap_in_use
+    assert heap_free is None, heap_free
 
 build = {"operation": "create_index", "index_type": "btree"}
 builds = [
@@ -231,18 +253,46 @@ assert observed("lance_memory_stage_peak_bytes") == stage_count
 # While observation is off, a snapshot leaves the gauges as they were, even
 # once the process has grown by 64 MiB.
 (frozen,) = snapshot("lance_memory_rss_bytes")
+if heap_available:
+    (frozen_heap_in_use,) = snapshot("lance_memory_heap_in_use_bytes")
+    (frozen_heap_free,) = snapshot("lance_memory_heap_free_bytes")
 before = resident_bytes()
-ballast = b"x" * (64 << 20)
+libc = ctypes.CDLL(None)
+libc.malloc.argtypes = [ctypes.c_size_t]
+libc.malloc.restype = ctypes.c_void_p
+libc.free.argtypes = [ctypes.c_void_p]
+ballast = libc.malloc(64 << 20)
+assert ballast, "libc malloc failed"
+ctypes.memset(ballast, 0, 64 << 20)
 assert resident_bytes() - before >= 48 << 20, "the ballast is not resident"
 (current,) = snapshot("lance_memory_rss_bytes")
 assert current.value == frozen.value, (current.value, frozen.value)
-# Switched back on, the gauges follow the process again.
+if heap_available:
+    (current_heap_in_use,) = snapshot("lance_memory_heap_in_use_bytes")
+    assert current_heap_in_use.value == frozen_heap_in_use.value
+    (current_heap_free,) = snapshot("lance_memory_heap_free_bytes")
+    assert current_heap_free.value == frozen_heap_free.value
+else:
+    assert not snapshot("lance_memory_heap_in_use_bytes")
+    assert not snapshot("lance_memory_heap_free_bytes")
+# Switched back on, the gauges follow the process again. The live ballast
+# raises glibc's in-use bytes, including its mmap-backed allocation.
 set_memory_observation(True)
 (current,) = snapshot("lance_memory_rss_bytes")
 assert current.value >= before + (48 << 20), (current.value, before)
+if heap_available:
+    (current_heap_in_use,) = snapshot("lance_memory_heap_in_use_bytes")
+    assert current_heap_in_use.value >= heap_before + (48 << 20), (
+        current_heap_in_use.value,
+        heap_before,
+    )
+else:
+    assert not snapshot("lance_memory_heap_in_use_bytes")
+    assert not snapshot("lance_memory_heap_free_bytes")
 dataset.create_scalar_index("id", "BTREE")
 assert observed("lance_memory_operation_peak_bytes") == build_count + 1
 assert observed("lance_memory_stage_peak_bytes") > stage_count
+libc.free(ballast)
 """
 
 
@@ -260,6 +310,69 @@ def test_native_snapshot_reports_memory_while_observed(tmp_path):
             _NATIVE_MEMORY_SNAPSHOT_BUILD,
             str(tmp_path / "ds.lance"),
         ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LANCE_MEMORY_OBSERVE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+_UNOBSERVED_HEAP_SNAPSHOT = """
+from lance.lance import register_lance_metrics_recorder, snapshot_lance_metrics
+
+assert register_lance_metrics_recorder()
+heap = [
+    point
+    for point in snapshot_lance_metrics()
+    if point.name.startswith("lance_memory_heap_")
+]
+assert not heap, heap
+"""
+
+
+def test_native_snapshot_omits_heap_while_unobserved():
+    env = {k: v for k, v in os.environ.items() if k != "LANCE_MEMORY_OBSERVE"}
+    result = subprocess.run(
+        [sys.executable, "-c", _UNOBSERVED_HEAP_SNAPSHOT],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+_BOUNDED_HEAP_REFRESHES = """
+import lance.otel as otel
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+snapshots = 0
+heap_refreshes = 0
+real_snapshot = otel.snapshot_lance_metrics
+
+
+def counted_snapshot(refresh_heap=True):
+    global snapshots, heap_refreshes
+    snapshots += 1
+    heap_refreshes += int(refresh_heap)
+    return real_snapshot(refresh_heap=refresh_heap)
+
+
+otel.snapshot_lance_metrics = counted_snapshot
+reader = InMemoryMetricReader()
+assert otel.instrument_lance_metrics(MeterProvider(metric_readers=[reader]))
+reader.get_metrics_data()
+assert heap_refreshes == 2, (heap_refreshes, snapshots)
+assert snapshots > heap_refreshes, (heap_refreshes, snapshots)
+reader.get_metrics_data()
+assert heap_refreshes == 4, (heap_refreshes, snapshots)
+"""
+
+
+def test_otel_collection_bounds_heap_refreshes():
+    pytest.importorskip("opentelemetry.sdk.metrics")
+    result = subprocess.run(
+        [sys.executable, "-c", _BOUNDED_HEAP_REFRESHES],
         capture_output=True,
         text=True,
         env={**os.environ, "LANCE_MEMORY_OBSERVE": "1"},

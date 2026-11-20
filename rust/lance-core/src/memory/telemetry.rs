@@ -4,7 +4,7 @@
 //! Memory metrics published through the `metrics` crate facade.
 //!
 //! Without the `metrics` feature the functions here record nothing, though
-//! [`refresh_metrics`] can still log a warning.
+//! [`refresh_metrics`] and [`refresh_metrics_with_heap`] can still log a warning.
 
 /// Resident set size of the process, in bytes.
 pub const METRIC_RSS: &str = "lance_memory_rss_bytes";
@@ -24,6 +24,10 @@ pub const METRIC_STAGE_PEAK: &str = "lance_memory_stage_peak_bytes";
 pub const METRIC_OPERATION_PEAK: &str = "lance_memory_operation_peak_bytes";
 /// Bytes that Lance components hold right now, labelled by `component`.
 pub const METRIC_COMPONENT: &str = "lance_memory_component_bytes";
+/// Bytes the allocator reports as in use, including freed blocks in glibc tcache.
+pub const METRIC_HEAP_IN_USE: &str = "lance_memory_heap_in_use_bytes";
+/// Bytes the allocator reports as free and retains, excluding glibc tcache.
+pub const METRIC_HEAP_FREE: &str = "lance_memory_heap_free_bytes";
 
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * MIB;
@@ -96,6 +100,16 @@ pub fn describe_metrics() {
             Bytes,
             "Bytes that Lance components hold right now, by component."
         );
+        metrics::describe_gauge!(
+            METRIC_HEAP_IN_USE,
+            Bytes,
+            "Bytes the allocator reports as in use, including freed blocks in glibc tcache."
+        );
+        metrics::describe_gauge!(
+            METRIC_HEAP_FREE,
+            Bytes,
+            "Bytes the allocator reports as free and retains, excluding glibc tcache."
+        );
     }
 }
 
@@ -103,17 +117,46 @@ pub fn describe_metrics() {
 /// and the Lance components.
 ///
 /// Does nothing while observation is off (see [`super::set_observation`]). Call it
-/// from the collection loop of the recorder; the Python and Java bridges call
-/// it before every snapshot. A process or cgroup gauge whose source is
-/// unavailable, such as the cgroup limit of a process without one, is left
-/// unset, and keeps its last value when its source disappears later. A
+/// from the collection loop of the recorder. A process or cgroup gauge whose
+/// source is unavailable, such as the cgroup limit of a process without one, is
+/// left unset, and keeps its last value when its source disappears later. A
 /// component gauge is not set until Lance first creates an instance of its
 /// component, and reads 0 while none is alive.
 pub fn refresh_metrics() {
+    refresh_metrics_inner(None);
+}
+
+/// Set the process, cgroup, component and allocator gauges to current readings.
+///
+/// This is [`refresh_metrics`] with an explicit allocator provider. The Python
+/// and Java bridges use [`super::read_glibc_heap`], because their native
+/// libraries use the system allocator on GNU/Linux. A Rust application should
+/// pass the provider for its own allocator; `None` from the provider leaves
+/// both heap gauges unset, or keeps their last values if it was available
+/// before. The provider is never called while observation is off or Lance is
+/// built without the `metrics` feature.
+///
+/// Allocator statistics are not a decomposition of RSS. Component and cache
+/// metrics use separate accounting and are not necessarily subsets of the
+/// allocator's in-use bytes.
+///
+/// ```
+/// lance_core::memory::refresh_metrics_with_heap(lance_core::memory::read_glibc_heap);
+/// ```
+pub fn refresh_metrics_with_heap(provider: super::heap::HeapProvider) {
+    refresh_metrics_inner(Some(provider));
+}
+
+fn refresh_metrics_inner(provider: Option<super::heap::HeapProvider>) {
     match super::observer::observe_flag() {
         Ok(true) => {
             #[cfg(feature = "metrics")]
-            super::components::publish();
+            {
+                super::components::publish();
+                if let Some(provider) = provider {
+                    publish_heap_gauges(provider());
+                }
+            }
             #[cfg(all(feature = "metrics", target_os = "linux"))]
             publish_gauges(
                 super::proc::read_process_memory(),
@@ -128,6 +171,8 @@ pub fn refresh_metrics() {
             INVALID.call_once(|| tracing::warn!("Memory gauges are not refreshed: {err}"));
         }
     }
+    #[cfg(not(feature = "metrics"))]
+    let _ = provider;
 }
 
 #[cfg(all(feature = "metrics", any(test, target_os = "linux")))]
@@ -147,6 +192,14 @@ fn publish_gauges(
     }
     if let Some(limit_bytes) = cgroup.limit_bytes {
         metrics::gauge!(METRIC_CGROUP_LIMIT).set(limit_bytes as f64);
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn publish_heap_gauges(heap: Option<super::heap::HeapMemory>) {
+    if let Some(heap) = heap {
+        metrics::gauge!(METRIC_HEAP_IN_USE).set(heap.in_use_bytes as f64);
+        metrics::gauge!(METRIC_HEAP_FREE).set(heap.free_bytes as f64);
     }
 }
 
@@ -333,12 +386,110 @@ mod tests {
 
     #[test]
     fn test_refresh_reports_nothing_while_observation_is_off() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static PROVIDER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_provider() -> Option<crate::memory::heap::HeapMemory> {
+            PROVIDER_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(crate::memory::heap::HeapMemory {
+                in_use_bytes: 100,
+                free_bytes: 50,
+            })
+        }
+
         assert!(
             std::env::var_os(super::super::OBSERVE_ENV_VAR).is_none(),
             "this test needs the switch unset"
         );
-        let recorded = capture(refresh_metrics);
+        PROVIDER_CALLS.store(0, Ordering::Relaxed);
+        let recorded = capture(|| {
+            refresh_metrics();
+            refresh_metrics_with_heap(counted_provider);
+        });
         assert!(recorded.is_empty(), "{recorded:?}");
+        assert_eq!(PROVIDER_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_public_refresh_reports_heap_and_retains_unavailable_values() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CHILD: &str = "LANCE_MEMORY_PUBLIC_REFRESH_TEST_CHILD";
+        static PROVIDER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_provider() -> Option<crate::memory::heap::HeapMemory> {
+            PROVIDER_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(crate::memory::heap::HeapMemory {
+                in_use_bytes: 100,
+                free_bytes: 50,
+            })
+        }
+        fn unavailable_provider() -> Option<crate::memory::heap::HeapMemory> {
+            None
+        }
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory::telemetry::tests::test_public_refresh_reports_heap_and_retains_unavailable_values",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child process failed: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+                "the child test did not run: {output:?}"
+            );
+            return;
+        }
+
+        super::super::set_observation(true);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let read_gauge = |name| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| match value {
+                    DebugValue::Gauge(value) if key.key().name() == name => Some(value.0),
+                    _ => None,
+                })
+        };
+        PROVIDER_CALLS.store(0, Ordering::Relaxed);
+        metrics::with_local_recorder(&recorder, refresh_metrics);
+        assert_eq!(read_gauge(METRIC_HEAP_IN_USE), None);
+        assert_eq!(read_gauge(METRIC_HEAP_FREE), None);
+        assert_eq!(PROVIDER_CALLS.load(Ordering::Relaxed), 0);
+
+        metrics::with_local_recorder(&recorder, || refresh_metrics_with_heap(counted_provider));
+        assert_eq!(PROVIDER_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(read_gauge(METRIC_HEAP_IN_USE), Some(100.0));
+        assert_eq!(read_gauge(METRIC_HEAP_FREE), Some(50.0));
+
+        metrics::with_local_recorder(&recorder, || {
+            refresh_metrics_with_heap(unavailable_provider)
+        });
+        assert_eq!(read_gauge(METRIC_HEAP_IN_USE), Some(100.0));
+        assert_eq!(read_gauge(METRIC_HEAP_FREE), Some(50.0));
+    }
+
+    #[rstest]
+    #[case::reading(
+        Some(crate::memory::heap::HeapMemory { in_use_bytes: 300, free_bytes: 100 }),
+        [Some(300.0), Some(100.0)]
+    )]
+    #[case::no_reading(None, [None, None])]
+    fn test_heap_gauges_report_what_is_available(
+        #[case] heap: Option<crate::memory::heap::HeapMemory>,
+        #[case] expected: [Option<f64>; 2],
+    ) {
+        let recorded = capture(|| publish_heap_gauges(heap));
+        assert_eq!(
+            [METRIC_HEAP_IN_USE, METRIC_HEAP_FREE].map(|name| gauge(&recorded, name)),
+            expected
+        );
     }
 
     #[test]

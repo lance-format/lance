@@ -191,10 +191,11 @@ public final class LanceMetrics {
    * is process-wide; {@link #instrument(MeterProvider)} and {@link #close()} neither read nor reset
    * it, and another JVM, such as a Spark executor in cluster mode, needs its own call or variable.
    * On Linux, observation reads the process and cgroup memory, keeps the peak of every operation
-   * and stage, and emits the memory events. Events need no recorder; the gauges and histograms need
-   * the {@code metrics} feature and a recorder, so instrument before the operations to observe. The
-   * component gauge is independent of the platform, and counts the I/O schedulers, DataFusion pools
-   * and MemWAL writers created while observation is on, never one created before:
+   * and stage, and emits the memory events. On GNU/Linux with glibc 2.33 or newer it also reads
+   * heap memory. Events need no recorder; the gauges and histograms need the {@code metrics}
+   * feature and a recorder, so instrument before the operations to observe. The component gauge is
+   * independent of the platform, and counts the I/O schedulers, DataFusion pools and MemWAL writers
+   * created while observation is on, never one created before:
    *
    * <pre>{@code
    * LanceMetrics.instrument();
