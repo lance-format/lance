@@ -37,6 +37,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{BlobHandling, Field as LanceField};
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
@@ -337,6 +338,21 @@ impl CompactionTask {
     /// the read version for this task (the same version from which the
     /// compaction was planned).
     pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
+        let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
+        let stage_name = match &self.task.kind {
+            CompactionTaskKind::RewriteFragments => "rewrite_files",
+            CompactionTaskKind::RepackColumns { .. } => "repack_files",
+        };
+        let stage = scope.stages().start(stage_name);
+        let result = self.execute_inner(dataset).await?;
+        stage.complete();
+        scope.finish();
+        Ok(result)
+    }
+
+    // Both whole-plan and standalone execution must read the planned snapshot
+    // so conflict checking includes every write committed since planning.
+    pub(super) async fn execute_inner(&self, dataset: &Dataset) -> Result<RewriteResult> {
         let dataset = if dataset.manifest.version == self.read_version {
             Cow::Borrowed(dataset)
         } else {

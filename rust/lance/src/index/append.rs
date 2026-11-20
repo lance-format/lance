@@ -810,6 +810,7 @@ async fn rebuild_scalar_segment(
     field_path: &str,
     uuid: Uuid,
     fragment_ids: Vec<u32>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
     let params = reference_index.derive_index_params()?;
     let update_criteria = reference_index.update_criteria();
@@ -852,7 +853,7 @@ async fn rebuild_scalar_segment(
         true,
         None,
         Some((training_data, update_criteria.data_criteria.clone())),
-        Arc::new(NoopIndexBuildProgress),
+        progress,
     )
     .await
 }
@@ -1183,6 +1184,7 @@ async fn merge_scalar_indices<'a>(
                 field_path,
                 new_uuid,
                 rebuild_frags.iter().collect(),
+                options.progress.clone(),
             )
             .await?,
             dataset.manifest.version,
@@ -2334,7 +2336,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 true,
                                 None,
                                 Some((new_data_stream, update_criteria.data_criteria.clone())),
-                                Arc::new(NoopIndexBuildProgress),
+                                options.progress.clone(),
                             )
                             .await?,
                             dataset.manifest.version,

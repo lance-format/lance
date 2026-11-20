@@ -4,6 +4,7 @@
 //! Memory accounting of the cgroup the current process runs in.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// cgroup v1 reports a group without a limit as the largest page-aligned
 /// `i64`, so the value depends on the page size. Anything at or above this
@@ -54,19 +55,61 @@ struct CgroupFiles {
 /// Memory of the process's cgroup, or `None` when it is not in a memory cgroup.
 #[cfg(target_os = "linux")]
 pub(super) fn read_cgroup_memory() -> Option<CgroupMemory> {
-    // Not cached: a process can be moved to another group while it runs.
-    discover(Path::new("/")).as_ref().map(read)
+    static DISCOVERED: AtomicPtr<Discovered> = AtomicPtr::new(std::ptr::null_mut());
+    cached_files(&DISCOVERED, Path::new("/")).map(read)
 }
 
-/// Finds the process's memory cgroup under `root`, which is `/` outside tests.
-fn discover(root: &Path) -> Option<CgroupFiles> {
-    let mountinfo = std::fs::read_to_string(root.join("proc/self/mountinfo")).ok()?;
+/// The groups found for one membership of the process.
+struct Discovered {
+    /// `/proc/self/cgroup` when the groups were found.
+    membership: String,
+    files: CgroupFiles,
+}
+
+/// The process's memory cgroup under `root`, found again only when
+/// `/proc/self/cgroup` changes, as it does when the process is moved to another
+/// group. Finding it parses `/proc/self/mountinfo` and probes the files of the
+/// groups, while memory events read the group at every stage boundary. A
+/// lookup that finds no group is not kept, since a read can fail for a moment.
+///
+/// The slot is a raw pointer rather than a lock: a child forked while another
+/// thread of its parent held a lock would wait on it forever. Each lookup that a
+/// newer one replaces is leaked, once per move of the process.
+fn cached_files(slot: &AtomicPtr<Discovered>, root: &Path) -> Option<&'static CgroupFiles> {
     let membership = std::fs::read_to_string(root.join("proc/self/cgroup")).ok()?;
+    loop {
+        let current = slot.load(Ordering::Acquire);
+        // SAFETY: non-null values of the slot come from `Box::into_raw` below
+        // and are never freed, so a loaded pointer stays valid.
+        if let Some(discovered) = unsafe { current.as_ref() }
+            && discovered.membership == membership
+        {
+            return Some(&discovered.files);
+        }
+        let fresh = Box::into_raw(Box::new(Discovered {
+            files: discover(root, &membership)?,
+            membership: membership.clone(),
+        }));
+        match slot.compare_exchange(current, fresh, Ordering::AcqRel, Ordering::Acquire) {
+            // SAFETY: `fresh` came from `Box::into_raw` above and the slot now
+            // owns it for the rest of the process.
+            Ok(_) => return Some(&unsafe { &*fresh }.files),
+            // SAFETY: another thread installed its lookup first, so `fresh`
+            // was never shared and can be freed here.
+            Err(_) => drop(unsafe { Box::from_raw(fresh) }),
+        }
+    }
+}
+
+/// Finds the memory cgroup under `root`, which is `/` outside tests, of a
+/// process whose `/proc/self/cgroup` reads `membership`.
+fn discover(root: &Path, membership: &str) -> Option<CgroupFiles> {
+    let mountinfo = std::fs::read_to_string(root.join("proc/self/mountinfo")).ok()?;
     // A unified hierarchy without the memory controller (hybrid v1/v2 hosts)
     // has no memory files; the v1 controller reports instead.
     [Version::V2, Version::V1]
         .into_iter()
-        .find_map(|version| discover_version(root, &mountinfo, &membership, version))
+        .find_map(|version| discover_version(root, &mountinfo, membership, version))
 }
 
 fn discover_version(
@@ -303,6 +346,43 @@ mod tests {
         #[case] expected: Option<CgroupMemory>,
     ) {
         let root = fake_root(files);
-        assert_eq!(discover(&root).as_ref().map(read), expected);
+        let membership = std::fs::read_to_string(root.join("proc/self/cgroup")).unwrap();
+        assert_eq!(discover(&root, &membership).as_ref().map(read), expected);
+    }
+
+    #[test]
+    fn test_the_group_is_found_again_only_after_a_move() {
+        let root = fake_root(&[
+            ("proc/self/mountinfo", ""),
+            ("proc/self/cgroup", "0::/a\n"),
+            ("sys/fs/cgroup/a/memory.current", "100\n"),
+            ("sys/fs/cgroup/a/memory.max", "1000\n"),
+            ("sys/fs/cgroup/b/memory.current", "200\n"),
+            ("sys/fs/cgroup/b/memory.max", "2000\n"),
+        ]);
+        let write = |path: &str, contents: &str| std::fs::write(root.join(path), contents).unwrap();
+        let slot = AtomicPtr::new(std::ptr::null_mut());
+        let memory = || cached_files(&slot, &root).map(read);
+        let memory_of = |current_bytes, limit_bytes| {
+            Some(CgroupMemory {
+                current_bytes: Some(current_bytes),
+                limit_bytes: Some(limit_bytes),
+            })
+        };
+        // A lookup that finds no group, here because the mounts could not be
+        // read, is tried again on the next reading.
+        assert_eq!(memory(), None);
+        write("proc/self/mountinfo", V2_MOUNTINFO);
+        assert_eq!(memory(), memory_of(100, 1000));
+        // Usage and limit are read every time, while the mounts, which no
+        // longer show any cgroup, are not read again.
+        write("sys/fs/cgroup/a/memory.current", "150\n");
+        write("sys/fs/cgroup/a/memory.max", "500\n");
+        write("proc/self/mountinfo", "");
+        assert_eq!(memory(), memory_of(150, 500));
+        // A move shows in the membership, and the group is found again.
+        write("proc/self/mountinfo", V2_MOUNTINFO);
+        write("proc/self/cgroup", "0::/b\n");
+        assert_eq!(memory(), memory_of(200, 2000));
     }
 }

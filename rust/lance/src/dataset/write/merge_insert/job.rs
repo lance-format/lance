@@ -65,6 +65,7 @@ use futures::{
 };
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::NullabilityComparison;
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
     datatypes::{OnMissing, SchemaCompareOptions},
@@ -698,8 +699,9 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let scope = OperationScope::start(ObservedOperation::MergeInsert, || None)?;
         let (provider, source_mode) = self.stream_source_to_provider(source).await?;
-        self.execute_inner(provider, source_mode).await
+        self.execute_inner(provider, source_mode, scope).await
     }
 
     /// Executes the merge insert job from a re-scannable [`TableProvider`].
@@ -717,9 +719,10 @@ impl MergeInsertJob {
         self,
         provider: Arc<dyn TableProvider>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let scope = OperationScope::start(ObservedOperation::MergeInsert, || None)?;
         // TableProvider supports repeated scans, but does not guarantee that
         // separate scans observe the same rows.
-        self.execute_inner(provider, SourceProviderMode::Rescannable)
+        self.execute_inner(provider, SourceProviderMode::Rescannable, scope)
             .await
     }
 
@@ -776,8 +779,9 @@ impl MergeInsertJob {
         self,
         batches: Vec<RecordBatch>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let scope = OperationScope::start(ObservedOperation::MergeInsert, || None)?;
         let provider = self.batches_to_provider(batches)?;
-        self.execute_inner(provider, SourceProviderMode::StableSnapshot)
+        self.execute_inner(provider, SourceProviderMode::StableSnapshot, scope)
             .await
     }
 
@@ -789,7 +793,7 @@ impl MergeInsertJob {
         batches: Vec<RecordBatch>,
     ) -> Result<UncommittedMergeInsert> {
         let provider = self.batches_to_provider(batches)?;
-        self.execute_uncommitted_impl(provider, SourceProviderMode::StableSnapshot)
+        self.execute_uncommitted_observed(provider, SourceProviderMode::StableSnapshot)
             .await
     }
 
@@ -830,7 +834,7 @@ impl MergeInsertJob {
         self,
         source: Arc<Dataset>,
     ) -> Result<UncommittedMergeInsert> {
-        self.execute_uncommitted_impl(
+        self.execute_uncommitted_observed(
             Self::dataset_source_provider(source),
             SourceProviderMode::Rescannable,
         )
@@ -844,7 +848,7 @@ impl MergeInsertJob {
         self,
         provider: Arc<dyn TableProvider>,
     ) -> Result<UncommittedMergeInsert> {
-        self.execute_uncommitted_impl(provider, SourceProviderMode::Rescannable)
+        self.execute_uncommitted_observed(provider, SourceProviderMode::Rescannable)
             .await
     }
 
@@ -911,10 +915,12 @@ impl MergeInsertJob {
     /// `source_mode` indicates whether the provider can be scanned more than once
     /// and whether those scans share one materialized snapshot. One-shot sources
     /// disable retries; arbitrary providers are re-scanned once per attempt.
+    /// Every attempt reports its stages into `scope`.
     async fn execute_inner(
         self,
         provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,
+        scope: OperationScope,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let dataset = self.dataset.clone();
         let config = RetryConfig {
@@ -933,7 +939,15 @@ impl MergeInsertJob {
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
-        Box::pin(execute_with_retry(wrapper, dataset, config)).await
+        let result = Box::pin(execute_with_retry(
+            wrapper,
+            dataset,
+            config,
+            &scope.stages(),
+        ))
+        .await?;
+        scope.finish();
+        Ok(result)
     }
 
     /// Execute the merge insert job without committing the changes.
@@ -944,8 +958,23 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
-        self.execute_uncommitted_impl(one_shot_provider(stream)?, SourceProviderMode::OneShot)
+        self.execute_uncommitted_observed(one_shot_provider(stream)?, SourceProviderMode::OneShot)
             .await
+    }
+
+    /// [`Self::execute_uncommitted_impl`] as an observed operation of its own,
+    /// for the entry points that do not commit.
+    async fn execute_uncommitted_observed(
+        self,
+        provider: Arc<dyn TableProvider>,
+        source_mode: SourceProviderMode,
+    ) -> Result<UncommittedMergeInsert> {
+        let scope = OperationScope::start(ObservedOperation::MergeInsert, || None)?;
+        let stage = scope.stages().start("execute");
+        let uncommitted = self.execute_uncommitted_impl(provider, source_mode).await?;
+        stage.complete();
+        scope.finish();
+        Ok(uncommitted)
     }
 
     fn create_plan_join_type(&self) -> JoinType {

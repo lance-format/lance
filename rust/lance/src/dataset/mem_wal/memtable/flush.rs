@@ -10,10 +10,12 @@ use arrow_array::RecordBatch;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_core::cache::LanceCache;
+use lance_core::memory::{ObservedOperation, OperationScope, StageReporter};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::{ShardManifest, SsTable};
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
@@ -34,6 +36,7 @@ use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types}
 use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
 use crate::dataset::write::InsertBuilder;
 use crate::index::CreateIndexBuilder;
+use crate::index::memory_progress::observing_progress;
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -215,12 +218,14 @@ impl MemTableFlusher {
     /// failure is logged and the flush proceeds — warming is never a commit
     /// gate. No-op without a warmer. `uri` must be the resolved reader path
     /// (`path_to_uri(gen_path)`) so warmed entries key-match later queries.
-    async fn warm_generation(&self, uri: &str) {
+    async fn warm_generation(&self, uri: &str, stages: &StageReporter) {
         let Some(warmer) = &self.warmer else {
             return;
         };
-        if let Err(e) = warmer.warm(uri).await {
-            warn!("pre-commit warm failed for generation {uri}; committing cold: {e}");
+        let warm_stage = stages.start("warm");
+        match warmer.warm(uri).await {
+            Ok(()) => warm_stage.complete(),
+            Err(e) => warn!("pre-commit warm failed for generation {uri}; committing cold: {e}"),
         }
     }
 
@@ -309,11 +314,14 @@ impl MemTableFlusher {
         covered_wal_entry_position: u64,
         durable: usize,
     ) -> Result<FlushResult> {
+        let scope = OperationScope::start(ObservedOperation::MemWalFlush, || None)?;
+        let stages = scope.stages();
         self.manifest_store.check_fenced(epoch).await?;
         if let Some(published) = self
             .already_published(memtable, covered_wal_entry_position)
             .await?
         {
+            scope.finish();
             return Ok(published);
         }
 
@@ -340,15 +348,19 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
+        let storage_version = self.base_storage_version().await?;
+        let write_stage = stages.start("write_fragments");
         let (rows_flushed, deleted) = self
             .write_data_file(
                 &gen_path,
                 memtable,
                 preassigned_data_file_name.as_deref(),
-                self.base_storage_version().await?,
+                storage_version,
             )
             .await?;
+        write_stage.complete();
 
+        let finalize_stage = stages.start("finalize");
         // Persist the within-generation deletion vector so the
         // SSTable exposes newest-per-PK on every read path.
         if !deleted.is_empty() {
@@ -360,17 +372,21 @@ impl MemTableFlusher {
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
+        finalize_stage.complete();
 
+        let index_stage = stages.start("build_indices");
         // Write the standalone primary-key dedup sidecar. A primary key needs
         // no secondary index, so this is required on the plain-flush path too —
         // the LSM scanner opens it to dedup the generation. (`flush_with_indexes`
         // writes it on the indexed path.) No-op when the memtable has no PK.
         self.create_pk_index(&gen_path, memtable.indexes()).await?;
+        index_stage.complete();
 
         // Warm before commit (zero cold window); no-op without a warmer.
         let warm_uri = self.path_to_uri(&gen_path);
-        self.warm_generation(&warm_uri).await;
+        self.warm_generation(&warm_uri, &stages).await;
 
+        let commit_stage = stages.start("commit");
         let new_manifest = self
             .update_manifest(
                 epoch,
@@ -380,12 +396,14 @@ impl MemTableFlusher {
                 size,
             )
             .await?;
+        commit_stage.complete();
 
         info!(
             "Flushed SSTable {} for shard {} (manifest version {})",
             generation, self.shard_id, new_manifest.version
         );
 
+        scope.finish();
         Ok(FlushResult {
             sstable: size.sstable(generation, gen_folder_name),
             rows_flushed,
@@ -500,7 +518,8 @@ impl MemTableFlusher {
         let mut builder = InsertBuilder::new(uri.as_str())
             .with_params(&write_params)
             .with_inherited_field_ids()
-            .with_dictionary_split_disabled();
+            .with_dictionary_split_disabled()
+            .without_memory_observation();
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
         }
@@ -589,11 +608,14 @@ impl MemTableFlusher {
         covered_wal_entry_position: u64,
         durable: usize,
     ) -> Result<FlushResult> {
+        let scope = OperationScope::start(ObservedOperation::MemWalFlush, || None)?;
+        let stages = scope.stages();
         self.manifest_store.check_fenced(epoch).await?;
         if let Some(published) = self
             .already_published(memtable, covered_wal_entry_position)
             .await?
         {
+            scope.finish();
             return Ok(published);
         }
 
@@ -621,6 +643,7 @@ impl MemTableFlusher {
         );
 
         let storage_version = self.base_storage_version().await?;
+        let write_stage = stages.start("write_fragments");
         let (total_rows, deleted) = self
             .write_data_file(
                 &gen_path,
@@ -629,7 +652,9 @@ impl MemTableFlusher {
                 storage_version,
             )
             .await?;
+        write_stage.complete();
 
+        let index_stage = stages.start("build_indices");
         // Dataset::write already committed the data; the indexes join it in
         // one manifest below.
         let uri = self.path_to_uri(&gen_path);
@@ -642,6 +667,7 @@ impl MemTableFlusher {
                 memtable.indexes(),
                 total_rows,
                 crate::dataset::versions::index_file_version(storage_version),
+                observing_progress(&stages, noop_progress()),
             )
             .await?;
         info!(
@@ -653,7 +679,9 @@ impl MemTableFlusher {
         // Write the standalone primary-key dedup index (sidecar, not a manifest
         // index — the block-list opens it directly by path).
         self.create_pk_index(&gen_path, memtable.indexes()).await?;
+        index_stage.complete();
 
+        let finalize_stage = stages.start("finalize");
         // Write a single manifest that records the fragments, the
         // within-generation deletion vector, and all indexes, overwriting the
         // data-only v1 manifest created by Dataset::write.
@@ -663,11 +691,13 @@ impl MemTableFlusher {
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
+        finalize_stage.complete();
 
         // Warm before commit (zero cold window); no-op without a warmer.
         let warm_uri = self.path_to_uri(&gen_path);
-        self.warm_generation(&warm_uri).await;
+        self.warm_generation(&warm_uri, &stages).await;
 
+        let commit_stage = stages.start("commit");
         let new_manifest = self
             .update_manifest(
                 epoch,
@@ -677,12 +707,14 @@ impl MemTableFlusher {
                 size,
             )
             .await?;
+        commit_stage.complete();
 
         info!(
             "Flushed SSTable {} for shard {} (manifest version {})",
             generation, self.shard_id, new_manifest.version
         );
 
+        scope.finish();
         Ok(FlushResult {
             sstable: size.sstable(generation, gen_folder_name),
             rows_flushed: memtable.row_count(),
@@ -695,6 +727,7 @@ impl MemTableFlusher {
     ///
     /// Returns index metadata without committing; the caller writes a single
     /// manifest with all of it.
+    #[allow(clippy::too_many_arguments)]
     async fn create_indexes(
         &self,
         dataset: &mut Dataset,
@@ -703,6 +736,7 @@ impl MemTableFlusher {
         mem_indexes: Option<&IndexStore>,
         total_rows: usize,
         storage_version: ConcreteFileVersion,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<Vec<IndexMetadata>> {
         let Some(store) = mem_indexes else {
             return Ok(vec![]);
@@ -750,7 +784,7 @@ impl MemTableFlusher {
                 FlushOutcome::TrainingData(stream) => Some(stream),
                 FlushOutcome::BuildFromGeneration => None,
             };
-            created.push(build_scalar_index(dataset, spec, training_data).await?);
+            created.push(build_scalar_index(dataset, spec, training_data, progress.clone()).await?);
         }
         Ok(created)
     }
@@ -921,11 +955,12 @@ impl std::fmt::Debug for TriggerMemTableFlush {
 }
 
 /// Build a scalar index on the generation from `training_data`, or from its
-/// rows without any.
+/// rows without any, reporting its stages to `progress`.
 async fn build_scalar_index(
     dataset: &mut Dataset,
     spec: &MemIndexSpec,
     training_data: Option<SendableRecordBatchStream>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<IndexMetadata> {
     let index_type = spec.plugin.flush_index_type();
     if !index_type.is_scalar() {
@@ -940,6 +975,7 @@ async fn build_scalar_index(
     let params = spec.plugin.flush_params(spec)?;
     let mut builder = CreateIndexBuilder::new(dataset, &columns, index_type, &params)
         .name(spec.name.clone())
+        .progress(progress)
         .without_memory_observation();
     if let Some(stream) = training_data {
         // Memtable positions are the flushed file's row ids, so no remap.

@@ -780,7 +780,8 @@ async fn test_defer_index_remap() {
             .iter_mut()
             .flat_map(|r| r.new_fragments.iter_mut())
             .collect();
-        reserve_fragment_ids(&dataset2, frags.into_iter())
+        let unobserved = lance_core::memory::OperationScope::unobserved();
+        reserve_fragment_ids(&dataset2, frags.into_iter(), &unobserved.stages())
             .await
             .unwrap();
     }
