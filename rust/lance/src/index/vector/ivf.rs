@@ -10055,8 +10055,11 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::unit_scale(1.0)]
+    #[case::large_values(1000.0)]
     #[tokio::test]
-    async fn test_create_ivf_flat_f16() {
+    async fn test_create_ivf_flat_f16(#[case] magnitude: f32) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
@@ -10070,32 +10073,82 @@ mod tests {
             true,
         )]));
 
-        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let arr = generate_random_array_with_seed::<Float16Type>(1024 * DIM, [22; 32]);
+        let arr = Float16Array::from_iter_values(
+            arr.values()
+                .iter()
+                .map(|v| f16::from_f32(v.to_f32() * magnitude)),
+        );
         let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 512,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
 
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let mut ivf_params = IvfBuildParams::new(2);
+        ivf_params.max_iters = 2;
+        let params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
 
-        let query = Float16Array::from_iter_values(repeat_n(f16::from_f32(0.5), DIM));
-        let results = dataset
-            .scan()
-            .nearest("vector", &query, 5)
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].num_rows(), 5);
-        let schema = results[0].schema();
+        let centroids = index.ivf_model().centroids.as_ref().unwrap();
+        assert!(
+            centroids
+                .values()
+                .as_primitive::<Float16Type>()
+                .values()
+                .iter()
+                .all(|v| v.is_finite() && v.to_f32() > 0.0 && v.to_f32() <= magnitude)
+        );
+
+        let query = Float16Array::from_iter_values(repeat_n(f16::from_f32(0.5 * magnitude), DIM));
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .minimum_nprobes(2)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 5);
+        assert!(
+            results["_distance"]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+        let ground_truth = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
+        let expected_ids = ground_truth[ROW_ID].as_primitive::<UInt64Type>().values();
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count() as f32 / 5.0;
+        assert!(recall >= 0.5, "recall: {recall}");
+        let schema = results.schema();
         let field = schema.field(0);
         let DataType::FixedSizeList(item, _) = field.data_type() else {
             panic!("vector column should remain fixed size list");
