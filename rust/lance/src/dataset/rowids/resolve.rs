@@ -32,7 +32,7 @@ const PREPARE_ROW_BUDGET: usize = 192 * 1024 * 1024;
 /// A cached empty span proves the immutable source has no IDs. The metadata
 /// entry holds no sequence, deletion vector or prepared lookup allocation.
 #[derive(Debug)]
-pub struct FragmentSpan(Option<RangeInclusive<u64>>);
+pub struct FragmentSpan(pub(super) Option<RangeInclusive<u64>>);
 
 impl DeepSizeOf for FragmentSpan {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
@@ -165,6 +165,9 @@ pub async fn resolve_row_ids(
             .map(|index| index.get_many(row_ids))
             .transpose();
     }
+    if let Some(addresses) = super::group::try_resolve_with_group(dataset, row_ids).await? {
+        return Ok(Some(addresses));
+    }
     // Sort once for fragment-bound slicing, but retain every original position.
     // Only the exclusive allocation bound can discard IDs without inspecting
     // candidate sources; a match never ends the search for another live copy.
@@ -179,20 +182,55 @@ pub async fn resolve_row_ids(
     let mut unique_ids: Vec<_> = sorted.iter().map(|&(id, _)| id).collect();
     unique_ids.dedup();
     let mut found = vec![None; unique_ids.len()];
-    let mut misses = Vec::with_capacity(dataset.manifest.fragments.len());
+    let fragments: Vec<&Fragment> = dataset.manifest.fragments.iter().collect();
+    let (cached_fragments, loaded_fragments, prepared_fragments, excluded_fragments, parallelism) =
+        resolve_fragments(dataset, &fragments, &unique_ids, &mut found).await?;
+    tracing::debug!(
+        event = "row_id_fragment_resolution",
+        total_fragments = dataset.manifest.fragments.len(),
+        cached_fragments,
+        loaded_fragments,
+        prepared_fragments,
+        excluded_fragments,
+        preparation_parallelism = parallelism,
+        requested_ids = row_ids.len(),
+        unique_requested_ids = unique_ids.len(),
+        fragment_batch_calls = cached_fragments + prepared_fragments,
+        "resolved row ids with fragment-only cache"
+    );
+    let mut result = vec![None; row_ids.len()];
+    let mut unique_position = 0;
+    for (id, original_position) in sorted {
+        if unique_ids[unique_position] != id {
+            unique_position += 1;
+        }
+        result[original_position] = found[unique_position];
+    }
+    Ok(Some(result))
+}
+
+/// Resolve sorted deduplicated `unique_ids` against `fragments`, accumulating
+/// live matches into `found` and rejecting duplicate live IDs across fragments.
+pub(super) async fn resolve_fragments(
+    dataset: &Dataset,
+    fragments: &[&Fragment],
+    unique_ids: &[u64],
+    found: &mut [Option<RowAddress>],
+) -> Result<(usize, usize, usize, usize, usize)> {
+    let mut misses = Vec::with_capacity(fragments.len());
     let mut cached_fragments = 0;
     let mut excluded_fragments = 0;
     let mut resident = Vec::new();
     // Consume every hit before admitting misses: a scan under cache pressure
     // must not evict a useful resident entry before this request has queried it.
-    for fragment in dataset.manifest.fragments.iter() {
+    for &fragment in fragments {
         let key = PreparedRowIdFragmentKey {
             source: sequence_identity(dataset, fragment)?,
             deletion: deletion_identity(dataset, fragment, true)?,
         };
         let mut range = 0..unique_ids.len();
         if let Some(cached) = cached_fragment(dataset, fragment, &key).await {
-            range = candidate_range(&cached.span, &unique_ids);
+            range = candidate_range(&cached.span, unique_ids);
             if range.is_empty() {
                 excluded_fragments += 1;
                 continue;
@@ -203,7 +241,7 @@ pub async fn resolve_row_ids(
         }
         let span_key = RowIdFragmentSpanKey { source: key.source };
         if let Some(span) = dataset.metadata_cache.get_with_key(&span_key).await {
-            range = candidate_range(&span.0, &unique_ids);
+            range = candidate_range(&span.0, unique_ids);
             if range.is_empty() {
                 excluded_fragments += 1;
                 continue;
@@ -214,7 +252,7 @@ pub async fn resolve_row_ids(
     // Consume every resident hit before admitting any source miss.
     let mut resident_queries = Vec::with_capacity(resident.len());
     for (fragment, deletion, prepared, range) in resident {
-        let ids = &unique_ids;
+        let ids = unique_ids;
         resident_queries.push(async move {
             let addresses =
                 lookup_fragment(dataset, fragment, deletion, &prepared, &ids[range.clone()])
@@ -237,7 +275,7 @@ pub async fn resolve_row_ids(
     );
     let mut loads = Vec::with_capacity(misses.len());
     for (fragment, key, range) in misses {
-        let ids = &unique_ids;
+        let ids = unique_ids;
         loads.push(async move {
             let prepared = prepare_shared(dataset, fragment, &key, &ids[range]).await?;
             // A newly read source can narrow the candidate slice further than
@@ -264,28 +302,13 @@ pub async fn resolve_row_ids(
             prepared_fragments += 1;
         }
     }
-    tracing::debug!(
-        event = "row_id_fragment_resolution",
-        total_fragments = dataset.manifest.fragments.len(),
+    Ok((
         cached_fragments,
         loaded_fragments,
         prepared_fragments,
         excluded_fragments,
-        preparation_parallelism = parallelism,
-        requested_ids = row_ids.len(),
-        unique_requested_ids = unique_ids.len(),
-        fragment_batch_calls = cached_fragments + prepared_fragments,
-        "resolved row ids with fragment-only cache"
-    );
-    let mut result = vec![None; row_ids.len()];
-    let mut unique_position = 0;
-    for (id, original_position) in sorted {
-        if unique_ids[unique_position] != id {
-            unique_position += 1;
-        }
-        result[original_position] = found[unique_position];
-    }
-    Ok(Some(result))
+        parallelism,
+    ))
 }
 
 /// Min/max bounds are inclusive and can only exclude candidates, including

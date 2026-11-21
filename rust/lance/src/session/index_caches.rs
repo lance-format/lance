@@ -523,6 +523,66 @@ impl CacheKey for RowIdFragmentDeletionKey {
     }
 }
 
+/// Shared deletion-free lookup merged across a high-overlap set of immutable
+/// fragment row-ID sources.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MergedRowIdGroupKey {
+    pub group: InternalCacheKey,
+}
+
+impl CacheKey for MergedRowIdGroupKey {
+    type ValueType = crate::dataset::rowids::group::MergedSourceGroup;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_merged_group")
+    }
+
+    fn type_name() -> &'static str {
+        "MergedRowIdGroup"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.merged-row-id-group", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.group.as_bytes());
+    }
+}
+
+/// Lightweight per-snapshot route pointing weakly to a cached
+/// [`crate::dataset::rowids::group::MergedSourceGroup`] plus snapshot deletion
+/// metadata and uncovered delta fragments.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SnapshotRowIdRouteKey<'a> {
+    pub version: u64,
+    pub e_tag: &'a str,
+}
+
+impl CacheKey for SnapshotRowIdRouteKey<'_> {
+    type ValueType = crate::dataset::rowids::group::SnapshotRowIdRoute;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_id_snapshot_route/{}/{}",
+            self.version, self.e_tag
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "SnapshotRowIdRoute"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.snapshot-row-id-route", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_str(self.e_tag);
+    }
+}
+
 /// Decoded fragment reuse history with `index_version = 0`, keyed by
 /// `index::frag_reuse::v0_cache_identity`.
 #[derive(Debug)]

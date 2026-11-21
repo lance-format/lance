@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub(crate) mod cache;
+pub(crate) mod group;
 pub(crate) mod resolve;
 mod spill;
 mod validate;

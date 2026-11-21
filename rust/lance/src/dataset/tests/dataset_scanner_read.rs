@@ -2272,7 +2272,7 @@ async fn test_ann_with_deletion(
             .filter(|entry| {
                 matches!(
                     entry.type_name.as_str(),
-                    "RowIdIndex" | "PreparedRowIdFragment"
+                    "RowIdIndex" | "PreparedRowIdFragment" | "MergedRowIdGroup"
                 )
             })
             .map(|entry| (entry.type_name.as_str(), entry.num_entries))

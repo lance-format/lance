@@ -324,7 +324,7 @@ async fn profile(config: Config) {
     assert_eq!(memory["swap_max"].as_str(), Some("0"));
     let oracle: Oracle =
         serde_json::from_slice(&std::fs::read(&config.query_file).unwrap()).unwrap();
-    assert!(oracle.uri.starts_with("s3://"));
+    assert!(oracle.uri.starts_with("s3://") || oracle.uri.starts_with("gs://"));
     assert!(config.batch > 0 && config.batch <= 1000);
     assert!(config.prewarm_batches > 0 && config.warm_calls > 0 && config.nonresident_calls > 0);
     let pool = if config.locality == "random" {
@@ -389,6 +389,7 @@ async fn profile(config: Config) {
                         | "CachedRowIdIndex"
                         | "RowIdPointResolution"
                         | "PreparedRowIdFragment"
+                        | "MergedRowIdGroup"
                 ) && entry.num_entries > 0
             })
     };

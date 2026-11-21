@@ -23,14 +23,29 @@ use crate::{Dataset, Error, Result};
 #[derive(Default)]
 pub struct RowIdFragmentRegistry {
     fragments: Mutex<FragmentBuilds>,
+    groups: Mutex<GroupBuilds>,
 }
 
 type FragmentBuildKey = (String, InternalCacheKey, Option<InternalCacheKey>);
 type FragmentBuild = tokio::sync::Mutex<Option<Arc<super::resolve::PreparedFragment>>>;
+type GroupBuildKey = (String, InternalCacheKey);
+type GroupBuild = tokio::sync::Mutex<Option<Weak<super::group::MergedSourceGroup>>>;
 #[derive(Default)]
 struct FragmentBuilds {
     entries: HashMap<FragmentBuildKey, FragmentBuildEntry>,
     requests_until_prune: usize,
+}
+
+#[derive(Default)]
+struct GroupBuilds {
+    entries: HashMap<GroupBuildKey, GroupBuildEntry>,
+    requests_until_prune: usize,
+}
+
+#[derive(Default)]
+struct GroupBuildEntry {
+    build: Weak<GroupBuild>,
+    active: Weak<super::group::MergedSourceGroup>,
 }
 
 #[derive(Default)]
@@ -91,11 +106,65 @@ impl RowIdFragmentRegistry {
         }
         Ok(())
     }
+
+    pub(super) fn for_group(&self, uri: &str, key: InternalCacheKey) -> Result<Arc<GroupBuild>> {
+        let mut groups = self.groups.lock().map_err(|error| {
+            Error::internal(format!("row id group build registry poisoned: {error}"))
+        })?;
+        if groups.requests_until_prune == 0 {
+            groups.entries.retain(|_, entry| {
+                entry.build.strong_count() > 0 || entry.active.strong_count() > 0
+            });
+            let interval = groups.entries.len().max(16);
+            if groups.entries.capacity() > interval.saturating_mul(4) {
+                groups.entries.shrink_to(interval);
+            }
+            groups.requests_until_prune = interval;
+        }
+        groups.requests_until_prune -= 1;
+        let entry = groups.entries.entry((uri.to_owned(), key)).or_default();
+        if let Some(build) = entry.build.upgrade() {
+            return Ok(build);
+        }
+        let build = Arc::new(tokio::sync::Mutex::new(Some(entry.active.clone())));
+        entry.build = Arc::downgrade(&build);
+        Ok(build)
+    }
+
+    pub(super) fn register_group(
+        &self,
+        uri: &str,
+        key: InternalCacheKey,
+        active: &Arc<super::group::MergedSourceGroup>,
+    ) -> Result<()> {
+        let mut groups = self.groups.lock().map_err(|error| {
+            Error::internal(format!("row id group build registry poisoned: {error}"))
+        })?;
+        let entry = groups.entries.entry((uri.to_owned(), key)).or_default();
+        entry.active = Arc::downgrade(active);
+        Ok(())
+    }
+
+    pub(super) fn live_groups(
+        &self,
+        uri: &str,
+    ) -> Result<Vec<(InternalCacheKey, Arc<super::group::MergedSourceGroup>)>> {
+        let groups = self.groups.lock().map_err(|error| {
+            Error::internal(format!("row id group build registry poisoned: {error}"))
+        })?;
+        Ok(groups
+            .entries
+            .iter()
+            .filter(|((entry_uri, _), _)| entry_uri == uri)
+            .filter_map(|((_, key), entry)| entry.active.upgrade().map(|g| (*key, g)))
+            .collect())
+    }
 }
 
 impl DeepSizeOf for RowIdFragmentRegistry {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
-        self.fragments
+        let frag_bytes = self
+            .fragments
             .lock()
             .map(|fragments| {
                 fragments.entries.capacity()
@@ -106,7 +175,20 @@ impl DeepSizeOf for RowIdFragmentRegistry {
                         .map(|(uri, _, _)| uri.capacity())
                         .sum::<usize>()
             })
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let group_bytes = self
+            .groups
+            .lock()
+            .map(|groups| {
+                groups.entries.capacity() * std::mem::size_of::<(GroupBuildKey, GroupBuildEntry)>()
+                    + groups
+                        .entries
+                        .keys()
+                        .map(|(uri, _)| uri.capacity())
+                        .sum::<usize>()
+            })
+            .unwrap_or(0);
+        frag_bytes + group_bytes
     }
 }
 
