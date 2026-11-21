@@ -801,6 +801,47 @@ pub(crate) mod tests {
         assert_false!(version_needed_by_any_index(&version, &[caught_up], &chain));
     }
 
+    /// Each version is decided on its own. A segment retains a later version
+    /// only when that version's own check fails for it: the segment predates
+    /// the version, or its bitmap meets one of the version's groups (a whole
+    /// group, or part of one, which errors). Retaining an earlier version for
+    /// an error does not retain the later ones: a segment whose bitmap misses
+    /// every later group claims no row those versions would translate.
+    #[test]
+    fn test_trim_retains_later_versions_by_their_own_check() {
+        let v1 = reuse_version(10, &[4, 5], &[6]);
+        let v2 = reuse_version(11, &[6, 7], &[8]);
+        let chain = reuse_chain_frag_bitmap(&[v1.clone(), v2.clone()]);
+
+        // Straddles v1 (only 4 of 4 + 5) and v2 (only 7 of 6 + 7).
+        let straddles_both = index_covering(12, &[4, 7]);
+        assert!(matches!(
+            is_index_remap_caught_up(&v1, &straddles_both, &chain),
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            is_index_remap_caught_up(&v2, &straddles_both, &chain),
+            Err(Error::InvalidInput { .. })
+        ));
+        let indices = std::slice::from_ref(&straddles_both);
+        assert_true!(version_needed_by_any_index(&v1, indices, &chain));
+        assert_true!(version_needed_by_any_index(&v2, indices, &chain));
+
+        // Straddles v1 and was built at v2's rewrite, so it predates v2.
+        let predates_v2 = index_covering(11, &[4]);
+        assert_false!(is_index_remap_caught_up(&v2, &predates_v2, &chain).unwrap());
+        let indices = std::slice::from_ref(&predates_v2);
+        assert_true!(version_needed_by_any_index(&v1, indices, &chain));
+        assert_true!(version_needed_by_any_index(&v2, indices, &chain));
+
+        // Straddles v1, past both and misses v2's group: v2 is released.
+        let misses_v2 = index_covering(12, &[4]);
+        assert_true!(is_index_remap_caught_up(&v2, &misses_v2, &chain).unwrap());
+        let indices = std::slice::from_ref(&misses_v2);
+        assert_true!(version_needed_by_any_index(&v1, indices, &chain));
+        assert_false!(version_needed_by_any_index(&v2, indices, &chain));
+    }
+
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {
         let mut dataset = lance_datagen::gen_batch()

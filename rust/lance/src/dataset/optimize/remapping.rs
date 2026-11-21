@@ -246,6 +246,29 @@ fn reuse_lineage(ancestors: &HashMap<u32, RoaringBitmap>, fragment: u32) -> Roar
     lineage
 }
 
+/// Whether folding `versions` into `index_frag_bitmap` meets a group whose
+/// old fragments are only partly in the evolving bitmap.
+fn any_group_straddles(
+    versions: &[FragReuseVersion],
+    mut index_frag_bitmap: RoaringBitmap,
+) -> bool {
+    for group in versions.iter().flat_map(|version| version.groups.iter()) {
+        let indexed = group
+            .old_frags
+            .iter()
+            .filter(|old_frag| index_frag_bitmap.remove(old_frag.id as u32))
+            .count();
+        if indexed == 0 {
+            continue;
+        }
+        if indexed != group.old_frags.len() {
+            return true;
+        }
+        index_frag_bitmap.extend(group.new_frags.iter().map(|f| f.id as u32));
+    }
+    false
+}
+
 /// Fold every reuse version into a segment's stored bitmap.
 ///
 /// A wholly indexed group swaps its old fragments for its new ones. A
@@ -258,15 +281,22 @@ fn reuse_lineage(ancestors: &HashMap<u32, RoaringBitmap>, fragment: u32) -> Roar
 /// exclusion), until no claimed fragment shares lineage with the exclusion.
 /// A manifest write persists the healed bitmap of the other segments too, so
 /// those need no remap of their own.
+///
+/// Lineage is only tracked when some group straddles the evolving bitmap.
+/// Without a straddle the fold keeps only the bitmap; with one it also keeps
+/// one lineage set per rewritten destination fragment of the retained reuse
+/// history, at most (destination fragments in the history) x (fragments in
+/// the history) bits, which the reuse index trim keeps bounded.
 fn remap_untagged_coverage(
     versions: &[FragReuseVersion],
     mut index_frag_bitmap: RoaringBitmap,
     baseline_version: u64,
 ) -> UntaggedCoverage {
+    let track_lineage = any_group_straddles(versions, index_frag_bitmap.clone());
     let mut should_remap = false;
     let mut excluded_source_fragments = RoaringBitmap::new();
     // For every new fragment of a version, all the fragments its rows may
-    // have come from through earlier versions.
+    // have come from through earlier versions. Empty unless `track_lineage`.
     let mut ancestors: HashMap<u32, RoaringBitmap> = HashMap::new();
     for version in versions {
         let data_predates_version = baseline_version <= version.dataset_version;
@@ -275,13 +305,17 @@ fn remap_untagged_coverage(
             let mut indexed_old_frags = RoaringBitmap::new();
             for old_frag in group.old_frags.iter() {
                 let old_frag = old_frag.id as u32;
-                group_lineage |= reuse_lineage(&ancestors, old_frag);
+                if track_lineage {
+                    group_lineage |= reuse_lineage(&ancestors, old_frag);
+                }
                 if index_frag_bitmap.remove(old_frag) {
                     indexed_old_frags.insert(old_frag);
                 }
             }
-            for new_frag in group.new_frags.iter() {
-                ancestors.insert(new_frag.id as u32, group_lineage.clone());
+            if track_lineage {
+                for new_frag in group.new_frags.iter() {
+                    ancestors.insert(new_frag.id as u32, group_lineage.clone());
+                }
             }
 
             if !indexed_old_frags.is_empty() {
@@ -5136,6 +5170,53 @@ mod tests {
                     should_remap,
                     fragment_bitmap: bitmap(claimed),
                     excluded_source_fragments: bitmap(excluded),
+                }
+            );
+        }
+
+        const CHAIN_LENGTH: u64 = 200;
+        const CHAIN_DESTINATION_BASE: u64 = 1000;
+        const OUTSIDE_CHAIN: u32 = 5000;
+
+        /// Version `k` rewrites the previous destination (fragment 0 for the
+        /// first) plus the fresh fragment `k` into `CHAIN_DESTINATION_BASE + k`.
+        fn rewrite_chain() -> Vec<FragReuseVersion> {
+            (1..=CHAIN_LENGTH)
+                .map(|k| {
+                    let previous = if k == 1 {
+                        0
+                    } else {
+                        CHAIN_DESTINATION_BASE + k - 1
+                    };
+                    reuse_version(
+                        10 + k,
+                        vec![(vec![previous, k], vec![CHAIN_DESTINATION_BASE + k])],
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn test_untagged_coverage_long_chain_owned() {
+            let stored: RoaringBitmap = (0..=CHAIN_LENGTH as u32).collect();
+            assert_eq!(
+                remap_untagged_coverage(&rewrite_chain(), stored, 1),
+                UntaggedCoverage {
+                    should_remap: true,
+                    fragment_bitmap: bitmap(&[(CHAIN_DESTINATION_BASE + CHAIN_LENGTH) as u32]),
+                    excluded_source_fragments: RoaringBitmap::new(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_untagged_coverage_long_chain_straddled_at_first_hop() {
+            assert_eq!(
+                remap_untagged_coverage(&rewrite_chain(), bitmap(&[0, OUTSIDE_CHAIN]), 1),
+                UntaggedCoverage {
+                    should_remap: true,
+                    fragment_bitmap: bitmap(&[OUTSIDE_CHAIN]),
+                    excluded_source_fragments: bitmap(&[0]),
                 }
             );
         }
