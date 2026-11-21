@@ -56,45 +56,13 @@
 //
 // SAFETY: executing any AMX tile instruction without first (a) confirming the
 // amx-tile + amx-fp16 CPUID bits and (b) obtaining XTILEDATA permission from
-// the kernel raises SIGILL. Both are the Rust caller's responsibility (see
-// `simd/amx_fp16.rs`); `lance_amx_fp16_request_perm` below performs (b).
-
-// Must precede all includes: exposes the glibc `syscall()` prototype from
-// <unistd.h>, which -std=c17 otherwise hides.
-#define _GNU_SOURCE
+// the kernel raises SIGILL. Both are the Rust caller's responsibility: lance-core's
+// `CpuFeatures::host` reports AMX only after doing both.
 
 #include <immintrin.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-
-#ifdef __linux__
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-
-// ---------------------------------------------------------------------------
-// XTILEDATA permission
-// ---------------------------------------------------------------------------
-
-// Ask the kernel to enable AMX tile data state for this process, via
-// arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA). Returns 0 on success,
-// non-zero otherwise. Requesting XTILEDATA (18) implicitly also grants
-// XTILECFG (17). Constants per Linux Documentation/arch/x86/xstate.rst.
-//
-// XTILEDATA is the single dynamically-enabled XSAVE state component backing the
-// physical TMM tile registers, shared by every AMX compute instruction
-// (TDPBUUD / TDPBF16PS / TDPFP16PS ...). The syscall is idempotent, so
-// requesting an already-granted permission is harmless.
-int lance_amx_fp16_request_perm(void) {
-#ifdef __linux__
-  const unsigned long ARCH_REQ_XCOMP_PERM = 0x1023;
-  const unsigned long XFEATURE_XTILEDATA = 18;
-  return (int)syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
-#else
-  return -1;
-#endif
-}
 
 // ---------------------------------------------------------------------------
 // Shared tile configuration
@@ -193,7 +161,7 @@ static inline void lance_amx_tile_done(void) { _tile_release(); }
 //
 // TILERELEASE needs no XTILEDATA grant of its own -- XFD traps only instructions
 // that touch a TMM register -- but a test calling this is about to call a kernel
-// that does, so it should have gone through `amx_supported()` anyway.
+// that does, so it should have checked `amx_fp16_supported()` anyway.
 __attribute__((visibility("hidden"))) void lance_amx_tile_clobber_for_test(void) {
   _tile_release();
 }
