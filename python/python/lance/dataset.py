@@ -2051,19 +2051,27 @@ class LanceDataset(pa.dataset.Dataset):
     def count_rows(
         self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
-        """Count rows matching the scanner filter.
+        """Count rows in the dataset matching the filter.
 
         Parameters
         ----------
+        filter : str or pyarrow.compute.Expression, optional
+            Count only rows matching this predicate.
         **kwargs : dict, optional
-            See py:method:`scanner` method for full parameter description.
+            PyArrow scan tuning arguments are accepted for compatibility.
+            To count rows in a selected fragment, use :meth:`LanceFragment.count_rows`.
 
         Returns
         -------
         count : int
-            The total number of rows in the dataset.
+            The number of matching rows.
 
         """
+        if kwargs.get("fragments") is not None:
+            raise TypeError(
+                "LanceDataset.count_rows() does not support fragments. "
+                "Call LanceFragment.count_rows() on the selected fragments."
+            )
         if isinstance(filter, pa.compute.Expression):
             # TODO: consolidate all to use scanner
             return self.scanner(
