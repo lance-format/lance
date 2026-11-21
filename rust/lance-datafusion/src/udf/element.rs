@@ -58,7 +58,7 @@ use crate::planner::Planner;
 
 mod lambda;
 
-pub use lambda::rewrite_element_lambdas;
+pub use lambda::{balance_logical_binary_exprs, rewrite_element_lambdas};
 
 /// The name `any_element` is registered under.
 pub const ANY_ELEMENT: &str = "any_element";

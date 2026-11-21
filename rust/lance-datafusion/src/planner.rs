@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
@@ -25,8 +26,8 @@ use arrow_schema::{
 };
 use arrow_select::concat::concat;
 use datafusion::catalog::Session;
-use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DFSchema, ParamValues};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::{SessionContext, SessionState};
@@ -45,7 +46,7 @@ use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, CeilFloorKind, DataType as SQLDataType,
     DateTimeField, ExactNumberInfo, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator,
-    Value, ValueWithSpan,
+    Value, ValueWithSpan, visit_expressions,
 };
 use datafusion::{
     common::Column,
@@ -234,6 +235,7 @@ impl ScalarUDFImpl for CastListF16Udf {
 }
 
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
+#[derive(Clone)]
 struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
     // Functions are looked up in the session's shared state rather than in a
@@ -361,6 +363,9 @@ pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
     enable_relations: bool,
+    /// Values for the placeholders of the filter being parsed, see
+    /// [`Self::parse_filter_with_params`].
+    params: Option<ParamValues>,
 }
 
 impl Planner {
@@ -369,6 +374,7 @@ impl Planner {
             schema,
             context_provider: LanceContextProvider::default(),
             enable_relations: false,
+            params: None,
         }
     }
 
@@ -379,6 +385,7 @@ impl Planner {
             schema,
             context_provider: LanceContextProvider::new(session),
             enable_relations: false,
+            params: None,
         }
     }
 
@@ -680,7 +687,32 @@ impl Planner {
         }
     }
 
+    /// The literal bound to the placeholder `id`.
+    fn bind_placeholder(id: &str, params: &ParamValues) -> Result<Expr> {
+        // DataFusion drops the first character unchecked, so `?` and `:name`
+        // would otherwise be looked up in a named set.
+        if !id.starts_with('$') {
+            return Err(Error::invalid_input(format!(
+                "Unsupported placeholder '{id}': only $1 and $name placeholders can be bound"
+            )));
+        }
+        let bound = params
+            .get_placeholders_with_values(id)
+            .map_err(|e| Error::invalid_input(format!("Cannot bind placeholder '{id}': {e}")))?;
+        // A literal NULL is untyped, and only an untyped null is accepted by
+        // every column type.
+        let value = if bound.value.is_null() {
+            ScalarValue::Null
+        } else {
+            bound.value
+        };
+        Ok(Expr::Literal(value, bound.metadata))
+    }
+
     fn value(&self, value: &Value) -> Result<Expr> {
+        if let (Value::Placeholder(id), Some(params)) = (value, &self.params) {
+            return Self::bind_placeholder(id, params);
+        }
         Ok(match value {
             Value::Number(v, _) => self.number(v.as_str(), false)?,
             Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone())), None),
@@ -1225,13 +1257,62 @@ impl Planner {
     pub fn parse_filter_with_schema(&self, filter: &str, schema: &Schema) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let mut ast_expr = parse_sql_filter(filter)?;
+        if self.params.is_some() {
+            // The check recurses over the AST, like the lambda rewrite.
+            crate::udf::balance_logical_binary_exprs(&mut ast_expr);
+            reject_lambda_placeholders(&ast_expr)?;
+        }
         self.rewrite_filter_lambdas(&mut ast_expr)?;
-        let expr = self.parse_sql_expr(&ast_expr)?;
+        let mut expr = self.parse_sql_expr(&ast_expr)?;
+        if let Some(params) = &self.params {
+            // DataFusion plans function calls, and leaves the placeholders in
+            // their arguments unbound.
+            expr = expr
+                .transform(|expr| match expr {
+                    Expr::Placeholder(placeholder) => Ok(Transformed::yes(Self::bind_placeholder(
+                        &placeholder.id,
+                        params,
+                    )?)),
+                    other => Ok(Transformed::no(other)),
+                })?
+                .data;
+        }
         let resolved = resolve_expr(&expr, schema).map_err(|e| {
             Error::invalid_input(format!("Error resolving filter expression {filter}: {e}"))
         })?;
 
         Ok(coerce_filter_type_to_boolean(resolved))
+    }
+
+    /// Like [`Self::parse_filter`], for a filter with `$1` or `$name`
+    /// placeholders, each replaced by its value in `params`.
+    ///
+    /// A value is bound as the literal it stands for, so it is coerced to the
+    /// type of the column it is compared with exactly as a literal is, and a
+    /// null of any type is bound as `NULL`. Values that no placeholder refers
+    /// to are ignored.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use datafusion::common::{ParamValues, ScalarValue};
+    /// # use lance_datafusion::planner::Planner;
+    /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    /// let planner = Planner::new(schema);
+    /// let params = ParamValues::from(vec![ScalarValue::Int64(Some(7))]);
+    /// assert_eq!(
+    ///     planner.parse_filter_with_params("id = $1", &params).unwrap(),
+    ///     planner.parse_filter("id = 7").unwrap()
+    /// );
+    /// ```
+    pub fn parse_filter_with_params(&self, filter: &str, params: &ParamValues) -> Result<Expr> {
+        let bound = Self {
+            schema: self.schema.clone(),
+            context_provider: self.context_provider.clone(),
+            enable_relations: self.enable_relations,
+            params: Some(params.clone()),
+        };
+        bound.parse_filter(filter)
     }
 
     /// Rewrite each `array_any_match(list, x -> predicate)` in a parsed filter
@@ -1441,6 +1522,28 @@ impl Planner {
 /// UTC wall time, which a column with a time zone then reads as local time in its own
 /// zone, while the zoned type keeps the instant. The result stays a cast rather than a
 /// literal so that DataFusion still coerces it against other column types, such as dates.
+/// Reject a placeholder in a lambda body: the body is planned later from its
+/// printed form, where the placeholder can no longer be bound.
+fn reject_lambda_placeholders(filter: &SQLExpr) -> Result<()> {
+    let is_placeholder = |expr: &SQLExpr| match expr {
+        SQLExpr::Value(ValueWithSpan {
+            value: Value::Placeholder(id),
+            ..
+        }) => ControlFlow::Break(id.clone()),
+        _ => ControlFlow::Continue(()),
+    };
+    let found = visit_expressions(filter, |expr| match expr {
+        SQLExpr::Lambda(lambda) => visit_expressions(&lambda.body, is_placeholder),
+        _ => ControlFlow::Continue(()),
+    });
+    match found {
+        ControlFlow::Break(id) => Err(Error::invalid_input(format!(
+            "Cannot bind placeholder '{id}' inside a lambda"
+        ))),
+        ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
 fn with_utc_zone_if_offset(value: &str, data_type: ArrowDataType) -> ArrowDataType {
     let ArrowDataType::Timestamp(unit, None) = data_type else {
         return data_type;
@@ -1461,11 +1564,11 @@ mod tests {
 
     use super::*;
 
-    use arrow::datatypes::{Float64Type, Int64Type};
+    use arrow::datatypes::{Float32Type, Float64Type, Int64Type};
     use arrow_array::{
-        ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray, Time32SecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+        RecordBatch, StringArray, StructArray, Time32SecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
@@ -1480,6 +1583,7 @@ mod tests {
     #[rstest]
     #[case::named_placeholder("i = :id")]
     #[case::numbered_placeholder("i = $1")]
+    #[case::dollar_named_placeholder("i = $id")]
     #[case::question_placeholder("i = ?")]
     #[case::national_string("s = N'abc'")]
     #[case::in_array_literal("s = [N'abc']")]
@@ -1488,8 +1592,14 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
             Field::new("i", DataType::Int32, false),
         ]));
-        let planner = Planner::new(schema);
+        let planner = Planner::new(schema.clone());
 
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let with_schema = planner.parse_filter_with_schema(filter, &lance_schema);
+        assert!(
+            matches!(with_schema, Err(Error::InvalidInput { .. })),
+            "expected InvalidInput for {filter}, got {with_schema:?}"
+        );
         let err = planner.parse_filter(filter).unwrap_err();
         assert!(
             matches!(err, Error::InvalidInput { .. }),
@@ -1499,6 +1609,190 @@ mod tests {
             err.to_string().contains("Unsupported SQL value"),
             "error should name the unsupported value for {filter}, got {err}"
         );
+    }
+
+    fn params_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("f", DataType::Float32, true),
+            Field::new("bin", DataType::Binary, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("d", DataType::Date32, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+            Field::new(
+                "parent",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "child",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            Field::new(
+                "detections",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(Fields::from(vec![Field::new(
+                        "label",
+                        DataType::Utf8,
+                        true,
+                    )])),
+                    true,
+                ))),
+                true,
+            ),
+        ]))
+    }
+
+    #[rstest]
+    #[case::int("id = $1", vec![ScalarValue::from(7i64)], "id = 7")]
+    #[case::int_out_of_range("id = $1", vec![ScalarValue::from(i64::MAX)], "id = 9223372036854775807")]
+    #[case::string("s = $1", vec![ScalarValue::from("a'b")], "s = 'a''b'")]
+    #[case::boolean("b = $1", vec![ScalarValue::from(true)], "b = true")]
+    #[case::float("f < $1", vec![ScalarValue::from(0.1f64)], "f < 0.1")]
+    #[case::null("id = $1", vec![ScalarValue::Null], "id = NULL")]
+    #[case::typed_null("id = $1", vec![ScalarValue::Utf8(None)], "id = NULL")]
+    #[case::reused(
+        "$1 < id AND parent.child = $1",
+        vec![ScalarValue::from(3i64)],
+        "3 < id AND parent.child = 3"
+    )]
+    #[case::in_list(
+        "id IN ($1, $2)",
+        vec![ScalarValue::from(1i64), ScalarValue::from(2i64)],
+        "id IN (1, 2)"
+    )]
+    #[case::between(
+        "id BETWEEN $1 AND $2",
+        vec![ScalarValue::from(1i64), ScalarValue::from(2i64)],
+        "id BETWEEN 1 AND 2"
+    )]
+    #[case::arithmetic(
+        "id + $1 > $2",
+        vec![ScalarValue::from(1i64), ScalarValue::from(10i64)],
+        "id + 1 > 10"
+    )]
+    #[case::function("starts_with(s, $1)", vec![ScalarValue::from("ab")], "starts_with(s, 'ab')")]
+    #[case::array_literal(
+        "array_has([$1, $2], s)",
+        vec![ScalarValue::from("a"), ScalarValue::from("b")],
+        "array_has(['a', 'b'], s)"
+    )]
+    #[case::nested_field("parent.child >= $1", vec![ScalarValue::from(5i64)], "parent.child >= 5")]
+    #[case::unused_values(
+        "id = $1",
+        vec![ScalarValue::from(7i64), ScalarValue::from(99i64)],
+        "id = 7"
+    )]
+    #[case::named(
+        "id = $low AND s = $name AND b = $unset",
+        vec![
+            ("low", ScalarValue::from(1i64)),
+            ("name", ScalarValue::from("x")),
+            ("unset", ScalarValue::Boolean(None)),
+            ("unused", ScalarValue::from(2i64)),
+        ],
+        "id = 1 AND s = 'x' AND b = NULL"
+    )]
+    fn test_parse_filter_with_params_matches_literal(
+        #[case] filter: &str,
+        #[case] params: impl Into<ParamValues>,
+        #[case] literal: &str,
+    ) {
+        let planner = Planner::new(params_schema());
+        assert_eq!(
+            planner
+                .parse_filter_with_params(filter, &params.into())
+                .unwrap(),
+            planner.parse_filter(literal).unwrap()
+        );
+    }
+
+    /// A value of a type no literal has is compared as that type.
+    #[rstest]
+    #[case::float32("f", ScalarValue::Float32(Some(0.1)), None)]
+    #[case::binary("bin", ScalarValue::Binary(Some(vec![1, 2])), None)]
+    #[case::timestamp("ts", ScalarValue::TimestampMicrosecond(Some(5), None), None)]
+    #[case::timestamp_unit(
+        "ts",
+        ScalarValue::TimestampNanosecond(Some(5000), None),
+        Some(ScalarValue::TimestampMicrosecond(Some(5), None))
+    )]
+    #[case::date("d", ScalarValue::Date32(Some(5)), None)]
+    #[case::large_string(
+        "s",
+        ScalarValue::LargeUtf8(Some("x".to_string())),
+        Some(ScalarValue::from("x"))
+    )]
+    #[case::vector(
+        "vec",
+        ScalarValue::FixedSizeList(Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                [Some([Some(1.0), Some(2.0)])],
+                2
+            )
+        )),
+        None
+    )]
+    fn test_parse_filter_with_params_keeps_typed_values(
+        #[case] column: &str,
+        #[case] value: ScalarValue,
+        #[case] coerced: Option<ScalarValue>,
+    ) {
+        let expr = Planner::new(params_schema())
+            .parse_filter_with_params(&format!("{column} = $1"), &vec![value.clone()].into())
+            .unwrap();
+        assert_eq!(expr, col(column).eq(lit(coerced.unwrap_or(value))));
+    }
+
+    #[rstest]
+    #[case::index_out_of_range("id = $2", vec![ScalarValue::from(7i64)], "placeholder '$2'")]
+    #[case::index_zero("id = $0", vec![ScalarValue::from(7i64)], "placeholder '$0'")]
+    #[case::no_values("id = $1", Vec::<ScalarValue>::new(), "placeholder '$1'")]
+    #[case::name_for_positional("id = $low", vec![ScalarValue::from(7i64)], "placeholder '$low'")]
+    #[case::unknown_name("id = $high", vec![("low", ScalarValue::from(7i64))], "placeholder '$high'")]
+    #[case::question_mark("id = ?", vec![("", ScalarValue::from(7i64))], "placeholder '?'")]
+    #[case::colon_name("id = :low", vec![("low", ScalarValue::from(7i64))], "placeholder ':low'")]
+    #[case::function_argument(
+        "starts_with(s, $2)",
+        vec![ScalarValue::from("ab")],
+        "placeholder '$2'"
+    )]
+    #[case::function_question_mark(
+        "starts_with(s, ?)",
+        vec![ScalarValue::from("ab")],
+        "placeholder '?'"
+    )]
+    #[case::lambda(
+        "array_any_match(detections, x -> x.label = $1)",
+        vec![ScalarValue::from("car")],
+        "placeholder '$1' inside a lambda"
+    )]
+    #[case::wrong_type("s = $1", vec![ScalarValue::from(7i64)], "could not convert")]
+    #[case::wrong_width(
+        "bin = $1",
+        vec![ScalarValue::LargeBinary(Some(vec![1, 2]))],
+        "could not convert"
+    )]
+    fn test_parse_filter_with_params_errors(
+        #[case] filter: &str,
+        #[case] params: impl Into<ParamValues>,
+        #[case] message: &str,
+    ) {
+        let err = Planner::new(params_schema())
+            .parse_filter_with_params(filter, &params.into())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput for {filter}, got {err:?}"
+        );
+        assert!(err.to_string().contains(message), "{filter}: {err}");
     }
 
     /// Compare complete arrays, including validity bits, across both optimizer passes.
@@ -2600,6 +2894,62 @@ mod tests {
 
             assert_eq!(optimized, lit(true));
         }
+    }
+
+    fn deep_chain(term: &str, op: &str) -> String {
+        std::iter::repeat_n(term, 1000)
+            .collect::<Vec<_>>()
+            .join(&format!(" {op} "))
+    }
+
+    /// Binding walks the filter before and after it is planned, and neither
+    /// walk may recurse as deep as a chain has operands.
+    #[rstest]
+    fn test_parse_deep_logical_filter_with_params(
+        #[values("AND", "OR")] op: &str,
+        #[values(("id = $1", "id = 7"), ("starts_with(s, $2)", "starts_with(s, 'ab')"))] terms: (
+            &str,
+            &str,
+        ),
+        #[values("{}", "coalesce({}, false)")] wrapper: &str,
+    ) {
+        let planner = Planner::new(params_schema());
+        let params = vec![ScalarValue::from(7i64), ScalarValue::from("ab")].into();
+        assert_eq!(
+            planner
+                .parse_filter_with_params(&wrapper.replace("{}", &deep_chain(terms.0, op)), &params)
+                .unwrap(),
+            planner
+                .parse_filter(&wrapper.replace("{}", &deep_chain(terms.1, op)))
+                .unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_parse_deep_logical_filter_rejects_lambda_placeholder(
+        #[values("AND", "OR")] op: &str,
+        #[values(
+            "{} AND array_any_match(detections, x -> x.label = $2)",
+            "array_any_match(detections, x -> {})"
+        )]
+        wrapper: &str,
+    ) {
+        let term = if wrapper.starts_with("{}") {
+            "id = $1"
+        } else {
+            "x.label = $2"
+        };
+        let err = Planner::new(params_schema())
+            .parse_filter_with_params(
+                &wrapper.replace("{}", &deep_chain(term, op)),
+                &vec![ScalarValue::from(7i64), ScalarValue::from("ab")].into(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("placeholder '$2' inside a lambda"),
+            "{err}"
+        );
     }
 
     #[derive(Debug, Eq, PartialEq, Hash)]
