@@ -408,13 +408,17 @@ mod tests {
             fsl.values()
                 .as_primitive::<Float32Type>()
                 .values()
-                .chunks_exact(DIM)
+                .as_chunks::<DIM>()
+                .0
+                .iter()
                 .map(|row| {
                     (0..NUM_SUB_VECTORS)
                         .map(|s| {
                             let sub = &row[s * SUB_DIM..][..SUB_DIM];
                             codebook[s * 256 * SUB_DIM..][..256 * SUB_DIM]
-                                .chunks_exact(SUB_DIM)
+                                .as_chunks::<SUB_DIM>()
+                                .0
+                                .iter()
                                 .map(|c| l2(sub, c) as f64)
                                 .fold(f64::INFINITY, f64::min)
                         })
@@ -434,7 +438,9 @@ mod tests {
                     .values()
                     .as_primitive::<Float32Type>()
                     .values()
-                    .chunks_exact(DIM)
+                    .as_chunks::<DIM>()
+                    .0
+                    .iter()
                     .flat_map(|row| row[s * SUB_DIM..][..SUB_DIM].to_vec())
                     .collect();
                 let params = KMeansParams::new(None, 50, 1, DistanceType::L2).with_seed(s as u64);
