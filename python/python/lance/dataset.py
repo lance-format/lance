@@ -626,8 +626,9 @@ class LanceDataset(pa.dataset.Dataset):
                     "distance_range": (0.0, 1.0),
                 }
 
-            ``q`` may also be a 2-D array-like value, or a list of vectors, for
-            fixed-size vector columns. In that case Lance runs a batch nearest-neighbor
+            ``q`` may also be a 2-D array-like value, a list of vectors, or an Arrow
+            list, large-list, or fixed-size-list array, including chunked arrays.
+            For fixed-size vector columns, Lance runs a batch nearest-neighbor
             query, returns up to ``k`` rows for each query vector, and adds
             an Int32 non-null ``query_index`` as the first output column to identify
             the source query for each result row.
@@ -636,8 +637,9 @@ class LanceDataset(pa.dataset.Dataset):
             used for batch nearest-neighbor search. When ``use_index`` is true and a
             vector index is available, each query vector is searched through the index
             path; otherwise the flat batch path is used.
-            For multivector columns, ``"warp_imputation_rank"`` tunes WARP search;
-            see :meth:`ScannerBuilder.nearest`.
+            For multivector columns, a list-shaped query is one late-interaction
+            query. The ``"warp_imputation_rank"`` option tunes WARP search.
+            See :meth:`ScannerBuilder.nearest`.
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
