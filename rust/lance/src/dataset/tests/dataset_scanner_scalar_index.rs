@@ -1154,6 +1154,16 @@ async fn test_ngram_regex_index_scan() {
         );
     }
 
+    // The plan names the trigrams the index is asked for.
+    let mut scan = dataset.scan();
+    scan.filter("regexp_match(s, 'rhino.*(horn|nose)')")
+        .unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("trigrams=(hin AND ino AND rhi AND ((hor AND orn) OR (nos AND ose)))"),
+        "{plan}"
+    );
+
     // contains with >= 3 characters (uses index)
     assert_eq!(
         matched(&dataset, "contains(s, 'rhino')").await,

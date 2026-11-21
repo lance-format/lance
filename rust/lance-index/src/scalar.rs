@@ -471,7 +471,13 @@ impl AnyQuery for TextQuery {
     }
 
     fn format(&self, col: &str) -> String {
-        format!("{}", self.to_expr(col.to_string()))
+        let expr = self.to_expr(col.to_string());
+        match self {
+            Self::StringContains(_) => expr.to_string(),
+            Self::Regex(pattern) => {
+                format!("{expr} trigrams={}", ngram::regex_trigrams(pattern))
+            }
+        }
     }
 
     fn to_expr(&self, col: String) -> Expr {
