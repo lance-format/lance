@@ -324,6 +324,11 @@ pub struct VectorIndexDetails {
     #[prost(map = "string, string", tag = "9")]
     pub runtime_hints:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Per-segment overlay exceptions, as in RankedIndexOverlayDetails.
+    #[prost(message, optional, tag = "32")]
+    #[cfg(any())]
+    pub overlay_freshness:
+        ::core::option::Option<::lance_table::format::pb::IndexOverlayFreshnessList>,
     #[prost(oneof = "vector_index_details::Compression", tags = "4, 5, 6, 8")]
     pub compression: ::core::option::Option<vector_index_details::Compression>,
 }
@@ -621,7 +626,7 @@ impl ::prost::Name for FmIndexDetails {
 /// message in their schema metadata so that a file which does not belong to
 /// the details is detected. A reader validates every field against the ranges
 /// below before it allocates memory or reads an index file.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Eq, Hash, Clone, PartialEq, ::prost::Message)]
 pub struct MinHashLshIndexDetails {
     /// Number of MinHash values per signature (k): in \[1, 4096\] and a multiple
     /// of `num_bands`.

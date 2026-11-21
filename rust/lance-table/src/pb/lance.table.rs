@@ -2908,3 +2908,90 @@ impl ::prost::Name for RowDatasetVersionRun {
         "/lance.table.RowDatasetVersionRun".into()
     }
 }
+/// The overlay fields shared by VectorIndexDetails and InvertedIndexDetails.
+/// Table maintenance can project this field from either message without
+/// interpreting index configuration. Its wire number and type must match.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RankedIndexOverlayDetails {
+    #[prost(message, optional, tag = "32")]
+    pub overlay_freshness: ::core::option::Option<IndexOverlayFreshnessList>,
+}
+impl ::prost::Name for RankedIndexOverlayDetails {
+    const NAME: &'static str = "RankedIndexOverlayDetails";
+    const PACKAGE: &'static str = "lance.table";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.table.RankedIndexOverlayDetails".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.table.RankedIndexOverlayDetails".into()
+    }
+}
+/// Keeping the entries in a single length-delimited field lets readers skip
+/// the entire list when they need only the index configuration.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IndexOverlayFreshnessList {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<IndexOverlayFreshness>,
+    /// A local snapshot at which the merge verified coverage inherited from
+    /// another dataset. Used to validate base files, deletions and overlay
+    /// identities on later publication. It does not date the row addresses or
+    /// establish that every overlay at this snapshot was indexed.
+    #[prost(uint64, optional, tag = "2")]
+    pub validation_version: ::core::option::Option<u64>,
+}
+impl ::prost::Name for IndexOverlayFreshnessList {
+    const NAME: &'static str = "IndexOverlayFreshnessList";
+    const PACKAGE: &'static str = "lance.table";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.table.IndexOverlayFreshnessList".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.table.IndexOverlayFreshnessList".into()
+    }
+}
+/// Physical sources and incorporated overlays for one index fragment. Each
+/// fragment and each overlay within it occur at most once.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IndexOverlayFreshness {
+    #[prost(uint32, tag = "1")]
+    pub fragment_id: u32,
+    /// Actual build snapshots for the contributing entries. Repeated merges
+    /// retain the original snapshots. Empty means the source history is
+    /// unavailable in this dataset, for example after a clone.
+    #[prost(uint64, repeated, tag = "2")]
+    pub source_versions: ::prost::alloc::vec::Vec<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub overlays: ::prost::alloc::vec::Vec<IndexedDataOverlay>,
+}
+impl ::prost::Name for IndexOverlayFreshness {
+    const NAME: &'static str = "IndexOverlayFreshness";
+    const PACKAGE: &'static str = "lance.table";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.table.IndexOverlayFreshness".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.table.IndexOverlayFreshness".into()
+    }
+}
+/// An incorporated file newer than the segment-wide dataset_version.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IndexedDataOverlay {
+    #[prost(uint64, tag = "1")]
+    pub committed_version: u64,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// An absent base identifies the base of the index segment. A shallow clone
+    /// can therefore resolve the same file after assigning that base an id.
+    #[prost(uint32, optional, tag = "3")]
+    pub base_id: ::core::option::Option<u32>,
+}
+impl ::prost::Name for IndexedDataOverlay {
+    const NAME: &'static str = "IndexedDataOverlay";
+    const PACKAGE: &'static str = "lance.table";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.table.IndexedDataOverlay".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.table.IndexedDataOverlay".into()
+    }
+}

@@ -114,14 +114,13 @@ effective** — the version of the commit that introduced it, **not** the versio
 it was read from. It is stamped at commit time and re-stamped if the commit is
 retried, in the same way as the created-at / last-updated-at version sequences.
 
-This single value drives every ordering decision:
+Readers use the committed version to order overlays and compare them with indices.
 
 - **Overlay vs. overlay** (read precedence): higher `committed_version` wins.
-- **Overlay vs. index** (query correctness): an index records the
-  `dataset_version` it was built from. An index whose `dataset_version >=
-  committed_version` already incorporates the overlay. An overlay whose
-  `committed_version > index.dataset_version` is newer than the index and its
-  cells must be excluded from index results and re-evaluated.
+- **Overlay vs. index.** An index segment incorporates overlays through its
+  `dataset_version`. A merged vector or inverted segment can also identify
+  individual newer overlays that its source segments incorporated. See
+  [Overlay freshness after a segment merge](../index/index.md#overlay-freshness-after-a-segment-merge).
 - **Scheduler signal**: the gap between an overlay's `committed_version` and an
   index's `dataset_version`, or between an overlay and the base, is a staleness
   measure the compaction scheduler can use.
@@ -142,10 +141,10 @@ Building an index over a fragment that has overlays does **not** require droppin
 the fragment from the index's coverage. The fragment stays indexed, and the query
 path reconciles overlays at query time using an **exclusion set**.
 
-The exclusion set for an index on field `F` is the union of the coverage bitmaps,
-restricted to field `F`, of every overlay whose `committed_version >
-index.dataset_version`. The exclusion is **field-aware**: an overlay that touches
-only unrelated columns does not exclude anything from the index on `F`.
+The exclusion set for a segment on field `F` is the union of the coverage
+bitmaps for `F` from overlays newer than its `dataset_version`, skipping
+files the segment explicitly identifies as incorporated. Only overlays that
+touch `F` can contribute rows to this set.
 
 `F` here ranges over the union of the index's `fields` and `covering_fields`
 (see [Serving carried columns](../index/index.md#serving-carried-columns)).
@@ -194,14 +193,12 @@ file to open, and additional work to interleave values. Compaction bounds that c
 
 !!! warning "Folding an indexed field must update its index"
 
-    An overlay→base fold removes the overlay, which removes the exclusion signal
-    that kept an index correct. Folding an overlay that covers an indexed field
-    `F` is therefore equivalent to a column rewrite of `F` and must, in the same
-    commit, either rebuild the index to a `dataset_version` at least the folded
-    overlay's `committed_version`, or remove the fragment from the index's
-    coverage so the rows fall to the flat path. Otherwise the index would serve
-    stale values with no overlay to exclude them. This is the same rule that
-    already governs rewriting a column that an index is built on.
+    Folding an overlay into the base removes the file that identifies rows
+    requiring exclusion. If any folded overlay supplies values for an indexed
+    field that the segment has yet to incorporate, the same commit must
+    rebuild the affected entries or withdraw the fragment from the segment's
+    coverage. A segment that already incorporates all folded values can retain
+    coverage subject to the usual row-address remapping rules.
 
 When a fragment with overlays is compacted by a row-rewriting operation
 (`RewriteRows`, which produces new fragments with new row addresses), the
