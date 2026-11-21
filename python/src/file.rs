@@ -682,10 +682,13 @@ impl LanceFileSession {
                 self.base_path.clone()
             };
 
+            // The Python API returns display paths relative to the session.
             let result = self
                 .object_store
+                .inner
                 .list_with_delimiter(Some(&list_path))
                 .await
+                .map_err(lance_core::Error::from)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
             // Strip the base_path prefix to make each path relative to the session.
