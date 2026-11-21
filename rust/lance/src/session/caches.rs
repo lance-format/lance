@@ -17,6 +17,7 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_select::RowAddrMask;
 use lance_table::{
     format::{
@@ -25,6 +26,7 @@ use lance_table::{
     rowids::RowIdSequence,
 };
 use object_store::path::Path;
+use uuid::Uuid;
 
 use crate::dataset::transaction::Transaction;
 
@@ -326,6 +328,34 @@ impl CacheKey for RowVersionSequenceKey<'_> {
         builder.write_u64(self.field_id as u64);
         builder.write_str(&self.data_file.path);
         builder.write_u64(self.data_file.base_id.map_or(u64::MAX, u64::from));
+    }
+}
+
+/// Complete persisted inverted-index tokenizer parameters, independent of row
+/// remapping. Stored in the metadata cache so parameter checks never populate
+/// the index partition cache.
+#[derive(Debug)]
+pub(crate) struct InvertedIndexParamsKey<'a> {
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for InvertedIndexParamsKey<'_> {
+    type ValueType = InvertedIndexParams;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("inverted_params/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "InvertedIndexParams"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.inverted-params-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
     }
 }
 

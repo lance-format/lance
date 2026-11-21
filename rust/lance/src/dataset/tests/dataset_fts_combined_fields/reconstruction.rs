@@ -761,26 +761,32 @@ async fn bm25f_flat_prescored_streams_without_opening_index_segments() {
     .unwrap();
 
     // Reference full-corpus single-node mixed query.
-    let mut scanner = dataset.scan();
-    scanner
-        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
-            query.clone(),
-        )))
-        .unwrap();
-    let plan = scanner.create_plan().await.unwrap();
-    let expected = id_scores(plan.clone()).await;
+    let make_plan = || async {
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
+                query.clone(),
+            )))
+            .unwrap();
+        scanner.create_plan().await.unwrap()
+    };
+    let expected = id_scores(make_plan().await).await;
 
-    // Extract the native FlatCombinedFieldsExec from the mixed plan and attach a
-    // precomputed global scorer built from fragment 0's index + fragment 1's flat stats.
-    let mut flat_node: Option<FlatCombinedFieldsExec> = None;
-    plan.apply(|node| {
-        if let Some(flat) = node.downcast_ref::<FlatCombinedFieldsExec>() {
-            flat_node = Some(flat.clone());
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })
-    .unwrap();
-    let flat = flat_node.expect("mixed plan must contain FlatCombinedFieldsExec");
+    // Extract fresh FlatCombinedFieldsExec instances from unexecuted plans because
+    // FilteredReadExec's underlying stream state is single-use once executed.
+    let extract_flat = |plan: &Arc<dyn ExecutionPlan>| {
+        let mut flat_node: Option<FlatCombinedFieldsExec> = None;
+        plan.apply(|node| {
+            if let Some(flat) = node.downcast_ref::<FlatCombinedFieldsExec>() {
+                flat_node = Some(flat.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        flat_node.expect("mixed plan must contain FlatCombinedFieldsExec")
+    };
+    let flat_for_stats = extract_flat(&make_plan().await);
+    let flat_for_score = extract_flat(&make_plan().await);
 
     // Collect global stats: indexed segment 0 + flat fragment 1.
     let terms = vec!["alpha".to_string(), "beta".to_string()];
@@ -820,7 +826,7 @@ async fn bm25f_flat_prescored_streams_without_opening_index_segments() {
             }
         }
     }
-    let flat_input = flat.children()[0]
+    let flat_input = flat_for_stats.children()[0]
         .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
         .unwrap();
     let flat_schema = flat_input.schema();
@@ -844,11 +850,21 @@ async fn bm25f_flat_prescored_streams_without_opening_index_segments() {
     )
     .await
     .unwrap();
-    for slot in 0..2 {
-        doc_counts[slot] += flat_stats.doc_counts[slot];
-        total_tokens[slot] += flat_stats.total_tokens[slot];
-        for t in 0..2 {
-            doc_freqs[slot][t] += flat_stats.doc_freqs[slot][t];
+    assert_eq!(flat_stats.doc_counts, vec![2, 2]);
+    for ((dc, tt), (dfs, (flat_dc, (flat_tt, flat_dfs)))) in
+        doc_counts.iter_mut().zip(&mut total_tokens).zip(
+            doc_freqs.iter_mut().zip(
+                flat_stats
+                    .doc_counts
+                    .iter()
+                    .zip(flat_stats.total_tokens.iter().zip(&flat_stats.doc_freqs)),
+            ),
+        )
+    {
+        *dc += *flat_dc;
+        *tt += *flat_tt;
+        for (df, flat_df) in dfs.iter_mut().zip(flat_dfs) {
+            *df += *flat_df;
         }
     }
     let global_scorer = Arc::new(
@@ -863,9 +879,11 @@ async fn bm25f_flat_prescored_streams_without_opening_index_segments() {
     );
 
     let prescored_flat = Arc::new(
-        reconstruct_flat(&flat, flat.children()[0].clone()).with_base_scorer(global_scorer.clone()),
+        reconstruct_flat(&flat_for_score, flat_for_score.children()[0].clone())
+            .with_base_scorer(global_scorer.clone()),
     );
     let flat_rows = row_scores(prescored_flat.clone()).await;
+    assert_eq!(flat_rows.len(), 2, "expected both unindexed rows to match");
     let parts = prescored_flat
         .metrics()
         .unwrap()

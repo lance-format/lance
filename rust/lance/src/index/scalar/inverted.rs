@@ -36,7 +36,7 @@ use crate::{
     Dataset, Error, Result,
     dataset::index::LanceIndexStoreExt,
     index::{DatasetIndexExt, scalar::fetch_index_details},
-    session::index_caches::InvertedIndexParamsKey,
+    session::caches::InvertedIndexParamsKey,
 };
 
 #[derive(Debug, Clone)]
@@ -1236,13 +1236,14 @@ fn inverted_index_details_semantically_equal(
 }
 
 /// Read one segment's [`InvertedIndexParams`], caching decoded values in the
-/// dataset's index cache by immutable segment UUID.
+/// dataset's metadata cache by immutable segment UUID without populating the
+/// index partition cache.
 pub async fn load_segment_params(
     dataset: &Dataset,
     segment: &IndexMetadata,
 ) -> Result<InvertedIndexParams> {
     let params = dataset
-        .index_cache
+        .metadata_cache
         .get_or_insert_with_key(
             InvertedIndexParamsKey {
                 uuid: &segment.uuid,
@@ -1276,8 +1277,8 @@ mod tests {
         let batch =
             arrow_array::record_batch!(("text", Utf8, [r#"{"title":"alpha beta"}"#])).unwrap();
         let session = Arc::new(Session::new(
+            1024 * 1024,
             cache_bytes,
-            0,
             Arc::new(ObjectStoreRegistry::default()),
         ));
         let mut dataset = Dataset::write(
@@ -1306,12 +1307,19 @@ mod tests {
         let old_segment = dataset.load_indices().await.unwrap()[0].clone();
         let old_snapshot = dataset.clone();
         dataset.index_cache.clear().await;
+        dataset.metadata_cache.clear().await;
+        let index_entries_before = dataset.index_cache_entry_count().await;
 
         let before = dataset.object_store.io_stats_snapshot().read_iops;
         let first = load_segment_params(&dataset, &old_segment).await.unwrap();
         let after_first = dataset.object_store.io_stats_snapshot().read_iops;
         assert!(after_first > before);
         assert!(first.same_tokenization(&json_params));
+        assert_eq!(
+            dataset.index_cache_entry_count().await,
+            index_entries_before,
+            "load_segment_params must not populate the index cache"
+        );
         let repeated = load_segment_params(&dataset, &old_segment).await.unwrap();
         assert_eq!(first, repeated);
         let after_repeat = dataset.object_store.io_stats_snapshot().read_iops;
@@ -1321,7 +1329,7 @@ mod tests {
             assert_eq!(after_repeat, after_first);
         }
 
-        dataset.index_cache.clear().await;
+        dataset.metadata_cache.clear().await;
         let before_reload = dataset.object_store.io_stats_snapshot().read_iops;
         assert_eq!(
             load_segment_params(&dataset, &old_segment).await.unwrap(),
