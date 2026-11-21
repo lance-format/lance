@@ -10,21 +10,25 @@
 //! so a seeded column keeps its seed in whichever data file serves it.
 //!
 //! Seed formats that readers must opt into declare dataset feature flags
-//! ([`IndexSeedWriter::required_feature_flags`]). The collector embeds such a
-//! seed only when the writer's snapshot already carries the flags, and the
-//! commit path sets them for every index that requests such a seed
+//! ([`IndexSeedWriter::required_feature_flags`]). The collector embeds an
+//! index-requested seed only when the writer's snapshot already carries the
+//! flags. A field policy activates them in its metadata commit; a creation
+//! commit derives them from its write schema. The commit path also sets them
+//! for every index that requests such a seed
 //! ([`apply_seed_feature_flags`]), so no manifest references a seed its flags
 //! do not announce.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arrow_array::RecordBatch;
-use lance_core::Result;
+use arrow_schema::DataType;
 use lance_core::datatypes::Schema;
+use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::pbold;
 use lance_index::scalar::seed::IndexSeedWriter;
 use lance_index::scalar::zonemap::ZoneMapSeedWriter;
+use lance_table::feature_flags::ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY;
 use lance_table::format::{IndexMetadata, Manifest};
 
 use super::GenericWriter;
@@ -32,6 +36,190 @@ use crate::Dataset;
 use crate::index::scalar::zonemap::stored_null_bitmap_policy;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::index::{loading::load_all_indices, segment::index_is_usable};
+
+/// Collection settings for a top-level column's future zone write seeds.
+///
+/// Seeds accelerate later ZoneMap index creation and maintenance without
+/// creating an index or making the column indexed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZoneWriteSeedOptions {
+    /// Current name of the top-level column to configure.
+    pub column: String,
+    /// Maximum number of physical rows summarized by each seed record.
+    /// Must be greater than zero. A file's final record may be shorter.
+    pub rows_per_zone: u64,
+}
+
+impl ZoneWriteSeedOptions {
+    /// Select a column and its positive collection row count.
+    ///
+    /// ```
+    /// use lance::dataset::ZoneWriteSeedOptions;
+    /// let options = ZoneWriteSeedOptions::new("timestamp", 1_000_000);
+    /// assert_eq!(options.rows_per_zone, 1_000_000);
+    /// ```
+    pub fn new(column: impl Into<String>, rows_per_zone: u64) -> Self {
+        Self {
+            column: column.into(),
+            rows_per_zone,
+        }
+    }
+}
+
+fn supports_zone_write_seeds(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+    )
+}
+
+/// The validated row count requested by a field's persistent policy.
+pub fn configured_zone_rows(field: &lance_core::datatypes::Field) -> Result<Option<u64>> {
+    let Some(value) = field.metadata.get(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY) else {
+        return Ok(None);
+    };
+    let rows = value.parse::<u64>().ok().filter(|rows| *rows > 0 && value.bytes().all(|byte| byte.is_ascii_digit())).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Column {}: {ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY} must be a positive u64 row count, got {value:?}",
+            field.name
+        ))
+    })?;
+    validate_zone_seed_options(field, rows)?;
+    Ok(Some(rows))
+}
+
+fn validate_zone_seed_options(field: &lance_core::datatypes::Field, rows: u64) -> Result<()> {
+    if rows == 0 {
+        return Err(Error::invalid_input(format!(
+            "Column {}: zone write seed rows_per_zone must be positive, got {rows}",
+            field.name
+        )));
+    }
+    if field.is_blob() || !supports_zone_write_seeds(&field.data_type()) {
+        return Err(Error::invalid_input(format!(
+            "Zone write seeds are not supported for column {} of type {:?}",
+            field.name,
+            field.data_type()
+        )));
+    }
+    Ok(())
+}
+
+impl Dataset {
+    /// Replace the columns whose future data-file writes collect zone write
+    /// seeds, independently of any index. An empty selection disables this
+    /// additional collection; index-requested seeds remain enabled.
+    ///
+    /// The settings persist on the selected fields, follow renames, and apply
+    /// to append, column rewrites, and re-encoding compaction. Other handles
+    /// must be reopened or refreshed to observe the settings. A stale handle
+    /// cannot replace a newer selection. Existing files are not backfilled.
+    ///
+    /// Supported types are integers, floats, Boolean, decimals, temporal
+    /// types, strings, and binary, excluding blobs. V2.0 through V2.3 files
+    /// collect seeds; legacy V1 files cannot. Enabling collection activates the existing sticky seed
+    /// reader and writer capabilities; clearing it does not clear those bits.
+    ///
+    /// Existing ZoneMap requests share the finest requested granularity and
+    /// collect null positions if any consumer needs them. Later index creation
+    /// reuses compatible whole seed records and scans uncovered rows.
+    ///
+    /// ```
+    /// use lance::{Dataset, Result};
+    /// use lance::dataset::ZoneWriteSeedOptions;
+    /// # async fn configure(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.set_zone_write_seed_columns(&[
+    ///     ZoneWriteSeedOptions::new("timestamp", 1_000_000),
+    /// ]).await?;
+    /// dataset.set_zone_write_seed_columns(&[]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_zone_write_seed_columns(
+        &mut self,
+        columns: &[ZoneWriteSeedOptions],
+    ) -> Result<()> {
+        let mut selected = BTreeMap::new();
+        for options in columns {
+            let field = self
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.name == options.column)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Zone write seeds require an existing top-level column: {}",
+                        options.column
+                    ))
+                })?;
+            validate_zone_seed_options(field, options.rows_per_zone)?;
+            if selected
+                .insert(field.id, options.rows_per_zone.to_string())
+                .is_some()
+            {
+                return Err(Error::invalid_input(format!(
+                    "Column {} is selected more than once for zone write seeds",
+                    options.column
+                )));
+            }
+        }
+        let updates: Vec<_> = self
+            .schema()
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let value = selected.get(&field.id).cloned();
+                (field.metadata.get(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY) != value.as_ref())
+                    .then_some((field.id, value))
+            })
+            .collect();
+        if updates.is_empty() {
+            let latest = self.latest_version_id().await?;
+            if latest != self.version_id() {
+                return Err(Error::retryable_commit_conflict_source(self.version_id(), format!(
+                    "Zone write seed selection uses version {}, but latest version advanced from the expected snapshot to {latest}",
+                    self.version_id()
+                ).into()));
+            }
+            return Ok(());
+        }
+        let version = self.version_id();
+        let mut update = self
+            .update_field_metadata()
+            .with_expected_latest_version(version);
+        for (field_id, value) in updates {
+            update = update.update(
+                field_id,
+                [(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, value.as_deref())],
+            )?;
+        }
+        update.await?;
+        Ok(())
+    }
+}
 
 /// The unresolved same-column conflict is a configuration fact, so it is
 /// reported once per process and at debug level afterwards.
@@ -53,9 +241,9 @@ impl SeedCollector {
     ///
     /// A column gets a seed writer when an existing, usable index on it asks
     /// for one through its plugin and the dataset already carries the feature
-    /// flags that seed format requires. `consult_indices` is false for writes
-    /// that discard the dataset's indices (overwrite), where seeds have no
-    /// consumer.
+    /// flags that seed format requires, or its field policy requests one.
+    /// `consult_indices` is false for writes that discard the dataset's indices
+    /// (overwrite); field policies still apply.
     pub async fn for_write(
         version: ConcreteFileVersion,
         dataset: Option<&Dataset>,
@@ -63,22 +251,45 @@ impl SeedCollector {
         consult_indices: bool,
     ) -> Result<Self> {
         // Legacy files have no global buffers to hold a seed.
-        if version == ConcreteFileVersion::V1 || !consult_indices {
+        if version == ConcreteFileVersion::V1 {
             return Ok(Self::disabled());
         }
         let Some(dataset) = dataset else {
-            return Ok(Self::disabled());
+            let mut writers: Vec<Box<dyn IndexSeedWriter>> = Vec::new();
+            for field in &write_schema.fields {
+                if let Some(rows) = configured_zone_rows(field)? {
+                    writers.push(Box::new(ZoneMapSeedWriter::new(
+                        &field.name,
+                        rows,
+                        field.data_type(),
+                    )?));
+                }
+            }
+            // The returned write schema carries the policy, so the creation
+            // commit derives both capability bits before publishing these files.
+            return Ok(Self { writers });
         };
 
-        let indices = load_all_indices(dataset).await?;
+        let indices = if consult_indices {
+            load_all_indices(dataset).await?
+        } else {
+            Default::default()
+        };
         let manifest = dataset.manifest.as_ref();
         let writers = seed_writers_for(dataset, &indices, write_schema, SeedWriterPurpose::Collect)
             .await?
             .into_iter()
             .filter(|writer| {
                 let required = writer.required_feature_flags();
-                let activated = manifest.reader_feature_flags & required == required
-                    && manifest.writer_feature_flags & required == required;
+                let policy_activates = write_schema.fields.iter().any(|field| {
+                    field.name == writer.column_name()
+                        && field
+                            .metadata
+                            .contains_key(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY)
+                });
+                let activated = policy_activates
+                    || (manifest.reader_feature_flags & required == required
+                        && manifest.writer_feature_flags & required == required);
                 if !activated {
                     // Readers could not be told about this seed yet; the next
                     // commit activates the flags and later writes embed it.
@@ -161,6 +372,15 @@ async fn seed_writers_for(
     // that collects seeds, as (index name, rows_per_zone, null positions).
     let mut zone_map_columns: HashMap<i32, Vec<(String, u64, bool)>> = HashMap::new();
     let mut other_columns: HashSet<i32> = HashSet::new();
+    for field in &schema.fields {
+        if let Some(rows_per_zone) = configured_zone_rows(field)? {
+            zone_map_columns.entry(field.id).or_default().push((
+                "column policy".to_string(),
+                rows_per_zone,
+                true,
+            ));
+        }
+    }
     for index in indices.iter().filter(|index| index_is_usable(index)) {
         // A covered index lists its carried columns in `fields` too; the
         // seed writer keys on the single keyed column. System indices
@@ -231,6 +451,12 @@ async fn seed_writers_for(
             continue;
         };
         if other_columns.contains(&field_id) {
+            if configured_zone_rows(field)?.is_some() {
+                return Err(Error::invalid_input(format!(
+                    "Column {} requests zone write seeds and another index seed format; only one seed format per column is supported",
+                    field.name
+                )));
+            }
             // One seed key per column; a zone map and another plugin's
             // seed cannot both be served. Left unresolved rather than
             // guessing: the zone maps scan their new fragments.
@@ -285,7 +511,7 @@ fn required_seed_feature_flags(writers: &[Box<dyn IndexSeedWriter>]) -> u64 {
 }
 
 /// Set, in both feature words of a manifest being built, the flags required
-/// by every seed its indices request.
+/// by every seed its indices or field policies request.
 ///
 /// `indices` is the prepared index list of that manifest. An index that
 /// requests a flagged seed format activates the flags in the commit that
@@ -301,9 +527,6 @@ pub async fn apply_seed_feature_flags(
     indices: &[IndexMetadata],
     dataset: &Dataset,
 ) -> Result<()> {
-    if indices.is_empty() {
-        return Ok(());
-    }
     let writers = seed_writers_for(
         dataset,
         indices,
@@ -325,6 +548,85 @@ mod tests {
     use bytes::Bytes;
     use lance_index::scalar::zonemap::ZoneMapSeedWriter;
     use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
+
+    #[rstest::rstest]
+    #[case::plus("+1")]
+    #[case::space(" 1")]
+    #[case::zero("0")]
+    #[case::overflow("18446744073709551616")]
+    fn test_policy_requires_positive_decimal_digits(#[case] value: &str) {
+        let mut field =
+            lance_core::datatypes::Field::new_arrow("value", DataType::Int32, true).unwrap();
+        field.metadata.insert(
+            ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY.to_string(),
+            value.to_string(),
+        );
+        let error = configured_zone_rows(&field).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(value));
+        assert!(error.to_string().contains("positive u64 row count"));
+    }
+
+    #[rstest::rstest]
+    #[case::fixed_binary(DataType::FixedSizeBinary(4))]
+    #[case::null(DataType::Null)]
+    #[case::dictionary(DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)))]
+    fn test_policy_rejects_unsupported_type(#[case] data_type: DataType) {
+        let field = lance_core::datatypes::Field::new_arrow("value", data_type, true).unwrap();
+        let error = validate_zone_seed_options(&field, 4).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("value"));
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn test_policy_rejects_legacy_blob() {
+        let mut field =
+            lance_core::datatypes::Field::new_arrow("blob", DataType::LargeBinary, true).unwrap();
+        field
+            .metadata
+            .insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+        let error = validate_zone_seed_options(&field, 4).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("blob"));
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn test_policy_collects_without_dataset_and_ignores_empty_batch() {
+        let arrow_schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.fields[0].metadata.insert(
+            ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY.to_string(),
+            u64::MAX.to_string(),
+        );
+        let mut collector =
+            SeedCollector::for_write(ConcreteFileVersion::V2_2, None, &schema, true)
+                .await
+                .unwrap();
+        assert_eq!(collector.len(), 1);
+        collector
+            .observe(&RecordBatch::new_empty(std::sync::Arc::new(arrow_schema)))
+            .unwrap();
+        assert!(collector.writers[0].finish().unwrap().is_none());
+        collector
+            .observe(
+                &arrow_array::record_batch!(("value", Int32, [Some(1), None, Some(3)])).unwrap(),
+            )
+            .unwrap();
+        let bytes = collector.writers[0].finish().unwrap().unwrap();
+        let lance_index::scalar::zonemap::CarriedSeed::Supported(seed) =
+            lance_index::scalar::zonemap::parse_seed_for_binary_copy(&bytes, u64::MAX).unwrap()
+        else {
+            panic!("newly collected seed must be supported");
+        };
+        assert_eq!(seed.total_rows(), 3);
+        assert_eq!(seed.rows_per_zone(), u64::MAX);
+    }
 
     /// A seed format that needs no reader support.
     #[derive(Debug)]

@@ -33,8 +33,8 @@ use lance_table::format::{DataFile, IndexMetadata};
 use roaring::RoaringBitmap;
 
 use crate::Dataset;
-use crate::dataset::WriteParams;
 use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
+use crate::dataset::{WriteParams, ZoneWriteSeedOptions};
 use crate::index::scalar::zonemap::{SEED_REUSE_REPORTS, SeedReuseReport, harvest_concurrency};
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 
@@ -380,6 +380,51 @@ async fn unseeded_dataset(uri: &str, appends: i32) -> Dataset {
         append(&mut dataset, k * N..(k + 1) * N).await;
     }
     dataset
+}
+
+#[tokio::test]
+async fn test_first_create_zone_map_reuses_seed_only_writes() {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("val", 64)])
+        .await
+        .unwrap();
+    append(&mut dataset, N..2 * N).await;
+    append(&mut dataset, 2 * N..3 * N).await;
+    dataset.delete("id % 13 = 0").await.unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    assert!(seed_locator(&dataset, 0, "val").await.is_none());
+    for id in [1, 2] {
+        assert!(seed_locator(&dataset, id, "val").await.is_some());
+    }
+    io(&dataset);
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(640, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![1, 2]);
+    assert_eq!(reports[0].scanned_fragments, vec![0]);
+    assert_eq!(reports[0].scanned_rows, N as u64);
+    assert!(reports[0].total_seed_bytes > 0);
+    let reads = classify_data_file_reads(&dataset, &io(&dataset)).await;
+    for (fragment, pages) in pages_per_fragment(&dataset, "val", &reads) {
+        if fragment == 0 {
+            assert!(pages > 4096, "missing-seed fragment scanned: {pages}");
+        } else {
+            assert!(
+                pages < 4096,
+                "seeded fragment {fragment} read {pages} column page bytes"
+            );
+        }
+    }
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_index_matches_scan_with(&dataset, VAL_FILTERS, true).await;
 }
 
 async fn zone_summaries(dataset: &Dataset, column: &str) -> Vec<ZoneSummary> {
