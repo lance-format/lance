@@ -96,8 +96,10 @@ impl Dataset {
 ///    the version could never be cleaned up.
 ///
 /// A version whose check fails for any index is kept. Once the check errors
-/// for some index, that version and every later one are kept: folding the kept
-/// version can move rows into fragments only a later version translates.
+/// for some index, or any group of the version covers only part of its old
+/// fragments in an index's bitmap (whatever the order of the groups), that
+/// version and every later one are kept: folding the kept version can move
+/// rows into fragments only a later version translates.
 ///
 /// Note that there could be a race condition that an index is being added during the cleanup,
 /// This will make that specific index not efficient until the next reindex,
@@ -207,9 +209,29 @@ enum VersionNeed {
     NotNeeded,
     /// Some index is not caught up on the version.
     Needed,
-    /// Some index's caught-up check errored, so it cannot be proven caught up
-    /// and its fold may also depend on any later version.
+    /// Some index's caught-up check errored or some group of the version is
+    /// partly in its bitmap, so its fold may also depend on any later version.
     NeededWithError,
+}
+
+/// Whether some group of `version` has some but not all of its old fragments
+/// in `index`'s bitmap. Scans every group, so it does not depend on the order
+/// the groups are stored in.
+fn version_straddles_index(version: &FragReuseVersion, index: &IndexMetadata) -> bool {
+    let Some(index_frag_bitmap) = &index.fragment_bitmap else {
+        return false;
+    };
+    if is_system_index(index) {
+        return false;
+    }
+    version.groups.iter().any(|group| {
+        let indexed = group
+            .old_frags
+            .iter()
+            .filter(|old_frag| index_frag_bitmap.contains(old_frag.id as u32))
+            .count();
+        indexed > 0 && indexed < group.old_frags.len()
+    })
 }
 
 fn version_need(
@@ -219,6 +241,9 @@ fn version_need(
 ) -> VersionNeed {
     let mut need = VersionNeed::NotNeeded;
     for idx in indices {
+        if version_straddles_index(version, idx) {
+            return VersionNeed::NeededWithError;
+        }
         match is_index_remap_caught_up(version, idx, chain_frag_bitmap) {
             Ok(true) => {}
             Ok(false) => need = VersionNeed::Needed,
@@ -229,8 +254,8 @@ fn version_need(
 }
 
 /// The versions, in history order, the v0 trim keeps. A version not caught up
-/// by some index is kept on its own; from the first version whose check errors
-/// for some index, every version is kept.
+/// by some index is kept on its own; from the first version some index
+/// straddles or errors on, every version is kept.
 fn retained_untagged_versions(
     versions: &[FragReuseVersion],
     indices: &[IndexMetadata],
@@ -899,27 +924,41 @@ pub(crate) mod tests {
         );
     }
 
-    /// v1 errors on its straddled first group, while v2's own check passes.
-    /// Folding the retained v1 still moves the wholly owned 9 into 10, which
-    /// only v2 translates on, so v2 must be retained too.
-    #[test]
-    fn test_trim_retains_a_later_version_an_errored_fold_depends_on() {
-        let group = |old: &[u64], new: &[u64]| lance_index::frag_reuse::FragReuseGroup {
+    fn reuse_group(old: &[u64], new: &[u64]) -> lance_index::frag_reuse::FragReuseGroup {
+        lance_index::frag_reuse::FragReuseGroup {
             changed_row_addrs: Vec::new(),
             old_frags: old.iter().copied().map(frag_digest).collect(),
             new_frags: new.iter().copied().map(frag_digest).collect(),
-        };
+        }
+    }
+
+    /// v1 straddles [4, 5] -> [6] while v2's own check passes. Folding the
+    /// retained v1 still moves the wholly owned 9 into 10, which only v2
+    /// translates on, so v2 must be retained too, whichever group comes first.
+    #[rstest::rstest]
+    #[case::straddled_group_first(false)]
+    #[case::owned_group_first(true)]
+    fn test_trim_retains_a_later_version_a_straddled_fold_depends_on(
+        #[case] owned_group_first: bool,
+    ) {
+        let mut groups = vec![reuse_group(&[4, 5], &[6]), reuse_group(&[9], &[10])];
+        if owned_group_first {
+            groups.reverse();
+        }
         let v1 = FragReuseVersion {
             dataset_version: 10,
-            groups: vec![group(&[4, 5], &[6]), group(&[9], &[10])],
+            groups,
         };
         let v2 = reuse_version(11, &[10], &[11]);
         let versions = [v1.clone(), v2.clone()];
         let chain = reuse_chain_frag_bitmap(&versions);
         let segment = index_covering(12, &[4, 9]);
 
-        assert!(is_index_remap_caught_up(&v1, &segment, &chain).is_err());
         assert_true!(is_index_remap_caught_up(&v2, &segment, &chain).unwrap());
+        assert_eq!(
+            version_need(&v1, std::slice::from_ref(&segment), &chain),
+            VersionNeed::NeededWithError
+        );
         assert_eq!(
             dataset_versions(&retained_untagged_versions(
                 &versions,
@@ -927,6 +966,35 @@ pub(crate) mod tests {
                 &chain
             )),
             vec![10, 11]
+        );
+    }
+
+    /// A version whose groups are each wholly owned or untouched by the index
+    /// is classified by the existing caught-up check, never as an error.
+    #[test]
+    fn test_trim_owned_or_untouched_groups_use_the_caught_up_check() {
+        let version = FragReuseVersion {
+            dataset_version: 10,
+            groups: vec![reuse_group(&[4, 5], &[6]), reuse_group(&[9], &[10])],
+        };
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+
+        let owns_one_group = index_covering(12, &[9]);
+        assert_eq!(
+            version_need(&version, std::slice::from_ref(&owns_one_group), &chain),
+            VersionNeed::Needed
+        );
+
+        let owns_both_groups = index_covering(12, &[4, 5, 9]);
+        assert_eq!(
+            version_need(&version, std::slice::from_ref(&owns_both_groups), &chain),
+            VersionNeed::Needed
+        );
+
+        let caught_up = index_covering(12, &[1, 6, 10]);
+        assert_eq!(
+            version_need(&version, std::slice::from_ref(&caught_up), &chain),
+            VersionNeed::NotNeeded
         );
     }
 

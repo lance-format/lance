@@ -230,6 +230,14 @@ pub fn transpose_row_ids_from_digest(
 /// build before it is refused in favour of rebuilding the index.
 const LINEAGE_WORKING_BYTES_BUDGET: u64 = 64 << 20;
 
+/// Charged per lineage set by the admission estimate: map entry and an empty
+/// roaring bitmap, rounded up.
+const LINEAGE_SET_BASE_BYTES: u64 = 128;
+
+/// Charged per member of a lineage set by the admission estimate: enough for
+/// a sparse id that needs its own roaring container plus the entry.
+const LINEAGE_MEMBER_BYTES: u64 = 32;
+
 /// The coverage an untagged remap publishes for one segment, and the rows it
 /// must drop to keep the rebuilt files within that coverage.
 #[derive(Debug, PartialEq)]
@@ -250,17 +258,27 @@ fn reuse_lineage(ancestors: &HashMap<u32, RoaringBitmap>, fragment: u32) -> Roar
     lineage
 }
 
-/// Upper bound on the lineage working set of a straddled fold, in bytes: one
-/// bit per fragment named in the history for every destination fragment.
+/// A cheap, deliberately conservative overestimate of the lineage working set
+/// of a straddled fold, not allocator accounting: every destination fragment
+/// is charged a set holding every fragment named in the history, at a cost per
+/// member that does not depend on id density, and doubled for the temporary
+/// clone made per group. At least one set is charged, so a straddled history
+/// is never admitted at a zero budget.
 fn lineage_working_bytes_estimate(versions: &[FragReuseVersion]) -> u64 {
     let mut destinations = 0u64;
     let mut named = RoaringBitmap::new();
     for group in versions.iter().flat_map(|version| version.groups.iter()) {
-        destinations += group.new_frags.len() as u64;
+        destinations = destinations.saturating_add(group.new_frags.len() as u64);
         named.extend(group.old_frags.iter().map(|f| f.id as u32));
         named.extend(group.new_frags.iter().map(|f| f.id as u32));
     }
-    destinations.saturating_mul(named.len()) / 8
+    let per_set = LINEAGE_MEMBER_BYTES
+        .saturating_mul(named.len())
+        .saturating_add(LINEAGE_SET_BASE_BYTES);
+    destinations
+        .max(1)
+        .saturating_mul(per_set)
+        .saturating_mul(2)
 }
 
 /// Whether folding `versions` into `index_frag_bitmap` meets a group whose
@@ -5266,6 +5284,48 @@ mod tests {
                 remap_untagged_coverage(&versions, bitmap(&[0, OUTSIDE_CHAIN]), 1, 1).unwrap_err();
             assert!(matches!(err, Error::NotSupported { .. }), "{err}");
             assert!(err.to_string().contains("optimize_indices"), "{err}");
+        }
+
+        /// One straddled group naming 3 fragments with 1 destination.
+        fn small_straddle_estimate() -> u64 {
+            2 * (LINEAGE_SET_BASE_BYTES + LINEAGE_MEMBER_BYTES * 3)
+        }
+
+        #[test]
+        fn test_untagged_coverage_lineage_budget_boundary() {
+            let versions = vec![reuse_version(5, vec![(vec![1, 2], vec![4])])];
+            let estimate = small_straddle_estimate();
+            assert_eq!(lineage_working_bytes_estimate(&versions), estimate);
+            assert_eq!(
+                remap_untagged_coverage(&versions, bitmap(&[0, 1]), 1, estimate).unwrap(),
+                UntaggedCoverage {
+                    should_remap: true,
+                    fragment_bitmap: bitmap(&[0]),
+                    excluded_source_fragments: bitmap(&[1]),
+                }
+            );
+            let err =
+                remap_untagged_coverage(&versions, bitmap(&[0, 1]), 1, estimate - 1).unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+            assert!(remap_untagged_coverage(&versions, bitmap(&[0, 1]), 1, 0).is_err());
+        }
+
+        #[test]
+        fn test_untagged_coverage_lineage_estimate_ignores_id_density() {
+            let versions = vec![reuse_version(
+                5,
+                vec![(vec![5, 1_000_000], vec![3_000_000_000])],
+            )];
+            let estimate = small_straddle_estimate();
+            assert_eq!(lineage_working_bytes_estimate(&versions), estimate);
+            assert_eq!(
+                remap_untagged_coverage(&versions, bitmap(&[5, 7]), 1, estimate).unwrap(),
+                UntaggedCoverage {
+                    should_remap: true,
+                    fragment_bitmap: bitmap(&[7]),
+                    excluded_source_fragments: bitmap(&[5]),
+                }
+            );
         }
 
         #[test]
