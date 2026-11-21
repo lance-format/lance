@@ -12,6 +12,8 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+percent-encoding.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-data.workspace = true
