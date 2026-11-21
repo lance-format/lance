@@ -58,4 +58,6 @@ public class JniTestHelper {
   public static native void parseQuery(Optional<Query> query);
 
   public static native void parseIndexParams(IndexParams indexParams);
+
+  public static native void parseOrderedIndexMode(String name);
 }

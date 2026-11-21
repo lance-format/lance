@@ -1323,6 +1323,61 @@ public class ScannerTest {
   }
 
   @Test
+  void testOrderedIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_ordered_index").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(60, 20);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                .withIndexName("id_idx")
+                .build());
+        dataset.delete("id > 55 OR id = 51");
+
+        ColumnOrdering.Builder ordering = new ColumnOrdering.Builder();
+        ordering.setColumnName("id");
+        ordering.setAscending(false);
+        ordering.setNullFirst(false);
+        for (ScanOptions.OrderedIndexMode orderedIndex : ScanOptions.OrderedIndexMode.values()) {
+          List<Integer> ids = new ArrayList<>();
+          try (LanceScanner scanner =
+              dataset.newScan(
+                  new ScanOptions.Builder()
+                      .columns(Collections.singletonList("id"))
+                      .setColumnOrderings(Collections.singletonList(ordering.build()))
+                      .limit(10)
+                      .orderedIndex(orderedIndex)
+                      .collectStats(true)
+                      .build())) {
+            try (ArrowReader reader = scanner.scanBatches()) {
+              while (reader.loadNextBatch()) {
+                IntVector idVector = (IntVector) reader.getVectorSchemaRoot().getVector("id");
+                for (int i = 0; i < idVector.getValueCount(); i++) {
+                  ids.add(idVector.get(i));
+                }
+              }
+            }
+            assertEquals(
+                orderedIndex == ScanOptions.OrderedIndexMode.AUTO,
+                scanner.getStats().get().getAllCounts().containsKey("pages_loaded"),
+                "only the ordered index read records pages_loaded, orderedIndex=" + orderedIndex);
+          }
+          assertEquals(
+              Arrays.asList(55, 54, 53, 52, 50, 49, 48, 47, 46, 45),
+              ids,
+              "orderedIndex=" + orderedIndex);
+        }
+      }
+    }
+  }
+
+  @Test
   void testFastSearchSkipsUnindexedFragments(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_fast_search_scalar_index").toString();
     try (BufferAllocator allocator = new RootAllocator()) {

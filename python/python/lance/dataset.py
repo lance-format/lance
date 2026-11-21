@@ -542,6 +542,7 @@ class LanceDataset(pa.dataset.Dataset):
         ] = None,
         use_scalar_index: Optional[bool] = None,
         ignored_scalar_indices: Optional[Iterable[str]] = None,
+        ordered_index: Optional[str] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -705,13 +706,20 @@ class LanceDataset(pa.dataset.Dataset):
             corner cases this can make query performance worse and this parameter can
             be used to disable scalar indices in these cases.
         ignored_scalar_indices: iterable of str, default None
-            Logical scalar index names to ignore during expression-filter planning.
+            Logical scalar index names to ignore during expression-filter planning
+            and ordered reads.
             Other scalar indices remain eligible, and the original filter is still
             evaluated. Inverted indices used by ``contains_tokens`` filters are
             included; vector index segments and explicit full-text search queries
             are unaffected. If no index query remains, ``fast_search`` falls back
             to scanning all selected fragments and may return more matching rows.
             See ``ScannerBuilder.ignored_scalar_indices`` for more information.
+        ordered_index: str, default None
+            Whether a scan with ``order_by`` and a limit may read a B-tree index in
+            key order instead of sorting.  ``"auto"``, the default, reads the index
+            when it can serve the ordering, and ``"off"`` always sorts.  An index
+            named in ``ignored_scalar_indices`` never serves the read.  See
+            ``ScannerBuilder.ordered_index`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
@@ -891,6 +899,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.ignored_scalar_indices, ignored_scalar_indices)
+        setopt(builder.ordered_index, ordered_index)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
@@ -1034,6 +1043,7 @@ class LanceDataset(pa.dataset.Dataset):
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         ignored_scalar_indices: Optional[Iterable[str]] = None,
+        ordered_index: Optional[str] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1101,8 +1111,12 @@ class LanceDataset(pa.dataset.Dataset):
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
         ignored_scalar_indices: iterable of str, default None
-            Scalar index names to ignore during expression-filter planning. See
-            ``ScannerBuilder.ignored_scalar_indices`` for more information.
+            Scalar index names to ignore during expression-filter planning and
+            ordered reads. See ``ScannerBuilder.ignored_scalar_indices`` for more
+            information.
+        ordered_index: str, default None
+            ``"auto"`` or ``"off"``.  See ``ScannerBuilder.ordered_index`` for more
+            information.
         with_row_id: bool, optional, default False
             Return row ID.
         with_row_address: bool, optional, default False
@@ -1167,6 +1181,7 @@ class LanceDataset(pa.dataset.Dataset):
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
             ignored_scalar_indices=ignored_scalar_indices,
+            ordered_index=ordered_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1202,6 +1217,7 @@ class LanceDataset(pa.dataset.Dataset):
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
         use_scalar_index: Optional[bool] = None,
         ignored_scalar_indices: Optional[Iterable[str]] = None,
+        ordered_index: Optional[str] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1236,6 +1252,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             use_scalar_index=use_scalar_index,
             ignored_scalar_indices=ignored_scalar_indices,
+            ordered_index=ordered_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1640,6 +1657,7 @@ class LanceDataset(pa.dataset.Dataset):
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         ignored_scalar_indices: Optional[Iterable[str]] = None,
+        ordered_index: Optional[str] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1671,6 +1689,7 @@ class LanceDataset(pa.dataset.Dataset):
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
             ignored_scalar_indices=ignored_scalar_indices,
+            ordered_index=ordered_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,

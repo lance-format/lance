@@ -547,6 +547,7 @@ class _Dataset:
         row_addr_allowlist: Optional[bytes] = None,
         row_addr_blocklist: Optional[bytes] = None,
         minhash_query: Optional[Dict[str, str]] = None,
+        ordered_index: Optional[str] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(

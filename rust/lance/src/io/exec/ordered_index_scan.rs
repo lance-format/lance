@@ -167,7 +167,7 @@ impl OrderedIndexScanExec {
         let column = schema.field_path_minimal(field_id)?;
         let nullable = ancestry.iter().any(|field| field.nullable);
         let output_schema = Arc::new(Schema::new(vec![
-            Field::new(&column, key.data_type(), nullable),
+            Field::from(*key).with_name(&column).with_nullable(nullable),
             ROW_ADDR_FIELD.clone(),
         ]));
         let ordering = PhysicalSortExpr::new(Arc::new(Column::new(&column, 0)), options);
