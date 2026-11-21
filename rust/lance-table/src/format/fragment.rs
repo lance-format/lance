@@ -599,6 +599,10 @@ impl DeletionFile {
         self.inline.is_some()
     }
 
+    pub fn uses_derived_path(&self) -> bool {
+        self.path.is_none() && !self.is_inline()
+    }
+
     pub fn validate_location(&self) -> Result<()> {
         self.check_location().map_err(Error::invalid_input)
     }

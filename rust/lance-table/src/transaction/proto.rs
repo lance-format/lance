@@ -13,7 +13,7 @@ use crate::format::pb;
 use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
-use crate::transaction::action::CompositeOperation;
+use crate::transaction::action::{Action, CompositeOperation};
 use crate::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
@@ -509,6 +509,35 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
+fn pb_data_fragment(fragment: &Fragment) -> Result<pb::DataFragment> {
+    if let Some(deletion_file) = &fragment.deletion_file {
+        deletion_file.validate_location()?;
+    }
+    Ok(pb::DataFragment::from(fragment))
+}
+
+fn pb_fragments(fragments: &[Fragment]) -> Result<Vec<pb::DataFragment>> {
+    fragments.iter().map(pb_data_fragment).collect()
+}
+
+fn pb_rewrite_group(value: &RewriteGroup) -> Result<pb::transaction::rewrite::RewriteGroup> {
+    Ok(pb::transaction::rewrite::RewriteGroup {
+        old_fragments: pb_fragments(&value.old_fragments)?,
+        new_fragments: pb_fragments(&value.new_fragments)?,
+    })
+}
+
+fn pb_composite_operation(value: &CompositeOperation) -> Result<pb_actions::CompositeOperation> {
+    for step in &value.steps {
+        for action in &step.actions {
+            if let Action::SetDeletionFile(set_deletion_file) = action {
+                set_deletion_file.deletion_file.validate_location()?;
+            }
+        }
+    }
+    Ok(pb_actions::CompositeOperation::from(value))
+}
+
 impl TryFrom<&Transaction> for pb::Transaction {
     type Error = Error;
 
@@ -516,7 +545,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
         let operation = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    fragments: pb_fragments(fragments)?,
                 })
             }
             Operation::Clone {
@@ -537,10 +566,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 deleted_fragment_ids,
                 predicate,
             } => pb::transaction::Operation::Delete(pb::transaction::Delete {
-                updated_fragments: updated_fragments
-                    .iter()
-                    .map(pb::DataFragment::from)
-                    .collect(),
+                updated_fragments: pb_fragments(updated_fragments)?,
                 deleted_fragment_ids: deleted_fragment_ids.clone(),
                 predicate: predicate.clone(),
             }),
@@ -551,7 +577,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 initial_bases,
             } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    fragments: pb_fragments(fragments)?,
                     schema: Fields::from(schema).0,
                     schema_metadata: Default::default(), // TODO: handle metadata
                     config_upsert_values: config_upsert_values
@@ -579,10 +605,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 rewritten_indices,
                 frag_reuse_index: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
-                groups: groups
-                    .iter()
-                    .map(pb::transaction::rewrite::RewriteGroup::from)
-                    .collect(),
+                groups: groups.iter().map(pb_rewrite_group).collect::<Result<_>>()?,
                 rewritten_indices: rewritten_indices
                     .iter()
                     .map(|rewritten| rewritten.into())
@@ -607,7 +630,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema,
                 preserves_nullability,
             } => pb::transaction::Operation::Merge(pb::transaction::Merge {
-                fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                fragments: pb_fragments(fragments)?,
                 schema: Fields::from(schema).0,
                 schema_metadata: Default::default(), // TODO: handle metadata
                 preserves_nullability: *preserves_nullability,
@@ -628,11 +651,8 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 updated_fragment_offsets,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
-                updated_fragments: updated_fragments
-                    .iter()
-                    .map(pb::DataFragment::from)
-                    .collect(),
-                new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
+                updated_fragments: pb_fragments(updated_fragments)?,
+                new_fragments: pb_fragments(new_fragments)?,
                 fields_modified: fields_modified.clone(),
                 compacted_sstables: compacted_sstables
                     .iter()
@@ -747,9 +767,9 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 )));
             }
             Operation::CompositeOperation(composite_operation) => {
-                pb::transaction::Operation::CompositeOperation(
-                    pb_actions::CompositeOperation::from(composite_operation),
-                )
+                pb::transaction::Operation::CompositeOperation(pb_composite_operation(
+                    composite_operation,
+                )?)
             }
         };
 
@@ -941,6 +961,64 @@ mod tests {
                 .contains("at least one field must remain indexed"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn test_transaction_rejects_invalid_deletion_file_location() {
+        use crate::format::{DeletionFile, DeletionFileType};
+        use crate::transaction::action::SetDeletionFile;
+
+        let invalid_cases = [
+            (
+                DeletionFile {
+                    read_version: 1,
+                    id: 2,
+                    file_type: DeletionFileType::Bitmap,
+                    num_deleted_rows: Some(1),
+                    base_id: None,
+                    path: Some("_deletions/ab/file.bin".to_string()),
+                    inline: Some(bytes::Bytes::from_static(&[1, 2, 3])),
+                },
+                "both path and inline",
+            ),
+            (
+                DeletionFile {
+                    read_version: 1,
+                    id: 2,
+                    file_type: DeletionFileType::Bitmap,
+                    num_deleted_rows: Some(1),
+                    base_id: None,
+                    path: Some("data/outside_deletions.bin".to_string()),
+                    inline: None,
+                },
+                "_deletions/",
+            ),
+        ];
+
+        for (deletion_file, expected) in invalid_cases {
+            let mut fragment = Fragment::new(1).with_physical_rows(10);
+            fragment.deletion_file = Some(deletion_file.clone());
+            let operations = [
+                Operation::Append {
+                    fragments: vec![fragment],
+                },
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "delete",
+                    vec![Action::SetDeletionFile(SetDeletionFile {
+                        fragment: Ref::Committed(1),
+                        deletion_file,
+                        data_change: true,
+                        base: None,
+                    })],
+                )])),
+            ];
+            for operation in operations {
+                let transaction = Transaction::new(1, operation, None);
+                let err = pb::Transaction::try_from(&transaction).unwrap_err();
+                assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+                assert!(err.to_string().contains(expected), "{err}");
+            }
+        }
     }
 
     /// A transaction file holds only the suffix layout, so decoding one refuses

@@ -1077,7 +1077,7 @@ impl Transaction {
                     .all(|(i, old)| final_fragments[start + i].id == old.id);
 
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             // These are this commit's outputs, whichever path places them.
             for fragment in &new_fragments {
                 changed_clustering_references.fragment(fragment);

@@ -22,6 +22,7 @@ use lance_table::{
     format::{
         DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
     },
+    io::deletion::relative_deletion_file_path,
     rowids::RowIdSequence,
 };
 use object_store::path::Path;
@@ -130,34 +131,33 @@ pub struct DeletionFileKey<'a> {
 impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
     fn key(&self) -> Cow<'_, str> {
-        let mut key = format!(
-            "deletion/{}/{}/{}/{}",
-            self.fragment_id,
-            self.deletion_file.read_version,
-            self.deletion_file.id,
-            self.deletion_file.file_type.suffix()
-        );
-        if let Some(path) = &self.deletion_file.path {
-            key.push('/');
-            key.push_str(path);
+        if let Some(inline) = &self.deletion_file.inline {
+            return Cow::Owned(format!("deletion/inline/{}", blake3::hash(inline)));
         }
-        Cow::Owned(key)
+        let location = relative_deletion_file_path(self.fragment_id, self.deletion_file);
+        match self.deletion_file.base_id {
+            Some(base_id) => Cow::Owned(format!("deletion/{base_id}/{location}")),
+            None => Cow::Owned(format!("deletion/{location}")),
+        }
     }
     fn type_name() -> &'static str {
         "DeletionVector"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.fragment_id);
-        builder.write_u64(self.deletion_file.read_version);
-        builder.write_u64(self.deletion_file.id);
-        builder.write_variant(match &self.deletion_file.file_type {
-            DeletionFileType::Array => 0,
-            DeletionFileType::Bitmap => 1,
+        if let Some(inline) = &self.deletion_file.inline {
+            builder.write_variant(0);
+            builder.write_bytes(inline);
+            return;
+        }
+        builder.write_variant(if self.deletion_file.path.is_some() {
+            1
+        } else {
+            2
         });
         if let Some(base_id) = self.deletion_file.base_id {
             builder.write_some();
@@ -165,12 +165,16 @@ impl CacheKey for DeletionFileKey<'_> {
         } else {
             builder.write_none();
         }
-        // An explicit path identifies the file along with the fields above.
         if let Some(path) = &self.deletion_file.path {
-            builder.write_some();
             builder.write_str(path);
         } else {
-            builder.write_none();
+            builder.write_u64(self.fragment_id);
+            builder.write_u64(self.deletion_file.read_version);
+            builder.write_u64(self.deletion_file.id);
+            builder.write_variant(match &self.deletion_file.file_type {
+                DeletionFileType::Array => 0,
+                DeletionFileType::Bitmap => 1,
+            });
         }
     }
 }
@@ -416,6 +420,148 @@ mod tests {
                 })
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_file_key_uses_base_and_path_identity() {
+        let cache = LanceCache::with_capacity(4096);
+        let first = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
+            inline: None,
+        };
+        let deletion_vector = Arc::new(DeletionVector::from_iter([1_u32]));
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 42,
+                    deletion_file: &first,
+                },
+                deletion_vector.clone(),
+            )
+            .await;
+
+        let renumbered = DeletionFile {
+            read_version: 9,
+            id: 99,
+            ..first.clone()
+        };
+        let cached = cache
+            .get_with_key(&DeletionFileKey {
+                fragment_id: 43,
+                deletion_file: &renumbered,
+            })
+            .await
+            .expect("explicit path identity should depend only on (base_id, path)");
+        assert!(Arc::ptr_eq(&cached, &deletion_vector));
+        assert_eq!(
+            DeletionFileKey {
+                fragment_id: 42,
+                deletion_file: &first,
+            }
+            .key(),
+            DeletionFileKey {
+                fragment_id: 43,
+                deletion_file: &renumbered,
+            }
+            .key()
+        );
+
+        let other_base = DeletionFile {
+            base_id: Some(7),
+            ..first.clone()
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 42,
+                    deletion_file: &other_base,
+                })
+                .await
+                .is_none()
+        );
+
+        let derived = DeletionFile {
+            path: None,
+            ..first
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 42,
+                    deletion_file: &derived,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_file_key_uses_inline_bytes() {
+        let cache = LanceCache::with_capacity(4096);
+        let first = DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: None,
+            inline: Some(bytes::Bytes::from_static(b"first")),
+        };
+        let second = DeletionFile {
+            inline: Some(bytes::Bytes::from_static(b"second")),
+            ..first.clone()
+        };
+        let first_dv = Arc::new(DeletionVector::from_iter([1_u32]));
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 0,
+                    deletion_file: &first,
+                },
+                first_dv.clone(),
+            )
+            .await;
+
+        let same_bytes_different_frag = DeletionFile {
+            read_version: 9,
+            id: 99,
+            ..first.clone()
+        };
+        let cached = cache
+            .get_with_key(&DeletionFileKey {
+                fragment_id: 42,
+                deletion_file: &same_bytes_different_frag,
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &first_dv));
+
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 0,
+                    deletion_file: &second,
+                })
+                .await
+                .is_none()
+        );
+        assert_ne!(
+            DeletionFileKey {
+                fragment_id: 0,
+                deletion_file: &first,
+            }
+            .key(),
+            DeletionFileKey {
+                fragment_id: 0,
+                deletion_file: &second,
+            }
+            .key()
         );
     }
 
