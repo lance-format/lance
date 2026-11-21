@@ -790,6 +790,72 @@ async fn test_when_matched_delete_full_schema(
     assert_eq!(remaining_keys, vec![1, 2, 3]);
 }
 
+#[tokio::test]
+async fn test_delete_unmatched_targets_by_composite_key() {
+    let integers = |values: &[Option<i32>]| {
+        Arc::new(arrow_array::Int32Array::from(values.to_vec())) as ArrayRef
+    };
+    let target = RecordBatch::try_from_iter([
+        (
+            "a",
+            integers(&[Some(1), Some(1), None, Some(2), Some(2), Some(1)]),
+        ),
+        (
+            "b",
+            integers(&[Some(1), Some(2), Some(1), None, Some(1), Some(1)]),
+        ),
+        (
+            "payload",
+            integers(&[Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]),
+        ),
+    ])
+    .unwrap();
+    let source = RecordBatch::try_from_iter([
+        ("a", integers(&[Some(1), Some(1), None, Some(2), Some(9)])),
+        ("b", integers(&[Some(1), Some(1), Some(1), None, Some(9)])),
+    ])
+    .unwrap();
+    for stable in [false, true] {
+        let dir = TempStrDir::default();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(target.clone())], target.schema()),
+            &dir,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: stable,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["a".into(), "b".into()]).unwrap();
+        let job = builder
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap();
+        let plan = job
+            .explain_plan(Some(&source.schema()), false)
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("Anti") && plan.contains("_rowaddr") && !plan.contains("payload"),
+            "{plan}"
+        );
+        let (dataset, stats) = job.execute_batches(vec![source.clone()]).await.unwrap();
+        assert_eq!(stats.num_deleted_rows, 4);
+        let remaining = dataset.scan().try_into_batch().await.unwrap();
+        let mut payload = remaining["payload"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        payload.sort_unstable();
+        assert_eq!(payload, [0, 5]);
+    }
+}
+
 /// Test WhenMatched::Delete with ID-only source data (just key column).
 /// This is the optimized bulk delete case where we only need key columns for matching.
 #[rstest::rstest]
@@ -1148,9 +1214,12 @@ async fn test_is_delete_only() {
             .indent(true)
             .to_string();
 
-        let expected_delete_only = matches!(when_matched, WhenMatched::Delete)
-            && matches!(when_not_matched, WhenNotMatched::DoNothing)
-            && matches!(when_not_matched_by_source, WhenNotMatchedBySource::Keep);
+        let expected_delete_only = matches!(when_not_matched, WhenNotMatched::DoNothing)
+            && matches!(
+                (&when_matched, &when_not_matched_by_source),
+                (WhenMatched::Delete, WhenNotMatchedBySource::Keep)
+                    | (WhenMatched::DoNothing, WhenNotMatchedBySource::Delete)
+            );
 
         if expected_delete_only {
             assert!(

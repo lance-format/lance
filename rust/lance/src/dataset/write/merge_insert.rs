@@ -491,6 +491,15 @@ struct MergeInsertParams {
 }
 
 impl MergeInsertParams {
+    fn deletes_only_unmatched_targets(&self) -> bool {
+        !self.insert_not_matched
+            && matches!(self.when_matched, WhenMatched::DoNothing)
+            && matches!(
+                self.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Delete
+            )
+    }
+
     /// Return ON field IDs only when they match the declared primary key.
     fn primary_key_field_ids(&self, schema: &lance_core::datatypes::Schema) -> Option<Vec<i32>> {
         let field_ids: Vec<i32> = self
