@@ -1,0 +1,1416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>BTree — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/index/scalar/btree/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../../">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        
+          <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+      
+    <a href="../../../">Overview</a>
+  </div>
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+      
+    <a href="../../../file/">Specification</a>
+      
+    <a href="../../../file/encoding/">Encoding Strategy</a>
+      
+    <a href="../../../file/versioning/">Versioning</a>
+  </div>
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+      
+    <a href="../../../table/">Lance Table Format</a>
+      
+    <a href="../../../table/schema/">Schema</a>
+      
+    <a href="../../../table/blob/">Blob v2</a>
+      
+    <a href="../../../table/table_config/">Table Config</a>
+      
+    <a href="../../../table/versioning/">Versioning</a>
+      
+    <a href="../../../table/transaction/">Transactions</a>
+      
+    <a href="../../../table/layout/">Layout</a>
+      
+    <a href="../../../table/branch_tag/">Branch &amp; Tag</a>
+      
+    <a href="../../../table/row_id_lineage/">Row ID &amp; Lineage</a>
+      
+    <a href="../../../table/data_overlay_file/">Data Overlay Files</a>
+      
+    <a href="../../../table/clustering/">Clustering Metadata</a>
+      
+    <a href="../../../table/fragment_metadata/">Fragment Metadata Tree</a>
+      
+    <a href="../../../table/mem_wal/">MemTable &amp; WAL</a>
+  </div>
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+      
+    <a href="../../">Overview</a>
+      
+    <details class="ld-sidenav__sub" open="open">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>Scalar Indices</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a class="active" href="./">BTree</a>
+        
+    <a href="../bitmap/">Bitmap</a>
+        
+    <a href="../label_list/">Label List</a>
+        
+    <a href="../zonemap/">Zone Map</a>
+        
+    <a href="../zone_write_seeds/">Zone Write Seeds</a>
+        
+    <a href="../bloom_filter/">Bloom Filter</a>
+        
+    <a href="../fts/">Full Text Search</a>
+        
+    <a href="../ngram/">N-gram</a>
+        
+    <a href="../minhash_lsh/">MinHash LSH (experimental)</a>
+        
+    <a href="../fmindex/">FM-Index</a>
+        
+    <a href="../rtree/">RTree</a>
+        
+    <a href="../json/">JSON</a>
+        
+    <a href="../list_element/">List Element (experimental)</a>
+      </div>
+    </details>
+      
+    <details class="ld-sidenav__sub">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>Vector Indices</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a href="../../vector/">Vector Indices</a>
+      </div>
+    </details>
+      
+    <details class="ld-sidenav__sub">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>System Indices</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a href="../../system/frag_reuse/">Fragment Reuse</a>
+        
+    <a href="../../system/mem_wal/">MemWAL</a>
+      </div>
+    </details>
+  </div>
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+      
+    <a href="../../../catalog/">Overview</a>
+      
+    <details class="ld-sidenav__sub">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>Directory Catalog</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a href="../../../catalog/dir/">Lance Directory Catalog</a>
+      </div>
+    </details>
+      
+    <details class="ld-sidenav__sub">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>REST Catalog</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a href="../../../catalog/rest/">Lance REST Catalog</a>
+      </div>
+    </details>
+  </div>
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+      
+    <a href="../../../namespace/">Overview</a>
+      
+    <a href="../../../namespace/object-relationship/">Objects &amp; Relationships</a>
+      
+    <details class="ld-sidenav__sub">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>Operations</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a href="../../../namespace/operations/">Overview</a>
+        
+    <a href="../../../namespace/operations/errors/">Errors</a>
+        
+    <details class="ld-sidenav__sub">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>Models</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a href="../../../namespace/operations/models/">Operation Models</a>
+        
+    <a href="../../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+        
+    <a href="../../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+        
+    <a href="../../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+        
+    <a href="../../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+        
+    <a href="../../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+        
+    <a href="../../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+        
+    <a href="../../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+        
+    <a href="../../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+        
+    <a href="../../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+        
+    <a href="../../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+        
+    <a href="../../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+        
+    <a href="../../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+        
+    <a href="../../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+        
+    <a href="../../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+        
+    <a href="../../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+        
+    <a href="../../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+        
+    <a href="../../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+        
+    <a href="../../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+        
+    <a href="../../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+        
+    <a href="../../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+        
+    <a href="../../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+        
+    <a href="../../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+        
+    <a href="../../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+        
+    <a href="../../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+        
+    <a href="../../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+        
+    <a href="../../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+        
+    <a href="../../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+        
+    <a href="../../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+        
+    <a href="../../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+        
+    <a href="../../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+        
+    <a href="../../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+        
+    <a href="../../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+        
+    <a href="../../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+        
+    <a href="../../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+        
+    <a href="../../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+        
+    <a href="../../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+        
+    <a href="../../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+        
+    <a href="../../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+        
+    <a href="../../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+        
+    <a href="../../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+        
+    <a href="../../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+        
+    <a href="../../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+        
+    <a href="../../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+        
+    <a href="../../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+        
+    <a href="../../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+        
+    <a href="../../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+        
+    <a href="../../../namespace/operations/models/Identity/">Identity</a>
+        
+    <a href="../../../namespace/operations/models/IndexContent/">IndexContent</a>
+        
+    <a href="../../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+        
+    <a href="../../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+        
+    <a href="../../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+        
+    <a href="../../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+        
+    <a href="../../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+        
+    <a href="../../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+        
+    <a href="../../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+        
+    <a href="../../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+        
+    <a href="../../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+        
+    <a href="../../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+        
+    <a href="../../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+        
+    <a href="../../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+        
+    <a href="../../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+        
+    <a href="../../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+        
+    <a href="../../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+        
+    <a href="../../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+        
+    <a href="../../../namespace/operations/models/PartitionField/">PartitionField</a>
+        
+    <a href="../../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+        
+    <a href="../../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+        
+    <a href="../../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+        
+    <a href="../../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+        
+    <a href="../../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+        
+    <a href="../../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+        
+    <a href="../../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+        
+    <a href="../../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+        
+    <a href="../../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+        
+    <a href="../../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+        
+    <a href="../../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+        
+    <a href="../../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+        
+    <a href="../../../namespace/operations/models/TableVersion/">TableVersion</a>
+        
+    <a href="../../../namespace/operations/models/TagContents/">TagContents</a>
+        
+    <a href="../../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+        
+    <a href="../../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+        
+    <a href="../../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+        
+    <a href="../../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+        
+    <a href="../../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+        
+    <a href="../../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+        
+    <a href="../../../namespace/operations/models/VersionRange/">VersionRange</a>
+      </div>
+    </details>
+      </div>
+    </details>
+      
+    <details class="ld-sidenav__sub">
+      <summary class="ld-sidenav__sub-toggle">
+        <span>Supported Catalogs</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        
+    <a href="../../../namespace/supported-catalogs/">Overview</a>
+        
+    <a href="../../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+        
+    <a href="../../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+        
+    <a href="../../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+        
+    <a href="../../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+        
+    <a href="../../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+        
+    <a href="../../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+        
+    <a href="../../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+        
+    <a href="../../../namespace/supported-catalogs/glue/">AWS Glue</a>
+        
+    <a href="../../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+        
+    <a href="../../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+        
+    <a href="../../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+        
+    <a href="../../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+        
+    <a href="../../../namespace/supported-catalogs/template/">Template</a>
+      </div>
+    </details>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Index Formats</span>
+        <span>/</span><span>Scalar Indices</span>
+        <span>/</span><b>BTree</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="btree-index">BTree Index<a class="headerlink" href="#btree-index" title="Permanent link">&para;</a></h1>
+<p>The BTree index is a two-level structure that provides efficient range queries and sorted access. 
+It strikes a balance between an expensive memory structure containing all values 
+and an expensive disk structure that can't be efficiently searched.</p>
+<p>The upper layers of the BTree are designed to be cached in memory and stored in a 
+BTree structure (<code>page_lookup.lance</code>), while the leaves are searched using sub-indices 
+(<code>page_data.lance</code>, currently just a flat file). 
+This design enables efficient memory usage - for example, with 1 billion values, 
+the index can store 256K leaves of size 4K each, requiring only a few MiB of memory 
+(depending on data type) for the BTree metadata while narrowing any search to just 4K values.</p>
+<h2 id="index-details">Index Details<a class="headerlink" href="#index-details" title="Permanent link">&para;</a></h2>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">BTreeIndexDetails</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="cm">/* Present when the index pages store encoded keys, and absent when they store</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="cm">   * raw values. A segment that sets it also sets IndexMetadata.index_version</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="cm">   * to 2. A version 2 segment without it has the version 1 layout.</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="cm">   */</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span><span class="n">BTreeKeyLayout</span><span class="w"> </span><span class="na">key_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>Index version 2 is a superset of version 1. A version 2 segment without
+<code>key_layout</code> has exactly the version 1 layout and meaning. A segment sets
+<code>key_layout</code> when its pages store encoded keys instead of raw values. See
+<a href="#key-layout">Key Layout</a>.</p>
+<h2 id="storage-layout">Storage Layout<a class="headerlink" href="#storage-layout" title="Permanent link">&para;</a></h2>
+<p>The BTree index consists of two files:</p>
+<ol>
+<li><code>page_lookup.lance</code> - The BTree structure mapping value ranges to page numbers</li>
+<li><code>page_data.lance</code> - The actual sub-indices (flat file) containing sorted values and row addresses</li>
+</ol>
+<h3 id="page-lookup-file-schema-btree-structure">Page Lookup File Schema (BTree Structure)<a class="headerlink" href="#page-lookup-file-schema-btree-structure" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>min</code></td>
+<td>{DataType}</td>
+<td>true</td>
+<td>Minimum value in the page (forms BTree keys)</td>
+</tr>
+<tr>
+<td><code>max</code></td>
+<td>{DataType}</td>
+<td>true</td>
+<td>Maximum value in the page (for range pruning)</td>
+</tr>
+<tr>
+<td><code>null_count</code></td>
+<td>UInt32</td>
+<td>false</td>
+<td>Number of null values in the page</td>
+</tr>
+<tr>
+<td><code>page_idx</code></td>
+<td>UInt32</td>
+<td>false</td>
+<td>Page number pointing to the sub-index in page_data.lance</td>
+</tr>
+</tbody>
+</table>
+<h3 id="schema-metadata">Schema Metadata<a class="headerlink" href="#schema-metadata" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>batch_size</code></td>
+<td>String</td>
+<td>Number of rows per page (default: "4096")</td>
+</tr>
+</tbody>
+</table>
+<h3 id="page-data-file-schema-sub-indices">Page Data File Schema (Sub-indices)<a class="headerlink" href="#page-data-file-schema-sub-indices" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>values</code></td>
+<td>{DataType}</td>
+<td>true</td>
+<td>Sorted values from the indexed column (flat file)</td>
+</tr>
+<tr>
+<td><code>ids</code></td>
+<td>UInt64</td>
+<td>false</td>
+<td>Physical row address (<code>fragment_id &lt;&lt; 32 \| offset</code>) corresponding to each value. A segment persisted before format version 1 (<code>IndexMetadata::index_version</code>) stores a row id here instead.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="stable-row-id-reverse-lookup">Stable Row ID Reverse Lookup<a class="headerlink" href="#stable-row-id-reverse-lookup" title="Permanent link">&para;</a></h2>
+<p>An ordinary BTree may index the logical <code>_rowid</code> column of a table, given the following rules:</p>
+<ul>
+<li>Stable Row IDs <strong>must</strong> be enabled on the table.</li>
+<li><code>IndexMetadata.fields</code> <strong>must</strong> be a single field ID <code>-3</code>.</li>
+<li><code>_rowid</code> <strong>must</strong> be represented as a non-nullable <code>UInt64</code> field.</li>
+<li>The index <strong>must</strong> use the address-domain format and be at least version 1.</li>
+<li>The index <strong>must not</strong> set <code>key_layout</code>.</li>
+</ul>
+<p>The logical field need not appear in the user schema. Its inline and spilled
+representations are defined in
+<a href="../../../table/row_id_lineage/#inline-and-spilled-storage">Row ID and Lineage</a>.</p>
+<h2 id="accelerated-queries">Accelerated Queries<a class="headerlink" href="#accelerated-queries" title="Permanent link">&para;</a></h2>
+<p>The BTree index provides exact results for the following query types:</p>
+<table>
+<thead>
+<tr>
+<th>Query Type</th>
+<th>Description</th>
+<th>Operation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Equals</strong></td>
+<td><code>column = value</code></td>
+<td>BTree lookup to find relevant pages, then search within sub-indices</td>
+</tr>
+<tr>
+<td><strong>Range</strong></td>
+<td><code>column BETWEEN a AND b</code></td>
+<td>BTree traversal for pages overlapping the range, then search each sub-index</td>
+</tr>
+<tr>
+<td><strong>IsIn</strong></td>
+<td><code>column IN (v1, v2, ...)</code></td>
+<td>Multiple BTree lookups, union results from all matching sub-indices</td>
+</tr>
+<tr>
+<td><strong>IsNull</strong></td>
+<td><code>column IS NULL</code></td>
+<td>Returns rows from all pages where null_count &gt; 0</td>
+</tr>
+</tbody>
+</table>
+<h2 id="key-layout">Key Layout<a class="headerlink" href="#key-layout" title="Permanent link">&para;</a></h2>
+<div class="admonition warning">
+<p class="admonition-title">Experimental</p>
+<p>Key layouts are unstable. The <code>key_layout</code> message, the <code>arrow_row</code>
+encoding, the <code>lexicographic</code> ordering, and the page layout in this
+section may change incompatibly without a separate vote. After such a
+change, an index with a <code>key_layout</code> must be rebuilt. The table data is
+never rewritten. The feature is removed if its stabilization vote does not
+pass.</p>
+</div>
+<p>A BTree index with a <code>key_layout</code> has one or more keys and stores them in the
+<a href="#encoded-page-layout">encoded page layout</a>. With two or more keys it is a
+composite index. With one key it is a single-column index whose direction and
+null placement are set explicitly.</p>
+<p>The index sorts rows lexicographically by their tuple of key values: compare
+the first key, and if the values are equal, compare the second key, and so on.
+Each comparison uses that key's direction and null placement.</p>
+<p>Each page key is a single byte string that encodes the whole tuple, such that
+comparing two encoded keys as bytes gives the same result as comparing their
+tuples. The page lookup above therefore works unchanged on encoded keys.</p>
+<p>Because nulls are encoded as part of the tuple, the null handling in
+<a href="#accelerated-queries">Accelerated Queries</a> does not apply to an index with a
+<code>key_layout</code>.</p>
+<h3 id="key-layout-metadata">Key Layout Metadata<a class="headerlink" href="#key-layout-metadata" title="Permanent link">&para;</a></h3>
+<p>A segment with <code>key_layout</code> sets these <code>IndexMetadata</code> fields:</p>
+<ul>
+<li><code>index_version</code> is 2.</li>
+<li><code>fields</code> lists the key columns in key order. It has at least one entry.
+  Each entry names a field of the dataset schema, and no field appears twice.</li>
+<li><code>index_details</code> is a <code>BTreeIndexDetails</code> whose <code>key_layout</code> describes the keys.</li>
+</ul>
+<p>This version defines no covering columns for an index with a <code>key_layout</code>, so
+<code>fields</code> holds exactly its keys under either
+<a href="../../#covering-field-contracts">covering-field contract</a>. A later format
+change may add covering columns.</p>
+<p><code>key_layout.keys[i]</code> gives the direction and the null placement of the key
+column <code>fields[i]</code>. The dataset schema gives the type of each key column, so
+<code>key_layout</code> does not repeat it. Each key sets its direction and its null
+placement explicitly. The null placement does not follow from the direction,
+so an ascending or a descending key may put its nulls first or last. In the
+protobuf, a false <code>descending</code> means ascending and a false <code>nulls_first</code> means
+nulls last.</p>
+<p><code>key_layout.encoding</code> sets how a tuple becomes bytes, and <code>key_layout.ordering</code>
+sets how those bytes order tuples. Each holds a <code>oneof</code> with one message per
+kind, and the parameters of a kind are fields of its message. This page defines
+the <code>arrow_row</code> encoding with <code>version</code> 1, and the <code>lexicographic</code> ordering,
+which has no parameters.</p>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">BTreeKeyLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">ArrowRow</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="c1">// The arrow_row byte layout. The BTree spec defines version 1.</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="kt">uint32</span><span class="w"> </span><span class="na">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span><span class="c1">// An unset encoding is unsupported.</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">KeyEncoding</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span><span class="k">oneof</span><span class="w"> </span><span class="n">encoding</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">      </span><span class="n">ArrowRow</span><span class="w"> </span><span class="na">arrow_row</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">Lexicographic</span><span class="w"> </span><span class="p">{}</span>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="w">  </span><span class="c1">// An unset ordering is unsupported.</span>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">KeyOrdering</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">    </span><span class="k">oneof</span><span class="w"> </span><span class="n">ordering</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="w">      </span><span class="n">Lexicographic</span><span class="w"> </span><span class="na">lexicographic</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">KeyField</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a><span class="w">    </span><span class="kt">bool</span><span class="w"> </span><span class="na">descending</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="w">    </span><span class="c1">// True places nulls of this key before every other value. False places them after.</span>
+</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="w">    </span><span class="kt">bool</span><span class="w"> </span><span class="na">nulls_first</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="w">  </span><span class="c1">// How a tuple of key values becomes the bytes stored in the index pages.</span>
+</span><span id="__span-1-25"><a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a><span class="w">  </span><span class="n">KeyEncoding</span><span class="w"> </span><span class="na">encoding</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-26"><a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a><span class="w">  </span><span class="c1">// How the stored bytes order the key tuples.</span>
+</span><span id="__span-1-27"><a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a><span class="w">  </span><span class="n">KeyOrdering</span><span class="w"> </span><span class="na">ordering</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-1-28"><a id="__codelineno-1-28" name="__codelineno-1-28" href="#__codelineno-1-28"></a><span class="w">  </span><span class="c1">// keys[i] describes the key column IndexMetadata.fields[i].</span>
+</span><span id="__span-1-29"><a id="__codelineno-1-29" name="__codelineno-1-29" href="#__codelineno-1-29"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">KeyField</span><span class="w"> </span><span class="na">keys</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-1-30"><a id="__codelineno-1-30" name="__codelineno-1-30" href="#__codelineno-1-30"></a>
+</span><span id="__span-1-31"><a id="__codelineno-1-31" name="__codelineno-1-31" href="#__codelineno-1-31"></a><span class="p">}</span>
+</span></code></pre></div>
+<h3 id="encoded-page-layout">Encoded Page Layout<a class="headerlink" href="#encoded-page-layout" title="Permanent link">&para;</a></h3>
+<p>An index with a <code>key_layout</code> has the same two files and the same schema
+metadata as an index without one. Only the type of the value columns changes.
+<code>page_data.lance</code> has one row for each indexed row:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"values"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">binary</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"ids"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint64</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">])</span>
+</span></code></pre></div>
+<p><code>values</code> holds the encoded key tuple of the row. It is never null, even when
+some keys in the tuple are null. <code>ids</code> holds the row address, as in version 1.
+Rows sort by <code>values</code> compared as unsigned byte strings, and rows with equal
+<code>values</code> sort by <code>ids</code> in ascending order. Two byte strings compare at their
+first differing byte, so the one-byte string <code>0xFF</code> sorts after the two-byte
+string <code>0x0000</code>. A byte string sorts before every longer byte string that
+starts with it, so <code>0x01</code> sorts before <code>0x0100</code>.</p>
+<p><code>page_lookup.lance</code> has one row for each page:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"min"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">binary</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"max"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">binary</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"null_count"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint32</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"page_idx"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint32</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="p">])</span>
+</span></code></pre></div>
+<p><code>min</code> and <code>max</code> are the first and the last <code>values</code> of the page. <code>null_count</code>
+is always 0, because <code>values</code> is never null. The column stays so that
+<code>page_lookup.lance</code> has the same columns with or without a <code>key_layout</code>.</p>
+<h3 id="encoding-arrow_row-version-1">Encoding <code>arrow_row</code> Version 1<a class="headerlink" href="#encoding-arrow_row-version-1" title="Permanent link">&para;</a></h3>
+<p><code>arrow_row</code> version 1 encodes a tuple as the encodings of its keys,
+concatenated in key order, with no header, separator, or length. A reader splits
+an encoded tuple into keys from left to right, because the type and direction
+of each key determine where its encoding ends.</p>
+<p>The encoding admits these key types: Boolean, Int8, Int16, Int32, Int64,
+UInt8, UInt16, UInt32, UInt64, Float32, Float64, Date32, Date64, Timestamp with
+any unit and with or without a time zone, Utf8, LargeUtf8, Binary, and
+LargeBinary. The encoding admits no other type, including nested types such as
+Struct and List and the Decimal types, and a later encoding version may admit
+them.</p>
+<p>The encoding of a key depends on its type, on <code>descending</code>, and on
+<code>nulls_first</code>. The null sentinel of a key is the byte <code>0x00</code> when <code>nulls_first</code>
+is true and the byte <code>0xFF</code> when it is false. Every non-null encoding below
+starts with a byte strictly between <code>0x00</code> and <code>0xFF</code>. A fixed-width value
+starts with <code>0x01</code> in either direction. A variable-width value starts with
+<code>0x01</code> or <code>0x02</code>, or with their inverses <code>0xFE</code> or <code>0xFD</code> when <code>descending</code> is
+true. The first byte alone therefore puts a null before or after every non-null
+value of the key, however many bytes the values take.</p>
+<h4 id="fixed-width-types">Fixed-Width Types<a class="headerlink" href="#fixed-width-types" title="Permanent link">&para;</a></h4>
+<p>A key of a fixed-width type encodes in 1 + W bytes:</p>
+<ul>
+<li>A non-null value is the byte <code>0x01</code>, then the W value bytes from the table
+  below. When <code>descending</code> is true, every value byte is inverted, but the
+  <code>0x01</code> is not.</li>
+<li>A null is the null sentinel, then W bytes of <code>0x00</code>. These bytes are never
+  inverted.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>W</th>
+<th>Value bytes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Boolean</td>
+<td>1</td>
+<td><code>0x00</code> for false and <code>0x01</code> for true</td>
+</tr>
+<tr>
+<td>UInt8, UInt16, UInt32, UInt64</td>
+<td>1, 2, 4, 8</td>
+<td>The value, big-endian</td>
+</tr>
+<tr>
+<td>Int8, Int16, Int32, Int64</td>
+<td>1, 2, 4, 8</td>
+<td>The two's-complement value, big-endian, with the most significant bit inverted</td>
+</tr>
+<tr>
+<td>Float32, Float64</td>
+<td>4, 8</td>
+<td>The IEEE 754 bit pattern, big-endian. If the sign bit is 1, every bit is inverted. Otherwise only the sign bit is inverted.</td>
+</tr>
+<tr>
+<td>Date32</td>
+<td>4</td>
+<td>The days since the UNIX epoch, encoded as an Int32</td>
+</tr>
+<tr>
+<td>Date64</td>
+<td>8</td>
+<td>The milliseconds since the UNIX epoch, encoded as an Int64</td>
+</tr>
+<tr>
+<td>Timestamp</td>
+<td>8</td>
+<td>The stored value, encoded as an Int64. The unit and the time zone do not change the bytes.</td>
+</tr>
+</tbody>
+</table>
+<h4 id="variable-width-types">Variable-Width Types<a class="headerlink" href="#variable-width-types" title="Permanent link">&para;</a></h4>
+<p>A Utf8 or LargeUtf8 key encodes the UTF-8 bytes of its value. A Binary or
+LargeBinary key encodes the bytes of its value. A type and its large variant
+give the same bytes.</p>
+<ul>
+<li>A null is the null sentinel alone.</li>
+<li>An empty value is the byte <code>0x01</code>.</li>
+<li>Any other value is the byte <code>0x02</code>, then the value split into blocks. The
+  first four blocks hold 8 bytes each, and every later block holds 32 bytes. The
+  last block is padded with <code>0x00</code> to its full size. Each block is followed by
+  one byte, which is <code>0xFF</code> if more of the value follows the block, and
+  otherwise the number of value bytes in the block.</li>
+</ul>
+<p>When <code>descending</code> is true, every byte of a non-null encoding is inverted. That
+includes the leading <code>0x01</code> or <code>0x02</code>, the padding, and the byte after each
+block. A null is never inverted.</p>
+<h3 id="ordering-lexicographic">Ordering <code>lexicographic</code><a class="headerlink" href="#ordering-lexicographic" title="Permanent link">&para;</a></h3>
+<p><code>lexicographic</code> compares two tuples one key at a time, in key order.
+The first key whose values differ decides the order. Two values of one key
+compare as follows:</p>
+<ol>
+<li>If exactly one value is null, the null sorts first when <code>nulls_first</code> is
+   true and last when it is false. Two nulls are equal.</li>
+<li>Otherwise the values compare in the order of their type, reversed when
+   <code>descending</code> is true.</li>
+</ol>
+<p>The order of each type is:</p>
+<ul>
+<li>Integers, dates, and timestamps order by their stored value. The time zone
+  of a timestamp does not change its order.</li>
+<li>Boolean orders false before true.</li>
+<li>Float32 and Float64 order by the IEEE 754 <code>totalOrder</code> predicate. Negative
+  NaNs sort first, then negative infinity, the negative numbers, -0.0, +0.0, the
+  positive numbers, positive infinity, and the positive NaNs. NaNs with
+  different bit patterns are different values.</li>
+<li>Strings and binary values order by their bytes, compared as unsigned byte
+  strings.</li>
+</ul>
+<p>Under <code>arrow_row</code> version 1, comparing two encoded tuples as unsigned byte
+strings gives the same order as <code>lexicographic</code> gives the tuples. Two
+tuples are equal exactly when their encodings are equal. A reader therefore
+orders and searches pages by comparing bytes, and never decodes a key to do so.</p>
+<h3 id="encoding-examples">Encoding Examples<a class="headerlink" href="#encoding-examples" title="Permanent link">&para;</a></h3>
+<p>Each row below gives the <code>arrow_row</code> version 1 encoding of one value, in
+hexadecimal. Spaces separate the leading byte, the value bytes, and the byte
+after each block. They are not part of the encoding.</p>
+<table>
+<thead>
+<tr>
+<th>Key type</th>
+<th>Direction and nulls</th>
+<th>Value</th>
+<th>Encoding</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Boolean</td>
+<td>ascending, nulls first</td>
+<td>null</td>
+<td><code>00 00</code></td>
+</tr>
+<tr>
+<td>Boolean</td>
+<td>ascending, nulls first</td>
+<td>false</td>
+<td><code>01 00</code></td>
+</tr>
+<tr>
+<td>Boolean</td>
+<td>ascending, nulls first</td>
+<td>true</td>
+<td><code>01 01</code></td>
+</tr>
+<tr>
+<td>Boolean</td>
+<td>descending, nulls last</td>
+<td>null</td>
+<td><code>ff 00</code></td>
+</tr>
+<tr>
+<td>Boolean</td>
+<td>descending, nulls last</td>
+<td>false</td>
+<td><code>01 ff</code></td>
+</tr>
+<tr>
+<td>Boolean</td>
+<td>descending, nulls last</td>
+<td>true</td>
+<td><code>01 fe</code></td>
+</tr>
+<tr>
+<td>Int8</td>
+<td>ascending, nulls first</td>
+<td>-2</td>
+<td><code>01 7e</code></td>
+</tr>
+<tr>
+<td>Int16</td>
+<td>ascending, nulls first</td>
+<td>-2</td>
+<td><code>01 7ffe</code></td>
+</tr>
+<tr>
+<td>Int32</td>
+<td>ascending, nulls first</td>
+<td>null</td>
+<td><code>00 00000000</code></td>
+</tr>
+<tr>
+<td>Int32</td>
+<td>ascending, nulls first</td>
+<td>MIN</td>
+<td><code>01 00000000</code></td>
+</tr>
+<tr>
+<td>Int32</td>
+<td>ascending, nulls first</td>
+<td>-2</td>
+<td><code>01 7ffffffe</code></td>
+</tr>
+<tr>
+<td>Int32</td>
+<td>ascending, nulls first</td>
+<td>MAX</td>
+<td><code>01 ffffffff</code></td>
+</tr>
+<tr>
+<td>Int32</td>
+<td>ascending, nulls last</td>
+<td>null</td>
+<td><code>ff 00000000</code></td>
+</tr>
+<tr>
+<td>Int32</td>
+<td>descending, nulls first</td>
+<td>-2</td>
+<td><code>01 80000001</code></td>
+</tr>
+<tr>
+<td>Int32</td>
+<td>descending, nulls last</td>
+<td>null</td>
+<td><code>ff 00000000</code></td>
+</tr>
+<tr>
+<td>Int64</td>
+<td>ascending, nulls first</td>
+<td>-2</td>
+<td><code>01 7ffffffffffffffe</code></td>
+</tr>
+<tr>
+<td>UInt8</td>
+<td>ascending, nulls first</td>
+<td>128</td>
+<td><code>01 80</code></td>
+</tr>
+<tr>
+<td>UInt16</td>
+<td>ascending, nulls first</td>
+<td>32768</td>
+<td><code>01 8000</code></td>
+</tr>
+<tr>
+<td>UInt32</td>
+<td>ascending, nulls first</td>
+<td>2147483648</td>
+<td><code>01 80000000</code></td>
+</tr>
+<tr>
+<td>UInt64</td>
+<td>ascending, nulls first</td>
+<td>9223372036854775808</td>
+<td><code>01 8000000000000000</code></td>
+</tr>
+<tr>
+<td>Float32</td>
+<td>ascending, nulls first</td>
+<td>-MAX (bits <code>ff7fffff</code>)</td>
+<td><code>01 00800000</code></td>
+</tr>
+<tr>
+<td>Float32</td>
+<td>ascending, nulls first</td>
+<td>-0.0 (bits <code>80000000</code>)</td>
+<td><code>01 7fffffff</code></td>
+</tr>
+<tr>
+<td>Float32</td>
+<td>ascending, nulls first</td>
+<td>+0.0 (bits <code>00000000</code>)</td>
+<td><code>01 80000000</code></td>
+</tr>
+<tr>
+<td>Float32</td>
+<td>ascending, nulls first</td>
+<td>1.5 (bits <code>3fc00000</code>)</td>
+<td><code>01 bfc00000</code></td>
+</tr>
+<tr>
+<td>Float32</td>
+<td>ascending, nulls first</td>
+<td>-NaN (bits <code>ffc00000</code>)</td>
+<td><code>01 003fffff</code></td>
+</tr>
+<tr>
+<td>Float32</td>
+<td>ascending, nulls first</td>
+<td>+NaN (bits <code>7fc00000</code>)</td>
+<td><code>01 ffc00000</code></td>
+</tr>
+<tr>
+<td>Float64</td>
+<td>ascending, nulls first</td>
+<td>-inf (bits <code>fff0000000000000</code>)</td>
+<td><code>01 000fffffffffffff</code></td>
+</tr>
+<tr>
+<td>Float64</td>
+<td>ascending, nulls first</td>
+<td>1.5 (bits <code>3ff8000000000000</code>)</td>
+<td><code>01 bff8000000000000</code></td>
+</tr>
+<tr>
+<td>Float64</td>
+<td>ascending, nulls first</td>
+<td>+NaN (bits <code>7ff8000000000001</code>)</td>
+<td><code>01 fff8000000000001</code></td>
+</tr>
+<tr>
+<td>Date32</td>
+<td>ascending, nulls first</td>
+<td>0</td>
+<td><code>01 80000000</code></td>
+</tr>
+<tr>
+<td>Date64</td>
+<td>ascending, nulls first</td>
+<td>0</td>
+<td><code>01 8000000000000000</code></td>
+</tr>
+<tr>
+<td>Timestamp(ns)</td>
+<td>ascending, nulls first</td>
+<td>MIN</td>
+<td><code>01 0000000000000000</code></td>
+</tr>
+<tr>
+<td>Timestamp(ns, UTC)</td>
+<td>ascending, nulls first</td>
+<td>0</td>
+<td><code>01 8000000000000000</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>ascending, nulls first</td>
+<td>null</td>
+<td><code>00</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>ascending, nulls first</td>
+<td><code>""</code></td>
+<td><code>01</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>ascending, nulls first</td>
+<td><code>"ab"</code></td>
+<td><code>02 6162000000000000 02</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>ascending, nulls first</td>
+<td><code>"\u{10FFFF}"</code></td>
+<td><code>02 f48fbfbf00000000 04</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>ascending, nulls first</td>
+<td><code>"0123456789abcdefghijklmnopqrstuv"</code></td>
+<td><code>02 3031323334353637 ff 3839616263646566 ff 6768696a6b6c6d6e ff 6f70717273747576 08</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>ascending, nulls first</td>
+<td><code>"0123456789abcdefghijklmnopqrstuvw"</code></td>
+<td><code>02 3031323334353637 ff 3839616263646566 ff 6768696a6b6c6d6e ff 6f70717273747576 ff 7700000000000000000000000000000000000000000000000000000000000000 01</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>ascending, nulls last</td>
+<td>null</td>
+<td><code>ff</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>descending, nulls first</td>
+<td>null</td>
+<td><code>00</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>descending, nulls first</td>
+<td><code>""</code></td>
+<td><code>fe</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>descending, nulls first</td>
+<td><code>"ab"</code></td>
+<td><code>fd 9e9dffffffffffff fd</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>descending, nulls first</td>
+<td><code>"012345678"</code></td>
+<td><code>fd cfcecdcccbcac9c8 00 c7ffffffffffffff fe</code></td>
+</tr>
+<tr>
+<td>Utf8</td>
+<td>descending, nulls last</td>
+<td>null</td>
+<td><code>ff</code></td>
+</tr>
+<tr>
+<td>LargeUtf8</td>
+<td>ascending, nulls first</td>
+<td><code>"ab"</code></td>
+<td><code>02 6162000000000000 02</code></td>
+</tr>
+<tr>
+<td>Binary</td>
+<td>ascending, nulls first</td>
+<td><code>[]</code></td>
+<td><code>01</code></td>
+</tr>
+<tr>
+<td>Binary</td>
+<td>ascending, nulls first</td>
+<td><code>[00 ff]</code></td>
+<td><code>02 00ff000000000000 02</code></td>
+</tr>
+<tr>
+<td>Binary</td>
+<td>ascending, nulls first</td>
+<td><code>[ff]</code></td>
+<td><code>02 ff00000000000000 01</code></td>
+</tr>
+<tr>
+<td>LargeBinary</td>
+<td>ascending, nulls first</td>
+<td><code>[00 ff]</code></td>
+<td><code>02 00ff000000000000 02</code></td>
+</tr>
+</tbody>
+</table>
+<p>A tuple concatenates the encodings of its keys. With an Int32 key that is
+ascending with nulls first, followed by a Utf8 key that is descending with nulls
+last:</p>
+<table>
+<thead>
+<tr>
+<th>Tuple</th>
+<th>Encoding</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>(-1, "ab")</code></td>
+<td><code>01 7fffffff</code> <code>fd 9e9dffffffffffff fd</code></td>
+</tr>
+<tr>
+<td><code>(null, null)</code></td>
+<td><code>00 00000000</code> <code>ff</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="key-layout-reader-rules">Key Layout Reader Rules<a class="headerlink" href="#key-layout-reader-rules" title="Permanent link">&para;</a></h3>
+<p>A reader applies these rules from the manifest alone, before it opens an index
+file. It picks the page layout of a BTree segment from whether <code>key_layout</code> is
+present, never from the number of entries in <code>fields</code>. It treats a segment with
+a <code>key_layout</code> as unusable when any of these is true:</p>
+<ul>
+<li><code>index_version</code> is below 2.</li>
+<li><code>fields</code> is empty, names a field twice, or names a field that is not in the
+  dataset schema.</li>
+<li><code>covering_fields</code> is not empty.</li>
+<li><code>key_layout.keys</code> and <code>fields</code> have different lengths.</li>
+<li>The reader does not support the <code>encoding</code> or the <code>ordering</code>, including their
+  parameters such as the <code>arrow_row</code> <code>version</code>. A missing <code>encoding</code> or
+  <code>ordering</code>, or one whose <code>oneof</code> is unset, is not supported.</li>
+<li>The encoding does not admit the type of a key column.</li>
+<li>The manifest's writer feature flags lack <code>FLAG_BTREE_KEY_LAYOUT</code>.</li>
+</ul>
+<p>An engine skips an unusable index and scans the fragments that the index
+covers, as it does for any index segment it cannot use (see
+<a href="../../#index-compatibility">Index Compatibility</a>). The
+<a href="#key-layout-writer-rules">Key Layout Writer Rules</a> say how a writer maintains
+an unusable index.</p>
+<h3 id="key-layout-writer-rules">Key Layout Writer Rules<a class="headerlink" href="#key-layout-writer-rules" title="Permanent link">&para;</a></h3>
+<p>These rules apply to every writer that supports key layouts. Released versions
+do not support key layouts.
+<a href="#compatibility-with-released-versions">Compatibility With Released Versions</a>
+explains how the index version and <code>FLAG_BTREE_KEY_LAYOUT</code> fence them.</p>
+<p>By default, a writer builds a single-column index without a <code>key_layout</code>.</p>
+<p>A writer must set <code>FLAG_BTREE_KEY_LAYOUT</code> (<code>2^22</code>) in the writer
+<a href="../../../table/versioning/#current-feature-flags">feature flags</a> of every
+manifest it publishes, including by clone and restore, exactly when the
+manifest's index section has a segment with a <code>key_layout</code>. It must not set the
+bit in the reader feature flags.</p>
+<p>A writer must not carry a segment with a <code>key_layout</code> out of a manifest whose
+writer feature flags lack the bit. This rule covers the parent manifest that a
+commit builds on and the version that a restore, clone, or branch copies. The
+writer must drop such a segment before it computes the bit.</p>
+<p>A writer may keep a segment with a <code>key_layout</code> that the
+<a href="#key-layout-reader-rules">Key Layout Reader Rules</a> make unusable to it. It must
+then maintain the segment as follows:</p>
+<ul>
+<li>It must not add rows or fragments to the segment.</li>
+<li>It must remove fragments from the segment's <code>fragment_bitmap</code> when an update
+  requires it (see
+  <a href="../../#creating-and-updating-index-segments">Creating and Updating Index Segments</a>).</li>
+<li>Its compaction may rewrite the fragments that the segment covers. The commit
+  that rewrites them must remove them from the segment's <code>fragment_bitmap</code>, as
+  an update does. Readers then scan the new fragments (see
+  <a href="../../#compaction-and-remapping">Compaction and remapping</a>).</li>
+<li>When compaction defers the remap to a
+  <a href="../../system/frag_reuse/">fragment reuse index</a>, the commit must still remove
+  the rewritten fragments from the segment's <code>fragment_bitmap</code>. The segment
+  then covers none of the fragments that the reuse index maps them to, so
+  readers scan those fragments.</li>
+</ul>
+<h3 id="encoding-stability">Encoding Stability<a class="headerlink" href="#encoding-stability" title="Permanent link">&para;</a></h3>
+<p>The bytes of <code>arrow_row</code> version 1 are the bytes that the <code>RowConverter</code> of the
+Arrow Rust crate <code>arrow-row</code> 59.3.3 writes for the admitted types. Arrow does
+not promise to keep those bytes across releases, so this page, not the crate,
+defines version 1. If a later <code>arrow-row</code> release writes different bytes for an
+admitted type, Lance keeps writing version 1 bytes for that type by vendoring
+the version 1 encoder. An Arrow upgrade never changes version 1. A different
+byte layout is a new encoding version, <code>arrow_row</code> version 2.</p>
+<h3 id="compatibility-with-released-versions">Compatibility With Released Versions<a class="headerlink" href="#compatibility-with-released-versions" title="Permanent link">&para;</a></h3>
+<p>Index version 2 fences released readers. Releases from v10.0.0 on do not use a
+BTree index of version 2, so they skip an index with a <code>key_layout</code> and answer
+queries from the table data.</p>
+<p><code>FLAG_BTREE_KEY_LAYOUT</code> fences released writers. Without it, an update by
+v12.0.0 or v13.0.0 on a table with stable row IDs would add the fragment that
+receives the rewritten rows to the index's <code>fragment_bitmap</code> without indexing
+those rows, because these releases do not check the index version before they
+update. Releases v12.0.0 through v14.0.0 refuse to write a table that sets the
+bit. Releases v10.0.0 and v11.0.0 check writer feature flags only when they
+insert, and their restore, shallow clone, and branch creation clear the bit but
+keep the index. For that reason, a reader does not use an index with a
+<code>key_layout</code> from a manifest that lacks the bit, and a writer drops such an
+index (see <a href="#key-layout-reader-rules">Key Layout Reader Rules</a> and
+<a href="#key-layout-writer-rules">Key Layout Writer Rules</a>).</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../../">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Overview</div>
+        </a>
+        <a class="next" href="../bitmap/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Bitmap</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#index-details">Index Details</a>
+      <a class="ld-toc__h2" href="#storage-layout">Storage Layout</a>
+      <a class="ld-toc__h3" href="#page-lookup-file-schema-btree-structure">Page Lookup File Schema (BTree Structure)</a>
+      <a class="ld-toc__h3" href="#schema-metadata">Schema Metadata</a>
+      <a class="ld-toc__h3" href="#page-data-file-schema-sub-indices">Page Data File Schema (Sub-indices)</a>
+      <a class="ld-toc__h2" href="#stable-row-id-reverse-lookup">Stable Row ID Reverse Lookup</a>
+      <a class="ld-toc__h2" href="#accelerated-queries">Accelerated Queries</a>
+      <a class="ld-toc__h2" href="#key-layout">Key Layout</a>
+      <a class="ld-toc__h3" href="#key-layout-metadata">Key Layout Metadata</a>
+      <a class="ld-toc__h3" href="#encoded-page-layout">Encoded Page Layout</a>
+      <a class="ld-toc__h3" href="#encoding-arrow_row-version-1">Encoding arrow_row Version 1</a>
+      <a class="ld-toc__h3" href="#ordering-lexicographic">Ordering lexicographic</a>
+      <a class="ld-toc__h3" href="#encoding-examples">Encoding Examples</a>
+      <a class="ld-toc__h3" href="#key-layout-reader-rules">Key Layout Reader Rules</a>
+      <a class="ld-toc__h3" href="#key-layout-writer-rules">Key Layout Writer Rules</a>
+      <a class="ld-toc__h3" href="#encoding-stability">Encoding Stability</a>
+      <a class="ld-toc__h3" href="#compatibility-with-released-versions">Compatibility With Released Versions</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../">Specification</a>
+        <a href="../../../file/">File format</a>
+        <a href="../../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>
