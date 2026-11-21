@@ -153,7 +153,7 @@ def dataset(
     commit_lock: Optional[CommitLock] = None,
     index_cache_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    default_scan_options: Optional[Dict[str, str]] = None,
+    default_scan_options: Optional[Dict[str, Any]] = None,
     metadata_cache_size_bytes: Optional[int] = None,
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, Any]] = None,
