@@ -49,19 +49,7 @@ full set of metadata maps.
 | `lance.compaction.max_source_rows`               | Non-negative integer                                                     | Maximum number of live source rows (physical rows minus soft-deleted rows) to compact in a single run. Defaults to unlimited.                                                                                                                                                            |
 | `lance.compaction.max_source_bytes`              | Non-negative integer                                                     | Maximum number of source bytes (data files and [data overlay files](data_overlay_file.md), excluding blob v2 payloads) to compact in a single run. Defaults to unlimited.                                                                                                                |
 | `lance.compaction.max_overlays_per_fragment`     | Non-negative integer or `none`                                          | Maximum number of [data overlay files](data_overlay_file.md) a fragment may carry before it is fully compacted (overlays and deletions materialized into the base data). Defaults to `10`. Set to `0` to compact every fragment with any overlay, or `none` to disable the trigger.     |
-| `lance.layout.target_rows_per_fragment`          | Positive integer, at most 4,294,967,295                                 | Target number of rows per data file. Writes use it as the per-file row limit; [compaction](../../guide/read_and_write.md#compact-data-files) uses it as the row target for the files it rewrites. Unset means the operation's own default. |
-| `lance.layout.max_bytes_per_file`                | Positive integer                                                        | Soft bound, in bytes, on one data file. A writer compares it with the bytes it has already emitted after writing a chunk of input; encoded pages, buffered data and the footer can make the final file larger. Unset means the operation's own default. |
 
 </div>
 
-Unrecognized `lance.compaction.*` keys are ignored with a warning; unrecognized keys under other `lance.*` prefixes should likewise be ignored by conforming readers rather than treated as errors. A `lance.compaction.*` or `lance.layout.*` value that is present but not a valid integer is an error for the operation that reads it.
-
-The `lance.layout.*` keys are one description of how a table's data files should be sized, shared by writes and compaction. The per-file row limit and byte bound are resolved independently, highest precedence first:
-
-1. an explicit option of the current operation (the writer's per-write layout override, or a compaction option applied after the manifest config);
-2. `lance.compaction.*` for the compaction-specific keys, then `lance.layout.*`;
-3. the operation's own default (for writes, the writer's `max_rows_per_file` and `max_bytes_per_file`).
-
-A setting that is absent never removes a lower-precedence value, and a setting whose value equals a default is still applied because presence, not the value, carries the precedence. Writes to a dataset persist `lance.layout.*` only when they create the table, in the same version as the first data files; later appends, overwrites and compaction read the persisted values without changing them.
-
-The byte bound is not a maximum file size. A writer compares it with the bytes it has already emitted after writing a chunk of input and does not flush only to honor it. How much data is visible at that point belongs to the file format: V2 files buffer encoded data in pages, so a page counts toward the emitted bytes only once it is flushed, and data still buffered in the writer and the footer add to the file after the last check. The format therefore defines no numeric bound on how far a file may exceed the bound.
+Unrecognized `lance.compaction.*` keys are ignored with a warning; unrecognized keys under other `lance.*` prefixes should likewise be ignored by conforming readers rather than treated as errors.
