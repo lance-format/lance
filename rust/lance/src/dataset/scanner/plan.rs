@@ -403,14 +403,10 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         desired_projection: &Projection,
     ) -> Result<Projection> {
-        // Note: We use all_columns and not refine_columns here.  If a column is covered by an index but
-        // the user has requested it, then we do not use it for late materialization.
-        //
-        // Either that column is covered by an exact filter (e.g. string with bitmap/btree) and there is no
-        // need for late materialization or that column is covered by an inexact filter (e.g. ngram) in which
-        // case we are going to load the column anyways for the recheck.
+        // FilteredRead adds any columns needed for a full recheck per fragment.
+        // Carrying those in the output here would also decode them on exact index hits.
         let filter_columns = filter_plan
-            .full_expr
+            .refine_expr
             .as_ref()
             .map(|expr| filter_read_columns(expr, desired_projection))
             .unwrap_or_default();
