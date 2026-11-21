@@ -335,7 +335,7 @@ impl CacheKey for RowVersionSequenceKey<'_> {
 /// remapping. Stored in the metadata cache so parameter checks never populate
 /// the index partition cache.
 #[derive(Debug)]
-pub(crate) struct InvertedIndexParamsKey<'a> {
+pub struct InvertedIndexParamsKey<'a> {
     pub uuid: &'a Uuid,
 }
 
