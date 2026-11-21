@@ -484,7 +484,7 @@ async fn build_dense_lookup(
     let addrs = spawn_cpu(move || {
         let mut v = Vec::with_capacity(len);
         v.resize_with(len, || AtomicU64::new(EMPTY_SLOT));
-        Ok(Arc::new(v))
+        Ok::<_, Error>(Arc::new(v))
     })
     .await?;
     let overflow: Arc<Mutex<HashMap<u64, Vec<RowAddress>>>> = Arc::new(Mutex::new(HashMap::new()));
