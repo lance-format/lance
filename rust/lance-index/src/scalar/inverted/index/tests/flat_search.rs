@@ -1218,9 +1218,10 @@ async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
         .unwrap();
     assert_eq!(replayed, capped);
 
-    // 6. Excessive fuzziness fails cleanly.
+    // 6. Excessive fuzziness fails cleanly (5+ char ASCII token with fuzziness=10
+    // exceeds the Levenshtein DFA state budget).
     assert!(
-        run_fuzzy("alpa", Some(10), 50, 0, Operator::Or, None)
+        run_fuzzy("quick", Some(10), 50, 0, Operator::Or, None)
             .await
             .is_err()
     );
