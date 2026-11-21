@@ -8257,6 +8257,57 @@ async fn test_label_list_index_on_int32_items() {
 }
 
 #[tokio::test]
+async fn test_projected_ngram_recheck_is_materialized_once() {
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..64)) as ArrayRef,
+        ),
+        (
+            "text",
+            Arc::new(StringArray::from_iter_values(
+                (0..64).map(|i| format!("needle {i}")),
+            )) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::NGram,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut scan = dataset.scan();
+    scan.project(&["id", "text"])
+        .unwrap()
+        .filter("contains(text, 'needle') AND id > 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("projection=[id, text]"),
+        "{plan}"
+    );
+    assert!(!plan.contains("Take:"), "{plan}");
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 63);
+}
+
+#[tokio::test]
 async fn test_label_list_refine_projection_with_partial_coverage() {
     let batch = |start: i32| {
         let labels = ListArray::from_iter_primitive::<Int32Type, _, _>([

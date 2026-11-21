@@ -403,19 +403,20 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         desired_projection: &Projection,
     ) -> Result<Projection> {
-        // FilteredRead adds any columns needed for a full recheck per fragment.
-        // Carrying those in the output here would also decode them on exact index hits.
-        let filter_columns = filter_plan
-            .refine_expr
-            .as_ref()
-            .map(|expr| filter_read_columns(expr, desired_projection))
-            .unwrap_or_default();
-
-        let filter_schema = self
-            .dataset
-            .empty_projection()
-            .union_columns(filter_columns, OnMissing::Error)?
-            .into_schema();
+        // A recheck may already read a requested column. Keep it in the output
+        // so a later Take does not fetch it a second time. Unrequested columns
+        // covered by an index are read only on fragments that need a recheck.
+        let filter_projection = |expr: Option<&datafusion_expr::Expr>| {
+            let columns = expr
+                .map(|expr| filter_read_columns(expr, desired_projection))
+                .unwrap_or_default();
+            self.dataset
+                .empty_projection()
+                .union_columns(columns, OnMissing::Error)
+        };
+        let requested_filter =
+            filter_projection(filter_plan.full_expr.as_ref())?.intersect(desired_projection);
+        let refine = filter_projection(filter_plan.refine_expr.as_ref())?;
 
         let mut late_ids = HashSet::new();
         for field in self.dataset.schema().fields.iter() {
@@ -428,7 +429,8 @@ impl Scanner {
             // Subtract columns that are expensive
             .subtract_predicate(|f| late_ids.contains(&f.id))
             // Add back columns that we need for filtering
-            .union_schema(&filter_schema))
+            .union_projection(&requested_filter)
+            .union_projection(&refine))
     }
 
     // Collects the ids of the fields that should be materialized late (see calc_eager_projection).
