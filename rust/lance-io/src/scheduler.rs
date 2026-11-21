@@ -14,7 +14,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 use tokio::sync::Notify;
 
@@ -932,6 +932,8 @@ impl FromStr for SchedulerErrorMode {
 /// Note: The 2.X file readers already do this so this is only a concern if you are
 /// using the ScanScheduler directly.
 pub struct ScanScheduler {
+    // Freeze admission on first open, including an explicitly unaccounted reader.
+    memory_pool: OnceLock<Option<Arc<dyn lance_core::utils::memory::MemoryReserver>>>,
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
@@ -1065,6 +1067,7 @@ impl ScanScheduler {
             IoQueueType::Standard(io_queue)
         };
         let scheduler = Arc::new(Self {
+            memory_pool: OnceLock::new(),
             object_store,
             io_queue,
             stats,
@@ -1093,6 +1096,36 @@ impl ScanScheduler {
         }
     }
 
+    /// Configure admission for raw read buffers before opening any files.
+    /// Returned buffers retain their charges through cloning and slicing. The
+    /// reader must implement [`Reader::configure_memory_reserver`]; unsupported
+    /// backends return an error on open rather than issuing unaccounted reads.
+    /// Configuration is allowed once, including when shared with memory observers,
+    /// and must precede the first file open. This does not account for decoded
+    /// arrays or scheduler request metadata.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # use lance_io::{scheduler::{ScanScheduler, SchedulerConfig}, object_store::ObjectStore};
+    /// fn scheduler(store: Arc<ObjectStore>, pool: Arc<dyn MemoryReserver>) -> Result<Arc<ScanScheduler>> {
+    ///     ScanScheduler::new(store, SchedulerConfig::new(1024 * 1024))
+    ///         .with_memory_reserver(pool)
+    /// }
+    /// ```
+    #[doc(hidden)]
+    pub fn with_memory_reserver(
+        self: Arc<Self>,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<Arc<Self>> {
+        self.memory_pool.set(Some(pool)).map_err(|_| {
+            Error::invalid_input(
+                "scheduler memory reserver must be configured before opening files and can only be configured once",
+            )
+        })?;
+        Ok(self)
+    }
+
     /// Open a file for reading
     ///
     /// # Arguments
@@ -1107,19 +1140,41 @@ impl ScanScheduler {
         base_priority: u64,
         file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
-        let file_size_bytes = if let Some(size) = file_size_bytes.get() {
-            u64::from(size)
-        } else {
-            let size = self.object_store.size(path).await?;
+        let reader = if let Some(pool) = self.memory_pool.get_or_init(|| None) {
+            // SmallReader caches the entire object. Open the actual backend in
+            // this mode, including admission and ownership for open/HEAD tasks.
+            let known_size = file_size_bytes
+                .get()
+                .map(|size| {
+                    usize::try_from(u64::from(size)).map_err(|_| {
+                        Error::invalid_input(format!("cached local file size={size} exceeds usize"))
+                    })
+                })
+                .transpose()?;
+            let reader = self
+                .object_store
+                .open_with_memory_reserver(path, known_size, pool.clone())
+                .await?;
+            let size = u64::try_from(reader.size().await?)
+                .map_err(|_| Error::invalid_input("local file size exceeds u64"))?;
             if let Some(size) = NonZero::new(size) {
                 file_size_bytes.set(size);
             }
-            size
+            reader
+        } else {
+            let size = if let Some(size) = file_size_bytes.get() {
+                u64::from(size)
+            } else {
+                let size = self.object_store.size(path).await?;
+                if let Some(size) = NonZero::new(size) {
+                    file_size_bytes.set(size);
+                }
+                size
+            };
+            self.object_store
+                .open_with_size(path, size as usize)
+                .await?
         };
-        let reader = self
-            .object_store
-            .open_with_size(path, file_size_bytes as usize)
-            .await?;
         let block_size = self.object_store.block_size() as u64;
         let max_iop_size = self.object_store.max_iop_size();
         Ok(FileScheduler {
@@ -1415,6 +1470,26 @@ fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
 }
 
 impl FileScheduler {
+    /// Return the actual reader's raw-buffer pool. Reassembly and decoding can
+    /// share it even when this scheduler was opened over a charged spill reader.
+    /// This getter does not configure decoder accounting.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::scheduler::FileScheduler;
+    /// fn reserve(reader: &FileScheduler) -> Result<()> {
+    ///     if let Some(pool) = reader.memory_reserver() {
+    ///         let owner = pool.reserve("read transformation", 1024)?;
+    ///         drop(owner);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    #[doc(hidden)]
+    pub fn memory_reserver(&self) -> Option<Arc<dyn lance_core::utils::memory::MemoryReserver>> {
+        self.reader.memory_reserver()
+    }
+
     /// Submit a batch of I/O requests to the reader
     ///
     /// The requests will be queued in a FIFO manner and, when all requests

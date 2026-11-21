@@ -25,6 +25,28 @@ use crate::traits::Writer;
 use crate::utils::tracking_store::{IOTracker, IoMetricsGuard};
 use tokio::runtime::Handle;
 
+mod local_resources;
+pub(crate) use local_resources::ResourceLocalWriter;
+
+/// Pre-admitted ownership of one newly created output file.
+/// A lifecycle enables atomic publication without replacing an existing file.
+/// Its callback must only mark existing state, without allocation or I/O.
+///
+/// ```
+/// use std::sync::atomic::{AtomicBool, Ordering};
+/// use lance_io::object_writer::OutputLifecycle;
+/// #[derive(Debug, Default)]
+/// struct Output(AtomicBool);
+/// impl OutputLifecycle for Output {
+///     fn published(&self) { self.0.store(true, Ordering::Release); }
+/// }
+/// ```
+#[doc(hidden)]
+pub trait OutputLifecycle: std::fmt::Debug + Send + Sync {
+    /// Mark this file owned only after its no-replace publication succeeds.
+    fn published(&self);
+}
+
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
 
