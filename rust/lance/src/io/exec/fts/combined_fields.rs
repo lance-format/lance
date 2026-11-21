@@ -472,7 +472,7 @@ pub(super) async fn open_combined_fields_scan(
             query.column_names().collect::<Vec<_>>()
         )),
     })?;
-    let mut tokenizer = params.build()?;
+    let mut tokenizer = tokenizer_for_scan(&columns, &params)?;
     let tokens = try_collect_query_tokens(query.terms(), &mut tokenizer)?;
     record_tokenized_query(tokenized_query, &tokens);
 
@@ -482,6 +482,21 @@ pub(super) async fn open_combined_fields_scan(
         tokens,
         tokenizer,
     })
+}
+
+/// Reuse a cached tokenizer from an already-opened index whenever one is
+/// available (preserving dictionary sharing for heavy tokenizers such as Jieba
+/// on warm queries); only construct from persisted parameters when scoped
+/// execution opened zero segments.
+fn tokenizer_for_scan(
+    columns: &[CombinedFieldColumn],
+    fallback_params: &InvertedIndexParams,
+) -> DataFusionResult<Box<dyn LanceTokenizer>> {
+    if let Some(index) = columns.iter().find_map(|column| column.indices.first()) {
+        Ok(index.tokenizer())
+    } else {
+        fallback_params.build().map_err(Into::into)
+    }
 }
 
 impl ExecutionPlan for CombinedFieldsQueryExec {
@@ -690,5 +705,81 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::DatasetIndexExt;
+    use arrow_array::{RecordBatchIterator, record_batch};
+    use lance_index::IndexType;
+
+    #[tokio::test]
+    async fn tokenizer_for_scan_reuses_opened_index_and_falls_back_when_empty() {
+        let batch = record_batch!(
+            ("title", Utf8, ["alpha beta"]),
+            ("body", Utf8, ["gamma delta"])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let valid_params = InvertedIndexParams::default();
+        for column in ["title", "body"] {
+            dataset
+                .create_index(&[column], IndexType::Inverted, None, &valid_params, true)
+                .await
+                .unwrap();
+        }
+        let query = CombinedFieldsQuery::try_new(
+            "alpha".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = FtsIndexMetrics::new(&metrics_set, 0);
+        let scan = open_combined_fields_scan(
+            &dataset,
+            &query,
+            None,
+            CombinedFieldsIndexRequirement::EveryColumn,
+            &[],
+            &OnceLock::new(),
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert!(!scan.columns[0].indices.is_empty());
+
+        // Passing invalid fallback params proves an opened index's cached
+        // tokenizer is cloned rather than rebuilt from InvertedIndexParams.
+        let invalid_params =
+            InvertedIndexParams::default().base_tokenizer("nonexistent_tokenizer".to_string());
+        let mut reused = tokenizer_for_scan(&scan.columns, &invalid_params)
+            .expect("opened index tokenizer should be cloned without calling params.build()");
+        let tokens = try_collect_query_tokens("alpha", &mut reused).unwrap();
+        assert_eq!(tokens.len(), 1);
+
+        // When scoped execution opens zero segments, parameter-based
+        // construction is used.
+        let empty_columns = vec![CombinedFieldColumn {
+            column: "title".to_string(),
+            weight: 1.0,
+            indices: Vec::new(),
+            stale_rows: None,
+        }];
+        let mut built = tokenizer_for_scan(&empty_columns, &valid_params)
+            .expect("zero-segment scan should build tokenizer from params");
+        assert_eq!(
+            try_collect_query_tokens("alpha", &mut built).unwrap().len(),
+            1
+        );
+        assert!(tokenizer_for_scan(&empty_columns, &invalid_params).is_err());
     }
 }
