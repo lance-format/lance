@@ -41,14 +41,16 @@ use lance_index::scalar::inverted::query::{
     uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::{
-    DocumentGranularity, FlatBm25SearchOptions, MemBM25Scorer, build_global_bm25_scorer,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema,
+    DocumentGranularity, FlatBm25FuzzyOptions, FlatBm25SearchOptions, MemBM25Scorer,
+    PreparedBm25Query, build_global_bm25_scorer, flat_bm25_search_stream_with_fuzzy_and_scorer,
+    fts_schema,
 };
 use tracing::instrument;
 
 use super::corpus::{SharedFtsScorer, SharedFtsScorerProducer};
 use super::query_tokens::{
     TokenizedQuery, default_text_tokenizer, fmt_tokenized_query, record_tokenized_query,
+    tokenizer_for_match_query_from_base,
 };
 use super::segments::{open_fts_segment, open_fts_segments};
 use super::selection::FtsIndexMetrics;
@@ -681,6 +683,9 @@ pub struct FlatMatchQueryExec {
     /// Optional override for the BM25 scorer normally built locally inside
     /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    /// Optional canonical expanded vocabulary + corpus-wide BM25 scorer.
+    /// Mutually exclusive with `base_scorer`.
+    prepared_query: Option<Arc<PreparedBm25Query>>,
     /// Publishes the scorer extended with this flat branch's documents.
     shared_scorer: Option<Arc<SharedFtsScorer>>,
     /// Optional pre-resolved segment list. See
@@ -763,6 +768,7 @@ impl FlatMatchQueryExec {
             unindexed_input,
             candidate_filter: PreFilterSource::None,
             base_scorer: None,
+            prepared_query: None,
             shared_scorer: None,
             preset_segments: None,
             document_granularity,
@@ -821,6 +827,7 @@ impl FlatMatchQueryExec {
             params,
             unindexed_input,
             base_scorer: None,
+            prepared_query: None,
             shared_scorer: None,
             preset_segments: Some(segments),
             candidate_filter: PreFilterSource::None,
@@ -836,6 +843,15 @@ impl FlatMatchQueryExec {
     /// [`super::MatchQueryExec::with_base_scorer`].
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self.prepared_query = None;
+        self
+    }
+
+    /// Override flat fuzzy expansion and corpus scoring with a canonical
+    /// [`PreparedBm25Query`]; see [`super::MatchQueryExec::with_prepared_query`].
+    pub fn with_prepared_query(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
+        self.prepared_query = Some(prepared);
+        self.base_scorer = None;
         self
     }
 
@@ -862,6 +878,7 @@ impl FlatMatchQueryExec {
             unindexed_input: self.unindexed_input.clone(),
             candidate_filter: self.candidate_filter.clone(),
             base_scorer: self.base_scorer.clone(),
+            prepared_query: self.prepared_query.clone(),
             shared_scorer: Some(scorer),
             preset_segments: self.preset_segments.clone(),
             document_granularity: self.document_granularity,
@@ -927,6 +944,10 @@ impl FlatMatchQueryExec {
         self.base_scorer.as_ref()
     }
 
+    pub fn prepared_query(&self) -> Option<&Arc<PreparedBm25Query>> {
+        self.prepared_query.as_ref()
+    }
+
     pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
         self.preset_segments.as_deref()
     }
@@ -987,6 +1008,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             unindexed_input,
             candidate_filter,
             base_scorer: self.base_scorer.clone(),
+            prepared_query: self.prepared_query.clone(),
             shared_scorer: self.shared_scorer.clone(),
             preset_segments: self.preset_segments.clone(),
             document_granularity: self.document_granularity,
@@ -1008,6 +1030,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let candidate_filter = self.candidate_filter.clone();
         let preset_base_scorer = self.base_scorer.clone();
+        let preset_prepared_query = self.prepared_query.clone();
         let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -1044,17 +1067,18 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let stream = stream::once(async move {
             let shared_scorer_producer = shared_scorer_producer;
             let result = async {
+                let is_fuzzy = uses_fuzzy_expansion(query.fuzziness);
                 let segments = match preset_segments {
                     Some(segments) => Some(segments),
                     None => load_segments(&ds, &column, document_granularity).await?,
                 };
-                let (tokenizer, base_scorer) = match segments {
+                let (doc_tokenizer, query_tokenizer, opened_indices, base_scorer) = match segments {
                     Some(segments) if segments.is_empty() => {
                         // A residual-only distributed scope must not implicitly
                         // open every committed segment. Read tokenizer metadata
                         // from the pinned snapshot without constructing an index
                         // or borrowing any of its document/term statistics.
-                        let mut tokenizer =
+                        let doc_tokenizer =
                             match load_segments(&ds, &column, document_granularity).await? {
                                 Some(metadata) => {
                                     let segment = metadata.first().ok_or_else(|| {
@@ -1064,10 +1088,17 @@ impl ExecutionPlan for FlatMatchQueryExec {
                                 }
                                 None => default_text_tokenizer(),
                             };
-                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                        let mut query_tokenizer = tokenizer_for_match_query_from_base(
+                            doc_tokenizer.as_ref(),
+                            query.fuzziness,
+                        );
+                        let query_tokens =
+                            try_collect_query_tokens(&query.terms, &mut query_tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
                         (
-                            tokenizer,
+                            doc_tokenizer,
+                            query_tokenizer,
+                            Vec::new(),
                             preset_base_scorer.map(|scorer| (*scorer).clone()),
                         )
                     }
@@ -1082,11 +1113,17 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         let first_index = indices.first().ok_or(DataFusionError::Execution(
                             format!("FTS index for column {} has no segments", column),
                         ))?;
-                        let mut tokenizer = first_index.tokenizer();
-                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                        let doc_tokenizer = first_index.tokenizer();
+                        let mut query_tokenizer = tokenizer_for_match_query_from_base(
+                            doc_tokenizer.as_ref(),
+                            query.fuzziness,
+                        );
+                        let query_tokens =
+                            try_collect_query_tokens(&query.terms, &mut query_tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
                         let base_scorer = match preset_base_scorer {
-                            Some(scorer) => (*scorer).clone(),
+                            Some(scorer) => Some((*scorer).clone()),
+                            None if is_fuzzy || preset_prepared_query.is_some() => None,
                             None => {
                                 let scorer_start = std::time::Instant::now();
                                 let scorer = build_global_bm25_scorer(
@@ -1098,24 +1135,36 @@ impl ExecutionPlan for FlatMatchQueryExec {
                                 .boxed()
                                 .await?;
                                 metrics.record_scorer_build(scorer_start.elapsed());
-                                scorer
+                                Some(scorer)
                             }
                         };
-                        (tokenizer, Some(base_scorer))
+                        (doc_tokenizer, query_tokenizer, indices, base_scorer)
                     }
                     None => {
-                        let mut tokenizer = default_text_tokenizer();
-                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                        let doc_tokenizer = default_text_tokenizer();
+                        let mut query_tokenizer = tokenizer_for_match_query_from_base(
+                            doc_tokenizer.as_ref(),
+                            query.fuzziness,
+                        );
+                        let query_tokens =
+                            try_collect_query_tokens(&query.terms, &mut query_tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
-                        (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
+                        (
+                            doc_tokenizer,
+                            query_tokenizer,
+                            Vec::new(),
+                            preset_base_scorer.map(|s| (*s).clone()),
+                        )
                     }
                 };
 
-                flat_bm25_search_stream_with_options_and_scorer(
+                flat_bm25_search_stream_with_fuzzy_and_scorer(
                     unindexed_input,
                     document_column,
                     query.terms,
-                    tokenizer,
+                    doc_tokenizer,
+                    query_tokenizer,
+                    &opened_indices,
                     base_scorer,
                     FlatBm25SearchOptions {
                         target_batch_size,
@@ -1124,6 +1173,12 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         boost: query.boost,
                         document_granularity,
                         phrase_slop,
+                    },
+                    FlatBm25FuzzyOptions {
+                        fuzziness: query.fuzziness,
+                        max_expansions: query.max_expansions,
+                        prefix_length: query.prefix_length,
+                        prepared_query: preset_prepared_query,
                     },
                 )
                 .await
@@ -1409,5 +1464,109 @@ mod tests {
             .unwrap();
         let analysis = analyze_scanner.analyze_plan().await.unwrap();
         assert!(analysis.contains(PARTITIONS_SEARCHED_METRIC));
+    }
+
+    #[tokio::test]
+    async fn test_flat_match_query_exec_fuzzy_matches_indexed_scores() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, Operator};
+        use std::collections::BTreeMap;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    "aapa foo",
+                    "abpa bar",
+                    "acpa baz",
+                    "alpha beta",
+                    "alpa beta",
+                    "unrelated doc",
+                ])),
+            ],
+        )
+        .unwrap();
+        let unindexed_ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            "memory://flat_fuzzy_unindexed",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut indexed_ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://flat_fuzzy_indexed",
+            None,
+        )
+        .await
+        .unwrap();
+        indexed_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().stem(false).lower_case(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let queries = [
+            MatchQuery::new("alpa".to_string())
+                .with_column(Some("text".to_string()))
+                .with_fuzziness(Some(1))
+                .with_max_expansions(2),
+            MatchQuery::new("alpa".to_string())
+                .with_column(Some("text".to_string()))
+                .with_fuzziness(Some(1))
+                .with_prefix_length(2),
+            MatchQuery::new("alpa betz".to_string())
+                .with_column(Some("text".to_string()))
+                .with_fuzziness(Some(1))
+                .with_operator(Operator::And),
+        ];
+
+        for query in queries {
+            let mut flat_scan = unindexed_ds.scan();
+            flat_scan
+                .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                    query.clone(),
+                )))
+                .unwrap();
+            let flat_batch = flat_scan.try_into_batch().await.unwrap();
+
+            let mut idx_scan = indexed_ds.scan();
+            idx_scan
+                .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(query)))
+                .unwrap();
+            let idx_batch = idx_scan.try_into_batch().await.unwrap();
+
+            let to_map = |b: &RecordBatch| -> BTreeMap<i32, f32> {
+                let ids = b["id"].as_primitive::<arrow_array::types::Int32Type>();
+                let scores = b["_score"].as_primitive::<arrow_array::types::Float32Type>();
+                ids.values()
+                    .iter()
+                    .copied()
+                    .zip(scores.values().iter().copied())
+                    .collect()
+            };
+            let flat_map = to_map(&flat_batch);
+            let idx_map = to_map(&idx_batch);
+            assert_eq!(flat_map.len(), idx_map.len());
+            assert!(!flat_map.is_empty());
+            for (id, idx_score) in idx_map {
+                let flat_score = flat_map[&id];
+                assert!(
+                    (flat_score - idx_score).abs() < 1e-4,
+                    "row {id}: flat={flat_score} indexed={idx_score}"
+                );
+            }
+        }
     }
 }
