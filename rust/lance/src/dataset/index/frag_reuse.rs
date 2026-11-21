@@ -568,9 +568,10 @@ pub(crate) fn is_tagged_trim_operation(
 
 /// Derive the trimmed tagged entry from the CURRENT manifest state.
 ///
-/// Zero payload IO: retention is computed from the entry's digests and the
-/// stored index metadata alone. Row-map files released by trimming a
-/// stable-partition transition are collected separately by dataset cleanup.
+/// Zero payload IO: retention is computed from the entry's digests, the
+/// stored index metadata and the manifest's live fragments alone. Row-map
+/// files released by trimming a stable-partition transition are collected
+/// separately by dataset cleanup.
 pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<TaggedTrimOutcome> {
     let indices = read_manifest_indexes(
         &dataset.object_store,
@@ -603,8 +604,14 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
         ));
     }
     let elements = split_trim_elements(&content)?;
-    let retained =
-        compute_tagged_retention(&elements, &indices, crate::index::segment::index_is_usable);
+    // The live fragments of the same snapshot `indices` was read from; the
+    // commit-time rebase calls this again with the rebased dataset.
+    let retained = compute_tagged_retention(
+        &elements,
+        &indices,
+        dataset.fragment_bitmap.as_ref(),
+        crate::index::segment::index_is_usable,
+    );
 
     if retained.iter().all(|kept| *kept) {
         return Ok(TaggedTrimOutcome::NothingToTrim);
@@ -1189,6 +1196,7 @@ pub(crate) mod tests {
             decode_frag_reuse_ledger, load_frag_reuse_records, load_raw_frag_reuse_content,
         };
         use crate::index::frag_reuse_reader::tests as reader_tests;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int32Type;
         use lance_index::IndexType;
@@ -1238,6 +1246,10 @@ pub(crate) mod tests {
             index
         }
 
+        fn live(fragments: &[u32]) -> RoaringBitmap {
+            fragments.iter().copied().collect()
+        }
+
         /// The per-transition retention rule (B1-B5, B7-B9): retain iff some
         /// logical index still derives coverage from the transition's sources
         /// while not directly covering every destination.
@@ -1245,8 +1257,12 @@ pub(crate) mod tests {
         fn transition_retention_rules() {
             let elements = vec![transition_element(&[1, 2], &[5, 6])];
             let retain = |indices: &[IndexMetadata]| {
-                compute_tagged_retention(&elements, indices, crate::index::segment::index_is_usable)
-                    [0]
+                compute_tagged_retention(
+                    &elements,
+                    indices,
+                    &live(&[3, 4, 5, 6]),
+                    crate::index::segment::index_is_usable,
+                )[0]
             };
 
             // B1: a disjoint index does not block the trim.
@@ -1294,6 +1310,7 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 1, &[1])],
+                    &live(&[3]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![true, true]
@@ -1303,6 +1320,7 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 1, &[2])],
+                    &live(&[3]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![false, true]
@@ -1312,6 +1330,7 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 2, &[3])],
+                    &live(&[3]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![false, false]
@@ -1332,6 +1351,7 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 5, &[1])],
+                    &live(&[3]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![true, true]
@@ -1342,6 +1362,7 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 11, &[3])],
+                    &live(&[3]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![false, false]
@@ -1359,10 +1380,615 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 5, &[1])],
+                    &live(&[2, 7]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![true, true]
             );
+        }
+
+        /// A retired destination is settled for an index once every
+        /// destination of the record consuming it is settled, so a stable
+        /// partition followed by a compaction onto a directly covered fragment
+        /// releases both. Settlement is per index and counts only usable
+        /// segments.
+        #[rstest::rstest]
+        #[case::chain_settled_by_direct_coverage(
+            vec![
+                named_index("a_idx", 1, &[1, 3]),
+                named_index("a_idx", 1, &[2, 4]),
+                named_index("a_idx", 3, &[30]),
+            ],
+            &[3, 4, 30],
+            vec![false, false]
+        )]
+        #[case::other_index_lacks_final_coverage(
+            vec![
+                named_index("a_idx", 1, &[1, 3]),
+                named_index("a_idx", 1, &[2, 4]),
+                named_index("a_idx", 3, &[30]),
+                named_index("b_idx", 1, &[1, 2]),
+            ],
+            &[3, 4, 30],
+            vec![true, true]
+        )]
+        #[case::final_coverage_unusable(
+            vec![
+                named_index("a_idx", 1, &[1, 3]),
+                named_index("a_idx", 1, &[2, 4]),
+                {
+                    let mut unusable = named_index("a_idx", 3, &[30]);
+                    unusable.index_details = unusable_details();
+                    unusable
+                },
+            ],
+            &[3, 4, 30],
+            vec![true, true]
+        )]
+        #[case::final_destination_live_and_uncovered(
+            vec![named_index("a_idx", 1, &[1, 3]), named_index("a_idx", 1, &[2, 4])],
+            &[3, 4, 30],
+            vec![true, true]
+        )]
+        fn chain_retention_settles_retired_destinations(
+            #[case] indices: Vec<IndexMetadata>,
+            #[case] live_fragments: &[u32],
+            #[case] expected: Vec<bool>,
+        ) {
+            let elements = vec![
+                transition_element(&[1, 2], &[10]),
+                transition_element(&[10], &[30]),
+            ];
+            assert_eq!(
+                compute_tagged_retention(
+                    &elements,
+                    &indices,
+                    &live(live_fragments),
+                    crate::index::segment::index_is_usable
+                ),
+                expected
+            );
+        }
+
+        /// A sibling destination that is live and not directly covered keeps
+        /// the transition, and the forward closure keeps the settled branch's
+        /// consumer with it.
+        #[test]
+        fn live_uncovered_sibling_destination_retains_chain() {
+            let elements = vec![
+                transition_element(&[1, 2], &[10, 11]),
+                transition_element(&[10], &[30]),
+            ];
+            assert_eq!(
+                compute_tagged_retention(
+                    &elements,
+                    &[
+                        named_index("a_idx", 1, &[1, 3]),
+                        named_index("a_idx", 1, &[2, 4]),
+                        named_index("a_idx", 3, &[30]),
+                    ],
+                    &live(&[3, 4, 11, 30]),
+                    crate::index::segment::index_is_usable
+                ),
+                vec![true, true]
+            );
+        }
+
+        /// A retired destination that no record consumes had its rows
+        /// deleted, so it leads to no live fragment and the transition is
+        /// released.
+        #[test]
+        fn retired_destination_without_consumer_is_released() {
+            let elements = vec![transition_element(&[1, 2], &[10])];
+            assert_eq!(
+                compute_tagged_retention(
+                    &elements,
+                    &[
+                        named_index("a_idx", 1, &[1, 3]),
+                        named_index("a_idx", 1, &[2, 4]),
+                    ],
+                    &live(&[3, 4]),
+                    crate::index::segment::index_is_usable
+                ),
+                vec![false]
+            );
+        }
+
+        /// The settledness walk treats a lifted legacy group like any other
+        /// consumer, while the legacy version itself keeps the v0 predicate.
+        #[test]
+        fn settled_chain_passes_through_legacy_group() {
+            let elements = vec![
+                transition_element(&[1], &[2]),
+                legacy_element(10, &[2], &[3]),
+            ];
+            // Rebuilt past the legacy version onto its output: settled.
+            assert_eq!(
+                compute_tagged_retention(
+                    &elements,
+                    &[named_index("a_idx", 11, &[1, 3])],
+                    &live(&[3]),
+                    crate::index::segment::index_is_usable
+                ),
+                vec![false, false]
+            );
+            // The legacy output is live and uncovered: the transition stays
+            // and the forward closure keeps the legacy version it feeds.
+            assert_eq!(
+                compute_tagged_retention(
+                    &elements,
+                    &[named_index("a_idx", 11, &[1])],
+                    &live(&[3]),
+                    crate::index::segment::index_is_usable
+                ),
+                vec![true, true]
+            );
+        }
+
+        /// Three hops fanning out to two leaves: every hop is released once
+        /// both leaves are covered, and one live uncovered leaf retains all of
+        /// them (the settled branch through the forward closure).
+        #[test]
+        fn three_hop_chain_settles_only_when_every_leaf_is_covered() {
+            let elements = vec![
+                transition_element(&[1], &[2]),
+                transition_element(&[2], &[3, 4]),
+                transition_element(&[3], &[5]),
+            ];
+            let retain = |covered_leaves: &[u32]| {
+                compute_tagged_retention(
+                    &elements,
+                    &[
+                        named_index("a_idx", 1, &[1]),
+                        named_index("a_idx", 2, covered_leaves),
+                    ],
+                    &live(&[4, 5]),
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert_eq!(retain(&[4, 5]), vec![false, false, false]);
+            assert_eq!(retain(&[5]), vec![true, true, true]);
+        }
+
+        /// A consumer whose rows were all deleted has no destinations and is
+        /// settled, so it does not pin the transition producing its source.
+        #[test]
+        fn consumer_without_destinations_is_settled() {
+            let elements = vec![
+                transition_element(&[1, 2], &[10, 11]),
+                transition_element(&[11], &[]),
+                transition_element(&[10], &[30]),
+            ];
+            let retain = |indices: &[IndexMetadata]| {
+                compute_tagged_retention(
+                    &elements,
+                    indices,
+                    &live(&[30]),
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert_eq!(
+                retain(&[
+                    named_index("a_idx", 1, &[1, 2]),
+                    named_index("a_idx", 3, &[30]),
+                ]),
+                vec![false, false, false]
+            );
+            assert_eq!(
+                retain(&[named_index("a_idx", 1, &[1, 2])]),
+                vec![true, true, true]
+            );
+        }
+
+        /// A segment storing only fragment 1 forces transition `1 -> 2` to walk
+        /// the retired descendants through all hops to the live leaf, on the
+        /// heap rather than the call stack. With a second segment storing the
+        /// leaf every transition is released; without it the first transition
+        /// is needed and its forward closure retains all of them.
+        #[test]
+        fn long_chain_settles_without_deep_recursion() {
+            const HOPS: u64 = 5_000;
+            let elements: Vec<TrimElement> = (1..=HOPS)
+                .map(|hop| transition_element(&[hop], &[hop + 1]))
+                .collect();
+            let leaf = (HOPS + 1) as u32;
+            let pinner = named_index("a_idx", 1, &[1]);
+            let retain = |indices: &[IndexMetadata]| {
+                compute_tagged_retention(
+                    &elements,
+                    indices,
+                    &live(&[leaf]),
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert!(
+                retain(&[pinner.clone(), named_index("a_idx", 2, &[leaf])])
+                    .iter()
+                    .all(|kept| !kept)
+            );
+            assert!(retain(&[pinner]).iter().all(|kept| *kept));
+        }
+
+        /// A destination deleted outright releases its transition, while a
+        /// live sibling destination outside direct coverage keeps it.
+        #[test]
+        fn deleted_destination_releases_unless_sibling_is_live() {
+            let elements = vec![transition_element(&[1, 2], &[10, 11])];
+            let indices = [named_index("a_idx", 1, &[1]), named_index("a_idx", 1, &[2])];
+            let retain = |live_fragments: &[u32]| {
+                compute_tagged_retention(
+                    &elements,
+                    &indices,
+                    &live(live_fragments),
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert_eq!(retain(&[]), vec![false]);
+            assert_eq!(retain(&[11]), vec![true]);
+        }
+
+        /// A fan-in with only some sources in provenance stays retained: a
+        /// later segment over the other sources may complete it.
+        #[test]
+        fn fan_in_with_partial_provenance_retains() {
+            let elements = vec![transition_element(&[1, 2], &[3])];
+            assert_eq!(
+                compute_tagged_retention(
+                    &elements,
+                    &[named_index("a_idx", 1, &[1])],
+                    &live(&[3]),
+                    crate::index::segment::index_is_usable
+                ),
+                vec![true]
+            );
+        }
+
+        /// The walk stops at a usable segment's retired fragment, so the hop
+        /// upstream of it is released; an unusable segment does not stop it.
+        #[test]
+        fn walk_stops_at_directly_covered_retired_fragment() {
+            let elements = vec![
+                transition_element(&[1], &[2]),
+                transition_element(&[2], &[3]),
+            ];
+            let mut unusable = named_index("a_idx", 2, &[2]);
+            unusable.index_details = unusable_details();
+            let retain = |indices: &[IndexMetadata]| {
+                compute_tagged_retention(
+                    &elements,
+                    indices,
+                    &live(&[3]),
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert_eq!(
+                retain(&[named_index("a_idx", 1, &[1]), named_index("a_idx", 2, &[2])]),
+                vec![false, true]
+            );
+            assert_eq!(
+                retain(&[named_index("a_idx", 1, &[1]), unusable]),
+                vec![true, true]
+            );
+        }
+
+        /// A pin several hops upstream of the live fragment retains every hop
+        /// between them; direct coverage of the live fragment releases all.
+        #[test]
+        fn upstream_pin_retains_every_hop_to_the_live_fragment() {
+            let elements = vec![
+                transition_element(&[1], &[2]),
+                transition_element(&[2], &[3]),
+                transition_element(&[3], &[4]),
+            ];
+            let retain = |indices: &[IndexMetadata]| {
+                compute_tagged_retention(
+                    &elements,
+                    indices,
+                    &live(&[4]),
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert_eq!(
+                retain(&[named_index("a_idx", 1, &[1])]),
+                vec![true, true, true]
+            );
+            assert_eq!(
+                retain(&[named_index("a_idx", 1, &[1]), named_index("a_idx", 2, &[4])]),
+                vec![false, false, false]
+            );
+        }
+
+        /// A wide transition whose destinations are all live and directly
+        /// covered is released; one uncovered destination retains it.
+        #[test]
+        fn wide_transition_releases_only_when_every_destination_is_covered() {
+            const WIDTH: u64 = 32_768;
+            let sources: Vec<u64> = (1..=WIDTH).collect();
+            let destinations: Vec<u64> = (WIDTH + 1..=2 * WIDTH).collect();
+            let elements = vec![transition_element(&sources, &destinations)];
+            let source_ids: Vec<u32> = sources.iter().map(|&id| id as u32).collect();
+            let destination_ids: Vec<u32> = destinations.iter().map(|&id| id as u32).collect();
+            let live_fragments = live(&destination_ids);
+            let retain = |covered: &[u32]| {
+                compute_tagged_retention(
+                    &elements,
+                    &[
+                        named_index("a_idx", 1, &source_ids),
+                        named_index("a_idx", 2, covered),
+                    ],
+                    &live_fragments,
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert_eq!(retain(&destination_ids), vec![false]);
+            assert_eq!(
+                retain(&destination_ids[..destination_ids.len() - 1]),
+                vec![true]
+            );
+        }
+
+        /// Two records naming the same destination are both walked; only the
+        /// one with a pin behind it is retained.
+        #[test]
+        fn duplicate_producers_are_both_walked() {
+            let elements = vec![
+                transition_element(&[1], &[5]),
+                transition_element(&[2], &[5]),
+            ];
+            let retain = |covered: &[u32]| {
+                compute_tagged_retention(
+                    &elements,
+                    &[named_index("a_idx", 1, covered)],
+                    &live(&[5]),
+                    crate::index::segment::index_is_usable,
+                )
+            };
+            assert_eq!(retain(&[1]), vec![true, false]);
+            assert_eq!(retain(&[2]), vec![false, true]);
+            assert_eq!(retain(&[1, 2]), vec![true, true]);
+        }
+
+        /// Deterministic linear congruential generator for generated histories.
+        struct Lcg(u64);
+
+        impl Lcg {
+            fn below(&mut self, bound: u64) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (self.0 >> 33) % bound
+            }
+
+            fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
+                self.below(denominator) < numerator
+            }
+        }
+
+        struct GeneratedHistory {
+            elements: Vec<TrimElement>,
+            indices: Vec<IndexMetadata>,
+            live: RoaringBitmap,
+        }
+
+        /// A valid history: acyclic, each fragment produced at most once and
+        /// consumed at most once, ids never reused. Lifted legacy versions
+        /// come first; segments are random subsets of every fragment ever
+        /// named (so fan-ins get partial provenance), some unusable, some
+        /// without a bitmap.
+        fn generate_history(rng: &mut Lcg) -> GeneratedHistory {
+            let originals = 2 + rng.below(4);
+            let mut next_id = originals + 1;
+            let mut available: Vec<u64> = (1..next_id).collect();
+            let mut elements = Vec::new();
+            let mut tagged = false;
+            for position in 0..1 + rng.below(6) {
+                if available.is_empty() {
+                    break;
+                }
+                let source_count = 1 + rng.below(available.len().min(3) as u64);
+                let sources: Vec<u64> = (0..source_count)
+                    .map(|_| available.swap_remove(rng.below(available.len() as u64) as usize))
+                    .collect();
+                let destination_count = if rng.chance(1, 8) {
+                    0
+                } else {
+                    1 + rng.below(3)
+                };
+                let destinations: Vec<u64> = (next_id..next_id + destination_count).collect();
+                next_id += destination_count;
+                available.extend(&destinations);
+                tagged |= rng.chance(3, 4);
+                elements.push(if tagged {
+                    transition_element(&sources, &destinations)
+                } else {
+                    legacy_element(10 * (position + 1), &sources, &destinations)
+                });
+            }
+            let live = available
+                .iter()
+                .filter(|_| rng.chance(3, 4))
+                .map(|&id| id as u32)
+                .collect();
+            let indices = (0..rng.below(5))
+                .map(|_| {
+                    let name = if rng.chance(1, 3) { "b_idx" } else { "a_idx" };
+                    let covered: Vec<u32> = (1..next_id)
+                        .filter(|_| rng.chance(1, 3))
+                        .map(|id| id as u32)
+                        .collect();
+                    let mut index = named_index(name, 1 + rng.below(80), &covered);
+                    if rng.chance(1, 4) {
+                        index.index_details = unusable_details();
+                    }
+                    if rng.chance(1, 10) {
+                        index.fragment_bitmap = None;
+                    }
+                    index
+                })
+                .collect();
+            GeneratedHistory {
+                elements,
+                indices,
+                live,
+            }
+        }
+
+        /// The retention rule written independently of the production walk:
+        /// a record reaches a live fragment when one of its destinations
+        /// outside direct coverage is live or consumed by a reaching record;
+        /// it is pinned when a source is in provenance or a source outside
+        /// direct coverage has a pinned producer. Seeds are the legacy
+        /// versions failing the v0 predicate and the reaching, pinned
+        /// transitions; retention is their forward closure at element
+        /// granularity.
+        fn reference_retention(
+            elements: &[TrimElement],
+            indices: &[IndexMetadata],
+            live_fragments: &RoaringBitmap,
+        ) -> Vec<bool> {
+            struct Record {
+                element: usize,
+                tagged: bool,
+                sources: Vec<u64>,
+                destinations: Vec<u64>,
+            }
+            let mut records = Vec::new();
+            let mut legacy_versions = Vec::new();
+            for (element, trim_element) in elements.iter().enumerate() {
+                match &trim_element.record {
+                    TrimRecord::LegacyVersion(version) => {
+                        legacy_versions.push((element, version.clone()));
+                        for group in &version.groups {
+                            records.push(Record {
+                                element,
+                                tagged: false,
+                                sources: group.old_frags.iter().map(|f| f.id).collect(),
+                                destinations: group.new_frags.iter().map(|f| f.id).collect(),
+                            });
+                        }
+                    }
+                    TrimRecord::Transition(transition) => records.push(Record {
+                        element,
+                        tagged: true,
+                        sources: transition.sources.iter().map(|d| d.id).collect(),
+                        destinations: transition.destinations.iter().map(|d| d.id).collect(),
+                    }),
+                }
+            }
+            let contains = |bitmap: &RoaringBitmap, id: u64| {
+                u32::try_from(id).is_ok_and(|id| bitmap.contains(id))
+            };
+
+            let mut retained = vec![false; elements.len()];
+            let versions: Vec<lance_index::frag_reuse::FragReuseVersion> =
+                legacy_versions.iter().map(|(_, v)| v.clone()).collect();
+            let chain = reuse_chain_frag_bitmap(&versions);
+            for (element, version) in &legacy_versions {
+                let caught_up = indices
+                    .iter()
+                    .map(|index| is_index_remap_caught_up(version, index, &chain))
+                    .collect::<lance_core::Result<Vec<bool>>>();
+                if let Ok(caught_up) = caught_up {
+                    retained[*element] = !caught_up.into_iter().all(|ok| ok);
+                }
+            }
+
+            let mut groups: HashMap<&str, (RoaringBitmap, RoaringBitmap)> = HashMap::new();
+            for index in indices {
+                let group = groups.entry(index.name.as_str()).or_default();
+                if let Some(bitmap) = &index.fragment_bitmap {
+                    group.0 |= bitmap;
+                    if crate::index::segment::index_is_usable(index) {
+                        group.1 |= bitmap;
+                    }
+                }
+            }
+            fn reaches(
+                record: usize,
+                records: &[Record],
+                direct: &RoaringBitmap,
+                live: &RoaringBitmap,
+                contains: &dyn Fn(&RoaringBitmap, u64) -> bool,
+            ) -> bool {
+                records[record].destinations.iter().any(|&d| {
+                    !contains(direct, d)
+                        && (contains(live, d)
+                            || (0..records.len()).any(|other| {
+                                records[other].sources.contains(&d)
+                                    && reaches(other, records, direct, live, contains)
+                            }))
+                })
+            }
+            fn pinned(
+                record: usize,
+                records: &[Record],
+                provenance: &RoaringBitmap,
+                direct: &RoaringBitmap,
+                contains: &dyn Fn(&RoaringBitmap, u64) -> bool,
+            ) -> bool {
+                records[record].sources.iter().any(|&s| {
+                    contains(provenance, s)
+                        || (!contains(direct, s)
+                            && (0..records.len()).any(|other| {
+                                records[other].destinations.contains(&s)
+                                    && pinned(other, records, provenance, direct, contains)
+                            }))
+                })
+            }
+            for (provenance, direct) in groups.values() {
+                for (index, record) in records.iter().enumerate() {
+                    if record.tagged
+                        && reaches(index, &records, direct, live_fragments, &contains)
+                        && pinned(index, &records, provenance, direct, &contains)
+                    {
+                        retained[record.element] = true;
+                    }
+                }
+            }
+
+            loop {
+                let mut changed = false;
+                for record in &records {
+                    if !retained[record.element] {
+                        continue;
+                    }
+                    for consumer in &records {
+                        if !retained[consumer.element]
+                            && consumer
+                                .sources
+                                .iter()
+                                .any(|s| record.destinations.contains(s))
+                        {
+                            retained[consumer.element] = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    return retained;
+                }
+            }
+        }
+
+        /// The production walk agrees with the independent reference on
+        /// generated valid histories.
+        #[test]
+        fn retention_matches_reference_on_generated_histories() {
+            let mut rng = Lcg(0x5eed_f00d);
+            for case in 0..400 {
+                let history = generate_history(&mut rng);
+                assert_eq!(
+                    compute_tagged_retention(
+                        &history.elements,
+                        &history.indices,
+                        &history.live,
+                        crate::index::segment::index_is_usable
+                    ),
+                    reference_retention(&history.elements, &history.indices, &history.live),
+                    "case {case}"
+                );
+            }
         }
 
         async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
@@ -1501,6 +2127,132 @@ pub(crate) mod tests {
             assert_eq!(dataset.count_rows(None).await.unwrap(), 12);
         }
 
+        /// Commit an `i_idx` BTree segment built over exactly `fragments`.
+        async fn commit_segment_over_fragments(dataset: &mut Dataset, fragments: &[u32]) -> Uuid {
+            let params = ScalarIndexParams::default();
+            let mut segment =
+                crate::index::CreateIndexBuilder::new(dataset, &["i"], IndexType::BTree, &params)
+                    .name("i_idx_segment".into())
+                    .fragments(fragments.to_vec())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segment.name = "i_idx".into();
+            let uuid = segment.uuid;
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![segment],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            uuid
+        }
+
+        /// A stable partition whose destinations were compacted away is
+        /// released once the compacted fragment is covered directly, even
+        /// though its own destinations are in no segment's bitmap: the
+        /// retired destinations are settled through their consumer. Both
+        /// older segments keep live fragments of their own, so they stay, and
+        /// every row is still served by the index exactly once.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn trim_releases_chain_settled_by_direct_coverage() {
+            // Fragments 0 and 1 hold four rows each, 2 and 3 hold eight, so
+            // the compaction below merges only the partition's destinations.
+            let dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+                .await
+                .unwrap();
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+                .into_batch_rows(lance_datagen::RowCount::from(16))
+                .unwrap();
+            let mut dataset = crate::dataset::InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    max_rows_per_file: 8,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![0, 1, 2, 3]
+            );
+            let segment_a = commit_segment_over_fragments(&mut dataset, &[0, 2]).await;
+            let segment_b = commit_segment_over_fragments(&mut dataset, &[1, 3]).await;
+            reserve_fragments(&mut dataset, 20).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 8,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let ledger = decode_frag_reuse_ledger(&dataset, &fri_entry(&dataset).await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(ledger.transitions().len(), 2);
+            let compaction = &ledger.transitions()[1];
+            assert!(matches!(
+                compaction.mapping(),
+                Mapping::OrderedCompaction(_)
+            ));
+            assert_eq!(
+                compaction
+                    .sources()
+                    .iter()
+                    .map(|d| d.id)
+                    .collect::<Vec<_>>(),
+                vec![10, 11]
+            );
+            let [compacted] = compaction.destinations() else {
+                panic!("the compaction must produce one fragment");
+            };
+            let compacted = compacted.id as u32;
+            let segment_c = commit_segment_over_fragments(&mut dataset, &[compacted]).await;
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+            assert!(fri_entry(&dataset).await.is_none());
+            let mut segments: Vec<Uuid> = stored_segments(&dataset, "i_idx")
+                .await
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect();
+            segments.sort();
+            let mut expected = vec![segment_a, segment_b, segment_c];
+            expected.sort();
+            assert_eq!(segments, expected);
+            for value in 0..24 {
+                let mut scan = dataset.scan();
+                scan.filter(&format!("i = {value}")).unwrap();
+                let plan = scan.explain_plan(false).await.unwrap();
+                assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+                assert_eq!(
+                    scan.try_into_batch().await.unwrap().num_rows(),
+                    1,
+                    "value {value}"
+                );
+            }
+        }
+
         /// Deletes after tagging (rows of one destination, then the other
         /// destination entirely) leave the history and the segment's stored
         /// provenance alone: the segment keeps translating, trim retains the
@@ -1612,6 +2364,106 @@ pub(crate) mod tests {
             assert_eq!(dataset.count_rows(Some("i = 3".into())).await.unwrap(), 1);
             assert_eq!(dataset.count_rows(Some("i = 4".into())).await.unwrap(), 0);
             assert_eq!(dataset.count_rows(Some("i = 101".into())).await.unwrap(), 1);
+        }
+
+        /// A real stable partition of an indexed table (evens to fragment 10,
+        /// odds to 11), then a delete of every even row, which drops fragment
+        /// 10 outright. With `cover_sibling` a segment then covers 11
+        /// directly. Trims twice and returns, from a fresh session, whether
+        /// the FRI entry survived the first trim; asserts the second trim
+        /// changes nothing and every remaining row is answered through the
+        /// index exactly once.
+        async fn trim_after_destination_deleted(cover_sibling: bool) -> bool {
+            let dir = lance_core::utils::tempfile::TempStrDir::default();
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_dataset(
+                    dir.as_str(),
+                    FragmentCount::from(2),
+                    FragmentRowCount::from(4),
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::BTree,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            reserve_fragments(&mut dataset, 20).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let entry = fri_entry(&dataset).await.unwrap();
+            dataset.delete("i % 2 = 0").await.unwrap();
+            assert_eq!(
+                dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![11]
+            );
+            if cover_sibling {
+                commit_segment_over_fragments(&mut dataset, &[11]).await;
+            }
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let after_first = fri_entry(&dataset).await.map(|index| index.uuid);
+            let version = dataset.manifest.version;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(
+                dataset.manifest.version, version,
+                "the second trim is a no-op"
+            );
+            assert_eq!(
+                fri_entry(&dataset).await.map(|index| index.uuid),
+                after_first
+            );
+
+            let dataset = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+                .with_session(Arc::new(crate::session::Session::default()))
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(
+                fri_entry(&dataset).await.map(|index| index.uuid),
+                after_first
+            );
+            for value in 0..8 {
+                let predicate = format!("i = {value}");
+                let plan = dataset
+                    .scan()
+                    .filter(&predicate)
+                    .unwrap()
+                    .use_scalar_index(true)
+                    .explain_plan(false)
+                    .await
+                    .unwrap();
+                assert!(plan.contains("ScalarIndexQuery"), "{predicate}: {plan}");
+                let indexed = filtered_values(&dataset, &predicate, true).await;
+                assert_eq!(indexed, filtered_values(&dataset, &predicate, false).await);
+                let expected = if value % 2 == 1 { vec![value] } else { vec![] };
+                assert_eq!(indexed, expected, "{predicate}");
+            }
+            if let Some(uuid) = after_first {
+                assert_eq!(uuid, entry.uuid, "a retained entry is left untouched");
+            }
+            after_first.is_some()
+        }
+
+        /// The live sibling destination is only translated, so the
+        /// transition stays.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deleted_destination_with_translated_sibling_retains() {
+            assert!(trim_after_destination_deleted(false).await);
+        }
+
+        /// The deleted destination pins nothing: once the sibling is covered
+        /// directly the transition is released.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deleted_destination_with_covered_sibling_releases() {
+            assert!(!trim_after_destination_deleted(true).await);
         }
 
         /// A trim committed from a stale read must re-derive at commit time:
@@ -1751,6 +2603,53 @@ pub(crate) mod tests {
                     .map(|d| d.id)
                     .collect::<Vec<_>>(),
                 vec![10, 11]
+            );
+        }
+
+        /// The rebased trim settles destinations against the live fragments
+        /// of the version it rebases onto: the stale read still sees the
+        /// second partition's destinations live, but a concurrent compaction
+        /// retires them onto a fragment a new segment covers directly, so the
+        /// rebase releases every record.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn trim_rebase_settles_against_rebased_live_fragments() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 40).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let mut dataset = commit_stable_partition(dataset, &[10, 11], 20).await;
+
+            // The trim's read: the first partition is releasable, the second
+            // is still needed because 20 and 21 are live and only translated.
+            let mut stale = dataset.clone();
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            commit_delta_segment(&mut dataset, None).await;
+
+            cleanup_frag_reuse_index(&mut stale).await.unwrap();
+            assert!(
+                fri_entry(&stale).await.is_none(),
+                "the rebase must settle the retired destinations of the second partition"
             );
         }
 
@@ -2156,6 +3055,7 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[pinner.clone(), unusable_taker],
+                    &live(&[5, 6]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![true],
@@ -2166,6 +3066,7 @@ pub(crate) mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[pinner, named_index("a_idx", 2, &[5, 6])],
+                    &live(&[5, 6]),
                     crate::index::segment::index_is_usable
                 ),
                 vec![false]
