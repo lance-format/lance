@@ -26,7 +26,6 @@ use crate::scalar::{
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -1193,29 +1192,32 @@ impl ScalarIndex for ZoneMapIndex {
     }
 
     fn can_remap(&self) -> bool {
-        false
+        true
     }
 
-    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    /// Relocate the stored zones through `mapping` into `dest_store`; see
+    /// [`ZoneMapIndex::remap_with_withdrawals`]. A remap that would have to
+    /// withdraw coverage of a destination fragment is refused with a
+    /// [`ZoneMapRemapNeedsWithdrawal`] before anything is written, since this
+    /// result cannot report it.
+    ///
+    /// `remap_streaming` keeps the trait default: a batch translator is
+    /// declined with a `RemapUnavailable` because `stored_fragments` is
+    /// unknown, so a segment on a tagged history keeps translating through
+    /// the reuse index instead.
     async fn remap(
         &self,
-        _mapping: &RowAddrRemap,
-        _dest_store: &dyn IndexStore,
+        mapping: &RowAddrRemap,
+        dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::invalid_input_source(
-            "ZoneMapIndex does not support remap".into(),
-        ))
-    }
-
-    async fn remap_streaming(
-        &self,
-        _translator: &RowAddrTranslator,
-        _dest_store: &dyn IndexStore,
-    ) -> Result<CreatedIndex> {
-        // No mapping to materialize for an index that cannot be remapped.
-        Err(Error::invalid_input_source(
-            "ZoneMapIndex does not support remap".into(),
-        ))
+        let remapped = self.remap_zones(mapping)?;
+        if !remapped.withdrawn_fragments.is_empty() {
+            return Err(ZoneMapRemapNeedsWithdrawal {
+                fragments: remapped.withdrawn_fragments,
+            }
+            .into_error());
+        }
+        self.write_remapped(remapped, dest_store).await
     }
 
     /// Add the new data , creating an updated version of the index in `dest_store`
@@ -1344,20 +1346,203 @@ impl ZoneMapIndex {
     }
 }
 
-/// The destination runs of `zone` under `remapper`. With `fragment_filter`,
-/// rows that land outside those fragments are dropped before the runs are
-/// built, so a run the caller would not keep can neither fail here nor be
-/// checked later.
+/// What relocating a segment's zones through a mapping produced, before it
+/// is written.
+struct RemappedZones {
+    zones: Vec<ZoneMapStatistics>,
+    null_rows: Option<RowAddrTreeMap>,
+    /// Destination fragments the segment stops covering: a run landing in
+    /// each has no sound counts, so none of its zones are kept.
+    withdrawn_fragments: RoaringBitmap,
+}
+
+impl ZoneMapIndex {
+    /// Relocate the stored zones through `mapping` into `dest_store` without
+    /// reading column data, returning the new segment and the destination
+    /// fragments it must not cover.
+    ///
+    /// The stored zones are translated exactly once, from the address domain
+    /// they were written in; a fragment-reuse remapper the index was loaded
+    /// with only serves queries and is not applied here. A zone in a fragment
+    /// the mapping does not touch is copied as it is; every other zone is
+    /// split into its surviving runs of contiguous addresses in one fragment,
+    /// with the counts of `remapped_run_counts`. When a run has no sound
+    /// counts, every zone and null position landing in its destination
+    /// fragment is dropped and the fragment is returned: the caller must
+    /// remove it from the remapped segment's fragment bitmap, so queries
+    /// scan it instead.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_core::utils::row_addr_remap::RowAddrRemap;
+    /// # use lance_index::scalar::IndexStore;
+    /// # use lance_index::scalar::zonemap::ZoneMapIndex;
+    /// # async fn remap(index: &ZoneMapIndex, mapping: &RowAddrRemap, store: &dyn IndexStore) -> Result<()> {
+    /// let (created, withdrawn) = index.remap_with_withdrawals(mapping, store).await?;
+    /// // Publish `created` covering the remapped fragments except `withdrawn`.
+    /// # let _ = (created, withdrawn);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn remap_with_withdrawals(
+        &self,
+        mapping: &RowAddrRemap,
+        dest_store: &dyn IndexStore,
+    ) -> Result<(CreatedIndex, RoaringBitmap)> {
+        let remapped = self.remap_zones(mapping)?;
+        let withdrawn = remapped.withdrawn_fragments.clone();
+        Ok((self.write_remapped(remapped, dest_store).await?, withdrawn))
+    }
+
+    fn remap_zones(&self, mapping: &RowAddrRemap) -> Result<RemappedZones> {
+        let affected = mapping.affected_fragments();
+        let null_rows = self
+            .null_rows
+            .as_ref()
+            .map(|null_rows| remap_null_rows(null_rows, mapping))
+            .transpose()?;
+        let translate = |addrs: &mut [Option<u64>]| mapping.remap_in_place(addrs);
+        let mut withdrawn_fragments = RoaringBitmap::new();
+        let mut zones = Vec::with_capacity(self.zones.len());
+        for zone in &self.zones {
+            let is_unaffected = u32::try_from(zone.bound.fragment_id)
+                .is_ok_and(|fragment| !affected.contains(fragment));
+            if is_unaffected {
+                zones.push(zone.clone());
+            } else {
+                zones.extend(remap_zone(
+                    zone,
+                    &translate,
+                    null_rows.as_ref(),
+                    remap_bounds_decide_comparable(self.version, &self.data_type),
+                    None,
+                    &mut withdrawn_fragments,
+                )?);
+            }
+        }
+        let is_withdrawn = |fragment_id: u64| {
+            u32::try_from(fragment_id).is_ok_and(|fragment| withdrawn_fragments.contains(fragment))
+        };
+        zones.retain(|zone| !is_withdrawn(zone.bound.fragment_id));
+        zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
+        let null_rows = null_rows.map(|null_rows| {
+            without_fragments(&null_rows, withdrawn_fragments.iter().map(u64::from))
+        });
+        Ok(RemappedZones {
+            zones,
+            null_rows,
+            withdrawn_fragments,
+        })
+    }
+
+    /// Write relocated zones with this segment's parameters and version, the
+    /// same builder sequence as [`merge_zonemap_indices`].
+    async fn write_remapped(
+        &self,
+        remapped: RemappedZones,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let mut builder =
+            ZoneMapIndexBuilder::try_new(self.builder_params(), self.data_type.clone())?
+                .with_version(self.version);
+        builder.maps = remapped.zones;
+        builder.set_null_rows(remapped.null_rows);
+        let has_null_bitmap = builder.null_rows.is_some();
+        let files = builder.write_index(dest_store).await?;
+        Ok(CreatedIndex {
+            index_details: make_zone_map_index_details(
+                self.rows_per_zone,
+                self.use_seeds,
+                has_null_bitmap,
+            ),
+            index_version: self.version as u32,
+            files,
+        })
+    }
+}
+
+/// Why [`ZoneMapIndex::remap`] refused a remap: a run landing in each of
+/// `fragments` has no sound counts, so the remapped segment would have to
+/// stop covering them (see [`ZoneMapIndex::remap_with_withdrawals`]), which a
+/// plain [`CreatedIndex`] cannot report. Nothing was written. Carried inside
+/// [`Error::NotSupported`]; see [`Self::from_error`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoneMapRemapNeedsWithdrawal {
+    /// The destination fragments whose coverage would be withdrawn.
+    pub fragments: RoaringBitmap,
+}
+
+impl std::fmt::Display for ZoneMapRemapNeedsWithdrawal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "remapping the zone map would withdraw its coverage of fragments {:?}, which this \
+             remap result cannot report",
+            self.fragments.iter().collect::<Vec<_>>()
+        )
+    }
+}
+
+impl std::error::Error for ZoneMapRemapNeedsWithdrawal {}
+
+impl ZoneMapRemapNeedsWithdrawal {
+    /// This refusal as the error [`ZoneMapIndex::remap`] returns.
+    pub fn into_error(self) -> Error {
+        Error::not_supported_source(Box::new(self))
+    }
+
+    /// The refusal carried by `error`, if it is one; `None` for any other
+    /// error.
+    pub fn from_error(error: &Error) -> Option<&Self> {
+        match error {
+            Error::NotSupported { source, .. } => source.downcast_ref::<Self>(),
+            _ => None,
+        }
+    }
+}
+
+/// `null_rows` translated through `mapping`, dropping deleted rows.
+fn remap_null_rows(null_rows: &RowAddrTreeMap, mapping: &RowAddrRemap) -> Result<RowAddrTreeMap> {
+    let addrs = null_rows.row_addrs().ok_or_else(|| {
+        Error::corrupt_file_named(
+            ZONEMAP_FILENAME,
+            "ZoneMapIndex: the null bitmap selects a whole fragment instead of null positions",
+        )
+    })?;
+    let mut addrs: Vec<Option<u64>> = addrs.map(|addr| Some(u64::from(addr))).collect();
+    mapping.remap_in_place(&mut addrs);
+    Ok(addrs.into_iter().flatten().collect())
+}
+
+/// Whether a remap written as `version` may rely on a scalar zone's recorded
+/// bounds, rather than its counts, to keep its comparable values: only on
+/// version 0, the legacy behaviour. A version 1 file is read by consumers
+/// that may trust its counts without consulting the bounds.
+fn remap_bounds_decide_comparable(version: ZoneMapIndexVersion, data_type: &DataType) -> bool {
+    version == ZoneMapIndexVersion::V0 && !data_type.is_nested()
+}
+
+/// The destination runs of `zone`, whose addresses `translate` maps in place
+/// (`None` marks a deleted row). With `fragment_filter`, rows that land
+/// outside those fragments are dropped before the runs are built. A run
+/// without sound counts ([`remapped_run_counts`]) is not returned; its
+/// destination fragment is added to `unrepresentable` instead.
 fn remap_zone(
     zone: &ZoneMapStatistics,
-    remapper: &dyn RowIdRemapper,
+    translate: &dyn Fn(&mut [Option<u64>]),
     remapped_null_rows: Option<&RowAddrTreeMap>,
-    is_nested: bool,
+    bounds_decide_comparable: bool,
     fragment_filter: Option<&RoaringBitmap>,
+    unrepresentable: &mut RoaringBitmap,
 ) -> Result<Vec<ZoneMapStatistics>> {
     let zone_start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
-    let mut remapped = (0..zone.bound.length as u64)
-        .filter_map(|offset| remapper.remap_row_id(zone_start.saturating_add(offset)))
+    let mut addrs = (0..zone.bound.length as u64)
+        .map(|offset| Some(zone_start.saturating_add(offset)))
+        .collect::<Vec<_>>();
+    translate(&mut addrs);
+    let mut remapped = addrs
+        .into_iter()
+        .flatten()
         .filter(|row_id| {
             fragment_filter.is_none_or(|filter| {
                 u32::try_from(row_id >> 32).is_ok_and(|fragment| filter.contains(fragment))
@@ -1367,73 +1552,7 @@ fn remap_zone(
     remapped.sort_unstable();
     remapped.dedup();
 
-    let make_zone = |start: u64, end: u64| -> Result<ZoneMapStatistics> {
-        let length = (end - start + 1) as usize;
-        let null_count = if let Some(null_rows) = remapped_null_rows {
-            u32::try_from(
-                (start..=end)
-                    .filter(|row_id| null_rows.contains(*row_id))
-                    .count(),
-            )
-            .map_err(|_| {
-                Error::invalid_input(format!(
-                    "remapped ZoneMap zone has more null rows than can be represented: \
-                     fragment_id={}, start={}, length={}",
-                    start >> 32,
-                    start & u64::from(u32::MAX),
-                    length
-                ))
-            })?
-        } else if length == zone.bound.length {
-            zone.null_count
-        } else if zone.null_count == 0 {
-            0
-        } else if zone.null_count as usize == zone.bound.length {
-            u32::try_from(length).map_err(|_| {
-                Error::invalid_input(format!(
-                    "remapped all-null ZoneMap zone length cannot be represented: \
-                     fragment_id={}, start={}, length={}",
-                    start >> 32,
-                    start & u64::from(u32::MAX),
-                    length
-                ))
-            })?
-        } else if length > 1 || (!is_nested && !ZoneMapIndex::zone_has_missing_extrema(zone)) {
-            // Without exact null positions, one null conservatively preserves both
-            // null and non-null candidates when the run has multiple rows. A scalar
-            // singleton is also safe when its extrema independently prove that it
-            // may contain a comparable value. Otherwise null_count == length would
-            // fabricate an all-null zone and could prune live non-null rows.
-            1
-        } else {
-            return Err(Error::not_supported(format!(
-                "cannot safely remap a mixed-null ZoneMap zone without an exact null bitmap: \
-                 fragment_id={}, start={}, original_length={}, null_count={}, remapped_length={}, \
-                 nested={}, missing_extrema={}",
-                zone.bound.fragment_id,
-                zone.bound.start,
-                zone.bound.length,
-                zone.null_count,
-                length,
-                is_nested,
-                ZoneMapIndex::zone_has_missing_extrema(zone)
-            )));
-        };
-
-        Ok(ZoneMapStatistics {
-            min: zone.min.clone(),
-            max: zone.max.clone(),
-            null_count,
-            nan_count: zone.nan_count,
-            negative_nan_count: zone.negative_nan_count,
-            bound: ZoneBound {
-                fragment_id: start >> 32,
-                start: start & u64::from(u32::MAX),
-                length,
-            },
-        })
-    };
-    let mut zones = Vec::new();
+    let mut runs = Vec::new();
     let mut run_start = None;
     let mut previous = 0u64;
     for row_id in remapped {
@@ -1441,19 +1560,197 @@ fn remap_zone(
             run_start = Some(row_id);
         } else if row_id != previous.saturating_add(1) || row_id >> 32 != previous >> 32 {
             if let Some(start) = run_start {
-                zones.push(make_zone(start, previous)?);
+                runs.push((start, previous));
             }
             run_start = Some(row_id);
         }
         previous = row_id;
     }
     if let Some(start) = run_start {
-        zones.push(make_zone(start, previous)?);
+        runs.push((start, previous));
+    }
+
+    let mut zones = Vec::with_capacity(runs.len());
+    for (start, end) in runs {
+        let length = end - start + 1;
+        let exact_null_count = remapped_null_rows
+            .map(|null_rows| {
+                u32::try_from(
+                    (start..=end)
+                        .filter(|row_id| null_rows.contains(*row_id))
+                        .count(),
+                )
+                .map_err(|_| {
+                    Error::invalid_input(format!(
+                        "remapped ZoneMap zone has more null rows than can be represented: \
+                         fragment_id={}, start={}, length={}",
+                        start >> 32,
+                        start & u64::from(u32::MAX),
+                        length
+                    ))
+                })
+            })
+            .transpose()?;
+        let Some(counts) =
+            remapped_run_counts(zone, length, exact_null_count, bounds_decide_comparable)
+        else {
+            // `start >> 32` is a fragment id, which always fits in 32 bits.
+            unrepresentable.insert((start >> 32) as u32);
+            continue;
+        };
+        zones.push(ZoneMapStatistics {
+            min: zone.min.clone(),
+            max: zone.max.clone(),
+            null_count: counts.null_count,
+            nan_count: counts.nan_count,
+            negative_nan_count: counts.negative_nan_count,
+            bound: ZoneBound {
+                fragment_id: start >> 32,
+                start: start & u64::from(u32::MAX),
+                length: length as usize,
+            },
+        });
     }
     Ok(zones)
 }
 
+/// The counts a relocated run is written with; see [`remapped_run_counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunCounts {
+    null_count: u32,
+    nan_count: u32,
+    negative_nan_count: Option<u32>,
+}
+
+/// The counts of a run of `run_length` rows relocated from `source`, or
+/// `None` when no counts are sound for it. `exact_null_count` is the run's
+/// null count from an exact null bitmap, when the segment has one.
+///
+/// A run that keeps every row of its source zone keeps the source counts.
+/// A narrowed run (`L < L0`) only knows the source's counts, so it gets
+/// counts that may be imprecise but never let a predicate skip a row that
+/// may match, and that satisfy [`v1_zone_violation`] for `L`. The bounds are
+/// always reused unchanged. With the source's length `L0`, nulls `n`, NaNs
+/// `a` and negative NaNs `b` (unknown on version 0 zones):
+///
+/// | source                         | run nulls | run NaNs | run negative NaNs |
+/// |--------------------------------|-----------|----------|-------------------|
+/// | exact null bitmap              | exact     |          |                   |
+/// | `n == 0`                       | 0         |          |                   |
+/// | `n == L0` (all null)           | `L`       |          |                   |
+/// | otherwise (mixed)              | 1         |          |                   |
+/// | `a == 0`                       |           | 0        | 0 (unknown stays) |
+/// | run all null by exact nulls    |           | 0        | 0 (unknown stays) |
+/// | all NaN (`n == 0, a == L0`), `b == 0` | | `L`      | 0                 |
+/// | all NaN, `b == a`              |           | `L`      | `L`               |
+/// | all NaN, `b` unknown           |           | `L`      | unknown           |
+/// | all NaN, `0 < b < a`           |           | `L`      | 1 (`L >= 2`)      |
+/// | some NaNs, `b == 0`            |           | 1        | 0                 |
+/// | some NaNs, `b == a`            |           | 1        | 1                 |
+/// | some NaNs, `b` unknown         |           | 1        | unknown           |
+/// | some NaNs, `0 < b < a`         |           | 2        | 1                 |
+///
+/// Exactness is decided from the persisted source zone alone, never from
+/// in-memory state: a source is all null only when `n == L0` and it has no
+/// recorded bounds, and all NaN only when `n == 0`, `a == L0` and it has no
+/// finite min; otherwise it takes the mixed and some-NaN rows. So a
+/// reopened zone that an earlier remap narrowed, whose placeholder counts
+/// may reach its length while its bounds still hold a comparable value, is
+/// never misread as all null or all NaN.
+///
+/// The run is unrepresentable when its nulls plus NaNs exceed `L`, when
+/// an all-NaN run of both signs has `L == 1`, or when the source may hold
+/// comparable values (`L0 > n + a`), the counts are not both exact, and
+/// nulls plus NaNs reach `L`: claiming no comparable value would let
+/// `zone_has_comparable_values`, `zone_non_null_possible` and the nested
+/// all-null test prune it. Only with `bounds_decide_comparable` (a version 0
+/// scalar segment, the legacy behaviour) is a zone with recorded bounds kept
+/// in that case, since version 0 queries decide its comparable values from
+/// the bounds. A version 1 run is withdrawn regardless of its bounds, since
+/// other readers of the file may trust its counts alone.
+///
+/// Why each predicate keeps a candidate run: `IS NULL` needs nulls `> 0`
+/// whenever a null may remain (mixed gives 1); a NaN equality or NaN-bounded
+/// range needs `nan > neg` for a possible positive NaN and `neg > 0` (or
+/// an unknown sign) for a possible negative one, which every NaN row of the
+/// table provides; non-NaN values are decided by the reused bounds, or by
+/// `L > nulls + NaNs` when the bounds are missing, which the last rule
+/// keeps.
+fn remapped_run_counts(
+    source: &ZoneMapStatistics,
+    run_length: u64,
+    exact_null_count: Option<u32>,
+    bounds_decide_comparable: bool,
+) -> Option<RunCounts> {
+    let source_length = source.bound.length as u64;
+    if run_length == source_length {
+        return Some(RunCounts {
+            null_count: source.null_count,
+            nan_count: source.nan_count,
+            negative_nan_count: source.negative_nan_count,
+        });
+    }
+    let length = u32::try_from(run_length).ok()?;
+    let nulls = u64::from(source.null_count);
+    let nans = u64::from(source.nan_count);
+    let (null_count, are_nulls_exact) = match exact_null_count {
+        Some(count) => (count, true),
+        None if nulls == 0 => (0, true),
+        None if nulls == source_length && ZoneMapIndex::zone_has_missing_extrema(source) => {
+            (length, true)
+        }
+        None => (1, false),
+    };
+    let is_all_nan =
+        nulls == 0 && nans == source_length && !ZoneMapIndex::zone_has_finite_min(source);
+    let (nan_count, negative_nan_count, are_nans_exact) = match source.negative_nan_count {
+        // An all-null run holds no NaN, whatever its source held.
+        _ if nans == 0 || (are_nulls_exact && null_count == length) => {
+            (0, source.negative_nan_count.map(|_| 0), true)
+        }
+        Some(0) if is_all_nan => (length, Some(0), true),
+        Some(negative) if is_all_nan && negative == source.nan_count => {
+            (length, Some(length), true)
+        }
+        None if is_all_nan => (length, None, true),
+        Some(_) if is_all_nan => {
+            if length < 2 {
+                return None;
+            }
+            (length, Some(1), true)
+        }
+        Some(0) => (1, Some(0), false),
+        Some(negative) if negative == source.nan_count => (1, Some(1), false),
+        None => (1, None, false),
+        Some(_) => (2, Some(1), false),
+    };
+    let encoded = u64::from(null_count) + u64::from(nan_count);
+    if encoded > run_length {
+        return None;
+    }
+    let counts_decide_comparable =
+        !bounds_decide_comparable || ZoneMapIndex::zone_has_missing_extrema(source);
+    let source_has_comparable = source_length > nulls + nans;
+    if counts_decide_comparable
+        && source_has_comparable
+        && !(are_nulls_exact && are_nans_exact)
+        && encoded >= run_length
+    {
+        return None;
+    }
+    Some(RunCounts {
+        null_count,
+        nan_count,
+        negative_nan_count,
+    })
+}
+
 /// Merge caller-selected ZoneMap segments into one self-contained segment.
+///
+/// A source loaded with a fragment-reuse remapper has its zones relocated
+/// like [`ZoneMapIndex::remap_with_withdrawals`]; the merge is refused
+/// before anything is written when a kept run has no sound counts, since
+/// its output coverage is the caller's `fragment_filter`.
 pub async fn merge_zonemap_indices(
     source_indices: &[&ZoneMapIndex],
     dest_store: &dyn IndexStore,
@@ -1487,6 +1784,7 @@ pub async fn merge_zonemap_indices(
     let mut zones = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut any_missing_bitmap = false;
+    let mut unrepresentable = RoaringBitmap::new();
     for source in source_indices {
         if source.batch_remapper.is_some() {
             return Err(Error::not_supported(
@@ -1517,30 +1815,34 @@ pub async fn merge_zonemap_indices(
                 |remapper| remapper.remap_row_addrs_tree_map(null_rows),
             )
         });
-        for zone in &source.zones {
-            let source_zones = source.fri.as_deref().map_or_else(
-                || Ok(vec![zone.clone()]),
-                |remapper| {
-                    remap_zone(
+        match source.fri.as_deref() {
+            Some(remapper) => {
+                let translate = |addrs: &mut [Option<u64>]| {
+                    for addr in addrs.iter_mut() {
+                        *addr = addr.and_then(|addr| remapper.remap_row_id(addr));
+                    }
+                };
+                for zone in &source.zones {
+                    zones.extend(remap_zone(
                         zone,
-                        remapper,
+                        &translate,
                         remapped_null_rows.as_ref(),
-                        source.data_type.is_nested(),
+                        remap_bounds_decide_comparable(version, &source.data_type),
                         Some(fragment_filter),
-                    )
-                },
-            )?;
-            // Only the runs that are kept are held to the version 1 contract.
-            let retained = source_zones.into_iter().filter(|zone| {
-                u32::try_from(zone.bound.fragment_id)
-                    .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
-            });
-            for remapped in retained {
-                if version == ZoneMapIndexVersion::V1 {
-                    reject_inexact_remapped_zone(zone, &remapped, remapped_null_rows.is_some())?;
+                        &mut unrepresentable,
+                    )?);
                 }
-                zones.push(remapped);
             }
+            None => zones.extend(
+                source
+                    .zones
+                    .iter()
+                    .filter(|zone| {
+                        u32::try_from(zone.bound.fragment_id)
+                            .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+                    })
+                    .cloned(),
+            ),
         }
         match remapped_null_rows {
             Some(mut filtered) => {
@@ -1549,6 +1851,18 @@ pub async fn merge_zonemap_indices(
             }
             None => any_missing_bitmap = true,
         }
+    }
+    if !unrepresentable.is_empty() {
+        return Err(Error::not_supported_source(
+            format!(
+                "cannot merge remapped ZoneMap zones: runs landing in fragments {:?} keep only \
+                 part of their source zones, so the inherited counts cannot be encoded without \
+                 letting a predicate skip a matching row; rebuild it from its data \
+                 (optimize_indices) instead",
+                unrepresentable.iter().collect::<Vec<_>>()
+            )
+            .into(),
+        ));
     }
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
@@ -1564,46 +1878,6 @@ pub async fn merge_zonemap_indices(
         index_version: version as u32,
         files,
     })
-}
-
-/// `remap_zone` copies a zone's counts into each destination run, which is
-/// exact only when the run keeps every row of the zone. A version 1 file
-/// must hold exact counts, so a narrower run is accepted only when the zone
-/// has no NaNs and its null count is exact: recomputed from a bitmap, zero,
-/// or a zone whose every row is null, since every surviving row of it is a
-/// null too (`remap_zone` then counts the run's own length). Otherwise the
-/// merge is refused before writing.
-fn reject_inexact_remapped_zone(
-    source: &ZoneMapStatistics,
-    remapped: &ZoneMapStatistics,
-    null_positions_exact: bool,
-) -> Result<()> {
-    if remapped.bound.length == source.bound.length {
-        return Ok(());
-    }
-    let all_null = source.null_count as usize == source.bound.length;
-    let nulls_exact = null_positions_exact || source.null_count == 0 || all_null;
-    if source.nan_count == 0 && nulls_exact {
-        return Ok(());
-    }
-    Err(Error::not_supported_source(
-        format!(
-            "cannot merge a remapped ZoneMap zone into a version 1 segment: the run \
-             (fragment {}, start {}, length {}) keeps only part of its source zone \
-             (fragment {}, start {}, length {}, null_count {}, nan_count {}), so the \
-             inherited counts are no longer exact; rebuild it from its data \
-             (optimize_indices) instead",
-            remapped.bound.fragment_id,
-            remapped.bound.start,
-            remapped.bound.length,
-            source.bound.fragment_id,
-            source.bound.start,
-            source.bound.length,
-            source.null_count,
-            source.nan_count
-        )
-        .into(),
-    ))
 }
 
 fn default_rows_per_zone() -> u64 {
@@ -2201,7 +2475,7 @@ impl BasicTrainer for ZoneMapIndexPlugin {
 #[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
-        Ok(false)
+        Ok(true)
     }
 
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {

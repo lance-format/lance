@@ -1534,9 +1534,13 @@ mod tests {
             .unwrap()
             .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
             .collect::<BTreeSet<_>>();
+        // The compaction remaps frag 0's zone onto its output with the old
+        // bounds, so only live fragments may still be candidates.
         assert!(
-            searched_fragments.is_empty(),
-            "must filter retired-fragment zones"
+            searched_fragments
+                .iter()
+                .all(|fragment_id| live_frags.contains(*fragment_id)),
+            "must filter retired-fragment zones: {searched_fragments:?}"
         );
     }
 

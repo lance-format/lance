@@ -509,9 +509,10 @@ async fn overlay_rescan(
 /// physical address rather than by stable row id (see [`build_old_data_filter`] and
 /// [`overlay_rescan`]). This is the domain the merged index stores, not whether its type
 /// migrated from row ids: BTree, Bitmap, NGram, RTree and MinHash LSH merge as address-domain
-/// segments (a row-id-domain one under stable row ids is rebuilt instead), BloomFilter always
-/// stored addresses, a LabelList segment reports its own domain, and of the other types a JSON
-/// index over an address-domain target and a list-element index store addresses.
+/// segments (a row-id-domain one under stable row ids is rebuilt instead), BloomFilter and
+/// ZoneMap always stored addresses, a LabelList segment reports its own domain, and of the
+/// other types a JSON index over an address-domain target and a list-element index store
+/// addresses.
 fn old_data_address_domain(index_type: IndexType, reference_index: &dyn ScalarIndex) -> bool {
     match index_type {
         IndexType::BTree
@@ -519,7 +520,8 @@ fn old_data_address_domain(index_type: IndexType, reference_index: &dyn ScalarIn
         | IndexType::NGram
         | IndexType::RTree
         | IndexType::MinHashLsh
-        | IndexType::BloomFilter => true,
+        | IndexType::BloomFilter
+        | IndexType::ZoneMap => true,
         IndexType::LabelList => reference_index.results_are_row_addresses(),
         _ => {
             let index = reference_index.as_any();
@@ -1059,7 +1061,12 @@ async fn merge_scalar_indices<'a>(
     // address-domain (or the dataset lacks stable row ids and the two domains
     // coincide).
     let address_domain = old_data_address_domain(index_type, reference_index.as_ref());
-    let (stale_rows, scan_selection) = if is_remappable {
+    // A remappable ZoneMap still updates by copying its stored zones verbatim
+    // (`zonemap::update_segment`) and ignores any old-data filter, so it
+    // neither rescans overlays nor translates its sources: it keeps the
+    // non-remapping path, and with it the oldest source's dataset version.
+    let follows_generic_remap_update = is_remappable && index_type != IndexType::ZoneMap;
+    let (stale_rows, scan_selection) = if follows_generic_remap_update {
         overlay_rescan(
             dataset.as_ref(),
             &selected_old_indices,
@@ -1213,9 +1220,11 @@ async fn merge_scalar_indices<'a>(
             // Zone maps go through the metadata-aware builder: zones are cut
             // at the configured physical boundaries, seeds (when the index
             // collects them) cover what they can, and the rest is scanned,
-            // in one segment write. (`stale_rows` is empty for a zone map,
-            // which does not remap; the guard keeps the generic rescan below
-            // authoritative if that ever changes.)
+            // in one segment write. The stored zones are copied in their own
+            // address domain, which is why a zone map never takes the
+            // remapping update (`follows_generic_remap_update`) and
+            // `stale_rows` is always empty here; the guard keeps the generic
+            // rescan below authoritative if that ever changes.
             crate::index::scalar::zonemap::update_segment(
                 dataset.as_ref(),
                 &reference_index,
@@ -1403,7 +1412,7 @@ async fn merge_scalar_indices<'a>(
                 }
             }
         };
-        let new_dataset_version = if is_remappable {
+        let new_dataset_version = if follows_generic_remap_update {
             dataset.manifest.version
         } else {
             selected_old_indices

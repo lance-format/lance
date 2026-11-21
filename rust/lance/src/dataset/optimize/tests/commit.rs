@@ -602,7 +602,6 @@ async fn test_commit_refuses_recording_mismatch_before_reserving_fragments(
 #[rstest]
 #[case::remap(CatchUp::Remap, false)]
 #[case::merge_segments(CatchUp::MergeSegments, false)]
-// Zone maps cannot be remapped.
 #[case::merge_zone_map_segments_with_stable_row_ids(CatchUp::MergeSegments, true)]
 #[tokio::test]
 async fn test_index_built_before_the_rewrite_publishes_is_retained_and_caught_up(

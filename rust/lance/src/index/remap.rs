@@ -13,6 +13,7 @@ use lance_index::scalar::RowAddrTranslator;
 use lance_index::scalar::inverted::InvertedIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapRemapNeedsWithdrawal};
 use lance_index::scalar::{CreatedIndex, index_files_to_table, table_files_to_index};
 use lance_index::{IndexType, metrics::NoOpMetricsCollector, progress::NoopIndexBuildProgress};
 use roaring::RoaringBitmap;
@@ -73,12 +74,54 @@ async fn remap_deletes_all_indexed_rows(
 
 /// Restrict rows to `owned_fragments` only for sources of a staging merge,
 /// before translating their addresses. Independent and deferred remaps pass None.
+///
+/// A remapped segment that would have to stop covering some destination
+/// fragments (see [`remap_index_with_withdrawals`]) is dropped here: these
+/// callers publish coverage that follows whole rewrite groups and cannot
+/// subtract fragments from it, and dropping is what they did for such an
+/// index type before it could be remapped.
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &RowAddrTranslator,
     owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<RemapResult> {
+    let (result, withdrawn_fragments) =
+        remap_index_with_withdrawals(dataset, index_id, row_id_map, owned_fragments).await?;
+    if withdrawn_fragments.is_empty() {
+        return Ok(result);
+    }
+    log::warn!(
+        "Remapping index {} would withdraw its coverage of fragments {:?}, which this \
+         rewrite cannot publish, so the index is not remapped. Rebuild it to cover them.",
+        index_id,
+        withdrawn_fragments.iter().collect::<Vec<_>>()
+    );
+    if let RemapResult::Remapped(remapped) = &result {
+        let index_dir = dataset.indices_dir().join(remapped.new_id.to_string());
+        if let Err(error) = dataset.object_store.remove_dir_all(index_dir).await {
+            log::warn!(
+                "Failed to remove dropped remapped index {}: {}",
+                remapped.new_id,
+                error
+            );
+        }
+    }
+    Ok(RemapResult::Drop)
+}
+
+/// [`remap_index`] for a caller that can narrow the published coverage: the
+/// second value lists the destination fragments the remapped segment must
+/// not claim, because no sound statistics could be written for some of
+/// their rows (today only a ZoneMap reports any). Empty for every other
+/// outcome.
+pub(crate) async fn remap_index_with_withdrawals(
+    dataset: &Dataset,
+    index_id: &Uuid,
+    row_id_map: &RowAddrTranslator,
+    owned_fragments: Option<&RoaringBitmap>,
+) -> Result<(RemapResult, RoaringBitmap)> {
+    let mut withdrawn_fragments = RoaringBitmap::new();
     // A remap is maintenance: a segment the tagged reader excludes from the
     // listing is still reachable here (its caller decided whether to touch
     // it), so the metadata comes from the maintenance lookup.
@@ -109,7 +152,7 @@ pub(crate) async fn remap_index(
             matched.name,
             matched.covering_fields,
         );
-        return Ok(RemapResult::Drop);
+        return Ok((RemapResult::Drop, withdrawn_fragments));
     }
 
     // With covering withdrawn above, `fields` is entirely keyed, so more than one
@@ -131,7 +174,7 @@ pub(crate) async fn remap_index(
         // This can happen if there is a bug where the index is covering empty
         // fragment that haven't been cleaned up. They should be cleaned up
         // outside of this function.
-        return Ok(RemapResult::Keep(*index_id));
+        return Ok((RemapResult::Keep(*index_id), withdrawn_fragments));
     }
 
     let field_id = matched
@@ -154,7 +197,7 @@ pub(crate) async fn remap_index(
                 field_path,
                 e
             );
-            return Ok(RemapResult::Drop);
+            return Ok((RemapResult::Drop, withdrawn_fragments));
         }
     };
 
@@ -170,14 +213,14 @@ pub(crate) async fn remap_index(
             // capability below covers built-ins and new implementations.
             #[allow(deprecated)]
             if !scalar_index.can_remap() {
-                return Ok(RemapResult::Drop);
+                return Ok((RemapResult::Drop, withdrawn_fragments));
             }
             let details = fetch_index_details(dataset, &field_path, matched).await?;
             if !IndexDetails(details.clone())
                 .get_plugin()?
                 .can_remap(details.as_ref())?
             {
-                return Ok(RemapResult::Drop);
+                return Ok((RemapResult::Drop, withdrawn_fragments));
             }
 
             match scalar_index.index_type() {
@@ -215,7 +258,38 @@ pub(crate) async fn remap_index(
                         scalar_index.remap_streaming(row_id_map, &new_store).await?
                     }
                 }
-                _ => scalar_index.remap_streaming(row_id_map, &new_store).await?,
+                _ => {
+                    // A ZoneMap remapped through a synchronous map reports
+                    // the coverage it withdraws; through a batch translator
+                    // it takes the trait default, which declines.
+                    let zonemap = scalar_index.as_any().downcast_ref::<ZoneMapIndex>();
+                    match (row_id_map, zonemap) {
+                        (RowAddrTranslator::Sync(mapping), Some(zonemap)) => {
+                            let (created, withdrawn) =
+                                zonemap.remap_with_withdrawals(mapping, &new_store).await?;
+                            withdrawn_fragments = withdrawn;
+                            created
+                        }
+                        _ => match scalar_index.remap_streaming(row_id_map, &new_store).await {
+                            Ok(created) => created,
+                            // A wrapper over a ZoneMap reaches the plain
+                            // remap, which cannot report withdrawn coverage
+                            // and refuses instead.
+                            Err(error) => match ZoneMapRemapNeedsWithdrawal::from_error(&error) {
+                                Some(reason) => {
+                                    log::warn!(
+                                        "Index '{}' on '{}' is not remapped: {reason}. Rebuild \
+                                         the index.",
+                                        index_id,
+                                        field_path
+                                    );
+                                    return Ok((RemapResult::Drop, withdrawn_fragments));
+                                }
+                                None => return Err(error),
+                            },
+                        },
+                    }
+                }
             }
         }
         it if it.is_vector() => {
@@ -256,13 +330,16 @@ pub(crate) async fn remap_index(
         }
     };
 
-    Ok(RemapResult::Remapped(RemappedIndex {
-        old_id: *index_id,
-        new_id,
-        index_details: created_index.index_details,
-        index_version: created_index.index_version,
-        files: Some(index_files_to_table(created_index.files)),
-    }))
+    Ok((
+        RemapResult::Remapped(RemappedIndex {
+            old_id: *index_id,
+            new_id,
+            index_details: created_index.index_details,
+            index_version: created_index.index_version,
+            files: Some(index_files_to_table(created_index.files)),
+        }),
+        withdrawn_fragments,
+    ))
 }
 
 #[cfg(test)]

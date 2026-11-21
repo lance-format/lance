@@ -2683,8 +2683,8 @@ pub mod tests {
             .unwrap();
     }
 
-    /// `i_idx` on `i`: a zone map, which an eager compaction cannot remap, or a
-    /// BTree, which it remaps.
+    /// `i_idx` on `i`: a zone map or BTree, which an eager compaction remaps,
+    /// or a bloom filter, which it cannot remap.
     async fn create_address_index(dataset: &mut Dataset, index_type: IndexType) {
         let builtin = match index_type {
             IndexType::ZoneMap => BuiltinIndexType::ZoneMap,
@@ -2758,16 +2758,17 @@ pub mod tests {
     /// Trimming every version keeps the empty entry. Current handles see the
     /// trim; the previous snapshot retains its history. Only a deferred
     /// compaction records into the empty history: without `defer_index_remap`
-    /// it stays empty, a caught-up zone map stops covering the rewritten
-    /// fragments instead of following their rows, and a BTree is remapped onto
-    /// them.
+    /// it stays empty, a caught-up bloom filter stops covering the rewritten
+    /// fragments instead of following their rows, and a zone map or BTree is
+    /// remapped onto them.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_trims_the_history_no_index_needs(
         #[values(
             Indexing::None,
             Indexing::CaughtUp(IndexType::ZoneMap),
-            Indexing::CaughtUp(IndexType::BTree)
+            Indexing::CaughtUp(IndexType::BTree),
+            Indexing::CaughtUp(IndexType::BloomFilter)
         )]
         indexing: Indexing,
         #[values(Storage::Inline, Storage::External)] storage: Storage,
@@ -2820,10 +2821,15 @@ pub mod tests {
             );
             assert_eq!(
                 coverage.contains(output),
-                defer_index_remap || index_type == IndexType::BTree,
+                defer_index_remap || index_type != IndexType::BloomFilter,
                 "{coverage:?}"
             );
-            assert_answers_through(&latest, "i_idx", "i >= 55").await;
+            let filter = if index_type == IndexType::BloomFilter {
+                "i = 55"
+            } else {
+                "i >= 55"
+            };
+            assert_answers_through(&latest, "i_idx", filter).await;
         }
     }
 
@@ -2880,9 +2886,9 @@ pub mod tests {
         assert_answers_through(&latest, "i_idx", "i >= 55 AND i < 75").await;
     }
 
-    /// Every index type that stores row addresses an eager compaction cannot
-    /// remap lives with the history the same way: zone maps and bloom filters. A
-    /// deferred compaction records its moves, which the index answers through.
+    /// A bloom filter stores row addresses an eager compaction cannot remap, so
+    /// it lives with the history. A deferred compaction records its moves,
+    /// which the index answers through.
     /// A compaction without `defer_index_remap` records nothing, also across the
     /// output of a recorded one: the index stops covering what it rewrote, which
     /// is scanned, and the rows keep their stable row ids. Cleanup keeps the
@@ -2891,8 +2897,8 @@ pub mod tests {
     /// without giving the index coverage it never had, and neither does merging
     /// the index's segments. Caught up, the index needs no version: cleanup
     /// empties the history, keeps the entry, and the next deferred compaction
-    /// records into it. A BTree is remapped eagerly instead, which is refused
-    /// while the history holds versions.
+    /// records into it. A zone map, like a BTree, is remapped eagerly instead,
+    /// which is refused while the history holds versions.
     #[rstest]
     #[tokio::test]
     async fn test_address_index_lives_with_the_history(
@@ -2952,6 +2958,16 @@ pub mod tests {
             defer_index_remap: false,
             ..compaction_of(&dataset, &[8, 9])
         };
+        if index_type == IndexType::ZoneMap {
+            let version = dataset.manifest.version;
+            let error = compact_files(&mut dataset, options, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert_eq!(dataset.manifest.version, version);
+            assert_answers(&dataset).await;
+            return;
+        }
         compact_files(&mut dataset, options, None).await.unwrap();
         let latest = Dataset::open(uri).await.unwrap();
         assert_same_history(&history(&latest).await, &recorded);
