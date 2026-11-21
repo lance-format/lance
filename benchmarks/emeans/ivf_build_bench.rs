@@ -26,6 +26,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
@@ -446,6 +447,16 @@ fn process_usage() -> (f64, u64) {
     )
 }
 
+/// `CLOCK_MONOTONIC` in seconds, the clock `perf record -k mono` stamps
+/// samples with, so a profile can be split at the build's stage boundaries.
+fn monotonic_secs() -> f64 {
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `now` is a valid, writable `timespec` for clock_gettime to fill.
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    assert_eq!(ret, 0, "clock_gettime failed");
+    now.tv_sec as f64 + now.tv_nsec as f64 * 1e-9
+}
+
 /// Recall@10 of the index over the stored queries with `nprobes` partitions
 /// and, when `refine` is positive, that refine factor.
 async fn recall(
@@ -522,6 +533,7 @@ async fn build(flags: &Flags) {
     BUILD_LOG.lines.lock().unwrap().clear();
     let (cpu_start, _) = process_usage();
     let start = Instant::now();
+    println!("{label}: build starts at monotonic {:.6}", monotonic_secs());
     dataset
         .create_index_builder(&["vector"], IndexType::Vector, &params)
         .name(INDEX_NAME.to_string())
@@ -607,6 +619,56 @@ async fn build(flags: &Flags) {
     }
 }
 
+/// Times one read path on its own: a scan of the vector column, or the
+/// training sample IVF training draws.
+async fn probe(flags: &Flags) {
+    let dir = PathBuf::from(flags.required("dir"));
+    let dataset = Dataset::open(dir.join("data.lance").to_str().unwrap())
+        .await
+        .unwrap();
+    let what = flags.required("what");
+    let start = Instant::now();
+    let (rows, bytes) = match what {
+        "scan" => {
+            let mut scan = dataset.scan();
+            scan.project(&["vector"]).unwrap();
+            if let Some(readahead) = flags.get("batch-readahead") {
+                scan.batch_readahead(readahead.parse().unwrap());
+            }
+            if flags.parse_or("in-order", false) {
+                scan.scan_in_order(true);
+            }
+            if flags.parse_or("row-id", false) {
+                scan.with_row_id();
+            }
+            let mut stream = scan.try_into_stream().await.unwrap();
+            let (mut rows, mut bytes) = (0usize, 0usize);
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                rows += batch.num_rows();
+                bytes += batch.get_array_memory_size();
+            }
+            (rows, bytes)
+        }
+        "sample" => {
+            let rows: usize = flags.parse_or("rows", 1 << 20);
+            let sample = lance::index::vector::utils::maybe_sample_training_data(
+                &dataset, "vector", rows, None,
+            )
+            .await
+            .unwrap();
+            (sample.len(), sample.get_array_memory_size())
+        }
+        other => panic!("--what {other}: expected scan or sample"),
+    };
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "probe {what}: {rows} rows, {:.1} GB in {secs:.2}s ({:.2} GB/s)",
+        bytes as f64 / 1e9,
+        bytes as f64 / 1e9 / secs
+    );
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = argv.split_first() else {
@@ -645,6 +707,17 @@ fn main() {
                 "out",
             ],
         ))),
-        other => panic!("unknown command {other}; expected write or build"),
+        "probe" => runtime.block_on(probe(&Flags::parse(
+            rest,
+            &[
+                "dir",
+                "what",
+                "rows",
+                "batch-readahead",
+                "in-order",
+                "row-id",
+            ],
+        ))),
+        other => panic!("unknown command {other}; expected write, build or probe"),
     }
 }

@@ -30,6 +30,29 @@ NAMES = {
 }
 COLORS = {"main-lloyd": "#2a78d6", "head-lloyd": "#eb6834", "head-emeans": "#1baf7a"}
 IVF_VARIANT = {"main": "main-lloyd", "lloyd": "head-lloyd", "emeans": "head-emeans"}
+# The builds compared in `ivf.jsonl`: main and this branch's IVF training choices.
+IVF_SERIES = {
+    "file": "ivf",
+    "variants": VARIANTS,
+    "of": lambda row: IVF_VARIANT[row["variant"]],
+    "names": NAMES,
+    "short": ["main", "branch, Lloyd IVF", "branch, e-means IVF"],
+    "colors": COLORS,
+}
+# The builds compared in `ab.jsonl`: main, and this branch before and after its
+# read path and assignment fixes, both training IVF with e-means.
+AB_SERIES = {
+    "file": "ab",
+    "variants": ["main", "before", "after"],
+    "of": lambda row: row["label"].split("-")[1],
+    "names": {
+        "main": "main",
+        "before": "branch before read fixes",
+        "after": "branch after read fixes",
+    },
+    "short": ["main", "branch, before", "branch, after"],
+    "colors": {"main": "#2a78d6", "before": "#1baf7a", "after": "#6250d6"},
+}
 STAGES = [
     ("ivf_sample", "IVF sample read"),
     ("ivf_kmeans", "IVF centroid training"),
@@ -328,18 +351,19 @@ def ivf_config_name(config):
     return f"{rows / 2**20:.0f}M × {dim}d, IVF{k}, PQ{m}, {threads} vCPUs"
 
 
-def plot_ivf(rows, out):
+def plot_ivf(rows, out, series):
+    variants, names, colors = series["variants"], series["names"], series["colors"]
     by_config = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        by_config[ivf_config(row)][IVF_VARIANT[row["variant"]]].append(row)
-    configs = [c for c in by_config if all(by_config[c][v] for v in VARIANTS)]
+        by_config[ivf_config(row)][series["of"](row)].append(row)
+    configs = [c for c in by_config if all(by_config[c][v] for v in variants)]
     configs.sort(key=lambda c: (c[4] != 96, c[1], c[0], c[2], -c[3]))
     if not configs:
         return [], by_config
     height = 1.55 * len(configs) + 1.2
     fig, axes = plt.subplots(len(configs), 1, figsize=(11, height), squeeze=False)
     for ax, config in zip(axes[:, 0], configs):
-        for i, variant in enumerate(VARIANTS):
+        for i, variant in enumerate(variants):
             group = by_config[config][variant]
             parts = {
                 name: np.median([stage_times(r)[name] for r in group])
@@ -361,23 +385,21 @@ def plot_ivf(rows, out):
                 )
                 left += width
             ax.text(left, i, f"  {total:.0f}s", va="center", fontsize=8, color=INK)
-        ax.set_yticks(
-            range(3), ["main", "branch, Lloyd IVF", "branch, e-means IVF"], fontsize=8
-        )
+        ax.set_yticks(range(len(variants)), series["short"], fontsize=8)
         ax.invert_yaxis()
         ax.set_title(ivf_config_name(config), loc="left", fontsize=9, color=INK)
         ax.grid(axis="y", visible=False)
     axes[-1, 0].set_xlabel("build time (s), median over repetitions")
-    handles, names = axes[0, 0].get_legend_handles_labels()
+    handles, legend_names = axes[0, 0].get_legend_handles_labels()
     fig.legend(
         handles[: len(STAGES)],
-        names[: len(STAGES)],
+        legend_names[: len(STAGES)],
         loc="lower center",
         ncol=4,
         bbox_to_anchor=(0.5, -0.005),
     )
     fig.tight_layout(rect=(0, 0.75 / height, 0.97, 1))
-    fig.savefig(out / "ivf_stages.png", dpi=150)
+    fig.savefig(out / f"{series['file']}_stages.png", dpi=150)
     plt.close(fig)
 
     # Total speedup and the IVF-training share of each build.
@@ -387,18 +409,20 @@ def plot_ivf(rows, out):
         for rows, dim, k, m, threads in configs
     ]
     x = np.arange(len(configs))
-    for i, variant in enumerate(VARIANTS[1:]):
+    top_speedup = 1.0
+    for i, variant in enumerate(variants[1:]):
         speedup = [
-            np.median([r["build_secs"] for r in by_config[c]["main-lloyd"]])
+            np.median([r["build_secs"] for r in by_config[c][variants[0]]])
             / np.median([r["build_secs"] for r in by_config[c][variant]])
             for c in configs
         ]
+        top_speedup = max(top_speedup, *speedup)
         bars = axes[0].bar(
             x + (i - 0.5) * 0.4,
             speedup,
             0.38,
-            color=COLORS[variant],
-            label=NAMES[variant],
+            color=colors[variant],
+            label=names[variant],
         )
         for bar, value in zip(bars, speedup):
             axes[0].text(
@@ -412,11 +436,11 @@ def plot_ivf(rows, out):
             )
     axes[0].axhline(1, color=MUTED, linestyle=":")
     axes[0].set_xticks(x, labels, fontsize=7)
-    axes[0].set_ylim(0, 1.7)
+    axes[0].set_ylim(0, top_speedup * 1.2)
     axes[0].set_ylabel("full build speedup over main (×)")
     axes[0].set_title("end-to-end IVF_PQ build speedup", color=INK)
-    axes[0].legend(fontsize=7, loc="upper right")
-    for i, variant in enumerate(VARIANTS):
+    axes[0].legend(fontsize=7, loc="upper left")
+    for i, variant in enumerate(variants):
         share = [
             100
             * np.median(
@@ -428,7 +452,7 @@ def plot_ivf(rows, out):
             for c in configs
         ]
         bars = axes[1].bar(
-            x + (i - 1) * 0.28, share, 0.26, color=COLORS[variant], label=NAMES[variant]
+            x + (i - 1) * 0.28, share, 0.26, color=colors[variant], label=names[variant]
         )
         for bar, value in zip(bars, share):
             axes[1].text(
@@ -446,19 +470,20 @@ def plot_ivf(rows, out):
     axes[1].set_title("share of the build spent training IVF centroids", color=INK)
     axes[1].legend(fontsize=7, loc="upper right")
     fig.tight_layout()
-    fig.savefig(out / "ivf_speedup.png", dpi=150)
+    fig.savefig(out / f"{series['file']}_speedup.png", dpi=150)
     plt.close(fig)
     return configs, by_config
 
 
-def ivf_tables(configs, by_config):
+def ivf_tables(configs, by_config, series):
+    variants, names = series["variants"], series["names"]
     lines = [
         "| configuration | variant | build (s) | speedup | IVF sample | IVF train | PQ prep | PQ train | shuffle | merge | peak RSS (GB) | recall@10 (nprobes, refine) |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for config in configs:
-        base = np.median([r["build_secs"] for r in by_config[config]["main-lloyd"]])
-        for variant in VARIANTS:
+        base = np.median([r["build_secs"] for r in by_config[config][variants[0]]])
+        for variant in variants:
             group = by_config[config][variant]
             total = np.median([r["build_secs"] for r in group])
             parts = {
@@ -474,7 +499,7 @@ def ivf_tables(configs, by_config):
             )
             rss = np.median([r["peak_rss_bytes"] for r in group]) / 1e9
             lines.append(
-                f"| {ivf_config_name(config)} | {NAMES[variant]} (n={len(group)}) | {total:.1f} | {base / total:.2f}× | "
+                f"| {ivf_config_name(config)} | {names[variant]} (n={len(group)}) | {total:.1f} | {base / total:.2f}× | "
                 + " | ".join(
                     f"{parts[name]:.1f}"
                     for name in (
@@ -514,17 +539,22 @@ def main():
             "",
         ]
 
-    ivf = load(out / "ivf.jsonl")
-    if ivf:
-        configs, by_config = plot_ivf(ivf, out)
+    for series, title in (
+        (IVF_SERIES, "Full IVF_PQ builds"),
+        (AB_SERIES, "Full IVF_PQ builds before and after the read path fixes"),
+    ):
+        rows = load(out / f"{series['file']}.jsonl")
+        if not rows:
+            continue
+        configs, by_config = plot_ivf(rows, out, series)
         summary += [
-            "## Full IVF_PQ builds",
+            f"## {title}",
             "",
-            *ivf_tables(configs, by_config),
+            *ivf_tables(configs, by_config, series),
             "",
-            "![stages](ivf_stages.png)",
+            f"![stages]({series['file']}_stages.png)",
             "",
-            "![speedup](ivf_speedup.png)",
+            f"![speedup]({series['file']}_speedup.png)",
             "",
         ]
 
