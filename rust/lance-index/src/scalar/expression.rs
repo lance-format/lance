@@ -5190,7 +5190,7 @@ mod tests {
         let exact_batch = IndexExprResult::exact(mask.clone())
             .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
             .unwrap();
-        let exact_upper = exact_batch.column(1).as_binary::<i32>();
+        let exact_upper = exact_batch.column(1).as_binary::<i64>();
         assert!(exact_upper.is_null(0) && exact_upper.is_null(1));
 
         // Non-exact (at_most): upper column must carry the upper mask, so at
@@ -5199,7 +5199,7 @@ mod tests {
         let at_most_batch = IndexExprResult::at_most(mask.clone())
             .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
             .unwrap();
-        let at_most_upper = at_most_batch.column(1).as_binary::<i32>();
+        let at_most_upper = at_most_batch.column(1).as_binary::<i64>();
         assert!(!(at_most_upper.is_null(0) && at_most_upper.is_null(1)));
 
         // Non-exact (at_least): upper = all_rows, which `into_arrow`
@@ -5208,7 +5208,7 @@ mod tests {
         let at_least_batch = IndexExprResult::at_least(mask)
             .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
             .unwrap();
-        let at_least_upper = at_least_batch.column(1).as_binary::<i32>();
+        let at_least_upper = at_least_batch.column(1).as_binary::<i64>();
         assert!(!at_least_upper.is_null(0));
         let (round_tripped, _) = IndexExprResult::deserialize(&at_least_batch).unwrap();
         assert!(round_tripped.is_at_least());
