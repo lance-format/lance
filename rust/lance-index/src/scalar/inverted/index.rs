@@ -69,7 +69,8 @@ use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder}
 use super::iter::PostingListIterator;
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 use super::{
-    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams, wand::*,
+    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams,
+    PreparedBm25Query, wand::*,
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
