@@ -1209,9 +1209,8 @@ impl ScalarQueryParser for TextQueryParser {
         // Infix LIKE is accelerated only by the ngram index (via its regex
         // machinery). A plain-literal `regexp_like(col, 'foo')` is rewritten to
         // `col LIKE '%foo%'` before it reaches the index, so this is the path
-        // that accelerates those. ILIKE is skipped because its case folding does
-        // not match the index's normalization.
-        if !self.supports_regex || like.case_insensitive {
+        // that accelerates those.
+        if !self.supports_regex {
             return None;
         }
         let pattern_str = match pattern {
@@ -1221,7 +1220,10 @@ impl ScalarQueryParser for TextQueryParser {
         // Translate the LIKE pattern into a loose regex used only for candidate
         // generation; the original LIKE stays as the recheck filter, so the
         // regex only needs to be a sound superset.
-        let regex = like_to_regex(pattern_str, like.escape_char)?;
+        let mut regex = like_to_regex(pattern_str, like.escape_char)?;
+        if like.case_insensitive {
+            regex.insert_str(0, "(?i)");
+        }
         if !crate::scalar::ngram::regex_can_use_index(&regex) {
             return None;
         }
