@@ -226,6 +226,10 @@ pub fn transpose_row_ids_from_digest(
     mapping
 }
 
+/// Largest lineage working set an untagged remap across a straddled group may
+/// build before it is refused in favour of rebuilding the index.
+const LINEAGE_WORKING_BYTES_BUDGET: u64 = 64 << 20;
+
 /// The coverage an untagged remap publishes for one segment, and the rows it
 /// must drop to keep the rebuilt files within that coverage.
 #[derive(Debug, PartialEq)]
@@ -244,6 +248,19 @@ fn reuse_lineage(ancestors: &HashMap<u32, RoaringBitmap>, fragment: u32) -> Roar
     let mut lineage = ancestors.get(&fragment).cloned().unwrap_or_default();
     lineage.insert(fragment);
     lineage
+}
+
+/// Upper bound on the lineage working set of a straddled fold, in bytes: one
+/// bit per fragment named in the history for every destination fragment.
+fn lineage_working_bytes_estimate(versions: &[FragReuseVersion]) -> u64 {
+    let mut destinations = 0u64;
+    let mut named = RoaringBitmap::new();
+    for group in versions.iter().flat_map(|version| version.groups.iter()) {
+        destinations += group.new_frags.len() as u64;
+        named.extend(group.old_frags.iter().map(|f| f.id as u32));
+        named.extend(group.new_frags.iter().map(|f| f.id as u32));
+    }
+    destinations.saturating_mul(named.len()) / 8
 }
 
 /// Whether folding `versions` into `index_frag_bitmap` meets a group whose
@@ -282,17 +299,28 @@ fn any_group_straddles(
 /// A manifest write persists the healed bitmap of the other segments too, so
 /// those need no remap of their own.
 ///
-/// Lineage is only tracked when some group straddles the evolving bitmap.
-/// Without a straddle the fold keeps only the bitmap; with one it also keeps
-/// one lineage set per rewritten destination fragment of the retained reuse
-/// history, at most (destination fragments in the history) x (fragments in
-/// the history) bits, which the reuse index trim keeps bounded.
+/// Without a straddle the fold keeps only the bitmap. With one it also keeps
+/// one lineage set per rewritten destination fragment of the reuse history,
+/// so it is admitted only when a worst-case estimate of that working set fits
+/// `lineage_budget_bytes`, and refused otherwise without changing anything.
 fn remap_untagged_coverage(
     versions: &[FragReuseVersion],
     mut index_frag_bitmap: RoaringBitmap,
     baseline_version: u64,
-) -> UntaggedCoverage {
+    lineage_budget_bytes: u64,
+) -> Result<UntaggedCoverage> {
     let track_lineage = any_group_straddles(versions, index_frag_bitmap.clone());
+    if track_lineage {
+        let estimate = lineage_working_bytes_estimate(versions);
+        if estimate > lineage_budget_bytes {
+            return Err(Error::not_supported(format!(
+                "Remapping this index across a straddled fragment-reuse rewrite group would \
+                 need an estimated {estimate} bytes of lineage working set, over the budget of \
+                 {lineage_budget_bytes} bytes. The index and the fragment reuse history are left \
+                 unchanged; rebuild the index with optimize_indices instead."
+            )));
+        }
+    }
     let mut should_remap = false;
     let mut excluded_source_fragments = RoaringBitmap::new();
     // For every new fragment of a version, all the fragments its rows may
@@ -369,11 +397,11 @@ fn remap_untagged_coverage(
         index_frag_bitmap -= &withdrawn;
     }
 
-    UntaggedCoverage {
+    Ok(UntaggedCoverage {
         should_remap,
         fragment_bitmap: index_frag_bitmap,
         excluded_source_fragments,
-    }
+    })
 }
 
 /// Remap a given index using the fragment reuse index if possible.
@@ -438,7 +466,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     &frag_reuse_index.details.versions,
                     index_frag_bitmap,
                     baseline_version,
-                );
+                    LINEAGE_WORKING_BYTES_BUDGET,
+                )?;
                 (
                     coverage.should_remap,
                     Some(coverage.fragment_bitmap),
@@ -5165,7 +5194,8 @@ mod tests {
             #[case] excluded: &[u32],
         ) {
             assert_eq!(
-                remap_untagged_coverage(&versions, bitmap(stored), 1),
+                remap_untagged_coverage(&versions, bitmap(stored), 1, LINEAGE_WORKING_BYTES_BUDGET)
+                    .unwrap(),
                 UntaggedCoverage {
                     should_remap,
                     fragment_bitmap: bitmap(claimed),
@@ -5200,7 +5230,8 @@ mod tests {
         fn test_untagged_coverage_long_chain_owned() {
             let stored: RoaringBitmap = (0..=CHAIN_LENGTH as u32).collect();
             assert_eq!(
-                remap_untagged_coverage(&rewrite_chain(), stored, 1),
+                remap_untagged_coverage(&rewrite_chain(), stored, 1, LINEAGE_WORKING_BYTES_BUDGET)
+                    .unwrap(),
                 UntaggedCoverage {
                     should_remap: true,
                     fragment_bitmap: bitmap(&[(CHAIN_DESTINATION_BASE + CHAIN_LENGTH) as u32]),
@@ -5212,12 +5243,39 @@ mod tests {
         #[test]
         fn test_untagged_coverage_long_chain_straddled_at_first_hop() {
             assert_eq!(
-                remap_untagged_coverage(&rewrite_chain(), bitmap(&[0, OUTSIDE_CHAIN]), 1),
+                remap_untagged_coverage(
+                    &rewrite_chain(),
+                    bitmap(&[0, OUTSIDE_CHAIN]),
+                    1,
+                    LINEAGE_WORKING_BYTES_BUDGET
+                )
+                .unwrap(),
                 UntaggedCoverage {
                     should_remap: true,
                     fragment_bitmap: bitmap(&[OUTSIDE_CHAIN]),
                     excluded_source_fragments: bitmap(&[0]),
                 }
+            );
+        }
+
+        #[test]
+        fn test_untagged_coverage_straddled_over_lineage_budget_is_refused() {
+            let versions = rewrite_chain();
+            assert!(lineage_working_bytes_estimate(&versions) > 1);
+            let err =
+                remap_untagged_coverage(&versions, bitmap(&[0, OUTSIDE_CHAIN]), 1, 1).unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+            assert!(err.to_string().contains("optimize_indices"), "{err}");
+        }
+
+        #[test]
+        fn test_untagged_coverage_owned_ignores_lineage_budget() {
+            let stored: RoaringBitmap = (0..=CHAIN_LENGTH as u32).collect();
+            assert_eq!(
+                remap_untagged_coverage(&rewrite_chain(), stored, 1, 0)
+                    .unwrap()
+                    .fragment_bitmap,
+                bitmap(&[(CHAIN_DESTINATION_BASE + CHAIN_LENGTH) as u32])
             );
         }
 
