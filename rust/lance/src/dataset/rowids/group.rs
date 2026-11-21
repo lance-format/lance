@@ -484,9 +484,9 @@ async fn build_dense_lookup(
     let addrs = spawn_cpu(move || {
         let mut v = Vec::with_capacity(len);
         v.resize_with(len, || AtomicU64::new(EMPTY_SLOT));
-        Arc::new(v)
+        Ok(Arc::new(v))
     })
-    .await;
+    .await?;
     let overflow: Arc<Mutex<HashMap<u64, Vec<RowAddress>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut initial = Vec::with_capacity(preloaded.len());
@@ -922,12 +922,10 @@ async fn resolve_with_route(
             Candidate::Multi(cands) => {
                 let mut live: Option<RowAddress> = None;
                 for &addr in cands {
-                    if is_visible(addr) {
-                        if live.replace(addr).is_some() {
-                            return Err(Error::internal(format!(
-                                "row id index corrupt: stable row id {id} is live in multiple fragments"
-                            )));
-                        }
+                    if is_visible(addr) && live.replace(addr).is_some() {
+                        return Err(Error::internal(format!(
+                            "row id index corrupt: stable row id {id} is live in multiple fragments"
+                        )));
                     }
                 }
                 *slot = live;
