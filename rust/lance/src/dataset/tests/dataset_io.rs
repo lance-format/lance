@@ -60,7 +60,6 @@ use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::{BasePath, Fragment, pb};
 use lance_table::io::deletion::DELETIONS_DIR;
-use object_store::ObjectStoreExt;
 use prost::Message;
 
 use crate::index::DatasetIndexExt;
@@ -363,11 +362,7 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let _ = existing_tracker.incremental_stats();
     let _ = request_tracker.incremental_stats();
 
-    base_store
-        .inner
-        .get_range(&base_location, 0..1)
-        .await
-        .unwrap();
+    base_store.read_range(&base_location, 0..1).await.unwrap();
 
     assert!(existing_tracker.incremental_stats().read_iops > 0);
     assert!(request_tracker.incremental_stats().read_iops > 0);
@@ -425,7 +420,7 @@ async fn test_store_params_for_base_resolves_base_scoped_options() {
         .join("data")
         .join("probe.lance");
     base_store.put(&probe, b"hello").await.unwrap();
-    let read = base_store.inner.get_range(&probe, 0..5).await.unwrap();
+    let read = base_store.read_range(&probe, 0..5).await.unwrap();
     assert_eq!(read.as_ref(), b"hello");
 }
 
@@ -718,6 +713,7 @@ async fn test_create_data_file_checks_column_types(
                 replacements: vec![crate::dataset::transaction::DataReplacementGroup(
                     0, data_file,
                 )],
+                data_change: true,
             },
             Some(read_version),
             None,
@@ -3059,6 +3055,8 @@ async fn test_shallow_clone_cross_store(
     #[case] source_has_target: bool,
     #[case] target_has_target: bool,
 ) {
+    use object_store::ObjectStoreExt;
+
     let source_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
     let target_store: Arc<dyn object_store::ObjectStore> =

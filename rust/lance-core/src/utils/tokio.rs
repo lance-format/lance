@@ -129,6 +129,9 @@ extern "C" fn atfork_tokio_child() {
 
 #[cfg(not(windows))]
 fn install_atfork() {
+    // SAFETY: `atfork_tokio_child` has the required C ABI and signature and is
+    // valid for the process lifetime. The other handlers are `None`, and the
+    // child handler performs only atomic stores.
     unsafe { libc::pthread_atfork(None, None, Some(atfork_tokio_child)) };
 }
 
@@ -244,6 +247,9 @@ enum Stage<F, T> {
 // SAFETY: the stage is never accessed concurrently (see `SpawnedTask`), so
 // sharing it across threads only requires its contents to be `Send`.
 unsafe impl<F: Future + Send> Send for SpawnedTask<F> where F::Output: Send {}
+// SAFETY: shared references reach the stage only through the lifecycle-sequenced
+// paths described on `SpawnedTask`, which never access it concurrently. Both the
+// future and its output are `Send`.
 unsafe impl<F: Future + Send> Sync for SpawnedTask<F> where F::Output: Send {}
 
 trait PollErased: Send + Sync {
@@ -431,6 +437,8 @@ impl<F: FnOnce() -> T + Send, T: Send> RunOnce for CpuTask<F, T> {
         // SAFETY: upheld by the caller of `run`; see `RunOnce::run`.
         let func = unsafe { (*self.func.get()).take() }.expect("spawn_cpu task runs once");
         let output = func();
+        // SAFETY: `run` has exclusive access to `output` until it returns, and
+        // the caller reads the slot only after this task's join handle resolves.
         unsafe { *self.output.get() = Some(output) };
     }
 }

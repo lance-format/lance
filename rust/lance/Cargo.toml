@@ -143,6 +143,7 @@ datafusion-substrait = { workspace = true }
 parquet = { workspace = true }
 parquet-variant-compute = "59.2.0"
 reqwest = { workspace = true, features = ["rustls"] }
+wiremock.workspace = true
 
 # Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
 # Not part of the default test run: CI runs it from the `arrow-ordering-compat`
@@ -201,6 +202,10 @@ required-features = ["cli"]
 
 [[bench]]
 name = "scalar_index"
+harness = false
+
+[[bench]]
+name = "membership_planning"
 harness = false
 
 [[bench]]

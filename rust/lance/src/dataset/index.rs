@@ -483,6 +483,7 @@ mod tests {
         let descriptions = dataset.describe_indices(None).await.unwrap();
         assert_eq!(descriptions.len(), 1);
         assert_eq!(descriptions[0].name(), FRAG_REUSE_INDEX_NAME);
+        assert_eq!(descriptions[0].details().unwrap(), "{}");
         assert!(
             descriptions[0].fragment_coverage().is_none(),
             "fragment-reuse metadata does not represent data-index coverage"

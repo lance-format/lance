@@ -22,6 +22,7 @@ use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
 use lance_core::cache::{CacheActivity, CacheSnapshotMode, LanceCache};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
@@ -58,6 +59,79 @@ use crate::session::index_caches::{
 // `knn` module, so the tests below cover that surface too.
 use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+#[rstest]
+#[case::created("_row_created_at_version")]
+#[case::updated("_row_last_updated_at_version")]
+#[tokio::test]
+async fn test_knn_version_projection(
+    #[case] version_column: &str,
+    #[values(false, true)] with_data: bool,
+) {
+    let data = RecordBatch::try_from_iter([
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])) as ArrayRef,
+        ),
+        (
+            "vec",
+            Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    Float32Array::from(vec![
+                        0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0,
+                    ]),
+                    2,
+                )
+                .unwrap(),
+            ) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.slice(0, 3))], data.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(data.slice(3, 3))], data.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", &Float32Array::from(vec![2.25, 0.0]), 3)
+        .unwrap();
+    scanner.use_index(false).with_row_id();
+    let columns = if with_data {
+        vec!["i", version_column]
+    } else {
+        vec![version_column]
+    };
+    scanner.project(&columns).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[2, 3, 1]
+    );
+    assert_eq!(
+        batch[version_column].as_primitive::<UInt64Type>().values(),
+        &[1, 2, 1]
+    );
+    if with_data {
+        assert_eq!(batch["i"].as_primitive::<Int32Type>().values(), &[2, 3, 1]);
+    }
+}
 
 #[rstest]
 #[tokio::test]
@@ -3184,6 +3258,7 @@ async fn test_quantized_refinement_cache_snapshot_identity(#[case] change: fn(&m
         query_parallelism: 0,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Normal,
+        rq_graph_scoring: Default::default(),
     };
     let options = QuantizedRefinementOptions {
         result_count: 10,
@@ -4173,6 +4248,106 @@ async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
     assert_eq!(batch_row_ids(&quantized), batch_row_ids(&accurate_range));
     assert_eq!(quantized.num_rows(), 1);
     assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
+}
+
+/// A query whose probed partitions hold at least two scoring tasks' worth of
+/// bytes (`SCORING_TASK_BYTES`) is scored by concurrent CPU tasks that merge
+/// their heaps, unless the query asks for a single worker (#6475) or the
+/// compute pool has only one worker; either way the result must be the exact
+/// top-k, here checked against a flat scan over the same rows.
+#[rstest]
+#[case::automatic(0)]
+#[case::single_worker(1)]
+#[tokio::test]
+async fn test_knn_scores_large_chunk_on_concurrent_tasks(#[case] query_parallelism: i32) {
+    use crate::index::vector::ivf::v2::{PARALLEL_SCORING_CHUNKS, SCORING_TASK_BYTES};
+    use rand::{Rng, SeedableRng};
+    use std::sync::atomic::Ordering;
+
+    // An automatic query follows the pool size; an explicit count of one pins
+    // the chunk to a single task whatever the pool offers.
+    let splits = query_parallelism != 1 && get_num_compute_intensive_cpus() >= 2;
+
+    // The split counter is process-wide, so the cases must not interleave.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serial = SERIAL.lock().await;
+
+    const DIM: usize = 1024;
+    // Two exact (flat) partitions holding three tasks' worth of vectors in
+    // all, so the split happens however unevenly k-means divides them.
+    let rows = 3 * SCORING_TASK_BYTES.div_ceil(DIM * 4);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1024);
+    let vectors = Float32Array::from_iter_values((0..rows * DIM).map(|_| rng.random::<f32>()));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+            Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap()),
+        ],
+    )
+    .unwrap();
+    let test_dir = TempStrDir::default();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = Float32Array::from_iter_values((0..DIM).map(|_| rng.random::<f32>()));
+    let k = 5;
+    let results = |use_index: bool| {
+        let dataset = dataset.clone();
+        let query = query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, k).unwrap();
+            scan.minimum_nprobes(2).maximum_nprobes(2);
+            scan.use_index(use_index);
+            scan.query_parallelism(query_parallelism);
+            scan.project(&["id"]).unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            let dists = batch[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            (ids, dists)
+        }
+    };
+    let before = PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed);
+    let indexed = results(true).await;
+    assert_eq!(
+        PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed) > before,
+        splits,
+        "query_parallelism={query_parallelism} should {}split the chunk",
+        if splits { "" } else { "not " }
+    );
+    let flat = results(false).await;
+    assert_eq!(indexed.0, flat.0);
+    assert_eq!(indexed.0.len(), k);
+    // The exact index and the flat scan take different L2 kernels, which
+    // round differently in the last bits.
+    for (indexed, flat) in indexed.1.iter().zip(&flat.1) {
+        assert!((indexed - flat).abs() <= 1e-4 * flat, "{indexed} vs {flat}");
+    }
 }
 
 /// A multivector query must score each row the same whatever the execution

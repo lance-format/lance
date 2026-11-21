@@ -705,6 +705,17 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        // Noop when no rows match so we don't bump the version or block other writers.
+        if update_data.removed_fragment_ids.is_empty()
+            && update_data.old_fragments.is_empty()
+            && update_data.new_fragments.is_empty()
+        {
+            return Ok(UpdateResult {
+                new_dataset: dataset,
+                rows_updated: 0,
+            });
+        }
+
         // Updated columns are top-level (nested references are rejected by `set`), but a
         // struct-column update rewrites all of its descendants. Collect the full field
         // subtree so an index on a nested child field is recognized as modified and not
@@ -1240,6 +1251,8 @@ mod tests {
     #[rstest]
     #[case::integers("[3, 4]", Some(vec![Some(3.0), Some(4.0)]), None)]
     #[case::floats("[3.5, 4.5]", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::integer_then_float("[3, 4.5]", Some(vec![Some(3.0), Some(4.5)]), None)]
+    #[case::null_then_integer("[NULL, 4]", Some(vec![None, Some(4.0)]), None)]
     #[case::strings("['3.5', '4.5']", Some(vec![Some(3.5), Some(4.5)]), None)]
     #[case::invalid_element("['invalid', '4.5']", None, Some("Cannot cast string"))]
     #[case::all_null_elements("[NULL, NULL]", Some(vec![None, None]), None)]

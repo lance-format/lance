@@ -262,6 +262,12 @@ pub(crate) fn accumulate_distances_into_heap(
     let mut max_dist = res.peek().map(|node| node.dist);
 
     for (id, dist) in dists.iter().copied().enumerate() {
+        // Nearly every row of a full heap loses to its worst entry; one plain
+        // float compare settles those before the total-order compares below.
+        // A NaN fails this test and takes the ordered path unchanged.
+        if res.len() >= k && max_dist.is_some_and(|max_dist| dist >= max_dist.0) {
+            continue;
+        }
         let dist = OrderedFloat(dist);
         if dist < lower_bound || dist >= upper_bound {
             continue;
@@ -1510,9 +1516,19 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ) -> Self {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::from_cached_with_remapper(reader, ivf, metadata, distance_type, frag_reuse_index)
+        Self::from_cached_with_remapper(
+            reader,
+            ivf,
+            metadata,
+            distance_type,
+            frag_reuse_index,
+            None,
+        )
     }
 
+    /// `quantizer` is one built earlier for the same metadata, so that
+    /// reconstructing an index does not rebuild it (and its prepared targets)
+    /// from the metadata each time.
     #[doc(hidden)]
     pub fn from_cached_with_remapper(
         reader: FileReader,
@@ -1520,9 +1536,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         metadata: Q::Metadata,
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        quantizer: Option<Quantizer>,
     ) -> Self {
         let quantizer = if Q::retain_quantizer_for_partition_storage() {
-            Q::from_metadata(&metadata, distance_type).ok()
+            quantizer.or_else(|| Q::from_metadata(&metadata, distance_type).ok())
         } else {
             None
         };
@@ -1722,6 +1739,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     pub fn partition_size(&self, part_id: usize) -> usize {
         self.ivf.partition_size(part_id)
+    }
+
+    /// The quantizer this storage keeps, if its quantization retains one.
+    /// Unlike [`Self::quantizer`], never builds one from the metadata.
+    pub fn retained_quantizer(&self) -> Option<&Quantizer> {
+        self.quantizer.as_ref()
     }
 
     pub fn quantizer(&self) -> Result<Quantizer> {

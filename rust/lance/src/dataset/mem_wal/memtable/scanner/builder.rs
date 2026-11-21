@@ -1484,6 +1484,19 @@ impl MemTableScanner {
 mod tests {
     use super::*;
 
+    use arrow_array::cast::AsArray;
+    use datafusion::common::{DFSchema, stats::Precision};
+    use datafusion::config::ConfigOptions;
+    use datafusion::functions_aggregate::count::count_all;
+    use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+    use datafusion::physical_expr::execution_props::ExecutionProps;
+    use datafusion::physical_optimizer::{
+        PhysicalOptimizerRule, aggregate_statistics::AggregateStatistics,
+    };
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
+
     use crate::dataset::mem_wal::memtable::scanner::{fallback_reads, newest_checks};
 
     /// A deduplicated filtered read from the filter indexes returns what
@@ -3353,6 +3366,133 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::fewer_than_k(3, 2, None, None, 3, 3)]
+    #[case::empty(0, 0, None, None, 0, 0)]
+    #[case::no_visible_rows(20, 0, None, None, 0, 0)]
+    #[case::visibility(20, 1, None, None, 2, 2)]
+    #[case::prefilter(20, 2, Some("id = 1"), None, 1, 10)]
+    #[case::prefilter_no_matches(20, 2, Some("id > 99"), None, 0, 10)]
+    #[case::distance_bound(20, 2, None, Some(0.5), 1, 10)]
+    #[case::full_top_k(20, 2, None, None, 10, 10)]
+    #[tokio::test]
+    async fn vector_count_uses_actual_output(
+        #[values(false, true)] has_index: bool,
+        #[case] stored_rows: usize,
+        #[case] readable_count: usize,
+        #[case] filter: Option<&str>,
+        #[case] distance_upper_bound: Option<f32>,
+        #[case] expected_rows: usize,
+        #[case] estimated_rows: usize,
+    ) {
+        let batch = vector_batch().slice(0, stored_rows);
+        let schema = batch.schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(2));
+        let mut indexes = IndexStore::new();
+        if has_index {
+            indexes.add_hnsw(
+                "vector_idx".to_string(),
+                1,
+                "vector".to_string(),
+                DistanceType::L2,
+                32,
+                2,
+            );
+        }
+        // Split the visible prefix from later rows to exercise snapshot bounds.
+        let first_rows = stored_rows.min(2);
+        for (offset, rows) in [(0, first_rows), (first_rows, stored_rows - first_rows)] {
+            if rows == 0 {
+                continue;
+            }
+            let batch = batch.slice(offset, rows);
+            let (position, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, row_offset, Some(position))
+                .unwrap();
+        }
+        let mut scanner = MemTableScanner::new_at_readable_count(
+            batch_store,
+            Arc::new(indexes),
+            schema,
+            readable_count,
+        );
+        scanner
+            .nearest(
+                "vector",
+                &arrow_array::Float32Array::from(vec![0.0, 0.0]),
+                10,
+            )
+            .unwrap();
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        scanner.distance_range(None, distance_upper_bound);
+        let input = scanner.create_plan().await.unwrap();
+        let plan = datafusion::physical_plan::displayable(input.as_ref())
+            .indent(true)
+            .to_string();
+        let route = if has_index && filter.is_none() {
+            "VectorIndexExec"
+        } else {
+            "MemTableBruteForceVectorExec"
+        };
+        assert!(plan.contains(route), "{plan}");
+        assert_eq!(
+            scanner.try_into_batch().await.unwrap().num_rows(),
+            expected_rows
+        );
+
+        let expr = count_all();
+        let input_schema = input.schema();
+        let df_schema = DFSchema::try_from(input_schema.as_ref().clone()).unwrap();
+        let aggregate = LoweredAggregateBuilder::new(
+            &expr,
+            &df_schema,
+            input_schema.as_ref(),
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )
+        .with_name(expr.schema_name().to_string())
+        .with_human_display(expr.human_display().to_string())
+        .build()
+        .unwrap()
+        .aggregate;
+        let count_plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::default(),
+                vec![aggregate],
+                vec![None],
+                input.clone(),
+                input_schema,
+            )
+            .unwrap(),
+        );
+        let optimized = AggregateStatistics::new()
+            .optimize(count_plan, &ConfigOptions::default())
+            .unwrap();
+        let result =
+            datafusion::physical_plan::collect(optimized, SessionContext::new().task_ctx())
+                .await
+                .unwrap();
+        assert_eq!(
+            result[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            expected_rows as i64,
+            "optimized COUNT(*) must count the rows emitted by {route}"
+        );
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(input.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
+            Precision::Inexact(estimated_rows)
+        );
     }
 
     /// The three nearest neighbours, through an HNSW that deviates.

@@ -1022,6 +1022,11 @@ impl ScalarQueryParser for LabelListQueryParser {
         for idx in 0..list_values.len() {
             scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
         }
+        // Coercing the literal to the column's item type turns an item that does not
+        // fit into NULL, which the index would match against NULL items.
+        if scalars.iter().any(ScalarValue::is_null) {
+            return None;
+        }
         if func.name() == "array_has_all" {
             let query = LabelListQuery::HasAllLabels(scalars);
             Some(IndexedExpression::index_query(
@@ -1204,9 +1209,8 @@ impl ScalarQueryParser for TextQueryParser {
         // Infix LIKE is accelerated only by the ngram index (via its regex
         // machinery). A plain-literal `regexp_like(col, 'foo')` is rewritten to
         // `col LIKE '%foo%'` before it reaches the index, so this is the path
-        // that accelerates those. ILIKE is skipped because its case folding does
-        // not match the index's normalization.
-        if !self.supports_regex || like.case_insensitive {
+        // that accelerates those.
+        if !self.supports_regex {
             return None;
         }
         let pattern_str = match pattern {
@@ -1216,7 +1220,10 @@ impl ScalarQueryParser for TextQueryParser {
         // Translate the LIKE pattern into a loose regex used only for candidate
         // generation; the original LIKE stays as the recheck filter, so the
         // regex only needs to be a sound superset.
-        let regex = like_to_regex(pattern_str, like.escape_char)?;
+        let mut regex = like_to_regex(pattern_str, like.escape_char)?;
+        if like.case_insensitive {
+            regex.insert_str(0, "(?i)");
+        }
         if !crate::scalar::ngram::regex_can_use_index(&regex) {
             return None;
         }
@@ -2258,6 +2265,33 @@ fn is_plain_string(data_type: &DataType) -> bool {
     )
 }
 
+/// Whether `from` is a list whose integer items convert to `to`'s item type without
+/// changing any value.
+///
+/// DataFusion coerces `array_has` and friends to the union item type of the column
+/// and the literal, and the literal list is typed from its first value as Int64.
+/// So a narrower integer list column reaches the planner as `CAST(col AS List(Int64))`.
+fn is_lossless_integer_list_cast(from: &DataType, to: &DataType) -> bool {
+    let (from, to) = match (from, to) {
+        (DataType::List(from), DataType::List(to))
+        | (DataType::LargeList(from), DataType::LargeList(to)) => {
+            (from.data_type(), to.data_type())
+        }
+        _ => return false,
+    };
+    let (Some(from_width), Some(to_width)) = (from.primitive_width(), to.primitive_width()) else {
+        return false;
+    };
+    match (from.is_signed_integer(), from.is_unsigned_integer()) {
+        (true, _) => to.is_signed_integer() && from_width <= to_width,
+        (_, true) => {
+            (to.is_unsigned_integer() && from_width <= to_width)
+                || (to.is_signed_integer() && from_width < to_width)
+        }
+        _ => false,
+    }
+}
+
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
 //
 // There's two ways to get a column.  First, the obvious way, is a
@@ -2299,11 +2333,14 @@ fn maybe_indexed_column<'b>(
         // what keeps a LIKE whose pattern is a wider string variant on the index
         // instead of a full scan; restricting it to casts that stay within the string
         // types is what keeps the index answer equal to the original predicate, which
-        // matters because an exact answer skips the recheck.
+        // matters because an exact answer skips the recheck.  The same holds for a
+        // list cast that only widens integer items, which is how a LABEL_LIST column
+        // narrower than int64 reaches `array_has`.
         Expr::Cast(cast) => {
             let (column, data_type, parser) = maybe_indexed_column(&cast.expr, index_info)?;
-            (is_plain_string(&data_type) && is_plain_string(cast.field.data_type()))
-                .then_some((column, data_type, parser))
+            ((is_plain_string(&data_type) && is_plain_string(cast.field.data_type()))
+                || is_lossless_integer_list_cast(&data_type, cast.field.data_type()))
+            .then_some((column, data_type, parser))
         }
         _ => None,
     }
@@ -2745,8 +2782,23 @@ fn visit_binary_expr(
         }
         Operator::And => visit_and(expr, index_info, depth),
         Operator::Or => visit_or(expr, index_info, depth),
+        Operator::RegexMatch | Operator::RegexIMatch => Ok(visit_regex_match(expr, index_info)),
         _ => Ok(None),
     }
+}
+
+/// `col ~ 'pat'` is `regexp_like(col, 'pat')`; `~*` adds the `i` flag.
+fn visit_regex_match(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let (column, data_type, query_parser) = maybe_indexed_column(&expr.left, index_info)?;
+    let mut args = vec![expr.left.as_ref().clone(), expr.right.as_ref().clone()];
+    if expr.op == Operator::RegexIMatch {
+        args.push(Expr::Literal(ScalarValue::Utf8(Some("i".into())), None));
+    }
+    let regexp_like = datafusion_functions::regex::regexp_like();
+    query_parser.visit_scalar_function(&column, &data_type, &regexp_like, &args)
 }
 
 fn visit_scalar_fn(
@@ -3361,6 +3413,136 @@ mod tests {
             true,
             schema,
         );
+    }
+
+    fn label_list_index_info(label_type: &DataType) -> MockIndexInfoProvider {
+        MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )])
+    }
+
+    fn plan_label_list_filter(label_type: DataType, filter: &str) -> FilterPlan {
+        let index_info = label_list_index_info(&label_type);
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "labels", label_type, true,
+        )])));
+        let expr = planner.parse_filter(filter).unwrap();
+        create_filter_plan(planner.optimize_expr(expr).unwrap(), &index_info, true).unwrap()
+    }
+
+    // DataFusion types the literal list as Int64 and casts a narrower integer column
+    // to match, so the parser only sees the column through a `Cast`.
+    #[rstest]
+    #[case::int8(DataType::Int8, ScalarValue::Int8(Some(5)), ScalarValue::Int8(Some(7)))]
+    #[case::int32(
+        DataType::Int32,
+        ScalarValue::Int32(Some(5)),
+        ScalarValue::Int32(Some(7))
+    )]
+    #[case::uint8(
+        DataType::UInt8,
+        ScalarValue::UInt8(Some(5)),
+        ScalarValue::UInt8(Some(7))
+    )]
+    #[case::uint32(
+        DataType::UInt32,
+        ScalarValue::UInt32(Some(5)),
+        ScalarValue::UInt32(Some(7))
+    )]
+    fn test_label_list_integer_items_narrower_than_int64(
+        #[case] item_type: DataType,
+        #[case] first: ScalarValue,
+        #[case] second: ScalarValue,
+        #[values(false, true)] large: bool,
+    ) {
+        let item = Arc::new(Field::new("item", item_type, true));
+        let label_type = if large {
+            DataType::LargeList(item)
+        } else {
+            DataType::List(item)
+        };
+        let expected_any = LabelListQuery::HasAnyLabel(vec![first.clone(), second.clone()]);
+        let expected_all = LabelListQuery::HasAllLabels(vec![first.clone(), second]);
+        for (filter, expected) in [
+            (
+                "array_has(labels, 5)",
+                LabelListQuery::HasAnyLabel(vec![first]),
+            ),
+            ("array_has_any(labels, [5, 7])", expected_any),
+            ("array_has_all(labels, [5, 7])", expected_all),
+        ] {
+            let plan = plan_label_list_filter(label_type.clone(), filter);
+            let Some(ScalarIndexExpr::Query(search)) = plan.index_query.as_ref() else {
+                panic!("{filter} did not use the index: {:?}", plan.index_query);
+            };
+            assert_eq!(search.index_name, "labels_idx");
+            assert_eq!(
+                search.query.as_any().downcast_ref::<LabelListQuery>(),
+                Some(&expected),
+                "{filter}"
+            );
+        }
+    }
+
+    // A literal outside the item type's range cannot be answered by the index:
+    // coercing it to the item type would turn it into NULL, and the index would
+    // match rows with NULL items instead of nothing.
+    #[rstest]
+    #[case::int32_array_has("array_has(labels, 3000000000)")]
+    #[case::int32_array_has_any("array_has_any(labels, [1, 3000000000])")]
+    #[case::int32_array_has_all("array_has_all(labels, [1, 3000000000])")]
+    fn test_label_list_integer_literal_out_of_item_range(#[case] filter: &str) {
+        let label_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let plan = plan_label_list_filter(label_type, filter);
+
+        assert!(plan.index_query.is_none(), "{filter}");
+        assert!(plan.refine_expr.is_some());
+    }
+
+    #[test]
+    fn test_label_list_lossless_integer_cast() {
+        let list = |item_type| DataType::List(Arc::new(Field::new("item", item_type, true)));
+        let large = |item_type| DataType::LargeList(Arc::new(Field::new("item", item_type, true)));
+        assert!(is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &list(DataType::Int64)
+        ));
+        assert!(is_lossless_integer_list_cast(
+            &large(DataType::UInt32),
+            &large(DataType::Int64)
+        ));
+        assert!(is_lossless_integer_list_cast(
+            &list(DataType::UInt8),
+            &list(DataType::UInt64)
+        ));
+        // These change values or the type of the items.
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int64),
+            &list(DataType::Int32)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::UInt64),
+            &list(DataType::Int64)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &list(DataType::UInt64)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &list(DataType::Float64)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &large(DataType::Int64)
+        ));
     }
 
     #[test]

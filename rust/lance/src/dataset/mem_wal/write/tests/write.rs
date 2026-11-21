@@ -6,11 +6,60 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::{RecordBatch, record_batch};
+use lance_core::Error;
+use rstest::rstest;
 use uuid::Uuid;
 
 use super::super::test_support::*;
-use super::super::{ShardWriter, ShardWriterConfig};
+use super::super::{ShardWriter, ShardWriterConfig, WriteBatchBuffer};
 use crate::dataset::mem_wal::index::MemIndexSpec;
+
+#[test]
+fn test_write_buffer_byte_limit() {
+    let config = ShardWriterConfig::default();
+    let batch = record_batch!(("id", Int64, [1, 2])).unwrap();
+    let batch_bytes = batch.get_array_memory_size() + std::mem::size_of::<RecordBatch>();
+    let mut buffer = WriteBatchBuffer::new(&config, 2 * batch_bytes).unwrap();
+    buffer.push(batch.clone()).unwrap();
+    buffer.push(batch.clone()).unwrap();
+    let error = buffer.push(batch.clone()).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("exceeds max_bytes="));
+    assert_eq!(buffer.into_batches(), vec![batch.clone(), batch]);
+
+    let error = WriteBatchBuffer::new(&config, 0).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("max_bytes must be positive"));
+}
+
+#[rstest]
+#[case::memtable(true)]
+#[case::wal_only(false)]
+fn test_write_buffer_row_limit(#[case] enable_memtable: bool) {
+    let config = ShardWriterConfig {
+        enable_memtable,
+        max_memtable_rows: 2,
+        ..Default::default()
+    };
+    let batch = record_batch!(("id", Int64, [1, 2])).unwrap();
+    let mut buffer = WriteBatchBuffer::new(&config, 1024 * 1024).unwrap();
+    buffer.push(batch.clone()).unwrap();
+    let result = buffer.push(batch);
+    if enable_memtable {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("4 rows exceeds max_memtable_rows=2")
+        );
+        assert_eq!(buffer.into_batches().len(), 1);
+    } else {
+        result.unwrap();
+        assert_eq!(buffer.into_batches().len(), 2);
+    }
+}
 
 #[tokio::test]
 async fn test_shard_writer_basic_write() {

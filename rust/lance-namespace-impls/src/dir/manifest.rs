@@ -1013,6 +1013,7 @@ impl std::fmt::Debug for ManifestNamespace {
 /// - `CommitConflict`: version collision retries exhausted -> Throttling (safe to retry)
 /// - `TooMuchWriteContention`: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
 /// - `IncompatibleTransaction`: incompatible concurrent change -> ConcurrentModification
+/// - `InvalidInput`: the request itself is invalid (e.g. it adds an existing column) -> InvalidInput
 /// - Errors containing "matched/duplicate/already exists": ConcurrentModification (from WhenMatched::Fail)
 /// - Other errors: IO error with the operation description
 fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option<&str>) -> Error {
@@ -1039,6 +1040,15 @@ fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option
             };
             NamespaceError::ConcurrentModification { message }.into()
         }
+        // Checked before the message text below: "Column x already exists in the
+        // dataset" is a bad request, not a concurrent create.
+        LanceError::InvalidInput { .. } => NamespaceError::InvalidInput {
+            message: match object_id {
+                Some(id) => format!("{} on '{}': {}", operation, id, e),
+                None => format!("{}: {}", operation, e),
+            },
+        }
+        .into(),
         // Other errors: check message for semantic conflicts (matched/duplicate from WhenMatched::Fail)
         _ => {
             let error_msg = e.to_string();
@@ -7598,6 +7608,52 @@ mod tests {
             field_names.contains(&"doubled_id"),
             "Column 'doubled_id' should exist after add_columns, got: {:?}",
             field_names
+        );
+    }
+
+    /// Adding a column the table already has is a bad request, not a concurrent create.
+    #[rstest]
+    #[case::with_optimization(true, true)]
+    #[case::without_optimization(false, true)]
+    #[case::directory_only(false, false)]
+    #[tokio::test]
+    async fn test_alter_table_add_columns_existing_column(
+        #[case] inline_optimization: bool,
+        #[case] manifest_enabled: bool,
+    ) {
+        use lance_namespace::error::{ErrorCode, NamespaceError};
+        use lance_namespace::models::{AddColumnsEntry, AlterTableAddColumnsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .inline_optimization_enabled(inline_optimization)
+            .manifest_enabled(manifest_enabled)
+            .build()
+            .await
+            .unwrap();
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["test_table".to_string()]);
+        dir_namespace
+            .create_table(create_request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+
+        let mut new_col = AddColumnsEntry::new("id".to_string());
+        new_col.expression = Some(Some("CAST(1 AS INT)".to_string()));
+        let mut request = AlterTableAddColumnsRequest::new(vec![new_col]);
+        request.id = Some(vec!["test_table".to_string()]);
+        let err = dir_namespace
+            .alter_table_add_columns(request)
+            .await
+            .unwrap_err();
+        let lance_core::Error::Namespace { source, .. } = &err else {
+            panic!("expected a namespace error, got {err:?}");
+        };
+        let code = source.downcast_ref::<NamespaceError>().map(|e| e.code());
+        assert_eq!(code, Some(ErrorCode::InvalidInput), "{err}");
+        assert!(
+            err.to_string().contains("Column id already exists"),
+            "{err}"
         );
     }
 
