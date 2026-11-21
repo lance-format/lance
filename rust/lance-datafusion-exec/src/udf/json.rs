@@ -457,6 +457,164 @@ fn extract_json_path(jsonb_bytes: &[u8], path: &str) -> Result<Option<String>> {
     }
 }
 
+/// Create the json_extract_string UDF for extracting a string by JSONPath
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: JSONPath expression as string (Utf8)
+///
+/// # Returns
+/// The value at the path with the `json_get_string` conversion rules, or null
+/// if the path is not found, the value is JSON `null` or it cannot be
+/// converted. A path matching several values selects them as one JSON array,
+/// which converts to null for every typed function.
+pub fn json_extract_string_udf() -> ScalarUDF {
+    json_extract_typed_udf(
+        "json_extract_string",
+        DataType::Utf8,
+        json_extract_string_impl,
+    )
+}
+
+/// Implementation of json_extract_string function
+fn json_extract_string_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let mut builder = StringBuilder::new();
+    visit_json_path_values(args, "json_extract_string", |value| {
+        match value.map(json_value_to_string).transpose()?.flatten() {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+        Ok(())
+    })?;
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Create the json_extract_int UDF for extracting an integer by JSONPath
+///
+/// Same arguments and null rules as [`json_extract_string_udf`], with the
+/// `json_get_int` conversion rules.
+pub fn json_extract_int_udf() -> ScalarUDF {
+    json_extract_typed_udf("json_extract_int", DataType::Int64, json_extract_int_impl)
+}
+
+/// Implementation of json_extract_int function
+fn json_extract_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let mut builder = Int64Builder::new();
+    visit_json_path_values(args, "json_extract_int", |value| {
+        match value.map(json_value_to_int).transpose()?.flatten() {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+        Ok(())
+    })?;
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Create the json_extract_float UDF for extracting a float by JSONPath
+///
+/// Same arguments and null rules as [`json_extract_string_udf`], with the
+/// `json_get_float` conversion rules.
+pub fn json_extract_float_udf() -> ScalarUDF {
+    json_extract_typed_udf(
+        "json_extract_float",
+        DataType::Float64,
+        json_extract_float_impl,
+    )
+}
+
+/// Implementation of json_extract_float function
+fn json_extract_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let mut builder = Float64Builder::new();
+    visit_json_path_values(args, "json_extract_float", |value| {
+        match value.map(json_value_to_float).transpose()?.flatten() {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+        Ok(())
+    })?;
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Create the json_extract_bool UDF for extracting a boolean by JSONPath
+///
+/// Same arguments and null rules as [`json_extract_string_udf`], with the
+/// `json_get_bool` conversion rules.
+pub fn json_extract_bool_udf() -> ScalarUDF {
+    json_extract_typed_udf(
+        "json_extract_bool",
+        DataType::Boolean,
+        json_extract_bool_impl,
+    )
+}
+
+/// Implementation of json_extract_bool function
+fn json_extract_bool_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let mut builder = BooleanBuilder::new();
+    visit_json_path_values(args, "json_extract_bool", |value| {
+        match value.map(json_value_to_bool).transpose()?.flatten() {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+        Ok(())
+    })?;
+    Ok(Arc::new(builder.finish()))
+}
+
+fn json_extract_typed_udf(
+    name: &str,
+    return_type: DataType,
+    extract: fn(&[ArrayRef]) -> Result<ArrayRef>,
+) -> ScalarUDF {
+    create_udf(
+        name,
+        vec![DataType::LargeBinary, DataType::Utf8],
+        return_type,
+        Volatility::Immutable,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let arrays = common::columnar_to_arrays(args);
+            Ok(ColumnarValue::Array(extract(&arrays)?))
+        }),
+    )
+}
+
+/// Select the value at each row's JSONPath and pass it to `visit`.
+///
+/// A row with a null document or path, or whose path matches nothing, visits
+/// `None`. The path is parsed again only when it differs from the previous
+/// row's, so a constant path is parsed once per batch.
+fn visit_json_path_values(
+    args: &[ArrayRef],
+    function_name: &str,
+    mut visit: impl FnMut(Option<lance_jsonb::OwnedJsonb>) -> Result<()>,
+) -> Result<()> {
+    common::validate_arg_count(args, 2, function_name)?;
+
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let path_array = common::extract_string_array(args, 1)?;
+    let mut parsed: Option<(&str, lance_jsonb::jsonpath::JsonPath<'_>)> = None;
+
+    for i in 0..jsonb_array.len() {
+        let path = common::get_string_value_at(path_array, i);
+        let Some(path) = path.filter(|_| !jsonb_array.is_null(i)) else {
+            visit(None)?;
+            continue;
+        };
+        let (path, json_path) = match parsed.take() {
+            Some(cached) if cached.0 == path => cached,
+            _ => (path, common::parse_json_path(path)?),
+        };
+        let value = select_json_path(jsonb_array.value(i), &json_path).map_err(|e| {
+            common::execution_error(format!(
+                "Failed to select value from path '{}': {}",
+                path, e
+            ))
+        })?;
+        parsed = Some((path, json_path));
+        visit(value)?;
+    }
+    Ok(())
+}
+
 /// Create the json_exists UDF for checking if a JSONPath exists
 ///
 /// # Arguments
@@ -1059,6 +1217,125 @@ mod tests {
         assert_eq!(string_array.value(2), "[\"python\",\"ml\"]");
         assert!(string_array.is_null(3));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_extract_typed_udfs() -> Result<()> {
+        let json = r#"{
+            "user": {
+                "profile": {"name": "Alice"},
+                "age": 30,
+                "score": 9.5,
+                "active": true,
+                "a.b": 1,
+                "nick": null,
+                "tags": ["x", "y"]
+            },
+            "items": [{"n": 1}, {"n": 2}],
+            "single": [{"n": 7}]
+        }"#;
+        let jsonb_bytes = create_test_jsonb(json);
+
+        // Each case is (path, string, int, float, bool).
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Option<&str>, Option<i64>, Option<f64>, Option<bool>)> = vec![
+            ("$.user.profile.name", Some("Alice"), None, None, None),
+            ("$.user.age", Some("30"), Some(30), Some(30.0), Some(true)),
+            // Floats convert to integers as `json_get_int` does.
+            ("$.user.score", Some("9.5"), Some(10), Some(9.5), Some(true)),
+            (
+                "$.user.active",
+                Some("true"),
+                Some(1),
+                Some(1.0),
+                Some(true),
+            ),
+            // A literal key containing a dot is addressed by a quoted path segment.
+            ("$.user[\"a.b\"]", Some("1"), Some(1), Some(1.0), Some(true)),
+            ("$.user.tags[1]", Some("y"), None, None, None),
+            ("$.items[0].n", Some("1"), Some(1), Some(1.0), Some(true)),
+            // A single match is the value itself.
+            ("$.single[*].n", Some("7"), Some(7), Some(7.0), Some(true)),
+            // Missing paths, JSON null, containers and multiple matches are null.
+            ("$.user.missing", None, None, None, None),
+            ("$.user.nick", None, None, None, None),
+            ("$.user.tags", None, None, None, None),
+            ("$.user", None, None, None, None),
+            ("$.items[*].n", None, None, None, None),
+        ];
+
+        let mut binary_builder = LargeBinaryBuilder::new();
+        for _ in &cases {
+            binary_builder.append_value(&jsonb_bytes);
+        }
+        // A null document and a null path.
+        binary_builder.append_null();
+        binary_builder.append_value(&jsonb_bytes);
+        let jsonb_array = Arc::new(binary_builder.finish());
+        let mut paths: Vec<Option<&str>> = cases.iter().map(|case| Some(case.0)).collect();
+        paths.extend([Some("$.user.age"), None]);
+        let path_array = Arc::new(StringArray::from(paths));
+        let args: [ArrayRef; 2] = [jsonb_array, path_array];
+
+        let strings = json_extract_string_impl(&args)?;
+        let strings = strings.as_any().downcast_ref::<StringArray>().unwrap();
+        let ints = json_extract_int_impl(&args)?;
+        let ints = ints.as_any().downcast_ref::<Int64Array>().unwrap();
+        let floats = json_extract_float_impl(&args)?;
+        let floats = floats.as_any().downcast_ref::<Float64Array>().unwrap();
+        let bools = json_extract_bool_impl(&args)?;
+        let bools = bools.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        for (i, (path, string, int, float, boolean)) in cases.iter().enumerate() {
+            assert_eq!(
+                (!strings.is_null(i)).then(|| strings.value(i)),
+                *string,
+                "{path}"
+            );
+            assert_eq!((!ints.is_null(i)).then(|| ints.value(i)), *int, "{path}");
+            assert_eq!(
+                (!floats.is_null(i)).then(|| floats.value(i)),
+                *float,
+                "{path}"
+            );
+            assert_eq!(
+                (!bools.is_null(i)).then(|| bools.value(i)),
+                *boolean,
+                "{path}"
+            );
+        }
+        for i in cases.len()..cases.len() + 2 {
+            assert!(strings.is_null(i) && ints.is_null(i) && floats.is_null(i) && bools.is_null(i));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_extract_typed_udfs_scalar_path_and_errors() -> Result<()> {
+        let jsonb_bytes = create_test_jsonb(r#"{"a": {"b": 5}}"#);
+        let mut binary_builder = LargeBinaryBuilder::new();
+        for _ in 0..3 {
+            binary_builder.append_value(&jsonb_bytes);
+        }
+        let jsonb_array = Arc::new(binary_builder.finish());
+
+        // A scalar path reaches the function as a one-element array.
+        let path_array = Arc::new(StringArray::from(vec![Some("$.a.b")]));
+        let result = json_extract_int_impl(&[jsonb_array.clone(), path_array])?;
+        let ints = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.len(), 3);
+        assert!((0..3).all(|i| ints.value(i) == 5));
+
+        let bad_path = Arc::new(StringArray::from(vec![Some("$.[")]));
+        let err = json_extract_int_impl(&[jsonb_array.clone(), bad_path]).unwrap_err();
+        assert!(err.to_string().contains("Invalid JSONPath"), "{err}");
+
+        let err = json_extract_string_impl(&[jsonb_array]).unwrap_err();
+        assert!(
+            err.to_string().contains("requires exactly 2 arguments"),
+            "{err}"
+        );
         Ok(())
     }
 

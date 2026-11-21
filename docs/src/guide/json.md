@@ -172,6 +172,31 @@ result = dataset.to_table(
 )
 ```
 
+### Typed JSONPath Extraction
+
+`json_extract_string`, `json_extract_int`, `json_extract_float` and `json_extract_bool` evaluate a
+JSONPath, like `json_extract`, and return a typed value instead of serialized JSON text. They
+convert the value with the same rules as the matching `json_get_*` function.
+
+**Syntax:** `json_extract_int(json_column, json_path)`
+
+**Returns:** String, 64-bit integer, 64-bit float or boolean. The result is null if the path is
+not found, the value is JSON `null`, the value cannot be converted, or the path matches several
+values (which are selected as one array).
+
+**Example:**
+```python
+# Sample data: {"user": {"profile": {"name": "Alice"}, "age": 30}}
+result = dataset.to_table(
+    filter="json_extract_string(data, '$.user.profile.name') = 'Alice' "
+           "AND json_extract_int(data, '$.user.age') > 25"
+)
+```
+
+Use `json_get_*` for one literal key or array index; a key that contains `.` is only
+unambiguous there. Use `json_extract` when you need the JSON text of a nested value. These functions
+do not use a JSON index.
+
 ### Existence and Array Functions
 
 #### json_exists
