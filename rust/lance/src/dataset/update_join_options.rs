@@ -23,7 +23,7 @@ pub enum UpdateJoinStrategy {
     SortMerge,
 }
 
-/// Controls algorithm selection and external resources for a fragment update join.
+/// Controls algorithm selection, external resources, and null handling for a fragment update join.
 ///
 /// The existing fragment update methods use [`Default`] values. Use
 /// [`FileFragment::update_columns_with_options`](crate::dataset::fragment::FileFragment::update_columns_with_options)
@@ -38,9 +38,11 @@ pub enum UpdateJoinStrategy {
 ///     .with_strategy(UpdateJoinStrategy::Auto)
 ///     .with_hash_thresholds(500_000, 1024 * 1024 * 1024)
 ///     .with_external_memory_pool_bytes(256 * 1024 * 1024)
-///     .with_max_temp_directory_bytes(20 * 1024 * 1024 * 1024);
+///     .with_max_temp_directory_bytes(20 * 1024 * 1024 * 1024)
+///     .with_skip_null(true);
 ///
 /// assert_eq!(options.strategy(), UpdateJoinStrategy::Auto);
+/// assert!(options.skip_null());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateJoinOptions {
@@ -49,6 +51,7 @@ pub struct UpdateJoinOptions {
     max_hash_bytes: usize,
     external_memory_pool_bytes: Option<u64>,
     max_temp_directory_bytes: Option<u64>,
+    skip_null: bool,
 }
 
 impl Default for UpdateJoinOptions {
@@ -59,6 +62,7 @@ impl Default for UpdateJoinOptions {
             max_hash_bytes: DEFAULT_MAX_HASH_BYTES,
             external_memory_pool_bytes: None,
             max_temp_directory_bytes: None,
+            skip_null: false,
         }
     }
 }
@@ -98,6 +102,17 @@ impl UpdateJoinOptions {
         self
     }
 
+    /// Keeps the existing value of a matched row wherever the update stream has a null.
+    ///
+    /// Only top-level nulls are skipped: a non-null struct still replaces the old struct as a
+    /// whole, including its null children. An update row whose columns other than the join key
+    /// are all null changes nothing, so it is treated as unmatched and is excluded from
+    /// [`FragmentUpdateColumnsResult::matched_offsets`](crate::dataset::fragment::FragmentUpdateColumnsResult::matched_offsets).
+    pub fn with_skip_null(mut self, skip_null: bool) -> Self {
+        self.skip_null = skip_null;
+        self
+    }
+
     /// Returns the configured algorithm-selection strategy.
     pub fn strategy(&self) -> UpdateJoinStrategy {
         self.strategy
@@ -121,6 +136,11 @@ impl UpdateJoinOptions {
     /// Returns the explicit temporary-directory limit, or `None` when Lance should resolve its default.
     pub fn max_temp_directory_bytes(&self) -> Option<u64> {
         self.max_temp_directory_bytes
+    }
+
+    /// Returns whether nulls in the update stream keep the existing values.
+    pub fn skip_null(&self) -> bool {
+        self.skip_null
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -152,17 +172,20 @@ mod tests {
         assert_eq!(defaults.max_hash_bytes(), 1024 * 1024 * 1024);
         assert_eq!(defaults.external_memory_pool_bytes(), None);
         assert_eq!(defaults.max_temp_directory_bytes(), None);
+        assert!(!defaults.skip_null());
 
         let configured = defaults
             .with_strategy(UpdateJoinStrategy::SortMerge)
             .with_hash_thresholds(10, 20)
             .with_external_memory_pool_bytes(30)
-            .with_max_temp_directory_bytes(40);
+            .with_max_temp_directory_bytes(40)
+            .with_skip_null(true);
         assert_eq!(configured.strategy(), UpdateJoinStrategy::SortMerge);
         assert_eq!(configured.max_hash_rows(), 10);
         assert_eq!(configured.max_hash_bytes(), 20);
         assert_eq!(configured.external_memory_pool_bytes(), Some(30));
         assert_eq!(configured.max_temp_directory_bytes(), Some(40));
+        assert!(configured.skip_null());
         configured.validate().unwrap();
     }
 

@@ -31,6 +31,8 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -190,8 +192,9 @@ public class UpdateTest extends OperationTestBase {
     }
   }
 
-  @Test
-  void testUpdateColumns(@TempDir Path tempDir) throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testUpdateColumns(boolean skipNull, @TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testUpdateColumns").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.UpdateColumnTestDataset testDataset =
@@ -231,7 +234,11 @@ public class UpdateTest extends OperationTestBase {
        *   2:   |    2   |  "Update 2"  |
        *   3:   |  null  |     null     |
        */
-      FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
+      FragmentUpdateResult updateResult =
+          testDataset.updateColumn(targetFragment, updateRowCount, skipNull);
+      // With skipNull, source rows 1 and 3 have only nulls to write, so they do not match.
+      long[] expectOffsets = skipNull ? new long[] {0, 2} : new long[] {0, 1, 2, 3};
+      assertArrayEquals(expectOffsets, updateResult.getUpdatedRowOffsets());
       try (Transaction updateTxn =
           new Transaction.Builder()
               .readVersion(dataset.version())
@@ -270,7 +277,7 @@ public class UpdateTest extends OperationTestBase {
                 }
               }
             }
-            /* result dataset content
+            /* result dataset content (row 1 keeps 1 / "Person 1" with skipNull)
              * _rowid |   id   |     name     | timeStamp |
              *   0:   |   100  |  "Update 0"  |     0     |
              *   1:   |  null  |     null     |    null   |
@@ -279,9 +286,11 @@ public class UpdateTest extends OperationTestBase {
              *   4:   |    4   |  "Person 4"  |     4     |
              *   5:   |  null  |     null     |    null   |
              */
-            List<Integer> expectIds = Arrays.asList(100, null, 2, null, 4, null);
+            Integer rowOneId = skipNull ? 1 : null;
+            String rowOneName = skipNull ? "Person 1" : null;
+            List<Integer> expectIds = Arrays.asList(100, rowOneId, 2, null, 4, null);
             List<String> expectNames =
-                Arrays.asList("Update 0", null, "Update 2", null, "Person 4", null);
+                Arrays.asList("Update 0", rowOneName, "Update 2", null, "Person 4", null);
             List<Long> expectTimeStamps = Arrays.asList(0L, null, 2L, null, 4L, null);
             assertEquals(expectIds, actualIds);
             assertEquals(expectNames, actualNames);
