@@ -1186,9 +1186,9 @@ impl ExecutionPlan for FlatMatchQueryExec {
             .await;
 
             match result {
-                Ok((stream, scorer)) => {
+                Ok((stream, scorer, prepared_query)) => {
                     if let Some(producer) = shared_scorer_producer {
-                        producer.publish(Arc::new(scorer));
+                        producer.publish_with_prepared(Arc::new(scorer), prepared_query);
                     }
                     // Candidate selection is deliberately inside this node: even
                     // an empty selection must not remove the corpus producer.
@@ -1568,5 +1568,278 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_flat_fuzzy_partial_index_cap_matches_rebuilt_index() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["abpa"])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            "memory://flat_fuzzy_partial_cap",
+            None,
+        )
+        .await
+        .unwrap();
+        let index_params = InvertedIndexParams::default().stem(false);
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &index_params, true)
+            .await
+            .unwrap();
+        let tail = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["aapa"])),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(tail)], schema), None)
+            .await
+            .unwrap();
+
+        let query = MatchQuery::new("alpa".to_string())
+            .with_column(Some("text".to_string()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1);
+
+        let mut partial_scan = dataset.scan();
+        partial_scan
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                query.clone(),
+            )))
+            .unwrap();
+        let partial_batch = partial_scan.try_into_batch().await.unwrap();
+        let partial_ids: Vec<i32> = partial_batch["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values()
+            .to_vec();
+        let partial_scores: Vec<f32> = partial_batch["_score"]
+            .as_primitive::<arrow_array::types::Float32Type>()
+            .values()
+            .to_vec();
+
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &index_params, true)
+            .await
+            .unwrap();
+        let mut rebuilt_scan = dataset.scan();
+        rebuilt_scan
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(query)))
+            .unwrap();
+        let rebuilt_batch = rebuilt_scan.try_into_batch().await.unwrap();
+        let rebuilt_ids: Vec<i32> = rebuilt_batch["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values()
+            .to_vec();
+        let rebuilt_scores: Vec<f32> = rebuilt_batch["_score"]
+            .as_primitive::<arrow_array::types::Float32Type>()
+            .values()
+            .to_vec();
+
+        assert_eq!(rebuilt_ids, vec![1]);
+        assert_eq!(
+            partial_ids, rebuilt_ids,
+            "partial index and rebuilt index must share one corpus-wide max_expansions budget"
+        );
+        assert!(
+            (partial_scores[0] - rebuilt_scores[0]).abs() < 1e-4,
+            "partial={} rebuilt={}",
+            partial_scores[0],
+            rebuilt_scores[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flat_fuzzy_partial_list_element_index_shares_prepared_vocabulary() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery};
+
+        let make_batch = |id: i32, elem: &str| {
+            let mut list_builder = ListBuilder::new(StringBuilder::new());
+            list_builder.values().append_value(elem);
+            list_builder.append(true);
+            let list_arr = list_builder.finish();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("tags", list_arr.data_type().clone(), false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int32Array::from(vec![id])), Arc::new(list_arr)],
+            )
+            .unwrap()
+        };
+
+        let first = make_batch(0, "abpa");
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first.clone())], first.schema()),
+            "memory://flat_fuzzy_list_element_partial",
+            None,
+        )
+        .await
+        .unwrap();
+        let index_params = InvertedIndexParams::default()
+            .stem(false)
+            .document_granularity(DocumentGranularity::ListElement);
+        dataset
+            .create_index(&["tags"], IndexType::Inverted, None, &index_params, true)
+            .await
+            .unwrap();
+        let tail = make_batch(1, "aapa");
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(tail.clone())], tail.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let query = MatchQuery::new("alpa".to_string())
+            .with_column(Some("tags".to_string()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1)
+            .with_document_granularity(DocumentGranularity::ListElement);
+
+        let mut partial_scan = dataset.scan();
+        partial_scan
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                query.clone(),
+            )))
+            .unwrap();
+        let partial_batch = partial_scan.try_into_batch().await.unwrap();
+        let partial_ids: Vec<i32> = partial_batch["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values()
+            .to_vec();
+
+        dataset
+            .create_index(&["tags"], IndexType::Inverted, None, &index_params, true)
+            .await
+            .unwrap();
+        let mut rebuilt_scan = dataset.scan();
+        rebuilt_scan
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(query)))
+            .unwrap();
+        let rebuilt_batch = rebuilt_scan.try_into_batch().await.unwrap();
+        let rebuilt_ids: Vec<i32> = rebuilt_batch["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values()
+            .to_vec();
+
+        assert_eq!(rebuilt_ids, vec![1]);
+        assert_eq!(partial_ids, rebuilt_ids);
+    }
+
+    #[tokio::test]
+    async fn test_flat_fuzzy_vocabulary_is_independent_of_prefilter_and_fragments() {
+        use crate::dataset::WriteParams;
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                Arc::new(StringArray::from(vec!["aapa", "abpa"])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://flat_fuzzy_prefilter_independence",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let query = MatchQuery::new("alpa".to_string())
+            .with_column(Some("text".to_string()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1);
+
+        let mut unfiltered = dataset.scan();
+        unfiltered
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                query.clone(),
+            )))
+            .unwrap();
+        let unfiltered_batch = unfiltered.try_into_batch().await.unwrap();
+        assert_eq!(
+            unfiltered_batch["id"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[0]
+        );
+
+        let mut filtered = dataset.scan();
+        filtered.prefilter(true).filter("id = 1").unwrap();
+        filtered
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                query.clone(),
+            )))
+            .unwrap();
+        let unindexed_filtered = filtered.try_into_batch().await.unwrap();
+
+        // Restricting scanner fragments to fragment 1 ("abpa") must also not
+        // let "abpa" enter the corpus-wide capped vocabulary.
+        let frag1 = dataset.get_fragments()[1].metadata().clone();
+        let mut frag_restricted = dataset.scan();
+        frag_restricted.with_fragments(vec![frag1]);
+        frag_restricted
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                query.clone(),
+            )))
+            .unwrap();
+        let unindexed_frag = frag_restricted.try_into_batch().await.unwrap();
+
+        let params = InvertedIndexParams::default().stem(false);
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        let mut idx_filtered = dataset.scan();
+        idx_filtered.prefilter(true).filter("id = 1").unwrap();
+        idx_filtered
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(query)))
+            .unwrap();
+        let indexed_filtered = idx_filtered.try_into_batch().await.unwrap();
+
+        assert_eq!(indexed_filtered.num_rows(), 0);
+        assert_eq!(
+            unindexed_filtered.num_rows(),
+            0,
+            "prefilter must not let abpa enter the capped vocabulary"
+        );
+        assert_eq!(
+            unindexed_frag.num_rows(),
+            0,
+            "fragment restriction must not let abpa enter the capped vocabulary"
+        );
     }
 }

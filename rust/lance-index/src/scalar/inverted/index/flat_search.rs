@@ -1143,7 +1143,11 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
     base_scorer: Option<MemBM25Scorer>,
     options: FlatBm25SearchOptions,
     fuzzy: FlatBm25FuzzyOptions,
-) -> DataFusionResult<(SendableRecordBatchStream, MemBM25Scorer)> {
+) -> DataFusionResult<(
+    SendableRecordBatchStream,
+    MemBM25Scorer,
+    Option<Arc<PreparedBm25Query>>,
+)> {
     // 1. Canonical prepared-query replay (exact or fuzzy, e.g. distributed flat).
     if let Some(prepared) = fuzzy.prepared_query {
         let FlatBm25SearchOptions {
@@ -1165,6 +1169,7 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                     stream::empty::<DataFusionResult<RecordBatch>>(),
                 )),
                 prepared_scorer,
+                Some(prepared),
             ));
         }
 
@@ -1221,12 +1226,13 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
         return Ok((
             Box::pin(RecordBatchStreamAdapter::new(output_schema, batches)),
             prepared_scorer,
+            Some(prepared),
         ));
     }
 
     // 2. Exact flat search: delegate straight to the existing fast path.
     if !uses_fuzzy_expansion(fuzzy.fuzziness) {
-        return flat_bm25_search_stream_with_options_and_scorer(
+        let (stream, scorer) = flat_bm25_search_stream_with_options_and_scorer(
             input,
             doc_col,
             query,
@@ -1234,7 +1240,8 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
             base_scorer,
             options,
         )
-        .await;
+        .await?;
+        return Ok((stream, scorer, None));
     }
 
     // 3. Genuine fuzzy flat search over unindexed rows (+ optional indexed segments).
@@ -1251,12 +1258,24 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
     let source_tokens = try_collect_query_tokens(&query, &mut query_tokenizer)?;
     if source_tokens.is_empty() || fuzzy.max_expansions == 0 {
         let scorer = base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()));
+        let empty_tokens = Tokens::try_from_parts(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            source_tokens.token_type().clone(),
+        )?;
+        let prepared = Arc::new(PreparedBm25Query::from_parts(
+            Arc::new(empty_tokens),
+            Arc::new(scorer.clone()),
+            source_tokens.is_empty(),
+        ));
         return Ok((
             Box::pin(RecordBatchStreamAdapter::new(
                 output_schema,
                 stream::empty::<DataFusionResult<RecordBatch>>(),
             )),
             scorer,
+            Some(prepared),
         ));
     }
 
@@ -1559,9 +1578,10 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
 
     // Canonical bounded lexicographical expansion across groups in ascending order.
     let mut expanded_tokens = Vec::new();
+    let mut expanded_positions = Vec::new();
     let mut expanded_groups = Vec::new();
     let mut seen_pairs = HashSet::new();
-    for (g_idx, (orig_group, _, _)) in source_groups.iter().enumerate() {
+    for (g_idx, (orig_group, orig_pos, _)) in source_groups.iter().enumerate() {
         let remaining = fuzzy.max_expansions.saturating_sub(expanded_tokens.len());
         if remaining == 0 {
             break;
@@ -1572,6 +1592,7 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
             }
             if seen_pairs.insert((candidate.clone(), *orig_group)) {
                 expanded_tokens.push(candidate.clone());
+                expanded_positions.push(*orig_pos);
                 expanded_groups.push(*orig_group);
             }
         }
@@ -1611,6 +1632,17 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
         }
     }
     let final_scorer = MemBM25Scorer::new(total_tokens, total_docs, token_docs);
+    let prepared_tokens = Tokens::try_from_parts(
+        expanded_tokens.clone(),
+        expanded_positions,
+        expanded_groups.clone(),
+        source_tokens.token_type().clone(),
+    )?;
+    let prepared_query = Arc::new(PreparedBm25Query::from_parts(
+        Arc::new(prepared_tokens),
+        Arc::new(final_scorer.clone()),
+        has_all_query_positions,
+    ));
 
     if expanded_tokens.is_empty()
         || (operator == Operator::And && !has_all_query_positions)
@@ -1622,6 +1654,7 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                 stream::empty::<DataFusionResult<RecordBatch>>(),
             )),
             final_scorer,
+            Some(prepared_query),
         ));
     }
 
@@ -1712,6 +1745,7 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
             stream::iter(out_batches),
         )),
         final_scorer,
+        Some(prepared_query),
     ))
 }
 

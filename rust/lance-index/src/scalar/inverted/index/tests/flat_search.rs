@@ -1120,7 +1120,7 @@ async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
             ));
             let doc_tok = InvertedIndexParams::default().stem(false).build().unwrap();
             let query_tok = InvertedIndexParams::default().stem(false).build().unwrap();
-            let (result_stream, scorer) = flat_bm25_search_stream_with_fuzzy_and_scorer(
+            let (result_stream, scorer, _prepared) = flat_bm25_search_stream_with_fuzzy_and_scorer(
                 input,
                 "text".to_string(),
                 query,
