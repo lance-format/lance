@@ -1609,7 +1609,32 @@ impl Projection {
 
     /// Creates a new projection that is the intersection of this projection and another
     pub fn intersect(mut self, other: &Self) -> Self {
-        self.field_ids = HashSet::from_iter(self.field_ids.intersection(&other.field_ids).copied());
+        // Nested projections include their ancestors. Two sibling paths share
+        // a struct ID even when they have no projected value in common.
+        fn retain_paths(field: &Field, common: &mut HashSet<i32>) -> bool {
+            if field.is_leaf() || field.logical_type.is_map() || field.is_blob() {
+                return common.contains(&field.id);
+            }
+            let mut has_child = false;
+            for child in &field.children {
+                has_child |= retain_paths(child, common);
+            }
+            if has_child {
+                common.insert(field.id);
+            } else {
+                common.remove(&field.id);
+            }
+            has_child
+        }
+
+        self.field_ids.retain(|id| other.field_ids.contains(id));
+        if !self.field_ids.is_empty() {
+            for field in &self.base.schema().fields {
+                if !field.is_leaf() {
+                    retain_paths(field, &mut self.field_ids);
+                }
+            }
+        }
         self.with_row_id = self.with_row_id && other.with_row_id;
         self.with_row_addr = self.with_row_addr && other.with_row_addr;
         self.with_row_last_updated_at_version =
@@ -2830,6 +2855,34 @@ mod tests {
         wide.push("`s.a`".to_string());
         let err = schema.project(&wide).unwrap_err();
         assert!(matches!(err, Error::FieldNotFound { .. }), "{err}");
+    }
+
+    #[test]
+    fn projection_intersection_retains_only_shared_paths() {
+        let group = ArrowField::new_struct(
+            "group",
+            vec![
+                ArrowField::new("a", DataType::Utf8, true),
+                ArrowField::new("b", DataType::Utf8, true),
+                ArrowField::new("c", DataType::Utf8, true),
+            ],
+            true,
+        );
+        let schema = ArrowSchema::new(vec![ArrowField::new_struct("s", vec![group], true)]);
+        let schema = Arc::new(Schema::try_from(&schema).unwrap());
+        let project = |cols: &[&str]| {
+            Projection::empty(schema.clone())
+                .union_columns(cols, OnMissing::Error)
+                .unwrap()
+        };
+
+        let left = project(&["s.group.a", "s.group.b"]).with_row_id();
+        let disjoint = left.clone().intersect(&project(&["s.group.c"]));
+        assert!(disjoint.is_empty());
+        let right = project(&["s.group.b", "s.group.c"]).with_row_id();
+        let common = left.intersect(&right);
+        assert!(common.with_row_id);
+        assert_eq!(common.field_ids, project(&["s.group.b"]).field_ids);
     }
 
     #[test]

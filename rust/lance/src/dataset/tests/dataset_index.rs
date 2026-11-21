@@ -8256,6 +8256,161 @@ async fn test_label_list_index_on_int32_items() {
     }
 }
 
+#[tokio::test]
+async fn test_nested_index_sibling_projection() {
+    let nested = StructArray::from(vec![
+        (
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![1, 2, 1, 2])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("text", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["one", "two", "three", "four"])) as ArrayRef,
+        ),
+    ]);
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])) as ArrayRef,
+        ),
+        ("s", Arc::new(nested) as ArrayRef),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["s.x"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut scan = dataset.scan();
+    scan.project(&["s.text"])
+        .unwrap()
+        .filter("s.x = 1 AND id > 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("projection=[id]"),
+        "{plan}"
+    );
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.column(0).as_string::<i32>().value(0), "three");
+}
+
+#[tokio::test]
+async fn test_projected_ngram_recheck_is_materialized_once() {
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..64)) as ArrayRef,
+        ),
+        (
+            "text",
+            Arc::new(StringArray::from_iter_values(
+                (0..64).map(|i| format!("needle {i}")),
+            )) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::NGram,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut scan = dataset.scan();
+    scan.project(&["id", "text"])
+        .unwrap()
+        .filter("contains(text, 'needle') AND id > 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("projection=[id, text]"),
+        "{plan}"
+    );
+    assert!(!plan.contains("Take:"), "{plan}");
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 63);
+}
+
+#[tokio::test]
+async fn test_label_list_refine_projection_with_partial_coverage() {
+    let batch = |start: i32| {
+        let labels = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(7)]),
+            Some(vec![Some(9)]),
+            Some(vec![Some(7)]),
+        ]);
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(start..start + 3)) as ArrayRef,
+            ),
+            ("labels", Arc::new(labels) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        RecordBatchIterator::new([Ok(batch)], schema)
+    };
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(batch(0), &dir, None).await.unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset.append(batch(3), None).await.unwrap();
+
+    let mut scan = dataset.scan();
+    scan.project(&["id"])
+        .unwrap()
+        .filter("array_has(labels, 7) AND id > 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("LabelList") && plan.contains("projection=[id], num_fragments=2"),
+        "{plan}"
+    );
+    let result = scan.try_into_batch().await.unwrap();
+    let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+    ids.sort_unstable();
+    assert_eq!(ids, [2, 3, 5]);
+}
+
 /// LabelList analogue: after prewarming, an `array_has_any` query against a
 /// `LabelList` index serves results without any further IO. Exercises the
 /// `LabelListIndexState` codec (which embeds the inner bitmap state and the
