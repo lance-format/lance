@@ -1205,6 +1205,69 @@ async fn test_ngram_regex_index_scan() {
     }
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_regex_operators(#[values(false, true)] indexed: bool) {
+    let batch = arrow_array::record_batch!((
+        "s",
+        Utf8,
+        [
+            Some("rhino"),
+            Some("Rhinos nose"),
+            Some("rhino horn"),
+            Some("catalog"),
+            None
+        ]
+    ))
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    if indexed {
+        dataset
+            .create_index(
+                &["s"],
+                IndexType::NGram,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    for (filter, expected, accelerated) in [
+        ("s ~ 'rhino.*(horn|nose)'", vec!["rhino horn"], true),
+        // `regexp_like` is simplified to `~` before it reaches the index.
+        (
+            "regexp_like(s, 'rhino.*(horn|nose)')",
+            vec!["rhino horn"],
+            true,
+        ),
+        (
+            "s ~* 'RHINO.*(horn|nose)'",
+            vec!["Rhinos nose", "rhino horn"],
+            false,
+        ),
+        ("s !~ 'rhino'", vec!["Rhinos nose", "catalog"], false),
+        ("s !~* 'rhino'", vec!["catalog"], false),
+    ] {
+        let mut scan = dataset.scan();
+        scan.filter(filter).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        if accelerated || !indexed {
+            assert_eq!(plan.contains("ScalarIndexQuery"), indexed, "{plan}");
+        }
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut matched = batch["s"]
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        matched.sort();
+        assert_eq!(matched, expected, "{filter}");
+    }
+}
+
 #[tokio::test]
 async fn test_ngram_regex_non_accelerable_recheck() {
     // `a.b` yields no trigram, so the index returns "recheck everything".

@@ -558,6 +558,7 @@ Currently, Lance supports a growing list of expressions.
 * `IN`
 * `LIKE`, `NOT LIKE`
 * `regexp_match(column, pattern)`
+* `~`, `~*`, `!~`, `!~*` (regular-expression match, `*` for case-insensitive)
 * `any_element(list_column, 'predicate')` (experimental), see [below](#filtering-on-elements-of-a-list-of-structs)
 * `CAST`
 
