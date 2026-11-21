@@ -5943,7 +5943,7 @@ mod tests {
     use crate::index::{
         DatasetIndexExt, loading::DatasetIndexInternalExt, vector::VectorIndexParams,
     };
-    use crate::utils::test::copy_test_data_to_tmp;
+    use crate::utils::test::{copy_test_data_to_tmp, rerun_in_child_process};
 
     mod optimize;
 
@@ -6036,69 +6036,36 @@ mod tests {
     }
 
     // Verifies LANCE_INCLUDE_VECTOR_CENTROIDS env var is honored by
-    // maybe_centroids_for_stats. The env var is process-global, so this test
-    // is serialized against any other test that touches the same key.
-    #[test]
-    #[serial_test::serial(LANCE_INCLUDE_VECTOR_CENTROIDS)]
-    fn test_maybe_centroids_for_stats_env_var() {
+    // maybe_centroids_for_stats: unset or truthy values include the centroids
+    // (unset also logs a one-time warning), and falsy values omit them.
+    #[rstest]
+    #[case::unset(None, true)]
+    #[case::one(Some("1"), true)]
+    #[case::true_lowercase(Some("true"), true)]
+    #[case::true_uppercase(Some("TRUE"), true)]
+    #[case::on(Some("on"), true)]
+    #[case::yes(Some("yes"), true)]
+    #[case::y(Some("y"), true)]
+    #[case::zero(Some("0"), false)]
+    #[case::false_lowercase(Some("false"), false)]
+    #[case::false_uppercase(Some("FALSE"), false)]
+    #[case::no(Some("no"), false)]
+    #[case::off(Some("off"), false)]
+    fn test_maybe_centroids_for_stats_env_var(#[case] value: Option<&str>, #[case] included: bool) {
+        if rerun_in_child_process(&[(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, value)]) {
+            return;
+        }
         let centroids = Float32Array::from(vec![1.0_f32, 2.0, 3.0, 4.0]);
         let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
-        let expected = Some(vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
-
-        // Save the original value so we can restore it afterwards.
-        let original = std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).ok();
-
-        // Unset → centroids included (with one-time warning).
-        unsafe {
-            std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV);
-        }
+        let expected = included.then(|| vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
         assert_eq!(maybe_centroids_for_stats(&centroids).unwrap(), expected);
-
-        // Truthy values → centroids included.
-        for truthy in ["1", "true", "TRUE", "on", "yes", "y"] {
-            unsafe {
-                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, truthy);
-            }
-            assert_eq!(
-                maybe_centroids_for_stats(&centroids).unwrap(),
-                expected,
-                "expected centroids to be included for {truthy:?}",
-            );
-        }
-
-        // Non-truthy values → centroids omitted.
-        for falsy in ["0", "false", "FALSE", "no", "off"] {
-            unsafe {
-                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, falsy);
-            }
-            assert_eq!(
-                maybe_centroids_for_stats(&centroids).unwrap(),
-                None,
-                "expected centroids to be omitted for {falsy:?}",
-            );
-        }
-
-        // Restore original value.
-        unsafe {
-            match original {
-                Some(v) => std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, v),
-                None => std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV),
-            }
-        }
     }
 
-    // Verifies that when centroids are omitted via the env var, the
-    // serialized stats JSON does not contain the `centroids` field at all
-    // (instead of an explicit null), since downstream code distinguishes
-    // missing from null.
+    // Verifies that when centroids are omitted, the serialized stats JSON does
+    // not contain the `centroids` field at all (instead of an explicit null),
+    // since downstream code distinguishes missing from null.
     #[test]
-    #[serial_test::serial(LANCE_INCLUDE_VECTOR_CENTROIDS)]
     fn test_stats_centroids_omitted_when_disabled() {
-        let original = std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).ok();
-
-        unsafe {
-            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "false");
-        }
         let stats = IvfIndexStatistics {
             index_type: "IVF_PQ".to_string(),
             uuid: "uuid".to_string(),
@@ -6113,13 +6080,6 @@ mod tests {
         };
         let json = serde_json::to_value(&stats).unwrap();
         assert!(json.get("centroids").is_none());
-
-        unsafe {
-            match original {
-                Some(v) => std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, v),
-                None => std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV),
-            }
-        }
     }
 
     /// This goal of this function is to generate data that behaves in a very deterministic way so that

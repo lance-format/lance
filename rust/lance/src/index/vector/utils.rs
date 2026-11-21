@@ -1958,10 +1958,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(num_rows, 4);
-        let result: &[f32] =
-            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, 4 * dim) };
         let expected: Vec<f32> = (12..28).map(|i| i as f32).collect();
-        assert_eq!(result, &expected[..]);
+        assert_eq!(buf.typed_data::<f32>(), &expected[..]);
     }
 
     #[test]

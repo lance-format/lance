@@ -305,7 +305,6 @@ pub struct BatchStore {
 // - Slots are never modified after being written
 // - Blob preprocessing is serialized by its async mutex
 unsafe impl Sync for BatchStore {}
-unsafe impl Send for BatchStore {}
 
 struct BatchStoreWriterGuard<'a> {
     writer_active: &'a AtomicBool,
