@@ -21,7 +21,7 @@ use crate::distance::{BatchKernel, PairKernel, assert_batch_output_layout, asser
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
 // Tested `target-features`: avx512f,avx512vl,f16c
 #[inline(always)]
-fn dot_scalar<
+pub(super) fn dot_scalar<
     T: AsPrimitive<Output>,
     Output: Real + Sum + AddAssign + 'static,
     const LANES: usize,

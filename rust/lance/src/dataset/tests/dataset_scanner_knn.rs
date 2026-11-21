@@ -61,6 +61,83 @@ use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
 #[rstest]
+#[case::unit(1.0)]
+#[case::large(1e20)]
+#[case::small(1e-30)]
+#[case::smallest(f32::from_bits(1))]
+#[case::largest(3e38)]
+#[tokio::test]
+async fn test_cosine_extreme_vectors(#[case] query_scale: f32) {
+    const DIM: usize = 8;
+    let mut vectors = Vec::with_capacity(8 * DIM);
+    for scale in [1e20, 1e-30, f32::from_bits(1), 3e38] {
+        let mut vector = [0.0; DIM];
+        vector[0] = scale;
+        vectors.extend(vector);
+    }
+    for _ in 0..4 {
+        vectors.extend([0.5, 0.75_f32.sqrt(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col(
+            "vec",
+            array::cycle_vec(
+                array::cycle::<Float32Type>(vectors),
+                Dimension::from(DIM as u32),
+            ),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let centroids = FixedSizeListArray::try_new_from_values(
+        Float32Array::from(vec![
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ]),
+        DIM as i32,
+    )
+    .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::with_ivf_flat_params(
+                DistanceType::Cosine,
+                IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap(),
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let mut query = vec![0.0; DIM];
+    query[0] = query_scale;
+    for use_index in [false, true] {
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &Float32Array::from(query.clone()), 4)
+            .unwrap()
+            .distance_metric(DistanceType::Cosine)
+            .use_index(use_index)
+            .nprobes(2);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ANNSubIndex"), use_index, "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        // All four aligned vectors must be recalled, regardless of magnitude.
+        let ids: BTreeSet<i32> = batch["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(ids, BTreeSet::from([0, 1, 2, 3]), "{plan}");
+        for &distance in batch[DIST_COL].as_primitive::<Float32Type>().values() {
+            assert!(distance.abs() < 1e-6, "{plan}: distance={distance}");
+        }
+    }
+}
+
+#[rstest]
 #[case::created("_row_created_at_version")]
 #[case::updated("_row_last_updated_at_version")]
 #[tokio::test]

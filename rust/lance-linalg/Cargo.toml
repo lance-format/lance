@@ -54,6 +54,10 @@ name = "cosine"
 harness = false
 
 [[bench]]
+name = "cosine_range"
+harness = false
+
+[[bench]]
 name = "norm_l2"
 harness = false
 
