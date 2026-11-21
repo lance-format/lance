@@ -60,7 +60,7 @@ use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::versions;
-use super::{DATA_DIR, DataFilePart, DataFileTarget};
+use super::{DATA_DIR, DataFilePart, DataFileTarget, TableLayoutConfig};
 use dictionary_budget::DictionaryValueBudget;
 
 mod commit;
@@ -581,7 +581,8 @@ impl Default for AutoCleanupParams {
 /// Dataset Write Parameters
 #[derive(Debug, Clone)]
 pub struct WriteParams {
-    /// Max number of records per file.
+    /// Max number of records per file, unless [`Self::layout`] or the dataset's
+    /// `lance.layout.target_rows_per_fragment` config sets it.
     ///
     /// Must not exceed `u32::MAX`, the row capacity of a fragment.
     pub max_rows_per_file: usize,
@@ -589,7 +590,8 @@ pub struct WriteParams {
     /// Max number of rows per row group.
     pub max_rows_per_group: usize,
 
-    /// Max file size in bytes.
+    /// Max file size in bytes, unless [`Self::layout`] or the dataset's
+    /// `lance.layout.max_bytes_per_file` config sets it.
     ///
     /// This is a soft limit. The actual file size may be larger than this value
     /// by a few megabytes, since once we detect we hit this limit, we still
@@ -601,6 +603,36 @@ pub struct WriteParams {
     /// The default is 90 GB. If you are using an object store such as S3, we
     /// currently have a hard 100 GB limit.
     pub max_bytes_per_file: usize,
+
+    /// Table layout settings for this write: the `lance.layout.*` values that
+    /// size the data files.
+    ///
+    /// Each field is optional so that "let the table decide" stays distinct from
+    /// an explicit value that happens to equal a default. The per-file row limit
+    /// and the per-file byte soft bound are resolved independently, highest
+    /// precedence first:
+    ///
+    /// 1. the matching field here;
+    /// 2. the destination dataset's `lance.layout.*` manifest config;
+    /// 3. [`Self::max_rows_per_file`] / [`Self::max_bytes_per_file`].
+    ///
+    /// Because the fields of this struct are the lowest precedence tier, a
+    /// caller that must not follow the table's layout sets this field explicitly
+    /// rather than relying on `max_rows_per_file` / `max_bytes_per_file`. When
+    /// this write creates the dataset, the values set here are persisted in the
+    /// same transaction as the first data files; on other modes they apply to
+    /// this write only and the persisted config is left alone.
+    ///
+    /// The lowest tier exists because `max_rows_per_file` and
+    /// `max_bytes_per_file` are plain integers, so a caller that leaves them alone
+    /// and one that sets them to their default are indistinguishable. The wrappers
+    /// do not preserve presence either: the Python writer fills both from its own
+    /// defaults, and the Java bridge passes JNI values as concrete numbers. This
+    /// prototype therefore treats those fields as defaults and keeps per-write
+    /// control in this field. Recognizing a non-default legacy value as an
+    /// explicit choice, or making the legacy fields optional, would change the
+    /// public contract and is left to upstream discussion.
+    pub layout: TableLayoutConfig,
 
     /// Write mode
     pub mode: WriteMode,
@@ -749,6 +781,7 @@ impl Default for WriteParams {
             // object-store has a 100GB limit, so we should at least make sure
             // we are under that.
             max_bytes_per_file: 90 * 1024 * 1024 * 1024, // 90 GB
+            layout: TableLayoutConfig::default(),
             mode: WriteMode::Create,
             store_params: None,
             base_store_params: None,

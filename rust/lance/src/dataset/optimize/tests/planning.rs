@@ -2520,6 +2520,51 @@ fn test_apply_dataset_config_overwrites_matching_field() {
     // Config value should overwrite the pre-set value
     assert_eq!(opts.max_rows_per_group, 2048);
 }
+#[test]
+fn test_from_dataset_config_falls_back_to_layout() {
+    let config = HashMap::from([
+        (
+            "lance.layout.target_rows_per_fragment".to_string(),
+            "250".to_string(),
+        ),
+        (
+            "lance.layout.max_bytes_per_file".to_string(),
+            "1048576".to_string(),
+        ),
+    ]);
+
+    let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+    let defaults = CompactionOptions::default();
+
+    assert_eq!(opts.target_rows_per_fragment, 250);
+    assert_eq!(opts.max_bytes_per_file, Some(1_048_576));
+    // Other fields keep their defaults: the layout only sizes files.
+    assert_eq!(opts.max_rows_per_group, defaults.max_rows_per_group);
+}
+#[test]
+fn test_compaction_config_wins_over_layout_per_field() {
+    let config = HashMap::from([
+        (
+            "lance.layout.target_rows_per_fragment".to_string(),
+            "250".to_string(),
+        ),
+        (
+            "lance.layout.max_bytes_per_file".to_string(),
+            "1048576".to_string(),
+        ),
+        (
+            "lance.compaction.target_rows_per_fragment".to_string(),
+            "500000".to_string(),
+        ),
+    ]);
+
+    let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+
+    // The compaction-specific key wins where it is set, and the layout still
+    // fills the field it does not set.
+    assert_eq!(opts.target_rows_per_fragment, 500_000);
+    assert_eq!(opts.max_bytes_per_file, Some(1_048_576));
+}
 #[tokio::test]
 async fn test_max_source_fragments() {
     let test_dir = TempStrDir::default();

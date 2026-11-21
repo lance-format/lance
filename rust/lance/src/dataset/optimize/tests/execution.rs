@@ -357,6 +357,138 @@ async fn test_compact_many(
         .collect::<Vec<_>>();
     assert_eq!(fragment_ids, vec![3, 7, 8]);
 }
+/// Ten 100-row fragments plus the requested manifest config.
+///
+/// `compact_files` takes already resolved options, so the config-aware entry
+/// point is [`CompactionOptions::from_dataset_config`], which is what the Python
+/// and Java wrappers call before `compact_files`.
+async fn dataset_with_persisted_layout(
+    test_uri: &str,
+    target_rows_per_fragment: &str,
+    extra_config: &[(&str, &str)],
+) -> Dataset {
+    let data = sample_data();
+    let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1000))], data.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 10);
+
+    let mut config = vec![(
+        "lance.layout.target_rows_per_fragment".to_string(),
+        target_rows_per_fragment.to_string(),
+    )];
+    config.extend(
+        extra_config
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+    );
+    dataset.update_config(config).await.unwrap();
+    dataset
+}
+
+#[derive(Debug)]
+struct LayoutCompactionCase {
+    /// Manifest config written after the shared layout row target.
+    extra_config: &'static [(&'static str, &'static str)],
+    /// Replace the loaded row target with the option default after loading.
+    explicit_default: bool,
+    /// The row target `from_dataset_config` resolves from the manifest alone.
+    expected_loaded_target: usize,
+    /// Sorted physical row counts of the fragments compaction produces.
+    expected_fragments: &'static [usize],
+}
+
+/// The three ways the row target of a real compaction can be decided: the
+/// shared layout key, the compaction-specific key over it, and a caller's
+/// explicit value (here the option default) over both.
+#[rstest]
+#[case::shared_layout_target(LayoutCompactionCase {
+    extra_config: &[],
+    explicit_default: false,
+    expected_loaded_target: 250,
+    expected_fragments: &[300, 300, 400],
+})]
+#[case::legacy_key_wins_over_layout(LayoutCompactionCase {
+    extra_config: &[("lance.compaction.target_rows_per_fragment", "500")],
+    explicit_default: false,
+    expected_loaded_target: 500,
+    expected_fragments: &[500, 500],
+})]
+#[case::explicit_default_wins_over_both(LayoutCompactionCase {
+    extra_config: &[("lance.compaction.target_rows_per_fragment", "500")],
+    explicit_default: true,
+    expected_loaded_target: 500,
+    expected_fragments: &[1000],
+})]
+#[tokio::test]
+async fn test_compact_files_applies_layout_config_from_manifest(
+    #[case] case: LayoutCompactionCase,
+) {
+    let test_dir = TempStrDir::default();
+    let mut dataset = dataset_with_persisted_layout(&test_dir, "250", case.extra_config).await;
+
+    let mut options = CompactionOptions::from_dataset_config(dataset.config()).unwrap();
+    assert_eq!(
+        options.target_rows_per_fragment,
+        case.expected_loaded_target
+    );
+    if case.explicit_default {
+        options.target_rows_per_fragment = CompactionOptions::default().target_rows_per_fragment;
+    }
+
+    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    // A no-op leaves all ten source fragments in place and reports none removed.
+    assert_eq!(metrics.fragments_removed, 10, "{:?}", case);
+    assert_eq!(
+        metrics.fragments_added,
+        case.expected_fragments.len(),
+        "{:?}",
+        case
+    );
+
+    let mut rows = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata.physical_rows.unwrap())
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    assert_eq!(rows, case.expected_fragments, "{:?}", case);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1000);
+}
+
+#[tokio::test]
+async fn test_invalid_layout_config_fails_config_aware_compaction_without_a_new_version() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = dataset_with_persisted_layout(&test_dir, "0", &[]).await;
+    let version = dataset.manifest.version;
+
+    let error = CompactionOptions::from_dataset_config(dataset.config()).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("lance.layout.target_rows_per_fragment"),
+        "{error}"
+    );
+    assert_eq!(dataset.manifest.version, version);
+
+    // The low-level entry point keeps taking the caller's options as given, so
+    // an invalid table config does not break it.
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1000);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_compaction_does_not_strand_small_remainders(

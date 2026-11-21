@@ -91,6 +91,7 @@ pub mod scanner;
 mod schema_evolution;
 pub mod sql;
 pub mod statistics;
+mod table_layout;
 mod take;
 /// Transaction definitions for updating datasets
 ///
@@ -128,6 +129,7 @@ pub mod write;
 
 pub use data_file::DataFileTarget;
 pub use data_file_part::DataFilePart;
+pub use table_layout::TableLayoutConfig;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
