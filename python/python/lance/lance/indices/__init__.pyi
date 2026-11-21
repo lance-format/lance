@@ -40,6 +40,7 @@ def train_ivf_model(
     sample_rate: int,
     max_iters: int,
     fragment_ids: Optional[list[int]] = None,
+    e_means_epochs: Optional[float] = None,
 ) -> pa.FixedSizeListArray: ...
 def train_pq_model(
     dataset,

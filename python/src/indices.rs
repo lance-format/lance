@@ -211,6 +211,7 @@ async fn do_train_ivf_model(
     sample_rate: u32,
     max_iters: u32,
     fragment_ids: Option<Vec<u32>>,
+    e_means_epochs: Option<f64>,
 ) -> PyResult<ArrayData> {
     // We verify distance_type earlier so can unwrap here
     let distance_type = DistanceType::try_from(distance_type).unwrap();
@@ -218,6 +219,10 @@ async fn do_train_ivf_model(
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
         num_partitions: Some(num_partitions as usize),
+        e_means: e_means_epochs.map(|epochs| lance_index::vector::kmeans::EMeansParams {
+            epochs,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let ivf_model = lance::index::vector::ivf::build_ivf_model(
@@ -237,7 +242,7 @@ async fn do_train_ivf_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature=(dataset, column, dimension, num_partitions, distance_type, sample_rate, max_iters, fragment_ids=None))]
+#[pyo3(signature=(dataset, column, dimension, num_partitions, distance_type, sample_rate, max_iters, fragment_ids=None, e_means_epochs=None))]
 fn train_ivf_model<'py>(
     py: Python<'py>,
     dataset: &Dataset,
@@ -248,6 +253,7 @@ fn train_ivf_model<'py>(
     sample_rate: u32,
     max_iters: u32,
     fragment_ids: Option<Vec<u32>>,
+    e_means_epochs: Option<f64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let centroids = rt().block_on(
         Some(py),
@@ -260,6 +266,7 @@ fn train_ivf_model<'py>(
             sample_rate,
             max_iters,
             fragment_ids,
+            e_means_epochs,
         ),
     )??;
     centroids.to_pyarrow(py)

@@ -239,6 +239,43 @@ Important creation parameters:
 
 The default index name is `<column>_idx`. Vector index creation uses `replace=False` by default, so pass `replace=True` explicitly to replace an existing index with the same name.
 
+### Train IVF Centroids with e-means
+
+Set `e_means_epochs` to select native Rust e-means for the IVF coarse
+centroids. The default remains Lance's k-means trainer.
+
+```python
+dataset.create_index(
+    "vector", "IVF_FLAT", num_partitions=64, metric="l2",
+    e_means_epochs=2.5,
+)
+```
+
+For staged builds, `IndicesBuilder(dataset, "vector").train_ivf(
+num_partitions=64, e_means_epochs=2.5)` returns the usual `IvfModel`.
+Rust callers can use `IvfBuildParams::new(64).with_e_means(EMeansParams {
+epochs: 2.5, ..Default::default() })`, importing `EMeansParams` from
+`lance_index::vector::kmeans`.
+
+The epoch budget counts passes over the sampled vectors and may be fractional.
+Five passes is the reference default. The batch and initial step sizes follow
+the [FAISS 1.16.0 recipes](https://github.com/facebookresearch/faiss/tree/v1.16.0/contrib/e_means);
+training implements the moving sum/count update, cosine step schedule, donor
+revival and last-pass closing means from the [e-means paper](https://arxiv.org/abs/2611.09501).
+For budgets of at least one pass, the final pass is complete and the fractional
+pass precedes it. An additional assignment evaluates the final loss.
+
+This implementation runs on CPU using Lance's distance kernels, with FP32
+coordinates and FP64 sums/counts. It needs no FAISS or PyTorch dependency.
+Float16/float32/float64 inputs are accepted when their values remain finite in
+FP32; centroids are returned in the input type. L2 and normalized cosine are
+supported. GPU training and streaming coreset options cannot be combined with
+e-means. Only IVF centroid training changes: PQ codebooks still use their
+existing trainer, and stored index formats are unchanged.
+
+The paper's epoch and GPU timing results are not Lance benchmarks. Measure
+index-build time and query recall on your data before choosing a training budget.
+
 ## Tune Search Parameters
 
 Use `search_effort` to choose a calibrated partition-routing target without

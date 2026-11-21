@@ -3802,6 +3802,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
+        if accelerator is not None and kwargs.get("e_means_epochs") is not None:
+            raise ValueError("Native e-means does not support accelerator training")
+
         if accelerator is not None and index_type != "IVF_PQ":
             LOGGER.warning(
                 "Index type %s does not support GPU acceleration; falling back to CPU",
@@ -4221,6 +4224,14 @@ class LanceDataset(pa.dataset.Dataset):
             The target partition size. If set, the number of partitions will be computed
             based on the target partition size.
             Otherwise, the target partition size will be set by index type.
+        e_means_epochs : float, optional
+            Train IVF centroids with native Rust e-means for this many passes
+            over the sample. Fractional passes are supported (e.g. 2.5). Batch
+            size and step size follow the FAISS 1.16.0 scaling laws; no FAISS
+            dependency is required. Supports L2 and cosine on CPU, with FP32
+            training coordinates and wider accumulation. Cannot be combined
+            with accelerator or streaming IVF training. PQ training still uses
+            k-means, and its ``max_iters`` is unchanged.
         streaming_sample_rate : int, optional
             If set below ``sample_rate``, IVF kmeans trains incrementally and samples
             at most ``num_partitions * streaming_sample_rate`` vectors per step. For

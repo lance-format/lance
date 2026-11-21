@@ -144,6 +144,50 @@ def test_ivf_centroids(tmpdir, small_rand_dataset):
     assert ivf.centroids == reloaded.centroids
 
 
+@pytest.mark.parametrize("metric", ["l2", "cosine"])
+def test_e_means_index_recall_and_reload(small_rand_dataset, metric):
+    ds = small_rand_dataset
+    query = ds.take([0])["vectors"][0].as_py()
+    nearest = {"column": "vectors", "q": query, "k": 10, "metric": metric}
+    exact = ds.to_table(nearest={**nearest, "use_index": False})
+    ds.create_index(
+        "vectors",
+        "IVF_FLAT",
+        num_partitions=4,
+        sample_rate=64,
+        metric=metric,
+        e_means_epochs=2.5,
+    )
+    reloaded = lance.dataset(ds.uri)
+    found = reloaded.to_table(nearest={**nearest, "nprobes": 4})
+    expected_vectors = {tuple(v) for v in exact["vectors"].to_pylist()}
+    found_vectors = {tuple(v) for v in found["vectors"].to_pylist()}
+    assert len(expected_vectors & found_vectors) / 10 == 1.0
+
+
+@pytest.mark.parametrize("epochs", [0, -1, float("nan"), float("inf")])
+def test_e_means_invalid_epochs(small_float32_dataset, epochs):
+    with pytest.raises(ValueError, match="epochs"):
+        small_float32_dataset.create_index(
+            "vectors", "IVF_FLAT", num_partitions=4, e_means_epochs=epochs
+        )
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        ({"metric": "dot"}, "L2 and cosine"),
+        ({"streaming_sample_rate": 8}, "streaming"),
+        ({"accelerator": "cuda"}, "accelerator"),
+    ],
+)
+def test_e_means_unsupported_options(small_float32_dataset, options, message):
+    with pytest.raises(ValueError, match=message):
+        small_float32_dataset.create_index(
+            "vectors", "IVF_FLAT", num_partitions=4, e_means_epochs=2.5, **options
+        )
+
+
 def test_ivf_centroids_hamming(tmpdir):
     num_rows = SMALL_NUM_ROWS
     vectors = np.random.default_rng(42).integers(
@@ -304,7 +348,8 @@ def test_gen_pq(tmpdir, pq_rand_dataset, pq_rand_ivf):
     assert PqModel.load(legacy_pq_uri).num_bits == 8
 
 
-def test_ivf_centroids_fragment_ids(tmpdir):
+@pytest.mark.parametrize("e_means_epochs", [None, 2.5])
+def test_ivf_centroids_fragment_ids(tmpdir, e_means_epochs):
     rows_per_fragment = 32
     vectors = np.concatenate(
         [
@@ -329,12 +374,14 @@ def test_ivf_centroids_fragment_ids(tmpdir):
         sample_rate=TRAINING_SAMPLE_RATE,
         max_iters=TRAINING_MAX_ITERS,
         fragment_ids=[fragment_ids[0]],
+        e_means_epochs=e_means_epochs,
     )
     second_ivf = IndicesBuilder(ds, "vectors").train_ivf(
         num_partitions=1,
         sample_rate=TRAINING_SAMPLE_RATE,
         max_iters=TRAINING_MAX_ITERS,
         fragment_ids=[fragment_ids[1]],
+        e_means_epochs=e_means_epochs,
     )
 
     first_centroid = first_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
