@@ -152,7 +152,8 @@ def test_lance_log_file_with_directory_creation(tmp_path):
     sys.platform == "win32",
     reason="subprocess does not work correctly in CI on Windows",
 )
-def test_lance_log_filters_trace_event_targets(tmp_path):
+@pytest.mark.parametrize("tracing_level", ["info", "debug"])
+def test_lance_log_filters_trace_event_targets(tmp_path, tracing_level):
     log_file = tmp_path / "lance_rust.log"
 
     result = subprocess.run(
@@ -164,6 +165,7 @@ def test_lance_log_filters_trace_event_targets(tmp_path):
         ],
         capture_output=True,
         env={
+            "LANCE_TRACING": tracing_level,
             "LANCE_LOG": "warn,lance::events::dataset_events=info",
             "LANCE_LOG_FILE": str(log_file),
         },
@@ -172,7 +174,15 @@ def test_lance_log_filters_trace_event_targets(tmp_path):
     assert result.returncode == 0, f"Command failed: {result.stderr.decode()}"
 
     log_content = log_file.read_text()
-    assert "lance::events::dataset_events" in log_content
+    dataset_event_lines = [
+        line
+        for line in log_content.splitlines()
+        if "lance::events::dataset_events" in line
+    ]
+    assert dataset_event_lines, log_content
+    assert all(re.search(r"\bINFO\b", line) for line in dataset_event_lines), (
+        log_content
+    )
     assert 'target="lance::dataset_events"' in log_content
     assert "lance::events::file_audit" not in log_content
     assert "lance::file_audit" not in log_content
