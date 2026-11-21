@@ -29,7 +29,7 @@ use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::pb;
 use lance_table::rowids::{FragmentRowIdIndex, segment::U64Segment};
 use lance_table::{
-    rowids::{RowIdIndex, RowIdSequence, read_row_ids, write_row_ids},
+    rowids::{RowIdIndex, RowIdSequence, read_row_ids, rechunk_sequences, write_row_ids},
     utils::stream::{RowIdAndDeletesConfig, apply_row_id_and_deletes},
 };
 use prost::Message;
@@ -68,6 +68,20 @@ fn make_frag_sequences(
             (i as u32, Arc::new(sequence))
         })
         .collect()
+}
+
+fn row_id_shapes(rows: u64) -> Vec<(&'static str, RowIdSequence)> {
+    let holes = (0..rows).filter(|id| id % 100 != 0).collect::<Vec<_>>();
+    let bitmap = (0..rows).filter(|id| id % 2 == 0).collect::<Vec<_>>();
+    let sparse = (0..rows).step_by(64).collect::<Vec<_>>();
+    let unordered = (0..rows).rev().collect::<Vec<_>>();
+    vec![
+        ("range", RowIdSequence::from(0..rows)),
+        ("holes", RowIdSequence::from(holes.as_slice())),
+        ("bitmap", RowIdSequence::from(bitmap.as_slice())),
+        ("sorted_array", RowIdSequence::from(sparse.as_slice())),
+        ("array", RowIdSequence::from(unordered.as_slice())),
+    ]
 }
 
 fn make_clustered_range_frag_sequences(num_rows: u64) -> Vec<FragmentRowIdIndex> {
@@ -229,6 +243,61 @@ fn bench_creation(c: &mut Criterion) {
         );
     }
 
+    let rows_per_fragment = num_rows() / 100;
+    let deletions_per_fragment = rows_per_fragment.div_ceil(4);
+    // This case measures `decompose_segment_with_deletions`, the per-row path
+    // `RowIdIndex::new` takes when a fragment's deletions live in its
+    // `DeletionVector` rather than in its row id sequence. Two library
+    // thresholds must stay on this side for that to hold:
+    //
+    // - The build chooses the merged representation only while it would read at
+    //   most `MERGE_ROWS_BUDGET` (1 << 20) rows. Above that it builds a probe
+    //   index and never calls the function under test.
+    // - `DeletionVector::from_iter` switches from `Set` to `Bitmap` at
+    //   `BITMAP_THRESDHOLD` (5,000) deletions. Their lookups cost differently,
+    //   so a case that crosses the threshold measures a different workload.
+    //
+    // Fail loudly instead of silently measuring another path.
+    assert!(
+        num_rows() <= 1 << 20,
+        "BuildIndexWithDeletionVector measures the merged deletion path, which \
+         the build only chooses while it reads at most {} rows; lower \
+         BENCH_NUM_ROWS from {} to stay within that budget",
+        1 << 20,
+        num_rows()
+    );
+    assert!(
+        deletions_per_fragment < 5_000,
+        "BuildIndexWithDeletionVector expects a Set-backed DeletionVector, but \
+         {} deletions per fragment reach the {} entry bitmap threshold; lower \
+         BENCH_NUM_ROWS",
+        deletions_per_fragment,
+        5_000
+    );
+    let sequences = make_frag_sequences(num_rows(), 100, 0.0);
+    let with_deletion_vector = sequences
+        .iter()
+        .map(|(fragment_id, sequence)| {
+            let deletion_vector = DeletionVector::from_iter(
+                (0..rows_per_fragment)
+                    .step_by(4)
+                    .map(|offset| offset as u32),
+            );
+            assert!(
+                matches!(deletion_vector, DeletionVector::Set(_)),
+                "expected a Set-backed DeletionVector, got {deletion_vector:?}"
+            );
+            FragmentRowIdIndex {
+                fragment_id: *fragment_id,
+                row_id_sequence: sequence.clone(),
+                deletion_vector: Arc::new(deletion_vector),
+            }
+        })
+        .collect::<Vec<_>>();
+    group.bench_function("BuildIndexWithDeletionVector", |b| {
+        b.iter(|| std::hint::black_box(RowIdIndex::new(&with_deletion_vector).unwrap()));
+    });
+
     let clustered_indices = make_clustered_range_frag_sequences(num_rows());
     group.bench_function("BuildIndexClusteredRanges", |b| {
         b.iter(|| std::hint::black_box(RowIdIndex::new(&clustered_indices).unwrap()));
@@ -339,6 +408,20 @@ fn bench_apply_row_id(c: &mut Criterion) {
         total_num_rows: num_rows() as u32,
     };
 
+    let stable_config = RowIdAndDeletesConfig {
+        params: ReadBatchParams::default(),
+        with_row_id: true,
+        with_row_addr: false,
+        with_row_last_updated_at_version: false,
+        with_row_created_at_version: false,
+        deletion_vector: None,
+        row_id_sequence: Some(Arc::new(RowIdSequence::from(0..num_rows()))),
+        last_updated_at_sequence: None,
+        created_at_sequence: None,
+        make_deletions_null: false,
+        total_num_rows: num_rows() as u32,
+    };
+
     group.bench_function("ApplyRowId", |b| {
         let batch = batch.clone();
         b.iter(|| {
@@ -346,6 +429,213 @@ fn bench_apply_row_id(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("ApplyStableRowId", |b| {
+        let batch = batch.clone();
+        b.iter(|| {
+            let _ = apply_row_id_and_deletes(batch.clone(), 0, 0, &stable_config);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_get_many(c: &mut Criterion) {
+    let rows = num_rows() as usize;
+    let fragments = std::env::var("BENCH_GET_MANY_FRAGMENTS")
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(100)
+        .min(rows);
+    let rows_per_fragment = rows.div_ceil(fragments);
+    let fragments: Vec<_> = (0..fragments)
+        .map(|fragment_id| {
+            let start = fragment_id * rows_per_fragment;
+            let end = (start + rows_per_fragment).min(rows);
+            FragmentRowIdIndex {
+                fragment_id: fragment_id as u32,
+                row_id_sequence: Arc::new(RowIdSequence::from(start as u64..end as u64)),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            }
+        })
+        .collect();
+    let index = RowIdIndex::new(&fragments).unwrap();
+
+    let default_sizes = [1_usize, 1_000, 10_000, 100_000, 1_000_000];
+    let sizes = std::env::var("BENCH_GET_MANY_SIZES")
+        .map(|value| {
+            value
+                .split(',')
+                .map(|size| {
+                    size.trim()
+                        .parse::<usize>()
+                        .expect("BENCH_GET_MANY_SIZES must be a comma-separated list of sizes")
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|_| default_sizes.to_vec());
+
+    let mut group = c.benchmark_group("row_id_index_get_many");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    for count in sizes {
+        if count == 0 || count > rows {
+            continue;
+        }
+        for pattern in ["sequential", "random", "clustered"] {
+            let mut rng = SmallRng::seed_from_u64(42);
+            let batches: Vec<Vec<u64>> = (0..4)
+                .map(|batch| {
+                    let base = if count == rows {
+                        0
+                    } else {
+                        (batch * count) % (rows - count)
+                    };
+                    match pattern {
+                        "sequential" => (0..count).map(|offset| (base + offset) as u64).collect(),
+                        "random" => (0..count)
+                            .map(|_| rng.random_range(0..rows) as u64)
+                            .collect(),
+                        "clustered" => {
+                            let clusters = 64.min(count);
+                            let cluster_len = count.div_ceil(clusters);
+                            let start_span = rows.saturating_sub(cluster_len).max(1);
+                            let mut keys = Vec::with_capacity(count);
+                            for _ in 0..clusters {
+                                let start = rng.random_range(0..start_span);
+                                let len = cluster_len.min(count - keys.len());
+                                keys.extend((start..start + len).map(|id| id as u64));
+                                if keys.len() == count {
+                                    break;
+                                }
+                            }
+                            keys
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .collect();
+            for keys in &batches {
+                let resolved = index.get_many(keys).unwrap();
+                for (key, address) in keys.iter().zip(&resolved) {
+                    let physical = *key as usize;
+                    let fragment = physical / rows_per_fragment;
+                    let offset = physical % rows_per_fragment;
+                    assert_eq!(
+                        *address,
+                        Some(RowAddress::new_from_parts(fragment as u32, offset as u32))
+                    );
+                }
+            }
+            group.throughput(criterion::Throughput::Elements(count as u64));
+            group.bench_with_input(BenchmarkId::new(pattern, count), &batches, |b, batches| {
+                let mut next = 0;
+                b.iter(|| {
+                    let result = index
+                        .get_many(std::hint::black_box(&batches[next]))
+                        .unwrap();
+                    next = (next + 1) % batches.len();
+                    std::hint::black_box(result)
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_row_id_serde(c: &mut Criterion) {
+    let shapes = row_id_shapes(num_rows());
+
+    let mut group = c.benchmark_group("row_id_serde");
+    for (name, sequence) in &shapes {
+        let bytes = write_row_ids(sequence);
+        group.throughput(criterion::Throughput::Elements(sequence.len()));
+        group.bench_with_input(BenchmarkId::new("write", name), sequence, |b, sequence| {
+            b.iter(|| std::hint::black_box(write_row_ids(sequence)));
+        });
+        group.bench_with_input(BenchmarkId::new("read", name), &bytes, |b, bytes| {
+            b.iter(|| std::hint::black_box(read_row_ids(bytes).unwrap()));
+        });
+    }
+    group.finish();
+}
+
+fn rechunk_inputs(rows: u64) -> Vec<(&'static str, RowIdSequence)> {
+    let mut holes = RowIdSequence::from(0..rows);
+    // Sparse deletions keep the sequence a range with a hole array.
+    holes.delete((0..rows).step_by(100).collect::<Vec<_>>());
+
+    let mut bitmap = RowIdSequence::from(0..rows);
+    // Dense deletions push the encoding to a range plus bitmap.
+    bitmap.delete((0..rows).step_by(2).collect::<Vec<_>>());
+
+    let shuffled = {
+        let mut ids = (0..rows).collect::<Vec<_>>();
+        ids.reverse();
+        RowIdSequence::from(ids.as_slice())
+    };
+
+    // Compaction rechunks whatever encoding the deleted fragments left behind,
+    // so each case must really produce the shape its name claims. Fail loudly
+    // if the segment cost model changes and picks another encoding.
+    let shapes = vec![
+        ("range", RowIdSequence::from(0..rows)),
+        ("holes", holes),
+        ("bitmap", bitmap),
+        ("array", shuffled),
+    ];
+    for (name, sequence) in &shapes {
+        let expected = match *name {
+            "range" => matches!(sequence.segments(), [U64Segment::Range(_)]),
+            "holes" => matches!(sequence.segments(), [U64Segment::RangeWithHoles { .. }]),
+            "bitmap" => matches!(sequence.segments(), [U64Segment::RangeWithBitmap { .. }]),
+            "array" => matches!(sequence.segments(), [U64Segment::Array(_)]),
+            other => unreachable!("unknown rechunk shape {other}"),
+        };
+        assert!(
+            expected,
+            "rechunk shape {name} did not produce the expected encoding: {:?}",
+            sequence.segments()
+        );
+    }
+    shapes
+}
+
+fn bench_rechunk_sequences(c: &mut Criterion) {
+    let rows = num_rows();
+
+    let mut group = c.benchmark_group("row_id_rechunk");
+    for (shape, sequence) in &rechunk_inputs(rows) {
+        for chunk_size in [4_096_u64, 65_536_u64] {
+            let chunk_sizes = (0..sequence.len())
+                .step_by(chunk_size as usize)
+                .map(|start| (sequence.len() - start).min(chunk_size))
+                .collect::<Vec<_>>();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{shape}/one_to_many"), chunk_size),
+                &chunk_sizes,
+                |b, chunk_sizes| {
+                    b.iter(|| {
+                        std::hint::black_box(
+                            rechunk_sequences([sequence.clone()], chunk_sizes.clone(), false)
+                                .unwrap(),
+                        )
+                    });
+                },
+            );
+        }
+    }
+
+    // Reverse direction: many input sequences feeding one output chunk.
+    let input_chunk = 4_096_u64;
+    let sequences = (0..rows)
+        .step_by(input_chunk as usize)
+        .map(|start| RowIdSequence::from(start..(start + input_chunk).min(rows)))
+        .collect::<Vec<_>>();
+    group.bench_function(BenchmarkId::new("many_to_one", input_chunk), |b| {
+        b.iter(|| {
+            std::hint::black_box(rechunk_sequences(sequences.clone(), [rows], false).unwrap())
+        });
+    });
     group.finish();
 }
 
@@ -725,6 +1015,74 @@ fn resolve_direct(fragments: &[FragmentRowIdIndex], ids: &[u64]) -> Vec<Option<R
     output
 }
 
+fn bench_row_addr_tree_map(c: &mut Criterion) {
+    let mut group = c.benchmark_group("row_id_tree_map");
+    group.sample_size(10);
+    for (name, sequence) in &row_id_shapes(num_rows()) {
+        group.throughput(criterion::Throughput::Elements(sequence.len()));
+        group.bench_with_input(*name, sequence, |b, sequence| {
+            b.iter(|| std::hint::black_box(RowAddrTreeMap::from(sequence)));
+        });
+    }
+    group.finish();
+}
+
+fn bench_row_id_select(c: &mut Criterion) {
+    let shapes = row_id_shapes(num_rows());
+
+    let mut group = c.benchmark_group("row_id_select");
+    group.sample_size(10);
+    for (name, sequence) in &shapes {
+        // `select` takes offsets into this sequence, not row ids. Build the
+        // subsets from its own length so each label selects the density it
+        // advertises instead of probing past the end.
+        let len = sequence.len() as usize;
+        let subsets = [
+            ("all", (0..len).collect::<Vec<_>>()),
+            ("half", (0..len).step_by(2).collect::<Vec<_>>()),
+            ("sparse", (0..len).step_by(64).collect::<Vec<_>>()),
+        ];
+        for (subset_name, subset) in &subsets {
+            let selected = sequence.select(subset.iter().copied()).count();
+            assert_eq!(selected, subset.len(), "{name}/{subset_name}");
+            group.throughput(criterion::Throughput::Elements(selected as u64));
+            group.bench_with_input(
+                BenchmarkId::new(*name, *subset_name),
+                subset,
+                |b, subset| {
+                    b.iter(|| {
+                        std::hint::black_box(sequence.select(subset.iter().copied()).count())
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_mask_to_offset_ranges_shapes(c: &mut Criterion) {
+    let shapes = row_id_shapes(num_rows());
+
+    let mut group = c.benchmark_group("row_id_mask_shapes");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    for (name, sequence) in &shapes {
+        let live = sequence.iter().collect::<Vec<_>>();
+        for percent in [1_usize, 10, 50, 99] {
+            let count = live.len().saturating_mul(percent) / 100;
+            let ids = (0..count)
+                .map(|index| live[index * live.len() / count.max(1)])
+                .collect::<Vec<_>>();
+            let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(ids.as_slice()));
+            group.bench_with_input(BenchmarkId::new(*name, percent), &mask, |b, mask| {
+                b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(mask)));
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_bitmap_mask_density(c: &mut Criterion) {
     let span = 1_000_000_u64;
     let live: Vec<u64> = (0..span).filter(|id| id % 17 != 0).collect();
@@ -805,15 +1163,21 @@ fn bench_broad_dataset_wide_mask(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config=Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
-    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_batch_lookup, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
+    targets=bench_creation, bench_get_single, bench_get_many, bench_apply_row_id, bench_row_id_serde, bench_rechunk_sequences, bench_row_addr_tree_map, bench_row_id_select, bench_shot_table, bench_batch_lookup, bench_mask_to_offset_ranges_shapes, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     benches,
     bench_creation,
     bench_get_single,
+    bench_get_many,
     bench_apply_row_id,
+    bench_row_id_serde,
+    bench_rechunk_sequences,
+    bench_row_addr_tree_map,
+    bench_row_id_select,
     bench_shot_table,
     bench_batch_lookup,
+    bench_mask_to_offset_ranges_shapes,
     bench_bitmap_mask_density,
     bench_broad_dataset_wide_mask
 );

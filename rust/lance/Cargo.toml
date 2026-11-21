@@ -390,5 +390,9 @@ harness = false
 name = "cleanup"
 harness = false
 
+[[bench]]
+name = "stable_row_ids"
+harness = false
+
 [lints]
 workspace = true
