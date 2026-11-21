@@ -8257,6 +8257,61 @@ async fn test_label_list_index_on_int32_items() {
 }
 
 #[tokio::test]
+async fn test_nested_index_sibling_projection() {
+    let nested = StructArray::from(vec![
+        (
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![1, 2, 1, 2])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("text", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["one", "two", "three", "four"])) as ArrayRef,
+        ),
+    ]);
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])) as ArrayRef,
+        ),
+        ("s", Arc::new(nested) as ArrayRef),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["s.x"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut scan = dataset.scan();
+    scan.project(&["s.text"])
+        .unwrap()
+        .filter("s.x = 1 AND id > 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("projection=[id]"),
+        "{plan}"
+    );
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.column(0).as_string::<i32>().value(0), "three");
+}
+
+#[tokio::test]
 async fn test_projected_ngram_recheck_is_materialized_once() {
     let batch = RecordBatch::try_from_iter([
         (
