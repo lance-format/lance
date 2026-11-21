@@ -304,13 +304,20 @@ class EncodedImageArray(ImageArray):
     """
 
     def __repr__(self):
-        def pillow_metadata_decoder(images):
+        prefix = f"<lance.arrow.{type(self).__name__} object at 0x{id(self):016x}>"
+        if len(self) == 0:
+            return f"{prefix}\n[]"
+        first_image = self.storage[0].as_py()
+        if first_image is None:
+            suffix = ", .." if len(self) > 1 else ""
+            return f"{prefix}\n[None{suffix}]"
+
+        def pillow_metadata_decoder(image):
             import io
 
             from PIL import Image  # pyright: ignore[reportMissingImports]
 
-            img = Image.open(io.BytesIO(images[0].as_py()))
-            return img
+            return Image.open(io.BytesIO(image))
 
         decoders = (("PIL", pillow_metadata_decoder),)
         decoder = None
@@ -323,12 +330,8 @@ class EncodedImageArray(ImageArray):
             except ImportError:
                 pass
 
-        return "<lance.arrow.%s object at 0x%016x>%s\n%s" % (
-            type(self).__name__,
-            id(self),
-            "\n[" + repr(decoder(self)) + ", ..]" if decoder else None,
-            repr(self.to_pylist()[0][:30]),
-        )
+        metadata = f"\n[{decoder(first_image)!r}, ..]" if decoder else None
+        return f"{prefix}{metadata}\n{first_image[:30]!r}"
 
     def to_tensor(
         self,
