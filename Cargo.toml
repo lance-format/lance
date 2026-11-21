@@ -27,8 +27,6 @@ members = [
     "rust/lance-tools",
     "rust/compression/fsst",
     "rust/compression/bitpacking",
-    "rust/arrow-scalar",
-    "rust/arrow-stats",
 ]
 exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
@@ -89,8 +87,6 @@ approx = "0.5.1"
 argminmax = "0.7.1"
 # Note that this one does not include pyarrow
 arrow = { version = "59.2.0", optional = false, features = ["prettyprint"] }
-lance-arrow-scalar = { version = "=59.0.0", path = "./rust/arrow-scalar" }
-lance-arrow-stats = { version = "=59.0.0", path = "./rust/arrow-stats" }
 arrow-arith = "59.2.0"
 arrow-array = "59.2.0"
 arrow-buffer = "59.2.0"

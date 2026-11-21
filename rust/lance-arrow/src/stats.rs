@@ -12,7 +12,7 @@
 //! use std::sync::Arc;
 //! use arrow_array::{ArrayRef, Int32Array};
 //! use arrow_schema::DataType;
-//! use lance_arrow_stats::StatisticsAccumulator;
+//! use lance_arrow::stats::StatisticsAccumulator;
 //!
 //! let mut acc = StatisticsAccumulator::new(&DataType::Int32);
 //! let array: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
@@ -52,11 +52,11 @@
 mod nan;
 pub use nan::{NanCounts, count_nans, count_nans_signed};
 
+use crate::scalar::ArrowScalar;
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow_scalar::ArrowScalar;
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
