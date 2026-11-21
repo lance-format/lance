@@ -37,7 +37,8 @@ jobs:
       matrix:
         include:
           - arch: x86-64
-            runner: ubuntu-24.04
+            # Keep the final fat-LTO JNI build on the larger runner used by Rust CI.
+            runner: ubuntu-24.04-8x
             docker_platform: linux/amd64
             protoc_arch: x86_64
             artifact: liblance_jni_linux_x86_64.zip
@@ -123,7 +124,7 @@ jobs:
   build-macos:
     name: Build on MacOS Arm64
     runs-on: warp-macos-14-arm64-6x
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

@@ -166,18 +166,7 @@ async fn do_take_rows(
 
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
-        let empty_batch = RecordBatch::new_empty(Arc::new(builder.projection.output_schema()?));
-        // If row addresses were requested, add an empty row address column.
-        // This ensures callers that expect the _rowaddr column don't panic.
-        if builder.with_row_address {
-            let row_addr_col = Arc::new(UInt64Array::from(Vec::<u64>::new()));
-            let row_addr_field =
-                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            return to_logical_json_batch(
-                empty_batch.try_with_column(row_addr_field, row_addr_col)?,
-            );
-        }
-        return to_logical_json_batch(empty_batch);
+        return builder.empty_batch();
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);
@@ -200,9 +189,10 @@ async fn do_take_rows(
     }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
+    // Keep an internal address so empty and constant projections retain row counts.
     let read_config = FragReadConfig::default()
         .with_row_id(with_row_id_in_projection)
-        .with_row_address(with_row_addr_in_projection)
+        .with_row_address(with_row_addr_in_projection || projection.physical_projection.is_empty())
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
@@ -385,9 +375,7 @@ async fn do_take_rows(
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     if builder.is_empty() {
-        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
-            builder.projection.output_schema()?,
-        )));
+        return builder.empty_batch();
     }
 
     let projection = builder.projection.clone();
@@ -401,6 +389,8 @@ fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
 ///
+/// `batch_readahead` must be greater than zero; otherwise the stream yields an invalid-input error.
+///
 /// This is an experimental API. It may change at any time.
 pub fn take_scan(
     dataset: &Dataset,
@@ -409,6 +399,15 @@ pub fn take_scan(
     batch_readahead: usize,
 ) -> DatasetRecordBatchStream {
     let arrow_schema = Arc::new(projection.as_ref().into());
+    if batch_readahead == 0 {
+        let error = DataFusionError::from(Error::invalid_input(
+            "batch_readahead must be greater than 0, got 0",
+        ));
+        return DatasetRecordBatchStream::new(Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema,
+            futures::stream::once(std::future::ready(Err(error))),
+        )));
+    }
     let dataset = Arc::new(dataset.clone());
     let batch_stream = row_ranges
         .map(move |res| {
@@ -422,7 +421,7 @@ pub fn take_scan(
                     .await
                     .map_err(|err| DataFusionError::External(Box::new(err)))
             };
-            async move { tokio::task::spawn(fut).await.unwrap() }
+            async move { lance_core::utils::tokio::spawn(fut).await.unwrap() }
         })
         .buffered(batch_readahead);
 
@@ -450,7 +449,7 @@ fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
 
     for addr in row_addrs.iter().skip(1) {
         sorted &= *addr >= last_offset;
-        contiguous &= *addr == last_offset + 1;
+        contiguous &= last_offset.checked_add(1) == Some(*addr);
         // Contiguous also requires the fragment ids are all the same
         contiguous &= (*addr >> 32) == first_fragment_id;
         last_offset = *addr;
@@ -552,6 +551,17 @@ impl TakeBuilder {
         }
     }
 
+    fn empty_batch(&self) -> Result<RecordBatch> {
+        let mut batch = RecordBatch::new_empty(Arc::new(self.projection.output_schema()?));
+        if self.with_row_address && batch.column_by_name(ROW_ADDR).is_none() {
+            batch = batch.try_with_column(
+                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false),
+                Arc::new(UInt64Array::from(Vec::<u64>::new())),
+            )?;
+        }
+        to_logical_json_batch(batch)
+    }
+
     async fn get_row_addrs(&mut self) -> Result<&Vec<u64>> {
         if self.row_addrs.is_none() {
             let row_ids = self
@@ -625,6 +635,7 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 
 #[cfg(test)]
 mod test {
+    use arrow_array::types::Int64Type;
     use arrow_array::{
         Int32Array, LargeBinaryArray, ListArray, MapArray, RecordBatchIterator, StringArray,
         StructArray,
@@ -636,6 +647,7 @@ mod test {
     use lance_core::utils::deletion::DeletionVector;
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
+    use lance_io::stream::RecordBatchStream;
     use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
@@ -647,6 +659,226 @@ mod test {
     };
 
     use super::*;
+
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::contiguous(&[0, 1])]
+    #[case::sorted(&[0, 4, 4])]
+    #[case::unsorted(&[4, 0, 4])]
+    #[case::mixed_deleted(&[4, 1, 0, 4])]
+    #[case::deleted_only(&[1, 1])]
+    #[tokio::test]
+    async fn test_take_empty_projection(
+        #[case] indices: &[u64],
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(false, true)] delete_row: bool,
+        #[values(false, true)] by_id: bool,
+    ) {
+        let data = test_batch(0..6);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        if delete_row {
+            dataset.delete("i = 1").await.unwrap();
+        }
+        let expected_rows = if by_id && delete_row {
+            indices.iter().filter(|&&id| id != 1).count()
+        } else {
+            indices.len()
+        };
+        let row_ids = indices
+            .iter()
+            .map(|&id| {
+                if enable_stable_row_ids {
+                    id
+                } else {
+                    u64::from(RowAddress::new_from_parts((id / 3) as u32, (id % 3) as u32))
+                }
+            })
+            .collect::<Vec<_>>();
+        let projection = ProjectionRequest::from_columns(Vec::<&str>::new(), dataset.schema());
+        dataset.object_store.io_stats_incremental();
+        let batch = if by_id {
+            dataset.take_rows(&row_ids, projection).await.unwrap()
+        } else {
+            dataset.take(indices, projection).await.unwrap()
+        };
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), expected_rows);
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| !request.path.as_ref().contains("/data/"))
+        );
+
+        let projection = ProjectionRequest::from_sql([("answer", "42")]);
+        let batch = if by_id {
+            dataset.take_rows(&row_ids, projection).await.unwrap()
+        } else {
+            dataset.take(indices, projection).await.unwrap()
+        };
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), expected_rows);
+        assert_eq!(batch.schema().field(0).name(), "answer");
+        assert_eq!(
+            batch["answer"]
+                .as_primitive::<Int64Type>()
+                .values()
+                .as_ref(),
+            vec![42; expected_rows]
+        );
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| !request.path.as_ref().contains("/data/"))
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_empty_projection_bounds(#[values(false, true)] enable_stable_row_ids: bool) {
+        let data = test_batch(0..6);
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let projection = ProjectionRequest::from_columns(Vec::<&str>::new(), dataset.schema());
+        let error = dataset.take(&[6], projection.clone()).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("non-existent fragment"),
+            "{error}"
+        );
+
+        if enable_stable_row_ids {
+            let batch = dataset.take_rows(&[6], projection.clone()).await.unwrap();
+            assert_eq!((batch.num_rows(), batch.num_columns()), (0, 0));
+            let batch = dataset.take_rows(&[6, 0, 0], projection).await.unwrap();
+            assert_eq!((batch.num_rows(), batch.num_columns()), (2, 0));
+        } else {
+            let error = dataset
+                .take_rows(&[3], projection.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains("Invalid read params"), "{error}");
+            let missing = u64::from(RowAddress::new_from_parts(2, 0));
+            let error = dataset.take_rows(&[missing], projection).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains("non-existent fragment: 2"),
+                "{error}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::single(&[6])]
+    #[case::repeated(&[6, 6])]
+    #[case::sorted(&[0, 6])]
+    #[case::unsorted(&[6, 0])]
+    #[tokio::test]
+    async fn test_take_out_of_bound(
+        #[case] indices: &[u64],
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        let data = test_batch(0..6);
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let error = dataset
+            .take(indices, dataset.schema().clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("fragment"), "{error}");
+        assert!(error.to_string().contains("4294967295"), "{error}");
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::missing(vec![100])]
+    #[tokio::test]
+    async fn test_take_empty_row_address_schema(
+        #[case] ids: Vec<u64>,
+        #[values(false, true)] explicit_address: bool,
+        #[values(false, true)] with_row_address: bool,
+    ) {
+        let data = test_batch(0..4);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let columns = if explicit_address {
+            vec!["i", ROW_ADDR]
+        } else {
+            vec!["i"]
+        };
+        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+        let expected = dataset
+            .take_builder(&[0], projection.clone())
+            .unwrap()
+            .with_row_address(with_row_address)
+            .execute()
+            .await
+            .unwrap();
+        let actual = dataset
+            .take_builder(&ids, projection)
+            .unwrap()
+            .with_row_address(with_row_address)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(actual.num_rows(), 0);
+        assert_eq!(actual.schema(), expected.schema());
+    }
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -668,6 +900,58 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    #[rstest]
+    #[case::top_level(&["i", "nope"], Some("nope"))]
+    #[case::nested(&["st.a", "st.nope"], Some("st.nope"))]
+    #[case::under_a_leaf(&["i.a"], Some("i.a"))]
+    #[case::nested_and_system(&["st.a", "_rowid"], None)]
+    #[tokio::test]
+    async fn test_take_projection_from_column_names(
+        #[case] columns: &[&str],
+        #[case] missing: Option<&str>,
+    ) {
+        let child = Arc::new(ArrowField::new("a", DataType::Int32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("st", DataType::Struct(vec![child.clone()].into()), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                Arc::new(StructArray::new(
+                    vec![child].into(),
+                    vec![Arc::new(Int32Array::from(vec![10, 11]))],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let projection = ProjectionRequest::try_from_columns(columns, dataset.schema());
+        match missing {
+            Some(missing) => {
+                let err = projection.unwrap_err();
+                assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+                assert!(err.to_string().contains(missing), "{err}");
+            }
+            None => {
+                let values = dataset.take(&[1], projection.unwrap()).await.unwrap();
+                let st = values["st"].as_struct();
+                assert_eq!(st.column_names(), vec!["a"]);
+                assert_eq!(
+                    st.column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .value(0),
+                    11
+                );
+                assert!(values.column_by_name("_rowid").is_some());
+            }
+        }
     }
 
     /// How a nested field carries one Arrow JSON document per row.
@@ -1114,6 +1398,7 @@ mod test {
             dataset.version().version,
             &DeletionVector::from_iter(0..4),
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap();
@@ -1594,6 +1879,15 @@ mod test {
             "{}",
             err.to_string()
         );
+
+        // Repeated maximum offsets must reach bounds validation without overflowing.
+        let err = ds
+            .take_rows(&[u32::MAX as u64; 2], ds.schema().clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("Invalid read params"), "{err}");
+        assert!(err.to_string().contains("4294967295"), "{err}");
     }
 
     #[rstest]
@@ -1762,6 +2056,60 @@ mod test {
         assert_eq!(
             results[2].column(0).as_primitive::<Int32Type>().values(),
             &[1],
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_scan_readahead(
+        #[values(0, 1)] batch_readahead: usize,
+        #[values(false, true)] empty_input: bool,
+    ) {
+        let data = test_batch(0..4);
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let ranges = if empty_input { vec![] } else { vec![Ok(0..3)] };
+        let mut stream = dataset.take_scan(
+            futures::stream::iter(ranges).boxed(),
+            Arc::new(dataset.schema().clone()),
+            batch_readahead,
+        );
+        assert_eq!(
+            stream.schema().as_ref(),
+            &ArrowSchema::from(dataset.schema())
+        );
+
+        if batch_readahead == 0 {
+            let error = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                .await
+                .expect("zero readahead must not hang")
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("batch_readahead must be greater than 0, got 0"),
+                "{error}"
+            );
+        } else if !empty_input {
+            assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 3);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                .await
+                .expect("take stream must terminate")
+                .is_none()
         );
     }
 

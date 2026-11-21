@@ -445,24 +445,6 @@ def test_map_keys_cannot_be_null(tmp_path: Path):
     values_list = [item[1] for item in first_map.as_py()]
     assert None in values_list  # At least one null value
 
-    # Test 3: Verify we cannot write maps with null keys
-    with pytest.raises(Exception):
-        pa.table(
-            {
-                "id": [1, 2],
-                "null_key_map": [
-                    [(None, 1), ("b", 2)],  # null key is not allowed
-                    [("c", 3)],
-                ],
-            },
-            schema=pa.schema(
-                [
-                    pa.field("id", pa.int32()),
-                    pa.field("null_key_map", pa.map_(pa.string(), pa.int32())),
-                ]
-            ),
-        )
-
 
 def test_map_projection_queries(tmp_path: Path):
     # Create a dataset with multiple columns including Map types

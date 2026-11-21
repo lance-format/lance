@@ -11,13 +11,15 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, SchemaRef};
 use arrow_select::take::take;
+use datafusion::catalog::Session;
 use datafusion::common::{
     Column, DFSchema, DataFusionError, Result as DFResult, TableReference,
-    tree_node::{Transformed, TransformedResult, TreeNode},
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
-use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+    apply_expression_roots,
     metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
     stream::RecordBatchStreamAdapter,
 };
@@ -72,7 +74,7 @@ impl MergeConditionExec {
         dataset: Arc<Dataset>,
         update_if: Option<Expr>,
         delete_if: Option<Expr>,
-        session: &SessionState,
+        session: &dyn Session,
     ) -> DFResult<Self> {
         let physical_schema = input.schema();
         let physical_names = physical_schema.fields().iter().map(|f| f.name());
@@ -405,6 +407,18 @@ impl ExecutionPlan for MergeConditionExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(
+            self.evaluator
+                .update_if
+                .iter()
+                .chain(self.evaluator.delete_if.iter()),
+            f,
+        )
+    }
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,

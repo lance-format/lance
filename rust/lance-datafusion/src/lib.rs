@@ -9,6 +9,7 @@ pub use lance_datafusion_exec::datagen;
 pub mod exec;
 pub use lance_datafusion_exec::expr;
 pub mod logical_expr;
+mod membership;
 pub mod planner;
 pub mod projection;
 pub mod pb {
@@ -20,10 +21,11 @@ pub mod pb {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.datafusion.rs"));
+    include!("pb/lance.datafusion.rs");
 }
 mod numeric_coercion;
-mod signed_zero;
+#[doc(hidden)]
+pub mod signed_zero;
 pub mod spill;
 pub mod sql;
 #[cfg(feature = "substrait")]

@@ -83,6 +83,7 @@ def test_duplicate_pairs_flat(tmp_path, metric, index_type):
         ("IVF_SQ", 8),
         ("IVF_HNSW_PQ", 4),
         ("IVF_HNSW_SQ", 8),
+        ("IVF_HNSW_RQ", 5),
         ("IVF_RQ", 1),
         ("IVF_RQ", 5),
         ("IVF_RQ", 9),

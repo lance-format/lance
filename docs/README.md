@@ -32,6 +32,10 @@ make build
 
 This will create a `site/` directory with the built documentation.
 
+### Testing the Theme
+
+Run `make test` to build a small fixture site and check the rendered navigation.
+
 ### Managing Dependencies
 
 #### Adding Dependencies

@@ -37,7 +37,7 @@ fn gather_materialized_values(
                 continue;
             }
             let take_end = end.min(array_end);
-            selected.extend(array_index, start - array_start, take_end - array_start);
+            selected.try_extend(array_index, start - array_start, take_end - array_start)?;
             start = take_end;
         }
     }
@@ -115,8 +115,8 @@ fn restore_leaf_slots(
                 "Materialized range exceeds decoded values",
             ));
         }
-        restored.extend_nulls(start - output_offset);
-        restored.extend(0, value_offset, value_offset + count);
+        restored.try_extend_nulls(start - output_offset)?;
+        restored.try_extend(0, value_offset, value_offset + count)?;
         output_offset = end;
         value_offset += count;
     }
@@ -125,7 +125,7 @@ fn restore_leaf_slots(
             "Decoded values exceed materialized ranges",
         ));
     }
-    restored.extend_nulls(slots - output_offset);
+    restored.try_extend_nulls(slots - output_offset)?;
     Ok(make_array(restored.freeze()))
 }
 
@@ -482,6 +482,7 @@ impl CachedPageData for CachedPlanarSparse {
 }
 
 pub(in crate::encodings::logical::primitive) struct PlanarSparseScheduler {
+    structural_projection: Option<super::super::structure::StructuralProjection>,
     layers: Vec<SparseLayerDecompressors>,
     structural_buffers: Vec<Range<u64>>,
     values: ValueStorage,
@@ -669,6 +670,7 @@ impl PlanarSparseScheduler {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layers,
+            structural_projection: None,
             structural_buffers,
             values,
             rows,
@@ -677,6 +679,17 @@ impl PlanarSparseScheduler {
             data_type: field.data_type(),
             state: None,
         })
+    }
+
+    pub(in crate::encodings::logical::primitive) fn with_structural_projection(
+        mut self,
+        projection: Option<super::super::structure::StructuralProjection>,
+    ) -> Self {
+        if projection.is_some() {
+            self.values = ValueStorage::None;
+        }
+        self.structural_projection = projection;
+        self
     }
 
     fn value_scheduler(&self) -> Option<&dyn StructuralPageScheduler> {
@@ -844,6 +857,7 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
                 ));
             }
             if matches!(self.values, ValueStorage::None)
+                && self.structural_projection.is_none()
                 && !positions.is_empty()
                 && !matches!(&self.data_type, DataType::Struct(fields) if fields.is_empty())
             {
@@ -925,6 +939,7 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
             _ => None,
         };
         let data_type = self.data_type.clone();
+        let structural_projection = self.structural_projection.clone();
         let row_scale = self.row_scale;
         let rows = self.rows;
         Ok(vec![PageLoadTask {
@@ -935,6 +950,7 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
                     decoders.push_back((task.decoder_fut.await?, task.num_rows));
                 }
                 Ok(Box::new(PlanarSparseDecoder {
+                    structural_projection,
                     ranges: ranges.into(),
                     range_offset: 0,
                     rows,
@@ -952,6 +968,7 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
 }
 
 struct PlanarSparseDecoder {
+    structural_projection: Option<super::super::structure::StructuralProjection>,
     ranges: VecDeque<Range<u64>>,
     range_offset: u64,
     rows: u64,
@@ -1019,6 +1036,7 @@ impl StructuralPageDecoder for PlanarSparseDecoder {
             }
         }
         if remaining > 0
+            && self.structural_projection.is_none()
             && self.scalar.is_none()
             && !matches!(&self.data_type, DataType::Struct(fields) if fields.is_empty())
         {
@@ -1027,6 +1045,7 @@ impl StructuralPageDecoder for PlanarSparseDecoder {
             ));
         }
         Ok(Box::new(PlanarSparseTask {
+            structural_projection: self.structural_projection.clone(),
             plan: selection.plan,
             positions: selected.positions,
             tasks,
@@ -1038,6 +1057,7 @@ impl StructuralPageDecoder for PlanarSparseDecoder {
 
 #[derive(Debug)]
 struct PlanarSparseTask {
+    structural_projection: Option<super::super::structure::StructuralProjection>,
     plan: SparseStructuralPlan,
     positions: SparsePositionPlan,
     tasks: Vec<Box<dyn DecodePageTask>>,
@@ -1046,6 +1066,12 @@ struct PlanarSparseTask {
 }
 impl PlanarSparseTask {
     fn decode_checked(self) -> Result<DecodedPage> {
+        if let Some(projection) = &self.structural_projection {
+            return Ok(DecodedPage {
+                data: projection.placeholder_values(self.plan.num_visible_items)?,
+                repdef: RepDefUnraveler::new_sparse(self.plan),
+            });
+        }
         let slots = usize_from_u64(self.plan.num_visible_items, "decoded leaf slots")?;
         let array = if let Some(scalar) = self.scalar {
             // Sparse structure carries validity. Materializing nullable take indices

@@ -27,10 +27,11 @@ use super::exec::{
 use crate::dataset::mem_wal::index::{FtsQueryExpr, IndexedFilter, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
     FtsMemQuery, MemQuery, SearchOptions, VectorMemQuery, plan_filter,
 };
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 /// Vector search query parameters.
 #[derive(Debug, Clone)]
@@ -1483,11 +1484,25 @@ impl MemTableScanner {
 mod tests {
     use super::*;
 
+    use arrow_array::cast::AsArray;
+    use datafusion::common::{DFSchema, stats::Precision};
+    use datafusion::config::ConfigOptions;
+    use datafusion::functions_aggregate::count::count_all;
+    use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+    use datafusion::physical_expr::execution_props::ExecutionProps;
+    use datafusion::physical_optimizer::{
+        PhysicalOptimizerRule, aggregate_statistics::AggregateStatistics,
+    };
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
+
     use crate::dataset::mem_wal::memtable::scanner::{fallback_reads, newest_checks};
 
     /// A deduplicated filtered read from the filter indexes returns what
     /// reading every row returns, across overwrites, deletes, rows not yet
-    /// visible, and every key type, single and composite.
+    /// visible, every key type, single and composite, and filters over one
+    /// index, two, or an index beside a predicate it cannot answer.
     #[tokio::test]
     async fn memtable_filter_indexes_answer_like_reading_every_row() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -1499,7 +1514,7 @@ mod tests {
             "red", "blue", "green", "amber", "black", "white", "grey", "pink", "cyan", "teal",
             "navy", "lime", "plum", "rose", "sand", "gold",
         ];
-        const FILTERS: [&str; 9] = [
+        const FILTERS: [&str; 17] = [
             "colour = 'red'",
             "colour IN ('red', 'blue')",
             "colour IS NULL",
@@ -1510,6 +1525,16 @@ mod tests {
             "colour BETWEEN 'red' AND 'blue'",
             "colour > 'red' AND colour < 'blue'",
             "colour > 'red' AND colour <= 'red'",
+            "n = 3",
+            "n IN (1, 2)",
+            "n < 3",
+            "n BETWEEN 30 AND 10",
+            "n > 20 AND n <= 20",
+            // Both indexes in one filter, and an index beside a predicate it
+            // cannot answer.
+            "n > 30 AND colour = 'red'",
+            "n = 3 OR colour = 'blue'",
+            "n = 3 AND colour LIKE 'r%'",
         ];
         // Every key type a memtable key index accepts.
         const KEY_TYPES: [DataType; 13] = [
@@ -1536,7 +1561,8 @@ mod tests {
             (seed >> 33) % bound
         };
         let (mut checked_reads, mut full_reads) = (0, 0);
-        for round in 0..150 {
+        // Twice through every pairing of key type with single or composite key.
+        for round in 0..2 * 3 * KEY_TYPES.len() {
             let composite = round % 3 == 1;
             let key_type = KEY_TYPES[round % KEY_TYPES.len()].clone();
             let string_key = matches!(
@@ -1547,11 +1573,15 @@ mod tests {
                 Field::new("a", key_type.clone(), false),
                 Field::new("b", DataType::Int32, false),
                 Field::new("colour", DataType::Utf8, true),
+                Field::new("n", DataType::Int32, true),
                 Field::new(TOMBSTONE, DataType::Boolean, false),
             ]));
             let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
             let mut indexes = IndexStore::from_specs(
-                &[MemIndexSpec::btree("colour_idx", 2, "colour")],
+                &[
+                    MemIndexSpec::btree("colour_idx", 2, "colour"),
+                    MemIndexSpec::btree("n_idx", 3, "n"),
+                ],
                 &lance_schema,
                 1024,
                 64,
@@ -1569,7 +1599,8 @@ mod tests {
             let batches = 1 + next(40) as usize;
             for position in 0..batches {
                 let rows = 1 + next(16) as usize;
-                let (mut a, mut b, mut colour, mut tombstone) = (vec![], vec![], vec![], vec![]);
+                let (mut a, mut b, mut colour, mut n, mut tombstone) =
+                    (vec![], vec![], vec![], vec![], vec![]);
                 for _ in 0..rows {
                     a.push(next(60) as i32);
                     b.push(if composite { next(3) as i32 } else { 1 });
@@ -1579,6 +1610,7 @@ mod tests {
                         16 => None,
                         c => Some(COLOURS[c as usize]),
                     });
+                    n.push((!deleted && next(12) != 0).then(|| next(40) as i32));
                     tombstone.push(deleted);
                 }
                 let batch = RecordBatch::try_new(
@@ -1597,6 +1629,7 @@ mod tests {
                         .unwrap(),
                         Arc::new(Int32Array::from(b)),
                         Arc::new(StringArray::from(colour)),
+                        Arc::new(Int32Array::from(n)),
                         Arc::new(BooleanArray::from(tombstone)),
                     ],
                 )
@@ -3335,6 +3368,133 @@ mod tests {
         .unwrap()
     }
 
+    #[rstest::rstest]
+    #[case::fewer_than_k(3, 2, None, None, 3, 3)]
+    #[case::empty(0, 0, None, None, 0, 0)]
+    #[case::no_visible_rows(20, 0, None, None, 0, 0)]
+    #[case::visibility(20, 1, None, None, 2, 2)]
+    #[case::prefilter(20, 2, Some("id = 1"), None, 1, 10)]
+    #[case::prefilter_no_matches(20, 2, Some("id > 99"), None, 0, 10)]
+    #[case::distance_bound(20, 2, None, Some(0.5), 1, 10)]
+    #[case::full_top_k(20, 2, None, None, 10, 10)]
+    #[tokio::test]
+    async fn vector_count_uses_actual_output(
+        #[values(false, true)] has_index: bool,
+        #[case] stored_rows: usize,
+        #[case] readable_count: usize,
+        #[case] filter: Option<&str>,
+        #[case] distance_upper_bound: Option<f32>,
+        #[case] expected_rows: usize,
+        #[case] estimated_rows: usize,
+    ) {
+        let batch = vector_batch().slice(0, stored_rows);
+        let schema = batch.schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(2));
+        let mut indexes = IndexStore::new();
+        if has_index {
+            indexes.add_hnsw(
+                "vector_idx".to_string(),
+                1,
+                "vector".to_string(),
+                DistanceType::L2,
+                32,
+                2,
+            );
+        }
+        // Split the visible prefix from later rows to exercise snapshot bounds.
+        let first_rows = stored_rows.min(2);
+        for (offset, rows) in [(0, first_rows), (first_rows, stored_rows - first_rows)] {
+            if rows == 0 {
+                continue;
+            }
+            let batch = batch.slice(offset, rows);
+            let (position, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, row_offset, Some(position))
+                .unwrap();
+        }
+        let mut scanner = MemTableScanner::new_at_readable_count(
+            batch_store,
+            Arc::new(indexes),
+            schema,
+            readable_count,
+        );
+        scanner
+            .nearest(
+                "vector",
+                &arrow_array::Float32Array::from(vec![0.0, 0.0]),
+                10,
+            )
+            .unwrap();
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        scanner.distance_range(None, distance_upper_bound);
+        let input = scanner.create_plan().await.unwrap();
+        let plan = datafusion::physical_plan::displayable(input.as_ref())
+            .indent(true)
+            .to_string();
+        let route = if has_index && filter.is_none() {
+            "VectorIndexExec"
+        } else {
+            "MemTableBruteForceVectorExec"
+        };
+        assert!(plan.contains(route), "{plan}");
+        assert_eq!(
+            scanner.try_into_batch().await.unwrap().num_rows(),
+            expected_rows
+        );
+
+        let expr = count_all();
+        let input_schema = input.schema();
+        let df_schema = DFSchema::try_from(input_schema.as_ref().clone()).unwrap();
+        let aggregate = LoweredAggregateBuilder::new(
+            &expr,
+            &df_schema,
+            input_schema.as_ref(),
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )
+        .with_name(expr.schema_name().to_string())
+        .with_human_display(expr.human_display().to_string())
+        .build()
+        .unwrap()
+        .aggregate;
+        let count_plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::default(),
+                vec![aggregate],
+                vec![None],
+                input.clone(),
+                input_schema,
+            )
+            .unwrap(),
+        );
+        let optimized = AggregateStatistics::new()
+            .optimize(count_plan, &ConfigOptions::default())
+            .unwrap();
+        let result =
+            datafusion::physical_plan::collect(optimized, SessionContext::new().task_ctx())
+                .await
+                .unwrap();
+        assert_eq!(
+            result[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            expected_rows as i64,
+            "optimized COUNT(*) must count the rows emitted by {route}"
+        );
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(input.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
+            Precision::Inexact(estimated_rows)
+        );
+    }
+
     /// The three nearest neighbours, through an HNSW that deviates.
     fn nearest(deviation: Deviation) -> MemTableScanner {
         let mut scanner = memtable_over(
@@ -3738,6 +3898,8 @@ mod tests {
             "NOT (i = 7)",
             "i = 7 AND rid > 3",
             "i = 7 OR rid = 0",
+            "(i = 7 AND rid > 3) OR s = 'b'",
+            "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
             "rid >= 6 AND f > 0.0",
             "b",
             "NOT b",
@@ -3768,6 +3930,8 @@ mod tests {
                     "s LIKE 'ap%'",
                     "b",
                     "d = DATE '2022-01-08'",
+                    "(i = 7 AND rid > 3) OR s = 'b'",
+                    "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
                 ] {
                     let (batch_store, indexes, schema) = &memtable;
                     let mut scanner =

@@ -31,15 +31,15 @@ use lance_core::{
     },
 };
 use lance_file::concat::EncodedFileInput;
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
-use object_store::{
-    ObjectStoreExt,
-    throttle::{ThrottleConfig, ThrottledStore},
-};
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
@@ -112,6 +112,7 @@ async fn commit(dataset: &Dataset, replacement: DataReplacementGroup) -> Result<
         WriteDestination::Dataset(Arc::new(dataset.clone())),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(dataset.version_id()),
         None,
@@ -1077,7 +1078,13 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
         .parts_dir(&dataset.data_dir())
         .join(part.file_name.as_str());
     let store = dataset.object_store(None).await.unwrap();
-    let original = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+    let original = store
+        .read_object(&path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
     let mut changed = original.to_vec();
     if grow {
         changed.push(0);
@@ -1085,8 +1092,7 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
         changed.pop();
     }
     store
-        .inner
-        .put(&path, Bytes::from(changed).into())
+        .put_payload(&path, Bytes::from(changed).into())
         .await
         .unwrap();
     let error = dataset
@@ -1107,9 +1113,87 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
             .await
             .unwrap()
     );
-    store.inner.put(&path, original.into()).await.unwrap();
+    store.put_payload(&path, original.into()).await.unwrap();
     dataset
         .concat_data_file_parts(&target, &[part])
         .await
         .unwrap();
+}
+
+/// Pages a single part holds when its writer is given `options`.
+async fn part_page_count(
+    dataset: &Dataset,
+    target: &DataFileTarget,
+    options: FileWriterOptions,
+) -> usize {
+    let batches = (0..8).map(|batch| {
+        Ok(arrow_array::record_batch!((
+            "value",
+            Int32,
+            (batch * 32..batch * 32 + 32).collect::<Vec<i32>>()
+        ))
+        .unwrap())
+    });
+    let part = dataset
+        .write_data_file_part_with_file_writer_options(target, None, stream::iter(batches), options)
+        .await
+        .unwrap();
+    let path = target
+        .parts_dir(&dataset.data_file_dir_for_base(target.base_id).unwrap())
+        .join(part.file_name.as_str());
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::default_for_testing(),
+    );
+    let file = scheduler
+        .open_file(&path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+    let reader = lance_file::reader::FileReader::try_open(
+        file,
+        None,
+        Default::default(),
+        &dataset.metadata_cache.file_metadata_cache(&path),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.metadata().column_metadatas[0].pages.len()
+}
+
+/// A part written through the dataset API must honour the caller's writer
+/// budget: without it every part buffers the writer's own default allowance,
+/// which a caller bounding a 100 MB+ Function output cannot account for.
+#[rstest]
+#[case(LanceFileVersion::V2_0)]
+#[case(LanceFileVersion::V2_3)]
+#[tokio::test]
+async fn part_write_applies_file_writer_cache_option(#[case] version: LanceFileVersion) {
+    let dataset = dataset_of(
+        arrow_array::record_batch!(("value", Int32, (0..256).collect::<Vec<_>>())).unwrap(),
+        version,
+    )
+    .await;
+    let target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        dataset.manifest.data_storage_format.lance_file_format(),
+    )
+    .unwrap();
+
+    let default_pages = part_page_count(&dataset, &target, FileWriterOptions::default()).await;
+    let bounded_pages = part_page_count(
+        &dataset,
+        &target,
+        FileWriterOptions {
+            data_cache_bytes: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        bounded_pages > default_pages,
+        "the part writer must not discard FileWriterOptions: default={default_pages}, bounded={bounded_pages}"
+    );
 }

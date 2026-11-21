@@ -10,8 +10,10 @@ use std::sync::Arc;
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -24,9 +26,10 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::VectorQuery;
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{MemMatches, SearchContext};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance column name in output.
 pub const DISTANCE_COLUMN: &str = "_distance";
@@ -323,6 +326,13 @@ impl ExecutionPlan for VectorIndexExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -357,8 +367,13 @@ impl ExecutionPlan for VectorIndexExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        let visible_rows = self
+            .batch_store
+            .max_visible_row(self.readable_count)
+            .map_or(0, |row| row as usize + 1);
         Ok(Arc::new(Statistics {
-            num_rows: Precision::Exact(self.query.k),
+            // Visibility and filtering may leave fewer than k results.
+            num_rows: Precision::Inexact(self.query.k.min(visible_rows)),
             total_byte_size: Precision::Absent,
             column_statistics: Statistics::unknown_column(&self.schema()),
         }))

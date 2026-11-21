@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::Arc;
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
+use std::sync::{LazyLock, Weak};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,6 +51,7 @@ use tracing::{debug, warn};
 
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 use crate::object_store::ObjectStoreParams;
 
 /// Match ObjectStore's documented delete concurrency to bound in-flight operations
@@ -578,6 +581,7 @@ impl AimdThrottleState {
         })
     }
 
+    #[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
     fn downgrade(&self) -> WeakThrottleState {
         WeakThrottleState {
             read: Arc::downgrade(&self.read),
@@ -588,6 +592,7 @@ impl AimdThrottleState {
     }
 }
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 /// A cache entry of [`SHARED_THROTTLE_STATES`]: alive exactly as long as some
 /// store still holds the budgets, since a store keeps all four.
 struct WeakThrottleState {
@@ -597,6 +602,7 @@ struct WeakThrottleState {
     list: Weak<OperationThrottle>,
 }
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 impl WeakThrottleState {
     fn upgrade(&self) -> Option<AimdThrottleState> {
         Some(AimdThrottleState {
@@ -612,6 +618,7 @@ impl WeakThrottleState {
 /// registry caches stores under. The AIMD contract is one budget per bucket, so
 /// stores that are split further, one per dataset in the `dataset` metrics label
 /// mode, must share the bucket's budget rather than each getting a full one.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 static SHARED_THROTTLE_STATES: LazyLock<
     std::sync::Mutex<HashMap<(String, ObjectStoreParams), WeakThrottleState>>,
 > = LazyLock::new(Default::default);
@@ -619,6 +626,7 @@ static SHARED_THROTTLE_STATES: LazyLock<
 /// The throttle state for a store of `store_prefix` built with `params`: the one
 /// its sibling stores already use, or a fresh one. `None` when throttling is
 /// disabled by the params.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) fn shared_throttle_state(
     store_prefix: &str,
     params: &ObjectStoreParams,
@@ -661,6 +669,42 @@ impl<C> AimdHttpConnector<C> {
     }
 }
 
+/// The caller's connector from [`ObjectStoreParams::http_connector`], or object_store's default.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+#[derive(Debug)]
+pub(crate) struct Transport(Arc<dyn HttpConnector>);
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl Transport {
+    pub(crate) fn new(connector: Option<&Arc<dyn HttpConnector>>) -> Self {
+        Self(
+            connector
+                .cloned()
+                .unwrap_or_else(|| Arc::new(object_store::client::ReqwestConnector::default())),
+        )
+    }
+}
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl HttpConnector for Transport {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        self.0.connect(options)
+    }
+}
+
+/// OpenDAL opens its own HTTP clients, so it would drop the caller's connector without notice.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn reject_http_connector_for_opendal(
+    params: &ObjectStoreParams,
+) -> lance_core::Result<()> {
+    if params.http_connector.is_some() {
+        return Err(lance_core::Error::not_supported(
+            "OpendalStore does not support an explicit http_connector; unset use_opendal to use it",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(
     any(feature = "aws", feature = "azure", feature = "gcp"),
     feature = "metrics"
@@ -668,9 +712,13 @@ impl<C> AimdHttpConnector<C> {
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     metrics_base: String,
+    transport: Transport,
 ) -> AimdHttpConnector<crate::object_store::metrics::MeteringHttpConnector> {
     AimdHttpConnector::new(
-        crate::object_store::metrics::MeteringHttpConnector::new(metrics_base),
+        crate::object_store::metrics::MeteringHttpConnector::with_transport(
+            metrics_base,
+            transport,
+        ),
         state,
     )
 }
@@ -682,8 +730,9 @@ pub(crate) fn cloud_http_connector(
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     _metrics_base: String,
-) -> AimdHttpConnector<object_store::client::ReqwestConnector> {
-    AimdHttpConnector::new(object_store::client::ReqwestConnector::default(), state)
+    transport: Transport,
+) -> AimdHttpConnector<Transport> {
+    AimdHttpConnector::new(transport, state)
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]

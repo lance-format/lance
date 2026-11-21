@@ -7,6 +7,7 @@ use std::task::Poll;
 use std::{
     ops::{Range, RangeInclusive},
     sync::Arc,
+    time::Instant,
 };
 
 use arrow_array::cast::AsArray;
@@ -19,6 +20,10 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
+use datafusion::physical_plan::StatisticsContext;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
@@ -40,15 +45,19 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{
-    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result, datatypes::Projection,
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD, Result, datatypes::Projection,
 };
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
-    ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
+    DECODE_TIME_METRIC, ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC,
+    RANGES_SCANNED_METRIC, ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
+use lance_io::object_store::{
+    METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, ObjectStore, StoreCounter,
+};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
     IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps, bitmap_to_ranges,
@@ -72,6 +81,7 @@ use crate::dataset::scanner::{
 };
 use crate::dataset::versions;
 
+use super::column_width::{self, MeasuredWidths};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
@@ -345,21 +355,63 @@ impl FilteredReadGlobalMetrics {
 /// These represent work that is divisible by partition and this work is reported on the
 /// partition that it belongs to
 pub struct FilteredReadPartitionMetrics {
-    // Records the amount of time spent waiting on the lock to grab the next task
-    //
-    // This should typically be fairly small relative to the overall execution time.  If this
-    // value is large then it means we are bottlenecked on the read scheduler which is preventing
-    // this partition from being utilized.
+    /// Time waiting for the next decode task, i.e. for its I/O to be scheduled.
+    /// Large means the scan is I/O bound.
     task_wait_time: Time,
+    /// Wall time of the decode tasks themselves. Tasks run concurrently, so the
+    /// sum can exceed the elapsed time.
+    decode_time: Time,
     baseline_metrics: BaselineMetrics,
+    /// The two timers again, as cumulative process-wide `metrics` counters a
+    /// scrape can read while the scan runs; the plan metrics exist only once
+    /// it has ended.
+    task_wait_counter: StoreCounter,
+    decode_counter: StoreCounter,
 }
 
 impl FilteredReadPartitionMetrics {
-    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, store: &ObjectStore) -> Self {
         Self {
             task_wait_time: metrics.new_time(TASK_WAIT_TIME_METRIC, partition),
+            decode_time: metrics.new_time(DECODE_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
+            task_wait_counter: store.counter(METRIC_SCAN_TASK_WAIT_TIME),
+            decode_counter: store.counter(METRIC_SCAN_DECODE_TIME),
         }
+    }
+
+    fn task_wait_timer(&self) -> ScanTimer<'_> {
+        ScanTimer::new(&self.task_wait_time, &self.task_wait_counter)
+    }
+
+    fn decode_timer(&self) -> ScanTimer<'_> {
+        ScanTimer::new(&self.decode_time, &self.decode_counter)
+    }
+}
+
+/// Records the same elapsed duration to a plan timer and its facade counter when
+/// dropped, including when the future is cancelled or the stream ends early.
+struct ScanTimer<'a> {
+    time: &'a Time,
+    counter: &'a StoreCounter,
+    start: Instant,
+}
+
+impl<'a> ScanTimer<'a> {
+    fn new(time: &'a Time, counter: &'a StoreCounter) -> Self {
+        Self {
+            time,
+            counter,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ScanTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        self.time.add_duration(elapsed);
+        self.counter.increment(elapsed.as_nanos().max(1) as u64);
     }
 }
 
@@ -468,6 +520,8 @@ struct FilteredReadStream {
     /// execute time, so the detection lives there too)
     touched_fragments: usize,
     planned_rows: u64,
+    /// The dataset's primary store, whose labels the scan's `metrics` counters carry
+    object_store: Arc<ObjectStore>,
 }
 
 /// Below this many fragments there are too few handoffs to be worth
@@ -501,8 +555,9 @@ fn consolidated_stream(
     builder.build()
 }
 
-/// Merge batches up to `target` rows; batches already at the target pass
-/// through whole (never split). Order is preserved.
+/// Merge consecutive batches while the merged batch stays within `target`
+/// rows; a batch already at or above the target passes through whole (never
+/// split). Order is preserved.
 pub fn coalesce_batches(
     input: SendableRecordBatchStream,
     target: usize,
@@ -560,8 +615,12 @@ pub fn coalesce_batches(
                 return Ok::<_, DataFusionError>(None);
             }
             match this.input.try_next().await? {
-                Some(batch) if batch.num_rows() >= this.target && !this.buffered.is_empty() => {
-                    // Emit the partial buffer on its own; the large batch
+                Some(batch)
+                    if !this.buffered.is_empty()
+                        && this.buffered_rows + batch.num_rows() > this.target =>
+                {
+                    // Emit the partial buffer on its own so merging never
+                    // overshoots the target; a batch already at the target
                     // then passes through whole on the next iteration
                     let out = this.emit()?;
                     this.buffer(batch);
@@ -608,6 +667,7 @@ impl FilteredReadStream {
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
+        let object_store = dataset.object_store.clone();
         let fragment_readahead = options
             .fragment_readahead
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
@@ -703,6 +763,7 @@ impl FilteredReadStream {
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
+            object_store,
         })
     }
 
@@ -716,10 +777,9 @@ impl FilteredReadStream {
             .await
     }
 
-    async fn load_all_fragments(
+    async fn load_fragments_with_row_ids(
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
-        needs_row_ids: bool,
     ) -> Result<Vec<LoadedFragment>> {
         let io_parallelism = dataset.object_store.io_parallelism();
         let fragments = options.selected_fragments(dataset.as_ref());
@@ -732,7 +792,7 @@ impl FilteredReadStream {
                     dataset.clone(),
                     frag.clone(),
                     options.with_deleted_rows,
-                    needs_row_ids,
+                    true,
                     None,
                 ))
             })
@@ -841,7 +901,8 @@ impl FilteredReadStream {
     // If the scan range is ignoring the filters we can push it down here.
     // If the scan range is not ignoring the filters we can only push it down if:
     // 1. The index result is an exact match (we know exactly which rows will be in the result)
-    // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
+    // 2. The index result is AtLeast and its guaranteed matches fill the range before the first
+    //    row that still needs a recheck
     // Returns: FilteredReadInternalPlan
     #[instrument(name = "plan_scan", skip_all)]
     fn plan_scan(
@@ -882,6 +943,11 @@ impl FilteredReadStream {
         // fall back to read the full fragment in fragments_to_read
         // Used only when index guarantees enough rows to satisfy scan_range_after_filter
         let mut scan_push_down_fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+        // True once a queued fragment has no mirror in scan_push_down_fragments_to_read.
+        // Swapping in the pushdown map would then drop that fragment's rows. The
+        // index can leave out a fragment that comes before covered ones, e.g. after
+        // a column rewrite in place or when the caller reorders the fragments.
+        let mut has_fragment_without_pushdown_mirror = false;
 
         // The current offset, includes filtered rows, but not deleted rows
         let mut range_offset = 0;
@@ -946,7 +1012,17 @@ impl FilteredReadStream {
                 options.only_indexed_fragments,
             )?;
 
-            if can_push_down_scan_range_after_filter && to_take == 0 {
+            let fragment_id = fragment.id() as u32;
+            if fragments_to_read.contains_key(&fragment_id)
+                && !scan_push_down_fragments_to_read.contains_key(&fragment_id)
+            {
+                has_fragment_without_pushdown_mirror = true;
+            }
+
+            if can_push_down_scan_range_after_filter
+                && to_take == 0
+                && !has_fragment_without_pushdown_mirror
+            {
                 scan_planned_with_limit_pushed_down = true;
                 fragments_to_read = scan_push_down_fragments_to_read;
                 break;
@@ -1137,12 +1213,24 @@ impl FilteredReadStream {
                         &index_result.lower,
                         None,
                     );
+                    // Rows outside the lower bound may match as well, so the
+                    // guaranteed matches serve the requested range only before
+                    // the first such candidate; past it, a guaranteed row could
+                    // take the place of a matching candidate.
+                    let first_candidate = Self::first_uncovered_row(&to_read, &guaranteed_ranges);
+                    if let Some(first_candidate) = first_candidate {
+                        guaranteed_ranges.retain(|range| range.end <= first_candidate);
+                    }
                     // Candidates outside the lower bound still need a recheck if
                     // the guaranteed matches cannot satisfy the requested limit.
                     fragments_to_read.insert(fragment_id, to_read);
 
                     Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
-                    scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                    // A fragment left without a mirror keeps the regular plan,
+                    // which rechecks the candidates in scan order.
+                    if first_candidate.is_none() || *to_take == 0 {
+                        scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                    }
                 } else {
                     // AtMost or true Refined: read everything in `upper`
                     // and rely on the full-filter recheck for survivors.
@@ -1245,6 +1333,21 @@ impl FilteredReadStream {
         }
 
         result
+    }
+
+    /// The first row of `ranges` missing from `covered`, a sorted subset of `ranges`.
+    fn first_uncovered_row(ranges: &[Range<u64>], covered: &[Range<u64>]) -> Option<u64> {
+        let mut covered = covered.iter().peekable();
+        for range in ranges {
+            let mut row = range.start;
+            while row < range.end {
+                let Some(next) = covered.next_if(|next| next.start == row) else {
+                    return Some(row);
+                };
+                row = next.end;
+            }
+        }
+        None
     }
 
     fn intersect_index_ranges(
@@ -1393,7 +1496,11 @@ impl FilteredReadStream {
         let global_metrics = self.metrics.clone();
         let scan_scheduler = self.scan_scheduler.clone();
 
-        let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(metrics, partition));
+        let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
+            metrics,
+            partition,
+            &self.object_store,
+        ));
 
         match self.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => {
@@ -1409,9 +1516,18 @@ impl FilteredReadStream {
                             // done by spawned background threads.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                            let maybe_task = task_stream.lock().await.next().await.transpose()?;
-                            Result::Ok(maybe_task.map(|task| (task, task_stream)))
+                            let maybe_task = {
+                                let _timer = partition_metrics.task_wait_timer();
+                                task_stream.lock().await.next().await
+                            };
+                            Result::Ok(maybe_task.transpose()?.map(|task| {
+                                let partition_metrics = partition_metrics.clone();
+                                let task = async move {
+                                    let _timer = partition_metrics.decode_timer();
+                                    task.await
+                                };
+                                (task, task_stream)
+                            }))
                         }
                     }
                 });
@@ -1478,12 +1594,16 @@ impl FilteredReadStream {
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
                             let maybe_task = {
-                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                                let _timer = partition_metrics.task_wait_timer();
                                 task_stream.lock().await.next().await
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batches = task.await?;
+                                let batches = {
+                                    let _timer = partition_metrics.decode_timer();
+                                    task.await
+                                };
+                                let batches = batches?;
                                 let batch_rows = batches
                                     .iter()
                                     .map(|batch| batch.batch().num_rows())
@@ -1915,11 +2035,13 @@ pub struct FilteredReadOptions {
     pub materialization_readahead_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
-    /// Row addresses whose index entries may be stale because an overlay committed after the
+    /// Row IDs whose index entries may be stale because an overlay committed after the
     /// index was built touches an indexed field. They are blocked from the index result so the
     /// index never emits them; the scanner re-evaluates just these rows against their current
     /// (overlay-merged) values on a targeted take path. Their fragments stay in the covered set,
-    /// so non-stale rows keep the index. `None` on the common no-overlay fast path.
+    /// so non-stale rows keep the index. This must be a block list in the index result's
+    /// identifier domain: stable row IDs on stable-ID datasets, physical addresses otherwise.
+    /// `None` on the common no-overlay fast path.
     pub overlay_block: Option<RowAddrMask>,
 }
 
@@ -2303,7 +2425,10 @@ pub struct FilteredReadExec {
 }
 
 /// Describes which rows a [`FilteredReadExec`] should read
-#[derive(Debug)]
+///
+/// `Clone` shares the input plan rather than copying it, which is what
+/// [`FilteredReadExec::with_measured_widths`] needs.
+#[derive(Debug, Clone)]
 enum RowSelector {
     /// Every live row of the dataset (no input plan)
     AllRows,
@@ -2341,6 +2466,8 @@ struct RowStreamSource {
     /// Options for the internal fragment read; carries the projection that
     /// reflects the actual columns to read (plus the alignment key column)
     read_options: FilteredReadOptions,
+    /// Positions in an explicit fragment scope, which can be in caller-defined order.
+    scoped_fragment_positions: HashMap<u32, usize>,
     /// The schema for newly read columns
     new_fields_schema: SchemaRef,
     /// Descriptor-bearing output before Blob v2 payload materialization
@@ -2396,6 +2523,41 @@ impl FilteredReadInternalPlan {
 
 impl FilteredReadExec {
     /// Create a new filtered read
+    /// Carries this node's width onto `rebuilt`, when the two report the same
+    /// schema.
+    ///
+    /// `try_new` seeds the width from the schema alone, so every rebuild -- a
+    /// limit pushed down, a child rewritten -- would otherwise discard what an
+    /// earlier scan measured and fall back to no byte size at all.
+    fn carry_measured_width(&self, mut rebuilt: Self) -> Self {
+        if rebuilt.schema() == self.schema() {
+            rebuilt.bytes_per_row = self.bytes_per_row;
+        }
+        rebuilt
+    }
+
+    /// Returns this node with widths measured by earlier reads folded in.
+    ///
+    /// Separate from [`Self::try_new`] because reading them is async. The plan and
+    /// running stream are shared: this node stands in for the original.
+    pub fn with_measured_widths(&self, measured: &MeasuredWidths) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            options: self.options.clone(),
+            bytes_per_row: estimated_bytes_per_row(
+                self.schema().as_ref(),
+                self.dataset.schema(),
+                measured,
+            ),
+            materialization_context: self.materialization_context.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+            input: self.input.clone(),
+            plan: self.plan.clone(),
+            running_stream: self.running_stream.clone(),
+        }
+    }
+
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -2498,7 +2660,7 @@ impl FilteredReadExec {
             .subtract_arrow_schema(input_schema.as_ref(), OnMissing::Ignore)?;
         let synthesize_row_id = fields_to_read.with_row_id;
         let synthesize_row_addr = fields_to_read.with_row_addr;
-        if !fields_to_read.has_data_fields() && !synthesize_row_id && !synthesize_row_addr {
+        if fields_to_read.is_empty() {
             return Err(Error::invalid_input_source(
                 "the input plan already contains every projected field; there is nothing to read"
                     .into(),
@@ -2518,7 +2680,11 @@ impl FilteredReadExec {
                 &materialization_output_schema,
             ),
         ));
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         // Row-stream reads preserve input order, but can drop identity columns.
         // Remap sort expressions to the output schema and retain only valid prefixes.
@@ -2557,6 +2723,12 @@ impl FilteredReadExec {
         {
             new_fields.push(Arc::new(ROW_ADDR_FIELD.clone()));
         }
+        if fields_to_read.with_row_last_updated_at_version {
+            new_fields.push(Arc::new(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone()));
+        }
+        if fields_to_read.with_row_created_at_version {
+            new_fields.push(Arc::new(ROW_CREATED_AT_VERSION_FIELD.clone()));
+        }
         let new_fields_schema = Arc::new(arrow_schema::Schema::new(new_fields));
 
         let intermediate_lance_schema = if materialize_blob_v2_binary {
@@ -2592,6 +2764,18 @@ impl FilteredReadExec {
             read_options.projection = read_options.projection.with_row_addr();
         }
 
+        let scoped_fragment_positions =
+            if key_column == ROW_ID && dataset.manifest.uses_stable_row_ids() {
+                HashMap::new()
+            } else {
+                read_options
+                    .fragments
+                    .iter()
+                    .flat_map(|fragments| fragments.iter().enumerate())
+                    .map(|(position, fragment)| (fragment.id as u32, position))
+                    .collect()
+            };
+
         Ok(Self {
             materialization_context: BlobMaterializationContext::new(
                 options.io_buffer_size_bytes,
@@ -2606,6 +2790,7 @@ impl FilteredReadExec {
                 plan: input,
                 key_column,
                 read_options,
+                scoped_fragment_positions,
                 new_fields_schema,
                 intermediate_output_schema,
                 materialization_output_schema,
@@ -2674,7 +2859,11 @@ impl FilteredReadExec {
             }
         }
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -3071,23 +3260,13 @@ impl FilteredReadExec {
 /// into lock contention
 const ROW_STREAM_CONCURRENT_BATCHES: usize = 4;
 
-/// Fragment metadata, loaded on the first batch and reused afterwards
-struct StreamFragments {
+/// Stable row-ID routing metadata, shared across batches of a row stream.
+struct StableRowIdFragments {
     /// All dataset (or scoped) fragments, in dataset order
     fragments: Vec<LoadedFragment>,
-    /// Fragment id → position in `fragments`
-    positions: HashMap<u32, usize>,
     /// Each fragment's row-id span, for skipping fragments a batch cannot
     /// touch (None = empty fragment)
     id_spans: Vec<Option<RangeInclusive<u64>>>,
-}
-
-impl StreamFragments {
-    fn get(&self, fragment_id: u32) -> Option<&LoadedFragment> {
-        self.positions
-            .get(&fragment_id)
-            .map(|position| &self.fragments[*position])
-    }
 }
 
 /// Executes a [`FilteredReadExec`] over a row-stream source
@@ -3100,7 +3279,7 @@ struct RowStreamRead {
     scan_scheduler: Arc<ScanScheduler>,
     base_schedulers: BaseSchedulers,
     materialization_context: Arc<BlobMaterializationContext>,
-    loaded_fragments: OnceCell<StreamFragments>,
+    stable_row_id_fragments: OnceCell<StableRowIdFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
     baseline_metrics: BaselineMetrics,
 }
@@ -3126,26 +3305,20 @@ impl RowStreamRead {
             scan_scheduler,
             base_schedulers,
             materialization_context,
-            loaded_fragments: OnceCell::new(),
+            stable_row_id_fragments: OnceCell::new(),
             global_metrics: Arc::new(FilteredReadGlobalMetrics::new(metrics)),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 
-    async fn load_fragments(&self) -> Result<&StreamFragments> {
-        self.loaded_fragments
+    async fn load_stable_row_id_fragments(&self) -> Result<&StableRowIdFragments> {
+        self.stable_row_id_fragments
             .get_or_try_init(|| async {
-                let fragments = FilteredReadStream::load_all_fragments(
+                let fragments = FilteredReadStream::load_fragments_with_row_ids(
                     &self.dataset,
                     &self.source.read_options,
-                    self.source.key_column == ROW_ID && self.dataset.manifest.uses_stable_row_ids(),
                 )
                 .await?;
-                let positions = fragments
-                    .iter()
-                    .enumerate()
-                    .map(|(position, fragment)| (fragment.fragment.id() as u32, position))
-                    .collect();
                 let id_spans = fragments
                     .iter()
                     .map(|fragment| {
@@ -3155,55 +3328,77 @@ impl RowStreamRead {
                             .and_then(|sequence| sequence.row_id_range())
                     })
                     .collect();
-                Ok(StreamFragments {
+                Ok(StableRowIdFragments {
                     fragments,
-                    positions,
                     id_spans,
                 })
             })
             .await
     }
 
-    /// Build a batch's read ranges directly from physical row addresses
-    fn plan_batch_from_addresses(
+    /// Load only the fragments identified by the batch's physical row addresses.
+    async fn plan_batch_from_addresses(
+        &self,
         addrs: &RowAddrTreeMap,
-        fragments: &StreamFragments,
-        physical_row_addr_prefilter: Option<&RowAddrTreeMap>,
-    ) -> FilteredReadInternalPlan {
-        let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
-        for (fragment_id, requested) in addrs.iter() {
-            // Unknown fragments (e.g. fully deleted) drop like stale keys
-            let Some(fragment) = fragments.get(*fragment_id) else {
-                continue;
-            };
-            let requested = match requested {
-                RowAddrSelection::Full => vec![0..fragment.num_physical_rows],
-                RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
-            };
-            let requested = match physical_row_addr_prefilter {
-                Some(allowed) => match allowed.get(fragment_id) {
-                    Some(RowAddrSelection::Full) => requested,
-                    Some(RowAddrSelection::Partial(bitmap)) => {
-                        FilteredReadStream::intersect_ranges(&requested, &bitmap_to_ranges(bitmap))
+    ) -> Result<(FilteredReadInternalPlan, Vec<Fragment>)> {
+        let options = &self.source.read_options;
+        let fragment_futures = addrs
+            .iter()
+            .filter_map(|(&fragment_id, requested)| {
+                // Unknown and out-of-scope fragments drop like stale keys.
+                let (position, descriptor) = match &options.fragments {
+                    Some(fragments) => {
+                        let position = *self.source.scoped_fragment_positions.get(&fragment_id)?;
+                        (position, &fragments[position])
                     }
-                    None => continue,
-                },
-                None => requested,
-            };
-            let valid = FilteredReadStream::full_frag_range(
-                fragment.num_physical_rows,
-                &fragment.deletion_vector,
-            );
-            let matched = FilteredReadStream::intersect_ranges(&valid, &requested);
-            if !matched.is_empty() {
-                rows.insert(*fragment_id, matched);
+                    None => (
+                        fragment_id as usize,
+                        self.dataset.find_fragment(u64::from(fragment_id))?,
+                    ),
+                };
+                let requested = match requested {
+                    RowAddrSelection::Full => None,
+                    RowAddrSelection::Partial(bitmap) => Some(bitmap_to_ranges(bitmap)),
+                };
+                let dataset = self.dataset.clone();
+                let descriptor = descriptor.clone();
+                Some(async move {
+                    let fragment =
+                        FilteredReadStream::load_fragment(dataset, descriptor, false, false, None)
+                            .await?;
+                    let requested =
+                        requested.unwrap_or_else(|| vec![0..fragment.num_physical_rows]);
+                    let valid = FilteredReadStream::full_frag_range(
+                        fragment.num_physical_rows,
+                        &fragment.deletion_vector,
+                    );
+                    let matched = FilteredReadStream::intersect_ranges(&valid, &requested);
+                    Ok::<_, Error>((position, fragment_id, fragment.fragment, matched))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut matched_fragments = futures::stream::iter(fragment_futures)
+            .buffered(self.dataset.object_store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        matched_fragments.sort_unstable_by_key(|(position, _, _, _)| *position);
+
+        let mut rows = BTreeMap::new();
+        let mut fragments = Vec::with_capacity(matched_fragments.len());
+        for (_, fragment_id, fragment, ranges) in matched_fragments {
+            if !ranges.is_empty() {
+                fragments.push(fragment.metadata().clone());
+                rows.insert(fragment_id, ranges);
             }
         }
-        FilteredReadInternalPlan {
-            rows,
-            filters: HashMap::new(),
-            scan_range_after_filter: None,
-        }
+        Ok((
+            FilteredReadInternalPlan {
+                rows,
+                filters: HashMap::new(),
+                scan_range_after_filter: None,
+            },
+            fragments,
+        ))
     }
 
     /// Build a batch's read ranges by resolving stable row ids through the
@@ -3211,7 +3406,7 @@ impl RowStreamRead {
     fn plan_batch_from_row_ids(
         ids: RowAddrTreeMap,
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
-        fragments: &StreamFragments,
+        fragments: &StableRowIdFragments,
         physical_row_addr_prefilter: Option<&RowAddrTreeMap>,
     ) -> Result<FilteredReadInternalPlan> {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
@@ -3294,37 +3489,33 @@ impl RowStreamRead {
     async fn plan_batch(
         &self,
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
-    ) -> DataFusionResult<FilteredReadInternalPlan> {
+    ) -> DataFusionResult<(FilteredReadInternalPlan, FilteredReadOptions)> {
         let compute_timer = self.baseline_metrics.elapsed_compute().timer();
         // Null keys are excluded; attach_columns drops their rows
-        let batch_keys = if keys.null_count() == 0 {
+        let mut batch_keys = if keys.null_count() == 0 {
             RowAddrTreeMap::from_iter(keys.values().iter().copied())
         } else {
             RowAddrTreeMap::from_iter(keys.iter().flatten())
         };
         drop(compute_timer);
 
-        let fragments = self.load_fragments().await?;
-        let physical_row_addr_prefilter = self
-            .source
-            .read_options
-            .physical_row_addr_prefilter
-            .as_deref();
-        // Row ids equal row addresses when the dataset does not use stable
-        // row ids, so either key resolves directly by position
+        let options = self.source.read_options.clone();
+        // Non-stable row IDs encode the physical address too.
         if self.source.key_column == ROW_ADDR || !self.dataset.manifest.uses_stable_row_ids() {
-            Ok(Self::plan_batch_from_addresses(
-                &batch_keys,
-                fragments,
-                physical_row_addr_prefilter,
-            ))
+            if let Some(allowed) = options.physical_row_addr_prefilter.as_deref() {
+                batch_keys &= allowed;
+            }
+            let (plan, fragments) = self.plan_batch_from_addresses(&batch_keys).await?;
+            Ok((plan, options.with_fragments(Arc::new(fragments))))
         } else {
-            Ok(Self::plan_batch_from_row_ids(
+            let fragments = self.load_stable_row_id_fragments().await?;
+            let plan = Self::plan_batch_from_row_ids(
                 batch_keys,
                 keys,
                 fragments,
-                physical_row_addr_prefilter,
-            )?)
+                options.physical_row_addr_prefilter.as_deref(),
+            )?;
+            Ok((plan, options))
         }
     }
 
@@ -3334,15 +3525,21 @@ impl RowStreamRead {
     async fn read_batch(
         &self,
         internal_plan: FilteredReadInternalPlan,
+        options: FilteredReadOptions,
         batch_index: u32,
     ) -> DataFusionResult<MaterializedBlobBatch> {
-        let fragment_count = self.load_fragments().await?.fragments.len();
-        // I/O priority: earlier batches strictly first (output emits in batch
-        // order), fragments keep dataset order within a batch
+        let fragment_count = self
+            .source
+            .read_options
+            .fragments
+            .as_ref()
+            .unwrap_or_else(|| self.dataset.fragments())
+            .len();
+        // Use the full scope as the stride even when this batch reads a subset.
         let priority_offset = batch_index.saturating_mul(fragment_count as u32);
         let read = FilteredReadStream::try_new(
             self.dataset.clone(),
-            self.source.read_options.clone(),
+            options,
             self.global_metrics.clone(),
             internal_plan,
             Some(self.scan_scheduler.clone()),
@@ -3395,8 +3592,8 @@ impl RowStreamRead {
                 RecordBatch::new_empty(self.output_schema.clone()),
             )]);
         }
-        let internal_plan = self.plan_batch(self.key_array(&batch, "input")?).await?;
-        let read_data = self.read_batch(internal_plan, batch_index).await?;
+        let (internal_plan, options) = self.plan_batch(self.key_array(&batch, "input")?).await?;
+        let read_data = self.read_batch(internal_plan, options, batch_index).await?;
         let attached = self.attach_columns(batch, read_data)?;
         let batch_size_bytes = self
             .source
@@ -3670,18 +3867,26 @@ impl ExecutionPlan for FilteredReadExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        // Only a row-stream input bounds the output rows; a row-set input is
+        // costed from the fragments it selects from.
+        match &self.input {
+            RowSelector::AllRows => vec![],
+            RowSelector::RowSet(_) => vec![ChildStats::Skip],
+            RowSelector::RowStream(_) => vec![ChildStats::At(partition)],
+        }
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
     ) -> datafusion::error::Result<Arc<Statistics>> {
-        if let RowSelector::RowStream(source) = &self.input {
+        let partition = args.partition();
+        if let RowSelector::RowStream(_) = &self.input {
             // At most one output row per input row, since keys of deleted or
             // missing rows are dropped
-            let num_rows = source
-                .plan
-                .partition_statistics(partition)?
-                .num_rows
-                .to_inexact();
+            let num_rows = input_stats[0].num_rows.to_inexact();
             return Ok(Arc::new(Statistics {
                 num_rows,
                 total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
@@ -3792,7 +3997,8 @@ impl ExecutionPlan for FilteredReadExec {
             None,
         )?);
         let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-        let mut df_stats = Arc::unwrap_or_clone(df_filter_exec.partition_statistics(partition)?);
+        let mut df_stats =
+            Arc::unwrap_or_clone(StatisticsContext::new().compute(&df_filter_exec, args)?);
 
         // If we have an after-filter range, we should apply it to the stats (the before-filter range
         // is applied in the mock input)
@@ -3839,6 +4045,19 @@ impl ExecutionPlan for FilteredReadExec {
         Ok(Arc::new(df_stats))
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        apply_expression_roots(
+            self.options
+                .physical_filters
+                .iter()
+                .map(|(_, physical_filter)| physical_filter),
+            f,
+        )
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -3853,7 +4072,7 @@ impl ExecutionPlan for FilteredReadExec {
             let child = children.into_iter().next();
             let rebuilt = Self::try_new(self.dataset.clone(), self.options.clone(), child)
                 .map_err(|e| DataFusionError::External(e.into()))?;
-            Ok(Arc::new(rebuilt))
+            Ok(Arc::new(self.carry_measured_width(rebuilt)))
         }
     }
 
@@ -3886,9 +4105,44 @@ impl ExecutionPlan for FilteredReadExec {
             )
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         });
+        // Measure what the read decodes and record it when the read finishes.
+        // A filter, a refine, an index input, a range, a fragment subset or a row
+        // address allow-list all mean this read saw a sample. Only an unrestricted
+        // read measures the column.
+        let representative = self.options.full_filter.is_none()
+            && self.options.refine_filter.is_none()
+            // Every selector but `AllRows` carries a chosen subset: a row set from
+            // an index, or a stream of rows another node already filtered.
+            && matches!(self.input, RowSelector::AllRows)
+            && self.options.scan_range_before_filter.is_none()
+            && self.options.scan_range_after_filter.is_none()
+            && !self.options.only_indexed_fragments
+            && !self.options.with_deleted_rows
+            && self.options.fragments.is_none()
+            && self.options.physical_row_addr_prefilter.is_none()
+            // Each partition wraps its own slice of the shared task stream and
+            // writes the same cache key, so the last one to finish would speak for
+            // the column. Only a single-partition read observes all of it.
+            && !matches!(
+                self.options.threading_mode,
+                FilteredReadThreadingMode::MultiplePartitions(_)
+            );
+        let measured = column_width::measuring(
+            stream.boxed(),
+            self.dataset.metadata_cache.clone(),
+            self.dataset.manifest().version,
+            self.dataset
+                .manifest_location
+                .e_tag
+                .clone()
+                .map(Arc::<str>::from),
+            output_schema.clone(),
+            representative,
+        );
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            stream,
+            measured,
         )))
     }
 
@@ -3959,7 +4213,7 @@ impl ExecutionPlan for FilteredReadExec {
             updated_options,
             self.input.row_set_plan().cloned(),
         ) {
-            Ok(exec) => Some(Arc::new(exec)),
+            Ok(exec) => Some(Arc::new(self.carry_measured_width(exec))),
             Err(e) => {
                 log::warn!(
                     "Failed to create FilteredReadExec for {} with fetch limit: {}",
@@ -3974,6 +4228,10 @@ impl ExecutionPlan for FilteredReadExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4006,7 +4264,7 @@ mod tests {
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
-        index::DatasetIndexInternalExt,
+        index::loading::DatasetIndexInternalExt,
         io::exec::scalar_index::ScalarIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
     };
@@ -4553,22 +4811,29 @@ mod tests {
     #[case::offset_fallback(Some(1..10), vec![13, 23, 33])]
     #[case::partial_limit_fallback(Some(0..3), vec![3, 13, 23])]
     #[case::partial_offset_fallback(Some(1..3), vec![13, 23])]
-    #[case::limit_pushdown(Some(0..1), vec![3])]
+    #[case::first_match(Some(0..1), vec![3])]
     #[tokio::test]
     async fn test_at_least_index_preserves_candidates(
         #[case] scan_range: Option<Range<u64>>,
         #[case] expected_values: Vec<u32>,
         #[values(false, true)] uses_stable_row_ids: bool,
-        #[values(false, true)] has_guaranteed_matches: bool,
+        // Fragments whose match (offset 3) the lower bound guarantees.
+        #[values(vec![], vec![0], vec![1, 2, 3])] guaranteed_fragments: Vec<u32>,
     ) {
         let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
         // An empty lower bound models untokenizable NGram needles; other results
-        // can guarantee a match while leaving further rows to recheck.
-        let guaranteed_rows = if has_guaranteed_matches {
-            RowAddrTreeMap::from_iter([3])
-        } else {
-            RowAddrTreeMap::new()
-        };
+        // can guarantee a match while leaving further rows to recheck, including
+        // rows that come before the guaranteed ones.
+        let guaranteed_rows = guaranteed_fragments
+            .into_iter()
+            .map(|fragment_id| {
+                if uses_stable_row_ids {
+                    u64::from(fragment_id) * 10 + 3
+                } else {
+                    RowAddress::new_from_parts(fragment_id, 3).into()
+                }
+            })
+            .collect::<RowAddrTreeMap>();
         let index_input = index_result_input(
             IndexExprResult::at_least(RowAddrMask::from_allowed(guaranteed_rows)),
             dataset.fragments(),
@@ -4593,6 +4858,51 @@ mod tests {
                 .values()
                 .as_ref(),
             expected_values.as_slice()
+        );
+    }
+
+    /// The guaranteed matches of an `AtLeast` result can serve a limit on their own
+    /// only while no row that still needs a recheck comes before them.
+    #[rstest]
+    #[case::guaranteed_first(0..5, true)]
+    #[case::candidates_first(5..10, false)]
+    #[tokio::test]
+    async fn test_at_least_limit_pushdown_needs_guaranteed_prefix(
+        #[case] guaranteed_rows: Range<u64>,
+        #[case] is_pushed_down: bool,
+        #[values(false, true)] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+        // Fragment 0's row addresses and initial stable row ids are both 0..10.
+        let index_input = index_result_input(
+            IndexExprResult::at_least(RowAddrMask::from_allowed(RowAddrTreeMap::from(
+                guaranteed_rows,
+            ))),
+            dataset.fragments(),
+        );
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let filter = planner.parse_filter("value < 1000").unwrap();
+        let filter = planner.optimize_expr(filter).unwrap();
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(None, Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(1..4)
+            .unwrap();
+        let read = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+
+        let plan = read
+            .get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        assert_eq!(plan.scan_range_after_filter.is_none(), is_pushed_down);
+
+        let stream = read.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(
+            batch["value"].as_primitive::<UInt32Type>().values(),
+            &[1, 2, 3]
         );
     }
 
@@ -4645,6 +4955,66 @@ mod tests {
             UInt32Array::from((30..40).collect::<Vec<_>>())
         };
         assert_eq!(batch["value"].as_ref(), &expected);
+    }
+
+    /// Limit pushdown must not discard an uncovered fragment that the caller
+    /// lists before the covered fragment satisfying the limit.  The pushdown
+    /// plan only mirrors covered fragments, so swapping it in would drop the
+    /// uncovered fragment's rows, which belong first in the caller's order.
+    #[rstest]
+    #[case::limit(0..2, vec![10, 11])]
+    #[case::offset_and_limit(1..3, vec![11, 12])]
+    #[tokio::test]
+    async fn test_limit_pushdown_keeps_preceding_uncovered_fragments(
+        #[case] scan_range: Range<u64>,
+        #[case] expected_values: Vec<u32>,
+        #[values(false, true)] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+        let all_fragments = dataset.fragments().as_ref().clone();
+        let fragment = |id: u64| {
+            all_fragments
+                .iter()
+                .find(|fragment| fragment.id == id)
+                .unwrap()
+                .clone()
+        };
+        // Uncovered fragment 1 precedes covered fragment 0 in the caller's
+        // order; fragment 1 holds values 10..20, fragment 0 holds values 0..10.
+        let fragments = Arc::new(vec![fragment(1), fragment(0)]);
+
+        // Exact result covering only fragment 0, where every row matches.
+        // (Fragment 0's row addresses and initial stable row ids are both 0..10.)
+        let covered = RoaringBitmap::from_iter([0u32]);
+        let index_input = index_result_input_with_coverage(
+            IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from(0u64..10))),
+            &covered,
+        );
+
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let filter = planner.parse_filter("value < 1000").unwrap();
+        let filter = planner.optimize_expr(filter).unwrap();
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_fragments(fragments)
+            .with_filter(None, Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(scan_range)
+            .unwrap();
+
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(
+            batch["value"]
+                .as_primitive::<UInt32Type>()
+                .values()
+                .as_ref(),
+            expected_values.as_slice(),
+            "limit pushdown dropped the uncovered fragment preceding the covered one"
+        );
     }
 
     /// Take-shaped masked reads consolidate their tiny per-fragment batches;
@@ -4861,7 +5231,9 @@ mod tests {
 
         let plan = fixture.make_plan(options).await;
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
 
         // The estimate is only worth anything if it matches what the scan emits.
@@ -5177,7 +5549,10 @@ mod tests {
             .with_projection(fixture.dataset.empty_projection().with_row_id());
         let plan = fixture.make_plan(options).await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Exact(300)
         );
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
@@ -5200,7 +5575,10 @@ mod tests {
             .with_physical_row_addr_prefilter(Arc::new(selected));
         let plan = fixture.make_plan(options.clone()).await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(100)
         );
         fixture.test_plan(options, &u32s(vec![200..300])).await;
@@ -5212,7 +5590,10 @@ mod tests {
             .with_filter_plan(filter);
         let plan = fixture.make_plan(options.clone()).await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(300)
         );
         fixture.test_plan(options, &u32s(vec![250..400])).await;
@@ -5300,8 +5681,8 @@ mod tests {
         // The fixture's utf8 column is seeded from the decoder's estimate, so the
         // whole row reports a width rather than withdrawing.
         assert_eq!(
-            full_plan
-                .partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&full_plan, &StatisticsArgs::new())
                 .unwrap()
                 .total_byte_size,
             Precision::Inexact(25282)
@@ -5321,7 +5702,9 @@ mod tests {
 
         let plan = fixture.make_plan(base_options.clone()).await;
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         // With no filter and no range we have an exact count
         assert_eq!(stats.num_rows, Precision::Exact(250));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
@@ -5334,7 +5717,9 @@ mod tests {
             .clone()
             .with_physical_row_addr_prefilter(Arc::new(physical_rows));
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(3));
 
         let mut full_fragment = RowAddrTreeMap::new();
@@ -5347,7 +5732,10 @@ mod tests {
             )
             .await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(100)
         );
 
@@ -5355,7 +5743,10 @@ mod tests {
         source_options.projection.with_row_addr = true;
         let source = fixture.make_plan(source_options).await;
         assert_eq!(
-            source.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&source, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Exact(250)
         );
         let stream_plan = FilteredReadExec::try_new(
@@ -5367,7 +5758,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            stream_plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&stream_plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(250)
         );
 
@@ -5377,7 +5771,9 @@ mod tests {
             .with_scan_range_before_filter(25..125)
             .unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(100));
         assert_eq!(stats.total_byte_size, Precision::Inexact(3300));
 
@@ -5396,7 +5792,9 @@ mod tests {
         )
         .unwrap();
         assert!(plan.options().full_filter.is_none() && plan.options().refine_filter.is_none());
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
@@ -5407,7 +5805,9 @@ mod tests {
             .unwrap();
         let plan =
             FilteredReadExec::try_new(fixture.dataset.clone(), options, index_input).unwrap();
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(10));
         assert_eq!(stats.total_byte_size, Precision::Inexact(330));
 
@@ -5417,7 +5817,9 @@ mod tests {
         // what a join above has to hold.
         let options = base_options.clone().with_deleted_rows().unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(300));
         // Keeping deleted rows also adds a nullable row id: 41.125 bytes per row.
         assert_eq!(stats.total_byte_size, Precision::Inexact(12338));
@@ -5428,7 +5830,9 @@ mod tests {
             .with_scan_range_before_filter(300..400)
             .unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(0));
         assert_eq!(stats.total_byte_size, Precision::Inexact(0));
 
@@ -5440,7 +5844,9 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("not_indexed >= 200", false).await);
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
@@ -5450,7 +5856,9 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("random() < 0.5", false).await);
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(50));
         assert_eq!(stats.total_byte_size, Precision::Inexact(1650));
 
@@ -5462,7 +5870,9 @@ mod tests {
             .with_scan_range_after_filter(0..10)
             .unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(10));
         assert_eq!(stats.total_byte_size, Precision::Inexact(330));
 
@@ -5480,7 +5890,9 @@ mod tests {
                     .unwrap(),
             );
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.column_statistics.len(), 1);
         // Only the vector is projected, so only the vector is billed: 16 bytes of
@@ -5754,7 +6166,11 @@ mod tests {
         let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
 
         let unfiltered = fixture.make_plan(base_options.clone()).await;
-        let Precision::Exact(rows) = unfiltered.partition_statistics(None).unwrap().num_rows else {
+        let Precision::Exact(rows) = StatisticsContext::new()
+            .compute(&unfiltered, &StatisticsArgs::new())
+            .unwrap()
+            .num_rows
+        else {
             panic!("a read with nothing selecting rows knows how many it returns");
         };
 
@@ -5770,7 +6186,9 @@ mod tests {
             "the refine filter has to be the only thing selecting rows here"
         );
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(rows));
     }
 
@@ -5811,7 +6229,9 @@ mod tests {
         options.scan_range_after_filter = Some(inverted);
         let plan = fixture.make_plan(options).await;
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(0));
     }
 
@@ -6827,7 +7247,12 @@ mod tests {
             assert_eq!(plan.properties().output_ordering(), expected.as_ref());
 
             // Replacing the input must not leave stale ordering properties.
-            let rebuilt = plan.with_new_children(vec![input]).unwrap();
+            let rebuilt = plan
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
+                .unwrap();
             assert!(rebuilt.output_ordering().is_none());
             assert_eq!(rebuilt.maintains_input_order(), vec![true]);
 
@@ -7198,6 +7623,28 @@ mod tests {
             let mixed = vec![batch.slice(0, 2), batch.slice(2, 5)];
             let plan = take_plan_sized(&fixture.dataset, rows_input(mixed), &["i"], 3).unwrap();
             assert_batches(run(&plan).await, plan.schema(), vec![2, 5]);
+
+            // A batch that would push the buffer past the target flushes it
+            // first, so merged batches never exceed the target
+            let pairs = vec![
+                batch.slice(0, 2),
+                batch.slice(2, 2),
+                batch.slice(4, 2),
+                batch.slice(6, 1),
+            ];
+            let plan = take_plan_sized(&fixture.dataset, rows_input(pairs), &["i"], 3).unwrap();
+            assert_batches(run(&plan).await, plan.schema(), vec![2, 2, 3]);
+
+            // Mixed sizes: small batches merge without overshooting, and a
+            // batch at the target after a partial buffer passes through whole
+            let mixed = vec![
+                batch.slice(0, 1),
+                batch.slice(1, 1),
+                batch.slice(2, 2),
+                batch.slice(4, 3),
+            ];
+            let plan = take_plan_sized(&fixture.dataset, rows_input(mixed), &["i"], 3).unwrap();
+            assert_batches(run(&plan).await, plan.schema(), vec![2, 2, 3]);
         }
 
         /// Storage-ordered input exercises the aligned fast path
@@ -7245,6 +7692,56 @@ mod tests {
                 .unwrap()
                 .as_primitive::<Float32Type>();
             assert_eq!(payload_col.values(), &payload[..]);
+        }
+
+        #[rstest]
+        #[case::by_row_addr(false, ROW_ADDR, false)]
+        #[case::by_row_id(false, ROW_ID, false)]
+        #[case::stable_by_row_addr(true, ROW_ADDR, false)]
+        #[case::explicit_scope(false, ROW_ADDR, true)]
+        #[tokio::test]
+        async fn take_skips_unrequested_fragment_metadata(
+            #[case] stable_row_ids: bool,
+            #[case] key: &str,
+            #[case] explicit_scope: bool,
+        ) {
+            let fixture = take_fixture(stable_row_ids).await;
+            let mut dataset = fixture.dataset.as_ref().clone();
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            let unrelated = &mut Arc::make_mut(&mut manifest.fragments)[1];
+            // Looking up this fragment's physical row count would open its file.
+            unrelated.physical_rows = None;
+            unrelated.files[0].path = "must-not-open.lance".to_string();
+            let dataset = Arc::new(dataset);
+
+            let input = arrow_array::record_batch!((
+                key,
+                UInt64,
+                vec![
+                    u64::from(RowAddress::new_from_parts(2, 1)),
+                    u64::from(RowAddress::new_from_parts(0, 3)),
+                ]
+            ))
+            .unwrap();
+            let projection = dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap();
+            let mut options = FilteredReadOptions::new(projection);
+            if explicit_scope {
+                let fragments = dataset.fragments().iter().rev().cloned().collect();
+                options = options.with_fragments(Arc::new(fragments));
+            }
+            let plan =
+                FilteredReadExec::try_new(dataset, options, Some(rows_input(vec![input]))).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+
+            assert_eq!(
+                result["i"]
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .values(),
+                &[21, 3]
+            );
         }
 
         /// A fragment-scoped take reads from the scoped fragments only; keys
@@ -7548,6 +8045,76 @@ mod tests {
             assert_eq!(addr_col.values(), &expected_addrs[..]);
         }
 
+        #[rstest]
+        #[case::created("_row_created_at_version")]
+        #[case::updated("_row_last_updated_at_version")]
+        #[tokio::test]
+        async fn take_version_columns(
+            #[case] version: &str,
+            #[values(false, true)] with_data: bool,
+            #[values(false, true)] all_null: bool,
+            #[values(ROW_ID, ROW_ADDR)] key: &str,
+        ) {
+            let fixture = take_fixture(true).await;
+            let ids = if all_null {
+                vec![None, None]
+            } else {
+                vec![Some(21_u64), None, Some(3), Some(999), Some(21)]
+            };
+            let keys = ids
+                .into_iter()
+                .map(|id| {
+                    id.map(|id| {
+                        if key == ROW_ID {
+                            id
+                        } else {
+                            u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                                (id / 10) as u32,
+                                (id % 10) as u32,
+                            ))
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let input = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    key,
+                    DataType::UInt64,
+                    true,
+                )])),
+                vec![Arc::new(UInt64Array::from(keys))],
+            )
+            .unwrap();
+            let columns = if with_data {
+                vec!["i", version]
+            } else {
+                vec![version]
+            };
+            let plan = take_plan(&fixture.dataset, rows_input(vec![input]), &columns).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let expected_rows = if all_null { 0 } else { 3 };
+            assert_eq!(result.num_rows(), expected_rows);
+            assert_eq!(result.num_columns(), 1 + usize::from(with_data));
+            assert_eq!(result.schema(), plan.schema());
+            assert_eq!(
+                result[version]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .as_ref(),
+                vec![1; expected_rows]
+            );
+            if with_data {
+                let expected: &[i32] = if all_null { &[] } else { &[21, 3, 21] };
+                assert_eq!(
+                    result["i"]
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .as_ref(),
+                    expected
+                );
+            }
+        }
+
         /// New sub-fields merge into an existing struct column
         #[tokio::test]
         async fn take_merges_nested_struct() {
@@ -7648,7 +8215,10 @@ mod tests {
                 MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None).unwrap();
             let plan = take_plan(&dataset, input, &["i"]).unwrap();
             assert_eq!(
-                plan.partition_statistics(None).unwrap().num_rows,
+                StatisticsContext::new()
+                    .compute(&plan, &StatisticsArgs::new())
+                    .unwrap()
+                    .num_rows,
                 Precision::Inexact(2)
             );
             let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
@@ -7825,7 +8395,13 @@ mod tests {
             let input = rows_input(vec![batch]);
             let plan: Arc<dyn ExecutionPlan> =
                 Arc::new(take_plan(&fixture.dataset, input.clone(), &["s"]).unwrap());
-            let rebuilt = plan.clone().with_new_children(vec![input]).unwrap();
+            let rebuilt = plan
+                .clone()
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
+                .unwrap();
             assert_eq!(plan.schema(), rebuilt.schema());
             assert!(
                 rebuilt
@@ -8034,5 +8610,102 @@ mod tests {
             projected_column_names(&narrow),
             vec!["id", "cells.item.idx"]
         );
+    }
+
+    /// The scan timers also reach the `metrics` facade, as cumulative counters
+    /// a scrape can read while a scan runs.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_scan_timers_reach_the_metrics_facade() {
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        // A thread-local recorder: the counters are registered when the scan
+        // starts, on this thread, so a current-thread runtime keeps every
+        // increment on them visible to it.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let dataset = gen_batch()
+                        .col("x", array::step::<UInt32Type>())
+                        .into_dataset(
+                            "memory://scan_timers",
+                            FragmentCount::from(4),
+                            FragmentRowCount::from(16),
+                        )
+                        .await
+                        .unwrap();
+                    let batch = dataset.scan().try_into_batch().await.unwrap();
+                    assert_eq!(batch.num_rows(), 64);
+
+                    let counters = |name: &str| {
+                        snapshotter
+                            .snapshot()
+                            .into_vec()
+                            .into_iter()
+                            .filter_map(|(key, _, _, value)| {
+                                let DebugValue::Counter(value) = value else {
+                                    return None;
+                                };
+                                if key.key().name() != name {
+                                    return None;
+                                }
+                                let labels = key
+                                    .key()
+                                    .labels()
+                                    .map(|label| {
+                                        (label.key().to_string(), label.value().to_string())
+                                    })
+                                    .collect::<HashMap<_, _>>();
+                                Some((labels, value))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let total_counter = |name: &str| {
+                        counters(name)
+                            .into_iter()
+                            .map(|(_, value)| value)
+                            .sum::<u64>()
+                    };
+                    let wait_before = total_counter(METRIC_SCAN_TASK_WAIT_TIME);
+                    let decode_before = total_counter(METRIC_SCAN_DECODE_TIME);
+
+                    let timer_metrics = ExecutionPlanMetricsSet::new();
+                    let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
+                        &timer_metrics,
+                        0,
+                        &dataset.object_store,
+                    ));
+                    let mut cancelled = Box::pin({
+                        let partition_metrics = partition_metrics.clone();
+                        async move {
+                            let _wait_timer = partition_metrics.task_wait_timer();
+                            let _decode_timer = partition_metrics.decode_timer();
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+                    drop(cancelled);
+
+                    assert!(partition_metrics.task_wait_time.value() > 0);
+                    assert!(partition_metrics.decode_time.value() > 0);
+                    assert!(total_counter(METRIC_SCAN_TASK_WAIT_TIME) > wait_before);
+                    assert!(total_counter(METRIC_SCAN_DECODE_TIME) > decode_before);
+
+                    for name in [METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME] {
+                        let recorded = counters(name);
+                        assert_eq!(recorded.len(), 1, "{name}: {recorded:?}");
+                        let (labels, value) = &recorded[0];
+                        assert_eq!(labels.get("base").map(String::as_str), Some("memory"));
+                        assert!(!labels.contains_key("dataset"), "{labels:?}");
+                        assert!(*value > 0, "{name}: {recorded:?}");
+                    }
+                });
+        });
     }
 }

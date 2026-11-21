@@ -45,11 +45,13 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -71,11 +73,159 @@ public class FragmentTest {
     DeletionFile bitmap = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null);
     DeletionFile array = new DeletionFile(7, 11, 2L, DeletionFileType.ARRAY, null);
     DeletionFile highBitId = new DeletionFile(-1L, 11, 2L, DeletionFileType.BITMAP, null);
+    byte[] inlineBytes = new byte[] {1, 2, 3};
+    DeletionFile inline = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, inlineBytes);
 
     assertEquals("_deletions/5-11-7.bin", bitmap.getRelativePath(5));
     assertEquals("_deletions/5-11-7.arrow", array.getRelativePath(5));
     assertEquals("_deletions/5-11-18446744073709551615.bin", highBitId.getRelativePath(5));
+    assertArrayEquals(inlineBytes, inline.getInline());
+    assertNull(inline.getRelativePath(5));
     assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+
+    String explicitPath = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin";
+    DeletionFile explicit =
+        new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, null, explicitPath);
+    assertEquals(explicitPath, explicit.getRelativePath(5));
+    assertEquals(explicitPath, explicit.getRelativePath(99));
+    assertEquals(Optional.of(explicitPath), explicit.getPath());
+    assertEquals(Optional.empty(), bitmap.getPath());
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, inlineBytes, explicitPath));
+  }
+
+  @Test
+  void testExplicitDeletionPathRoundTrip(@TempDir Path tempDir) throws Exception {
+    Path datasetDir = tempDir.resolve("explicit_deletion_round_trip");
+    String datasetPath = datasetDir.toString();
+    String explicitRelPath = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.arrow";
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.delete("id = 1");
+        assertEquals(4, dataset.countRows());
+
+        FragmentMetadata derivedMeta = dataset.getFragments().get(0).metadata();
+        DeletionFile derivedDel = derivedMeta.getDeletionFile();
+        assertNotNull(derivedDel);
+        assertEquals(Optional.empty(), derivedDel.getPath());
+        String derivedRelPath = derivedDel.getRelativePath(derivedMeta.getId());
+        assertNotNull(derivedRelPath);
+
+        Files.move(datasetDir.resolve(derivedRelPath), datasetDir.resolve(explicitRelPath));
+
+        DeletionFile explicitDel =
+            new DeletionFile(
+                derivedDel.getId(),
+                derivedDel.getReadVersion(),
+                derivedDel.getNumDeletedRows(),
+                derivedDel.getFileType(),
+                derivedDel.getBaseId().orElse(null),
+                null,
+                explicitRelPath);
+        FragmentMetadata withExplicit =
+            new FragmentMetadata(
+                derivedMeta.getId(),
+                derivedMeta.getFiles(),
+                derivedMeta.getPhysicalRows(),
+                explicitDel,
+                derivedMeta.getRowIdMeta(),
+                derivedMeta.getCreatedAtVersionMeta(),
+                derivedMeta.getLastUpdatedAtVersionMeta(),
+                derivedMeta.getReferencedLanceFiles(),
+                derivedMeta.getClusteringId(),
+                derivedMeta.getMetadata());
+
+        Update setExplicit =
+            Update.builder()
+                .updatedFragments(Collections.singletonList(withExplicit))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
+        try (Transaction tx1 =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(setExplicit)
+                    .build();
+            Dataset v3 = new CommitBuilder(dataset).execute(tx1)) {
+          FragmentMetadata v3Meta = v3.getFragments().get(0).metadata();
+          DeletionFile v3Del = v3Meta.getDeletionFile();
+          assertNotNull(v3Del);
+          assertEquals(Optional.of(explicitRelPath), v3Del.getPath());
+          assertEquals(explicitRelPath, v3Del.getRelativePath(v3Meta.getId()));
+          assertEquals(explicitRelPath, v3Del.getRelativePath(99));
+
+          Update roundTrip =
+              Update.builder()
+                  .updatedFragments(Collections.singletonList(v3Meta))
+                  .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                  .build();
+          try (Transaction tx2 =
+                  new Transaction.Builder().readVersion(v3.version()).operation(roundTrip).build();
+              Dataset v4 = new CommitBuilder(v3).execute(tx2)) {
+            FragmentMetadata v4Meta = v4.getFragments().get(0).metadata();
+            assertEquals(Optional.of(explicitRelPath), v4Meta.getDeletionFile().getPath());
+            assertEquals(4, v4.countRows());
+            assertEquals(0, v4.countRows("id = 1"));
+          }
+        }
+      }
+    }
+
+    try (Dataset reopened = Dataset.open(datasetPath)) {
+      FragmentMetadata reopenedMeta = reopened.getFragments().get(0).metadata();
+      assertEquals(Optional.of(explicitRelPath), reopenedMeta.getDeletionFile().getPath());
+      assertEquals(4, reopened.countRows());
+      assertEquals(0, reopened.countRows("id = 1"));
+    }
+  }
+
+  @Test
+  void testInlineDeletionFileRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("inline_deletion_round_trip").toString();
+    byte[] expectedInline;
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.updateConfig(Map.of("lance.deletions.inline_max_bytes", "4096"));
+        dataset.delete("id = 1");
+        assertEquals(4, dataset.countRows());
+
+        FragmentMetadata original = dataset.getFragments().get(0).metadata();
+        DeletionFile deletionFile = original.getDeletionFile();
+        assertNotNull(deletionFile);
+        assertNull(deletionFile.getRelativePath(original.getId()));
+        expectedInline = deletionFile.getInline();
+        assertNotNull(expectedInline);
+        assertTrue(expectedInline.length > 0);
+
+        Update update =
+            Update.builder()
+                .updatedFragments(Collections.singletonList(original))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
+        try (Transaction transaction =
+                new Transaction.Builder().readVersion(dataset.version()).operation(update).build();
+            Dataset committed = new CommitBuilder(dataset).execute(transaction)) {
+          assertArrayEquals(
+              expectedInline,
+              committed.getFragments().get(0).metadata().getDeletionFile().getInline());
+        }
+      }
+    }
+
+    try (Dataset reopened = Dataset.open(datasetPath)) {
+      assertEquals(4, reopened.countRows());
+      assertEquals(0, reopened.countRows("id = 1"));
+      assertArrayEquals(
+          expectedInline, reopened.getFragments().get(0).metadata().getDeletionFile().getInline());
+    }
   }
 
   @Test
@@ -569,6 +719,37 @@ public class FragmentTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(0, dataset.getFragmentStatistics().size());
+      }
+    }
+  }
+
+  @Test
+  void testColumnLayoutStatistics(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("column_layout_statistics").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata frag1 = testDataset.createNewFragment(10);
+      FragmentMetadata frag2 = testDataset.createNewFragment(5);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(frag1, frag2));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        ColumnLayoutStatistics stats = dataset.getColumnLayoutStatistics();
+        assertEquals(2, stats.size());
+        assertArrayEquals(
+            dataset.getFragments().stream().mapToLong(f -> f.getId()).toArray(),
+            stats.getFragmentIds());
+        assertArrayEquals(new int[] {1, 1}, stats.getLiveFileCounts());
+        assertArrayEquals(new int[] {2}, stats.getFieldsPerFile()[0]);
+        assertTrue(stats.getFileSizes()[0][0] > 0);
+        assertArrayEquals(new double[] {0.0, 0.0}, stats.getDeadSlotRatios());
+        assertArrayEquals(new int[] {0, 0}, stats.getOverlayCounts());
+
+        // Dropping a column leaves its id in the file that held it.
+        dataset.dropColumns(Collections.singletonList("name"));
+        ColumnLayoutStatistics dropped = dataset.getColumnLayoutStatistics();
+        assertArrayEquals(new int[] {1}, dropped.getFieldsPerFile()[1]);
+        assertArrayEquals(new double[] {0.5, 0.5}, dropped.getDeadSlotRatios());
       }
     }
   }

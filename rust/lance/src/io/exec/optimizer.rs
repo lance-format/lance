@@ -10,11 +10,19 @@ use super::filtered_read::FilteredReadExec;
 use arrow_schema::Schema as ArrowSchema;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
+    common::tree_node::{Transformed, TransformedResult, TreeNode},
     config::ConfigOptions,
     error::Result as DFResult,
-    physical_optimizer::{PhysicalOptimizerRule, optimizer::PhysicalOptimizer},
+    physical_optimizer::{
+        PhysicalOptimizerRule,
+        enforce_distribution::{
+            DistributionContext, PlanWithKeyRequirements, adjust_input_keys_ordering,
+            ensure_distribution, reorder_join_keys_to_inputs,
+        },
+        optimizer::PhysicalOptimizer,
+    },
     physical_plan::{ExecutionPlan, projection::ProjectionExec},
 };
 use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
@@ -81,7 +89,7 @@ impl CoalesceTake {
     ) -> Option<Arc<dyn ExecutionPlan>> {
         let inner_take_input = inner_take.children()[0].clone();
         let old_output_schema = outer_take.schema();
-        let collapsed = outer_exec.with_new_children(vec![inner_take_input]).ok()?;
+        let collapsed = replace_children_if_necessary(outer_exec, vec![inner_take_input]).ok()?;
         let new_output_schema = collapsed.schema();
 
         if old_output_schema
@@ -203,6 +211,51 @@ impl PhysicalOptimizerRule for SimplifyProjection {
     }
 }
 
+/// Rule that inserts exchange nodes (`RepartitionExec`, `CoalescePartitionsExec`)
+/// where needed to satisfy each node's input distribution requirements.
+///
+/// This is DataFusion's former `EnforceDistribution` rule. DataFusion 55 folded it
+/// into `EnsureRequirements`, which also enforces sort requirements and removes
+/// any sort a node above it does not declare it needs. Many Lance nodes do not
+/// declare whether they maintain their input order (e.g. `TakeExec`), so that
+/// rule drops sorts Lance relies on, such as the score ordering of full-text
+/// search results. Until those nodes declare their ordering, only enforce
+/// distribution. See <https://github.com/lance-format/lance/issues/9647>.
+#[derive(Debug, Default)]
+pub struct EnforceDistribution;
+
+impl PhysicalOptimizerRule for EnforceDistribution {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let plan = if config.optimizer.top_down_join_key_reordering {
+            PlanWithKeyRequirements::new_default(plan)
+                .transform_down(adjust_input_keys_ordering)
+                .data()?
+                .plan
+        } else {
+            plan.transform_up(|plan| Ok(Transformed::yes(reorder_join_keys_to_inputs(plan)?)))
+                .data()?
+        };
+
+        // Distribution enforcement needs to be applied bottom-up.
+        Ok(DistributionContext::new_default(plan)
+            .transform_up(|context| ensure_distribution(context, config))
+            .data()?
+            .plan)
+    }
+
+    fn name(&self) -> &str {
+        "EnforceDistribution"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
         // Rewrite `COUNT(*)`-style aggregates into CountFromMaskExec so they
@@ -215,7 +268,7 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
         Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
         // Insert exchange nodes (RepartitionExec, CoalescePartitionsExec) where needed
         // to satisfy distribution requirements as exec nodes migrate to multi-partition output.
-        Arc::new(datafusion::physical_optimizer::enforce_distribution::EnforceDistribution::new()),
+        Arc::new(EnforceDistribution),
         // Strip the `OutputRequirementExec` a plan may state its ordering with;
         // it cannot execute
         Arc::new(datafusion::physical_optimizer::output_requirements::OutputRequirements::new_remove_mode()),

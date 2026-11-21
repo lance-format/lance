@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+#![warn(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(coverage, feature(coverage_attribute))]
 
 // Allow the derive macro to reference `lance_core::deepsize` from within this crate.
@@ -14,6 +15,7 @@ pub mod datatypes;
 pub mod deepsize;
 pub mod error;
 pub mod levenshtein;
+pub mod memory;
 pub mod traits;
 pub mod utils;
 

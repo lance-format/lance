@@ -193,8 +193,7 @@ async fn test_create_table_version_on_branch() {
     let versions_dir = branch_ds.versions_dir();
     let store = branch_ds.object_store(None).await.unwrap();
     let existing = store
-        .inner
-        .list(Some(&versions_dir))
+        .list_objects(Some(&versions_dir))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -207,15 +206,14 @@ async fn test_create_table_version_on_branch() {
         })
         .expect("a branch manifest");
     let bytes = store
-        .inner
-        .get(&existing.location)
+        .read_object(&existing.location)
         .await
         .unwrap()
         .bytes()
         .await
         .unwrap();
     let staging = versions_dir.join("staging_manifest");
-    store.inner.put(&staging, bytes.into()).await.unwrap();
+    store.put_payload(&staging, bytes.into()).await.unwrap();
 
     let main_before = list_versions(&namespace, "users", None)
         .await
@@ -557,7 +555,9 @@ async fn test_branch_name_validation_rejects_traversal() {
 async fn test_branch_ops_reject_zombie_branch() {
     use futures::TryStreamExt;
     use lance_namespace::models::{
-        BatchDeleteTableVersionsRequest, CreateTableVersionRequest, RestoreTableRequest,
+        AnalyzeTableQueryPlanRequest, BatchDeleteTableVersionsRequest, CreateTableVersionRequest,
+        DescribeTableIndexStatsRequest, DropTableIndexRequest, ExplainTableQueryPlanRequest,
+        ListTableIndicesRequest, RestoreTableRequest, UpdateTableSchemaMetadataRequest,
         VersionRange,
     };
 
@@ -567,8 +567,7 @@ async fn test_branch_ops_reject_zombie_branch() {
     let dataset = open_dataset(&namespace, "users").await;
     let store = dataset.object_store(None).await.unwrap();
     let manifest = store
-        .inner
-        .list(Some(&dataset.versions_dir()))
+        .list_objects(Some(&dataset.versions_dir()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -581,8 +580,7 @@ async fn test_branch_ops_reject_zombie_branch() {
         })
         .expect("a manifest");
     let bytes = store
-        .inner
-        .get(&manifest.location)
+        .read_object(&manifest.location)
         .await
         .unwrap()
         .bytes()
@@ -595,7 +593,7 @@ async fn test_branch_ops_reject_zombie_branch() {
         .path
         .join(VERSIONS_DIR)
         .join(manifest.location.filename().unwrap());
-    store.inner.put(&zombie, bytes.into()).await.unwrap();
+    store.put_payload(&zombie, bytes.into()).await.unwrap();
 
     assert!(dataset.branches().get("ghost").await.is_err());
 
@@ -653,6 +651,300 @@ async fn test_branch_ops_reject_zombie_branch() {
                 ..Default::default()
             })
             .await,
+    );
+
+    let id = Some(vec!["users".to_string()]);
+    let ghost = Some("ghost".to_string());
+    // Give main the index and tag these ops name, so each op succeeds if it runs on main.
+    create_scalar_index(&namespace, "users", "id_idx").await;
+    namespace
+        .create_table_tag(CreateTableTagRequest {
+            id: id.clone(),
+            tag: "t".to_string(),
+            version: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    rejected(
+        "explain",
+        namespace
+            .explain_table_query_plan(ExplainTableQueryPlanRequest {
+                id: id.clone(),
+                query: Box::new(QueryTableRequest {
+                    branch: ghost.clone(),
+                    k: 10,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "analyze",
+        namespace
+            .analyze_table_query_plan(AnalyzeTableQueryPlanRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                k: 10,
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "list_indices",
+        namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "index_stats",
+        namespace
+            .describe_table_index_stats(DescribeTableIndexStatsRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                index_name: Some("id_idx".to_string()),
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "create_index",
+        namespace
+            .create_table_index(CreateTableIndexRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                column: "name".to_string(),
+                index_type: "BTREE".to_string(),
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "drop_index",
+        namespace
+            .drop_table_index(DropTableIndexRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                index_name: Some("id_idx".to_string()),
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "schema_metadata",
+        namespace
+            .update_table_schema_metadata(UpdateTableSchemaMetadataRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "create_tag",
+        namespace
+            .create_table_tag(CreateTableTagRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                tag: "t2".to_string(),
+                version: 1,
+                ..Default::default()
+            })
+            .await,
+    );
+    rejected(
+        "update_tag",
+        namespace
+            .update_table_tag(UpdateTableTagRequest {
+                id: id.clone(),
+                branch: ghost.clone(),
+                tag: "t".to_string(),
+                version: 1,
+                ..Default::default()
+            })
+            .await,
+    );
+}
+
+/// Data operations that name a branch run on it and leave main untouched.
+#[tokio::test]
+async fn test_data_ops_on_branch_leave_main_untouched() {
+    use lance_namespace::models::MergeInsertIntoTableRequest;
+
+    let (namespace, _temp_dir) = create_test_namespace().await;
+    create_scalar_table(&namespace, "users").await; // main: ids 1, 2, 3
+    create_branch_with_commits(&namespace, "users", "exp", 1).await; // exp adds 100, 101
+    let id = Some(vec!["users".to_string()]);
+    let exp = Some("exp".to_string());
+    let count = |branch: &Option<String>| CountTableRowsRequest {
+        id: id.clone(),
+        branch: branch.clone(),
+        ..Default::default()
+    };
+
+    namespace
+        .delete_from_table(DeleteFromTableRequest {
+            id: id.clone(),
+            branch: exp.clone(),
+            predicate: "id <= 3".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(namespace.count_table_rows(count(&None)).await.unwrap(), 3);
+    assert_eq!(namespace.count_table_rows(count(&exp)).await.unwrap(), 2);
+
+    let updated = namespace
+        .update_table(UpdateTableRequest {
+            id: id.clone(),
+            branch: exp.clone(),
+            updates: vec![vec!["name".to_string(), "'z'".to_string()]],
+            predicate: Some("id = 100".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.updated_rows, 1);
+
+    let insert = InsertIntoTableRequest {
+        id: id.clone(),
+        branch: exp.clone(),
+        ..Default::default()
+    };
+    let data = Bytes::from(create_single_row_test_ipc_data()); // id 10
+    namespace.insert_into_table(insert, data).await.unwrap();
+    let merge = MergeInsertIntoTableRequest {
+        id: id.clone(),
+        branch: exp.clone(),
+        on: Some(vec!["id".to_string()]),
+        when_matched_update_all: Some(true),
+        ..Default::default()
+    };
+    let data = Bytes::from(create_non_empty_test_ipc_data()); // ids 1, 2
+    namespace
+        .merge_insert_into_table(merge, data)
+        .await
+        .unwrap();
+    assert_eq!(namespace.count_table_rows(count(&exp)).await.unwrap(), 5);
+    assert_eq!(namespace.count_table_rows(count(&None)).await.unwrap(), 3);
+
+    let query = QueryTableRequest {
+        id: id.clone(),
+        branch: exp.clone(),
+        k: 10,
+        filter: Some("name = 'z'".to_string()),
+        ..Default::default()
+    };
+    let bytes = namespace.query_table(query).await.unwrap();
+    let reader = FileReader::try_new(Cursor::new(bytes.to_vec()), None).unwrap();
+    let rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(rows, 1);
+}
+
+/// Column alterations only run on main, and an explain whose query names
+/// another branch is ambiguous, so both fail instead of running on main.
+#[tokio::test]
+async fn test_unsupported_branch_requests_fail() {
+    use lance_namespace::models::{
+        AddColumnsEntry, AlterColumnsEntry, AlterTableAddColumnsRequest,
+        AlterTableAlterColumnsRequest, AlterTableDropColumnsRequest, ExplainTableQueryPlanRequest,
+    };
+
+    let (namespace, _temp_dir) = create_test_namespace().await;
+    create_scalar_table(&namespace, "users").await;
+    create_branch_with_commits(&namespace, "users", "exp", 1).await;
+    let id = Some(vec!["users".to_string()]);
+    let exp = Some("exp".to_string());
+
+    let mut add = AddColumnsEntry::new("doubled".to_string());
+    add.expression = Some(Some("id * 2".to_string()));
+    let mut rename = AlterColumnsEntry::new("name".to_string());
+    rename.rename = Some(Some("label".to_string()));
+    let results = [
+        namespace
+            .alter_table_add_columns(AlterTableAddColumnsRequest {
+                id: id.clone(),
+                branch: exp.clone(),
+                new_columns: vec![add],
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+        namespace
+            .alter_table_alter_columns(AlterTableAlterColumnsRequest {
+                id: id.clone(),
+                branch: exp.clone(),
+                alterations: vec![rename],
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+        namespace
+            .alter_table_drop_columns(AlterTableDropColumnsRequest {
+                id: id.clone(),
+                branch: exp.clone(),
+                columns: vec!["name".to_string()],
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+    ];
+    for result in results {
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("does not support branch 'exp'"),
+            "{err}"
+        );
+    }
+    let main = open_dataset(&namespace, "users").await;
+    let fields: Vec<_> = main
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    assert_eq!(fields, ["id", "name"]);
+
+    let err = namespace
+        .explain_table_query_plan(ExplainTableQueryPlanRequest {
+            id: id.clone(),
+            branch: exp.clone(),
+            query: Box::new(QueryTableRequest {
+                branch: Some("other".to_string()),
+                k: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("its query names branch 'other'"),
+        "{err}"
+    );
+
+    let err = namespace
+        .explain_table_query_plan(ExplainTableQueryPlanRequest {
+            id,
+            branch: Some("main".to_string()),
+            query: Box::new(QueryTableRequest {
+                branch: Some("exp".to_string()),
+                k: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("names branch 'main' but its query names branch 'exp'"),
+        "{err}"
     );
 }
 
@@ -920,8 +1212,7 @@ async fn test_managed_branch_open_and_commit() {
     let store = branch_ds.object_store(None).await.unwrap();
     let branch_data = branch_base.clone().join("data");
     let branch_files = store
-        .inner
-        .list(Some(&branch_data))
+        .list_objects(Some(&branch_data))
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -1738,11 +2029,10 @@ async fn test_create_branch_rejects_negative_from_version() {
 async fn test_create_branch_nonexistent_from_version() {
     let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
 
-    // Version 999 does not exist (the table has 2 versions). create_branch's clone phase
-    // raises DatasetNotFound, which we map to a documented InvalidInput (400).
+    // A missing source must return the documented InvalidInput (400) without reserving the name.
     let err = namespace
         .create_table_branch(CreateTableBranchRequest {
-            id: Some(table_id),
+            id: Some(table_id.clone()),
             name: "dev".to_string(),
             from_version: Some(999),
             ..Default::default()
@@ -1760,6 +2050,16 @@ async fn test_create_branch_nonexistent_from_version() {
         "error should name the missing source, got: {}",
         err
     );
+
+    namespace
+        .create_table_branch(CreateTableBranchRequest {
+            id: Some(table_id),
+            name: "dev".to_string(),
+            from_version: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
