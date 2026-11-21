@@ -697,6 +697,203 @@ pub(in super::super) async fn tokenize_and_blend_multi(
     Ok((chunks, totals))
 }
 
+/// Fold per-column corpus statistics for a flat `combined_fields` stream without
+/// retaining per-row blended scores or candidate arrays.
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) async fn collect_flat_stats_multi(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    doc_col_indices: Arc<Vec<usize>>,
+    stats_masks: Arc<Vec<Arc<RowAddrMask>>>,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<FlatFieldStats> {
+    let num_columns = doc_col_indices.len();
+    let num_terms = query_tokens.len();
+    let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+
+    let tasks = input
+        .map(move |batch| {
+            let mut tokenizer = tokenizer.box_clone();
+            let query_token_indices = query_token_indices.clone();
+            let doc_col_indices = doc_col_indices.clone();
+            let stats_masks = stats_masks.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            spawn_cpu(move || {
+                let start = std::time::Instant::now();
+                let batch = batch?;
+                let num_rows = batch.num_rows();
+                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+
+                let mut all_tokens = vec![0u64; num_rows * num_columns];
+                let mut counts = vec![0u64; num_rows * num_columns * num_terms];
+                for (column_slot, doc_col_idx) in doc_col_indices.iter().enumerate() {
+                    count_column_into(
+                        batch.column(*doc_col_idx),
+                        num_columns,
+                        num_terms,
+                        column_slot,
+                        &mut tokenizer,
+                        &query_token_indices,
+                        &mut all_tokens,
+                        &mut counts,
+                    )?;
+                }
+
+                let mut stats = FlatFieldStats::zeros(num_columns, num_terms);
+                let counts_stride = num_columns * num_terms;
+                for row in 0..num_rows {
+                    let lengths = &all_tokens[row * num_columns..(row + 1) * num_columns];
+                    if lengths.iter().all(|length| *length == 0) {
+                        continue;
+                    }
+                    let row_id = row_id_array.value(row);
+                    let row_counts = &counts[row * counts_stride..(row + 1) * counts_stride];
+                    stats.fold_row(row_id, &stats_masks, lengths, row_counts);
+                }
+
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
+                DataFusionResult::Ok(stats)
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus());
+
+    let mut tasks = std::pin::pin!(tasks);
+    let mut totals = FlatFieldStats::zeros(num_columns, num_terms);
+    while let Some(stats) = tasks.next().await {
+        totals.merge(stats?);
+    }
+    Ok(totals)
+}
+
+/// Tokenize, blend, and score each flat `combined_fields` batch on the fly using a
+/// precomputed [`CombinedFieldsBM25Scorer`], avoiding whole-corpus buffering.
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) fn tokenize_blend_and_score_multi(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    terms: Arc<Vec<String>>,
+    doc_col_indices: Arc<Vec<usize>>,
+    weights: Arc<Vec<f32>>,
+    emit_mask: Option<Arc<RowAddrMask>>,
+    require_all_terms: bool,
+    scorer: Arc<super::super::scorer::CombinedFieldsBM25Scorer>,
+    target_batch_size: usize,
+    elapsed_compute: Option<Time>,
+) -> SendableRecordBatchStream {
+    let num_columns = doc_col_indices.len();
+    let num_terms = terms.len();
+    let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+
+    let scored_batches = input
+        .map(move |batch| {
+            let mut tokenizer = tokenizer.box_clone();
+            let query_token_indices = query_token_indices.clone();
+            let terms = terms.clone();
+            let doc_col_indices = doc_col_indices.clone();
+            let weights = weights.clone();
+            let emit_mask = emit_mask.clone();
+            let scorer = scorer.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            spawn_cpu(move || {
+                let start = std::time::Instant::now();
+                let batch = batch?;
+                let num_rows = batch.num_rows();
+                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+
+                let mut all_tokens = vec![0u64; num_rows * num_columns];
+                let mut counts = vec![0u64; num_rows * num_columns * num_terms];
+                for (column_slot, doc_col_idx) in doc_col_indices.iter().enumerate() {
+                    count_column_into(
+                        batch.column(*doc_col_idx),
+                        num_columns,
+                        num_terms,
+                        column_slot,
+                        &mut tokenizer,
+                        &query_token_indices,
+                        &mut all_tokens,
+                        &mut counts,
+                    )?;
+                }
+
+                let mut row_ids = UInt64Builder::new();
+                let mut scores = Float32Builder::new();
+                let mut term_freqs = vec![0.0f32; num_terms];
+                let counts_stride = num_columns * num_terms;
+                for row in 0..num_rows {
+                    let row_id = row_id_array.value(row);
+                    if emit_mask
+                        .as_ref()
+                        .is_some_and(|mask| !mask.selected(row_id))
+                    {
+                        continue;
+                    }
+                    let lengths = &all_tokens[row * num_columns..(row + 1) * num_columns];
+                    if lengths.iter().all(|length| *length == 0) {
+                        continue;
+                    }
+                    let row_counts = &counts[row * counts_stride..(row + 1) * counts_stride];
+
+                    // Preserve exact column-slot f32 accumulation order.
+                    term_freqs.fill(0.0);
+                    let mut doc_length = 0f32;
+                    for (column, weight) in weights.iter().enumerate() {
+                        doc_length += weight * lengths[column] as f32;
+                        let base = column * num_terms;
+                        for (term, tf) in term_freqs.iter_mut().enumerate() {
+                            *tf += weight * row_counts[base + term] as f32;
+                        }
+                    }
+                    let matches = if require_all_terms {
+                        term_freqs.iter().all(|tf| *tf > 0.0)
+                    } else {
+                        term_freqs.iter().any(|tf| *tf > 0.0)
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    let score: f32 = terms
+                        .iter()
+                        .zip(&term_freqs)
+                        .map(|(term, tf)| {
+                            scorer.query_weight(term) * scorer.doc_weight(*tf, doc_length)
+                        })
+                        .sum();
+                    if score > 0.0 {
+                        row_ids.append_value(row_id);
+                        scores.append_value(score);
+                    }
+                }
+
+                let batch = RecordBatch::try_new(
+                    FTS_SCHEMA.clone(),
+                    vec![
+                        Arc::new(row_ids.finish()) as ArrayRef,
+                        Arc::new(scores.finish()) as ArrayRef,
+                    ],
+                )?;
+                let slices = slice_into_batches(batch, target_batch_size);
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
+                DataFusionResult::Ok(slices)
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus())
+        .flat_map(|res| match res {
+            Ok(batches) => stream::iter(batches).left_stream(),
+            Err(err) => stream::once(async move { Err(err) }).right_stream(),
+        });
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        FTS_SCHEMA.clone(),
+        scored_batches,
+    ))
+}
+
 /// Tokenize one column into the `(row, column_slot)`-strided slots of
 /// `all_tokens` / `counts`. Mirrors [`tokenize_and_count`]'s per-type handling: a
 /// list column sums over its elements and a null leaves the slots at zero.

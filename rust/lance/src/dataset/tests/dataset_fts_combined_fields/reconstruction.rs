@@ -49,7 +49,7 @@ fn reconstruct_flat(
     exec: &FlatCombinedFieldsExec,
     decoded_input: Arc<dyn ExecutionPlan>,
 ) -> FlatCombinedFieldsExec {
-    FlatCombinedFieldsExec::try_new(
+    let mut rebuilt = FlatCombinedFieldsExec::try_new(
         exec.dataset().clone(),
         exec.query().clone(),
         exec.params().clone(),
@@ -58,7 +58,15 @@ fn reconstruct_flat(
         exec.stats_scope().clone(),
         exec.emit_prefilter().clone(),
     )
-    .unwrap()
+    .unwrap();
+    if let Some(scorer) = exec.base_scorer() {
+        rebuilt = rebuilt.with_base_scorer(Arc::new(CombinedFieldsBM25Scorer::new(
+            scorer.doc_count(),
+            scorer.avg_doc_length(),
+            scorer.doc_freq().clone(),
+        )));
+    }
+    rebuilt
 }
 
 /// Reconstruct leaf configuration through its public API, then let each native
@@ -490,4 +498,405 @@ async fn bm25f_plan_rejects_invalid_input(#[case] expected: &str) {
         "{error}"
     );
     assert!(error.to_string().contains(expected), "{error}");
+}
+
+async fn row_scores(plan: Arc<dyn ExecutionPlan>) -> Vec<(u64, f32)> {
+    batches(plan)
+        .await
+        .iter()
+        .flat_map(|batch| {
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let scores = batch["_score"].as_primitive::<Float32Type>();
+            (0..batch.num_rows())
+                .map(|row| (row_ids.value(row), scores.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[rstest]
+#[tokio::test]
+async fn bm25f_scoped_prescored_opens_only_overlapping_segments(
+    #[values(false, true)] stable: bool,
+) {
+    use crate::index::loading::DatasetIndexInternalExt;
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::inverted::{InvertedIndex, build_combined_bm25_scorer_from_totals};
+
+    let mut dataset = write_fts_dataset(
+        "memory://",
+        combined_fields_batch(
+            vec![0, 1],
+            vec!["alpha beta", "gamma"],
+            vec!["delta alpha", "beta delta"],
+        ),
+        Some(WriteParams {
+            enable_stable_row_ids: stable,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let idx_params = combined_fields_test_params();
+    create_inverted_indices(&mut dataset, &["title", "body"], &idx_params).await;
+
+    append(
+        &mut dataset,
+        combined_fields_batch(
+            vec![2, 3],
+            vec!["beta", "alpha alpha"],
+            vec!["alpha gamma", "delta"],
+        ),
+    )
+    .await;
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let dataset = Arc::new(dataset);
+    let query = CombinedFieldsQuery::try_new(
+        "alpha beta".to_string(),
+        vec!["title".to_string(), "body".to_string()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![2.0, 1.0])
+    .unwrap();
+    let params = FtsSearchParams::default().with_limit(Some(10));
+
+    // Reference full-corpus single-node scores.
+    let reference = Arc::new(CombinedFieldsQueryExec::new(
+        dataset.clone(),
+        query.clone(),
+        params.clone(),
+        PreFilterSource::None,
+    ));
+    let expected = row_scores(reference).await;
+
+    // Collect exact global stats from each segment independently (simulating Phase 1).
+    let terms = vec!["alpha".to_string(), "beta".to_string()];
+    let mut doc_counts = vec![0usize; 2];
+    let mut total_tokens = vec![0u64; 2];
+    let mut doc_freqs = vec![vec![0usize; 2]; 2];
+    for (slot, col) in ["title", "body"].iter().enumerate() {
+        let segs = crate::index::scalar::inverted::load_segments(
+            &dataset,
+            col,
+            lance_index::scalar::inverted::DocumentGranularity::Row,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(segs.len(), 2, "expected two segments per column");
+        for seg in segs {
+            let idx = dataset
+                .open_generic_index(col, &seg.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let inv = idx.as_any().downcast_ref::<InvertedIndex>().unwrap();
+            let (toks, docs, dfs) = inv
+                .bm25_row_stats_for_terms(&terms, None, None)
+                .await
+                .unwrap();
+            total_tokens[slot] += toks;
+            doc_counts[slot] += docs;
+            for (t, df) in dfs.into_iter().enumerate() {
+                doc_freqs[slot][t] += df;
+            }
+        }
+    }
+    let global_scorer = Arc::new(
+        build_combined_bm25_scorer_from_totals(
+            &[2.0, 1.0],
+            &doc_counts,
+            &total_tokens,
+            &terms,
+            &doc_freqs,
+        )
+        .unwrap(),
+    );
+
+    // Execute two disjoint fragment shards with base_scorer. Each shard must open
+    // only the overlapping segment per column (2 partitions total, not 4).
+    let mut merged = Vec::new();
+    for frag_id in [0u32, 1u32] {
+        let exec = Arc::new(
+            CombinedFieldsQueryExec::new(
+                dataset.clone(),
+                query.clone(),
+                params.clone(),
+                PreFilterSource::None,
+            )
+            .with_covered_fragments(RoaringBitmap::from_iter([frag_id]))
+            .with_base_scorer(global_scorer.clone()),
+        );
+        let shard_rows = row_scores(exec.clone()).await;
+        let parts = exec
+            .metrics()
+            .unwrap()
+            .sum_by_name(PARTITIONS_SEARCHED_METRIC)
+            .map(|m| m.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            parts, 2,
+            "shard {frag_id} must open only its 1 overlapping segment per column"
+        );
+        merged.extend(shard_rows);
+    }
+    merged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    assert_eq!(
+        merged, expected,
+        "sharded pre-scored results must be bit-identical"
+    );
+
+    // Empty covered_fragments with base_scorer opens zero segments and returns empty.
+    let empty_exec = Arc::new(
+        CombinedFieldsQueryExec::new(dataset.clone(), query, params, PreFilterSource::None)
+            .with_covered_fragments(RoaringBitmap::new())
+            .with_base_scorer(global_scorer),
+    );
+    assert!(row_scores(empty_exec.clone()).await.is_empty());
+    let empty_parts = empty_exec
+        .metrics()
+        .unwrap()
+        .sum_by_name(PARTITIONS_SEARCHED_METRIC)
+        .map(|m| m.as_usize())
+        .unwrap_or(0);
+    assert_eq!(empty_parts, 0);
+}
+
+#[tokio::test]
+async fn bm25f_scoped_prescored_still_rejects_omitted_mismatched_tokenizer() {
+    let mut dataset = write_fts_dataset(
+        "memory://",
+        combined_fields_batch(vec![0], vec!["alpha beta"], vec!["alpha"]),
+        None,
+    )
+    .await;
+    dataset
+        .create_index(
+            &["title"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().stem(true),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["body"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().stem(false),
+            true,
+        )
+        .await
+        .unwrap();
+    let dataset = Arc::new(dataset);
+    let query = CombinedFieldsQuery::try_new(
+        "alpha".to_string(),
+        vec!["title".to_string(), "body".to_string()],
+    )
+    .unwrap();
+    let scorer = Arc::new(CombinedFieldsBM25Scorer::new(1, 2.0, Default::default()));
+    let exec = Arc::new(
+        CombinedFieldsQueryExec::new(
+            dataset,
+            query,
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        )
+        .with_covered_fragments(RoaringBitmap::new())
+        .with_base_scorer(scorer),
+    );
+    let err = execute_plan(exec, Default::default())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("same tokenizer"),
+        "expected tokenizer mismatch error even when segments are omitted, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn bm25f_flat_prescored_streams_without_opening_index_segments() {
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+    use lance_index::scalar::inverted::{
+        build_combined_bm25_scorer_from_totals, collect_flat_combined_field_stats,
+    };
+
+    let mut dataset = write_fts_dataset(
+        "memory://",
+        combined_fields_batch(
+            vec![0, 1],
+            vec!["alpha beta", "gamma"],
+            vec!["delta", "beta"],
+        ),
+        None,
+    )
+    .await;
+    let idx_params = combined_fields_test_params();
+    create_inverted_indices(&mut dataset, &["title", "body"], &idx_params).await;
+
+    // Append an unindexed fragment (fragment 1).
+    append(
+        &mut dataset,
+        combined_fields_batch(
+            vec![2, 3],
+            vec!["alpha", "beta alpha"],
+            vec!["gamma", "alpha"],
+        ),
+    )
+    .await;
+    let dataset = Arc::new(dataset);
+    let query = CombinedFieldsQuery::try_new(
+        "alpha beta".to_string(),
+        vec!["title".to_string(), "body".to_string()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![2.0, 1.0])
+    .unwrap();
+
+    // Reference full-corpus single-node mixed query.
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
+            query.clone(),
+        )))
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+    let expected = id_scores(plan.clone()).await;
+
+    // Extract the native FlatCombinedFieldsExec from the mixed plan and attach a
+    // precomputed global scorer built from fragment 0's index + fragment 1's flat stats.
+    let mut flat_node: Option<FlatCombinedFieldsExec> = None;
+    plan.apply(|node| {
+        if let Some(flat) = node.downcast_ref::<FlatCombinedFieldsExec>() {
+            flat_node = Some(flat.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    let flat = flat_node.expect("mixed plan must contain FlatCombinedFieldsExec");
+
+    // Collect global stats: indexed segment 0 + flat fragment 1.
+    let terms = vec!["alpha".to_string(), "beta".to_string()];
+    let mut doc_counts = vec![0usize; 2];
+    let mut total_tokens = vec![0u64; 2];
+    let mut doc_freqs = vec![vec![0usize; 2]; 2];
+    for (slot, col) in ["title", "body"].iter().enumerate() {
+        let segs = crate::index::scalar::inverted::load_segments(
+            &dataset,
+            col,
+            lance_index::scalar::inverted::DocumentGranularity::Row,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for seg in segs {
+            let idx = crate::index::loading::DatasetIndexInternalExt::open_generic_index(
+                dataset.as_ref(),
+                col,
+                &seg.uuid,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let inv = idx
+                .as_any()
+                .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+                .unwrap();
+            let (toks, docs, dfs) = inv
+                .bm25_row_stats_for_terms(&terms, None, None)
+                .await
+                .unwrap();
+            total_tokens[slot] += toks;
+            doc_counts[slot] += docs;
+            for (t, df) in dfs.into_iter().enumerate() {
+                doc_freqs[slot][t] += df;
+            }
+        }
+    }
+    let flat_input = flat.children()[0]
+        .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
+        .unwrap();
+    let flat_schema = flat_input.schema();
+    let col_indices = vec![
+        flat_schema.index_of("title").unwrap(),
+        flat_schema.index_of("body").unwrap(),
+    ];
+    let flat_stats = collect_flat_combined_field_stats(
+        flat_input,
+        col_indices,
+        &[
+            Arc::new(RowAddrMask::all_rows()),
+            Arc::new(RowAddrMask::all_rows()),
+        ],
+        &lance_index::scalar::inverted::query::Tokens::new(
+            terms.clone(),
+            lance_index::scalar::inverted::tokenizer::document_tokenizer::DocType::Text,
+        ),
+        idx_params.build().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    for slot in 0..2 {
+        doc_counts[slot] += flat_stats.doc_counts[slot];
+        total_tokens[slot] += flat_stats.total_tokens[slot];
+        for t in 0..2 {
+            doc_freqs[slot][t] += flat_stats.doc_freqs[slot][t];
+        }
+    }
+    let global_scorer = Arc::new(
+        build_combined_bm25_scorer_from_totals(
+            &[2.0, 1.0],
+            &doc_counts,
+            &total_tokens,
+            &terms,
+            &doc_freqs,
+        )
+        .unwrap(),
+    );
+
+    let prescored_flat = Arc::new(
+        reconstruct_flat(&flat, flat.children()[0].clone()).with_base_scorer(global_scorer.clone()),
+    );
+    let flat_rows = row_scores(prescored_flat.clone()).await;
+    let parts = prescored_flat
+        .metrics()
+        .unwrap()
+        .sum_by_name(PARTITIONS_SEARCHED_METRIC)
+        .map(|m| m.as_usize())
+        .unwrap_or(0);
+    assert_eq!(
+        parts, 0,
+        "pre-scored flat scan must not open any index segment"
+    );
+
+    let indexed_shard = Arc::new(
+        CombinedFieldsQueryExec::new(
+            dataset.clone(),
+            query,
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        )
+        .with_covered_fragments(RoaringBitmap::from_iter([0]))
+        .with_base_scorer(global_scorer),
+    );
+    let indexed_rows = row_scores(indexed_shard).await;
+
+    let mut combined_rows: Vec<(i32, f32)> = indexed_rows
+        .into_iter()
+        .chain(flat_rows)
+        .map(|(row_id, score)| {
+            let id = ((row_id >> 32) as i32) * 2 + (row_id & 0xffff_ffff) as i32;
+            (id, score)
+        })
+        .collect();
+    combined_rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    assert_eq!(combined_rows, expected);
 }
