@@ -822,14 +822,14 @@ async fn test_tag(
     assert_eq!(dataset.tags().list().await.unwrap().len(), 0);
 
     dataset.tags().create("tag1", 1).await.unwrap();
-    dataset.tags().create("tag2", 1).await.unwrap();
+    dataset.tags().create("é", 1).await.unwrap();
     dataset.tags().create("v1.0.0-rc1", 2).await.unwrap();
 
     let default_order = dataset.tags().list_tags_ordered(None).await.unwrap();
     let default_names: Vec<_> = default_order.iter().map(|t| &t.0).collect();
     assert_eq!(
         default_names,
-        ["v1.0.0-rc1", "tag1", "tag2"],
+        ["v1.0.0-rc1", "tag1", "é"],
         "Default ordering mismatch"
     );
 
@@ -841,7 +841,7 @@ async fn test_tag(
     let asc_names: Vec<_> = asc_order.iter().map(|t| &t.0).collect();
     assert_eq!(
         asc_names,
-        ["tag1", "tag2", "v1.0.0-rc1"],
+        ["tag1", "é", "v1.0.0-rc1"],
         "Ascending ordering mismatch"
     );
 
@@ -853,11 +853,18 @@ async fn test_tag(
     let desc_names: Vec<_> = desc_order.iter().map(|t| &t.0).collect();
     assert_eq!(
         desc_names,
-        ["v1.0.0-rc1", "tag1", "tag2"],
+        ["v1.0.0-rc1", "tag1", "é"],
         "Descending ordering mismatch"
     );
 
-    assert_eq!(dataset.tags().list().await.unwrap().len(), 3);
+    let listed = dataset.tags().list().await.unwrap();
+    assert_eq!(listed.len(), 3);
+    for (name, contents) in listed {
+        assert_eq!(
+            dataset.tags().get_version(&name).await.unwrap(),
+            contents.version
+        );
+    }
 
     let bad_checkout = dataset.checkout_version("tag3").await;
     assert_eq!(

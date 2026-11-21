@@ -24,6 +24,7 @@ use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
@@ -175,21 +176,34 @@ impl Tags<'_> {
     pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_tags_path(&root_location.path);
-        let tag_files = self.object_store().read_dir(base_path).await?;
+        let files = self
+            .object_store()
+            .list_with_delimiter(Some(&base_path))
+            .await?;
+        let mut tags = HashMap::with_capacity(files.objects.len());
+        for file in files.objects {
+            let Some(stem) = file
+                .location
+                .filename()
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let tag = listed_tag_name(stem)?;
+            let Entry::Vacant(entry) = tags.entry(tag) else {
+                return Err(Error::InvalidRef {
+                    message: format!(
+                        "Multiple files for the same tag in '{base_path}': '{stem}.json'"
+                    ),
+                });
+            };
+            entry.insert(file.location);
+        }
 
-        let tag_names: Vec<String> = tag_files
-            .iter()
-            .filter_map(|name| name.strip_suffix(".json"))
-            .map(|name| name.to_string())
-            .collect_vec();
-
-        let root_path = &root_location.path;
-        futures::stream::iter(tag_names)
-            .map(|tag_name| async move {
-                let contents =
-                    TagContents::from_path(&tag_path(root_path, &tag_name), self.object_store())
-                        .await?;
-                Ok((tag_name, contents))
+        futures::stream::iter(tags)
+            .map(|(name, path)| async move {
+                let contents = TagContents::from_path(&path, self.object_store()).await?;
+                Ok((name, contents))
             })
             .buffer_unordered(10)
             .try_collect()
@@ -1409,6 +1423,28 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
     base_tags_path(base_path).join(format!("{}.json", branch))
 }
 
+// A listed key can carry an escaping layer from tag_path and another from the
+// storage adapter. A literal percent sign is not a valid tag character.
+fn listed_tag_name(stem: &str) -> Result<String> {
+    let mut name = stem.to_owned();
+    for _ in 0..2 {
+        if !name.contains('%') {
+            break;
+        }
+        let decoded = Path::from_url_path(&name).map_err(|e| Error::InvalidRef {
+            message: format!("Invalid tag filename '{stem}.json': {e}"),
+        })?;
+        if PathPart::from(decoded.as_ref()).as_ref() != name {
+            return Err(Error::InvalidRef {
+                message: format!("Unexpected encoding in tag filename '{stem}.json'"),
+            });
+        }
+        name = String::from(decoded);
+    }
+    check_valid_tag(&name)?;
+    Ok(name)
+}
+
 // Path::join encodes '/' to '%2F'. Some object store adapters decode that
 // separator when translating the path into a provider key.
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
@@ -1666,6 +1702,25 @@ mod tests {
     use datafusion::common::assert_contains;
 
     use rstest::rstest;
+
+    #[rstest]
+    #[case::unicode("café", "café")]
+    #[case::escaped_unicode("caf%C3%A9", "café")]
+    #[case::adapter_escaped_unicode("caf%25C3%25A9", "café")]
+    fn test_listed_tag_name(#[case] stem: &str, #[case] expected: &str) {
+        assert_eq!(listed_tag_name(stem).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::invalid_utf8("%FF")]
+    #[case::unnecessary_escape("caf%65")]
+    #[case::extra_escape_layer("caf%2525C3%2525A9")]
+    fn test_reject_invalid_tag_filename(#[case] stem: &str) {
+        assert!(matches!(
+            listed_tag_name(stem),
+            Err(Error::InvalidRef { .. })
+        ));
+    }
 
     #[rstest]
     fn test_ok_ref(
