@@ -4,6 +4,315 @@
 use super::*;
 
 #[tokio::test]
+async fn test_describe_table_snapshot_selectors() {
+    use lance::dataset::ColumnAlteration;
+
+    let temp = TempStdDir::default();
+    let namespace = DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
+        .manifest_enabled(false)
+        .dir_listing_enabled(true)
+        .build()
+        .await
+        .unwrap();
+    create_scalar_table(&namespace, "users").await;
+    let mut main = open_dataset(&namespace, "users").await;
+    let mut dev = main.create_branch("dev", 1, None).await.unwrap();
+    for (dataset, name) in [(&mut main, "main_id"), (&mut dev, "dev_id")] {
+        dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename(name.into())])
+            .await
+            .unwrap();
+    }
+    dev.alter_columns(&[ColumnAlteration::new("dev_id".into()).rename("new_id".into())])
+        .await
+        .unwrap();
+    main.tags()
+        .create("release", main.version().version)
+        .await
+        .unwrap();
+
+    let request = |tag: Option<&str>, branch: Option<&str>, version| DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        tag: tag.map(str::to_owned),
+        branch: branch.map(str::to_owned),
+        version,
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    let mut light = request(None, None, None);
+    let declared_id = Some(vec!["empty".to_owned()]);
+    let declared = namespace
+        .declare_table(DeclareTableRequest {
+            id: declared_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for detailed in [false, true] {
+        let mut declaration = request(None, Some("main"), None);
+        declaration.id = declared_id.clone();
+        declaration.load_detailed_metadata = Some(detailed);
+        declaration.check_declared = Some(true);
+        let response = namespace.describe_table(declaration).await.unwrap();
+        assert_eq!(response.is_only_declared, Some(true));
+        assert_eq!(response.location, declared.location);
+        assert!(response.schema.is_none());
+    }
+    light.load_detailed_metadata = Some(false);
+    let location = namespace
+        .describe_table(light.clone())
+        .await
+        .unwrap()
+        .location;
+    light.branch = Some("missing".into());
+    let sparse = namespace.describe_table(light).await.unwrap();
+    assert_eq!(sparse.location, location);
+    assert!(sparse.schema.is_none() && sparse.version.is_none());
+
+    for (tag, branch, version, expected, field) in [
+        (None, None, None, 2, "main_id"),
+        (None, Some("dev"), None, 3, "new_id"),
+        (None, Some("dev"), Some(2), 2, "dev_id"),
+        (None, Some("main"), Some(2), 2, "main_id"),
+        (None, Some(""), Some(2), 2, "main_id"),
+        (Some("release"), None, None, 2, "main_id"),
+    ] {
+        let described = namespace
+            .describe_table(request(tag, branch, version))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                described.version,
+                described.schema.unwrap().fields[0].name.as_str()
+            ),
+            (Some(expected), field),
+            "DescribeTable must resolve the selected snapshot: {tag:?} {branch:?} {version:?}"
+        );
+        assert_eq!(described.location, location);
+    }
+    for (mut selected, expected) in [
+        (
+            request(None, Some("dev"), None),
+            ErrorCode::TableBranchNotFound,
+        ),
+        (
+            request(None, None, Some(1)),
+            ErrorCode::TableVersionNotFound,
+        ),
+    ] {
+        selected.id = declared_id.clone();
+        let error = namespace.describe_table(selected).await.unwrap_err();
+        assert_eq!(namespace_code(&error), Some(expected));
+    }
+    for (tag, branch, version, code) in [
+        (None, Some("absent"), None, ErrorCode::TableBranchNotFound),
+        (None, Some("dev"), Some(99), ErrorCode::TableVersionNotFound),
+        (None, None, Some(-1), ErrorCode::InvalidInput),
+    ] {
+        let err = namespace
+            .describe_table(request(tag, branch, version))
+            .await
+            .unwrap_err();
+        assert_eq!(namespace_code(&err), Some(code), "{err}");
+    }
+
+    for detailed in [false, true] {
+        for mut conflicting in [
+            request(Some("release"), Some("main"), None),
+            request(Some("release"), None, Some(1)),
+        ] {
+            conflicting.load_detailed_metadata = Some(detailed);
+            let error = namespace.describe_table(conflicting).await.unwrap_err();
+            assert_eq!(namespace_code(&error), Some(ErrorCode::InvalidInput));
+        }
+    }
+
+    // A newer main manifest need not be readable to serve an older snapshot or another branch.
+    let (store, base, _) = namespace
+        .configured_builder(main.uri())
+        .build_object_store()
+        .await
+        .unwrap();
+    let mut future = main.manifest().clone();
+    future.version += 1;
+    future.reader_feature_flags |= lance_table::feature_flags::FLAG_UNKNOWN;
+    let path = main
+        .manifest_location()
+        .naming_scheme
+        .manifest_path(&base, future.version);
+    lance_table::io::commit::write_manifest_file_to_path(&store, &mut future, None, &path, None)
+        .await
+        .unwrap();
+    assert!(
+        namespace
+            .describe_table(request(None, None, None))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Please upgrade")
+    );
+    let future_version = Some(i64::try_from(future.version).unwrap());
+    for selected in [
+        request(None, None, future_version),
+        request(None, Some("main"), future_version),
+    ] {
+        let error = namespace.describe_table(selected).await.unwrap_err();
+        assert_eq!(
+            namespace_code(&error),
+            Some(ErrorCode::Unsupported),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Please upgrade"), "{error}");
+    }
+    for (tag, branch, version, field) in [
+        (None, Some("dev"), None, "new_id"),
+        (None, Some("dev"), Some(2), "dev_id"),
+        (None, None, Some(1), "id"),
+    ] {
+        let response = namespace
+            .describe_table(request(tag, branch, version))
+            .await
+            .unwrap();
+        assert_eq!(response.schema.unwrap().fields[0].name, field);
+    }
+}
+
+#[tokio::test]
+async fn test_describe_table_snapshot_selectors_discovered_branch() {
+    let (ns, _temp) = create_test_namespace().await;
+    create_scalar_table(&ns, "users").await;
+    let mut main = open_dataset(&ns, "users").await;
+    let dev = main.create_branch("dev.lance", 1, None).await.unwrap();
+    let path = uri_to_url(dev.uri()).unwrap().to_file_path().unwrap();
+    let listing = DirectoryNamespaceBuilder::new(path.parent().unwrap().to_str().unwrap())
+        .manifest_enabled(false)
+        .dir_listing_enabled(true)
+        .build()
+        .await
+        .unwrap();
+    let mut request = DescribeTableRequest {
+        id: Some(vec!["dev".into()]),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    let local = listing.describe_table(request.clone()).await.unwrap();
+    assert_eq!(local.version, Some(1));
+    assert_eq!(
+        uri_to_url(&local.location.unwrap())
+            .unwrap()
+            .to_file_path()
+            .unwrap(),
+        path
+    );
+    for branch in ["", "main"] {
+        request.branch = Some(branch.into());
+        let error = listing.describe_table(request.clone()).await.unwrap_err();
+        assert_eq!(
+            namespace_code(&error),
+            Some(ErrorCode::Unsupported),
+            "{error}"
+        );
+    }
+    request.branch = Some("dev.lance".into());
+    request.version = Some(1);
+    let same_branch = listing.describe_table(request.clone()).await.unwrap();
+    assert_eq!(same_branch.version, Some(1));
+    assert_eq!(same_branch.schema.unwrap().fields[0].name, "id");
+    request.version = Some(99);
+    let error = listing.describe_table(request.clone()).await.unwrap_err();
+    assert_eq!(
+        namespace_code(&error),
+        Some(ErrorCode::TableVersionNotFound),
+        "{error}"
+    );
+
+    // Branch deletion removes its ref first. The version manifest can still
+    // be present when an open observes that the branch has disappeared.
+    let (store, base, _) = ns
+        .configured_builder(main.uri())
+        .build_object_store()
+        .await
+        .unwrap();
+    store
+        .delete(&lance::dataset::refs::branch_contents_path(
+            &base,
+            "dev.lance",
+        ))
+        .await
+        .unwrap();
+    request.version = Some(1);
+    let error = listing.describe_table(request).await.unwrap_err();
+    assert_eq!(
+        namespace_code(&error),
+        Some(ErrorCode::TableBranchNotFound),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_describe_table_snapshot_selectors_in_tree_named_directory() {
+    use lance::dataset::ColumnAlteration;
+
+    // "tree" can be an ordinary ancestor of a dataset as well as a branch directory.
+    let temp = TempStdDir::default();
+    let root = temp.as_ref().join("tree");
+    std::fs::create_dir(&root).unwrap();
+    let ns = DirectoryNamespaceBuilder::new(root.to_str().unwrap())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    create_scalar_table(&ns, "events").await;
+    let mut table = open_dataset(&ns, "events").await;
+    let mut dev = table.create_branch("dev", 1, None).await.unwrap();
+    dev.alter_columns(&[ColumnAlteration::new("id".into()).rename("dev_id".into())])
+        .await
+        .unwrap();
+    table
+        .alter_columns(&[ColumnAlteration::new("id".into()).rename("new_id".into())])
+        .await
+        .unwrap();
+    let (store, _, _) = ns
+        .configured_builder(table.uri())
+        .build_object_store()
+        .await
+        .unwrap();
+    store
+        .inner
+        .put(
+            &table.manifest_location().path,
+            Bytes::from_static(b"truncated").into(),
+        )
+        .await
+        .unwrap();
+
+    let request = DescribeTableRequest {
+        id: Some(vec!["events".into()]),
+        branch: Some("dev".into()),
+        version: Some(2),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    let described = ns.describe_table(request.clone()).await.unwrap();
+    assert_eq!(described.version, Some(2));
+    assert_eq!(described.schema.unwrap().fields[0].name, "dev_id");
+    let error = ns
+        .describe_table(DescribeTableRequest {
+            branch: Some("events.lance".into()),
+            version: Some(1),
+            ..request
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        namespace_code(&error),
+        Some(ErrorCode::TableBranchNotFound),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn test_list_table_versions_on_branch() {
     let (namespace, _temp_dir) = create_test_namespace().await;
     create_scalar_table(&namespace, "users").await;

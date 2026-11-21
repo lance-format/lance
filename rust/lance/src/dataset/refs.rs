@@ -16,7 +16,8 @@ use object_store::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::dataset::branch_location::BranchLocation;
+/// The location of a version chain supplied to [`Refs::new`].
+pub use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
