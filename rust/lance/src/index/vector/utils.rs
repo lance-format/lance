@@ -27,9 +27,21 @@ use crate::{Error, Result};
 // Target the vector payload size, independently of the storage block size.
 const TRAINING_SAMPLE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
-/// Sample fraction of the rows above which [`sample_fsl_uniform`] reads the
-/// sampled rows with one scan instead of `take`, see [`sample_fsl_by_scan`].
-const DENSE_SAMPLE_SCAN_FRACTION: f64 = 0.1;
+/// Bytes of the column [`sample_fsl_uniform`] may scan per sampled row to read
+/// the sample with one scan instead of `take`, see [`sample_fsl_by_scan`].
+///
+/// `take` pays for every sampled row, a scan for every byte of the column, so
+/// the narrower the rows the sparser the sample a scan wins at. With the data
+/// in memory on a 96-vCPU host, taking a row costs as long as scanning 63 KiB
+/// of 1,024-dim and 44 KiB of 128-dim `f32` vectors; this stays below both.
+const DENSE_SAMPLE_SCAN_BYTES_PER_ROW: usize = 32 * 1024;
+
+/// Whether to read `sample_rows` of `num_rows` rows `byte_width` wide with one
+/// scan rather than `take`.
+fn samples_by_scan(num_rows: usize, sample_rows: usize, byte_width: usize) -> bool {
+    num_rows.saturating_mul(byte_width)
+        <= sample_rows.saturating_mul(DENSE_SAMPLE_SCAN_BYTES_PER_ROW)
+}
 
 /// Bound each training read to about 64 MiB of fixed-width vector values.
 /// A vector wider than the target still needs one complete row per batch.
@@ -1035,7 +1047,7 @@ async fn sample_fsl_uniform(
     vector_field: &lance_core::datatypes::Field,
 ) -> Result<FixedSizeListArray> {
     let indices = generate_random_indices(num_rows, sample_size_hint);
-    if indices.len() as f64 >= num_rows as f64 * DENSE_SAMPLE_SCAN_FRACTION {
+    if samples_by_scan(num_rows, indices.len(), byte_width) {
         return sample_fsl_by_scan(dataset, column, &indices, byte_width, vector_field).await;
     }
     let projection = Arc::new(dataset.schema().project(&[column])?);
@@ -1092,8 +1104,9 @@ async fn sample_fsl_uniform(
 /// instead of `take`: the same uniform sample, read at scan speed.
 ///
 /// `take` of a dense sample is bound by the latency of one small read per row,
-/// while a scan streams whole pages, so above this fraction of the rows reading
-/// every row and keeping the sampled ones is faster.
+/// while a scan streams whole pages, so once the sample is dense enough (see
+/// [`DENSE_SAMPLE_SCAN_BYTES_PER_ROW`]) reading every row and keeping the
+/// sampled ones is faster.
 async fn sample_fsl_by_scan(
     dataset: &Dataset,
     column: &str,
@@ -1112,21 +1125,18 @@ async fn sample_fsl_by_scan(
         let batch_end = batch_start + batch.num_rows() as u64;
         let in_batch = remaining.partition_point(|&index| index < batch_end);
         if in_batch > 0 {
-            let local = arrow_array::UInt32Array::from_iter_values(
-                remaining[..in_batch]
-                    .iter()
-                    .map(|&index| (index - batch_start) as u32),
-            );
-            let array =
-                arrow::compute::take(&get_column_from_batch(&batch, column)?, &local, None)?;
-            accumulate_fsl_values(
-                &mut values_buf,
-                &mut total_rows,
-                &array,
-                byte_width,
-                false,
-                usize::MAX,
-            )?;
+            // Copy each sampled row straight into the sample: a `take` first
+            // would copy it twice, once into a fresh array per batch.
+            let array = get_column_from_batch(&batch, column)?;
+            let fsl = array.as_fixed_size_list();
+            let values = fsl.values().to_data();
+            let elem_size = byte_width / fsl.value_length() as usize;
+            let bytes = &values.buffers()[0].as_slice()[values.offset() * elem_size..];
+            for &index in &remaining[..in_batch] {
+                let start = (index - batch_start) as usize * byte_width;
+                values_buf.extend_from_slice(&bytes[start..start + byte_width]);
+            }
+            total_rows += in_batch;
             remaining = &remaining[in_batch..];
         }
         if remaining.is_empty() {
@@ -2021,6 +2031,21 @@ mod tests {
             |fsl: &FixedSizeListArray| fsl.values().as_primitive::<Float32Type>().values().to_vec();
         assert_eq!(scanned.len(), indices.len());
         assert_eq!(values(&scanned), values(taken["vec"].as_fixed_size_list()));
+    }
+
+    #[rstest::rstest]
+    #[case::wide_sparse(16 << 20, 1 << 20, 4096, false)]
+    #[case::wide_dense(16 << 20, 4 << 20, 4096, true)]
+    #[case::narrow_sparse(64 << 20, 65_536, 512, false)]
+    #[case::narrow_moderate(64 << 20, 4 << 20, 512, true)]
+    #[case::overflowing_column(usize::MAX, 1, 4096, false)]
+    fn test_samples_by_scan(
+        #[case] num_rows: usize,
+        #[case] sample_rows: usize,
+        #[case] byte_width: usize,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(samples_by_scan(num_rows, sample_rows, byte_width), expected);
     }
 
     #[rstest::rstest]
