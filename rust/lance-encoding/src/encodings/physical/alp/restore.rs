@@ -1644,7 +1644,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_avx2_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
+        if !CpuFeatures::host().contains(CpuFeatures::AVX2) {
             return;
         }
         assert_restore32_equivalent(restore_chunk32_avx2);
@@ -1702,7 +1702,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_avx512_f32_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx512f") {
+        if !CpuFeatures::host().contains(CpuFeatures::AVX512F) {
             return;
         }
         assert_restore32_equivalent(restore_chunk32_avx512);
@@ -1712,9 +1712,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_avx512_f64_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx512f")
-            || !std::arch::is_x86_feature_detected!("avx512dq")
-        {
+        if !CpuFeatures::host().contains(CpuFeatures::AVX512F.union(CpuFeatures::AVX512DQ)) {
             return;
         }
         assert_restore64_equivalent(restore_chunk64_avx512);

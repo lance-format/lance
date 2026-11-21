@@ -289,53 +289,67 @@ fn apply_inner_validity_in_place(defs: &mut [u16], validity: &BooleanBuffer, nul
     }
 }
 
+/// Packs `defs[i] <= cmp` into little-endian bits, four output bytes per 32
+/// levels. Packs only whole 32-level chunks that `out` has room for; the
+/// caller handles any remaining levels.
+type PackDefLeFn = unsafe fn(&[u16], u16, &mut [u8]);
+
+lance_core::dispatch! {
+    static PACK_DEF_LE: Dispatch<PackDefLeFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[PACK_DEF_LE_AVX2, PACK_DEF_LE_SCALAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[PACK_DEF_LE_SCALAR]
+        }
+    };
+}
+
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn pack_def_le_32_avx2(ptr: *const u16, cmp: u16) -> u32 {
-    use std::arch::x86_64::*;
-    // SAFETY: Caller verified AVX2 availability and that `ptr` is valid for 32 `u16` reads.
-    unsafe {
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(PACK_DEF_LE_AVX2: PackDefLeFn)]
+    fn pack_def_le_avx2(defs: &[u16], cmp: u16, out: &mut [u8]) {
+        use std::arch::x86_64::*;
         let cmp_vec = _mm256_set1_epi16(cmp as i16);
         let zero = _mm256_setzero_si256();
-        let v0 = _mm256_loadu_si256(ptr.cast::<__m256i>());
-        let v1 = _mm256_loadu_si256(ptr.add(16).cast::<__m256i>());
-        let m0 = _mm256_cmpeq_epi16(_mm256_subs_epu16(v0, cmp_vec), zero);
-        let m1 = _mm256_cmpeq_epi16(_mm256_subs_epu16(v1, cmp_vec), zero);
-        let packed = _mm256_packs_epi16(m0, m1);
-        let ordered = _mm256_permute4x64_epi64::<0xD8>(packed);
-        _mm256_movemask_epi8(ordered) as u32
+        for (chunk, dst) in defs.as_chunks::<32>().0.iter().zip(out.as_chunks_mut::<4>().0) {
+            // SAFETY: the two unaligned loads cover the chunk's 32 levels.
+            let (v0, v1) = unsafe {
+                (
+                    _mm256_loadu_si256(chunk.as_ptr().cast()),
+                    _mm256_loadu_si256(chunk.as_ptr().add(16).cast()),
+                )
+            };
+            let m0 = _mm256_cmpeq_epi16(_mm256_subs_epu16(v0, cmp_vec), zero);
+            let m1 = _mm256_cmpeq_epi16(_mm256_subs_epu16(v1, cmp_vec), zero);
+            let packed = _mm256_packs_epi16(m0, m1);
+            let ordered = _mm256_permute4x64_epi64::<0xD8>(packed);
+            *dst = (_mm256_movemask_epi8(ordered) as u32).to_le_bytes();
+        }
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(PACK_DEF_LE_SCALAR: PackDefLeFn)]
+    fn pack_def_le_scalar(defs: &[u16], cmp: u16, out: &mut [u8]) {
+        for (chunk, dst) in defs.as_chunks::<32>().0.iter().zip(out.as_chunks_mut::<4>().0) {
+            *dst = pack_def_le_bits(chunk, cmp).to_le_bytes();
+        }
+    }
+}
+
 #[inline]
-fn pack_def_le_32_scalar(slice: &[u16], cmp: u16) -> u32 {
-    debug_assert_eq!(slice.len(), 32);
+fn pack_def_le_bits(defs: &[u16], cmp: u16) -> u32 {
+    debug_assert!(defs.len() <= 32);
     let mut mask = 0u32;
-    for (i, &val) in slice.iter().enumerate() {
+    for (i, &val) in defs.iter().enumerate() {
         mask |= u32::from(val <= cmp) << i;
     }
     mask
-}
-
-#[inline]
-fn pack_def_le_32(slice: &[u16], cmp: u16) -> u32 {
-    debug_assert_eq!(slice.len(), 32);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        // SAFETY: `target_feature = "avx2"` is enabled at compile time and `slice.len() == 32`.
-        unsafe { pack_def_le_32_avx2(slice.as_ptr(), cmp) }
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    {
-        #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: Runtime check confirmed AVX2 support and `slice.len() == 32`.
-            return unsafe { pack_def_le_32_avx2(slice.as_ptr(), cmp) };
-        }
-        pack_def_le_32_scalar(slice, cmp)
-    }
 }
 
 /// Appends `def_levels.iter().map(|&d| d <= cmp)` into `validity` without allocating an
@@ -346,33 +360,32 @@ fn append_def_le_bitmap(validity: &mut BooleanBufferBuilder, def_levels: &[u16],
         return;
     }
 
+    let pack = PACK_DEF_LE.get();
     if validity.len().is_multiple_of(8) {
         let byte_start = validity.len() / 8;
         validity.advance(def_levels.len());
         let dst = &mut validity.as_slice_mut()[byte_start..];
         let (chunks, rem) = def_levels.as_chunks::<32>();
-        let mut byte_off = 0usize;
-        for chunk in chunks {
-            let mask32 = pack_def_le_32(chunk, cmp);
-            dst[byte_off..byte_off + 4].copy_from_slice(&mask32.to_le_bytes());
-            byte_off += 4;
-        }
+        let (dst_chunks, dst_tail) = dst.split_at_mut(chunks.len() * 4);
+        pack.call(chunks.as_flattened(), cmp, dst_chunks);
         if !rem.is_empty() {
-            let mut tail_mask = 0u32;
-            for (i, &val) in rem.iter().enumerate() {
-                tail_mask |= u32::from(val <= cmp) << i;
-            }
-            let tail_bytes = tail_mask.to_le_bytes();
+            let tail_bytes = pack_def_le_bits(rem, cmp).to_le_bytes();
             let num_tail_bytes = rem.len().div_ceil(8);
-            dst[byte_off..byte_off + num_tail_bytes].copy_from_slice(&tail_bytes[..num_tail_bytes]);
+            dst_tail[..num_tail_bytes].copy_from_slice(&tail_bytes[..num_tail_bytes]);
         }
     } else {
         validity.reserve(def_levels.len());
+        // Packs a bounded batch at a time so one kernel call covers many words
+        // without allocating a full-length bitmap.
+        const WORDS_PER_BATCH: usize = 16;
+        let mut packed = [0u8; WORDS_PER_BATCH * 8];
         let (chunks, rem) = def_levels.as_chunks::<64>();
-        for chunk in chunks {
-            let lo = pack_def_le_32(&chunk[..32], cmp) as u64;
-            let hi = pack_def_le_32(&chunk[32..64], cmp) as u64;
-            validity.append_word(lo | (hi << 32), 64);
+        for batch in chunks.chunks(WORDS_PER_BATCH) {
+            let batch_bytes = &mut packed[..batch.len() * 8];
+            pack.call(batch.as_flattened(), cmp, batch_bytes);
+            for word in batch_bytes.as_chunks::<8>().0 {
+                validity.append_word(u64::from_le_bytes(*word), 64);
+            }
         }
         if !rem.is_empty() {
             let mut word = 0u64;
@@ -3205,7 +3218,7 @@ impl ControlWordParser {
 
 #[cfg(test)]
 mod tests {
-    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 
     use crate::encodings::logical::primitive::sparse::{
         SparsePositionPlan, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
@@ -4557,6 +4570,59 @@ mod tests {
                 true, false, true, false, true, true, true, true
             ]))
         );
+    }
+
+    /// Every host-supported kernel packs whole 32-level chunks like the
+    /// reference and leaves the bytes of a partial trailing chunk alone.
+    #[rstest::rstest]
+    fn test_pack_def_le_candidates_match_reference(
+        #[values(0, 32, 33, 96, 1024)] len: usize,
+        #[values(0, 2, u16::MAX - 1, u16::MAX)] cmp: u16,
+    ) {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(len as u64);
+        // Mix small levels with extremes that a saturating compare could mishandle.
+        let defs: Vec<u16> = (0..len)
+            .map(|_| match rng.random_range(0..8) {
+                0 => u16::MAX,
+                1 => u16::MAX - 1,
+                level => level,
+            })
+            .collect();
+        let whole_bytes = len / 32 * 4;
+        let mut expected = vec![0xa7u8; whole_bytes + 4];
+        for (i, &level) in defs[..len / 32 * 32].iter().enumerate() {
+            if level > cmp {
+                expected[i / 8] &= !(1 << (i % 8));
+            } else {
+                expected[i / 8] |= 1 << (i % 8);
+            }
+        }
+        for candidate in super::PACK_DEF_LE.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut actual = vec![0xa7u8; whole_bytes + 4];
+            kernel.call(&defs, cmp, &mut actual);
+            assert_eq!(actual, expected, "{} len={len} cmp={cmp}", candidate.name());
+        }
+    }
+
+    /// Byte-aligned and unaligned appends, the latter spanning several packing
+    /// batches, a partial batch and a remainder word.
+    #[rstest::rstest]
+    fn test_append_def_le_bitmap_matches_reference(#[values(0, 3, 8)] prefix_bits: usize) {
+        let defs: Vec<u16> = (0..2 * 1024 + 64 + 5).map(|i| (i * 7 % 5) as u16).collect();
+        let cmp = 2;
+        let mut builder = BooleanBufferBuilder::new(0);
+        builder.append_n(prefix_bits, true);
+        super::append_def_le_bitmap(&mut builder, &defs, cmp);
+        let expected: Vec<bool> = std::iter::repeat_n(true, prefix_bits)
+            .chain(defs.iter().map(|&d| d <= cmp))
+            .collect();
+        let actual: Vec<bool> = builder.finish().iter().collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
