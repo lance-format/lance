@@ -239,8 +239,9 @@ fn run_uring_thread(
                     }
                 }
             }
-            Err(e) => {
-                log::error!("Error processing io_uring completions: {}", e);
+            Err(error) => {
+                shutdown_with_error(ring, pending, &request_rx, &is_alive, thread_id, error);
+                return;
             }
         }
 
@@ -453,6 +454,22 @@ fn process_completions(
     ring: &mut IoUring,
     pending: &mut PendingRequests,
 ) -> io::Result<CompletionResult> {
+    // With IORING_FEAT_NODROP, overflowed completions stay in the kernel until
+    // io_uring_enter flushes them. submit() sets GETEVENTS when overflow is set,
+    // even with no new SQEs; otherwise a worker waiting only on reads can spin forever.
+    if ring.submission().cq_overflow() {
+        match ring.submit() {
+            Ok(_) => {}
+            // A full CQ can prevent flushing. Reap it below and retry next iteration.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::ResourceBusy
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
     let mut iops = 0;
     let mut sectors = 0;
     let mut retries = Vec::new();
@@ -525,16 +542,21 @@ fn process_completions(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueuedRequest, shutdown_with_error, start_uring_thread, submit_all};
+    use super::{
+        QueuedRequest, process_completions, push_to_sq, shutdown_with_error, start_uring_thread,
+        submit_all,
+    };
     use crate::uring::requests::{IoRequest, PendingRequests, RequestState};
     use bytes::BytesMut;
     use io_uring::IoUring;
     use std::collections::VecDeque;
     use std::io;
+    use std::os::unix::fs::FileExt;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn new_request() -> Arc<IoRequest> {
         Arc::new(IoRequest {
@@ -550,6 +572,61 @@ mod tests {
                 bytes_read: 0,
             }),
         })
+    }
+
+    #[test]
+    fn test_process_completions_reaps_overflow_without_new_submissions() {
+        // io_uring may be disabled by the host; this regression needs NODROP support.
+        // https://github.com/lance-format/lance/issues/11047
+        let Ok(mut ring) = IoUring::new(1) else {
+            return;
+        };
+        if !ring.params().is_feature_nodrop() {
+            return;
+        }
+        assert_eq!(ring.completion().capacity(), 2);
+
+        let requests: Vec<_> = (0..3).map(|_| new_request()).collect();
+        let mut pending = PendingRequests::default();
+        for (index, request) in requests.iter().enumerate() {
+            request.file.write_all_at(&[index as u8], 0).unwrap();
+            push_to_sq(&mut ring, &mut pending, Arc::clone(request)).unwrap();
+            submit_all(1, || ring.submit()).unwrap();
+        }
+
+        // Three completed reads cannot fit in the two-slot CQ without reaping.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ring.submission().cq_overflow() {
+            assert!(
+                Instant::now() < deadline,
+                "completion queue never overflowed"
+            );
+            thread::yield_now();
+        }
+        assert!(ring.submission().is_empty());
+
+        let mut completed_iops = 0;
+        for _ in 0..requests.len() {
+            let result = process_completions(&mut ring, &mut pending).unwrap();
+            assert!(result.retries.is_empty());
+            completed_iops += result.iops;
+            if pending.is_empty() {
+                break;
+            }
+        }
+
+        assert!(
+            pending.is_empty(),
+            "{} reads were not reaped",
+            pending.len()
+        );
+        assert_eq!(completed_iops, requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            let state = request.state.lock().unwrap();
+            assert!(state.completed);
+            assert!(state.err.is_none(), "{:?}", state.err);
+            assert_eq!(state.buffer.as_ref(), &[index as u8]);
+        }
     }
 
     #[test]
