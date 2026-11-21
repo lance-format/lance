@@ -101,8 +101,8 @@ async fn test_stable_row_indices() {
     // uuid. The scalar index defaults to BTree, which is address-domain
     // under stable row ids and supports remap, so eager compaction remaps
     // it in place (a new uuid, but full coverage of the live fragments) --
-    // unlike an index whose type cannot remap (ZoneMap, BloomFilter, FM;
-    // see `test_addr_domain_index_after_compaction_with_stable_row_ids`).
+    // unlike an index whose type cannot remap (BloomFilter, FM; see
+    // `test_addr_domain_index_after_compaction_with_stable_row_ids`).
     let current_indices = index_by_name(&dataset).await;
     assert_eq!(current_indices["vector"], indices["vector"]);
     assert_ne!(current_indices["scalar"], indices["scalar"]);
@@ -130,25 +130,31 @@ async fn test_stable_row_indices() {
 /// Regression test for https://github.com/lance-format/lance/issues/8076
 ///
 /// Zone map, bloom filter, and FM indices report matches as physical row addresses, so
-/// compaction invalidates it even under stable row ids. Reusing it for the rewritten
+/// compaction invalidates them even under stable row ids. Reusing one for the rewritten
 /// fragments made a filtered scan fail with an internal error (a fragment referenced
 /// by the index no longer existed) or, once translation tolerated that, silently drop
 /// every match.
 ///
-/// NGram also reports matches as physical row addresses, but -- unlike these
-/// three -- it supports eager remap (`ScalarIndexPlugin::can_remap`), so an
-/// eager compaction keeps it covering the rewritten fragments instead of
-/// losing coverage of them; see `test_compact_ngram_with_stable_row_ids` for
-/// that case instead.
+/// A zone map supports eager remap (`ScalarIndexPlugin::can_remap`), as NGram does
+/// (see `test_compact_ngram_with_stable_row_ids`), so an eager compaction keeps it
+/// covering the rewritten fragments; bloom filter and FM lose coverage of them instead.
 #[rstest]
-#[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i > 0", 199)]
-#[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+#[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i > 0", 199, true)]
+#[case::bloom_filter(
+    BuiltinIndexType::BloomFilter,
+    IndexType::BloomFilter,
+    "i",
+    "i = 0",
+    1,
+    false
+)]
 #[case::fm(
     BuiltinIndexType::Fm,
     IndexType::Fm,
     "text",
     "contains(text, 'needle')",
-    100
+    100,
+    false
 )]
 #[tokio::test]
 async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
@@ -157,6 +163,7 @@ async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
     #[case] indexed_column: &str,
     #[case] query: &str,
     #[case] expected_rows: usize,
+    #[case] remaps_eagerly: bool,
     #[values(false, true)] defer_index_remap: bool,
 ) {
     let mut dataset = lance_datagen::gen_batch()
@@ -213,6 +220,9 @@ async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
     let covered = index.effective_fragment_bitmap(&live_fragments);
     if defer_index_remap {
         // Readers translate its addresses through the fragment reuse index.
+        assert_eq!(covered, Some(live_fragments));
+    } else if remaps_eagerly {
+        // Its addresses were rewritten onto the new fragments.
         assert_eq!(covered, Some(live_fragments));
     } else {
         // The index only knows the pre-compaction fragments, so it must not claim
@@ -450,13 +460,13 @@ async fn test_read_bitmap_index_with_defer_index_remap() {
 /// address it stores. Stable row ids do not save it: they spare the
 /// row-id-domain indices a remap, not this one.
 ///
-/// Without a deferred remap there is nothing to repair those addresses with,
-/// so the rewritten fragments are dropped from its coverage and the scanner
-/// falls back to a full scan. Answers stay correct; the index stops earning
-/// its keep.
+/// An eager compaction remaps it like a BTree: its zones are relocated onto
+/// the rewritten fragments, so it keeps covering them and answers like a
+/// scan.
 #[tokio::test]
-async fn test_zonemap_loses_coverage_compacting_stable_row_ids() {
+async fn test_zonemap_keeps_coverage_compacting_stable_row_ids() {
     let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+    let zonemap_before = dataset.load_indices_by_name("value_idx").await.unwrap();
 
     compact_files(
         &mut dataset,
@@ -477,21 +487,18 @@ async fn test_zonemap_loses_coverage_compacting_stable_row_ids() {
             .is_none(),
         "an eager compaction writes no fragment-reuse index"
     );
-    assert!(
-        zonemap_coverage(&dataset).await.is_empty(),
-        "coverage should have been dropped rather than followed"
-    );
+    let live_fragments: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    assert_eq!(zonemap_coverage(&dataset).await, live_fragments);
+    let zonemap_after = dataset.load_indices_by_name("value_idx").await.unwrap();
+    assert_ne!(zonemap_before[0].uuid, zonemap_after[0].uuid);
     assert_zonemap_answers_match_scan(&dataset).await;
+    assert_zonemap_is_used(&dataset).await;
 }
-/// When a remap-capable index (BTree) shares a stable-row-id table with a
-/// ZoneMap, an eager compaction must still remap the BTree in place and
-/// drop the ZoneMap's coverage of the rewritten fragments -- the same
-/// outcome as each index alone -- even though `DatasetIndexRemapper`
-/// never opens the ZoneMap to find that out (it isn't
-/// `supports_eager_remap`, so it's excluded up front rather than opened
-/// and found to report `RemapResult::Drop`).
+/// When a BTree shares a stable-row-id table with a ZoneMap, an eager
+/// compaction remaps both in place onto the rewritten fragments -- the same
+/// outcome as each index alone.
 #[tokio::test]
-async fn test_eager_compaction_remaps_btree_and_drops_zonemap_coverage_together() {
+async fn test_eager_compaction_remaps_btree_and_zonemap_together() {
     let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
     dataset
         .create_index(
@@ -532,9 +539,11 @@ async fn test_eager_compaction_remaps_btree_and_drops_zonemap_coverage_together(
         id_idx_before[0].uuid, id_idx_after[0].uuid,
         "the BTree must be remapped onto the rewritten fragments"
     );
-    assert!(
-        zonemap_coverage(&dataset).await.is_empty(),
-        "the ZoneMap's coverage should have been dropped rather than remapped"
+    let live_fragments: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    assert_eq!(
+        zonemap_coverage(&dataset).await,
+        live_fragments,
+        "the ZoneMap must be remapped onto the rewritten fragments"
     );
 
     assert_zonemap_answers_match_scan(&dataset).await;
@@ -647,6 +656,117 @@ async fn test_read_address_index_with_defer_index_remap(
 
     address_index.create(&mut dataset, true).await;
     assert_index_answers(&dataset, &address_index.cases(true)).await;
+}
+/// A deferred compaction over a deleted row and nulls leaves the zone map
+/// translating through the fragment reuse index; `remap_column_index` then
+/// relocates its zones onto the rewritten fragment, so the remapped segment
+/// covers it on its own and the reuse history can be trimmed. The remap
+/// reads only the current manifest, so it still works once older manifests,
+/// including the one the index was built at, are cleaned up.
+#[rstest]
+#[tokio::test]
+async fn test_remap_zonemap_after_deferred_compaction(
+    #[values(false, true)] enable_stable_row_ids: bool,
+    #[values(false, true)] remove_old_manifests: bool,
+) {
+    let dir = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, (0..12).collect::<Vec<_>>()),
+        (
+            "value",
+            Int64,
+            [
+                Some(0),
+                None,
+                Some(20),
+                Some(30),
+                Some(40),
+                None,
+                Some(60),
+                Some(70),
+                Some(80),
+                None,
+                Some(100),
+                Some(110)
+            ]
+        )
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 4,
+            enable_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let address_index = AddressIndex::ZoneMap;
+    address_index.create(&mut dataset, false).await;
+    dataset.delete("id = 1").await.unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 512,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let before = dataset.load_indices_by_name("addr_idx").await.unwrap();
+    assert_eq!(before.len(), 1);
+
+    if remove_old_manifests {
+        dataset
+            .cleanup(crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                delete_unverified: true,
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .checkout_version(before[0].dataset_version)
+                .await
+                .is_err(),
+            "the manifest the index was built at must be gone"
+        );
+    }
+
+    let remap_version = dataset.manifest.version;
+    remapping::remap_column_index(
+        &mut dataset,
+        &[address_index.column()],
+        Some("addr_idx".into()),
+    )
+    .await
+    .unwrap();
+    let after = dataset.load_indices_by_name("addr_idx").await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_ne!(after[0].uuid, before[0].uuid);
+    let live_fragments: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    assert_eq!(after[0].fragment_bitmap.as_ref(), Some(&live_fragments));
+    assert_eq!(after[0].dataset_version, remap_version);
+    assert_index_answers(&dataset, &address_index.cases(false)).await;
+
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert!(
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .is_none_or(|frag_reuse| frag_reuse.details.versions.is_empty()),
+        "the remapped segment no longer needs the reuse history"
+    );
+    assert_index_answers(&dataset, &address_index.cases(false)).await;
 }
 #[rstest]
 #[tokio::test]

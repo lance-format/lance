@@ -307,7 +307,9 @@ enum IndexPresence {
     None,
     /// BTree: address-domain and its type supports an eager remap.
     RemapCapable,
-    /// ZoneMap: address-domain, but its type always reports
+    /// ZoneMap: address-domain and, like BTree, remapped eagerly.
+    RemapCapableZoneMap,
+    /// BloomFilter: address-domain, but its type always reports
     /// `RemapResult::Drop`, so it can never be an eager-remap consumer.
     AddressDomainOnly,
 }

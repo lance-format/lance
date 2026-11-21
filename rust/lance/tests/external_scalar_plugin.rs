@@ -25,7 +25,8 @@ use lance_index::{
     progress::IndexBuildProgress,
     scalar::{
         CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-        expression::{SargableQueryParser, ScalarQueryParser},
+        bloomfilter::BloomFilterIndexPlugin,
+        expression::{BloomFilterQueryParser, SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
         zonemap::{ZoneMapIndexPlugin, ZoneMapSeedWriter},
@@ -55,6 +56,8 @@ const ROWS_PER_ZONE: u64 = 2;
 // Every test registers before its first dataset operation, even when tests run concurrently.
 static REGISTRATION: LazyLock<()> = LazyLock::new(|| {
     register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap();
+    register_scalar_index_plugin::<LegacyBloomFilterIndexDetails, LegacyBloomFilterIndexPlugin>()
+        .unwrap();
 });
 
 #[async_trait]
@@ -148,6 +151,96 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
             ROWS_PER_ZONE,
             data_type.clone(),
         )?)))
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyBloomFilterIndexDetails {}
+
+impl Name for LegacyBloomFilterIndexDetails {
+    const NAME: &'static str = "LegacyBloomFilterIndexDetails";
+    const PACKAGE: &'static str = "example.index";
+}
+
+/// A legacy external plugin whose loaded index reports
+/// `ScalarIndex::can_remap == false`, by delegating to BloomFilter.
+#[derive(Debug, Default)]
+struct LegacyBloomFilterIndexPlugin;
+
+#[async_trait]
+impl BasicTrainer for LegacyBloomFilterIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        BloomFilterIndexPlugin.new_training_request(params, field)
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let mut created = BloomFilterIndexPlugin
+            .train_index(data, index_store, request, fragment_ids, progress)
+            .await?;
+        created.index_details = prost_types::Any::from_msg(&LegacyBloomFilterIndexDetails {})?;
+        Ok(created)
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for LegacyBloomFilterIndexPlugin {
+    // Deliberately does not implement `can_remap`, like `ExampleIndexPlugin`.
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "LegacyBloomFilter"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        BloomFilterIndexPlugin.version()
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(BloomFilterQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        BloomFilterIndexPlugin
+            .load_index(
+                index_store,
+                index_details,
+                index_version,
+                frag_reuse_index,
+                cache,
+            )
+            .await
     }
 }
 
@@ -245,7 +338,7 @@ async fn external_address_index_keeps_rewritten_rows_visible(#[case] compact: bo
     assert_eq!(actual, expected, "rewritten rows must remain visible");
 }
 
-/// The example plugin predates `ScalarIndexPlugin::can_remap`, so the metadata
+/// The legacy plugin predates `ScalarIndexPlugin::can_remap`, so the metadata
 /// capability defaults to `true` and compaction keeps the existing
 /// load-and-check path. The loaded index still reports
 /// `ScalarIndex::can_remap == false`; that must keep it on the safe fallback
@@ -274,8 +367,8 @@ async fn legacy_external_plugin_can_remap_false_stays_on_fallback() {
         .create_index(
             &["value"],
             IndexType::Scalar,
-            Some("example_index".to_string()),
-            &ScalarIndexParams::new("example".to_string()),
+            Some("legacy_index".to_string()),
+            &ScalarIndexParams::new("legacybloomfilter".to_string()),
             false,
         )
         .await

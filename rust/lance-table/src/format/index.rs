@@ -225,9 +225,9 @@ impl IndexMetadata {
     ///
     /// Such an index cannot follow its data through a rewrite the way a row-id-domain
     /// index can: the addresses it stores name fragments and offsets, which a rewrite
-    /// invalidates. A type whose index supports remap (BTree) can still be rewritten in
-    /// place; a type that cannot (ZoneMap, BloomFilter, FM) instead loses coverage of the
-    /// rewritten fragments until it is rebuilt, or is kept in step through the fragment
+    /// invalidates. A type whose index supports remap (BTree, ZoneMap) can still be
+    /// rewritten in place; a type that cannot (BloomFilter, FM) instead loses coverage of
+    /// the rewritten fragments until it is rebuilt, or is kept in step through the fragment
     /// reuse index's read-time translation.
     ///
     /// Currently this is a rather short list.  We will soon be migrating the remaining
@@ -294,6 +294,11 @@ impl IndexMetadata {
 
     // A list-element segment wraps a B-tree that always stores row addresses
     // (`lance_index::scalar::list_element`), at every format version.
+    // A ZoneMap segment stores row addresses at every version.
+    fn is_zonemap(details: &prost_types::Any) -> bool {
+        details.type_url.ends_with("ZoneMapIndexDetails")
+    }
+
     fn is_list_element(details: &prost_types::Any) -> bool {
         details
             .type_url
@@ -325,13 +330,14 @@ impl IndexMetadata {
     /// and its type actively supports being remapped in place onto a rewrite's new
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
-    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram and
-    /// MinHash LSH's indexes support this today (`ScalarIndexPlugin::can_remap`);
-    /// ZoneMap, BloomFilter, FM and RTree cannot remap. This gate recognizes the
-    /// supported built-in address-domain formats without opening index files.
+    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram,
+    /// MinHash LSH and ZoneMap indices support this today (`ScalarIndexPlugin::can_remap`);
+    /// BloomFilter, FM and RTree cannot remap. This gate recognizes the supported
+    /// built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             Self::is_btree_addr_domain(details, self.index_version)
+                || Self::is_zonemap(details)
                 || Self::is_bitmap_addr_domain(details, self.index_version)
                 || Self::is_label_list_addr_domain(details, self.index_version)
                 || Self::is_list_element(details)
@@ -1461,14 +1467,19 @@ mod tests {
         assert_eq!(metadata.supports_eager_remap(), supports_eager_remap);
     }
 
-    /// A list-element index stores row addresses at every version, and remaps
-    /// its B-tree during compaction, so it keeps covering rewritten fragments on
-    /// a stable-row-ID table.
+    /// List-element and ZoneMap indices store row addresses at every version
+    /// and remap them during compaction, so they keep covering rewritten
+    /// fragments on a stable-row-ID table.
     #[rstest]
-    fn test_list_element_is_remappable_addr_domain(#[values(0, 1)] index_version: i32) {
+    #[case::list_element("type.googleapis.com/lance.index.pb.ListElementIndexDetails")]
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails")]
+    fn test_remappable_addr_domain_at_every_version(
+        #[case] type_url: &str,
+        #[values(0, 1)] index_version: i32,
+    ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/lance.index.pb.ListElementIndexDetails".to_string(),
+            type_url: type_url.to_string(),
             value: Vec::new(),
         }));
         metadata.index_version = index_version;

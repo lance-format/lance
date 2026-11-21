@@ -577,7 +577,7 @@ async fn test_undrained_fri_allows_a_repack_only_plan(
     assert!(plan.contains("ScalarIndexQuery"), "{plan}");
     assert_eq!(dataset.count_rows(Some("i = 7".into())).await.unwrap(), 1);
 }
-/// A table whose only index can never consume an eager remap (ZoneMap
+/// A table whose only index can never consume an eager remap (BloomFilter
 /// always reports `RemapResult::Drop`) still has to honor row-address
 /// moves its tasks recorded under `defer_index_remap` at plan/execution
 /// time, even when the commit uses different, eager options --
@@ -591,9 +591,9 @@ async fn test_recorded_moves_over_unremappable_index_still_commit_as_fri() {
     dataset
         .create_index(
             &["i"],
-            IndexType::ZoneMap,
+            IndexType::BloomFilter,
             Some("i_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
             false,
         )
         .await
@@ -2247,8 +2247,9 @@ async fn test_distributed_deferred_compaction_keeps_mappings_recorded_before_its
 /// A compaction without `defer_index_remap` records nothing, whatever
 /// history the table has, through `compact_files` and through the
 /// distributed API: the history and the feature flags stay as they were,
-/// every row keeps its stable row id, and a zone map stops covering the
-/// rewritten fragments and still answers as a scan does.
+/// every row keeps its stable row id, and an index that cannot remap
+/// (BloomFilter) stops covering the rewritten fragments and still answers as
+/// a scan does.
 #[rstest]
 #[tokio::test]
 async fn test_compaction_records_only_when_deferred(
@@ -2270,9 +2271,9 @@ async fn test_compaction_records_only_when_deferred(
         dataset
             .create_index(
                 &["i"],
-                IndexType::ZoneMap,
+                IndexType::BloomFilter,
                 Some("i_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
                 false,
             )
             .await
@@ -2325,7 +2326,14 @@ async fn test_compaction_records_only_when_deferred(
             .collect::<RoaringBitmap>()
             & fragments_before;
         assert_eq!(coverage, untouched);
-        assert_index_answers_like_a_scan(&latest).await;
+        for filter in ["i = 7", "i = 45", "i IN (3, 30, 55)"] {
+            assert_eq!(
+                values_matching(&latest, "i", filter, true).await,
+                values_matching(&latest, "i", filter, false).await,
+                "{filter}"
+            );
+            assert_index_is_used(&latest, filter, "i_idx").await;
+        }
     }
 }
 /// A second recorded compaction keeps row identity however the rewrite

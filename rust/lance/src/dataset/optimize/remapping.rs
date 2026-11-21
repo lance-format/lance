@@ -335,13 +335,18 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // leaves missing mappings unchanged, so no composed per-row map is needed.
     // This also handles the sibling-coverage-remap case: remapping is driven by
     // the row addresses stored in the index, not by its already-advanced bitmap.
-    let remap_result = index::remap::remap_index(
-        dataset,
-        index_id,
-        &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
-        None,
-    )
-    .await?;
+    // A segment with unknown coverage cannot have fragments subtracted from
+    // it, so it takes the plain remap, which drops a segment that would have
+    // to withdraw some.
+    let translator = RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone());
+    let (remap_result, withdrawn_fragments) = if has_unknown_coverage {
+        (
+            index::remap::remap_index(dataset, index_id, &translator, None).await?,
+            RoaringBitmap::new(),
+        )
+    } else {
+        index::remap::remap_index_with_withdrawals(dataset, index_id, &translator, None).await?
+    };
 
     // Remapping advances the index watermark for fragment-reuse cleanup, but it
     // does not incorporate overlays committed after the source index was built.
@@ -353,6 +358,9 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             &curr_index_meta,
             dataset.schema(),
         );
+        // Fragments the remapped files hold no sound statistics for are
+        // scanned instead.
+        *fragment_bitmap -= &withdrawn_fragments;
     }
     let new_dataset_version = if has_unknown_coverage {
         curr_index_meta.dataset_version
@@ -2467,9 +2475,11 @@ mod tests {
             assert!(plan.contains("ScalarIndexQuery"), "{plan}");
         }
 
-        /// A segment whose index type cannot be remapped is kept as it is on
-        /// a tagged table (queries keep translating through the reuse index),
-        /// never dropped the way the compaction path withdraws it.
+        /// A segment that cannot be remapped through a tagged history's batch
+        /// translator (a ZoneMap, whose legacy remap declines without a
+        /// complete in-memory mapping) is kept as it is on a tagged table
+        /// (queries keep translating through the reuse index), never dropped
+        /// the way the compaction path withdraws it.
         #[tokio::test]
         #[serial_test::serial(frag_reuse_maintenance)]
         async fn non_remappable_segment_is_kept_on_tagged_table() {

@@ -48,19 +48,22 @@ use crate::scalar::{
     RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
     lance_format::LanceIndexStore,
     zonemap::{
-        HarvestedZoneSeed, ReusedZones, SEED_NULL_BITMAP_META_KEY, SEED_VERSION_META_KEY,
-        SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
-        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedWriter, ZoneMapSegmentBase,
-        build_zonemap_segment, merge_seeds_for_binary_copy, merge_zonemap_indices,
-        parse_seed_for_binary_copy, place_records, remap_zone,
+        HarvestedZoneSeed, RemapBudget, ReusedZones, SEED_NULL_BITMAP_META_KEY,
+        SEED_VERSION_META_KEY, SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
+        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapRemapNeedsWithdrawal,
+        ZoneMapRemapOverBudget, ZoneMapSeedWriter, ZoneMapSegmentBase, build_zonemap_segment,
+        merge_seeds_for_binary_copy, merge_zonemap_indices, parse_seed_for_binary_copy,
+        place_records, remap_zone, remap_zone_in_chunks, remap_zone_runs, v1_zone_violation,
     },
 };
 use arrow_array::Int32Array;
 use lance_core::Error;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 use crate::Index;
 use crate::metrics::NoOpMetricsCollector;
 use roaring::RoaringBitmap;
+use rstest::rstest;
 use std::collections::HashMap;
 
 // Adds a _rowaddr column emulating each batch as a new fragment
@@ -190,6 +193,32 @@ impl RowIdRemapper for TestRemapper {
     }
 }
 
+/// `remap_zone` through `remapper`, with the destination fragments it
+/// reports unrepresentable.
+fn remap_zone_with(
+    zone: &ZoneMapStatistics,
+    remapper: &dyn RowIdRemapper,
+    remapped_null_rows: Option<&RowAddrTreeMap>,
+    bounds_decide_comparable: bool,
+) -> (Vec<ZoneMapStatistics>, RoaringBitmap) {
+    let translate = |addrs: &mut [Option<u64>]| {
+        for addr in addrs.iter_mut() {
+            *addr = addr.and_then(|addr| remapper.remap_row_id(addr));
+        }
+    };
+    let mut unrepresentable = RoaringBitmap::new();
+    let zones = remap_zone(
+        zone,
+        &translate,
+        remapped_null_rows,
+        bounds_decide_comparable,
+        None,
+        &mut unrepresentable,
+    )
+    .unwrap();
+    (zones, unrepresentable)
+}
+
 #[test]
 fn test_remap_zone_splits_discontiguous_runs() {
     let old_start = (2_u64 << 32) + 10;
@@ -230,7 +259,7 @@ fn test_remap_zone_splits_discontiguous_runs() {
     remapped_null_rows.insert(new_start + 1);
 
     assert_eq!(
-        remap_zone(&zone, &remapper, Some(&remapped_null_rows), false, None).unwrap(),
+        remap_zone_with(&zone, &remapper, Some(&remapped_null_rows), false).0,
         vec![first_run, second_run]
     );
 }
@@ -252,32 +281,42 @@ async fn test_remap_nested_mixed_null_zone_keeps_non_null_candidates() {
 
     let new_start = 3_u64 << 32;
     let remapper = TestRemapper::new([(2, new_start), (3, new_start + 1)]);
-    let remapped_null_rows = RowAddrTreeMap::new();
-    let zones = remap_zone(
-        &mixed_null_zone,
-        &remapper,
-        Some(&remapped_null_rows),
-        true,
-        None,
-    )
-    .unwrap();
+    // An exact (empty) bitmap counts the run's nulls; without one the run
+    // keeps a conservative single null and its non-null candidates.
+    for (remapped_null_rows, expected_null_count) in [(Some(RowAddrTreeMap::new()), 0), (None, 1)] {
+        let (zones, unrepresentable) = remap_zone_with(
+            &mixed_null_zone,
+            &remapper,
+            remapped_null_rows.as_ref(),
+            false,
+        );
 
-    assert_eq!(zones.len(), 1);
-    assert_eq!(zones[0].bound.length, 2);
-    assert_eq!(zones[0].null_count, 0);
-    assert!(
-        index
-            .evaluate_zone_against_query(
-                &zones[0],
-                &SargableQuery::Equals(fsl_scalar(vec![Some(3.0), Some(4.0)])),
-            )
-            .unwrap(),
-        "the two surviving rows are non-null candidates"
-    );
+        assert!(unrepresentable.is_empty());
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].bound.length, 2);
+        assert_eq!(zones[0].null_count, expected_null_count);
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &zones[0],
+                    &SargableQuery::Equals(fsl_scalar(vec![Some(3.0), Some(4.0)])),
+                )
+                .unwrap(),
+            "the two surviving rows are non-null candidates"
+        );
+        assert_eq!(
+            index
+                .evaluate_zone_against_query(&zones[0], &SargableQuery::IsNull())
+                .unwrap(),
+            expected_null_count > 0
+        );
+    }
 }
 
+/// A mixed-null singleton without exact positions has no sound counts (one
+/// null would claim the row is null), so its destination is withdrawn.
 #[test]
-fn test_remap_nested_mixed_null_singleton_without_bitmap_is_rejected() {
+fn test_remap_nested_mixed_null_singleton_without_bitmap_is_withdrawn() {
     let zone = ZoneMapStatistics {
         min: ScalarValue::Null,
         max: ScalarValue::Null,
@@ -292,13 +331,9 @@ fn test_remap_nested_mixed_null_singleton_without_bitmap_is_rejected() {
     };
     let remapper = TestRemapper::new([(2, 0)]);
 
-    let error = remap_zone(&zone, &remapper, None, true, None).unwrap_err();
-    assert!(matches!(error, lance_core::Error::NotSupported { .. }));
-    assert!(
-        error
-            .to_string()
-            .contains("cannot safely remap a mixed-null ZoneMap zone")
-    );
+    let (zones, unrepresentable) = remap_zone_with(&zone, &remapper, None, false);
+    assert!(zones.is_empty());
+    assert_eq!(unrepresentable, RoaringBitmap::from_iter([0u32]));
 }
 
 #[tokio::test]
@@ -348,7 +383,8 @@ async fn test_merge_legacy_decimal_mixed_null_singleton_is_rejected() {
     assert!(
         error
             .to_string()
-            .contains("cannot safely remap a mixed-null ZoneMap zone")
+            .contains("cannot merge remapped ZoneMap zones"),
+        "{error}"
     );
 }
 
@@ -389,14 +425,9 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
         .unwrap();
     assert!(negative_nan_count.is_null(0));
 
-    let remapped = remap_zone(
-        &source.zones[0],
-        source.fri.as_deref().unwrap(),
-        None,
-        false,
-        None,
-    )
-    .unwrap();
+    let (remapped, unrepresentable) =
+        remap_zone_with(&source.zones[0], source.fri.as_deref().unwrap(), None, true);
+    assert!(unrepresentable.is_empty());
     assert_eq!(remapped.len(), 1);
     assert_eq!(remapped[0].bound.length, 1);
     assert_eq!(remapped[0].nan_count, 1, "inherited, not exact");
@@ -424,11 +455,7 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
     }
 
     let dest_tmpdir = TempObjDir::default();
-    let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
-        dest_tmpdir.clone(),
-        Arc::new(LanceCache::no_cache()),
-    ));
+    let dest_store = local_store(&dest_tmpdir);
     let created = merge_zonemap_indices(
         &[source.as_ref()],
         dest_store.as_ref(),
@@ -457,8 +484,7 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
 
 /// The legacy-null variant: [5, null] without a null bitmap remapped to
 /// the single 5 row keeps `null_count = 1`; the bounds, not that count,
-/// decide bounded ranges. Such an inexact count is persisted only by a
-/// version 0 merge (a version 1 merge refuses it).
+/// decide bounded ranges.
 #[tokio::test]
 async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
     let mut source = train_and_load::<Int64Type>(vec![vec![Some(5), None]]).await;
@@ -468,14 +494,9 @@ async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
     let new_row = 3_u64 << 32;
     source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
 
-    let remapped = remap_zone(
-        &source.zones[0],
-        source.fri.as_deref().unwrap(),
-        None,
-        false,
-        None,
-    )
-    .unwrap();
+    let (remapped, unrepresentable) =
+        remap_zone_with(&source.zones[0], source.fri.as_deref().unwrap(), None, true);
+    assert!(unrepresentable.is_empty());
     assert_eq!(remapped.len(), 1);
     assert_eq!(remapped[0].bound.length, 1);
     assert_eq!(remapped[0].null_count, 1, "inherited, not exact");
@@ -499,11 +520,7 @@ async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
     }
 
     let dest_tmpdir = TempObjDir::default();
-    let dest_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
-        dest_tmpdir.clone(),
-        Arc::new(LanceCache::no_cache()),
-    ));
+    let dest_store = local_store(&dest_tmpdir);
     merge_zonemap_indices(
         &[source.as_ref()],
         dest_store.as_ref(),
@@ -527,6 +544,608 @@ async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
             "merged index must keep the 5 row for {query:?}"
         );
     }
+}
+
+/// Legacy (version 0, no null bitmap) zones without recorded bounds
+/// narrowed to their single comparable row: [5.0, NaN] keeps a NaN of
+/// unknown sign and [5, null] a null, and with no bounds to fall back on
+/// neither count fits one row without claiming that the row is not
+/// comparable. The run's destination is withdrawn, and a merge that keeps
+/// it is refused before anything is written.
+#[tokio::test]
+async fn test_remapped_legacy_singleton_is_withdrawn() {
+    let new_row = 3_u64 << 32;
+    let mut nan_placeholder =
+        train_and_load::<Float64Type>(vec![vec![Some(5.0), Some(f64::NAN)]]).await;
+    let source_mut = Arc::get_mut(&mut nan_placeholder).unwrap();
+    source_mut.version = ZoneMapIndexVersion::V0;
+    let zone = &mut source_mut.zones[0];
+    zone.min = ScalarValue::Float64(None);
+    zone.max = ScalarValue::Float64(None);
+    zone.negative_nan_count = None;
+    assert_eq!(zone.nan_count, 1);
+    source_mut.null_rows = None;
+    source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+
+    let mut legacy_null = train_and_load::<Int64Type>(vec![vec![Some(5), None]]).await;
+    let source_mut = Arc::get_mut(&mut legacy_null).unwrap();
+    source_mut.version = ZoneMapIndexVersion::V0;
+    let zone = &mut source_mut.zones[0];
+    zone.min = ScalarValue::Int64(None);
+    zone.max = ScalarValue::Int64(None);
+    source_mut.null_rows = None;
+    source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+
+    for source in [nan_placeholder, legacy_null] {
+        let (zones, unrepresentable) =
+            remap_zone_with(&source.zones[0], source.fri.as_deref().unwrap(), None, true);
+        assert!(zones.is_empty());
+        assert_eq!(unrepresentable, RoaringBitmap::from_iter([3u32]));
+
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let err = merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .err()
+        .expect("a kept unrepresentable run must refuse the merge");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(dest_store.open_index_file(ZONEMAP_FILENAME).await.is_err());
+    }
+}
+
+/// Builds a version 1 index over `fragments` (one batch per fragment) with
+/// `rows_per_zone` rows per zone into `store`, and loads it back.
+async fn train_float_fragments(
+    store: Arc<LanceIndexStore>,
+    rows_per_zone: u64,
+    fragments: Vec<Vec<Option<f64>>>,
+) -> Arc<ZoneMapIndex> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        VALUE_COLUMN_NAME,
+        DataType::Float64,
+        true,
+    )]));
+    let batches = fragments
+        .into_iter()
+        .map(|values| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(values))])
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream::iter(batches.into_iter().map(Ok)),
+    ));
+    ZoneMapIndexPlugin::train_zonemap_index(
+        add_row_addr(stream),
+        store.as_ref(),
+        Some(ZoneMapIndexBuilderParams::new(rows_per_zone)),
+        &NoopIndexBuildProgress,
+    )
+    .await
+    .unwrap();
+    ZoneMapIndex::load(
+        store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap()
+}
+
+fn row(fragment: u64, offset: u64) -> u64 {
+    (fragment << 32) | offset
+}
+
+/// A direct remap moving each `(old, new)` address in `moves` and deleting
+/// every address in `deleted`.
+fn direct_remap(moves: &[(u64, u64)], deleted: &[u64]) -> RowAddrRemap {
+    RowAddrRemap::direct(
+        moves
+            .iter()
+            .map(|&(old, new)| (old, Some(new)))
+            .chain(deleted.iter().map(|&old| (old, None)))
+            .collect(),
+    )
+}
+
+/// Remaps `source` through `mapping` into a fresh store and loads the
+/// result, returning it with the withdrawn fragments. Every written zone
+/// must hold the version 1 invariants.
+async fn remap_and_load(
+    source: &ZoneMapIndex,
+    mapping: &RowAddrRemap,
+) -> (Arc<ZoneMapIndex>, RoaringBitmap) {
+    let dest_tmpdir = TempObjDir::default();
+    let dest_store = local_store(&dest_tmpdir);
+    let (created, withdrawn) = source
+        .remap_with_withdrawals(mapping, dest_store.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(created.index_version, ZoneMapIndexVersion::V1 as u32);
+    let remapped = ZoneMapIndex::load(
+        dest_store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    for zone in &remapped.zones {
+        assert_eq!(
+            v1_zone_violation(
+                &zone.min,
+                &zone.max,
+                zone.null_count,
+                zone.nan_count,
+                zone.negative_nan_count.unwrap(),
+                zone.bound.length as u64,
+                false,
+            ),
+            None,
+            "{zone:?}"
+        );
+    }
+    (remapped, withdrawn)
+}
+
+/// The predicates `value` satisfies, so a zone holding a row of it must
+/// stay a candidate for each.
+fn predicates_matching(value: Option<f64>) -> Vec<SargableQuery> {
+    let Some(value) = value else {
+        return vec![
+            SargableQuery::IsNull(),
+            SargableQuery::Equals(ScalarValue::Float64(None)),
+        ];
+    };
+    let scalar = ScalarValue::Float64(Some(value));
+    let mut predicates = vec![
+        SargableQuery::Equals(scalar.clone()),
+        SargableQuery::IsIn(vec![scalar.clone()]),
+        SargableQuery::Range(Bound::Included(scalar.clone()), Bound::Unbounded),
+        SargableQuery::Range(Bound::Unbounded, Bound::Included(scalar.clone())),
+    ];
+    if value.is_nan() {
+        // A NaN bound on the opposite side of the value's sign holds it
+        // through the counts alone.
+        let opposite = if value.is_sign_negative() {
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Float64(Some(f64::NAN))),
+            )
+        } else {
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Float64(Some(-f64::NAN))),
+                Bound::Unbounded,
+            )
+        };
+        predicates.push(opposite);
+    } else {
+        predicates.extend([
+            SargableQuery::Range(Bound::Included(scalar.clone()), Bound::Included(scalar)),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Float64(Some(f64::NAN))),
+            ),
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Float64(Some(-f64::NAN))),
+                Bound::Unbounded,
+            ),
+        ]);
+    }
+    predicates
+}
+
+/// Every row that survives `mapping` outside the withdrawn fragments must
+/// stay a candidate of `remapped` for every predicate its value satisfies.
+async fn assert_survivors_are_candidates(
+    remapped: &ZoneMapIndex,
+    fragments: &[Vec<Option<f64>>],
+    mapping: &RowAddrRemap,
+    withdrawn: &RoaringBitmap,
+) {
+    for (fragment, values) in fragments.iter().enumerate() {
+        for (offset, value) in values.iter().enumerate() {
+            let old = row(fragment as u64, offset as u64);
+            let Some(new) = mapping.get(old).unwrap_or(Some(old)) else {
+                continue;
+            };
+            if withdrawn.contains((new >> 32) as u32) {
+                continue;
+            }
+            for predicate in predicates_matching(*value) {
+                let result = remapped
+                    .search(&predicate, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                assert!(
+                    result.row_addrs().selected(new),
+                    "row {old:#x} -> {new:#x} ({value:?}) lost for {predicate:?}"
+                );
+            }
+        }
+    }
+}
+
+/// One relocation through [`ZoneMapIndex::remap_with_withdrawals`].
+struct RemapCase {
+    fragments: Vec<Vec<Option<f64>>>,
+    rows_per_zone: u64,
+    keeps_null_bitmap: bool,
+    moves: Vec<(u64, u64)>,
+    deleted: Vec<u64>,
+    /// `(fragment, start, length, null_count, nan_count, negative_nan_count)`.
+    expected_zones: Vec<(u64, u64, usize, u32, u32, u32)>,
+    expected_withdrawn: Vec<u32>,
+}
+
+/// Moves fragment `from`'s `offsets`, in order, to consecutive offsets of
+/// fragment `to` starting at `to_start`.
+fn moved(
+    from: u64,
+    offsets: impl IntoIterator<Item = u64>,
+    to: u64,
+    to_start: u64,
+) -> Vec<(u64, u64)> {
+    offsets
+        .into_iter()
+        .zip(to_start..)
+        .map(|(offset, new_offset)| (row(from, offset), row(to, new_offset)))
+        .collect()
+}
+
+fn remap_case(
+    fragments: Vec<Vec<Option<f64>>>,
+    rows_per_zone: u64,
+    keeps_null_bitmap: bool,
+    moves: Vec<(u64, u64)>,
+    deleted: Vec<u64>,
+    expected_zones: Vec<(u64, u64, usize, u32, u32, u32)>,
+    expected_withdrawn: Vec<u32>,
+) -> RemapCase {
+    RemapCase {
+        fragments,
+        rows_per_zone,
+        keeps_null_bitmap,
+        moves,
+        deleted,
+        expected_zones,
+        expected_withdrawn,
+    }
+}
+
+const NAN: Option<f64> = Some(f64::NAN);
+const NEG_NAN: Option<f64> = Some(-f64::NAN);
+
+#[rstest]
+#[case::unaffected_fragment_untouched(remap_case(
+    vec![vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)], vec![Some(5.0), Some(6.0), Some(7.0), Some(8.0)]],
+    4, true, moved(1, 0..4, 10, 0), vec![],
+    vec![(0, 0, 4, 0, 0, 0), (10, 0, 4, 0, 0, 0)], vec![],
+))]
+#[case::whole_zone_keeps_exact_counts(remap_case(
+    vec![vec![None, NAN, NEG_NAN, Some(4.0)]],
+    4, false, moved(0, 0..4, 10, 0), vec![],
+    vec![(10, 0, 4, 1, 2, 1)], vec![],
+))]
+#[case::two_sources_concatenated(remap_case(
+    vec![vec![Some(1.0), None], vec![Some(3.0), Some(4.0)]],
+    2, true, [moved(0, 0..2, 10, 0), moved(1, 0..2, 10, 2)].concat(), vec![],
+    vec![(10, 0, 2, 1, 0, 0), (10, 2, 2, 0, 0, 0)], vec![],
+))]
+#[case::deleted_row_narrows_zone(remap_case(
+    vec![vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)]],
+    4, false, moved(0, [0, 2, 3], 10, 0), vec![row(0, 1)],
+    vec![(10, 0, 3, 0, 0, 0)], vec![],
+))]
+#[case::narrowed_mixed_null_without_bitmap(remap_case(
+    vec![vec![None, Some(2.0), Some(3.0), Some(4.0)]],
+    4, false, moved(0, 0..3, 10, 0), vec![row(0, 3)],
+    vec![(10, 0, 3, 1, 0, 0)], vec![],
+))]
+#[case::narrowed_mixed_null_with_bitmap(remap_case(
+    vec![vec![None, Some(2.0), Some(3.0), Some(4.0)]],
+    4, true, moved(0, 1..4, 10, 0), vec![row(0, 0)],
+    vec![(10, 0, 3, 0, 0, 0)], vec![],
+))]
+#[case::narrowed_positive_nan(remap_case(
+    vec![vec![NAN, Some(2.0), Some(3.0), Some(4.0)]],
+    4, true, moved(0, 0..3, 10, 0), vec![row(0, 3)],
+    vec![(10, 0, 3, 0, 1, 0)], vec![],
+))]
+#[case::narrowed_negative_nan(remap_case(
+    vec![vec![NEG_NAN, Some(2.0), Some(3.0), Some(4.0)]],
+    4, true, moved(0, 0..3, 10, 0), vec![row(0, 3)],
+    vec![(10, 0, 3, 0, 1, 1)], vec![],
+))]
+#[case::narrowed_nan_of_both_signs(remap_case(
+    vec![vec![NAN, NEG_NAN, Some(3.0), Some(4.0)]],
+    4, true, moved(0, 0..3, 10, 0), vec![row(0, 3)],
+    vec![(10, 0, 3, 0, 2, 1)], vec![],
+))]
+#[case::narrowed_all_nan_of_both_signs(remap_case(
+    vec![vec![NAN, NEG_NAN, NAN, NEG_NAN]],
+    4, true, moved(0, 0..3, 10, 0), vec![row(0, 3)],
+    vec![(10, 0, 3, 0, 3, 1)], vec![],
+))]
+#[case::mixed_null_singleton_is_withdrawn(remap_case(
+    vec![vec![
+        None, Some(2.0), Some(3.0), Some(4.0),
+        Some(5.0), Some(6.0), Some(7.0), Some(8.0),
+        Some(9.0), Some(10.0), Some(11.0), Some(12.0),
+    ]],
+    4, false,
+    [moved(0, [1], 10, 0), moved(0, 4..8, 10, 1), moved(0, 8..12, 11, 0)].concat(),
+    vec![row(0, 0), row(0, 2), row(0, 3)],
+    vec![(11, 0, 4, 0, 0, 0)], vec![10],
+))]
+#[case::exact_all_null_run_has_no_nan(remap_case(
+    vec![vec![None, NAN, None, Some(4.0)]],
+    4, true, moved(0, [0, 2], 10, 0), vec![row(0, 1), row(0, 3)],
+    vec![(10, 0, 2, 2, 0, 0)], vec![],
+))]
+#[case::no_room_for_null_and_nan(remap_case(
+    vec![vec![None, NAN, None, NAN]],
+    4, false, moved(0, [0], 10, 0), vec![row(0, 1), row(0, 2), row(0, 3)],
+    vec![], vec![10],
+))]
+#[tokio::test]
+async fn test_remap_relocates_zones(#[case] case: RemapCase) {
+    let tmpdir = TempObjDir::default();
+    let mut source = train_float_fragments(
+        local_store(&tmpdir),
+        case.rows_per_zone,
+        case.fragments.clone(),
+    )
+    .await;
+    if !case.keeps_null_bitmap {
+        Arc::get_mut(&mut source).unwrap().null_rows = None;
+    }
+    let mapping = direct_remap(&case.moves, &case.deleted);
+
+    let (remapped, withdrawn) = remap_and_load(&source, &mapping).await;
+
+    assert_eq!(withdrawn, RoaringBitmap::from_iter(case.expected_withdrawn));
+    assert_eq!(remapped.has_null_bitmap(), case.keeps_null_bitmap);
+    let zones = remapped
+        .zones
+        .iter()
+        .map(|zone| {
+            (
+                zone.bound.fragment_id,
+                zone.bound.start,
+                zone.bound.length,
+                zone.null_count,
+                zone.nan_count,
+                zone.negative_nan_count.unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(zones, case.expected_zones);
+    if let Some(null_rows) = &remapped.null_rows {
+        assert!(
+            null_rows
+                .iter()
+                .all(|(fragment, _)| !withdrawn.contains(*fragment)),
+            "a withdrawn fragment keeps no null positions"
+        );
+    }
+    assert_survivors_are_candidates(&remapped, &case.fragments, &mapping, &withdrawn).await;
+}
+
+/// Remapping an already narrowed zone goes through the same encoding: the
+/// placeholder null count of 1 stays "mixed" on a run of two, and once a
+/// single row is left it would claim the row is null, so a version 1 remap
+/// withdraws it whatever its recorded bounds.
+#[tokio::test]
+async fn test_remap_narrowed_zone_again_stays_conservative() {
+    let tmpdir = TempObjDir::default();
+    let mut source = train_float_fragments(
+        local_store(&tmpdir),
+        4,
+        vec![vec![None, Some(2.0), Some(3.0), Some(4.0)]],
+    )
+    .await;
+    Arc::get_mut(&mut source).unwrap().null_rows = None;
+
+    let first = direct_remap(&moved(0, 0..3, 10, 0), &[row(0, 3)]);
+    let (once, withdrawn) = remap_and_load(&source, &first).await;
+    assert!(withdrawn.is_empty());
+    assert_eq!(once.zones[0].bound.length, 3);
+    assert_eq!(once.zones[0].null_count, 1);
+
+    let second = direct_remap(&moved(10, 0..2, 11, 0), &[row(10, 2)]);
+    let (twice, withdrawn) = remap_and_load(&once, &second).await;
+    assert!(withdrawn.is_empty());
+    assert_eq!(twice.zones.len(), 1);
+    assert_eq!(twice.zones[0].bound.length, 2);
+    assert_eq!(twice.zones[0].null_count, 1);
+    for (offset, value) in [None, Some(2.0)].into_iter().enumerate() {
+        let new = row(11, offset as u64);
+        for predicate in predicates_matching(value) {
+            let result = twice
+                .search(&predicate, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert!(
+                result.row_addrs().selected(new),
+                "{value:?} lost for {predicate:?}"
+            );
+        }
+    }
+
+    let third = direct_remap(&moved(11, [0], 12, 0), &[row(11, 1)]);
+    let (thrice, withdrawn) = remap_and_load(&twice, &third).await;
+    assert_eq!(withdrawn, RoaringBitmap::from_iter([12u32]));
+    assert!(thrice.zones.is_empty());
+}
+
+/// A narrowed NaN run of both signs keeps placeholder NaN counts below its
+/// length while its finite bounds still record a comparable value. Reopened
+/// and narrowed again to as many rows as it has NaN slots, it would claim
+/// no comparable value, so the second remap withdraws it.
+#[tokio::test]
+async fn test_remap_narrowed_nan_zone_again_is_withdrawn() {
+    let fragments = vec![vec![NAN, NEG_NAN, Some(3.0), Some(4.0)]];
+    let tmpdir = TempObjDir::default();
+    let source = train_float_fragments(local_store(&tmpdir), 4, fragments.clone()).await;
+
+    let first = direct_remap(&moved(0, 0..3, 10, 0), &[row(0, 3)]);
+    let (once, withdrawn) = remap_and_load(&source, &first).await;
+    assert!(withdrawn.is_empty());
+    assert_eq!(once.zones.len(), 1);
+    let zone = &once.zones[0];
+    assert_eq!(zone.bound.length, 3);
+    assert_eq!(zone.null_count, 0);
+    assert_eq!(zone.nan_count, 2);
+    assert_eq!(zone.negative_nan_count, Some(1));
+    assert!(ZoneMapIndex::zone_has_finite_min(zone));
+    assert!(
+        ZoneMapIndex::zone_has_comparable_values(zone),
+        "the narrowed zone must not read as all NaN"
+    );
+    assert_survivors_are_candidates(&once, &fragments, &first, &withdrawn).await;
+
+    let second = direct_remap(&moved(10, 0..2, 11, 0), &[row(10, 2)]);
+    let (twice, withdrawn) = remap_and_load(&once, &second).await;
+    assert_eq!(withdrawn, RoaringBitmap::from_iter([11u32]));
+    assert!(twice.zones.is_empty());
+}
+
+/// A zone translated in chunks smaller than itself through a mapping that
+/// reverses rows, so runs cross chunk boundaries, yields the same runs and
+/// zones as a single pass.
+#[test]
+fn test_remap_zone_chunked_matches_single_pass() {
+    let zone = ZoneMapStatistics {
+        min: ScalarValue::Int64(Some(1)),
+        max: ScalarValue::Int64(Some(10)),
+        null_count: 0,
+        nan_count: 0,
+        negative_nan_count: Some(0),
+        bound: ZoneBound {
+            fragment_id: 1,
+            start: 0,
+            length: 10,
+        },
+    };
+    let destinations = [5, 4, 3, 2, 1, 0, 9, 8, 20, 21];
+    let mapping: HashMap<u64, u64> = destinations
+        .iter()
+        .enumerate()
+        .map(|(offset, &dest)| (row(1, offset as u64), row(2, dest)))
+        .collect();
+    let translate = |addrs: &mut [Option<u64>]| {
+        for addr in addrs.iter_mut() {
+            *addr = addr.and_then(|addr| mapping.get(&addr).copied());
+        }
+    };
+    let budget = RemapBudget::unlimited();
+    let single_pass = remap_zone_runs(&zone, &translate, None, 10, &budget).unwrap();
+    assert_eq!(
+        single_pass,
+        vec![
+            (row(2, 0), row(2, 5)),
+            (row(2, 8), row(2, 9)),
+            (row(2, 20), row(2, 21)),
+        ]
+    );
+    let zones_with = |chunk_rows| {
+        let mut unrepresentable = RoaringBitmap::new();
+        let zones = remap_zone_in_chunks(
+            &zone,
+            &translate,
+            None,
+            false,
+            None,
+            chunk_rows,
+            &budget,
+            &mut unrepresentable,
+        )
+        .unwrap();
+        (zones, unrepresentable)
+    };
+    for chunk_rows in [1, 3, 4] {
+        assert_eq!(
+            remap_zone_runs(&zone, &translate, None, chunk_rows, &budget).unwrap(),
+            single_pass,
+            "chunk_rows={chunk_rows}"
+        );
+        assert_eq!(
+            zones_with(chunk_rows),
+            zones_with(10),
+            "chunk_rows={chunk_rows}"
+        );
+    }
+}
+
+/// A remap over its working budget fails with `ZoneMapRemapOverBudget`
+/// and writes nothing.
+#[tokio::test]
+async fn test_remap_over_budget_writes_nothing() {
+    let tmpdir = TempObjDir::default();
+    let source = train_float_fragments(
+        local_store(&tmpdir),
+        2,
+        vec![vec![Some(1.0), None, Some(2.0), Some(3.0)]],
+    )
+    .await;
+    let mapping = direct_remap(&moved(0, 0..4, 1, 0), &[]);
+    let dest_tmpdir = TempObjDir::default();
+    let dest_store = local_store(&dest_tmpdir);
+
+    let Err(err) = source
+        .remap_within_budget(&mapping, dest_store.as_ref(), 1)
+        .await
+    else {
+        panic!("a remap over budget must fail");
+    };
+    let over_budget = ZoneMapRemapOverBudget::from_error(&err).expect("over budget error");
+    assert_eq!(over_budget.budget_bytes, 1);
+    assert!(over_budget.estimated_bytes > 1);
+    assert!(ZoneMapRemapNeedsWithdrawal::from_error(&err).is_none());
+    assert!(
+        dest_store.open_index_file(ZONEMAP_FILENAME).await.is_err(),
+        "nothing is written over budget"
+    );
+}
+
+/// Null positions in a fragment the mapping does not touch are kept as
+/// they are; those in an affected fragment are translated.
+#[tokio::test]
+async fn test_remap_null_rows_translates_only_affected_fragments() {
+    let tmpdir = TempObjDir::default();
+    let source = train_float_fragments(
+        local_store(&tmpdir),
+        2,
+        vec![
+            vec![Some(1.0), None, Some(2.0), None],
+            vec![None, Some(3.0), None, Some(4.0)],
+        ],
+    )
+    .await;
+    let mapping = direct_remap(
+        &[
+            (row(1, 0), row(2, 3)),
+            (row(1, 1), row(2, 2)),
+            (row(1, 2), row(2, 1)),
+            (row(1, 3), row(2, 0)),
+        ],
+        &[],
+    );
+
+    let (remapped, withdrawn) = remap_and_load(&source, &mapping).await;
+
+    assert!(withdrawn.is_empty());
+    let expected = RowAddrTreeMap::from_iter([row(0, 1), row(0, 3), row(2, 1), row(2, 3)]);
+    assert_eq!(remapped.null_rows.as_ref(), Some(&expected));
 }
 
 #[tokio::test]
@@ -5759,16 +6378,15 @@ async fn test_negative_nan_range_is_conservative_in_version_0() {
     );
 }
 
-/// Remapping copies a zone's counts into each destination run. A version
-/// 1 file must hold exact counts, so a merge persists a narrowed run only
-/// when the counts provably survive (no NaNs, nulls recomputed from an
-/// exact bitmap or absent); otherwise it is refused before any write
-/// rather than producing a file its own loader rejects.
+/// A merge persists a narrowed run with counts that keep every candidate
+/// and hold the version 1 invariants, which may be conservative rather than
+/// exact; a run without such counts refuses the merge before any write
+/// rather than producing a file that prunes a matching row.
 #[tokio::test]
-async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
+async fn test_merge_remapped_zones_in_version_1() {
     let new_row = 3_u64 << 32;
-    // [+NaN, +NaN, 5.0]: keeping only offset 2 would carry nan_count 2
-    // into a run of length 1.
+    // [+NaN, +NaN, 5.0]: keeping only offset 2 leaves a run of length 1
+    // that must keep both a NaN and a comparable candidate.
     let tmpdir = TempObjDir::default();
     let mut source = train_float_index_in(
         local_store(&tmpdir),
@@ -5788,12 +6406,13 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
     )
     .await
     .err()
-    .expect("a narrowed zone with NaNs must not be persisted as version 1");
+    .expect("a narrowed singleton with NaNs and values has no sound counts");
     assert!(matches!(err, Error::NotSupported { .. }), "{err}");
     assert!(dest_store.open_index_file(ZONEMAP_FILENAME).await.is_err());
 
-    // [null, 5.0, 6.0] without an exact bitmap: the conservative null
-    // count of the narrowed run is not exact either.
+    // [null, 5.0, 6.0] without an exact bitmap: the narrowed run of two
+    // keeps one conservative null, so IS NULL keeps it and the bounds keep
+    // its values.
     let tmpdir = TempObjDir::default();
     let mut source =
         train_float_index_in(local_store(&tmpdir), 3, vec![None, Some(5.0), Some(6.0)]).await;
@@ -5805,15 +6424,32 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
     ])));
     let dest_tmpdir = TempObjDir::default();
     let dest_store = local_store(&dest_tmpdir);
-    let err = merge_zonemap_indices(
+    merge_zonemap_indices(
         &[source.as_ref()],
         dest_store.as_ref(),
         &RoaringBitmap::from_iter([3]),
     )
     .await
-    .err()
-    .expect("a narrowed mixed-null zone without a bitmap must not be persisted");
-    assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    .unwrap();
+    let merged = ZoneMapIndex::load(
+        dest_store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(merged.zones.len(), 1);
+    assert_eq!(merged.zones[0].bound.length, 2);
+    assert_eq!(merged.zones[0].null_count, 1, "conservative, not exact");
+    for query in [
+        SargableQuery::IsNull(),
+        SargableQuery::Equals(ScalarValue::Float64(Some(5.0))),
+    ] {
+        let result = merged.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert!(result.row_addrs().selected(new_row), "{query:?}");
+    }
 
     // The same zone with its exact bitmap: the run's null count is
     // recomputed, so the merge proceeds and the file loads as version 1.

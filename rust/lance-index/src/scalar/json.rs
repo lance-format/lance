@@ -2592,6 +2592,10 @@ mod tests {
     )]
     #[case::zonemap(
         prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails::default()).unwrap(),
+        true
+    )]
+    #[case::bloom_filter(
+        prost_types::Any::from_msg(&crate::pb::BloomFilterIndexDetails::default()).unwrap(),
         false
     )]
     fn test_json_can_remap_delegates_to_target(

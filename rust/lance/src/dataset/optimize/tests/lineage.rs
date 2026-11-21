@@ -289,7 +289,10 @@ async fn test_row_addrs_only_used_with_remappable_index(
             row_addrs.len()
         );
     }
-    if !index_types.contains(&BuiltinIndexType::BTree) {
+    let remaps = |builtin: &BuiltinIndexType| {
+        matches!(builtin, BuiltinIndexType::BTree | BuiltinIndexType::ZoneMap)
+    };
+    if !index_types.iter().any(remaps) {
         // Invalid bytes prove commit skips decoding and building the map
         // when no index on the table supports remapping.
         result.row_addrs = Some(b"not a roaring treemap".to_vec());
@@ -309,7 +312,13 @@ async fn test_row_addrs_only_used_with_remappable_index(
             .iter()
             .find(|index| index.name == original.name)
             .unwrap();
-        if original.name == BuiltinIndexType::BTree.as_str() {
+        // Fully deleted sources are not covered by the rewrite, so nothing
+        // is remapped then.
+        let is_remapped = !is_fully_deleted
+            && index_types
+                .iter()
+                .any(|builtin| remaps(builtin) && original.name == builtin.as_str());
+        if is_remapped {
             assert_ne!(current.uuid, original.uuid);
         } else {
             assert_eq!(current.uuid, original.uuid);
@@ -350,12 +359,13 @@ async fn test_row_addrs_only_used_with_remappable_index(
 /// can remap in place (see `commit_compaction`'s `needs_remapping`).
 /// A dataset with no index, only row-id-domain ones (whose ids survive
 /// the rewrite on their own), or only an address-domain index whose type
-/// can never remap (ZoneMap, BloomFilter, FM) must not pay for a capture
+/// can never remap (BloomFilter, FM) must not pay for a capture
 /// nothing will use -- on a large compaction, that capture is an
 /// old-to-new move for every rewritten row.
 #[rstest::rstest]
 #[case::no_index(IndexPresence::None, false)]
 #[case::remap_capable_index(IndexPresence::RemapCapable, true)]
+#[case::remap_capable_zonemap(IndexPresence::RemapCapableZoneMap, true)]
 #[case::address_domain_only_index(IndexPresence::AddressDomainOnly, false)]
 #[tokio::test]
 async fn test_stable_row_ids_eager_compaction_captures_row_addrs_only_when_needed(
@@ -381,13 +391,18 @@ async fn test_stable_row_ids_eager_compaction_captures_row_addrs_only_when_neede
         IndexPresence::None => {}
         // Defaults to BTree, which is address-domain under stable row ids.
         IndexPresence::RemapCapable => create_scalar_index(&mut dataset, "a", false).await,
-        IndexPresence::AddressDomainOnly => {
+        IndexPresence::RemapCapableZoneMap | IndexPresence::AddressDomainOnly => {
+            let builtin = if matches!(index_presence, IndexPresence::RemapCapableZoneMap) {
+                BuiltinIndexType::ZoneMap
+            } else {
+                BuiltinIndexType::BloomFilter
+            };
             dataset
                 .create_index(
                     &["a"],
-                    IndexType::ZoneMap,
+                    IndexType::Scalar,
                     Some("a_idx".into()),
-                    &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                    &ScalarIndexParams::for_builtin(builtin),
                     false,
                 )
                 .await
