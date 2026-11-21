@@ -2047,14 +2047,11 @@ mod tests {
         .await
         .unwrap();
         let frag_ids: Vec<u32> = ds.get_fragments().iter().map(|f| f.id() as u32).collect();
+        let index_params = InvertedIndexParams::default().stem(false);
         let mut metas = Vec::new();
         for fid in frag_ids {
             let mut builder = ds
-                .create_index_builder(
-                    &["text"],
-                    IndexType::Inverted,
-                    &InvertedIndexParams::default().stem(false),
-                )
+                .create_index_builder(&["text"], IndexType::Inverted, &index_params)
                 .name("text_idx".to_string())
                 .fragments(vec![fid]);
             metas.push(builder.execute_uncommitted().await.unwrap());
