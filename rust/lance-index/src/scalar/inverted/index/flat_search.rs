@@ -1129,7 +1129,7 @@ struct FuzzyBatchAccum {
 }
 
 /// Run a flat BM25 search supporting exact matching, bounded fuzzy matching
-/// (with identical [`FuzzyAutomaton`], `auto_fuzziness`, `prefix_length`, and
+/// (with identical `FuzzyAutomaton`, `auto_fuzziness`, `prefix_length`, and
 /// `max_expansions` semantics to indexed search), and canonical
 /// [`PreparedBm25Query`] replay.
 #[allow(clippy::too_many_arguments)]
@@ -1155,7 +1155,7 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
             phrase_slop,
         } = options;
         let output_schema = fts_schema(document_granularity);
-        let prepared_scorer = (*prepared.scorer()).clone();
+        let prepared_scorer = prepared.scorer().as_ref().clone();
         if prepared.tokens().is_empty()
             || (operator == Operator::And && !prepared.has_all_query_positions())
         {
@@ -1316,189 +1316,195 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
     }
 
     let discount_overlaps = doc_tokenizer.discount_overlaps();
-    let mut tasks = chunked
-        .map(move |batch| {
-            let mut tokenizer = doc_tokenizer.box_clone();
-            let group_automatons = group_automatons.clone();
-            let elapsed_compute = elapsed_compute.clone();
-            spawn_cpu(move || {
-                let start = std::time::Instant::now();
-                let batch = batch?;
-                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let input_doc_indices = (0..coordinate_rank)
-                    .map(|rank| {
-                        let column_name = doc_index_storage_column(rank);
-                        batch
-                            .column_by_name(&column_name)
-                            .ok_or_else(|| {
-                                datafusion_common::DataFusionError::Internal(format!(
-                                    "flat ListElement FTS is missing {column_name}"
-                                ))
-                            })
-                            .map(|column| column.as_primitive::<UInt32Type>())
-                    })
-                    .collect::<DataFusionResult<Vec<_>>>()?;
+    let mut tasks = Box::pin(
+        chunked
+            .map(move |batch| {
+                let mut tokenizer = doc_tokenizer.box_clone();
+                let group_automatons = group_automatons.clone();
+                let elapsed_compute = elapsed_compute.clone();
+                spawn_cpu(move || {
+                    let start = std::time::Instant::now();
+                    let batch = batch?;
+                    let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                    let input_doc_indices = (0..coordinate_rank)
+                        .map(|rank| {
+                            let column_name = doc_index_storage_column(rank);
+                            batch
+                                .column_by_name(&column_name)
+                                .ok_or_else(|| {
+                                    datafusion_common::DataFusionError::Internal(format!(
+                                        "flat ListElement FTS is missing {column_name}"
+                                    ))
+                                })
+                                .map(|column| column.as_primitive::<UInt32Type>())
+                        })
+                        .collect::<DataFusionResult<Vec<_>>>()?;
 
-                let mut accum = FuzzyBatchAccum {
-                    doc_count: 0,
-                    total_tokens: 0,
-                    term_df: HashMap::new(),
-                    candidates_by_group: vec![BTreeSet::new(); num_groups],
-                    matched_docs: Vec::new(),
-                };
-                // Per-batch memoization: each distinct token string is checked
-                // against the fuzzy automatons at most once per batch.
-                let mut token_match_cache = HashMap::<String, Vec<usize>>::new();
-                let mut doc_term_freqs = HashMap::<String, u64>::new();
+                    let mut accum = FuzzyBatchAccum {
+                        doc_count: 0,
+                        total_tokens: 0,
+                        term_df: HashMap::new(),
+                        candidates_by_group: vec![BTreeSet::new(); num_groups],
+                        matched_docs: Vec::new(),
+                    };
+                    // Per-batch memoization: each distinct token string is checked
+                    // against the fuzzy automatons at most once per batch.
+                    let mut token_match_cache = HashMap::<String, Vec<usize>>::new();
+                    let mut doc_term_freqs = HashMap::<String, u64>::new();
 
-                let mut scan_text = |doc: &str, doc_term_freqs: &mut HashMap<String, u64>| -> u64 {
-                    let mut stream = tokenizer.token_stream_for_doc(doc);
-                    let mut all_tokens = 0u64;
-                    let mut last_position = None;
-                    while let Some(token) = stream.next() {
-                        if !discount_overlaps || last_position != Some(token.position) {
-                            all_tokens += 1;
+                    let mut scan_text = |doc: &str,
+                                         doc_term_freqs: &mut HashMap<String, u64>|
+                     -> u64 {
+                        let mut stream = tokenizer.token_stream_for_doc(doc);
+                        let mut all_tokens = 0u64;
+                        let mut last_position = None;
+                        while let Some(token) = stream.next() {
+                            if !discount_overlaps || last_position != Some(token.position) {
+                                all_tokens += 1;
+                            }
+                            last_position = Some(token.position);
+                            let matched_groups =
+                                if let Some(cached) = token_match_cache.get(&token.text) {
+                                    cached.as_slice()
+                                } else {
+                                    let mut matched = Vec::new();
+                                    for (g_idx, automatons) in group_automatons.iter().enumerate() {
+                                        if automatons.iter().any(|a| a.matches_str(&token.text)) {
+                                            matched.push(g_idx);
+                                        }
+                                    }
+                                    token_match_cache.insert(token.text.clone(), matched);
+                                    token_match_cache[&token.text].as_slice()
+                                };
+                            if !matched_groups.is_empty() {
+                                for &g_idx in matched_groups {
+                                    accum.candidates_by_group[g_idx].insert(token.text.clone());
+                                }
+                                *doc_term_freqs.entry(token.text.clone()).or_insert(0) += 1;
+                            }
                         }
-                        last_position = Some(token.position);
-                        let matched_groups =
-                            if let Some(cached) = token_match_cache.get(&token.text) {
-                                cached.as_slice()
+                        all_tokens
+                    };
+
+                    let finish_doc =
+                        |row_index: usize,
+                         row_id: u64,
+                         all_tokens: u64,
+                         doc_term_freqs: &mut HashMap<String, u64>,
+                         accum: &mut FuzzyBatchAccum| {
+                            if coordinate_rank > 0 || all_tokens > 0 {
+                                accum.doc_count += 1;
+                                accum.total_tokens += all_tokens;
+                                if !doc_term_freqs.is_empty() {
+                                    let mut term_freqs = Vec::with_capacity(doc_term_freqs.len());
+                                    for (term, freq) in doc_term_freqs.drain() {
+                                        *accum.term_df.entry(term.clone()).or_insert(0) += 1;
+                                        term_freqs.push((term, freq));
+                                    }
+                                    let doc_indices = input_doc_indices
+                                        .iter()
+                                        .map(|col| col.value(row_index))
+                                        .collect();
+                                    accum.matched_docs.push(FuzzyMatchedDoc {
+                                        row_id,
+                                        doc_indices,
+                                        all_tokens,
+                                        term_freqs,
+                                    });
+                                }
                             } else {
-                                let mut matched = Vec::new();
-                                for (g_idx, automatons) in group_automatons.iter().enumerate() {
-                                    if automatons.iter().any(|a| a.matches_str(&token.text)) {
-                                        matched.push(g_idx);
+                                doc_term_freqs.clear();
+                            }
+                        };
+
+                    match batch.column(doc_col_idx).data_type() {
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                            for (row_index, (doc, row_id)) in
+                                iter_str_array(batch.column(doc_col_idx))
+                                    .zip(row_id_array.values().iter())
+                                    .enumerate()
+                            {
+                                doc_term_freqs.clear();
+                                let all_tokens = match doc {
+                                    Some(doc) => scan_text(doc, &mut doc_term_freqs),
+                                    None => 0,
+                                };
+                                finish_doc(
+                                    row_index,
+                                    *row_id,
+                                    all_tokens,
+                                    &mut doc_term_freqs,
+                                    &mut accum,
+                                );
+                            }
+                        }
+                        DataType::List(_) => {
+                            if coordinate_rank != 0 {
+                                return Err(datafusion_common::DataFusionError::Internal(
+                                "ListElement flat FTS input must be expanded to string documents"
+                                    .to_string(),
+                            ));
+                            }
+                            let doc_array = batch.column(doc_col_idx).as_list::<i32>();
+                            for i in 0..row_id_array.len() {
+                                doc_term_freqs.clear();
+                                let mut all_tokens = 0u64;
+                                if !doc_array.is_null(i) {
+                                    let elements = doc_array.value(i);
+                                    for element in iter_str_array(elements.as_ref()).flatten() {
+                                        all_tokens += scan_text(element, &mut doc_term_freqs);
                                     }
                                 }
-                                token_match_cache.insert(token.text.clone(), matched);
-                                token_match_cache[&token.text].as_slice()
-                            };
-                        if !matched_groups.is_empty() {
-                            for &g_idx in matched_groups {
-                                accum.candidates_by_group[g_idx].insert(token.text.clone());
+                                finish_doc(
+                                    i,
+                                    row_id_array.value(i),
+                                    all_tokens,
+                                    &mut doc_term_freqs,
+                                    &mut accum,
+                                );
                             }
-                            *doc_term_freqs.entry(token.text.clone()).or_insert(0) += 1;
                         }
-                    }
-                    all_tokens
-                };
-
-                let finish_doc = |row_index: usize,
-                                  row_id: u64,
-                                  all_tokens: u64,
-                                  doc_term_freqs: &mut HashMap<String, u64>,
-                                  accum: &mut FuzzyBatchAccum| {
-                    if coordinate_rank > 0 || all_tokens > 0 {
-                        accum.doc_count += 1;
-                        accum.total_tokens += all_tokens;
-                        if !doc_term_freqs.is_empty() {
-                            let mut term_freqs = Vec::with_capacity(doc_term_freqs.len());
-                            for (term, freq) in doc_term_freqs.drain() {
-                                *accum.term_df.entry(term.clone()).or_insert(0) += 1;
-                                term_freqs.push((term, freq));
-                            }
-                            let doc_indices = input_doc_indices
-                                .iter()
-                                .map(|col| col.value(row_index))
-                                .collect();
-                            accum.matched_docs.push(FuzzyMatchedDoc {
-                                row_id,
-                                doc_indices,
-                                all_tokens,
-                                term_freqs,
-                            });
-                        }
-                    } else {
-                        doc_term_freqs.clear();
-                    }
-                };
-
-                match batch.column(doc_col_idx).data_type() {
-                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                        for (row_index, (doc, row_id)) in iter_str_array(batch.column(doc_col_idx))
-                            .zip(row_id_array.values().iter())
-                            .enumerate()
-                        {
-                            doc_term_freqs.clear();
-                            let all_tokens = match doc {
-                                Some(doc) => scan_text(doc, &mut doc_term_freqs),
-                                None => 0,
-                            };
-                            finish_doc(
-                                row_index,
-                                *row_id,
-                                all_tokens,
-                                &mut doc_term_freqs,
-                                &mut accum,
-                            );
-                        }
-                    }
-                    DataType::List(_) => {
-                        if coordinate_rank != 0 {
-                            return Err(datafusion_common::DataFusionError::Internal(
+                        DataType::LargeList(_) => {
+                            if coordinate_rank != 0 {
+                                return Err(datafusion_common::DataFusionError::Internal(
                                 "ListElement flat FTS input must be expanded to string documents"
                                     .to_string(),
                             ));
-                        }
-                        let doc_array = batch.column(doc_col_idx).as_list::<i32>();
-                        for i in 0..row_id_array.len() {
-                            doc_term_freqs.clear();
-                            let mut all_tokens = 0u64;
-                            if !doc_array.is_null(i) {
-                                let elements = doc_array.value(i);
-                                for element in iter_str_array(elements.as_ref()).flatten() {
-                                    all_tokens += scan_text(element, &mut doc_term_freqs);
-                                }
                             }
-                            finish_doc(
-                                i,
-                                row_id_array.value(i),
-                                all_tokens,
-                                &mut doc_term_freqs,
-                                &mut accum,
-                            );
-                        }
-                    }
-                    DataType::LargeList(_) => {
-                        if coordinate_rank != 0 {
-                            return Err(datafusion_common::DataFusionError::Internal(
-                                "ListElement flat FTS input must be expanded to string documents"
-                                    .to_string(),
-                            ));
-                        }
-                        let doc_array = batch.column(doc_col_idx).as_list::<i64>();
-                        for i in 0..row_id_array.len() {
-                            doc_term_freqs.clear();
-                            let mut all_tokens = 0u64;
-                            if !doc_array.is_null(i) {
-                                let elements = doc_array.value(i);
-                                for element in iter_str_array(elements.as_ref()).flatten() {
-                                    all_tokens += scan_text(element, &mut doc_term_freqs);
+                            let doc_array = batch.column(doc_col_idx).as_list::<i64>();
+                            for i in 0..row_id_array.len() {
+                                doc_term_freqs.clear();
+                                let mut all_tokens = 0u64;
+                                if !doc_array.is_null(i) {
+                                    let elements = doc_array.value(i);
+                                    for element in iter_str_array(elements.as_ref()).flatten() {
+                                        all_tokens += scan_text(element, &mut doc_term_freqs);
+                                    }
                                 }
+                                finish_doc(
+                                    i,
+                                    row_id_array.value(i),
+                                    all_tokens,
+                                    &mut doc_term_freqs,
+                                    &mut accum,
+                                );
                             }
-                            finish_doc(
-                                i,
-                                row_id_array.value(i),
-                                all_tokens,
-                                &mut doc_term_freqs,
-                                &mut accum,
-                            );
+                        }
+                        data_type => {
+                            return Err(datafusion_common::DataFusionError::Execution(format!(
+                                "unsupported data type {} for flat full text search",
+                                data_type
+                            )));
                         }
                     }
-                    data_type => {
-                        return Err(datafusion_common::DataFusionError::Execution(format!(
-                            "unsupported data type {} for flat full text search",
-                            data_type
-                        )));
+                    if let Some(t) = &elapsed_compute {
+                        t.add_duration(start.elapsed());
                     }
-                }
-                if let Some(t) = &elapsed_compute {
-                    t.add_duration(start.elapsed());
-                }
-                DataFusionResult::Ok(accum)
+                    DataFusionResult::Ok(accum)
+                })
             })
-        })
-        .buffered(get_num_compute_intensive_cpus());
+            .buffered(get_num_compute_intensive_cpus()),
+    );
 
     let mut flat_doc_count = 0usize;
     let mut flat_total_tokens = 0u64;
