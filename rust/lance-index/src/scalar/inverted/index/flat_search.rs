@@ -1353,7 +1353,8 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                     let mut doc_term_freqs = HashMap::<String, u64>::new();
 
                     let mut scan_text = |doc: &str,
-                                         doc_term_freqs: &mut HashMap<String, u64>|
+                                         doc_term_freqs: &mut HashMap<String, u64>,
+                                         candidates_by_group: &mut [BTreeSet<String>]|
                      -> u64 {
                         let mut stream = tokenizer.token_stream_for_doc(doc);
                         let mut all_tokens = 0u64;
@@ -1378,7 +1379,7 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                                 };
                             if !matched_groups.is_empty() {
                                 for &g_idx in matched_groups {
-                                    accum.candidates_by_group[g_idx].insert(token.text.clone());
+                                    candidates_by_group[g_idx].insert(token.text.clone());
                                 }
                                 *doc_term_freqs.entry(token.text.clone()).or_insert(0) += 1;
                             }
@@ -1426,7 +1427,11 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                             {
                                 doc_term_freqs.clear();
                                 let all_tokens = match doc {
-                                    Some(doc) => scan_text(doc, &mut doc_term_freqs),
+                                    Some(doc) => scan_text(
+                                        doc,
+                                        &mut doc_term_freqs,
+                                        &mut accum.candidates_by_group,
+                                    ),
                                     None => 0,
                                 };
                                 finish_doc(
@@ -1452,7 +1457,11 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                                 if !doc_array.is_null(i) {
                                     let elements = doc_array.value(i);
                                     for element in iter_str_array(elements.as_ref()).flatten() {
-                                        all_tokens += scan_text(element, &mut doc_term_freqs);
+                                        all_tokens += scan_text(
+                                            element,
+                                            &mut doc_term_freqs,
+                                            &mut accum.candidates_by_group,
+                                        );
                                     }
                                 }
                                 finish_doc(
@@ -1478,7 +1487,11 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                                 if !doc_array.is_null(i) {
                                     let elements = doc_array.value(i);
                                     for element in iter_str_array(elements.as_ref()).flatten() {
-                                        all_tokens += scan_text(element, &mut doc_term_freqs);
+                                        all_tokens += scan_text(
+                                            element,
+                                            &mut doc_term_freqs,
+                                            &mut accum.candidates_by_group,
+                                        );
                                     }
                                 }
                                 finish_doc(
