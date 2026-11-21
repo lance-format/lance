@@ -7,6 +7,7 @@ package lance.index.pb;
 
 import "google/protobuf/any.proto";
 import "index_old.proto";
+import "index_overlay.proto";
 
 // The type of an index.
 enum IndexType {
@@ -230,6 +231,8 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+  // Per-segment overlay exceptions, as in RankedIndexOverlayDetails.
+  lance.table.IndexOverlayFreshnessList overlay_freshness = 32;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

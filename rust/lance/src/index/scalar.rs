@@ -273,7 +273,7 @@ pub(crate) async fn load_training_data(
     dataset: &Dataset,
     column: &str,
     criteria: &TrainingCriteria,
-    fragments: Option<Vec<Fragment>>,
+    selection: Option<TrainingRows>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     options: TrainingScanOptions,
@@ -313,7 +313,6 @@ pub(crate) async fn load_training_data(
             let selection = Some(TrainingRows::Fragments(frags?));
             scan_training_data(dataset, column, criteria, selection, options).await
         } else {
-            let selection = fragments.map(TrainingRows::Fragments);
             scan_training_data(dataset, column, criteria, selection, options).await
         }
     } else {
@@ -325,7 +324,7 @@ pub(crate) async fn load_fts_training_data(
     dataset: &Dataset,
     resolved: &inverted::ResolvedFtsField,
     criteria: &TrainingCriteria,
-    fragments: Option<Vec<Fragment>>,
+    selection: Option<TrainingRows>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     params: &InvertedIndexParams,
@@ -350,7 +349,7 @@ pub(crate) async fn load_fts_training_data(
         &dataset,
         scan_column,
         criteria,
-        fragments,
+        selection,
         train,
         fragment_ids,
         TrainingScanOptions {

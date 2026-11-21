@@ -9,6 +9,11 @@
 //! <br/>
 //! API stability is not guaranteed.
 //! </section>
+//!
+//! [`pb::VectorIndexDetails`] and [`pbold::InvertedIndexDetails`] expose index
+//! configuration. To copy a segment, preserve the original [`prost_types::Any`].
+//! Its [`lance_table::format::pb::RankedIndexOverlayDetails`] can be read from the
+//! same bytes when the segment's overlay history is needed.
 
 use crate::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::mem_wal::MEM_WAL_INDEX_NAME;
@@ -127,6 +132,24 @@ pub fn infer_system_index_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+
+    #[test]
+    fn ranked_configuration_readers_skip_the_overlay_block() {
+        // Field 32 has a valid outer length and a truncated nested varint.
+        let bytes = [0x82, 0x02, 1, 0x80];
+        assert_eq!(
+            pb::VectorIndexDetails::decode(bytes.as_slice()).unwrap(),
+            pb::VectorIndexDetails::default()
+        );
+        assert_eq!(
+            pbold::InvertedIndexDetails::decode(bytes.as_slice()).unwrap(),
+            pbold::InvertedIndexDetails::default()
+        );
+        assert!(
+            lance_table::format::pb::RankedIndexOverlayDetails::decode(bytes.as_slice()).is_err()
+        );
+    }
 
     #[test]
     fn test_ivf_rq_has_dedicated_index_version() {

@@ -15,7 +15,7 @@ use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::address::RowAddress;
-use lance_index::IndexType;
+use lance_core::utils::tempfile::TempStrDir;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
@@ -28,10 +28,13 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::scalar::{AnyQuery, LabelListQuery, SargableQuery};
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::{IndexParams, IndexType};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_select::RowSetOps;
 use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+use lance_table::format::overlay::freshness::OverlayFreshness;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{DataFile, IndexMetadata};
 use roaring::RoaringBitmap;
@@ -1504,6 +1507,281 @@ async fn test_vector_overlay_stale_dropped_under_fast_search() {
 }
 
 #[rstest]
+#[case::vector(IndexType::Vector)]
+#[case::fts(IndexType::Inverted)]
+#[tokio::test]
+async fn test_fast_search_after_mixed_version_merge(
+    #[case] index_type: IndexType,
+    #[values("staged", "optimize", "bounded", "staged_after_restore")] merge: &str,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])) as ArrayRef,
+        ),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["needle", "hay", "hay", "hay"])),
+        ),
+        (
+            "vec",
+            fsl(vec![vec![0.0], vec![4.0], vec![6.0], vec![8.0]], 1),
+        ),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let centroids = Arc::new(fsl(vec![vec![0.0]], 1).as_fixed_size_list().clone());
+    let vector_params = VectorIndexParams::with_ivf_flat_params(
+        MetricType::L2,
+        IvfBuildParams::try_with_centroids(1, centroids).unwrap(),
+    );
+    let fts_params = InvertedIndexParams::default();
+    let (column, params): (_, &dyn IndexParams) = match index_type {
+        IndexType::Vector => ("vec", &vector_params),
+        IndexType::Inverted => ("text", &fts_params),
+        _ => unreachable!(),
+    };
+    let base_version = dataset.version_id();
+    let old = dataset
+        .create_index_builder(&[column], index_type, params)
+        .name("ranked_idx".into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    // Fragment 0 lost the match after its segment was built. Fragment 1
+    // gained the match before its segment was built.
+    for (fragment, text, vector) in [(0, "hay", 10.0), (1, "needle", 1.0)] {
+        dataset = commit_overlay(
+            dataset,
+            &format!("overlay_{fragment}"),
+            fragment,
+            &[1, 2],
+            OverlayCoverage::dense([0].into_iter().collect()),
+            vec![
+                Arc::new(StringArray::from(vec![text])),
+                fsl(vec![vec![vector]], 1),
+            ],
+        )
+        .await;
+    }
+    let new = dataset
+        .create_index_builder(&[column], index_type, params)
+        .name("ranked_idx".into())
+        .fragments(vec![1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("ranked_idx", column, vec![old, new])
+        .await
+        .unwrap();
+
+    // The former vector in fragment 1 is an exact match for this query.
+    let query = if merge == "staged_after_restore" {
+        1.0
+    } else {
+        0.0
+    };
+    let hits = async |dataset: &Dataset, fast: bool| {
+        let mut scan = dataset.scan();
+        match index_type {
+            IndexType::Vector => scan
+                .nearest(column, &arrow_array::Float32Array::from(vec![query]), 1)
+                .unwrap()
+                .nprobes(1),
+            IndexType::Inverted => scan
+                .full_text_search(FullTextSearchQuery::new("needle".into()))
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        if fast {
+            scan.fast_search();
+        }
+        let batch = scan
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut ids = ids_from_batches(&[batch]);
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(hits(&dataset, true).await, [2], "before merging");
+    let sources = dataset.load_indices_by_name("ranked_idx").await.unwrap();
+    assert_eq!(sources.len(), 2);
+    assert!(
+        sources
+            .iter()
+            .all(|source| OverlayFreshness::read(source).unwrap().is_empty())
+    );
+    if merge == "staged_after_restore" {
+        let mut restored = dataset.checkout_version(base_version).await.unwrap();
+        restored.restore().await.unwrap();
+        assert!(restored.fragments().iter().all(|f| f.overlays.is_empty()));
+        let merged = restored
+            .merge_existing_index_segments(sources)
+            .await
+            .unwrap();
+        assert_eq!(merged.fragment_bitmap, Some(RoaringBitmap::from_iter([0])));
+        restored
+            .commit_existing_index_segments("ranked_idx", column, vec![merged])
+            .await
+            .unwrap();
+        assert_eq!(hits(&restored, false).await, [0]);
+        assert_eq!(hits(&restored, true).await, [0]);
+        return;
+    }
+    match merge {
+        "staged" => {
+            let merged = dataset
+                .merge_existing_index_segments(sources)
+                .await
+                .unwrap();
+            dataset
+                .commit_existing_index_segments("ranked_idx", column, vec![merged])
+                .await
+                .unwrap();
+        }
+        "optimize" => dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap(),
+        "bounded" => dataset
+            .optimize_indices(&OptimizeOptions::merge(2).max_rows_per_task(Some(2)))
+            .await
+            .unwrap(),
+        _ => unreachable!(),
+    }
+    let merged_segments = dataset.load_indices_by_name("ranked_idx").await.unwrap();
+    assert_eq!(merged_segments.len(), 1);
+    let freshness = OverlayFreshness::read(&merged_segments[0]).unwrap();
+    assert!(freshness.for_fragment(0).is_none());
+    let accepted = &freshness.for_fragment(1).unwrap().overlays;
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(
+        accepted[0].path,
+        dataset.fragments()[1].overlays[0].data_file.path
+    );
+    dataset.object_store.io_stats_incremental();
+    let visibility = crate::index::visibility::IndexVisibility::from_segments(
+        Arc::new(dataset.clone()),
+        &merged_segments,
+        dataset.fragments(),
+    )
+    .unwrap();
+    assert_eq!(visibility.physical_rows().len(), 1);
+    assert!(visibility.physical_rows()[&0].contains(0));
+    let io = dataset.object_store.io_stats_incremental();
+    assert_eq!((io.read_iops, io.write_iops), (0, 0));
+    // One exact nearest neighbor and one matching document. This also
+    // catches using the newest version, which would expose id 0 again.
+    assert_eq!(hits(&dataset, true).await, [2], "after merging");
+
+    let tail = RecordBatch::try_new(
+        Arc::new(ArrowSchema::from(dataset.schema())),
+        vec![
+            Arc::new(Int32Array::from(vec![4, 5])),
+            Arc::new(StringArray::from(vec!["hay", "hay"])),
+            fsl(vec![vec![12.0], vec![14.0]], 1),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(tail.clone())], tail.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset = commit_overlay(
+        dataset,
+        "tail_update",
+        2,
+        &[1, 2],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![
+            Arc::new(StringArray::from(vec!["needle"])),
+            fsl(vec![vec![2.0]], 1),
+        ],
+    )
+    .await;
+    if merge == "bounded" {
+        let options = OptimizeOptions::merge(1).max_rows_per_task(Some(2));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| OverlayFreshness::read(&task.reference).unwrap().is_empty())
+        );
+        let mut donors = plan
+            .tasks
+            .iter()
+            .flat_map(|task| &task.old_segments)
+            .chain(plan.merges.iter().flat_map(|merge| &merge.old_segments));
+        assert!(donors.any(|source| {
+            source.uuid == merged_segments[0].uuid
+                && OverlayFreshness::read(source)
+                    .unwrap()
+                    .for_fragment(1)
+                    .is_some()
+        }));
+    }
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let matches: &[i32] = if index_type == IndexType::Vector {
+        &[2]
+    } else {
+        &[2, 4]
+    };
+    assert_eq!(
+        hits(&dataset, true).await,
+        matches,
+        "second merge with a newly indexed fragment"
+    );
+    let merged = dataset.clone();
+    dataset = commit_overlay(
+        dataset,
+        "later_update",
+        1,
+        &[1, 2],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![
+            Arc::new(StringArray::from(vec!["needle again"])),
+            fsl(vec![vec![0.25]], 1),
+        ],
+    )
+    .await;
+    assert_eq!(
+        hits(&dataset, true).await,
+        [4],
+        "later overlay is unindexed"
+    );
+    assert_eq!(
+        hits(&dataset, false).await,
+        matches,
+        "ordinary search reads the later overlay"
+    );
+    assert_eq!(hits(&merged, true).await, matches, "older snapshot");
+}
+
+#[rstest]
 #[case::postfilter("postfilter")]
 #[case::fast("fast")]
 #[case::allow("allow")]
@@ -2167,6 +2445,720 @@ async fn fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
 
 async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
     fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
+}
+
+async fn fast_fts_ids(dataset: &Dataset, term: &str) -> Vec<i32> {
+    let batch = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new(term.to_owned()))
+        .unwrap()
+        .fast_search()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    ids_from_batches(&[batch])
+}
+
+#[rstest]
+#[case::existing_fragment(false, false, 0)]
+#[case::later_append(true, false, 0)]
+#[case::restore_revives_unindexed_row(false, true, 0)]
+#[case::compacted_overlay_with_live_coverage(false, false, 1)]
+#[tokio::test]
+async fn test_staged_fts_remap_keeps_indexed_overlay(
+    #[case] is_appended: bool,
+    #[case] is_restored: bool,
+    #[case] compacted_fragment: u32,
+) {
+    let mut dataset = create_text_dataset(false).await;
+    let old = dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default(),
+        )
+        .name("text_fts".into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("text_fts", "text", vec![old])
+        .await
+        .unwrap();
+    let (overlaid_fragment, overlaid_id) = if is_appended {
+        let batch =
+            arrow_array::record_batch!(("id", Int32, [12]), ("text", Utf8, ["hay"])).unwrap();
+        let schema = batch.schema();
+        dataset
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+            .await
+            .unwrap();
+        (2_u32, 12)
+    } else {
+        (1, 6)
+    };
+    dataset = commit_overlay(
+        dataset,
+        "fresh_fts_overlay",
+        u64::from(overlaid_fragment),
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["needle"]))],
+    )
+    .await;
+    let overlay_version = dataset.manifest.version;
+    if is_restored {
+        // The overlay is already present. Only the newer source misses the row for "pear".
+        dataset.delete("id = 7").await.unwrap();
+    }
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let mixed = dataset.load_indices_by_name("text_fts").await.unwrap();
+    assert_eq!(mixed.len(), 1);
+    assert!(mixed[0].dataset_version < overlay_version);
+
+    assert_eq!(fast_fts_ids(&dataset, "needle").await, [overlaid_id]);
+    if is_restored {
+        assert!(fast_fts_ids(&dataset, "pear").await.is_empty());
+        dataset = dataset.checkout_version(overlay_version).await.unwrap();
+        dataset.restore().await.unwrap();
+    }
+
+    // A deletion triggers the rewrite of fragment 0. An overlaid fragment
+    // can be compacted directly by its overlay count.
+    if compacted_fragment == 0 {
+        dataset.delete("id = 0").await.unwrap();
+    }
+    let excluded_fragment_ids = dataset
+        .fragment_bitmap
+        .iter()
+        .filter(|&id| id != compacted_fragment)
+        .collect();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            max_overlays_per_fragment: Some(0),
+            excluded_fragment_ids,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(dataset.get_fragment(compacted_fragment as usize).is_none());
+    let mixed = if compacted_fragment == overlaid_fragment {
+        // The reader reports the destination in its coverage. The segment
+        // still stores the original fragment's postings and overlay snapshot.
+        let current = dataset.load_indices_by_name("text_fts").await.unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].uuid, mixed[0].uuid);
+        assert_eq!(
+            current[0].fragment_bitmap.as_ref(),
+            Some(dataset.fragment_bitmap.as_ref())
+        );
+        assert_eq!(fast_fts_ids(&dataset, "needle").await, [overlaid_id]);
+        current
+    } else {
+        mixed
+    };
+    let merged = dataset.merge_existing_index_segments(mixed).await.unwrap();
+    let coverage = merged.fragment_bitmap.clone().unwrap();
+    let mut accounted_for = coverage.clone();
+    if is_restored {
+        // This fragment can be withdrawn, or the merge can reindex its revived row.
+        accounted_for.insert(overlaid_fragment);
+    }
+    assert_eq!(&accounted_for, dataset.fragment_bitmap.as_ref());
+    dataset
+        .commit_existing_index_segments("text_fts", "text", vec![merged])
+        .await
+        .unwrap();
+    for (term, id, fragment) in [("needle", overlaid_id, overlaid_fragment), ("pear", 7, 1)] {
+        assert_eq!(
+            fts_ids_matching(&dataset, term).await,
+            [id],
+            "ordinary search for {term}"
+        );
+        let expected: &[i32] = if !is_restored || coverage.contains(fragment) {
+            std::slice::from_ref(&id)
+        } else {
+            &[]
+        };
+        assert_eq!(
+            fast_fts_ids(&dataset, term).await,
+            expected,
+            "fast search for {term}"
+        );
+    }
+}
+
+#[rstest]
+#[case::direct_publish(false)]
+#[case::remerge(true)]
+#[tokio::test]
+async fn test_staged_fts_restore_reintroduces_overlay_before_watermark(#[case] remerge: bool) {
+    let dataset = create_text_dataset_with(&[("text", &["hay", "chaff", "anchor"])], 1).await;
+    let base = dataset.manifest.version;
+    let overlay = async |dataset: Dataset, fragment: u64, word: &str| {
+        commit_overlay(
+            dataset,
+            word,
+            fragment,
+            &[1],
+            OverlayCoverage::dense([0].into_iter().collect()),
+            vec![Arc::new(StringArray::from(vec![word]))],
+        )
+        .await
+    };
+    let dataset = overlay(dataset, 0, "needle").await;
+    let with_needle = dataset.manifest.version;
+    let mut dataset = dataset.checkout_version(base).await.unwrap();
+    dataset.restore().await.unwrap();
+
+    // The source for fragment 0 reads "hay" from a newer snapshot in which the
+    // older overlay is absent. Fragment 2 stays indexed throughout both restores.
+    let stage = async |dataset: &mut Dataset, fragments: Vec<u32>| {
+        dataset
+            .create_index_builder(
+                &["text"],
+                IndexType::Inverted,
+                &InvertedIndexParams::default(),
+            )
+            .name("mixed_fts".into())
+            .fragments(fragments)
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    };
+    let old = stage(&mut dataset, vec![0, 2]).await;
+    let mut dataset = overlay(dataset, 1, "straw").await;
+    let later = stage(&mut dataset, vec![1]).await;
+    let mixed = dataset
+        .merge_existing_index_segments(vec![old, later])
+        .await
+        .unwrap();
+    assert!(with_needle < mixed.dataset_version);
+    assert!(
+        OverlayFreshness::read(&mixed)
+            .unwrap()
+            .for_fragment(1)
+            .is_some()
+    );
+
+    // Restoring the same file preserves its original commit version, below the
+    // merged segment's watermark. Its fragment therefore needs fresh postings.
+    let mut dataset = dataset.checkout_version(with_needle).await.unwrap();
+    dataset.restore().await.unwrap();
+    let mixed = if remerge {
+        dataset
+            .merge_existing_index_segments(vec![mixed])
+            .await
+            .unwrap()
+    } else {
+        mixed
+    };
+    dataset
+        .commit_existing_index_segments("mixed_fts", "text", vec![mixed])
+        .await
+        .unwrap();
+    assert_eq!(fts_ids_matching(&dataset, "needle").await, [0]);
+    assert!(fts_ids_matching(&dataset, "hay").await.is_empty());
+    assert!(fast_fts_ids(&dataset, "hay").await.is_empty());
+    assert_eq!(fast_fts_ids(&dataset, "anchor").await, [2]);
+    let published = dataset.load_indices_by_name("mixed_fts").await.unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(
+        published[0].fragment_bitmap,
+        Some([2].into_iter().collect())
+    );
+}
+
+#[rstest]
+#[case::commit_directly(false, false)]
+#[case::remerge(true, false)]
+#[case::remerge_before_restore(false, true)]
+#[tokio::test]
+async fn test_staged_fts_remerge_after_restore_removes_an_indexed_overlay(
+    #[case] remerge: bool,
+    #[case] stage_on_old_snapshot: bool,
+) {
+    let mut dataset = create_text_dataset(false).await;
+    let base = dataset.manifest.version;
+    let old = dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default(),
+        )
+        .name("text_fts".into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("text_fts", "text", vec![old])
+        .await
+        .unwrap();
+    dataset = commit_overlay(
+        dataset,
+        "fresh_fts_overlay",
+        1,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["needle"]))],
+    )
+    .await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let mixed = dataset.load_indices_by_name("text_fts").await.unwrap();
+    assert_eq!(mixed.len(), 1);
+    assert_eq!(fast_fts_ids(&dataset, "needle").await, [6]);
+
+    dataset = dataset.checkout_version(base).await.unwrap();
+    let mixed = if stage_on_old_snapshot {
+        // The segment watermark matches this snapshot, but its overlaid fragment
+        // was physically indexed later in the same dataset.
+        vec![dataset.merge_existing_index_segments(mixed).await.unwrap()]
+    } else {
+        mixed
+    };
+    dataset.restore().await.unwrap();
+    let segments = if remerge {
+        vec![dataset.merge_existing_index_segments(mixed).await.unwrap()]
+    } else {
+        mixed
+    };
+    dataset
+        .commit_existing_index_segments("restored_fts", "text", segments)
+        .await
+        .unwrap();
+    assert!(fts_ids_matching(&dataset, "needle").await.is_empty());
+    assert!(fast_fts_ids(&dataset, "needle").await.is_empty());
+    assert_eq!(fts_ids_matching(&dataset, "mango").await, [6]);
+    assert_eq!(fast_fts_ids(&dataset, "cherry").await, [2]);
+
+    // A sibling now owns the restored fragment. Its coverage also admits that
+    // fragment to the shared prefilter, so stale postings in the first segment
+    // can no longer be hidden by the single-segment coverage restriction.
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("restored_fts").await.unwrap();
+    assert_eq!(segments.len(), 2);
+    assert!(fts_ids_matching(&dataset, "needle").await.is_empty());
+    assert!(fast_fts_ids(&dataset, "needle").await.is_empty());
+    assert_eq!(fast_fts_ids(&dataset, "mango").await, [6]);
+}
+
+async fn stage_mixed_fts_fragments(dataset: &mut Dataset, fragments: Vec<u32>) -> IndexMetadata {
+    dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default(),
+        )
+        .name("mixed_fts".into())
+        .fragments(fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FtsFileChange {
+    RewriteAfterBuild,
+    Repack,
+    RewriteBeforeBuild,
+}
+
+#[rstest]
+#[case::changed_values(FtsFileChange::RewriteAfterBuild)]
+#[case::column_repack(FtsFileChange::Repack)]
+#[case::already_indexed_rewrite(FtsFileChange::RewriteBeforeBuild)]
+#[tokio::test]
+async fn test_tagged_fts_replay_of_later_fragment_file(
+    #[case] change: FtsFileChange,
+    #[values(false, true)] remerge: bool,
+) {
+    let mut dataset = create_text_dataset(false).await;
+    // A drained tagged history admits overlays until its next transition.
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    persist_fixture(&mut dataset, vec![]).await;
+
+    let rows = |other: &str| {
+        arrow_array::record_batch!(("id", Int32, [12, 13]), ("text", Utf8, ["base", other]))
+            .unwrap()
+    };
+    let mut early_snapshot = dataset.clone();
+    let batch = rows("oldtoken");
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    if change == FtsFileChange::RewriteBeforeBuild {
+        // The segment-wide floor sees this fragment's original file.
+        early_snapshot = dataset.clone();
+    }
+    let old = stage_mixed_fts_fragments(&mut early_snapshot, vec![0]).await;
+    let (current, retired) = if change == FtsFileChange::Repack {
+        ("oldtoken", "newtoken")
+    } else {
+        ("newtoken", "oldtoken")
+    };
+    let replace_file = async |dataset: Dataset| {
+        let fragment = dataset.get_fragment(2).unwrap();
+        let overlays = fragment.metadata().overlays.clone();
+        let replacement = fragment
+            .write_columns(futures::stream::iter([Ok(rows(current))]), dataset.schema())
+            .await
+            .unwrap();
+        let operation = if change != FtsFileChange::Repack {
+            let mut fragments = dataset.fragments().as_ref().clone();
+            let fragment = fragments
+                .iter_mut()
+                .find(|fragment| fragment.id == 2)
+                .unwrap();
+            assert_eq!(fragment.files.len(), 1);
+            assert_eq!(fragment.files[0].fields, replacement.1.fields);
+            fragment.files[0] = replacement.1;
+            Operation::Merge {
+                fragments,
+                schema: dataset.schema().clone(),
+                preserves_nullability: true,
+            }
+        } else {
+            Operation::DataReplacement {
+                replacements: vec![replacement],
+                data_change: false,
+            }
+        };
+        let read_version = dataset.manifest.version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            operation,
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.get_fragment(2).unwrap().metadata().overlays,
+            overlays
+        );
+        dataset
+    };
+    if change == FtsFileChange::RewriteBeforeBuild {
+        dataset = replace_file(dataset).await;
+    }
+    dataset = commit_overlay(
+        dataset,
+        "later_source",
+        2,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["needle"]))],
+    )
+    .await;
+    let later = stage_mixed_fts_fragments(&mut dataset, vec![2]).await;
+    let later_version = later.dataset_version;
+    let mixed = dataset
+        .merge_existing_index_segments(vec![old, later])
+        .await
+        .unwrap();
+    assert!(mixed.dataset_version < later_version);
+    assert_eq!(mixed.fragment_bitmap, Some([0, 2].into_iter().collect()));
+    assert_eq!(
+        OverlayFreshness::read(&mixed)
+            .unwrap()
+            .source_versions(2, &mixed.dataset_version),
+        [later_version]
+    );
+
+    // Start a tagged history on an unrelated fragment. Both indexed fragments stay in place.
+    dataset.delete("id = 6").await.unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            excluded_fragment_ids: vec![0, 2],
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    );
+
+    if change != FtsFileChange::RewriteBeforeBuild {
+        dataset = replace_file(dataset).await;
+    }
+
+    let segment = if remerge {
+        dataset
+            .merge_existing_index_segments(vec![mixed])
+            .await
+            .unwrap()
+    } else {
+        mixed
+    };
+    dataset
+        .commit_existing_index_segments("mixed_fts", "text", vec![segment])
+        .await
+        .unwrap();
+    assert_eq!(fts_ids_matching(&dataset, current).await, [13]);
+    assert!(fts_ids_matching(&dataset, retired).await.is_empty());
+    assert!(fast_fts_ids(&dataset, retired).await.is_empty());
+    assert_eq!(fts_ids_matching(&dataset, "needle").await, [12]);
+    assert_eq!(fast_fts_ids(&dataset, "cherry").await, [2]);
+    let segments = dataset.load_indices_by_name("mixed_fts").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    let mut expected = RoaringBitmap::from_iter([0]);
+    if change != FtsFileChange::RewriteAfterBuild {
+        expected.insert(2);
+    }
+    assert_eq!(segments[0].fragment_bitmap.as_ref(), Some(&expected));
+    for (term, id) in [(current, 13), ("needle", 12)] {
+        let indexed: &[i32] = if change == FtsFileChange::RewriteAfterBuild {
+            &[]
+        } else {
+            std::slice::from_ref(&id)
+        };
+        assert_eq!(fast_fts_ids(&dataset, term).await, indexed);
+    }
+}
+
+#[tokio::test]
+async fn test_tagged_fts_replay_keeps_live_coverage_while_another_source_translates() {
+    // Fragment 2 and the sibling are built first. Fragments 0 and 1 share a
+    // later build, which incorporates their overlays.
+    let texts = [
+        "base",
+        "extra",
+        "base",
+        "deleted",
+        "needle",
+        "deleted",
+        "siblinghit",
+        "extra",
+    ];
+    let mut dataset = create_text_dataset_with(&[("text", &texts)], 2).await;
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    persist_fixture(&mut dataset, vec![]).await;
+    let sibling = stage_mixed_fts_fragments(&mut dataset, vec![3]).await;
+    let early = stage_mixed_fts_fragments(&mut dataset, vec![2]).await;
+    for (fragment, term) in [(0, "livekeep"), (1, "oldtarget")] {
+        dataset = commit_overlay(
+            dataset,
+            term,
+            fragment,
+            &[1],
+            OverlayCoverage::dense([0].into_iter().collect()),
+            vec![Arc::new(StringArray::from(vec![term]))],
+        )
+        .await;
+    }
+    let late = stage_mixed_fts_fragments(&mut dataset, vec![0, 1]).await;
+    let late_version = late.dataset_version;
+    let mixed = dataset
+        .merge_existing_index_segments(vec![early, late])
+        .await
+        .unwrap();
+    assert_eq!(mixed.dataset_version, sibling.dataset_version);
+    let freshness = OverlayFreshness::read(&mixed).unwrap();
+    for fragment in [0, 1] {
+        assert_eq!(
+            freshness.source_versions(fragment, &mixed.dataset_version),
+            [late_version]
+        );
+    }
+
+    // The replacement supersedes fragment 1's overlay. Both source fragments
+    // can now be compacted on the tagged table, while 0 retains its overlay.
+    let replacement = arrow_array::record_batch!(
+        ("id", Int32, [2, 3]),
+        ("text", Utf8, ["newtarget", "deleted"])
+    )
+    .unwrap();
+    let new_file = dataset
+        .get_fragment(1)
+        .unwrap()
+        .write_columns(futures::stream::iter([Ok(replacement)]), dataset.schema())
+        .await
+        .unwrap();
+    let version = dataset.manifest.version;
+    dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![new_file],
+            data_change: true,
+        },
+        Some(version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        dataset
+            .get_fragment(1)
+            .unwrap()
+            .metadata()
+            .overlays
+            .is_empty()
+    );
+    dataset.delete("id IN (3, 5)").await.unwrap();
+    let compact = async |dataset: &mut Dataset, source: u32| {
+        let before = dataset.fragment_bitmap.clone();
+        let excluded_fragment_ids = before.iter().filter(|&id| id != source).collect();
+        let metrics = compact_files(
+            dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                excluded_fragment_ids,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((metrics.fragments_removed, metrics.fragments_added), (1, 1));
+        (dataset.fragment_bitmap.as_ref() - before.as_ref())
+            .min()
+            .unwrap()
+    };
+    compact(&mut dataset, 1).await;
+    let retained = compact(&mut dataset, 2).await;
+
+    let expected_order = [sibling.uuid, mixed.uuid];
+    dataset
+        .commit_existing_index_segments("mixed_fts", "text", vec![sibling, mixed])
+        .await
+        .unwrap();
+    assert_eq!(
+        fast_fts_ids(&dataset, "livekeep").await,
+        [0],
+        "withdrawing the rewritten source must preserve the live indexed row"
+    );
+    assert_eq!(fast_fts_ids(&dataset, "needle").await, [4]);
+    assert_eq!(fast_fts_ids(&dataset, "siblinghit").await, [6]);
+    assert!(fts_ids_matching(&dataset, "oldtarget").await.is_empty());
+    assert_eq!(fts_ids_matching(&dataset, "newtarget").await, [2]);
+    assert!(fast_fts_ids(&dataset, "newtarget").await.is_empty());
+    let stored = crate::index::loading::load_all_indices_by_name(&dataset, "mixed_fts")
+        .await
+        .unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>(),
+        expected_order
+    );
+    assert_eq!(
+        stored[1].fragment_bitmap,
+        Some([0, 2].into_iter().collect())
+    );
+    let derived = dataset.load_indices_by_name("mixed_fts").await.unwrap();
+    let mixed = derived
+        .iter()
+        .find(|s| s.uuid == expected_order[1])
+        .unwrap();
+    assert_eq!(
+        mixed.fragment_bitmap,
+        Some([0, retained].into_iter().collect())
+    );
+}
+
+/// A tagged remap moves one fragment and advances the version of the whole segment.
+/// It must also refresh stale postings in a covered fragment that stayed in place.
+#[tokio::test]
+async fn test_staged_fts_remap_refreshes_changed_postings() {
+    let mut dataset = create_text_dataset(false).await;
+    // A drained tagged history keeps its format flag. The writer accepts overlays
+    // before the first new transition, and the next deferred compaction uses that format.
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    persist_fixture(&mut dataset, vec![]).await;
+    build_text_fts_index(&mut dataset).await;
+    let source = dataset
+        .load_indices_by_name("text_idx")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    dataset = commit_overlay(
+        dataset,
+        "remapped_fts_update",
+        1,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["newneedle"]))],
+    )
+    .await;
+    dataset.delete("id = 0").await.unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            excluded_fragment_ids: vec![1],
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(dataset.get_fragment(0).is_none());
+    assert!(
+        crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    );
+    assert_eq!(fts_ids_matching(&dataset, "newneedle").await, [6]);
+    assert!(fast_fts_ids(&dataset, "newneedle").await.is_empty());
+    let merged = dataset
+        .merge_existing_index_segments(vec![source])
+        .await
+        .unwrap();
+    assert_eq!(merged.dataset_version, dataset.manifest.version);
+    assert_eq!(
+        merged.fragment_bitmap.as_ref(),
+        Some(dataset.fragment_bitmap.as_ref())
+    );
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(fast_fts_ids(&dataset, "newneedle").await, [6]);
+    assert!(fast_fts_ids(&dataset, "mango").await.is_empty());
+    assert_eq!(fast_fts_ids(&dataset, "apple").await, [1]);
 }
 
 /// [`scalar_index_hits`] for `contains(text, pattern)` on the `text_ngram` index.
@@ -3146,6 +4138,139 @@ async fn test_fts_combines_indexed_overlay_stale_and_unindexed_rows(
         fts_phrase_ids_matching(&dataset, "cherry mango").await,
         vec![1, 12]
     );
+}
+
+#[tokio::test]
+async fn test_deep_clone_preserves_fts_hits_from_a_parent_overlay() {
+    let dir = TempStrDir::default();
+    let reader = |id| {
+        let batch =
+            arrow_array::record_batch!(("id", Int32, [id]), ("text", Utf8, ["hay"])).unwrap();
+        let schema = batch.schema();
+        RecordBatchIterator::new([Ok(batch)], schema)
+    };
+    let mut source = Dataset::write(reader(0), format!("{dir}/source").as_str(), None)
+        .await
+        .unwrap();
+    build_text_fts_index(&mut source).await;
+    source.append(reader(1), None).await.unwrap();
+    let mut source = commit_overlay(
+        source,
+        "parent_overlay",
+        1,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["needle"]))],
+    )
+    .await;
+    let mut shallow = source
+        .shallow_clone(&format!("{dir}/shallow"), source.version().version, None)
+        .await
+        .unwrap();
+    // The merge reads the second fragment through the parent and writes its index locally.
+    shallow
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let segments = shallow.load_indices_by_name("text_idx").await.unwrap();
+    let overlay = &shallow.fragments()[1].overlays[0];
+    assert_eq!(segments.len(), 1);
+    assert!(segments[0].base_id.is_none());
+    assert!(overlay.data_file.base_id.is_some());
+    assert!(segments[0].dataset_version < overlay.committed_version);
+
+    let fast_hits = async |dataset: &Dataset| {
+        let batch = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("needle".into()))
+            .unwrap()
+            .fast_search()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        ids_from_batches(&[batch])
+    };
+    assert_eq!(fast_hits(&shallow).await, [1]);
+    let mut deep = shallow
+        .deep_clone(&format!("{dir}/deep"), shallow.version().version, None)
+        .await
+        .unwrap();
+    assert_eq!(fast_hits(&deep).await, [1]);
+    let sources = deep.load_indices_by_name("text_idx").await.unwrap();
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].base_id.is_none());
+    let source_uuid = sources[0].uuid;
+    let coverage = sources[0].fragment_bitmap.clone();
+    let merged = deep.merge_existing_index_segments(sources).await.unwrap();
+    assert_eq!(
+        merged.uuid, source_uuid,
+        "the unchanged local files can be reused"
+    );
+    assert_eq!(merged.fragment_bitmap, coverage);
+    deep.commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(fast_hits(&deep).await, [1]);
+
+    // The clone already endorses the inherited segment, but merging it with a
+    // locally built sibling creates new files and gives the result a new UUID.
+    deep.append(reader(2), None).await.unwrap();
+    deep.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(fast_hits(&deep).await, [1]);
+    let sources = deep.load_indices_by_name("text_idx").await.unwrap();
+    assert_eq!(sources.len(), 2);
+    let merged = deep.merge_existing_index_segments(sources).await.unwrap();
+    assert_ne!(merged.uuid, source_uuid);
+    assert_eq!(
+        OverlayFreshness::read(&merged)
+            .unwrap()
+            .validation_version(),
+        Some(deep.manifest.version)
+    );
+    assert_eq!(
+        merged.fragment_bitmap.as_ref(),
+        Some(deep.fragment_bitmap.as_ref())
+    );
+    deep.commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(fast_hits(&deep).await, [1]);
+
+    // The clone can follow the deferred rewrite from its local validation snapshot.
+    compact_files(
+        &mut deep,
+        CompactionOptions {
+            defer_index_remap: true,
+            max_overlays_per_fragment: Some(0),
+            excluded_fragment_ids: vec![0, 2],
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(deep.get_fragment(1).is_none());
+    assert!(
+        deep.open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(fast_hits(&deep).await, [1]);
+    let sources = deep.load_indices_by_name("text_idx").await.unwrap();
+    let merged = deep.merge_existing_index_segments(sources).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref(),
+        Some(deep.fragment_bitmap.as_ref())
+    );
+    deep.commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(fast_hits(&deep).await, [1]);
 }
 
 #[rstest]

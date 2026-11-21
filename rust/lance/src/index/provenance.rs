@@ -17,12 +17,17 @@ use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::deletion::DeletionVector;
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseVersion};
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
+use lance_table::format::overlay::freshness::{
+    OverlayFreshness, has_overlay_freshness, has_ranked_details,
+};
+use lance_table::format::overlay::staleness::{
+    field_affects_index, fragment_has_stale_overlay, overlay_affects_index,
+};
 use lance_table::format::{DataFile, DeletionFile, Fragment, IndexMetadata, Manifest};
 use roaring::RoaringBitmap;
 
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::index::api::IndexSegment;
+use crate::index::api::{IndexSegment, IntoIndexSegment};
 use crate::index::append;
 use crate::index::frag_reuse::{self, SegmentRemappingPlan};
 use crate::index::loading::{DatasetIndexInternalExt, load_all_indices};
@@ -599,38 +604,61 @@ async fn build_provenance<T: TableVersion>(
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
 ) -> Result<HashMap<u32, Vec<Option<u64>>>> {
-    let mut provenance = HashMap::new();
+    let mut provenance = HashMap::<u32, Vec<Option<u64>>>::new();
     for segment in segments {
-        let version = segment.dataset_version;
-        let built_at = history.at(version).await?;
+        let freshness = OverlayFreshness::read(segment)?;
+        let validation = freshness
+            .validation_version()
+            .filter(|&v| v <= history.table.manifest().version);
+        let original = history
+            .at(validation.unwrap_or(segment.dataset_version))
+            .await?;
+        let fields = segment.dependency_fields();
+        // The query listing may already report compaction destinations. Overlay
+        // facts retain the physical source fragment, even when it was appended
+        // after the segment-wide build version.
+        let is_source = |id| {
+            freshness.for_fragment(id).is_some()
+                || original
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.fragment(id).is_some())
+        };
         for fragment in segment.fragment_bitmap.iter().flatten() {
-            let Some(built_at) = &built_at else {
-                provenance
-                    .entry(fragment)
-                    .or_insert_with(|| Vec::with_capacity(1))
-                    .push(None);
+            let Some(sources) = sources_at_build(
+                &frag_reuse_index.details.versions,
+                segment.dataset_version,
+                fragment,
+                is_source,
+            ) else {
+                provenance.entry(fragment).or_default().push(None);
                 continue;
             };
-            let sources = sources_at_build(
-                &frag_reuse_index.details.versions,
-                version,
-                fragment,
-                |id| built_at.fragment(id).is_some(),
-            );
-            match sources {
-                Some(sources) => {
-                    for source in sources {
-                        provenance
-                            .entry(source)
-                            .or_insert_with(|| Vec::with_capacity(1))
-                            .push(Some(version));
-                    }
+            for source in sources {
+                let recorded = provenance.entry(source).or_default();
+                if let Some(validation) = validation {
+                    // A clone can endorse its files locally. An overlay still excluded
+                    // at that snapshot cannot vouch for a later fold into base data.
+                    let verified = original.as_ref().is_some_and(|snapshot| {
+                        snapshot.fragment(source).is_some_and(|fragment| {
+                            !fragment_has_stale_overlay(
+                                fragment,
+                                &fields,
+                                segment.dataset_version,
+                                &freshness,
+                                &snapshot.manifest().schema,
+                            )
+                        })
+                    });
+                    recorded.push(verified.then_some(validation));
+                    continue;
                 }
-                None => {
-                    provenance
-                        .entry(fragment)
-                        .or_insert_with(|| Vec::with_capacity(1))
-                        .push(None);
+                let versions = freshness.source_versions(source, &segment.dataset_version);
+                if versions.is_empty() {
+                    recorded.push(None);
+                } else {
+                    // fresh_fragments verifies each snapshot still contains this
+                    // physical source before carrying its rows through a rewrite.
+                    recorded.extend(versions.iter().copied().map(Some));
                 }
             }
         }
@@ -782,17 +810,163 @@ fn indexed_field_ids(
     Ok(indexed_field_ids)
 }
 
+/// The current snapshot already endorses exactly these physical files, their
+/// build provenance and their scope. In particular a deep clone can endorse
+/// a local segment whose source manifests belong to the original table.
+fn same_ranked_source(current: &IndexMetadata, source: &IndexMetadata) -> bool {
+    current.uuid == source.uuid
+        && current.base_id == source.base_id
+        && current.dataset_version == source.dataset_version
+        && current.index_version == source.index_version
+        && current.fields == source.fields
+        && current.covering_fields == source.covering_fields
+        && current.fragment_bitmap == source.fragment_bitmap
+        && match (&current.index_details, &source.index_details) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right) || left == right,
+            _ => false,
+        }
+}
+
+/// Group physical coverage by the snapshots that can verify its values.
+/// Fragments contributed by more than one build must pass every check.
+fn coverage_by_build_version(
+    coverage: &mut RoaringBitmap,
+    segment_version: u64,
+    facts: &OverlayFreshness,
+    current_version: u64,
+) -> BTreeMap<u64, RoaringBitmap> {
+    if let Some(version) = facts.validation_version().filter(|&v| v <= current_version) {
+        return BTreeMap::from([(version, coverage.clone())]);
+    }
+    let mut by_version = BTreeMap::<u64, RoaringBitmap>::new();
+    let mut ordinary = coverage.clone();
+    for entry in facts.entries() {
+        if !ordinary.remove(entry.fragment_id) {
+            continue;
+        }
+        if entry.source_versions.is_empty()
+            || entry.source_versions.iter().any(|&v| v > current_version)
+        {
+            coverage.remove(entry.fragment_id);
+            continue;
+        }
+        for &version in &entry.source_versions {
+            by_version
+                .entry(version)
+                .or_default()
+                .insert(entry.fragment_id);
+        }
+    }
+    if !ordinary.is_empty() {
+        *by_version.entry(segment_version).or_default() |= ordinary;
+    }
+    by_version
+}
+
+/// Check live staged inputs before folding their individual build snapshots into
+/// one version. Retired fragments still belong to the fragment reuse planner.
+pub(super) async fn prune_ranked_merge_sources(
+    dataset: &Dataset,
+    segments: &mut [IndexMetadata],
+) -> Result<HashMap<uuid::Uuid, RoaringBitmap>> {
+    let mut candidates = Vec::new();
+    let mut positions = Vec::new();
+    let mut withdrawn = HashMap::new();
+    let indices = load_all_indices(dataset).await?;
+    let tagged = indices
+        .iter()
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
+    let mut published = None;
+    for (position, source) in segments.iter().enumerate() {
+        let (Some(details), Some(coverage)) = (&source.index_details, &source.fragment_bitmap)
+        else {
+            continue;
+        };
+        if !has_ranked_details(details)
+            || (source.dataset_version == dataset.manifest.version
+                && !has_overlay_freshness(details)?)
+        {
+            continue;
+        }
+        // The current manifest already owns these physical entries, including
+        // those copied from a clone with a different version history.
+        if published
+            .get_or_insert_with(|| {
+                indices
+                    .iter()
+                    .map(|i| (i.uuid, i))
+                    .collect::<HashMap<_, _>>()
+            })
+            .get(&source.uuid)
+            .is_some_and(|current| same_ranked_source(current, source))
+        {
+            continue;
+        }
+        if tagged && !has_overlay_freshness(details)? {
+            // Ordinary source data already went through the tagged replay at
+            // exactly its build version.
+            continue;
+        }
+        let live = coverage & dataset.fragment_bitmap.as_ref();
+        if live.is_empty() {
+            continue;
+        }
+        // An unpublished external source has no matching local build history.
+        if source.base_id.is_some() {
+            withdrawn.insert(source.uuid, live);
+            continue;
+        }
+        let mut candidate = source.clone();
+        candidate.fragment_bitmap = Some(live.clone());
+        candidates.push(candidate.into_index_segment()?);
+        positions.push((position, live));
+    }
+    if !candidates.is_empty() {
+        let check = if tagged {
+            CoverageCheck::Replayed
+        } else {
+            CoverageCheck::Staged
+        };
+        prune_stale_segment_coverage(dataset, &mut candidates, check).await?;
+    }
+    for ((position, requested), checked) in positions.into_iter().zip(candidates) {
+        let removed = requested - checked.fragment_bitmap();
+        if !removed.is_empty() {
+            withdrawn.insert(segments[position].uuid, removed);
+        }
+    }
+    for source in segments {
+        if let Some(removed) = withdrawn.get(&source.uuid)
+            && let Some(coverage) = &mut source.fragment_bitmap
+        {
+            *coverage -= removed;
+        }
+    }
+    Ok(withdrawn)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CoverageCheck<'a> {
+    /// Compare a staged source with its historical data files.
+    Staged,
+    /// Tagged replay checked file changes from each contributing build snapshot.
+    Replayed,
+    /// Materialize current data, allowing these fragments to be absent before compaction.
+    Remapped(&'a RoaringBitmap),
+}
+
 /// Drops from each segment's coverage the fragments whose indexed data changed
-/// since it was built. `historically_missing_exempt` names fragments compaction
-/// created after the segments were built, whose absence from a segment's
-/// history is expected rather than stale.
+/// since it was built. A tagged replay can already have validated physical
+/// file changes, and a remap can introduce fragments absent from the build.
 pub(crate) async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
-    prune_historically_missing: bool,
-    historically_missing_exempt: &RoaringBitmap,
-    prune_newer_overlays: bool,
+    check: CoverageCheck<'_>,
 ) -> Result<()> {
+    let remapped = match check {
+        CoverageCheck::Remapped(fragments) => Some(fragments),
+        _ => None,
+    };
     let current_fragments = dataset
         .fragments()
         .iter()
@@ -805,28 +979,72 @@ pub(crate) async fn prune_stale_segment_coverage(
     // destinations of every transition); a retired fragment off the lineage
     // (a bare rewrite of uncovered data, a whole-fragment delete) holds
     // nothing the segment can reach and is pruned as before.
-    let lineage = load_all_indices(dataset)
-        .await?
+    let indices = load_all_indices(dataset).await?;
+    let mut published = None;
+    let lineage = indices
         .iter()
         .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
         .and_then(|entry| entry.fragment_bitmap.clone());
-    let historical_versions = segments
-        .iter()
-        .map(IndexSegment::dataset_version)
-        .filter(|version| *version < dataset.manifest.version)
-        .collect::<HashSet<_>>();
-
-    for version in historical_versions {
-        let historical = match dataset.checkout_version(version).await {
+    // Resolve an exceptional fragment against the builds that actually supplied
+    // its entries. The oldest segment-wide version still owns its row addresses.
+    let mut checks: BTreeMap<u64, Vec<(usize, Option<RoaringBitmap>)>> = BTreeMap::new();
+    let mut freshness = Vec::with_capacity(segments.len());
+    for (position, segment) in segments.iter_mut().enumerate() {
+        if remapped.is_none()
+            && has_ranked_details(segment.index_details())
+            && (segment.dataset_version() < dataset.manifest.version
+                || has_overlay_freshness(segment.index_details())?)
+            && published
+                .get_or_insert_with(|| {
+                    indices
+                        .iter()
+                        .map(|i| (i.uuid, i))
+                        .collect::<HashMap<_, _>>()
+                })
+                .get(&segment.uuid())
+                .is_some_and(|stored| {
+                    same_ranked_source(stored, &segment.clone().into_metadata(""))
+                })
+        {
+            freshness.push(OverlayFreshness::default());
+            continue;
+        }
+        let facts = OverlayFreshness::from_details(segment.uuid(), segment.index_details(), None)?;
+        let version = segment.dataset_version();
+        if facts.is_empty() {
+            if version < dataset.manifest.version {
+                checks.entry(version).or_default().push((position, None));
+            }
+        } else {
+            for (version, fragments) in coverage_by_build_version(
+                segment.fragment_bitmap_mut(),
+                version,
+                &facts,
+                dataset.manifest.version,
+            ) {
+                checks
+                    .entry(version)
+                    .or_default()
+                    .push((position, Some(fragments)));
+            }
+        }
+        freshness.push(facts);
+    }
+    for (version, checks) in checks {
+        let historical = match if version == dataset.manifest.version {
+            Ok(dataset.clone())
+        } else {
+            dataset.checkout_version(version).await
+        } {
             Ok(historical) => historical,
-            // Cleaned up: nothing the segments built there cover can be shown
-            // unchanged, so they cover nothing and those rows are scanned.
             Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                for segment in segments
-                    .iter_mut()
-                    .filter(|segment| segment.dataset_version() == version)
-                {
-                    segment.fragment_bitmap_mut().clear();
+                for (position, fragments) in checks {
+                    let covered = segments[position].fragment_bitmap_mut();
+                    if let Some(fragments) = fragments {
+                        *covered -= fragments;
+                    } else {
+                        covered.clear();
+                    }
                 }
                 continue;
             }
@@ -843,22 +1061,27 @@ pub(crate) async fn prune_stale_segment_coverage(
             .map(|fragment| (fragment.id as u32, fragment))
             .collect::<HashMap<_, _>>();
 
-        for segment in segments
-            .iter_mut()
-            .filter(|segment| segment.dataset_version() == version)
-        {
+        for (position, subset) in checks {
+            let segment = &mut segments[position];
+            let facts = &freshness[position];
+            let files_verified = matches!(check, CoverageCheck::Replayed)
+                && has_ranked_details(segment.index_details());
             let indexed_field_ids = indexed_field_ids(
                 dataset.schema(),
                 segment.fields(),
                 segment.covering_fields(),
             )?;
             let mut stale_fragments = Vec::new();
-            for fragment_id in segment.fragment_bitmap().iter() {
+            let fragments = subset.as_ref().unwrap_or_else(|| segment.fragment_bitmap());
+            for fragment_id in fragments.iter() {
+                let accepted = facts
+                    .for_fragment(fragment_id)
+                    .map_or(&[][..], |entry| entry.overlays.as_slice());
                 let historical_fragment = historical_fragments.get(&fragment_id);
                 if historical_fragment.is_none()
-                    && !historically_missing_exempt.contains(fragment_id)
+                    && remapped.is_none_or(|introduced| !introduced.contains(fragment_id))
                 {
-                    if prune_historically_missing {
+                    if remapped.is_some() || !accepted.is_empty() {
                         stale_fragments.push(fragment_id);
                     }
                     continue;
@@ -874,27 +1097,52 @@ pub(crate) async fn prune_stale_segment_coverage(
                 };
                 // A fragment the remap added may have no counterpart at
                 // this version to compare; the overlay check still applies.
-                let changed_files = historical_fragment.is_some_and(|historical_fragment| {
-                    let historical_files = fragment_field_files(
-                        &historical.manifest,
-                        historical_fragment,
-                        &indexed_field_ids,
-                    );
-                    let current_files = fragment_field_files(
+                if !files_verified && let Some(then) = historical_fragment {
+                    let before =
+                        fragment_field_files(&historical.manifest, then, &indexed_field_ids);
+                    let after = fragment_field_files(
                         &dataset.manifest,
                         current_fragment,
                         &indexed_field_ids,
                     );
-                    historical_files.is_none() || historical_files != current_files
-                });
-                let changed_overlays = prune_newer_overlays
+                    if before.is_none() || before != after {
+                        stale_fragments.push(fragment_id);
+                        continue;
+                    }
+                }
+                // A restore can remove an incorporated overlay or bring back one
+                // absent at build time. Newer unincorporated files are masked at query time.
+                let historical_overlays = historical_fragment.filter(|f| !f.overlays.is_empty());
+                if has_ranked_details(segment.index_details())
+                    && (!accepted.is_empty()
+                        || historical_overlays.is_some()
+                        || !current_fragment.overlays.is_empty())
+                {
+                    let live =
+                        indexed_overlays(current_fragment, &indexed_field_ids, dataset.schema());
+                    let previous = historical_overlays
+                        .map(|f| indexed_overlays(f, &indexed_field_ids, dataset.schema()))
+                        .unwrap_or_default();
+                    let missing_exception = accepted.iter().any(|file| {
+                        let key = (file.committed_version, file.base_id, file.path.as_str());
+                        !live.contains(&key) || !previous.contains(&key)
+                    });
+                    let changed_before_watermark = previous
+                        .symmetric_difference(&live)
+                        .any(|key| key.0 <= segment.dataset_version());
+                    if missing_exception || changed_before_watermark {
+                        stale_fragments.push(fragment_id);
+                        continue;
+                    }
+                }
+                let changed_overlays = remapped.is_some()
                     && has_overlay_newer_than(
                         current_fragment,
                         version,
                         &indexed_field_ids,
                         dataset.schema(),
                     );
-                if changed_files || changed_overlays {
+                if changed_overlays {
                     stale_fragments.push(fragment_id);
                     continue;
                 }
@@ -911,6 +1159,12 @@ pub(crate) async fn prune_stale_segment_coverage(
         }
     }
     Ok(())
+}
+
+pub(super) struct StagedReplay {
+    pub(super) segments: Vec<IndexMetadata>,
+    /// Present on a tagged history, where replay checked every intervening version.
+    pub(super) fts_withdrawals: Option<HashMap<uuid::Uuid, RoaringBitmap>>,
 }
 
 /// Validate staged (uncommitted) segments against the current snapshot on a
@@ -931,28 +1185,64 @@ pub(crate) async fn prune_stale_segment_coverage(
 /// version in the window that can no longer be read. The cost is
 /// proportional to the commits crossed. On a table without a tagged history
 /// nothing is replayed: coverage is reconciled when the segments commit.
-pub(crate) async fn replay_staged_segments(
+pub(super) async fn replay_staged_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
-) -> Result<Vec<IndexMetadata>> {
-    let tagged = load_all_indices(dataset)
-        .await?
+) -> Result<StagedReplay> {
+    let indices = load_all_indices(dataset).await?;
+    let Some(tagged) = indices
         .iter()
-        .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
-    if !tagged {
-        return Ok(segments);
-    }
+        .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
+    else {
+        return Ok(StagedReplay {
+            segments,
+            fts_withdrawals: None,
+        });
+    };
+    let mut original_fts: HashMap<_, _> = segments
+        .iter()
+        .filter(|segment| {
+            segment.dataset_version < dataset.manifest.version
+                && super::segment::segment_has_inverted_details(segment)
+        })
+        .filter_map(|segment| {
+            Some((
+                segment.uuid,
+                segment.fragment_bitmap.as_ref()? & dataset.fragment_bitmap.as_ref(),
+            ))
+        })
+        .collect();
     // One replay per build version: a segment is carried across the commits
     // it did not see, so a segment built after a rewrite is not withdrawn for
     // it again.
     let mut by_build_version: BTreeMap<u64, Vec<IndexMetadata>> = BTreeMap::new();
-    for segment in segments {
-        by_build_version
-            .entry(segment.dataset_version)
-            .or_default()
-            .push(segment);
+    let mut mixed = Vec::new();
+    let mut input_order = HashMap::with_capacity(segments.len());
+    for (position, segment) in segments.into_iter().enumerate() {
+        if input_order.insert(segment.uuid, position).is_some() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: duplicate segment uuid {} for index '{}'",
+                segment.uuid, segment.name
+            )));
+        }
+        if segment.dataset_version < dataset.manifest.version
+            && let Some(details) = &segment.index_details
+            && has_overlay_freshness(details)?
+            && segment.fragment_bitmap.is_some()
+        {
+            mixed.push(segment);
+        } else {
+            by_build_version
+                .entry(segment.dataset_version)
+                .or_default()
+                .push(segment);
+        }
     }
-    let mut validated = Vec::new();
+    let has_mixed_sources = !mixed.is_empty();
+    if has_mixed_sources {
+        replay_mixed_segment_coverage(dataset, tagged, &indices, &mut mixed).await?;
+    }
+    let mut validated = mixed;
     for (read_version, group) in by_build_version {
         if read_version >= dataset.manifest.version {
             validated.extend(group);
@@ -960,7 +1250,122 @@ pub(crate) async fn replay_staged_segments(
             validated.extend(replay_staged_segments_from(dataset, read_version, group).await?);
         }
     }
-    Ok(validated)
+    if has_mixed_sources {
+        // Match the ordinary replay order, including the caller's first model at each version.
+        validated.sort_by_key(|segment| {
+            (
+                segment.dataset_version,
+                input_order.get(&segment.uuid).copied(),
+            )
+        });
+    }
+    for segment in &validated {
+        if let Some(original) = original_fts.get_mut(&segment.uuid)
+            && let Some(coverage) = &segment.fragment_bitmap
+        {
+            *original -= coverage;
+        }
+    }
+    original_fts.retain(|_, removed| !removed.is_empty());
+    Ok(StagedReplay {
+        segments: validated,
+        fts_withdrawals: Some(original_fts),
+    })
+}
+
+/// Replay each exceptional fragment from the snapshot that supplied its indexed values.
+/// The segment-wide version continues to date its physical row addresses.
+async fn replay_mixed_segment_coverage(
+    dataset: &Dataset,
+    tagged: &IndexMetadata,
+    indices: &[IndexMetadata],
+    segments: &mut [IndexMetadata],
+) -> Result<()> {
+    let live = dataset.fragment_bitmap.as_ref();
+    let published = indices
+        .iter()
+        .map(|i| (i.uuid, i))
+        .collect::<HashMap<_, _>>();
+    let mut retired = Vec::with_capacity(segments.len());
+    let mut builds = BTreeMap::<(u64, bool), Vec<(usize, RoaringBitmap)>>::new();
+    for (position, segment) in segments.iter_mut().enumerate() {
+        if published
+            .get(&segment.uuid)
+            .is_some_and(|stored| same_ranked_source(stored, segment))
+        {
+            // A clone can endorse these exact files without retaining the parent's snapshots.
+            retired.push(RoaringBitmap::new());
+            continue;
+        }
+        let facts = OverlayFreshness::read(segment)?;
+        let coverage = segment.fragment_bitmap.as_mut().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} lacks fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        retired.push(&*coverage - live);
+        for (version, subset) in coverage_by_build_version(
+            coverage,
+            segment.dataset_version,
+            &facts,
+            dataset.manifest.version,
+        ) {
+            if version >= dataset.manifest.version {
+                continue;
+            }
+            // During a withdrawal the resolver can drop an entire physical file when
+            // only live, untranslated rows remain. Keep live and retired slices apart
+            // so that this decision is made once below, on the reassembled coverage.
+            for (is_retired, fragments) in [(false, &subset & live), (true, &subset - live)] {
+                if !fragments.is_empty() {
+                    builds
+                        .entry((version, is_retired))
+                        .or_default()
+                        .push((position, fragments));
+                }
+            }
+        }
+    }
+    for ((version, _), group) in builds {
+        let sources = group
+            .iter()
+            .map(|(position, fragments)| IndexMetadata {
+                fragment_bitmap: Some(fragments.clone()),
+                ..segments[*position].clone()
+            })
+            .collect();
+        let surviving = replay_staged_segments_from(dataset, version, sources)
+            .await?
+            .into_iter()
+            .filter_map(|source| Some((source.uuid, source.fragment_bitmap?)))
+            .collect::<HashMap<_, _>>();
+        // Several builds can contribute to the same fragment. A withdrawal from
+        // any one of them must survive the replay of every other contribution.
+        for (position, mut requested) in group {
+            let segment = &mut segments[position];
+            if let Some(verified) = surviving.get(&segment.uuid) {
+                requested -= verified;
+            }
+            if let Some(coverage) = &mut segment.fragment_bitmap {
+                *coverage -= requested;
+            }
+        }
+    }
+    for (segment, retired) in segments.iter_mut().zip(retired) {
+        if let Some(coverage) = &mut segment.fragment_bitmap
+            && !retired.is_subset(coverage)
+            && !coverage.is_empty()
+            && coverage.is_subset(live)
+            && !super::frag_reuse_reader::FragmentReuseIndex::open(dataset, tagged)
+                .await?
+                .may_need_translation(Some(coverage))
+        {
+            // An identity reader would expose retired rows still stored in this file.
+            coverage.clear();
+        }
+    }
+    Ok(())
 }
 
 async fn replay_staged_segments_from(
@@ -1021,6 +1426,9 @@ async fn replay_staged_segments_from(
     if expected != snapshot + 1 {
         return Err(rebuild(expected, &gone()));
     }
+    // The complete window distinguishes files rewritten with new values from
+    // files a column repack merely moved.
+    rebase.track_moved_files();
     for (version, transaction) in &window {
         rebase
             .check_txn(transaction, *version)

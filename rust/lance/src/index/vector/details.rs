@@ -389,7 +389,7 @@ pub fn needs_vector_details_inference(
 /// Infer missing vector index details for all indices that need it.
 ///
 /// Runs inference once per unique index name, concurrently across names.
-/// Applies the inferred details back to all matching indices in the slice.
+/// Fills only the missing details. Other segments may carry their own overlay coverage.
 pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [IndexMetadata]) {
     let schema = dataset.schema();
     let needs_inference: HashMap<&str, &IndexMetadata> = indices
@@ -417,7 +417,10 @@ pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [Inde
             }
         })
         .collect();
-    for index in indices.iter_mut() {
+    for index in indices
+        .iter_mut()
+        .filter(|idx| needs_vector_details_inference(idx, schema))
+    {
         if let Some(details) = inferred.get(&index.name) {
             index.index_details = Some(details.clone());
         }

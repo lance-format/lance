@@ -2415,6 +2415,11 @@ pub async fn initialize_vector_index(
     })?;
 
     let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
+    let index_details = source_index
+        .index_details
+        .as_ref()
+        .map(lance_table::format::overlay::freshness::configuration_details)
+        .transpose()?;
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,
@@ -2423,7 +2428,7 @@ pub async fn initialize_vector_index(
         covering_fields: vec![],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
-        index_details: source_index.index_details.clone(),
+        index_details,
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,

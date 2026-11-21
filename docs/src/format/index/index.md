@@ -309,6 +309,47 @@ must remain valid after changes to the segment.
 A nonempty map requires `FLAG_OBJECT_METADATA` (`1 << 17`) in
 `writer_feature_flags`. Readers may ignore it.
 
+### Overlay freshness after a segment merge
+
+Vector and inverted index details may record `overlay_freshness` for fragments
+with data overlays. Each fragment appears once. Its `overlays` list identifies
+each incorporated file by committed version, data file path, and base ID. An
+omitted base denotes the base holding the index segment. This combination must
+be unique within the fragment. Its `source_versions` list identifies the
+snapshots whose rows entered the merge. Repeated merges preserve those
+snapshots so that compaction can check base files and row deletions against
+the actual builds. The list is empty when that history belongs to another
+dataset, as on a clone.
+Writers copying a physical segment preserve its index-details payload, including
+field 32. Writers that re-encode only the configuration must carry the segment's
+overlay facts separately.
+
+Before adding overlay facts to a vector segment with missing or empty index
+details, a writer must recover the model configuration from the index files
+and record it, including the distance metric. Older readers interpret a
+nonempty details payload as an explicit model description.
+
+A merge that inherits a fragment whose build history belongs to another
+dataset may record a local `validation_version` for the segment. A later
+publisher can compare base files, deletions and the recorded overlay files
+against that snapshot. The segment still uses its original version for row
+addresses and the rule below for overlay visibility. Readers ignore a
+validation version from a different dataset.
+
+For an overlay on an indexed field in a covered fragment, a matching entry
+means the segment incorporates its values. In the absence of an entry, the
+offsets are stale when the overlay's committed version exceeds the segment's
+`dataset_version`.
+
+A physical merge records an entry only when this comparison would change the
+classification of an incorporated overlay. A writer advancing the segment
+version must first refresh any stale entries the higher version would expose.
+An overlay is incorporated when every source contributing entries for that
+fragment incorporated it. A fragment indexed from current data incorporates
+its visible overlays. A later overlay has its
+own identity and is classified independently. Row-address remapping continues
+to use the segment's `dataset_version`.
+
 ## Handling deleted and invalidated rows
 
 Since index segments are immutable, they may contain references to rows that have been deleted
@@ -336,16 +377,14 @@ There are four situations to consider:
    `covering_fields` counts. A carried column can be updated while the keyed column is untouched,
    and a segment left covering that fragment would answer from an obsolete carried value.
 4. **A fragment has an updated value in an [overlay file](../table/data_overlay_file.md).**
-   This can be detected by checking if any of the fragments in the index's `fragment_bitmap`
-   have overlay files. For each overlay whose `committed_version` is greater than the index
-   segment's `dataset_version`, the overlay carries updated values not reflected in the index,
-   so its covered rows must be excluded from index results. Excluded rows are re-evaluated
-   against their current (overlaid) values on the flat path — dropping them without
-   re-evaluation would silently lose rows that match under the new value. Exclusion is
-   field-aware: only overlays covering a column in the union of the index's `fields` and
-   `covering_fields` matter. Restricting this to the keyed columns would leave a fragment
-   covered after an overlay updated a carried one, and the index would then serve a stale
-   carried value.
+   In a fragment covered by the segment, exclude the rows of an overlay when its
+   `committed_version` exceeds the segment's `dataset_version` and the segment has no
+   matching [overlay freshness entry](#overlay-freshness-after-a-segment-merge). The
+   affected offsets are those where the overlay supplies a value for a field in the
+   union of `fields` and `covering_fields`. A change to a carried column can invalidate
+   the value the index would supply even when its keyed column is unchanged. Re-evaluate
+   excluded rows against their current values on the flat path. An index-only search
+   skips these rows.
    You may exclude just the affected rows or the whole fragment; the latter is simpler and
    safer but re-evaluates more rows than necessary.
    See [Data Overlay Files](../table/data_overlay_file.md#index-integration)

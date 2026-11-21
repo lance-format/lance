@@ -528,6 +528,9 @@ async fn do_commit_new_dataset(
                 spilled_clone_files.extend(spilled);
             } else if !*is_shallow {
                 // Deep clone: keep metadata but normalize base to local.
+                lance_table::format::overlay::freshness::OverlayFreshness::relocate_to_local(
+                    &mut index, true,
+                )?;
                 index.base_id = None;
             } else if index.base_id.is_none() {
                 // Same rule as the data files in `Manifest::shallow_clone`:

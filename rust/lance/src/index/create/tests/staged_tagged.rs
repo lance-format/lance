@@ -907,6 +907,108 @@ async fn rewrite_in_place(uri: &str, column: &str, key: i32, value: arrow_array:
         .unwrap();
 }
 
+#[rstest::rstest]
+#[case::direct(false)]
+#[case::merge_first(true)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_fts_replay_does_not_serve_a_siblings_rewritten_rows(#[case] remerge: bool) {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0], 10).await;
+    let older = staged_inverted_segment(&mut dataset, "text", vec![1, 10]).await;
+    // Even i values from 0..4 landed in fragment 10. Fragment 1 stayed in place.
+    rewrite_in_place(
+        dir.as_str(),
+        "text",
+        2,
+        Arc::new(arrow_array::StringArray::from(vec!["updated"])),
+    )
+    .await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let fresh = staged_inverted_segment(&mut dataset, "text", vec![10]).await;
+    let older = if remerge {
+        let merged = dataset
+            .merge_existing_index_segments(vec![older])
+            .await
+            .unwrap();
+        assert_eq!(merged.fragment_bitmap, Some(RoaringBitmap::from_iter([1])));
+        merged
+    } else {
+        older
+    };
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![older, fresh])
+        .await
+        .unwrap();
+    assert_eq!(
+        fts_ids(&dataset, "text", "document").await.0,
+        [0, 1, 3, 4, 5, 6, 7]
+    );
+    assert_eq!(fts_ids(&dataset, "text", "updated").await.0, [2]);
+}
+
+#[rstest::rstest]
+#[case::direct(false)]
+#[case::merge_first(true)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_fts_keeps_repacked_values_after_tagged_replay(#[case] remerge: bool) {
+    use crate::dataset::NewColumnTransform;
+    use crate::dataset::optimize::CompactionScope;
+
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0], 10).await;
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("extra".into(), "w + 1".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let source = staged_inverted_segment(&mut dataset, "text", vec![1]).await;
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            scope: CompactionScope::RepackColumns,
+            max_data_files_per_fragment: Some(1),
+            excluded_fragment_ids: vec![10, 11],
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.files_added, 1);
+    let source = if remerge {
+        let merged = dataset
+            .merge_existing_index_segments(vec![source])
+            .await
+            .unwrap();
+        assert_eq!(merged.fragment_bitmap, Some(RoaringBitmap::from_iter([1])));
+        merged
+    } else {
+        source
+    };
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![source])
+        .await
+        .unwrap();
+    let batch = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("document".into()))
+        .unwrap()
+        .fast_search()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 4);
+}
+
 /// The sequence that forces the replay to run BEFORE the merge: segments
 /// staged over F0 and F1, `i` of a row in F1 rewritten in place (admitted:
 /// no committed index covers `i`), F1 partitioned into F10 and F11, the

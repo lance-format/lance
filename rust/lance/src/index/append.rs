@@ -532,7 +532,7 @@ fn old_data_address_domain(index_type: IndexType, reference_index: &dyn ScalarIn
 /// Remove `stale_rows` from a segment's old-data filter ([`OldIndexDataFilter`]): the rows
 /// an overlay replaced after the segment was built, keyed like the filter (see
 /// [`overlay_rescan`]). The merge re-reads them.
-fn block_stale_rows(
+pub(super) fn block_stale_rows(
     dataset: &Dataset,
     filter: Option<OldIndexDataFilter>,
     stale_rows: &RowAddrTreeMap,
@@ -2244,7 +2244,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         }));
                     }
 
-                    let fragments = Some(unindexed.to_vec());
+                    let fragments = Some(TrainingRows::Fragments(unindexed.to_vec()));
                     let resolved = resolved_fts.as_ref().ok_or_else(|| {
                         Error::internal(
                             "Inverted index metadata did not resolve an FTS field".to_string(),

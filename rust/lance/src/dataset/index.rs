@@ -228,9 +228,24 @@ impl DatasetIndexRemapper {
             remapped_results.push(remapped);
         }
 
-        let merged =
+        let mut merged =
             crate::index::vector::ivf::merge_remapped_segments(&self.dataset, remapped_segments)
                 .await?;
+        let version = segments
+            .iter()
+            .map(|segment| segment.dataset_version)
+            .min()
+            .unwrap_or(merged.dataset_version);
+        let freshness = crate::index::overlay_freshness::merged_overlay_freshness(
+            &self.dataset,
+            &segments[0].dependency_fields(),
+            version,
+            segments
+                .iter()
+                .map(|&source| (source, source.fragment_bitmap.as_ref())),
+            &[],
+        )?;
+        freshness.apply(&self.dataset, &mut merged).await?;
         let merged_details = merged.index_details.as_ref().ok_or_else(|| {
             Error::internal(format!(
                 "Merged vector index {} is missing index details",

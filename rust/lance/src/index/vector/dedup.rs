@@ -317,20 +317,26 @@ async fn plan(
                 meta.uuid
             )));
         }
-        for fragment in dataset.fragments().iter() {
-            if meta
-                .fragment_bitmap
-                .as_ref()
-                .is_none_or(|ids| ids.contains(fragment.id as u32))
-                && fragment.overlays.iter().any(|overlay| {
-                    overlay.committed_version > meta.dataset_version
-                        && overlay.data_file.fields.contains(&field)
-                })
-            {
-                return Err(Error::invalid_input(format!(
-                    "column '{column}' has stale index values in segment {} after an overlay update; rebuild the index",
-                    meta.uuid
-                )));
+        if dataset.manifest().reader_feature_flags
+            & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+            != 0
+        {
+            let freshness = lance_table::format::overlay::freshness::OverlayFreshness::read(meta)?;
+            for fragment in dataset.fragments().iter() {
+                if meta
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(fragment.id as u32))
+                    && fragment.overlays.iter().any(|overlay| {
+                        freshness.is_stale(fragment.id as u32, overlay, meta.dataset_version)
+                            && overlay.data_file.fields.contains(&field)
+                    })
+                {
+                    return Err(Error::invalid_input(format!(
+                        "column '{column}' has stale index values in segment {} after an overlay update; rebuild the index",
+                        meta.uuid
+                    )));
+                }
             }
         }
         let mask = if dataset.manifest().uses_stable_row_ids() {
