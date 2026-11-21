@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest, FragReuseVersion};
 use lance_index::scalar::{
     BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, RemapUnavailable, RowAddrTranslator,
 };
@@ -226,6 +226,122 @@ pub fn transpose_row_ids_from_digest(
     mapping
 }
 
+/// The coverage an untagged remap publishes for one segment, and the rows it
+/// must drop to keep the rebuilt files within that coverage.
+#[derive(Debug, PartialEq)]
+struct UntaggedCoverage {
+    should_remap: bool,
+    fragment_bitmap: RoaringBitmap,
+    /// Fragments whose stored rows the remap drops as deleted rows. Named in
+    /// every address domain the files may hold (the stored fragments and the
+    /// intermediates they reached), since the exclusion applies before the
+    /// reuse chain.
+    excluded_source_fragments: RoaringBitmap,
+}
+
+/// `fragment` plus every fragment whose rows a reuse version moved into it.
+fn reuse_lineage(ancestors: &HashMap<u32, RoaringBitmap>, fragment: u32) -> RoaringBitmap {
+    let mut lineage = ancestors.get(&fragment).cloned().unwrap_or_default();
+    lineage.insert(fragment);
+    lineage
+}
+
+/// Fold every reuse version into a segment's stored bitmap.
+///
+/// A wholly indexed group swaps its old fragments for its new ones. A
+/// straddled group (only some old fragments indexed) is healed as the reader
+/// heals it: the indexed old fragments leave the bitmap and the new fragments
+/// are not claimed, since they also hold rows the segment never indexed.
+/// Their rows are excluded at whole-fragment granularity, together with every
+/// fragment they descend from, and every claimed fragment that any excluded
+/// fragment reaches is withdrawn as well (its lineage then joins the
+/// exclusion), until no claimed fragment shares lineage with the exclusion.
+/// A manifest write persists the healed bitmap of the other segments too, so
+/// those need no remap of their own.
+fn remap_untagged_coverage(
+    versions: &[FragReuseVersion],
+    mut index_frag_bitmap: RoaringBitmap,
+    baseline_version: u64,
+) -> UntaggedCoverage {
+    let mut should_remap = false;
+    let mut excluded_source_fragments = RoaringBitmap::new();
+    // For every new fragment of a version, all the fragments its rows may
+    // have come from through earlier versions.
+    let mut ancestors: HashMap<u32, RoaringBitmap> = HashMap::new();
+    for version in versions {
+        let data_predates_version = baseline_version <= version.dataset_version;
+        for group in version.groups.iter() {
+            let mut group_lineage = RoaringBitmap::new();
+            let mut indexed_old_frags = RoaringBitmap::new();
+            for old_frag in group.old_frags.iter() {
+                let old_frag = old_frag.id as u32;
+                group_lineage |= reuse_lineage(&ancestors, old_frag);
+                if index_frag_bitmap.remove(old_frag) {
+                    indexed_old_frags.insert(old_frag);
+                }
+            }
+            for new_frag in group.new_frags.iter() {
+                ancestors.insert(new_frag.id as u32, group_lineage.clone());
+            }
+
+            if !indexed_old_frags.is_empty() {
+                if indexed_old_frags.len() != group.old_frags.len() as u64 {
+                    log::warn!(
+                        "Healing straddling fragment-reuse rewrite group while remapping: \
+                         group {:?} was only partially indexed ({} of {} old fragments). \
+                         Its rows are dropped from the index and use flat scan until the \
+                         next optimize_indices.",
+                        group.old_frags,
+                        indexed_old_frags.len(),
+                        group.old_frags.len(),
+                    );
+                    for old_frag in indexed_old_frags.iter() {
+                        excluded_source_fragments |= reuse_lineage(&ancestors, old_frag);
+                    }
+                } else {
+                    index_frag_bitmap.extend(group.new_frags.iter().map(|f| f.id as u32));
+                }
+                should_remap = true;
+            } else if data_predates_version
+                && group
+                    .new_frags
+                    .iter()
+                    .any(|new_frag| index_frag_bitmap.contains(new_frag.id as u32))
+            {
+                // The bitmap was already coverage-remapped onto this
+                // group's new fragments and persisted before the data was
+                // remapped, so the old fragments are gone from the bitmap
+                // but the index data still needs remapping.
+                should_remap = true;
+            }
+        }
+    }
+
+    // A claimed fragment that shares lineage with an excluded one would lose
+    // some of its rows, so it is withdrawn and its whole lineage excluded.
+    while !excluded_source_fragments.is_empty() {
+        let withdrawn: RoaringBitmap = index_frag_bitmap
+            .iter()
+            .filter(|&fragment| {
+                !reuse_lineage(&ancestors, fragment).is_disjoint(&excluded_source_fragments)
+            })
+            .collect();
+        if withdrawn.is_empty() {
+            break;
+        }
+        for fragment in withdrawn.iter() {
+            excluded_source_fragments |= reuse_lineage(&ancestors, fragment);
+        }
+        index_frag_bitmap -= &withdrawn;
+    }
+
+    UntaggedCoverage {
+        should_remap,
+        fragment_bitmap: index_frag_bitmap,
+        excluded_source_fragments,
+    }
+}
+
 /// Remap a given index using the fragment reuse index if possible.
 /// If the frag reuse index does not exist, the operation fails with [Error::NotSupported]
 /// If the frag reuse index exists but is empty, the operation succeeds without a commit.
@@ -281,50 +397,22 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // at a version's dataset_version predates its rewrite.
     let baseline_version = curr_index_meta.dataset_version;
     let has_unknown_coverage = curr_index_meta.fragment_bitmap.is_none();
-    let (should_remap, mut bitmap_after_remap) = match curr_index_meta.fragment_bitmap.clone() {
-        Some(mut index_frag_bitmap) => {
-            let mut should_remap = false;
-            for version in frag_reuse_index.details.versions.iter() {
-                let data_predates_version = baseline_version <= version.dataset_version;
-                for group in version.groups.iter() {
-                    let mut old_frag_in_index = 0;
-                    for old_frag in group.old_frags.iter() {
-                        if index_frag_bitmap.remove(old_frag.id as u32) {
-                            old_frag_in_index += 1;
-                        }
-                    }
-
-                    if old_frag_in_index > 0 {
-                        if old_frag_in_index != group.old_frags.len() {
-                            // this should never happen because we always commit a full rewrite group
-                            // and we always reindex either the entire group or nothing.
-                            // We use invalid input to be consistent with
-                            // dataset::transaction::recalculate_fragment_bitmap
-                            return Err(Error::invalid_input(format!(
-                                "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                group.old_frags
-                            )));
-                        }
-                        index_frag_bitmap.extend(group.new_frags.iter().map(|f| f.id as u32));
-                        should_remap = true;
-                    } else if data_predates_version
-                        && group
-                            .new_frags
-                            .iter()
-                            .any(|new_frag| index_frag_bitmap.contains(new_frag.id as u32))
-                    {
-                        // The bitmap was already coverage-remapped onto this
-                        // group's new fragments and persisted before the data was
-                        // remapped, so the old fragments are gone from the bitmap
-                        // but the index data still needs remapping.
-                        should_remap = true;
-                    }
-                }
+    let (should_remap, mut bitmap_after_remap, excluded_source_fragments) =
+        match curr_index_meta.fragment_bitmap.clone() {
+            Some(index_frag_bitmap) => {
+                let coverage = remap_untagged_coverage(
+                    &frag_reuse_index.details.versions,
+                    index_frag_bitmap,
+                    baseline_version,
+                );
+                (
+                    coverage.should_remap,
+                    Some(coverage.fragment_bitmap),
+                    coverage.excluded_source_fragments,
+                )
             }
-            (should_remap, Some(index_frag_bitmap))
-        }
-        None => (true, None),
-    };
+            None => (true, None, RoaringBitmap::new()),
+        };
 
     if !should_remap {
         return Ok(());
@@ -335,13 +423,18 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // leaves missing mappings unchanged, so no composed per-row map is needed.
     // This also handles the sibling-coverage-remap case: remapping is driven by
     // the row addresses stored in the index, not by its already-advanced bitmap.
-    let remap_result = index::remap::remap_index(
-        dataset,
-        index_id,
-        &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
-        None,
-    )
-    .await?;
+    // Rows of excluded fragments are dropped before the chain applies, so the
+    // rebuilt files hold nothing for a fragment the new bitmap does not claim.
+    let row_addr_remap = frag_reuse_index.row_addr_remap().clone();
+    let translator = if excluded_source_fragments.is_empty() {
+        RowAddrTranslator::sync(row_addr_remap)
+    } else {
+        RowAddrTranslator::sync(RowAddrRemap::with_removed_fragments(
+            Arc::new(row_addr_remap),
+            excluded_source_fragments,
+        ))
+    };
+    let remap_result = index::remap::remap_index(dataset, index_id, &translator, None).await?;
 
     // Remapping advances the index watermark for fragment-reuse cleanup, but it
     // does not incorporate overlays committed after the source index was built.
@@ -4909,6 +5002,452 @@ mod tests {
             );
             let reopened = fresh(uri).await;
             assert_index_matches_scan(&reopened, all_values.iter().copied()).await;
+        }
+    }
+
+    /// The untagged remap heals a rewrite group that straddles a segment's
+    /// coverage the way the reader does instead of refusing the remap.
+    mod untagged_straddle {
+        use super::*;
+        use crate::dataset::index::DatasetIndexRemapperOptions;
+        use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+        use crate::dataset::optimize::{
+            CompactionOptions, CompactionTask, TaskData, commit_compaction,
+        };
+        use arrow_array::cast::AsArray;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_index::scalar::BuiltinIndexType;
+        use rstest::rstest;
+        use std::sync::Arc;
+
+        const INDEX_NAME: &str = "i_idx";
+        const ROWS_PER_FRAGMENT: u32 = 10;
+
+        fn digest(id: u64) -> FragDigest {
+            FragDigest {
+                id,
+                physical_rows: 10,
+                num_deleted_rows: 0,
+            }
+        }
+
+        fn reuse_version(
+            dataset_version: u64,
+            groups: Vec<(Vec<u64>, Vec<u64>)>,
+        ) -> FragReuseVersion {
+            FragReuseVersion {
+                dataset_version,
+                groups: groups
+                    .into_iter()
+                    .map(|(old, new)| FragReuseGroup {
+                        changed_row_addrs: Vec::new(),
+                        old_frags: old.into_iter().map(digest).collect(),
+                        new_frags: new.into_iter().map(digest).collect(),
+                    })
+                    .collect(),
+            }
+        }
+
+        fn bitmap(ids: &[u32]) -> RoaringBitmap {
+            ids.iter().copied().collect()
+        }
+
+        /// Coverage folding, segment built at version 1 (before every rewrite).
+        #[rstest]
+        #[case::untouched(
+            vec![reuse_version(5, vec![(vec![1, 2], vec![4])])],
+            &[0],
+            false,
+            &[0],
+            &[]
+        )]
+        #[case::wholly_owned(
+            vec![reuse_version(5, vec![(vec![1, 2], vec![4])])],
+            &[0, 1, 2],
+            true,
+            &[0, 4],
+            &[]
+        )]
+        #[case::straddled(
+            vec![reuse_version(5, vec![(vec![1, 2], vec![4])])],
+            &[0, 1],
+            true,
+            &[0],
+            &[1]
+        )]
+        // 0 -> 4 is owned, then 4 + 9 -> 5 straddles: the files hold 0's
+        // rows, so the stored fragment 0 is excluded, not only 4.
+        #[case::straddled_at_a_later_hop(
+            vec![
+                reuse_version(5, vec![(vec![0], vec![4])]),
+                reuse_version(6, vec![(vec![4, 9], vec![5])]),
+            ],
+            &[0, 1],
+            true,
+            &[1],
+            &[0, 4]
+        )]
+        // The stored bitmap was already advanced onto 4 while the files still
+        // hold 0's rows; the exclusion still reaches 0.
+        #[case::straddled_after_an_advanced_bitmap(
+            vec![
+                reuse_version(5, vec![(vec![0], vec![4])]),
+                reuse_version(6, vec![(vec![4, 9], vec![5])]),
+            ],
+            &[1, 4],
+            true,
+            &[1],
+            &[0, 4]
+        )]
+        // 0 + 1 -> 4 + 5 is owned, then 4 + 9 -> 6 straddles. 0 and 1 are
+        // excluded whole, so 5, which also received their rows, is withdrawn.
+        #[case::sibling_destination_withdrawn(
+            vec![
+                reuse_version(5, vec![(vec![0, 1], vec![4, 5])]),
+                reuse_version(6, vec![(vec![4, 9], vec![6])]),
+            ],
+            &[0, 1, 2],
+            true,
+            &[2],
+            &[0, 1, 4, 5]
+        )]
+        // One version straddles 3 + 4 and owns 5 + 6; the next combines both
+        // destinations, so the owned destination is straddled in turn.
+        #[case::owned_destination_straddled_later(
+            vec![
+                reuse_version(5, vec![(vec![3, 4], vec![8]), (vec![5, 6], vec![9])]),
+                reuse_version(6, vec![(vec![8, 9], vec![10])]),
+            ],
+            &[4, 5, 6, 7],
+            true,
+            &[7],
+            &[4, 5, 6, 9]
+        )]
+        fn test_untagged_coverage(
+            #[case] versions: Vec<FragReuseVersion>,
+            #[case] stored: &[u32],
+            #[case] should_remap: bool,
+            #[case] claimed: &[u32],
+            #[case] excluded: &[u32],
+        ) {
+            assert_eq!(
+                remap_untagged_coverage(&versions, bitmap(stored), 1),
+                UntaggedCoverage {
+                    should_remap,
+                    fragment_bitmap: bitmap(claimed),
+                    excluded_source_fragments: bitmap(excluded),
+                }
+            );
+        }
+
+        fn deferred() -> CompactionOptions {
+            CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                defer_index_remap: true,
+                ..Default::default()
+            }
+        }
+
+        /// Deferred-remap compaction of each group of fragment ids into one new
+        /// fragment, all committed together as one reuse version. Bypasses the
+        /// planner: the default planner never groups fragments of different
+        /// index segments, while callers with their own planning can.
+        async fn compact(dataset: &mut Dataset, groups: Vec<Vec<u64>>) {
+            let options = deferred();
+            let mut rewrites = Vec::with_capacity(groups.len());
+            for ids in &groups {
+                let fragments: Vec<_> = dataset
+                    .manifest
+                    .fragments
+                    .iter()
+                    .filter(|fragment| ids.contains(&fragment.id))
+                    .cloned()
+                    .collect();
+                assert_eq!(fragments.len(), ids.len());
+                let task = CompactionTask {
+                    task: TaskData {
+                        fragments,
+                        kind: Default::default(),
+                        output_clustering_id: None,
+                        output_metadata: HashMap::new(),
+                    },
+                    read_version: dataset.manifest.version,
+                    options: options.clone(),
+                };
+                rewrites.push(task.execute(dataset).await.unwrap());
+            }
+            commit_compaction(
+                dataset,
+                rewrites,
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &options,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Fragments of ten ascending `i` values and one BTree segment per entry
+        /// of `segments`, built from the same snapshot and committed together
+        /// before any compaction. Returned in the order of `segments`.
+        async fn table_with_segments(
+            fragments: u32,
+            segments: &[Vec<u32>],
+        ) -> (Dataset, Vec<IndexMetadata>) {
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(
+                    FragmentCount::from(fragments),
+                    FragmentRowCount::from(ROWS_PER_FRAGMENT),
+                )
+                .await
+                .unwrap();
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+            let mut staged = Vec::with_capacity(segments.len());
+            for covered in segments {
+                staged.push(
+                    dataset
+                        .create_index_builder(&["i"], IndexType::BTree, &params)
+                        .name(INDEX_NAME.into())
+                        .replace(true)
+                        .fragments(covered.clone())
+                        .execute_uncommitted()
+                        .await
+                        .unwrap(),
+                );
+            }
+            dataset
+                .commit_existing_index_segments(INDEX_NAME, "i", staged)
+                .await
+                .unwrap();
+            let mut committed = stored_segments(&dataset).await;
+            assert_eq!(committed.len(), segments.len());
+            committed.sort_by_key(|segment| bitmap_of(segment).min());
+            (dataset, committed)
+        }
+
+        async fn stored_segments(dataset: &Dataset) -> Vec<IndexMetadata> {
+            read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == INDEX_NAME)
+            .collect()
+        }
+
+        async fn effective_segments(dataset: &Dataset) -> Vec<IndexMetadata> {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|idx| idx.name == INDEX_NAME)
+                .cloned()
+                .collect()
+        }
+
+        fn bitmap_of(segment: &IndexMetadata) -> RoaringBitmap {
+            segment.fragment_bitmap.clone().unwrap()
+        }
+
+        fn sorted_bitmaps(segments: &[IndexMetadata]) -> Vec<RoaringBitmap> {
+            let mut bitmaps: Vec<RoaringBitmap> = segments.iter().map(bitmap_of).collect();
+            bitmaps.sort_by_key(|bitmap| bitmap.min());
+            bitmaps
+        }
+
+        fn fragments_from(dataset: &Dataset, first: u32) -> Vec<u32> {
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .filter(|&id| id >= first)
+                .collect()
+        }
+
+        async fn reuse_versions(dataset: &Dataset) -> usize {
+            let Some(meta) = dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+            else {
+                return 0;
+            };
+            load_frag_reuse_index_details(dataset, &meta)
+                .await
+                .unwrap()
+                .versions
+                .len()
+        }
+
+        async fn values(dataset: &Dataset, predicate: &str, use_index: bool) -> Vec<i32> {
+            let mut scan = dataset.scan();
+            scan.filter(predicate).unwrap().use_scalar_index(use_index);
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut values: Vec<i32> = batch["i"]
+                .as_primitive::<Int32Type>()
+                .iter()
+                .map(|value| value.unwrap())
+                .collect();
+            values.sort_unstable();
+            values
+        }
+
+        async fn assert_matches_scan(dataset: &Dataset, predicates: &[&str]) {
+            for predicate in predicates {
+                let indexed = values(dataset, predicate, true).await;
+                assert!(!indexed.is_empty(), "{predicate}");
+                assert_eq!(
+                    indexed,
+                    values(dataset, predicate, false).await,
+                    "{predicate}"
+                );
+            }
+        }
+
+        /// Values in F0, in C (from F1 and F2), in F3, and a range over all.
+        const TWO_SEGMENT_PREDICATES: [&str; 5] =
+            ["i = 5", "i = 15", "i = 25", "i = 35", "i >= 5 AND i < 35"];
+
+        /// S1 covers F0 + F1 and S2 covers F2 + F3 when a deferred compaction
+        /// rewrites F1 + F2 into C. Each segment drops its share of the group
+        /// and keeps the rest, nothing claims C until `optimize_indices`
+        /// indexes it, and the reuse version trims after the remap. S1 is
+        /// rebuilt; S2's healed bitmap is already persisted by S1's commit, so
+        /// it may keep its uuid.
+        #[tokio::test]
+        async fn test_straddled_group_heals_both_segments() {
+            let (mut dataset, segments) = table_with_segments(4, &[vec![0, 1], vec![2, 3]]).await;
+            compact(&mut dataset, vec![vec![1, 2]]).await;
+            let compacted = fragments_from(&dataset, 4);
+            assert_eq!(compacted.len(), 1);
+            let c = compacted[0];
+            let straddled = stored_segments(&dataset).await;
+            for (segment, rewritten) in segments.iter().zip([1, 2]) {
+                let stored = straddled
+                    .iter()
+                    .find(|stored| stored.uuid == segment.uuid)
+                    .unwrap();
+                assert!(bitmap_of(stored).contains(rewritten));
+            }
+
+            assert_matches_scan(&dataset, &TWO_SEGMENT_PREDICATES).await;
+            for segment in effective_segments(&dataset).await {
+                assert!(!bitmap_of(&segment).contains(c));
+            }
+
+            remap_column_index(&mut dataset, &["i"], Some(INDEX_NAME.into()))
+                .await
+                .unwrap();
+            let remapped = stored_segments(&dataset).await;
+            assert_eq!(remapped.len(), 2);
+            let s1 = remapped
+                .iter()
+                .find(|segment| bitmap_of(segment) == bitmap(&[0]))
+                .unwrap();
+            assert_ne!(s1.uuid, segments[0].uuid);
+            assert_eq!(sorted_bitmaps(&remapped), vec![bitmap(&[0]), bitmap(&[3])]);
+            assert_matches_scan(&dataset, &TWO_SEGMENT_PREDICATES).await;
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(reuse_versions(&dataset).await, 0);
+            assert_matches_scan(&dataset, &TWO_SEGMENT_PREDICATES).await;
+
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            let covered = stored_segments(&dataset)
+                .await
+                .iter()
+                .fold(RoaringBitmap::new(), |covered, segment| {
+                    covered | bitmap_of(segment)
+                });
+            assert_eq!(covered, bitmap(&[0, 3, c]));
+            assert_matches_scan(&dataset, &TWO_SEGMENT_PREDICATES).await;
+        }
+
+        /// Remapping only S1 commits a manifest that persists S2's healed
+        /// bitmap too: both stored bitmaps are final, C is claimed by no
+        /// segment, the trim releases the version, and S2's own remap is then
+        /// a no-op.
+        #[tokio::test]
+        async fn test_remapping_one_segment_persists_the_other_segments_healed_coverage() {
+            let (mut dataset, segments) = table_with_segments(4, &[vec![0, 1], vec![2, 3]]).await;
+            compact(&mut dataset, vec![vec![1, 2]]).await;
+            let c = fragments_from(&dataset, 4)[0];
+
+            remap_index(&mut dataset, &segments[0].uuid).await.unwrap();
+            assert_matches_scan(&dataset, &TWO_SEGMENT_PREDICATES).await;
+            let stored = stored_segments(&dataset).await;
+            assert_eq!(sorted_bitmaps(&stored), vec![bitmap(&[0]), bitmap(&[3])]);
+            let effective = effective_segments(&dataset).await;
+            for segment in stored.iter().chain(effective.iter()) {
+                assert!(!bitmap_of(segment).contains(c));
+            }
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(reuse_versions(&dataset).await, 0);
+            assert_matches_scan(&dataset, &TWO_SEGMENT_PREDICATES).await;
+
+            remap_index(&mut dataset, &segments[1].uuid).await.unwrap();
+            let stored = stored_segments(&dataset).await;
+            assert!(
+                stored
+                    .iter()
+                    .any(|segment| segment.uuid == segments[1].uuid)
+            );
+            assert_eq!(sorted_bitmaps(&stored), vec![bitmap(&[0]), bitmap(&[3])]);
+            assert_matches_scan(&dataset, &TWO_SEGMENT_PREDICATES).await;
+        }
+
+        /// S1 covers F0..F3 and S2 covers F4..F7. One compaction rewrites the
+        /// straddled F3 + F4 into X and S2's own F5 + F6 into Y, the next
+        /// combines X + Y into Z. S2's rows of Y land in Z next to rows S2
+        /// never held, so S2 keeps only F7 and S1 keeps F0..F2.
+        #[tokio::test]
+        async fn test_owned_destination_straddled_by_a_later_compaction() {
+            let (mut dataset, _) =
+                table_with_segments(8, &[vec![0, 1, 2, 3], vec![4, 5, 6, 7]]).await;
+            compact(&mut dataset, vec![vec![3, 4], vec![5, 6]]).await;
+            let first = fragments_from(&dataset, 8);
+            assert_eq!(first.len(), 2);
+            assert_eq!(reuse_versions(&dataset).await, 1);
+            compact(
+                &mut dataset,
+                vec![first.iter().map(|&id| id as u64).collect()],
+            )
+            .await;
+            assert_eq!(fragments_from(&dataset, 8).len(), 1);
+            assert_eq!(reuse_versions(&dataset).await, 2);
+
+            let predicates = [
+                "i = 5",
+                "i = 25",
+                "i = 35",
+                "i = 45",
+                "i = 55",
+                "i = 65",
+                "i = 75",
+                "i >= 25 AND i < 75",
+            ];
+            assert_matches_scan(&dataset, &predicates).await;
+            remap_column_index(&mut dataset, &["i"], Some(INDEX_NAME.into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                sorted_bitmaps(&stored_segments(&dataset).await),
+                vec![bitmap(&[0, 1, 2]), bitmap(&[7])]
+            );
+            assert_matches_scan(&dataset, &predicates).await;
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(reuse_versions(&dataset).await, 0);
+            assert_matches_scan(&dataset, &predicates).await;
         }
     }
 

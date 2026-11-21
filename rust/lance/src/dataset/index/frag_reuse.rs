@@ -15,7 +15,7 @@ use crate::index::frag_reuse_with_stable_row_ids::history::trimmable_versions;
 use crate::index::loading::DatasetIndexInternalExt;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails,
+    CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
 };
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -95,6 +95,8 @@ impl Dataset {
 ///    version is still in its bitmap. A missing bitmap counts as caught up, else
 ///    the version could never be cleaned up.
 ///
+/// A version whose check fails for any index is kept.
+///
 /// Note that there could be a race condition that an index is being added during the cleanup,
 /// This will make that specific index not efficient until the next reindex,
 /// but it will not cause any correctness problem.
@@ -160,20 +162,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
-        let check_results = indices
-            .iter()
-            .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
-            .collect::<Vec<_>>();
-
-        if check_results
-            .iter()
-            .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
-        {
-            // If the check fails, the reuse version is likely corrupted, do not retain it.
-            continue;
-        }
-
-        if !check_results.into_iter().all(|r| r.unwrap()) {
+        if version_needed_by_any_index(version, &indices, &chain_frag_bitmap) {
             fragment_bitmaps.extend(version.new_frag_bitmap());
             retained_versions.push(version.clone());
         }
@@ -210,6 +199,21 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         .await?;
 
     Ok(())
+}
+
+/// Whether some index may still need `version`. A check that errors cannot
+/// prove the index caught up, so it retains the version.
+fn version_needed_by_any_index(
+    version: &FragReuseVersion,
+    indices: &[IndexMetadata],
+    chain_frag_bitmap: &RoaringBitmap,
+) -> bool {
+    indices.iter().any(|idx| {
+        !matches!(
+            is_index_remap_caught_up(version, idx, chain_frag_bitmap),
+            Ok(true)
+        )
+    })
 }
 
 /// The stable-row-id cleanup: removes the versions [`trimmable_versions`] counts
@@ -773,6 +777,28 @@ pub(crate) mod tests {
         assert_false!(
             is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain).unwrap()
         );
+    }
+
+    /// A segment past the version that covers only part of one of its groups
+    /// makes the caught-up check fail. The trim cannot tell whether that
+    /// segment still needs the version, so it keeps it.
+    #[test]
+    fn test_trim_keeps_a_version_whose_check_errors() {
+        let version = reuse_version(10, &[4, 5], &[6]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        let straddling = index_covering(11, &[4]);
+        let caught_up = index_covering(11, &[1, 6]);
+        assert!(matches!(
+            is_index_remap_caught_up(&version, &straddling, &chain),
+            Err(Error::InvalidInput { .. })
+        ));
+
+        assert_true!(version_needed_by_any_index(
+            &version,
+            &[caught_up.clone(), straddling],
+            &chain
+        ));
+        assert_false!(version_needed_by_any_index(&version, &[caught_up], &chain));
     }
 
     #[tokio::test]
