@@ -3413,7 +3413,7 @@ def test_address_domain_index_not_query_with_stable_row_ids(tmp_path: Path, inde
 
 
 def test_zonemap_index_remapping(tmp_path: Path):
-    """Test zonemap index remapping after compaction and optimization"""
+    """Compaction remaps a zone map index so it keeps covering the new fragments"""
     # Create a dataset with 5 fragments by writing data in chunks
     # Each fragment will have 1000 rows, so we need 5000 total rows
     tbl = pa.Table.from_arrays([pa.array(range(0, 5000))], names=["values"])
@@ -3442,15 +3442,9 @@ def test_zonemap_index_remapping(tmp_path: Path):
     assert compaction.fragments_removed == 5
     assert len(dataset.get_fragments()) == 2
 
-    # Check if the zone map index is no longer being used
-    scanner = dataset.scanner(filter="values > 2500", prefilter=True)
-    plan = scanner.explain_plan()
-    assert "ScalarIndexQuery" not in plan
+    # The remapped zone map covers every compacted fragment
+    assert dataset.stats.index_stats("values_idx")["num_unindexed_rows"] == 0
 
-    # Run optimize indices to rebuild the index
-    dataset.optimize.optimize_indices()
-
-    # Confirm the zone map index is used again after optimization
     scanner = dataset.scanner(filter="values > 2500", prefilter=True)
     plan = scanner.explain_plan()
     assert "ScalarIndexQuery" in plan
