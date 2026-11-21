@@ -1593,22 +1593,21 @@ impl<'a> CleanupTask<'a> {
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
-        // Build stream for a managed subtree
+        // Build stream for a managed subtree.
         let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
             self.dataset
                 .object_store
                 .read_dir_all(&dir, unmodified_since)
-                .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
-                .or_else(|e| {
-                    // If the directory doesn't exist then we can just return an empty stream.
-                    if e.is_not_found() {
-                        future::ready(Ok(stream::empty::<Result<ObjectMeta>>().boxed()))
-                    } else {
-                        future::ready(Err(e))
-                    }
+                .filter_map(|result| {
+                    // A missing managed directory is an empty subtree, not an
+                    // error. Any other listing error stays in the stream.
+                    future::ready(match result {
+                        Ok(obj_meta) => Some(Ok(obj_meta)),
+                        Err(error) if error.is_not_found() => None,
+                        Err(error) => Some(Err(error)),
+                    })
                 })
-                .try_flatten()
                 .try_filter_map(move |obj_meta| {
                     // If a file is new-ish then it might be part of an ongoing operation and so we only
                     // delete it if we can verify it is part of an old version.
@@ -1660,7 +1659,11 @@ impl<'a> CleanupTask<'a> {
                 None,
             ));
         }
-        let unreferenced_files = stream::iter(streams).flatten().boxed();
+        // List the managed subtrees concurrently so a large `data/` listing
+        // doesn't delay `_indices/`, `_deletions/`, etc. Each subtree is a
+        // single paginated LIST, so this is at most one in-flight LIST per
+        // subtree.
+        let unreferenced_files = stream::iter(streams).flatten_unordered(None).boxed();
 
         // LocalFileSystem hides its staging files from object listings. They can
         // never be referenced, even inside a retained index or blob directory.
@@ -3207,6 +3210,8 @@ mod tests {
     mod auto_cleanup;
 
     mod branch_lineage;
+
+    mod listing;
 
     #[rstest]
     #[case::zero(0)]
