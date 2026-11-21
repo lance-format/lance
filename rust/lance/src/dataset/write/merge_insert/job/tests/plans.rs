@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::dataset::MergeInsertJoinStrategy;
-use arrow_array::record_batch;
+use arrow_array::{record_batch, types::Int32Type};
 use prost::Message;
 use std::sync::atomic::{AtomicU32, Ordering};
 
