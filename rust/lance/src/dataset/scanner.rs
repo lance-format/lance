@@ -618,6 +618,9 @@ pub struct Scanner {
     /// If true, the scanner will emit deleted rows
     include_deleted_rows: bool,
 
+    /// Additional output for consumers that tag rows with source fragments.
+    fragment_id_column: Option<String>,
+
     /// If set, this callback will be called after the scan with summary statistics
     scan_stats_callback: Option<ExecutionStatsCallback>,
 

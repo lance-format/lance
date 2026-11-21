@@ -11,6 +11,7 @@ import pickle
 import platform
 import random
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -38,6 +39,7 @@ import pytest
 from helper import ProgressForTest
 from lance._dataset.optimize import AutoCleanupConfig
 from lance._dataset.refs import _convert_version_timestamp
+from lance._dataset.scanner import ScannerBuilder
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
@@ -7055,6 +7057,225 @@ def test_scanner_schemas(tmp_path: Path):
     scanner = dataset.scanner(columns=["a"])
     assert scanner.dataset_schema == dataset.schema
     assert scanner.projected_schema == pa.schema([pa.field("a", pa.int64())])
+
+
+@pytest.mark.parametrize(
+    "projection", ["empty", "id", "row_address", "computed_row_address"]
+)
+def test_scan_batches_tags_ordered_filtered_runs(tmp_path, projection):
+    ds = lance.write_dataset(
+        pa.table({"id": [0, 4, 7, 1, 5, 6, 2, 3, 8]}),
+        tmp_path / "ds",
+        max_rows_per_file=3,
+    )
+    options = {
+        "filter": "id < 7 AND id != 3",
+        "order_by": ["id"],
+        "batch_size": 8,
+        "strict_batch_size": True,
+    }
+    reference = ds.scanner(columns=["id"], with_row_address=True, **options).to_table()
+    if projection == "computed_row_address":
+        columns = {"_rowaddr": "id + 100", "_lance_fragment_id": "id", "id": "id"}
+    else:
+        columns = [] if projection == "empty" else ["id"]
+    scanner = ds.scanner(
+        columns=columns, with_row_address=projection == "row_address", **options
+    )
+    expected = scanner.to_table()
+    assert [batch.num_rows for batch in expected.to_batches()] == [6]
+    expected_fragment_ids = [
+        row_address >> 32 for row_address in reference["_rowaddr"].to_pylist()
+    ]
+
+    ds.delete("id IN (0, 4, 7)")
+
+    tagged = list(scanner.scan_batches())
+    assert all(isinstance(item, pa_ds.TaggedRecordBatch) for item in tagged)
+    assert [item.fragment.fragment_id for item in tagged] == [0, 1, 2, 0, 1]
+    assert [
+        item.fragment.fragment_id
+        for item in tagged
+        for _ in range(item.record_batch.num_rows)
+    ] == expected_fragment_ids
+    assert [item.fragment.count_rows() for item in tagged] == [3] * 5
+    actual = pa.Table.from_batches([item.record_batch for item in tagged])
+    assert actual.equals(expected, check_metadata=True)
+    assert scanner.to_table().equals(expected, check_metadata=True)
+
+
+@pytest.mark.parametrize("delete", ["id = 0", "id < 2"], ids=["partial", "full"])
+def test_scan_batches_tags_explicit_fragment(tmp_path, delete):
+    ds = lance.write_dataset(
+        pa.table({"id": [0, 1, 2, 3]}), tmp_path / "ds", max_rows_per_file=2
+    )
+    original_fragment = ds.get_fragments()[0]
+    ds.delete(delete)
+
+    scanner = ds.scanner(fragments=[original_fragment])
+    expected = scanner.to_table()
+    assert expected["id"].to_pylist() == [0, 1]
+    tagged = list(scanner.scan_batches())
+    assert pa.Table.from_batches([item.record_batch for item in tagged]) == expected
+    assert all(item.fragment.to_table() == expected for item in tagged)
+
+
+@pytest.mark.parametrize("original_first", [False, True], ids=["current", "original"])
+def test_scan_batches_rejects_conflicting_fragment_ids(tmp_path, original_first):
+    ds = lance.write_dataset(pa.table({"id": [0, 1]}), tmp_path / "ds")
+    original = ds.get_fragments()[0]
+    ds.delete("id = 0")
+    current = ds.get_fragments()[0]
+    fragments = [original, current] if original_first else [current, original]
+    scanner = ds.scanner(fragments=fragments)
+
+    with mock.patch.object(
+        type(scanner._scanner),
+        "to_pyarrow",
+        side_effect=AssertionError("opened reader"),
+    ):
+        with pytest.raises(
+            ValueError, match="conflicting fragment descriptors for ID 0"
+        ):
+            next(scanner.scan_batches())
+
+
+def test_scan_batches_accepts_matching_fragment_ids(tmp_path):
+    ds = lance.write_dataset(pa.table({"id": [0, 1]}), tmp_path / "ds")
+    first = ds.get_fragments()[0]
+    second = ds.get_fragments()[0]
+    scanner = ds.scanner(fragments=[first, second])
+
+    expected = scanner.to_table()
+    tagged = list(scanner.scan_batches())
+    assert pa.Table.from_batches([item.record_batch for item in tagged]) == expected
+    assert all(item.fragment.to_table() == first.to_table() for item in tagged)
+
+
+@pytest.mark.parametrize("stable_row_ids", [False, True], ids=["physical", "stable"])
+@pytest.mark.parametrize("with_row_address", [False, True], ids=["rowid", "rowaddr"])
+def test_scan_batches_tags_deleted_rows(tmp_path, stable_row_ids, with_row_address):
+    ds = lance.write_dataset(
+        pa.table({"id": [0, 3, 1, 4, 2, 5]}),
+        tmp_path / "ds",
+        max_rows_per_file=2,
+        enable_stable_row_ids=stable_row_ids,
+    )
+    ds.delete("id IN (1, 2)")
+    scanner = ds.scanner(
+        columns=["id"],
+        with_row_id=True,
+        with_row_address=with_row_address,
+        include_deleted_rows=True,
+        filter="id < 5",
+        order_by=["id"],
+        strict_batch_size=True,
+        batch_size=8,
+    )
+    expected = scanner.to_table()
+    assert expected["id"].to_pylist() == [0, 1, 2, 3, 4]
+    assert expected["_rowid"].null_count == 2
+    if with_row_address:
+        assert expected["_rowaddr"].null_count == 2
+    tagged = list(scanner.scan_batches())
+    assert pa.Table.from_batches([item.record_batch for item in tagged]) == expected
+    assert [
+        item.fragment.fragment_id
+        for item in tagged
+        for _ in range(item.record_batch.num_rows)
+    ] == [0, 1, 2, 0, 1]
+
+
+def test_scan_batches_tags_legacy_deleted_rows(tmp_path):
+    fixture = Path(__file__).resolve().parents[3] / "test_data/v0.7.5/with_deletions"
+    ds = lance.dataset(shutil.copytree(fixture, tmp_path / "ds"))
+    scanner = ds.scanner(
+        with_row_id=True,
+        with_row_address=True,
+        include_deleted_rows=True,
+        order_by=["x"],
+    )
+    expected = scanner.to_table()
+    assert expected["x"].to_pylist() == list(range(100))
+    assert expected["_rowaddr"].null_count == 10
+    tagged = list(scanner.scan_batches())
+    assert pa.Table.from_batches([item.record_batch for item in tagged]) == expected
+    assert {item.fragment.fragment_id for item in tagged} == {0}
+
+
+def test_scan_batches_empty(tmp_path):
+    ds = lance.write_dataset(
+        pa.table({"id": [1, 2]}), tmp_path / "ds", max_rows_per_file=1
+    )
+    assert list(ds.scanner(filter="id < 0").scan_batches()) == []
+
+
+def test_scan_batches_rejects_aggregate(tmp_path):
+    from datafusion import SessionContext
+    from datafusion.substrait import Producer
+
+    table = pa.table({"id": [1, 2]})
+    ds = lance.write_dataset(table, tmp_path / "ds", max_rows_per_file=1)
+    ctx = SessionContext()
+    ctx.register_record_batches("source", [table.to_batches()])
+    plan = ctx.sql("SELECT COUNT(*) FROM source").logical_plan()
+    aggregate = Producer.to_substrait_plan(plan.inputs()[0], ctx).encode()
+    scanner = ScannerBuilder(ds).substrait_aggregate(aggregate).to_scanner()
+
+    assert scanner.to_table().column(0).to_pylist() == [2]
+    with pytest.raises(NotImplementedError, match="cannot tag aggregate results"):
+        next(scanner.scan_batches())
+
+
+@pytest.mark.parametrize("outcome", ["exhausted", "closed", "error"])
+def test_scan_batches_closes_reader(tmp_path, monkeypatch, outcome):
+    ds = lance.write_dataset(
+        pa.table({"id": [1, 2]}), tmp_path / "ds", max_rows_per_file=1
+    )
+    scanner = ds.scanner(batch_size=1)
+    native_type = type(scanner._scanner)
+    original_to_pyarrow = native_type.to_pyarrow
+    reader = None
+
+    class TrackingReader:
+        def __init__(self, inner):
+            self.inner = inner
+            self.schema = inner.schema
+            self.batches_read = 0
+            self.closed = False
+
+        def __iter__(self):
+            for batch in self.inner:
+                self.batches_read += 1
+                yield batch
+                if outcome == "error":
+                    raise pa.ArrowInvalid("simulated read failure")
+
+        def close(self):
+            self.closed = True
+            self.inner.close()
+
+    def open_reader(native):
+        nonlocal reader
+        reader = TrackingReader(original_to_pyarrow(native))
+        return reader
+
+    monkeypatch.setattr(native_type, "to_pyarrow", open_reader)
+    batches = scanner.scan_batches()
+    assert reader is None
+    assert next(batches).record_batch["id"].to_pylist() == [1]
+    assert reader.batches_read == 1
+    assert not reader.closed
+
+    if outcome == "error":
+        with pytest.raises(pa.ArrowInvalid, match="simulated read failure"):
+            next(batches)
+    elif outcome == "closed":
+        batches.close()
+        assert reader.batches_read == 1
+    else:
+        assert [item.record_batch["id"].to_pylist() for item in batches] == [[2]]
+    assert reader.closed
 
 
 def test_scan_deleted_rows(tmp_path: Path):

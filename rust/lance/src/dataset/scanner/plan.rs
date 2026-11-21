@@ -18,22 +18,23 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use datafusion::catalog::Session;
-use datafusion::common::exec_datafusion_err;
+use datafusion::common::{ScalarValue, exec_datafusion_err};
 use datafusion::config::ConfigOptions;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, Operator};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_optimizer::output_requirements::OutputRequirementExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, expressions};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion_physical_expr::{Distribution, LexOrdering, PhysicalExpr};
 use futures::future::BoxFuture;
 use futures::stream::StreamExt;
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -238,6 +239,21 @@ impl Scanner {
                 let row_addr_expr = output_expr.remove(row_addr_pos);
                 output_expr.push(row_addr_expr);
             }
+        }
+
+        if let Some(name) = &self.fragment_id_column {
+            let fragment_id = if current_schema.field_with_name(name).is_ok() {
+                expressions::col(name, current_schema)?
+            } else {
+                Arc::new(BinaryExpr::new(
+                    expressions::col(ROW_ADDR, current_schema)?,
+                    Operator::Divide,
+                    Arc::new(Literal::new(ScalarValue::UInt64(Some(
+                        RowAddress::FRAGMENT_SIZE,
+                    )))),
+                ))
+            };
+            output_expr.push((fragment_id, name.clone()));
         }
 
         Ok(output_expr)

@@ -95,6 +95,7 @@ impl Scanner {
             use_scalar_index: true,
             ignored_scalar_index_names: HashSet::new(),
             include_deleted_rows: false,
+            fragment_id_column: None,
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
@@ -1457,6 +1458,30 @@ impl Scanner {
         self.legacy_with_row_addr = true;
         self.projection_plan.include_row_addr();
         self
+    }
+
+    /// Add a source fragment ID column and return its distinct output name.
+    #[doc(hidden)]
+    pub fn with_fragment_id(&mut self) -> Result<String> {
+        if self.aggregate.is_some() {
+            return Err(Error::not_supported_source(
+                "scan_batches cannot tag aggregate results with source fragments".into(),
+            ));
+        }
+
+        let projection = &mut self.projection_plan;
+        let mut name = "_lance_fragment_id".to_string();
+        while self.dataset.schema().field(&name).is_some()
+            || projection
+                .requested_output_expr
+                .iter()
+                .any(|column| column.name == name)
+        {
+            name.push('_');
+        }
+        projection.physical_projection.with_row_addr = true;
+        self.fragment_id_column = Some(name.clone());
+        Ok(name)
     }
 
     /// Instruct the scanner to disable automatic projection of scoring columns

@@ -35,6 +35,7 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::version::ConcreteFileVersion;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
+use lance_table::utils::stream::ReadBatchFut;
 use log::debug;
 use tracing::Instrument;
 
@@ -46,6 +47,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
+use super::FragmentIdColumn;
 use super::column_width::{self, MeasuredWidths};
 use super::utils::{
     IoMetrics, buffered_fragment_opens, estimated_bytes_per_row, estimated_total_byte_size,
@@ -137,6 +139,7 @@ pub struct LanceStream {
     projection: Arc<Schema>,
 
     config: LanceScanConfig,
+    fragment_id_column: Option<FragmentIdColumn>,
 
     scan_metrics: ScanMetrics,
 
@@ -173,10 +176,19 @@ impl LanceStream {
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
+        fragment_id_column: Option<FragmentIdColumn>,
     ) -> Result<Self> {
         let version = dataset.manifest().data_storage_format.lance_file_format();
         crate::dataset::versions::create_scan_stream(
-            version, dataset, fragments, offsets, projection, config, metrics, partition,
+            version,
+            dataset,
+            fragments,
+            offsets,
+            projection,
+            config,
+            metrics,
+            partition,
+            fragment_id_column,
         )
     }
 
@@ -434,6 +446,7 @@ impl LanceStream {
             inner_stream,
             projection,
             config,
+            fragment_id_column: None,
             scan_metrics,
             scan_scheduler: Some(scan_scheduler_clone),
         })
@@ -448,6 +461,7 @@ impl LanceStream {
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
+        fragment_id_column: Option<FragmentIdColumn>,
     ) -> Result<Self> {
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
@@ -469,33 +483,49 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
+        let readers = buffered_fragment_opens(
+            stream::iter(file_fragments),
+            fragment_readahead,
+            move |file_fragment| {
+                let fragment_id = file_fragment.id();
+                let reader = open_file(
+                    file_fragment,
+                    project_schema.clone(),
+                    FragReadConfig::default()
+                        .with_row_id(config.with_row_id)
+                        .with_row_address(config.with_row_address)
+                        .with_row_last_updated_at_version(config.with_row_last_updated_at_version)
+                        .with_row_created_at_version(config.with_row_created_at_version),
+                    config.with_make_deletions_null,
+                    None,
+                );
+                async move { Ok((reader.await?, fragment_id)) }
+            },
+        );
+        let source_column = fragment_id_column.clone();
+        let tasks = readers.and_then(move |(reader, fragment_id)| {
+            let source_column = source_column.clone();
+            async move {
+                let tasks = reader.read_all(config.batch_size as u32).await?;
+                let tasks: BoxStream<'static, lance_core::Result<ReadBatchFut>> =
+                    if let Some(column) = source_column {
+                        tasks
+                            .map(move |task| {
+                                let column = column.clone();
+                                Ok(task
+                                    .and_then(move |batch| async move {
+                                        column.add_to_batch(&batch, fragment_id)
+                                    })
+                                    .boxed())
+                            })
+                            .boxed()
+                    } else {
+                        tasks.map(Ok).boxed()
+                    };
+                Ok(tasks)
+            }
+        });
         let batches = if config.ordered_output {
-            let readers = buffered_fragment_opens(
-                stream::iter(file_fragments),
-                fragment_readahead,
-                move |file_fragment| {
-                    open_file(
-                        file_fragment,
-                        project_schema.clone(),
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
-                            )
-                            .with_row_created_at_version(config.with_row_created_at_version),
-                        config.with_make_deletions_null,
-                        None,
-                    )
-                },
-            );
-            let tasks = readers.and_then(move |reader| async move {
-                reader
-                    .read_all(config.batch_size as u32)
-                    .await
-                    .map(|task_stream| task_stream.map(Ok))
-                    .map_err(DataFusionError::from)
-            });
             tasks
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
@@ -504,32 +534,6 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            let readers = buffered_fragment_opens(
-                stream::iter(file_fragments),
-                fragment_readahead,
-                move |file_fragment| {
-                    open_file(
-                        file_fragment,
-                        project_schema.clone(),
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
-                            )
-                            .with_row_created_at_version(config.with_row_created_at_version),
-                        config.with_make_deletions_null,
-                        None,
-                    )
-                },
-            );
-            let tasks = readers.and_then(move |reader| async move {
-                reader
-                    .read_all(config.batch_size as u32)
-                    .await
-                    .map(|task_stream| task_stream.map(Ok))
-                    .map_err(DataFusionError::from)
-            });
             // When we flatten the streams (one stream per fragment), we allow
             // `fragment_readahead` stream to be read concurrently.
             tasks
@@ -548,6 +552,7 @@ impl LanceStream {
             inner_stream,
             projection,
             config,
+            fragment_id_column,
             scan_metrics,
             scan_scheduler: None,
         })
@@ -584,6 +589,9 @@ impl RecordBatchStream for LanceStream {
             schema = schema
                 .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
+        }
+        if let Some(column) = &self.fragment_id_column {
+            schema = column.add_to_schema(&schema);
         }
         Arc::new(schema)
     }
@@ -648,6 +656,7 @@ pub struct LanceScanExec {
     bytes_per_row: Option<f64>,
     properties: Arc<PlanProperties>,
     config: LanceScanConfig,
+    fragment_id_column: Option<FragmentIdColumn>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -709,6 +718,7 @@ impl LanceScanExec {
             output_schema: self.output_schema.clone(),
             properties: self.properties.clone(),
             config: self.config.clone(),
+            fragment_id_column: self.fragment_id_column.clone(),
             // Shared: the rewritten node stands in for this one, so execution
             // must report through the metrics handle the caller already holds.
             metrics: self.metrics.clone(),
@@ -721,6 +731,17 @@ impl LanceScanExec {
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+    ) -> Self {
+        Self::new_with_fragment_id(dataset, fragments, range, projection, config, None)
+    }
+
+    pub(crate) fn new_with_fragment_id(
+        dataset: Arc<Dataset>,
+        fragments: Arc<Vec<Fragment>>,
+        range: Option<Range<u64>>,
+        projection: Arc<Schema>,
+        config: LanceScanConfig,
+        fragment_id_column: Option<FragmentIdColumn>,
     ) -> Self {
         let output_projection =
             crate::dataset::blob::public_blob_v2_binary_output_schema(projection.as_ref());
@@ -744,6 +765,9 @@ impl LanceScanExec {
                 .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
+        if let Some(column) = &fragment_id_column {
+            output_schema = column.add_to_schema(&output_schema);
+        }
         let output_schema = Arc::new(output_schema);
         let bytes_per_row = estimated_bytes_per_row(
             output_schema.as_ref(),
@@ -766,6 +790,7 @@ impl LanceScanExec {
             bytes_per_row,
             properties,
             config,
+            fragment_id_column,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -845,10 +870,18 @@ impl ExecutionPlan for LanceScanExec {
             ..self.config.clone()
         };
         let metrics = self.metrics.clone();
+        let fragment_id_column = self.fragment_id_column.clone();
 
         let lance_fut_stream = stream::once(async move {
             LanceStream::try_new(
-                dataset, fragments, range, projection, config, &metrics, partition,
+                dataset,
+                fragments,
+                range,
+                projection,
+                config,
+                &metrics,
+                partition,
+                fragment_id_column,
             )
         });
         let lance_stream = lance_fut_stream.try_flatten();

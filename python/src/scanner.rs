@@ -181,6 +181,14 @@ impl Scanner {
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
+    fn _with_fragment_id(&self) -> PyResult<(Self, String)> {
+        let mut scanner = self.clone();
+        let name = Arc::make_mut(&mut scanner.scanner)
+            .with_fragment_id()
+            .infer_error()?;
+        Ok((scanner, name))
+    }
+
     fn to_pyarrow(
         self_: PyRef<'_, Self>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
