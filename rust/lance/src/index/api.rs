@@ -14,6 +14,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::index::segment_reuse::{CommittedSegmentSource, ReusedSegment};
 use crate::{Error, Result};
 
 /// Statistics for one physical index segment, collected at a dataset read version.
@@ -533,6 +534,72 @@ pub trait DatasetIndexExt {
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()>;
+
+    /// Merge committed segments of one index, plus optional freshly built
+    /// uncommitted segments, into one uncommitted segment by reusing their
+    /// stored data, without reading table data.
+    ///
+    /// Only ZoneMap segments are supported. Every source must be a live
+    /// segment of one index whose effective coverage in the current manifest
+    /// equals its `expected_fragments` and whose `dataset_version` equals its
+    /// `expected_dataset_version`; otherwise the error message starts with
+    /// [`STALE_REUSE_SOURCE_ERROR`](crate::index::STALE_REUSE_SOURCE_ERROR).
+    /// Sources a fragment reuse history may still remap, tables with a tagged
+    /// or stable-row-id reuse history, sources that cannot be merged with each
+    /// other, sources whose file metadata gives no safe memory bound (values
+    /// that are not fixed width, such as strings), and merges estimated to
+    /// exceed the memory budget are refused
+    /// with a message starting with
+    /// [`UNSUPPORTED_REUSE_SOURCE_ERROR`](crate::index::UNSUPPORTED_REUSE_SOURCE_ERROR).
+    ///
+    /// `fresh` holds segments built with
+    /// [`CreateIndexBuilder::execute_uncommitted`](crate::index::CreateIndexBuilder::execute_uncommitted),
+    /// each contributing the fragments of its own coverage. The output covers
+    /// the sources' expected coverage and the fresh coverage, and keeps the
+    /// oldest committed source's dataset version (the oldest fresh version
+    /// without committed sources). Publish it with
+    /// [`Self::commit_reused_index_segments`].
+    async fn merge_committed_index_segments(
+        &self,
+        _sources: &[CommittedSegmentSource],
+        _fresh: Vec<IndexMetadata>,
+    ) -> Result<IndexMetadata> {
+        Err(Error::not_supported(
+            "segment reuse is not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Atomically publish segments built by
+    /// [`Self::merge_committed_index_segments`], removing exactly their
+    /// declared sources.
+    ///
+    /// Every source is validated again against the manifest the commit is
+    /// built on, as in the merge. Across all outputs each declared source
+    /// appears once, each output covers exactly its sources' expected coverage
+    /// and its fresh fragments, the outputs do not overlap, and no output is
+    /// stamped newer than the oldest of its sources and its fresh read
+    /// version. Only the fresh
+    /// fragments are checked against `fresh_read_version`: if that version
+    /// was cleaned up or any fresh fragment changed since, the whole
+    /// publication fails with a [`STALE_REUSE_SOURCE_ERROR`](crate::index::STALE_REUSE_SOURCE_ERROR)
+    /// message. Any other live segment of the index overlapping an output
+    /// fails it the same way.
+    ///
+    /// The commit lands only directly on the manifest it was validated
+    /// against: if any other commit landed since this dataset was loaded, it
+    /// fails with a retryable commit conflict and publishes nothing. Reload
+    /// the dataset and call again to revalidate every source against the new
+    /// manifest.
+    async fn commit_reused_index_segments(
+        &mut self,
+        _index_name: &str,
+        _column: &str,
+        _outputs: Vec<ReusedSegment>,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "segment reuse is not supported by this dataset implementation".to_owned(),
+        ))
+    }
 
     async fn read_index_partition(
         &self,

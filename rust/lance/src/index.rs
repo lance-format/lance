@@ -33,6 +33,7 @@ pub mod scalar;
 pub(crate) mod scalar_logical;
 pub(crate) mod segment;
 pub(crate) mod segment_coverage;
+pub(crate) mod segment_reuse;
 mod statistics;
 pub mod vector;
 pub(crate) mod visibility;
@@ -42,6 +43,9 @@ pub use crate::index::api::{
 };
 pub use crate::index::loading::DatasetIndexInternalExt;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
+pub use crate::index::segment_reuse::{
+    CommittedSegmentSource, ReusedSegment, STALE_REUSE_SOURCE_ERROR, UNSUPPORTED_REUSE_SOURCE_ERROR,
+};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;

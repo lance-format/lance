@@ -1453,13 +1453,235 @@ fn remap_zone(
     Ok(zones)
 }
 
+/// What bounds the memory of merging one ZoneMap segment, read from its
+/// file metadata without decoding zones or null positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneMapMergeInput {
+    /// Zones stored in the file.
+    pub num_zones: u64,
+    /// Width in bytes of one `min` or `max` value.
+    pub value_width: u64,
+    /// Serialized size of the stored null positions; 0 when none are stored.
+    pub null_bitmap_bytes: u64,
+    /// Size of the ZoneMap file.
+    pub file_bytes: u64,
+}
+
+/// Bytes per zone of the fixed-width columns of a ZoneMap file: three
+/// `UInt32` counts and three `UInt64` bounds.
+const ZONE_FIXED_COLUMN_BYTES: u64 = 3 * 4 + 3 * 8;
+/// Columns of a ZoneMap file: `min`, `max` and the six above.
+const ZONE_FILE_COLUMNS: u64 = 8;
+/// Per-buffer allowance for Arrow alignment and padding; every column has at
+/// most a values and a validity buffer.
+const ARROW_BUFFER_PADDING_BYTES: u64 = 2 * 64;
+/// Ratio bounding the in-memory size of deserialized null positions to their
+/// serialized size. The worst shapes are many containers or fragments with a
+/// single null each: a container serializes to at least 6 bytes and an entry
+/// to at least 26, while in memory each costs a container slot, a heap
+/// allocation and (per fragment) a tree entry, about 10x and 6x.
+const NULL_BITMAP_DECODED_FACTOR: u64 = 12;
+/// Fixed allowance for the tree and vector headers of one null position set.
+const NULL_BITMAP_FIXED_BYTES: u64 = 4096;
+/// The modeled total is raised by 1/this for allocations too small or too
+/// scattered to model one by one (per-zone temporaries, allocator rounding).
+const UNMODELED_ALLOWANCE_DIVISOR: u64 = 4;
+
+impl ZoneMapMergeInput {
+    /// Decoded `RecordBatch` of `num_zones` zones with values `value_width`
+    /// wide, including validity buffers and padding.
+    fn batch_bytes(num_zones: u64, value_width: u64) -> u64 {
+        let per_zone = 2 * value_width + ZONE_FIXED_COLUMN_BYTES;
+        let per_column = num_zones.div_ceil(8) + ARROW_BUFFER_PADDING_BYTES;
+        num_zones
+            .saturating_mul(per_zone)
+            .saturating_add(ZONE_FILE_COLUMNS * per_column)
+    }
+
+    /// Decoded zone statistics, as held by a loaded index.
+    fn zones_bytes(num_zones: u64) -> u64 {
+        num_zones.saturating_mul(std::mem::size_of::<ZoneMapStatistics>() as u64)
+    }
+
+    /// Deserialized null positions.
+    fn null_rows_bytes(&self) -> u64 {
+        if self.null_bitmap_bytes == 0 {
+            return 0;
+        }
+        self.null_bitmap_bytes
+            .saturating_mul(NULL_BITMAP_DECODED_FACTOR)
+            .saturating_add(NULL_BITMAP_FIXED_BYTES)
+    }
+
+    /// What a loaded source holds until the merge finishes.
+    fn loaded_bytes(&self) -> u64 {
+        Self::zones_bytes(self.num_zones).saturating_add(self.null_rows_bytes())
+    }
+
+    /// Transient memory of loading the source: the encoded pages, the
+    /// decoded batch and a copy of it, the raw null buffer and the copy
+    /// deserialization makes of it.
+    fn load_transient_bytes(&self) -> u64 {
+        self.file_bytes
+            .saturating_add(Self::batch_bytes(self.num_zones, self.value_width).saturating_mul(2))
+            .saturating_add(self.null_bitmap_bytes.saturating_mul(2))
+    }
+}
+
+/// Conservative estimate of the peak memory of loading `inputs` and merging
+/// them into one segment with [`merge_zonemap_indices_by_coverage`]: the
+/// loaded sources, plus the larger of one source's load temporaries and the
+/// merge's own output and temporaries (the merged zones with vector growth,
+/// the stable sort's scratch copy of them, one source's cloned null
+/// positions, the merged null positions, the output batch with the writer's
+/// encoded copy and the serialized null buffer), plus a quarter of that for
+/// unmodeled small allocations.
+///
+/// The estimate assumes no fragment reuse remapping during the merge.
+pub fn estimate_zonemap_merge_bytes(inputs: &[ZoneMapMergeInput]) -> u64 {
+    let total_zones = inputs.iter().map(|input| input.num_zones).sum::<u64>();
+    let value_width = inputs
+        .iter()
+        .map(|input| input.value_width)
+        .max()
+        .unwrap_or(0);
+    let loaded = inputs
+        .iter()
+        .map(ZoneMapMergeInput::loaded_bytes)
+        .fold(0u64, u64::saturating_add);
+    let load_transient = inputs
+        .iter()
+        .map(ZoneMapMergeInput::load_transient_bytes)
+        .max()
+        .unwrap_or(0);
+    let null_rows = inputs
+        .iter()
+        .map(ZoneMapMergeInput::null_rows_bytes)
+        .fold(0u64, u64::saturating_add);
+    let null_buffers = inputs
+        .iter()
+        .map(|input| input.null_bitmap_bytes)
+        .fold(0u64, u64::saturating_add);
+    let largest_null_rows = inputs
+        .iter()
+        .map(ZoneMapMergeInput::null_rows_bytes)
+        .max()
+        .unwrap_or(0);
+    // Up to twice the zones for the growth of the merged vector, once more
+    // for the scratch buffer of the stable sort.
+    let merge = ZoneMapMergeInput::zones_bytes(total_zones)
+        .saturating_mul(3)
+        .saturating_add(largest_null_rows)
+        .saturating_add(null_rows)
+        .saturating_add(ZoneMapMergeInput::batch_bytes(total_zones, value_width).saturating_mul(2))
+        .saturating_add(null_buffers)
+        .saturating_add(NULL_BITMAP_FIXED_BYTES);
+    let modeled = loaded.saturating_add(load_transient.max(merge));
+    modeled.saturating_add(modeled / UNMODELED_ALLOWANCE_DIVISOR)
+}
+
+/// Width in bytes of one decoded zone bound of `data_type`, when the
+/// decoded value has no heap part whose size the file metadata leaves open.
+fn fixed_zone_value_width(data_type: &DataType) -> Option<u64> {
+    if matches!(data_type, DataType::Boolean) {
+        return Some(1);
+    }
+    data_type.primitive_width().map(|width| width as u64)
+}
+
+impl ZoneMapIndex {
+    /// Read what bounds the memory of merging the segment in `store` from
+    /// its file metadata, without decoding zones or null positions.
+    ///
+    /// Fails with `NotSupported` when the metadata does not give a safe
+    /// bound: values that are not fixed width (strings, binary, nested
+    /// types), or a file reader that does not report the file or null buffer
+    /// size.
+    pub async fn merge_input_from_metadata(store: &dyn IndexStore) -> Result<ZoneMapMergeInput> {
+        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
+        let schema = index_file.schema();
+        let value_type = schema
+            .field("min")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?
+            .data_type();
+        let value_width = fixed_zone_value_width(&value_type).ok_or_else(|| {
+            Error::not_supported(format!(
+                "cannot bound the memory of merging ZoneMap values of type {value_type} \
+                 from file metadata"
+            ))
+        })?;
+        let file_bytes = index_file.file_size_bytes().ok_or_else(|| {
+            Error::not_supported("the ZoneMap file reader does not report the file size")
+        })?;
+        let null_bitmap_bytes = match schema.metadata.get(NULL_BITMAP_META_KEY) {
+            Some(idx_str) => {
+                let idx = idx_str.parse::<u32>().map_err(|e| {
+                    Error::invalid_input(format!("invalid null bitmap buffer index: {e}"))
+                })?;
+                index_file.global_buffer_size_bytes(idx).ok_or_else(|| {
+                    Error::not_supported(
+                        "the ZoneMap file reader does not report the null bitmap size",
+                    )
+                })?
+            }
+            None => 0,
+        };
+        Ok(ZoneMapMergeInput {
+            num_zones: index_file.num_rows() as u64,
+            value_width,
+            null_bitmap_bytes,
+            file_bytes,
+        })
+    }
+}
+
 /// Merge caller-selected ZoneMap segments into one self-contained segment.
+///
+/// Every source keeps the zones and null positions of the fragments in
+/// `fragment_filter`, so the filter is shared: use it when the sources'
+/// coverage was moved onto one group coverage (a remap of the whole group).
 pub async fn merge_zonemap_indices(
     source_indices: &[&ZoneMapIndex],
     dest_store: &dyn IndexStore,
     fragment_filter: &RoaringBitmap,
 ) -> Result<CreatedIndex> {
-    let first = source_indices.first().ok_or_else(|| {
+    let sources = source_indices
+        .iter()
+        .map(|source| (*source, fragment_filter))
+        .collect::<Vec<_>>();
+    merge_filtered_zonemap_indices(&sources, dest_store).await
+}
+
+/// Merge ZoneMap segments, keeping from each source only the zones and null
+/// positions of the fragments its own coverage names.
+///
+/// A source file can still hold zones for a fragment it no longer covers;
+/// filtering each source by its own coverage keeps those zones out even when
+/// another source covers that fragment. The coverages must be pairwise
+/// disjoint, since one fragment cannot be answered by two sources.
+pub async fn merge_zonemap_indices_by_coverage(
+    sources: &[(&ZoneMapIndex, &RoaringBitmap)],
+    dest_store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    let mut claimed = RoaringBitmap::new();
+    for (_, coverage) in sources {
+        let overlap = &claimed & *coverage;
+        if !overlap.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "cannot merge ZoneMap segments whose coverage overlaps on fragments {:?}",
+                overlap.iter().collect::<Vec<_>>()
+            )));
+        }
+        claimed |= *coverage;
+    }
+    merge_filtered_zonemap_indices(sources, dest_store).await
+}
+
+async fn merge_filtered_zonemap_indices(
+    sources: &[(&ZoneMapIndex, &RoaringBitmap)],
+    dest_store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    let (first, _) = sources.first().ok_or_else(|| {
         Error::invalid_input("merge_zonemap_indices requires at least one source index")
     })?;
     let rows_per_zone = first.rows_per_zone;
@@ -1470,10 +1692,7 @@ pub async fn merge_zonemap_indices(
     // to upgrade a version 0 segment with, so mixed inputs are refused
     // before anything is written.
     let version = first.version;
-    if let Some(other) = source_indices
-        .iter()
-        .find(|source| source.version != version)
-    {
+    if let Some((other, _)) = sources.iter().find(|(source, _)| source.version != version) {
         return Err(Error::not_supported_source(
             format!(
                 "cannot merge ZoneMap segments of different file versions ({} and {}); \
@@ -1487,7 +1706,8 @@ pub async fn merge_zonemap_indices(
     let mut zones = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut any_missing_bitmap = false;
-    for source in source_indices {
+    for (source, fragment_filter) in sources {
+        let fragment_filter = *fragment_filter;
         if source.batch_remapper.is_some() {
             return Err(Error::not_supported(
                 "this index maintenance operation does not support asynchronous row-ID remapping",

@@ -31,27 +31,19 @@ use crate::index::scalar::{TrainingRows, TrainingScanOptions, scan_training_data
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source ZoneMap segments into a single segment.
+///
+/// Each source contributes only the fragments of its own effective coverage.
+/// When a group remap moved every source onto one shared coverage (several
+/// segments compacted into one fragment), the coverages overlap and the
+/// shared coverage filters every source instead.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    if segments.is_empty() {
-        return Err(Error::index("No segment metadata was provided".to_string()));
-    }
-
-    let field_id = *segments[0].fields.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: segment {} is missing field ids",
-            segments[0].uuid
-        ))
-    })?;
-    let field_path = dataset.schema().field_path(field_id)?;
-
-    let mut scalar_indices = Vec::with_capacity(segments.len());
-    let mut fragment_bitmap = RoaringBitmap::new();
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    for segment in &segments {
+    let mut sources = Vec::with_capacity(segments.len());
+    for segment in segments {
         let effective = segment
             .effective_fragment_bitmap(dataset_fragments)
             .ok_or_else(|| {
@@ -60,7 +52,49 @@ pub(in crate::index) async fn merge_segments(
                     segment.uuid
                 ))
             })?;
-        fragment_bitmap |= effective;
+        sources.push((segment, effective));
+    }
+    let mut union = RoaringBitmap::new();
+    let mut disjoint = true;
+    for (_, coverage) in &sources {
+        disjoint &= union.is_disjoint(coverage);
+        union |= coverage;
+    }
+    if !disjoint {
+        for (_, coverage) in sources.iter_mut() {
+            *coverage = union.clone();
+        }
+    }
+    merge_segments_by_coverage(dataset, sources, staged, disjoint).await
+}
+
+/// Merge source ZoneMap segments, filtering each by the coverage paired with
+/// it. With `disjoint`, the coverages must not overlap; otherwise they must
+/// all be the same group coverage. The output covers their union and is
+/// stamped with the current version; callers set the version they need.
+pub(in crate::index) async fn merge_segments_by_coverage(
+    dataset: &Dataset,
+    sources: Vec<(IndexMetadata, RoaringBitmap)>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    disjoint: bool,
+) -> Result<IndexMetadata> {
+    let Some((first_segment, _)) = sources.first() else {
+        return Err(Error::index("No segment metadata was provided".to_string()));
+    };
+    let template = first_segment.clone();
+
+    let field_id = *template.fields.first().ok_or_else(|| {
+        Error::invalid_input(format!(
+            "CreateIndex: segment {} is missing field ids",
+            template.uuid
+        ))
+    })?;
+    let field_path = dataset.schema().field_path(field_id)?;
+
+    let mut scalar_indices = Vec::with_capacity(sources.len());
+    let mut fragment_bitmap = RoaringBitmap::new();
+    for (segment, coverage) in &sources {
+        fragment_bitmap |= coverage;
         let scalar_index = super::open_scalar_index_with_plan(
             dataset,
             &field_path,
@@ -74,7 +108,7 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let mut source_indices = Vec::with_capacity(scalar_indices.len());
-    for (segment_uuid, scalar_index) in &scalar_indices {
+    for ((segment_uuid, scalar_index), (_, coverage)) in scalar_indices.iter().zip(&sources) {
         let zonemap_index = scalar_index
             .as_any()
             .downcast_ref::<ZoneMapIndex>()
@@ -85,17 +119,22 @@ pub(in crate::index) async fn merge_segments(
                     scalar_index.index_type()
                 ))
             })?;
-        source_indices.push(zonemap_index);
+        source_indices.push((zonemap_index, coverage));
     }
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
-        &source_indices,
-        &new_store,
-        &fragment_bitmap,
-    )
-    .await?;
+    let created_index = if disjoint {
+        lance_index::scalar::zonemap::merge_zonemap_indices_by_coverage(&source_indices, &new_store)
+            .await?
+    } else {
+        let indices = source_indices
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        lance_index::scalar::zonemap::merge_zonemap_indices(&indices, &new_store, &fragment_bitmap)
+            .await?
+    };
 
     Ok(IndexMetadata {
         uuid: new_uuid,
@@ -108,7 +147,7 @@ pub(in crate::index) async fn merge_segments(
         files: Some(index_files_to_table(created_index.files)),
         clustering_id: None,
         metadata: Default::default(),
-        ..segments[0].clone()
+        ..template
     })
 }
 

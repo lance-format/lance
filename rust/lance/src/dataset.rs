@@ -2124,7 +2124,7 @@ impl Dataset {
         .await
     }
 
-    async fn apply_commit_with_expected_latest_version(
+    pub(crate) async fn apply_commit_with_expected_latest_version(
         &mut self,
         transaction: Transaction,
         write_config: &ManifestWriteConfig,

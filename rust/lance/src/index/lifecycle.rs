@@ -49,6 +49,7 @@ use crate::index::segment::{
     segment_has_zonemap_details, validate_segment_index_details, validate_segment_metadata,
     validate_segment_params_compatible,
 };
+use crate::index::segment_reuse::{self, CommittedSegmentSource, ReusedSegment};
 use crate::index::statistics::{
     IndexDescriptionImpl, collect_index_segment_statistics, index_statistics_frag_reuse,
     index_statistics_mem_wal, index_statistics_scalar, serialize_regular_index_statistics,
@@ -1106,6 +1107,29 @@ impl DatasetIndexExt for Dataset {
             .await?;
 
         Ok(())
+    }
+
+    async fn merge_committed_index_segments(
+        &self,
+        sources: &[CommittedSegmentSource],
+        fresh: Vec<IndexMetadata>,
+    ) -> Result<IndexMetadata> {
+        segment_reuse::merge_committed_index_segments_with_budget(
+            self,
+            sources,
+            fresh,
+            segment_reuse::REUSE_MERGE_BUDGET_BYTES,
+        )
+        .await
+    }
+
+    async fn commit_reused_index_segments(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        outputs: Vec<ReusedSegment>,
+    ) -> Result<()> {
+        segment_reuse::commit_reused_index_segments(self, index_name, column, outputs).await
     }
 
     async fn load_scalar_index<'a, 'b>(

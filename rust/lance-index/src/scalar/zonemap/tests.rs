@@ -52,7 +52,7 @@ use crate::scalar::{
         SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
         ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedWriter, ZoneMapSegmentBase,
         build_zonemap_segment, merge_seeds_for_binary_copy, merge_zonemap_indices,
-        parse_seed_for_binary_copy, place_records, remap_zone,
+        merge_zonemap_indices_by_coverage, parse_seed_for_binary_copy, place_records, remap_zone,
     },
 };
 use arrow_array::Int32Array;
@@ -6805,4 +6805,118 @@ fn test_seed_writer_without_positions_writes_counts_only() {
     assert!(positions.is_none());
     let nulls: Vec<u32> = records.iter().map(|r| r.null_count).collect();
     assert_eq!(nulls, vec![2, 1, 1]);
+}
+
+/// Moves every zone and null position of `from` onto fragment `to`, standing
+/// in for a source whose file holds zones of a fragment trained elsewhere.
+fn move_fragment(index: &mut ZoneMapIndex, from: u64, to: u64) {
+    for zone in index.zones.iter_mut() {
+        if zone.bound.fragment_id == from {
+            zone.bound.fragment_id = to;
+        }
+    }
+    if let Some(null_rows) = index.null_rows.as_ref() {
+        let moved = null_rows
+            .row_addrs()
+            .unwrap()
+            .map(|addr| {
+                let addr = u64::from(addr);
+                if addr >> 32 == from {
+                    (to << 32) | (addr & u64::from(u32::MAX))
+                } else {
+                    addr
+                }
+            })
+            .collect::<RowAddrTreeMap>();
+        index.null_rows = Some(moved);
+    }
+}
+
+/// Each source keeps only the fragments its own coverage names: source A
+/// still holds zones for fragment 7, which only source B covers, and those
+/// stale zones and null positions must not reach the merged segment.
+#[tokio::test]
+async fn test_merge_by_coverage_filters_each_source_by_its_own_coverage() {
+    let mut source_a =
+        train_and_load::<Int32Type>(vec![vec![Some(1), Some(2)], vec![None, Some(100)]]).await;
+    move_fragment(Arc::get_mut(&mut source_a).unwrap(), 1, 7);
+    let mut source_b = train_and_load::<Int32Type>(vec![vec![Some(1000), None]]).await;
+    move_fragment(Arc::get_mut(&mut source_b).unwrap(), 0, 7);
+    assert!(source_a.null_rows.is_some() && source_b.null_rows.is_some());
+
+    let coverage_a = RoaringBitmap::from_iter([0u32]);
+    let coverage_b = RoaringBitmap::from_iter([7u32]);
+    let dest_tmpdir = TempObjDir::default();
+    let dest_store = local_store(&dest_tmpdir);
+    merge_zonemap_indices_by_coverage(
+        &[
+            (source_a.as_ref(), &coverage_a),
+            (source_b.as_ref(), &coverage_b),
+        ],
+        dest_store.as_ref(),
+    )
+    .await
+    .unwrap();
+    let merged = ZoneMapIndex::load(
+        dest_store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+
+    let zone_of = |index: &ZoneMapIndex, fragment_id: u64| {
+        index
+            .zones
+            .iter()
+            .filter(|zone| zone.bound.fragment_id == fragment_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(merged.zones.len(), 2, "{:?}", merged.zones);
+    let merged_zone_0 = zone_of(&merged, 0);
+    let expected_zone_0 = zone_of(&source_a, 0);
+    assert_eq!(merged_zone_0.len(), 1);
+    assert_eq!(merged_zone_0[0].min, expected_zone_0[0].min);
+    assert_eq!(merged_zone_0[0].max, expected_zone_0[0].max);
+    assert_eq!(merged_zone_0[0].bound, expected_zone_0[0].bound);
+    let merged_zone_7 = zone_of(&merged, 7);
+    let expected_zone_7 = zone_of(&source_b, 7);
+    assert_eq!(merged_zone_7.len(), 1);
+    assert_eq!(merged_zone_7[0].min, ScalarValue::Int32(Some(1000)));
+    assert_eq!(merged_zone_7[0].max, expected_zone_7[0].max);
+    assert_eq!(merged_zone_7[0].null_count, 1);
+    assert_eq!(merged_zone_7[0].bound, expected_zone_7[0].bound);
+
+    // Only B's null at offset 1 of fragment 7; A's stale null at offset 0 is gone.
+    let null_rows = merged.null_rows.as_ref().unwrap();
+    assert!(
+        null_rows
+            .get_fragment_bitmap(0)
+            .is_none_or(|rows| rows.is_empty())
+    );
+    assert_eq!(
+        null_rows
+            .get_fragment_bitmap(7)
+            .map(|rows| rows.iter().collect::<Vec<_>>()),
+        Some(vec![1])
+    );
+
+    // Two sources may not both answer for one fragment.
+    let dest_tmpdir = TempObjDir::default();
+    let dest_store = local_store(&dest_tmpdir);
+    let both_7 = RoaringBitmap::from_iter([0u32, 7]);
+    let err = merge_zonemap_indices_by_coverage(
+        &[
+            (source_a.as_ref(), &both_7),
+            (source_b.as_ref(), &coverage_b),
+        ],
+        dest_store.as_ref(),
+    )
+    .await
+    .err()
+    .expect("overlapping coverage must be refused");
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
 }
