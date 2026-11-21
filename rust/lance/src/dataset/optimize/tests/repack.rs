@@ -1279,6 +1279,7 @@ impl Drop for EnvVar {
 #[case::own_files(false, false)]
 #[case::shallow_clone(true, false)]
 #[case::env_var(false, true)]
+#[case::env_var_shallow_clone(true, true)]
 // The events are recorded on this thread only, so the scheduler's I/O loop
 // has to run on it too.
 #[tokio::test(flavor = "current_thread")]
