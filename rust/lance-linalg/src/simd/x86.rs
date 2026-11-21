@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Reduction helpers shared by the x86_64 AVX kernels in [`crate::distance`].
+//! Reduction and load helpers shared by the x86_64 AVX kernels in
+//! [`crate::distance`].
 //!
 //! Each distance kernel accumulates into a 256-bit register and folds it down
 //! to a scalar once, after the main loop. The fold is identical across
@@ -54,6 +55,20 @@ pub unsafe fn hsum256_pd(v: __m256d) -> f64 {
     let sum128 = _mm_add_pd(lo, hi);
     let sum64 = _mm_add_pd(sum128, _mm_unpackhi_pd(sum128, sum128));
     _mm_cvtsd_f64(sum64)
+}
+
+/// Loads eight `f16` values from `ptr` and widens them to `f32`.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reading eight `f16` values, and the host must
+/// support AVX and F16C.
+#[inline]
+#[target_feature(enable = "avx,f16c")]
+pub unsafe fn load_f16x8(ptr: *const half::f16) -> __m256 {
+    // SAFETY: the caller guarantees eight readable values; `loadu` has no
+    // alignment requirement.
+    _mm256_cvtph_ps(unsafe { _mm_loadu_si128(ptr.cast()) })
 }
 
 #[cfg(test)]
