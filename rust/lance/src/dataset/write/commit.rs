@@ -64,6 +64,7 @@ pub struct CommitBuilder<'a> {
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Whether the caller has opted in to committing a [`CompositeOperation`].
     allow_composite_operations: bool,
+    disable_transaction_file: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -93,6 +94,7 @@ impl<'a> CommitBuilder<'a> {
             inherited_field_ids: false,
             clustering_definitions: None,
             allow_composite_operations: false,
+            disable_transaction_file: false,
         }
     }
 
@@ -273,6 +275,25 @@ impl<'a> CommitBuilder<'a> {
     /// ```
     pub fn with_retry_timeout(mut self, retry_timeout: Duration) -> Self {
         self.retry_timeout = retry_timeout;
+        self
+    }
+
+    /// Whether to store the transaction only inline in the manifest, skipping the
+    /// separate file under `_transactions/` and saving one object write.
+    ///
+    /// The new manifest gets a writer feature flag, so Lance releases older than
+    /// v1.0.0 refuse to write to that version. Later commits that do not set this
+    /// write the transaction file again and drop the flag.
+    ///
+    /// **Default is false.**
+    ///
+    /// ```
+    /// use lance::dataset::CommitBuilder;
+    ///
+    /// let _builder = CommitBuilder::new("memory://dataset").with_disable_transaction_file(true);
+    /// ```
+    pub fn with_disable_transaction_file(mut self, disable_transaction_file: bool) -> Self {
+        self.disable_transaction_file = disable_transaction_file;
         self
     }
 
@@ -574,6 +595,7 @@ impl<'a> CommitBuilder<'a> {
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             clustering_definitions: self.clustering_definitions.clone(),
+            disable_transaction_file: self.disable_transaction_file,
             ..Default::default()
         };
 

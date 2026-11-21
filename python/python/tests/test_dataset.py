@@ -9815,6 +9815,21 @@ def test_read_transaction_properties(tmp_path):
     assert props.get("custom_prop") == "custom_value"
 
 
+def test_disable_transaction_file(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3]})
+    transactions_dir = tmp_path / "_transactions"
+
+    dataset = lance.write_dataset(table, tmp_path, disable_transaction_file=True)
+    assert not transactions_dir.exists() or not any(transactions_dir.iterdir())
+    # The transaction is still readable from the manifest's inline section.
+    operation = dataset.read_transaction(1).operation
+    assert isinstance(operation, lance.LanceOperation.Overwrite)
+
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
+    assert len(list(transactions_dir.iterdir())) == 1
+    assert dataset.count_rows() == 6
+
+
 def test_get_properties_with_no_properties(tmp_path):
     """Test retrieving properties when none were set."""
     # Create a test dataset without properties

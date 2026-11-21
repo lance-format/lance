@@ -5804,6 +5804,7 @@ def write_dataset(
     enable_v2_manifest_paths: bool = True,
     enable_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
+    disable_transaction_file: bool = False,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
@@ -5907,6 +5908,12 @@ def write_dataset(
         then no autocleaning will be performed.
         Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
+    disable_transaction_file: bool, default False
+        If True, this write's commit stores its transaction only inline in the
+        manifest and skips the separate file under ``_transactions/``, saving one
+        object write. The new version gets a writer feature flag, so Lance releases
+        older than 1.0.0 refuse to write to it. Later commits that leave this unset
+        write the transaction file again and drop the flag.
     commit_message: str, optional
         A message to associate with this commit. This message will be stored in the
         dataset's metadata and can be retrieved using read_transaction().
@@ -6083,6 +6090,7 @@ def write_dataset(
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
+        "disable_transaction_file": disable_transaction_file,
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,

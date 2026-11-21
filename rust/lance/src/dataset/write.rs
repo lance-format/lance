@@ -687,6 +687,16 @@ pub struct WriteParams {
     /// just try and log a failure anyway. Default is false.
     pub skip_auto_cleanup: bool,
 
+    /// If true, this write's commit stores its transaction only inline in the
+    /// manifest and skips the separate file under `_transactions/`, saving one
+    /// object write per commit.
+    ///
+    /// The new manifest gets a writer feature flag, so Lance releases older than
+    /// v1.0.0 refuse to write to that version. The setting applies only to this
+    /// commit: later commits that leave it unset write the transaction file again
+    /// and drop the flag. Default is false.
+    pub disable_transaction_file: bool,
+
     /// Configuration key-value pairs for this write operation.
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
@@ -761,6 +771,7 @@ impl Default for WriteParams {
             session: None,
             auto_cleanup: None,
             skip_auto_cleanup: false,
+            disable_transaction_file: false,
             transaction_properties: None,
             initial_bases: None,
             target_bases: None,
@@ -2894,6 +2905,57 @@ mod tests {
         let params = WriteParams::default();
         assert!(params.auto_cleanup.is_none());
         assert!(!params.skip_auto_cleanup);
+    }
+
+    #[tokio::test]
+    async fn test_disable_transaction_file_applies_to_its_commit_only() {
+        use crate::dataset::transaction::Operation;
+        use lance_table::feature_flags::FLAG_DISABLE_TRANSACTION_FILE;
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let transaction_file_count = || {
+            std::fs::read_dir(std::path::Path::new(uri).join("_transactions"))
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        };
+        let data = || {
+            gen_batch()
+                .col("id", array::step::<arrow_array::types::Int32Type>())
+                .into_reader_rows(RowCount::from(3), BatchCount::from(1))
+        };
+
+        let params = WriteParams {
+            disable_transaction_file: true,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(data(), uri, Some(params)).await.unwrap();
+        assert!(dataset.manifest.transaction_file.is_none());
+        assert!(dataset.manifest.transaction_section.is_some());
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_DISABLE_TRANSACTION_FILE,
+            0
+        );
+        assert_eq!(transaction_file_count(), 0);
+
+        // A fresh handle has no cached transaction, so this reads the inline section.
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 3);
+        let transaction = reopened.read_transaction().await.unwrap().unwrap();
+        assert!(matches!(transaction.operation, Operation::Overwrite { .. }));
+
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(data(), uri, Some(params)).await.unwrap();
+        assert!(dataset.manifest.transaction_file.is_some());
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_DISABLE_TRANSACTION_FILE,
+            0
+        );
+        assert_eq!(transaction_file_count(), 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
     }
 
     #[cfg(windows)]
