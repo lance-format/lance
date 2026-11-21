@@ -26,7 +26,9 @@ use crate::scalar::{
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, remap_row_addrs_tree_map_async,
+};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
@@ -37,7 +39,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
 use datafusion_execution::SendableRecordBatchStream;
-use lance_select::{RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
@@ -1199,7 +1201,9 @@ impl ScalarIndex for ZoneMapIndex {
     /// [`ZoneMapIndex::remap_with_withdrawals`]. A remap that would have to
     /// withdraw coverage of a destination fragment is refused with a
     /// [`ZoneMapRemapNeedsWithdrawal`] before anything is written, since this
-    /// result cannot report it.
+    /// result cannot report it. Working memory is bounded the same way as
+    /// there: a remap whose estimate exceeds [`REMAP_WORKING_BYTES_BUDGET`]
+    /// fails with a [`ZoneMapRemapOverBudget`] before anything is written.
     ///
     /// `remap_streaming` keeps the trait default: a batch translator is
     /// declined with a `RemapUnavailable` because `stored_fragments` is
@@ -1210,7 +1214,7 @@ impl ScalarIndex for ZoneMapIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let remapped = self.remap_zones(mapping)?;
+        let remapped = self.remap_zones(mapping, REMAP_WORKING_BYTES_BUDGET)?;
         if !remapped.withdrawn_fragments.is_empty() {
             return Err(ZoneMapRemapNeedsWithdrawal {
                 fragments: remapped.withdrawn_fragments,
@@ -1372,6 +1376,13 @@ impl ZoneMapIndex {
     /// remove it from the remapped segment's fragment bitmap, so queries
     /// scan it instead.
     ///
+    /// Working memory is bounded: each zone is translated in chunks of
+    /// [`REMAP_CHUNK_ROWS`] addresses, and what stays live is that chunk, the
+    /// zone's run list, the output zone records and the remapped null
+    /// positions. When their estimate exceeds [`REMAP_WORKING_BYTES_BUDGET`]
+    /// the remap fails with a [`ZoneMapRemapOverBudget`] before anything is
+    /// written; no coverage is withdrawn for it.
+    ///
     /// ```
     /// # use lance_core::Result;
     /// # use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -1389,37 +1400,57 @@ impl ZoneMapIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<(CreatedIndex, RoaringBitmap)> {
-        let remapped = self.remap_zones(mapping)?;
+        self.remap_within_budget(mapping, dest_store, REMAP_WORKING_BYTES_BUDGET)
+            .await
+    }
+
+    async fn remap_within_budget(
+        &self,
+        mapping: &RowAddrRemap,
+        dest_store: &dyn IndexStore,
+        budget_bytes: u64,
+    ) -> Result<(CreatedIndex, RoaringBitmap)> {
+        let remapped = self.remap_zones(mapping, budget_bytes)?;
         let withdrawn = remapped.withdrawn_fragments.clone();
         Ok((self.write_remapped(remapped, dest_store).await?, withdrawn))
     }
 
-    fn remap_zones(&self, mapping: &RowAddrRemap) -> Result<RemappedZones> {
+    fn remap_zones(&self, mapping: &RowAddrRemap, budget_bytes: u64) -> Result<RemappedZones> {
         let affected = mapping.affected_fragments();
+        let mut budget = RemapBudget::new(budget_bytes);
         let null_rows = self
             .null_rows
             .as_ref()
-            .map(|null_rows| remap_null_rows(null_rows, mapping))
+            .map(|null_rows| remap_null_rows(null_rows, mapping, &affected, &mut budget))
             .transpose()?;
+        let null_bytes = budget.committed_bytes;
         let translate = |addrs: &mut [Option<u64>]| mapping.remap_in_place(addrs);
         let mut withdrawn_fragments = RoaringBitmap::new();
         let mut zones = Vec::with_capacity(self.zones.len());
         for zone in &self.zones {
+            budget.committed_bytes =
+                null_bytes.saturating_add((zones.len() as u64).saturating_mul(REMAP_RECORD_BYTES));
+            budget.check(0)?;
             let is_unaffected = u32::try_from(zone.bound.fragment_id)
                 .is_ok_and(|fragment| !affected.contains(fragment));
             if is_unaffected {
                 zones.push(zone.clone());
             } else {
-                zones.extend(remap_zone(
+                zones.extend(remap_zone_in_chunks(
                     zone,
                     &translate,
                     null_rows.as_ref(),
                     remap_bounds_decide_comparable(self.version, &self.data_type),
                     None,
+                    REMAP_CHUNK_ROWS,
+                    &budget,
                     &mut withdrawn_fragments,
                 )?);
             }
         }
+        budget.committed_bytes =
+            null_bytes.saturating_add((zones.len() as u64).saturating_mul(REMAP_RECORD_BYTES));
+        budget.check(0)?;
         let is_withdrawn = |fragment_id: u64| {
             u32::try_from(fragment_id).is_ok_and(|fragment| withdrawn_fragments.contains(fragment))
         };
@@ -1501,17 +1532,147 @@ impl ZoneMapRemapNeedsWithdrawal {
     }
 }
 
-/// `null_rows` translated through `mapping`, dropping deleted rows.
-fn remap_null_rows(null_rows: &RowAddrTreeMap, mapping: &RowAddrRemap) -> Result<RowAddrTreeMap> {
-    let addrs = null_rows.row_addrs().ok_or_else(|| {
-        Error::corrupt_file_named(
-            ZONEMAP_FILENAME,
-            "ZoneMapIndex: the null bitmap selects a whole fragment instead of null positions",
+/// Why a zone map remap failed: its working memory estimate exceeds the
+/// budget. Nothing was written. Carried inside [`Error::NotSupported`]; see
+/// [`Self::from_error`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneMapRemapOverBudget {
+    /// The estimated working bytes when the remap stopped.
+    pub estimated_bytes: u64,
+    /// The budget it exceeded.
+    pub budget_bytes: u64,
+}
+
+impl std::fmt::Display for ZoneMapRemapOverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "remapping the zone map needs an estimated {} working bytes, above the {} byte \
+             budget; the segment and the reuse history are left unchanged, and the index can be \
+             rebuilt instead",
+            self.estimated_bytes, self.budget_bytes
         )
-    })?;
-    let mut addrs: Vec<Option<u64>> = addrs.map(|addr| Some(u64::from(addr))).collect();
-    mapping.remap_in_place(&mut addrs);
-    Ok(addrs.into_iter().flatten().collect())
+    }
+}
+
+impl std::error::Error for ZoneMapRemapOverBudget {}
+
+impl ZoneMapRemapOverBudget {
+    /// This failure as the error a zone map remap returns.
+    pub fn into_error(self) -> Error {
+        Error::not_supported_source(Box::new(self))
+    }
+
+    /// The failure carried by `error`, if it is one; `None` for any other
+    /// error.
+    pub fn from_error(error: &Error) -> Option<&Self> {
+        match error {
+            Error::NotSupported { source, .. } => source.downcast_ref::<Self>(),
+            _ => None,
+        }
+    }
+}
+
+/// Addresses a zone or null list is translated in at a time.
+pub const REMAP_CHUNK_ROWS: usize = 64 * 1024;
+
+/// The working memory a zone map remap may estimate before it fails with
+/// [`ZoneMapRemapOverBudget`]; the same budget batch translators use to
+/// materialize a mapping.
+pub const REMAP_WORKING_BYTES_BUDGET: u64 = DEFAULT_MATERIALIZATION_BUDGET_BYTES;
+
+/// Estimated bytes of one `(start, end)` run.
+const REMAP_RUN_BYTES: u64 = 16;
+/// Estimated bytes of one output zone record.
+const REMAP_RECORD_BYTES: u64 = 128;
+/// Estimated bytes of one remapped null position: roaring's worst case per
+/// stored position, an array container. The transient translation chunk is
+/// bounded separately by [`REMAP_CHUNK_ROWS`].
+const REMAP_NULL_BYTES: u64 = 2;
+
+/// The working bytes a remap has committed against its budget.
+struct RemapBudget {
+    budget_bytes: u64,
+    committed_bytes: u64,
+}
+
+impl RemapBudget {
+    fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            committed_bytes: 0,
+        }
+    }
+
+    fn unlimited() -> Self {
+        Self::new(u64::MAX)
+    }
+
+    /// Fails when the committed bytes plus `transient_bytes` exceed the
+    /// budget.
+    fn check(&self, transient_bytes: u64) -> Result<()> {
+        let estimated_bytes = self.committed_bytes.saturating_add(transient_bytes);
+        if estimated_bytes > self.budget_bytes {
+            return Err(ZoneMapRemapOverBudget {
+                estimated_bytes,
+                budget_bytes: self.budget_bytes,
+            }
+            .into_error());
+        }
+        Ok(())
+    }
+}
+
+/// `null_rows` translated through `mapping`, dropping deleted rows. Positions
+/// in fragments outside `affected` are copied untranslated; the others are
+/// translated one fragment, and at most [`REMAP_CHUNK_ROWS`] positions, at a
+/// time. Each output position is committed to `budget`.
+fn remap_null_rows(
+    null_rows: &RowAddrTreeMap,
+    mapping: &RowAddrRemap,
+    affected: &RoaringBitmap,
+    budget: &mut RemapBudget,
+) -> Result<RowAddrTreeMap> {
+    let mut unaffected = RowAddrTreeMap::new();
+    let mut translated = RowAddrTreeMap::new();
+    let mut chunk = Vec::new();
+    for (&fragment, selection) in null_rows.iter() {
+        let RowAddrSelection::Partial(offsets) = selection else {
+            return Err(Error::corrupt_file_named(
+                ZONEMAP_FILENAME,
+                "ZoneMapIndex: the null bitmap selects a whole fragment instead of null positions",
+            ));
+        };
+        if !affected.contains(fragment) {
+            budget.committed_bytes = budget
+                .committed_bytes
+                .saturating_add(offsets.len().saturating_mul(REMAP_NULL_BYTES));
+            budget.check(0)?;
+            unaffected.insert_bitmap(fragment, offsets.clone());
+            continue;
+        }
+        let base = u64::from(fragment) << 32;
+        let mut offsets = offsets.iter().peekable();
+        while offsets.peek().is_some() {
+            chunk.clear();
+            chunk.extend(
+                offsets
+                    .by_ref()
+                    .take(REMAP_CHUNK_ROWS)
+                    .map(|offset| Some(base | u64::from(offset))),
+            );
+            mapping.remap_in_place(&mut chunk);
+            let kept = chunk.iter().flatten().count() as u64;
+            budget.committed_bytes = budget
+                .committed_bytes
+                .saturating_add(kept.saturating_mul(REMAP_NULL_BYTES));
+            budget.check(0)?;
+            translated.extend(chunk.iter().flatten().copied());
+        }
+    }
+    // A translated position may land in an unaffected fragment.
+    unaffected |= translated;
+    Ok(unaffected)
 }
 
 /// Whether a remap written as `version` may rely on a scalar zone's recorded
@@ -1535,27 +1696,98 @@ fn remap_zone(
     fragment_filter: Option<&RoaringBitmap>,
     unrepresentable: &mut RoaringBitmap,
 ) -> Result<Vec<ZoneMapStatistics>> {
+    remap_zone_in_chunks(
+        zone,
+        translate,
+        remapped_null_rows,
+        bounds_decide_comparable,
+        fragment_filter,
+        REMAP_CHUNK_ROWS,
+        &RemapBudget::unlimited(),
+        unrepresentable,
+    )
+}
+
+/// [`remap_zone`] translating `chunk_rows` addresses at a time, failing when
+/// the zone's run list on top of `budget` exceeds it.
+#[allow(clippy::too_many_arguments)]
+fn remap_zone_in_chunks(
+    zone: &ZoneMapStatistics,
+    translate: &dyn Fn(&mut [Option<u64>]),
+    remapped_null_rows: Option<&RowAddrTreeMap>,
+    bounds_decide_comparable: bool,
+    fragment_filter: Option<&RoaringBitmap>,
+    chunk_rows: usize,
+    budget: &RemapBudget,
+    unrepresentable: &mut RoaringBitmap,
+) -> Result<Vec<ZoneMapStatistics>> {
+    let runs = remap_zone_runs(zone, translate, fragment_filter, chunk_rows, budget)?;
+    zones_from_runs(
+        zone,
+        runs,
+        remapped_null_rows,
+        bounds_decide_comparable,
+        unrepresentable,
+    )
+}
+
+/// The destination runs of `zone`, sorted by start and merged: translated
+/// `chunk_rows` addresses at a time, each chunk cut into runs, then runs
+/// that touch or overlap within one fragment are joined, so the result does
+/// not depend on the mapping being monotonic.
+fn remap_zone_runs(
+    zone: &ZoneMapStatistics,
+    translate: &dyn Fn(&mut [Option<u64>]),
+    fragment_filter: Option<&RoaringBitmap>,
+    chunk_rows: usize,
+    budget: &RemapBudget,
+) -> Result<Vec<(u64, u64)>> {
     let zone_start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
-    let mut addrs = (0..zone.bound.length as u64)
-        .map(|offset| Some(zone_start.saturating_add(offset)))
-        .collect::<Vec<_>>();
-    translate(&mut addrs);
-    let mut remapped = addrs
-        .into_iter()
-        .flatten()
-        .filter(|row_id| {
+    let zone_rows = zone.bound.length as u64;
+    let chunk_rows = chunk_rows.max(1) as u64;
+    let mut runs = Vec::new();
+    let mut chunk = Vec::new();
+    let mut remapped = Vec::new();
+    let mut offset = 0u64;
+    while offset < zone_rows {
+        let chunk_end = offset.saturating_add(chunk_rows).min(zone_rows);
+        chunk.clear();
+        chunk.extend((offset..chunk_end).map(|offset| Some(zone_start.saturating_add(offset))));
+        translate(&mut chunk);
+        remapped.clear();
+        remapped.extend(chunk.iter().flatten().copied().filter(|row_id| {
             fragment_filter.is_none_or(|filter| {
                 u32::try_from(row_id >> 32).is_ok_and(|fragment| filter.contains(fragment))
             })
-        })
-        .collect::<Vec<_>>();
-    remapped.sort_unstable();
-    remapped.dedup();
+        }));
+        remapped.sort_unstable();
+        remapped.dedup();
+        push_sorted_runs(&remapped, &mut runs);
+        budget.check((runs.len() as u64).saturating_mul(REMAP_RUN_BYTES))?;
+        offset = chunk_end;
+    }
 
-    let mut runs = Vec::new();
+    runs.sort_unstable_by_key(|&(start, _)| start);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
+    for (start, end) in runs {
+        match merged.last_mut() {
+            Some((last_start, last_end))
+                if start >> 32 == *last_start >> 32 && start <= last_end.saturating_add(1) =>
+            {
+                *last_end = (*last_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    Ok(merged)
+}
+
+/// Appends the `(start, end)` runs of contiguous addresses in one fragment
+/// of the sorted, deduplicated `row_ids` to `runs`.
+fn push_sorted_runs(row_ids: &[u64], runs: &mut Vec<(u64, u64)>) {
     let mut run_start = None;
     let mut previous = 0u64;
-    for row_id in remapped {
+    for &row_id in row_ids {
         if run_start.is_none() {
             run_start = Some(row_id);
         } else if row_id != previous.saturating_add(1) || row_id >> 32 != previous >> 32 {
@@ -1569,7 +1801,17 @@ fn remap_zone(
     if let Some(start) = run_start {
         runs.push((start, previous));
     }
+}
 
+/// The zones written for the destination `runs` of `zone`; see
+/// [`remap_zone`].
+fn zones_from_runs(
+    zone: &ZoneMapStatistics,
+    runs: Vec<(u64, u64)>,
+    remapped_null_rows: Option<&RowAddrTreeMap>,
+    bounds_decide_comparable: bool,
+    unrepresentable: &mut RoaringBitmap,
+) -> Result<Vec<ZoneMapStatistics>> {
     let mut zones = Vec::with_capacity(runs.len());
     for (start, end) in runs {
         let length = end - start + 1;

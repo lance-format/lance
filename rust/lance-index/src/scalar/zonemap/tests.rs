@@ -48,11 +48,12 @@ use crate::scalar::{
     RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
     lance_format::LanceIndexStore,
     zonemap::{
-        HarvestedZoneSeed, ReusedZones, SEED_NULL_BITMAP_META_KEY, SEED_VERSION_META_KEY,
-        SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
-        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedWriter, ZoneMapSegmentBase,
-        build_zonemap_segment, merge_seeds_for_binary_copy, merge_zonemap_indices,
-        parse_seed_for_binary_copy, place_records, remap_zone, v1_zone_violation,
+        HarvestedZoneSeed, RemapBudget, ReusedZones, SEED_NULL_BITMAP_META_KEY,
+        SEED_VERSION_META_KEY, SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
+        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapRemapNeedsWithdrawal,
+        ZoneMapRemapOverBudget, ZoneMapSeedWriter, ZoneMapSegmentBase, build_zonemap_segment,
+        merge_seeds_for_binary_copy, merge_zonemap_indices, parse_seed_for_binary_copy,
+        place_records, remap_zone, remap_zone_in_chunks, remap_zone_runs, v1_zone_violation,
     },
 };
 use arrow_array::Int32Array;
@@ -1016,6 +1017,135 @@ async fn test_remap_narrowed_nan_zone_again_is_withdrawn() {
     let (twice, withdrawn) = remap_and_load(&once, &second).await;
     assert_eq!(withdrawn, RoaringBitmap::from_iter([11u32]));
     assert!(twice.zones.is_empty());
+}
+
+/// A zone translated in chunks smaller than itself through a mapping that
+/// reverses rows, so runs cross chunk boundaries, yields the same runs and
+/// zones as a single pass.
+#[test]
+fn test_remap_zone_chunked_matches_single_pass() {
+    let zone = ZoneMapStatistics {
+        min: ScalarValue::Int64(Some(1)),
+        max: ScalarValue::Int64(Some(10)),
+        null_count: 0,
+        nan_count: 0,
+        negative_nan_count: Some(0),
+        bound: ZoneBound {
+            fragment_id: 1,
+            start: 0,
+            length: 10,
+        },
+    };
+    let destinations = [5, 4, 3, 2, 1, 0, 9, 8, 20, 21];
+    let mapping: HashMap<u64, u64> = destinations
+        .iter()
+        .enumerate()
+        .map(|(offset, &dest)| (row(1, offset as u64), row(2, dest)))
+        .collect();
+    let translate = |addrs: &mut [Option<u64>]| {
+        for addr in addrs.iter_mut() {
+            *addr = addr.and_then(|addr| mapping.get(&addr).copied());
+        }
+    };
+    let budget = RemapBudget::unlimited();
+    let single_pass = remap_zone_runs(&zone, &translate, None, 10, &budget).unwrap();
+    assert_eq!(
+        single_pass,
+        vec![
+            (row(2, 0), row(2, 5)),
+            (row(2, 8), row(2, 9)),
+            (row(2, 20), row(2, 21)),
+        ]
+    );
+    let zones_with = |chunk_rows| {
+        let mut unrepresentable = RoaringBitmap::new();
+        let zones = remap_zone_in_chunks(
+            &zone,
+            &translate,
+            None,
+            false,
+            None,
+            chunk_rows,
+            &budget,
+            &mut unrepresentable,
+        )
+        .unwrap();
+        (zones, unrepresentable)
+    };
+    for chunk_rows in [1, 3, 4] {
+        assert_eq!(
+            remap_zone_runs(&zone, &translate, None, chunk_rows, &budget).unwrap(),
+            single_pass,
+            "chunk_rows={chunk_rows}"
+        );
+        assert_eq!(
+            zones_with(chunk_rows),
+            zones_with(10),
+            "chunk_rows={chunk_rows}"
+        );
+    }
+}
+
+/// A remap over its working budget fails with `ZoneMapRemapOverBudget`
+/// and writes nothing.
+#[tokio::test]
+async fn test_remap_over_budget_writes_nothing() {
+    let tmpdir = TempObjDir::default();
+    let source = train_float_fragments(
+        local_store(&tmpdir),
+        2,
+        vec![vec![Some(1.0), None, Some(2.0), Some(3.0)]],
+    )
+    .await;
+    let mapping = direct_remap(&moved(0, 0..4, 1, 0), &[]);
+    let dest_tmpdir = TempObjDir::default();
+    let dest_store = local_store(&dest_tmpdir);
+
+    let Err(err) = source
+        .remap_within_budget(&mapping, dest_store.as_ref(), 1)
+        .await
+    else {
+        panic!("a remap over budget must fail");
+    };
+    let over_budget = ZoneMapRemapOverBudget::from_error(&err).expect("over budget error");
+    assert_eq!(over_budget.budget_bytes, 1);
+    assert!(over_budget.estimated_bytes > 1);
+    assert!(ZoneMapRemapNeedsWithdrawal::from_error(&err).is_none());
+    assert!(
+        dest_store.open_index_file(ZONEMAP_FILENAME).await.is_err(),
+        "nothing is written over budget"
+    );
+}
+
+/// Null positions in a fragment the mapping does not touch are kept as
+/// they are; those in an affected fragment are translated.
+#[tokio::test]
+async fn test_remap_null_rows_translates_only_affected_fragments() {
+    let tmpdir = TempObjDir::default();
+    let source = train_float_fragments(
+        local_store(&tmpdir),
+        2,
+        vec![
+            vec![Some(1.0), None, Some(2.0), None],
+            vec![None, Some(3.0), None, Some(4.0)],
+        ],
+    )
+    .await;
+    let mapping = direct_remap(
+        &[
+            (row(1, 0), row(2, 3)),
+            (row(1, 1), row(2, 2)),
+            (row(1, 2), row(2, 1)),
+            (row(1, 3), row(2, 0)),
+        ],
+        &[],
+    );
+
+    let (remapped, withdrawn) = remap_and_load(&source, &mapping).await;
+
+    assert!(withdrawn.is_empty());
+    let expected = RowAddrTreeMap::from_iter([row(0, 1), row(0, 3), row(2, 1), row(2, 3)]);
+    assert_eq!(remapped.null_rows.as_ref(), Some(&expected));
 }
 
 #[tokio::test]
