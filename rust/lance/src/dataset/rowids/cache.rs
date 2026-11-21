@@ -449,6 +449,7 @@ pub(super) mod tests {
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(1),
                 base_id: None,
+                path: None,
                 inline: Some(encoded.into()),
             });
             let transaction = Transaction::new_from_version(

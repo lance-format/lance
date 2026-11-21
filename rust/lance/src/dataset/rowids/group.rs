@@ -317,7 +317,7 @@ async fn maybe_build_group(
     if cache_capacity == 0 {
         return Ok(None);
     }
-    let max_group_bytes = (cache_capacity as usize).saturating_mul(3) / 4;
+    let max_group_bytes = cache_capacity.saturating_mul(3) / 4;
     if max_group_bytes == 0 {
         return Ok(None);
     }
