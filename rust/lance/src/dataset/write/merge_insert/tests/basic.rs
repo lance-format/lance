@@ -222,6 +222,79 @@ async fn test_merge_insert_defaults_to_unenforced_primary_key() {
 }
 
 #[rstest::rstest]
+#[case::hyphen("user-id", "`user-id`")]
+#[case::quotes("a\"\"b", "`a\"\"b`")]
+#[case::backticks("`id`", "```id```")]
+#[tokio::test]
+async fn merge_insert_preserves_inferred_key_path(#[case] name: &str, #[case] path: &str) {
+    let key = Field::new(name, DataType::Int32, false)
+        .with_metadata([("lance-schema:unenforced-primary-key".into(), "true".into())].into());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        key,
+    ]));
+    let batch = RecordBatch::new_empty(schema.clone());
+    let ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Arc::new(ds);
+    let builder = MergeInsertBuilder::try_new(dataset.clone(), Vec::new()).unwrap();
+    assert_eq!(builder.params.on, [path]);
+    assert_eq!(
+        builder.params.primary_key_field_ids(dataset.schema()),
+        Some(vec![dataset.schema().fields[1].id])
+    );
+}
+
+#[rstest::rstest]
+#[case::explicit(vec!["meta.id"], "meta.id")]
+#[case::composite(vec!["id", "META.ID"], "META.ID")]
+#[case::inferred(vec![], "meta.id")]
+#[tokio::test]
+async fn merge_insert_nested_key_is_rejected(#[case] keys: Vec<&str>, #[case] path: &str) {
+    let child = Field::new("id", DataType::Int32, false)
+        .with_metadata([("lance-schema:unenforced-primary-key".into(), "true".into())].into());
+    let meta = StructArray::from(vec![(
+        Arc::new(child),
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+    )]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("meta", meta.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20])), Arc::new(meta)],
+    )
+    .unwrap();
+    let ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let error =
+        MergeInsertBuilder::try_new(Arc::new(ds), keys.into_iter().map(String::from).collect())
+            .expect_err("merge_insert accepted a nested join key");
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("'{path}' must be a top-level column")),
+        "{error}"
+    );
+}
+
+#[rstest::rstest]
 #[case::full(false, false)]
 #[case::column_patch(true, false)]
 #[case::partial_column_patch(true, true)]
