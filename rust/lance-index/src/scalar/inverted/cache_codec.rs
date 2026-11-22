@@ -585,7 +585,9 @@ impl CacheCodecImpl for Positions {
                             reader,
                             body_offset,
                             raw_start,
-                            block_offsets: values.to_vec(),
+                            // Retain the IPC buffer so the file reader's RAM reservation
+                            // lives as long as the decoded directory.
+                            block_offsets: values.clone(),
                             codec: proto_to_position_stream_codec(codec),
                         },
                     )))));

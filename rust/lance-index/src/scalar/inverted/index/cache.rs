@@ -26,7 +26,7 @@ pub(in super::super) struct FilePositions {
     pub(in super::super) reader: Arc<dyn lance_core::cache::CacheFileReader>,
     pub(in super::super) body_offset: usize,
     pub(in super::super) raw_start: usize,
-    pub(in super::super) block_offsets: Vec<u32>,
+    pub(in super::super) block_offsets: ScalarBuffer<u32>,
     pub(in super::super) codec: PositionStreamCodec,
 }
 
@@ -57,7 +57,7 @@ impl FilePositions {
             return Err(Error::io("positions cache short whole-stream read"));
         }
         Ok(CompressedPositionStorage::SharedStream(
-            SharedPositionStream::new(self.codec, self.block_offsets.clone(), bytes),
+            SharedPositionStream::new(self.codec, self.block_offsets.to_vec(), bytes),
         ))
     }
 }
@@ -147,7 +147,11 @@ impl DeepSizeOf for Positions {
             CachedPositions::Resident(storage) => storage.deep_size_of_children(context),
             CachedPositions::File(file) => {
                 std::mem::size_of::<FilePositions>()
-                    + file.block_offsets.capacity() * std::mem::size_of::<u32>()
+                    + file
+                        .block_offsets
+                        .inner()
+                        .capacity()
+                        .max(file.block_offsets.inner().len())
             }
         }
     }
