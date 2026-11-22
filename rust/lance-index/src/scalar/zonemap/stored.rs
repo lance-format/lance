@@ -13,7 +13,8 @@ use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use roaring::RoaringBitmap;
 
 use super::{
-    ReusedZones, ZoneMapIndexVersion, ZoneMapStatistics, parse_zones, read_zone_file, target_zone,
+    ReusedZones, ZoneFileRead, ZoneMapIndexVersion, ZoneMapStatistics, parse_zones, read_zone_file,
+    target_zone,
 };
 use crate::scalar::IndexStore;
 
@@ -37,20 +38,40 @@ pub struct StoredZones {
     /// Null positions of the requested fragments; `None` when the file
     /// stores none.
     null_rows: Option<RowAddrTreeMap>,
-    decoded_bytes: usize,
+    payload_bytes: usize,
+}
+
+/// The outcome of [`StoredZones::load`] when the file could be read.
+#[derive(Debug)]
+pub enum StoredZonesLoad {
+    Loaded(StoredZones),
+    /// The bytes read are not a valid zone file under the requested
+    /// version; the reason is the validation error's text.
+    Rejected(String),
 }
 
 impl StoredZones {
     /// Read the zones and null positions of `fragments` from the segment
     /// file in `store`, decoded under `version` (the segment's
     /// `IndexMetadata.index_version`).
+    ///
+    /// A failed storage or file-reader call is an `Err`; a file whose bytes
+    /// were read but do not validate is [`StoredZonesLoad::Rejected`].
     pub async fn load(
         store: &dyn IndexStore,
         version: ZoneMapIndexVersion,
         fragments: &RoaringBitmap,
-    ) -> Result<Self> {
-        let file = read_zone_file(store, true).await?;
-        let (data_type, all_zones) = parse_zones(&file.zone_maps, version)?;
+    ) -> Result<StoredZonesLoad> {
+        let file = match read_zone_file(store, true).await? {
+            ZoneFileRead::File(file) => file,
+            ZoneFileRead::Invalid(error) => {
+                return Ok(StoredZonesLoad::Rejected(error.to_string()));
+            }
+        };
+        let (data_type, all_zones) = match parse_zones(&file.zone_maps, version) {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(StoredZonesLoad::Rejected(error.to_string())),
+        };
         drop(file.zone_maps);
         let mut zones: HashMap<u64, Vec<ZoneMapStatistics>> = HashMap::new();
         for zone in all_zones {
@@ -64,7 +85,7 @@ impl StoredZones {
             rows.retain_fragments(fragments.iter());
             rows
         });
-        Ok(Self {
+        Ok(StoredZonesLoad::Loaded(Self {
             version,
             data_type,
             rows_per_zone: file.rows_per_zone,
@@ -72,8 +93,8 @@ impl StoredZones {
             stores_null_rows: file.stores_null_rows,
             zones,
             null_rows,
-            decoded_bytes: file.decoded_bytes,
-        })
+            payload_bytes: file.payload_bytes,
+        }))
     }
 
     pub fn version(&self) -> ZoneMapIndexVersion {
@@ -98,10 +119,12 @@ impl StoredZones {
         self.stores_null_rows
     }
 
-    /// In-memory bytes of the whole decoded file (zone records and the
-    /// null-position buffer), before the unrequested fragments were dropped.
-    pub fn decoded_bytes(&self) -> usize {
-        self.decoded_bytes
+    /// Arrow memory of the whole file's zone record batch plus the
+    /// serialized length of its null-position buffer, measured before the
+    /// unrequested fragments were dropped. Not the memory of the parsed
+    /// zones or null positions, and not a peak.
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
     }
 
     /// Why zones of this segment cannot feed a build of `data_type` with

@@ -25,7 +25,8 @@ use lance_index::IndexType;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME};
 use lance_index::scalar::zonemap::{
-    ZoneMapIndexBuilder, ZoneMapIndexBuilderParams, ZoneMapIndexVersion,
+    StoredZonesLoad, ZoneMapIndex, ZoneMapIndexBuilder, ZoneMapIndexBuilderParams,
+    ZoneMapIndexVersion,
 };
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams, index_files_to_table};
 use lance_io::utils::tracking_store::IoStats;
@@ -354,7 +355,7 @@ async fn test_rebuild_reuses_stored_zones_without_data_reads() {
         let (report, io) = rebuild(&mut dataset, column, &default_params()).await;
         assert_eq!(report.stored_fragments, ids, "{column}");
         assert_eq!(report.stored_sources, 1, "{column}");
-        assert!(report.stored_bytes > 0 && report.stored_decoded_bytes > 0);
+        assert!(report.stored_bytes > 0 && report.stored_payload_bytes > 0);
         assert!(report.scanned_fragments.is_empty(), "{column}");
         assert_eq!(report.scanned_rows, 0, "{column}");
         assert_eq!(report.total_seed_bytes, 0, "{column}");
@@ -809,21 +810,21 @@ async fn test_undecodable_source_falls_back_to_scan() {
     let ids = fragment_ids(&dataset);
     build(&mut dataset, "val", &default_params()).await;
     let bad = replace_with_undecodable_segment(&mut dataset).await;
-    // The parse error is not a storage error, so the build falls back.
+    // The file is read without error and rejected, so the build falls back.
     let store =
         LanceIndexStore::from_dataset_for_existing(&dataset, &segments(&dataset, "val").await[0])
             .await
             .unwrap();
-    let error = lance_index::scalar::zonemap::StoredZones::load(
+    let outcome = lance_index::scalar::zonemap::StoredZones::load(
         &store,
         ZoneMapIndexVersion::CURRENT,
         &RoaringBitmap::from_iter([0u32, 1]),
     )
     .await
-    .expect_err("the file does not parse as zones");
+    .unwrap();
     assert!(
-        matches!(error, lance_core::Error::InvalidInput { .. }),
-        "{error:?}"
+        matches!(outcome, StoredZonesLoad::Rejected(_)),
+        "{outcome:?}"
     );
 
     let (report, io) = rebuild(&mut dataset, "val", &default_params()).await;
@@ -831,7 +832,7 @@ async fn test_undecodable_source_falls_back_to_scan() {
     assert_eq!(report.unusable_sources, 1, "{report:?}");
     assert_eq!(report.stored_sources, 0, "{report:?}");
     assert_eq!(report.stored_bytes, 0, "{report:?}");
-    assert_eq!(report.stored_decoded_bytes, 0, "{report:?}");
+    assert_eq!(report.stored_payload_bytes, 0, "{report:?}");
     assert!(segment_reads(&io, &bad) > 0, "the file was opened");
     let now = segments(&dataset, "val").await;
     assert_eq!(now.len(), 1);
@@ -863,14 +864,7 @@ async fn test_missing_source_file_fails_the_build() {
     .name(index_name("val"))
     .replace(true)
     .await;
-    let error = result.expect_err("the build fails");
-    assert!(
-        matches!(
-            error,
-            lance_core::Error::IO { .. } | lance_core::Error::NotFound { .. }
-        ),
-        "{error:?}"
-    );
+    result.expect_err("the build fails");
     let dataset = DatasetBuilder::from_uri(dir.as_str()).load().await.unwrap();
     let now: Vec<Uuid> = segments(&dataset, "val")
         .await
@@ -1119,5 +1113,694 @@ async fn test_caller_supplied_training_data_disables_discovery() {
         reports.is_empty(),
         "the seed-aware build did not run: {reports:?}"
     );
+    assert_matches_scan(&dataset, VAL_FILTERS, &["val > 500"]).await;
+}
+
+/// 6f. A read of the admitted source's zone file that fails after its
+///     metadata was opened fails the build, whatever error the reader
+///     returns; the table keeps the old segment.
+#[tokio::test]
+async fn test_failed_read_after_open_fails_the_build() {
+    use crate::dataset::ReadParams;
+    use crate::utils::test::FailingProxyStore;
+    use lance_io::object_store::ObjectStoreParams;
+
+    let dir = TempStrDir::default();
+    let prefix = if dir.as_str().starts_with('/') {
+        ""
+    } else {
+        "/"
+    };
+    // Routed through the object store so that the proxy sees every read.
+    let uri = format!("file-object-store://{prefix}{}", dir.as_str());
+    let mut dataset = write(&uri, 2).await;
+    // Zones of two rows make the zone file larger than the first read of a
+    // file (its tail, where the metadata is), so its records are read by a
+    // later request.
+    let fine = params(2, false, true);
+    build(&mut dataset, "val", &fine).await;
+    let old = segments(&dataset, "val").await[0].clone();
+    assert!(zone_file_size(&old) > 2 * 4096, "{}", zone_file_size(&old));
+    let file: &'static str = Box::leak(format!("{}/zonemap.lance", old.uuid).into_boxed_str());
+
+    // A cold handle whose reads of the zone file fail after the first one.
+    // The manifest records the file's size, so the first request is the
+    // tail read that opens it.
+    let failing_handle = || async {
+        let failing = Arc::new(FailingProxyStore::new());
+        let dataset = DatasetBuilder::from_uri(&uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        failing.fail_after_n("get_opts", file, 1, "injected zone file read failure");
+        failing.fail_after_n("get_ranges", file, 0, "injected zone file read failure");
+        dataset
+    };
+
+    // Under that fault the file opens and its records do not read.
+    {
+        use lance_index::scalar::IndexStore;
+        let dataset = failing_handle().await;
+        let store = LanceIndexStore::from_dataset_for_existing(&dataset, &old)
+            .await
+            .unwrap();
+        let reader = store.open_index_file("zonemap.lance").await.unwrap();
+        let error = reader
+            .read_range(0..reader.num_rows(), None)
+            .await
+            .expect_err("the record read fails");
+        assert!(error.to_string().contains("injected"), "{error}");
+    }
+
+    let mut dataset = failing_handle().await;
+    let (result, reports) = with_reports(async {
+        CreateIndexBuilder::new(&mut dataset, &["val"], IndexType::ZoneMap, &fine)
+            .name(index_name("val"))
+            .replace(true)
+            .await
+    })
+    .await;
+    let error = result.expect_err("the build fails");
+    assert!(
+        error
+            .to_string()
+            .contains("injected zone file read failure"),
+        "{error}"
+    );
+    assert!(reports.is_empty(), "{reports:?}");
+
+    let dataset = DatasetBuilder::from_uri(&uri).load().await.unwrap();
+    let now: Vec<Uuid> = segments(&dataset, "val")
+        .await
+        .iter()
+        .map(|segment| segment.uuid)
+        .collect();
+    assert_eq!(now, vec![old.uuid]);
+}
+
+/// Filters on `x` for the staged-publication tests. A scan selects the NaN
+/// and the -NaN rows with `x > 1e308`; `x < -1e308` does not select the
+/// -NaN rows.
+const X_FILTERS: &[&str] = &[
+    "x > 10",
+    "x < -40",
+    "x = 3",
+    "x >= 0 AND x <= 1",
+    "x IS NULL",
+    "x IS NOT NULL",
+    "x > 1e308",
+    "x < -1e308",
+    "x > 100000000",
+];
+
+fn sorted(mut ids: Vec<u64>) -> Vec<u64> {
+    ids.sort_unstable();
+    ids
+}
+
+fn uuids(segments: &[IndexMetadata]) -> BTreeSet<Uuid> {
+    segments.iter().map(|segment| segment.uuid).collect()
+}
+
+/// An uncommitted build of the index on `column` over `fragments` (every
+/// fragment when `None`), with its report and the requests it made.
+async fn staged_build(
+    dataset: &mut Dataset,
+    column: &str,
+    params: &ScalarIndexParams,
+    fragments: Option<Vec<u32>>,
+) -> (IndexMetadata, SeedReuseReport, IoStats) {
+    io(dataset);
+    let (segment, reports) = with_reports(async {
+        let mut builder = CreateIndexBuilder::new(dataset, &[column], IndexType::ZoneMap, params)
+            .name(index_name(column))
+            .replace(true);
+        if let Some(fragments) = fragments {
+            builder = builder.fragments(fragments);
+        }
+        builder.execute_uncommitted().await.unwrap()
+    })
+    .await;
+    let io = io(dataset);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    (segment, reports.into_iter().next().unwrap(), io)
+}
+
+/// 9. Worker-style staged builds over fragment subsets, merged and
+///    committed, on a table that already has several disjoint committed
+///    segments of the index.
+#[tokio::test]
+async fn test_staged_subset_builds_merge_and_commit() {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 6).await;
+    let name = index_name("x");
+    let seeded = params(T, true, true);
+    let mut committed = Vec::new();
+    for fragments in [vec![0, 1], vec![2, 3], vec![4, 5]] {
+        let (segment, report, _) = staged_build(&mut dataset, "x", &seeded, Some(fragments)).await;
+        assert!(report.stored_fragments.is_empty(), "{report:?}");
+        committed.push(segment);
+    }
+    dataset
+        .commit_existing_index_segments(&name, "x", committed.clone())
+        .await
+        .unwrap();
+    assert_eq!(uuids(&segments(&dataset, "x").await), uuids(&committed));
+    // Fragment 6 is written after the index exists and carries a write seed.
+    append(&mut dataset, 6 * ROWS, ROWS).await;
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, 2, 3, 4, 5, 6]);
+    let indexed: Vec<u64> = (0..6).collect();
+
+    // Worker 1: one fragment from each of the first two segments.
+    let (first, report, io) = staged_build(&mut dataset, "x", &seeded, Some(vec![0, 2])).await;
+    assert_eq!(
+        sorted(report.stored_fragments.clone()),
+        vec![0, 2],
+        "{report:?}"
+    );
+    assert_eq!(report.stored_sources, 2, "{report:?}");
+    assert!(report.reused_fragments.is_empty(), "{report:?}");
+    assert!(report.scanned_fragments.is_empty(), "{report:?}");
+    assert_eq!(report.scanned_rows, 0, "{report:?}");
+    assert_eq!(data_reads(&dataset, &io, &indexed), Vec::<String>::new());
+
+    // Worker 2: the other fragments of those segments and the new one.
+    let (second, report, io) = staged_build(&mut dataset, "x", &seeded, Some(vec![1, 3, 6])).await;
+    assert_eq!(
+        sorted(report.stored_fragments.clone()),
+        vec![1, 3],
+        "{report:?}"
+    );
+    assert_eq!(report.stored_sources, 2, "{report:?}");
+    assert_eq!(report.reused_fragments, vec![6], "{report:?}");
+    assert!(report.scanned_fragments.is_empty(), "{report:?}");
+    assert_eq!(report.scanned_rows, 0, "{report:?}");
+    assert_eq!(data_reads(&dataset, &io, &indexed), Vec::<String>::new());
+
+    let merged = dataset
+        .merge_existing_index_segments(vec![first, second])
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.clone().unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2, 3, 6])
+    );
+    dataset
+        .commit_existing_index_segments(&name, "x", vec![merged.clone()])
+        .await
+        .unwrap();
+    // The two segments the merged output covers are replaced; the third,
+    // disjoint from it, stays.
+    assert_eq!(
+        uuids(&segments(&dataset, "x").await),
+        BTreeSet::from([merged.uuid, committed[2].uuid])
+    );
+    assert_matches_scan(&dataset, X_FILTERS, &["x > 10", "x IS NULL"]).await;
+}
+
+/// The fragments each listed segment of the index on `x` covers.
+async fn coverage(dataset: &Dataset) -> Vec<(Uuid, Vec<u32>)> {
+    segments(dataset, "x")
+        .await
+        .iter()
+        .map(|segment| {
+            let fragments = segment
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().collect())
+                .unwrap_or_default();
+            (segment.uuid, fragments)
+        })
+        .collect()
+}
+
+fn is_incompatible(result: &crate::Result<()>) -> bool {
+    matches!(result, Err(crate::Error::IncompatibleTransaction { .. }))
+}
+
+fn is_retryable(result: &crate::Result<()>) -> bool {
+    matches!(result, Err(crate::Error::RetryableCommitConflict { .. }))
+}
+
+/// 10a. Restore to an older version between the build and its
+///      publication, also with the history cleaned up: whatever is
+///      published still finds the restored null and NaN rows.
+#[tokio::test]
+async fn test_staged_commit_after_restore() {
+    for cleanup in [false, true] {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = write(uri, 2).await;
+        let before_deletion = dataset.version().version;
+        assert_eq!(x(13), None);
+        assert!(x(14).unwrap().is_nan());
+        dataset.delete("id = 13 OR id = 14").await.unwrap();
+        // The committed source and the staged build summarize the live rows.
+        build(&mut dataset, "x", &default_params()).await;
+        let source = segments(&dataset, "x").await[0].uuid;
+        let (staged, report, _) = staged_build(&mut dataset, "x", &default_params(), None).await;
+        assert_eq!(report.stored_fragments, vec![0, 1], "{report:?}");
+
+        let other = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let restored = restore(&other, before_deletion).await;
+        if cleanup {
+            cleanup_all_but_latest(restored, uri).await;
+        }
+        let result = dataset
+            .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+            .await;
+        assert!(is_incompatible(&result), "cleanup={cleanup}: {result:?}");
+
+        let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let listed = uuids(&segments(&latest, "x").await);
+        assert!(!listed.contains(&staged.uuid), "{listed:?}");
+        assert!(!listed.contains(&source), "{listed:?}");
+        assert!(
+            ids_matching(&latest, "x > 1e308", false)
+                .await
+                .contains(&row_of(14)),
+            "the filter selects the NaN row"
+        );
+        assert!(
+            ids_matching(&latest, "x IS NULL", true)
+                .await
+                .contains(&row_of(13))
+        );
+        assert!(
+            ids_matching(&latest, "x > 1e308", true)
+                .await
+                .contains(&row_of(14))
+        );
+        assert_matches_scan(&latest, X_FILTERS, &[]).await;
+    }
+}
+
+/// Ids in the second zone of fragment 0 whose `x` is null, NaN or -NaN.
+fn zone_null_and_nan_ids() -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let zone = T as i32..2 * T as i32;
+    let nulls = zone.clone().filter(|i| x(*i).is_none()).collect();
+    let nans = zone
+        .clone()
+        .filter(|i| x(*i).is_some_and(|v| v.is_nan() && v.is_sign_positive()))
+        .collect();
+    let negative_nans = zone
+        .filter(|i| x(*i).is_some_and(|v| v.is_nan() && v.is_sign_negative()))
+        .collect();
+    (nulls, nans, negative_nans)
+}
+
+/// 10a'. Restore between the build and its publication, then the retrying
+///       caller refreshes the handle and commits the same staged output
+///       again. Every null and NaN row of one whole zone was deleted before
+///       the build, so the staged summary of that zone has none; the
+///       restore brings them back. Run for a staged output taken from
+///       stored records of a committed source and for one that is not, and
+///       with and without the history cleaned up. The second commit
+///       succeeds with pruned coverage and every query equals a scan.
+async fn staged_commit_again_after_restore(from_stored: bool) {
+    let (nulls, nans, negative_nans) = zone_null_and_nan_ids();
+    assert!(!nulls.is_empty() && !nans.is_empty() && !negative_nans.is_empty());
+    let deleted: Vec<String> = nulls
+        .iter()
+        .chain(&nans)
+        .chain(&negative_nans)
+        .map(|id| id.to_string())
+        .collect();
+    for cleanup in [false, true] {
+        let case = format!("from_stored={from_stored} cleanup={cleanup}");
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = write(uri, 2).await;
+        let before_deletion = dataset.version().version;
+        dataset
+            .delete(&format!(
+                "id >= {} AND id < {} AND id IN ({})",
+                T,
+                2 * T,
+                deleted.join(", ")
+            ))
+            .await
+            .unwrap();
+        if from_stored {
+            build(&mut dataset, "x", &default_params()).await;
+        }
+        let (staged, report, _) = staged_build(&mut dataset, "x", &default_params(), None).await;
+        if from_stored {
+            assert_eq!(report.stored_fragments, vec![0, 1], "{case}: {report:?}");
+        } else {
+            assert!(report.stored_fragments.is_empty(), "{case}: {report:?}");
+        }
+
+        // The staged record of that zone excludes the deleted rows.
+        let store = LanceIndexStore::from_dataset_for_existing(&dataset, &staged)
+            .await
+            .unwrap();
+        let version = ZoneMapIndexVersion::from_metadata(staged.index_version as u32).unwrap();
+        let records = ZoneMapIndex::load_zone_statistics(&store, version)
+            .await
+            .unwrap();
+        let column = |name: &str| {
+            records[name]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+        };
+        let counts = |name: &str| {
+            records[name]
+                .as_any()
+                .downcast_ref::<arrow_array::UInt32Array>()
+                .unwrap()
+        };
+        let zone: Vec<usize> = (0..records.num_rows())
+            .filter(|row| {
+                column("fragment_id").value(*row) == 0
+                    && (T..2 * T).contains(&column("zone_start").value(*row))
+            })
+            .collect();
+        assert_eq!(zone.len(), 1, "{case}: {records:?}");
+        assert_eq!(counts("null_count").value(zone[0]), 0, "{case}");
+        assert_eq!(counts("nan_count").value(zone[0]), 0, "{case}");
+
+        let other = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let restored = restore(&other, before_deletion).await;
+        if cleanup {
+            cleanup_all_but_latest(restored, uri).await;
+        }
+        let first = dataset
+            .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+            .await;
+        assert!(is_incompatible(&first), "{case}: {first:?}");
+
+        dataset.checkout_latest().await.unwrap();
+        dataset
+            .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+            .await
+            .unwrap();
+        let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        // The commit prunes fragment 0, whose restored rows the staged
+        // summary does not hold; with the history cleaned up it covers none.
+        let expected: Vec<u32> = if cleanup { vec![] } else { vec![1] };
+        assert_eq!(
+            coverage(&latest).await,
+            vec![(staged.uuid, expected)],
+            "{case}"
+        );
+
+        // The restored rows are live and found through the index.
+        let null_rows: BTreeSet<u64> = nulls.iter().map(|id| row_of(*id)).collect();
+        let nan_rows: BTreeSet<u64> = nans
+            .iter()
+            .chain(&negative_nans)
+            .map(|id| row_of(*id))
+            .collect();
+        assert!(
+            null_rows.is_subset(&ids_matching(&latest, "x IS NULL", false).await),
+            "{case}"
+        );
+        assert!(
+            null_rows.is_subset(&ids_matching(&latest, "x IS NULL", true).await),
+            "{case}"
+        );
+        // NaN of either sign is selected by one of the two NaN filters.
+        for use_index in [false, true] {
+            let mut found = ids_matching(&latest, "x > 1e308", use_index).await;
+            found.extend(ids_matching(&latest, "x < -1e308", use_index).await);
+            assert!(nan_rows.is_subset(&found), "{case} use_index={use_index}");
+        }
+        assert_matches_scan(&latest, X_FILTERS, &[]).await;
+    }
+}
+
+#[tokio::test]
+async fn test_staged_commit_again_after_restore_from_stored_records() {
+    staged_commit_again_after_restore(true).await;
+}
+
+#[tokio::test]
+async fn test_staged_commit_again_after_restore_without_stored_records() {
+    staged_commit_again_after_restore(false).await;
+}
+
+/// 10b. Deferred and eager compaction between the build and its
+///      publication; on a failure the same staged output is committed again
+///      after refreshing the handle (never rebuilt).
+#[tokio::test]
+async fn test_staged_commit_after_compaction() {
+    for defer in [true, false] {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = write(uri, 2).await;
+        append(&mut dataset, 2 * ROWS, ROWS / 4).await;
+        append(&mut dataset, 2 * ROWS + ROWS / 4, ROWS / 4).await;
+        build(&mut dataset, "x", &default_params()).await;
+        let (staged, report, _) = staged_build(&mut dataset, "x", &default_params(), None).await;
+        assert_eq!(report.stored_fragments, vec![0, 1, 2, 3], "{report:?}");
+
+        let mut other = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        compact_files(
+            &mut other,
+            CompactionOptions {
+                target_rows_per_fragment: ROWS as usize,
+                defer_index_remap: defer,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // Fragments 2 and 3 are joined into fragment 4.
+        assert_eq!(fragment_ids(&other), vec![0, 1, 4]);
+        let result = dataset
+            .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+            .await;
+        let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        if defer {
+            result.unwrap();
+            assert_eq!(coverage(&latest).await, vec![(staged.uuid, vec![0, 1, 4])]);
+        } else {
+            assert!(is_retryable(&result), "{result:?}");
+            let listed = uuids(&segments(&latest, "x").await);
+            assert!(
+                !listed.contains(&staged.uuid),
+                "nothing published: {listed:?}"
+            );
+            dataset.checkout_latest().await.unwrap();
+            dataset
+                .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+                .await
+                .unwrap();
+            let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+            // The compaction destination is left unindexed and is scanned.
+            assert_eq!(coverage(&latest).await, vec![(staged.uuid, vec![0, 1])]);
+        }
+        let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        assert_matches_scan(&latest, X_FILTERS, &[]).await;
+    }
+}
+
+/// 10c. Another writer replaces the source segment with the same data
+///      under a new uuid: that alone does not invalidate the staged output.
+#[tokio::test]
+async fn test_staged_commit_after_source_replaced() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let mut dataset = write(uri, 3).await;
+    build(&mut dataset, "x", &default_params()).await;
+    let (staged, report, _) = staged_build(&mut dataset, "x", &default_params(), None).await;
+    assert_eq!(report.stored_fragments, vec![0, 1, 2], "{report:?}");
+
+    let mut other = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    build(&mut other, "x", &default_params()).await;
+    let result = dataset
+        .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+        .await;
+    assert!(is_retryable(&result), "{result:?}");
+    dataset.checkout_latest().await.unwrap();
+    dataset
+        .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+        .await
+        .unwrap();
+    let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    assert_eq!(
+        uuids(&segments(&latest, "x").await),
+        BTreeSet::from([staged.uuid])
+    );
+    assert_matches_scan(&latest, X_FILTERS, &["x > 10", "x IS NULL"]).await;
+}
+
+/// 10d. Another writer changes values of the indexed field in a fragment
+///      the staged output took from stored records, by rewriting the rows
+///      or by an overlay on the field: the published index must not answer
+///      for those rows with the old statistics.
+#[tokio::test]
+async fn test_staged_commit_after_indexed_values_change() {
+    use super::dataset_overlay_index_masking::commit_overlay;
+    use crate::dataset::UpdateBuilder;
+    use lance_table::format::overlay::OverlayCoverage;
+
+    for overlay in [false, true] {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = write(uri, 3).await;
+        build(&mut dataset, "x", &default_params()).await;
+        let (staged, report, _) = staged_build(&mut dataset, "x", &default_params(), None).await;
+        assert_eq!(report.stored_fragments, vec![0, 1, 2], "{report:?}");
+
+        let other = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        if overlay {
+            let x_field = other.schema().field("x").unwrap().id;
+            // Fragment 1, offset 0: x becomes 1e9, beyond every stored bound.
+            commit_overlay(
+                other,
+                "x_overlay",
+                1,
+                &[x_field],
+                OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+                vec![Arc::new(Float64Array::from(vec![Some(1e9)]))],
+            )
+            .await;
+        } else {
+            UpdateBuilder::new(Arc::new(other))
+                .update_where("id >= 1000 AND id < 1010")
+                .unwrap()
+                .set("x", "1000000000.0")
+                .unwrap()
+                .build()
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+        }
+        dataset
+            .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+            .await
+            .unwrap();
+
+        let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        if overlay {
+            // The overlay changes fragment 1 in place; it stays covered.
+            assert_eq!(fragment_ids(&latest), vec![0, 1, 2]);
+            assert_eq!(coverage(&latest).await, vec![(staged.uuid, vec![0, 1, 2])]);
+        } else {
+            // The rewritten rows move to fragment 3, which is not covered.
+            assert_eq!(fragment_ids(&latest), vec![0, 1, 2, 3]);
+            assert_eq!(coverage(&latest).await, vec![(staged.uuid, vec![0, 1, 2])]);
+        }
+        let changed = ids_matching(&latest, "x > 100000000", false).await;
+        assert!(!changed.is_empty(), "the changed rows exist");
+        assert_eq!(ids_matching(&latest, "x > 100000000", true).await, changed);
+        assert_matches_scan(&latest, X_FILTERS, &[]).await;
+    }
+}
+
+/// 10e. The build's snapshot is cleaned up before the staged commit:
+///      the commit succeeds and covers only the fragments it was built on.
+#[tokio::test]
+async fn test_staged_commit_after_build_snapshot_is_cleaned_up() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let mut dataset = write(uri, 2).await;
+    build(&mut dataset, "x", &default_params()).await;
+    let (staged, report, _) = staged_build(&mut dataset, "x", &default_params(), None).await;
+    assert_eq!(report.stored_fragments, vec![0, 1], "{report:?}");
+
+    let mut other = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    append(&mut other, 2 * ROWS, ROWS).await;
+    cleanup_all_but_latest(other, uri).await;
+    dataset
+        .commit_existing_index_segments(&index_name("x"), "x", vec![staged.clone()])
+        .await
+        .unwrap();
+
+    let latest = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    // The appended fragment 2 is not covered.
+    assert_eq!(fragment_ids(&latest), vec![0, 1, 2]);
+    assert_eq!(coverage(&latest).await, vec![(staged.uuid, vec![0, 1])]);
+    assert_matches_scan(&latest, X_FILTERS, &[]).await;
+}
+
+/// 11. A committed source made by the merge of segments, whose stored
+///     records for a compaction destination are not that fragment's target
+///     zones (three records inside one target interval), is discovered and
+///     offers the destination; the shape check rejects it and the fragment
+///     is recomputed.
+#[tokio::test]
+async fn test_merge_produced_source_is_rejected_by_shape() {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 2).await;
+    // Three fragments of 100 rows that compaction joins into one of 300.
+    for k in 0..3 {
+        append(&mut dataset, 2 * ROWS + k * 100, 100).await;
+    }
+    build(&mut dataset, "val", &default_params()).await;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: ROWS as usize,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let ids = fragment_ids(&dataset);
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert_eq!(&ids[..2], &[0, 1]);
+    let destination = ids[2];
+
+    let merged = dataset
+        .merge_existing_index_segments(segments(&dataset, "val").await)
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.clone().unwrap(),
+        RoaringBitmap::from_iter(ids.iter().map(|id| *id as u32))
+    );
+    // Four target zones for each full fragment, and three records of 100
+    // rows for the destination, whose single target interval is [0, 300).
+    let store = LanceIndexStore::from_dataset_for_existing(&dataset, &merged)
+        .await
+        .unwrap();
+    let records = ZoneMapIndex::load_zone_statistics(&store, ZoneMapIndexVersion::CURRENT)
+        .await
+        .unwrap();
+    assert_eq!(records.num_rows(), 4 + 4 + 3);
+    dataset
+        .commit_existing_index_segments(&index_name("val"), "val", vec![merged.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        uuids(&segments(&dataset, "val").await),
+        BTreeSet::from([merged.uuid])
+    );
+
+    // Only the destination requested: the merged segment offers it (so it
+    // is loaded and counted), and nothing is taken from it.
+    let (_, report, io) = staged_build(
+        &mut dataset,
+        "val",
+        &default_params(),
+        Some(vec![destination as u32]),
+    )
+    .await;
+    assert_eq!(report.stored_sources, 1, "{report:?}");
+    assert_eq!(report.unusable_sources, 0, "{report:?}");
+    assert!(report.stored_fragments.is_empty(), "{report:?}");
+    assert_eq!(report.scanned_fragments, vec![destination], "{report:?}");
+    assert!(segment_reads(&io, &merged.uuid) > 0, "the source was read");
+
+    let (report, io) = rebuild(&mut dataset, "val", &default_params()).await;
+    assert_eq!(report.stored_fragments, vec![0, 1], "{report:?}");
+    assert_eq!(report.stored_sources, 1, "{report:?}");
+    assert_eq!(report.scanned_fragments, vec![destination], "{report:?}");
+    assert_eq!(data_reads(&dataset, &io, &[0, 1]), Vec::<String>::new());
     assert_matches_scan(&dataset, VAL_FILTERS, &["val > 500"]).await;
 }

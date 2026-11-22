@@ -152,12 +152,14 @@ pub struct SeedReuseReport {
     /// Committed segments not opened because of their stored size.
     pub skipped_sources: usize,
     /// Committed segments whose version or configuration did not match, or
-    /// whose file did not decode.
+    /// whose file was read but is not a valid zone file.
     pub unusable_sources: usize,
     /// Stored bytes of the committed segment files loaded.
     pub stored_bytes: u64,
-    /// In-memory bytes those files decoded to.
-    pub stored_decoded_bytes: usize,
+    /// Sum over the files loaded of the Arrow memory of the zone record
+    /// batch plus the serialized length of the null-position buffer. Not the
+    /// memory of the parsed zones or null positions, and not a peak.
+    pub stored_payload_bytes: usize,
 }
 
 #[cfg(test)]
@@ -444,7 +446,7 @@ async fn assemble_segment(
         sources_skipped: skipped_sources,
         sources_unusable: unusable_sources,
         stored_bytes,
-        decoded_bytes: stored_decoded_bytes,
+        payload_bytes: stored_payload_bytes,
     } = stored;
     // Fragments summarized from committed segments are not read at all.
     // Type-erased so the enclosing future's `Send` bound does not depend
@@ -514,7 +516,7 @@ async fn assemble_segment(
     let max_live_seed_bytes = counters.max_live_seed_bytes.into_inner();
     let max_concurrent_harvests = counters.max_in_flight.into_inner();
     log::info!(
-        "zone map segment for {column}: {} fragments from committed segments ({} stored records from {stored_sources} segments, {stored_bytes} stored bytes, {stored_decoded_bytes} decoded bytes, {skipped_sources} segments over the admission limit, {unusable_sources} not matching), {} fragments from seeds, {} partly, {} scanned in {scan_count} scans ({scanned_rows} rows, {} seed records, {total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once over {max_concurrent_harvests} concurrent harvests)",
+        "zone map segment for {column}: {} fragments from committed segments ({} stored records from {stored_sources} segments, {stored_bytes} stored bytes, {stored_payload_bytes} payload bytes, {skipped_sources} segments over the admission limit, {unusable_sources} not matching), {} fragments from seeds, {} partly, {} scanned in {scan_count} scans ({scanned_rows} rows, {} seed records, {total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once over {max_concurrent_harvests} concurrent harvests)",
         reused.stored_fragments.len(),
         reused.stored_records,
         reused.reused_fragments.len(),
@@ -542,7 +544,7 @@ async fn assemble_segment(
             skipped_sources,
             unusable_sources,
             stored_bytes,
-            stored_decoded_bytes,
+            stored_payload_bytes,
         })
     });
     let refreshed: Vec<u64> = fragments.iter().map(|fragment| fragment.id).collect();

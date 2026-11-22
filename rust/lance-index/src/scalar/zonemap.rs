@@ -880,7 +880,7 @@ impl ZoneMapIndex {
         store: &dyn IndexStore,
         version: ZoneMapIndexVersion,
     ) -> Result<RecordBatch> {
-        let file = read_zone_file(store, false).await?;
+        let file = read_zone_file(store, false).await?.into_result()?;
         let (data_type, zones) = parse_zones(&file.zone_maps, version)?;
         zone_statistics_batch(&zones, &data_type, file.rows_per_zone)
     }
@@ -897,7 +897,7 @@ impl ZoneMapIndex {
     where
         Self: Sized,
     {
-        let file = read_zone_file(store.as_ref(), true).await?;
+        let file = read_zone_file(store.as_ref(), true).await?.into_result()?;
         Ok(Arc::new(Self::try_from_serialized(
             file.zone_maps,
             store,
@@ -954,13 +954,35 @@ struct ZoneFile {
     null_rows: Option<RowAddrTreeMap>,
     /// Whether the file stores null positions, requested or not.
     stores_null_rows: bool,
-    /// In-memory bytes of the zone records and the null-position buffer read.
-    decoded_bytes: usize,
+    /// Arrow memory of the zone record batch plus the serialized length of
+    /// the null-position buffer read. Not the memory of the parsed zones or
+    /// null positions, and not a peak.
+    payload_bytes: usize,
+}
+
+/// What [`read_zone_file`] read: a zone file, or bytes that were read
+/// without error but are not a valid zone file.
+enum ZoneFileRead {
+    File(ZoneFile),
+    /// The error the bytes were rejected with.
+    Invalid(Error),
+}
+
+impl ZoneFileRead {
+    /// The file, or the rejection as an error.
+    fn into_result(self) -> Result<ZoneFile> {
+        match self {
+            Self::File(file) => Ok(file),
+            Self::Invalid(error) => Err(error),
+        }
+    }
 }
 
 /// Read the ZoneMap file of `store`, with its null positions when
-/// `with_null_rows` is set.
-async fn read_zone_file(store: &dyn IndexStore, with_null_rows: bool) -> Result<ZoneFile> {
+/// `with_null_rows` is set. An error of a storage or file-reader call is
+/// returned as `Err`; bytes that were read but do not validate are
+/// [`ZoneFileRead::Invalid`].
+async fn read_zone_file(store: &dyn IndexStore, with_null_rows: bool) -> Result<ZoneFileRead> {
     let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
     let zone_maps = index_file
         .read_range(0..index_file.num_rows(), None)
@@ -969,15 +991,23 @@ async fn read_zone_file(store: &dyn IndexStore, with_null_rows: bool) -> Result<
     let rows_per_zone = rows_per_zone_from_schema(file_schema);
     let null_buffer = file_schema.metadata.get(NULL_BITMAP_META_KEY);
     let stores_null_rows = null_buffer.is_some();
-    let mut decoded_bytes = zone_maps.get_array_memory_size();
+    let mut payload_bytes = zone_maps.get_array_memory_size();
     let null_rows = match null_buffer {
         Some(idx_str) if with_null_rows => {
-            let idx = idx_str.parse::<u32>().map_err(|e| {
-                Error::invalid_input(format!("invalid null bitmap buffer index: {e}"))
-            })?;
+            let idx = match idx_str.parse::<u32>() {
+                Ok(idx) => idx,
+                Err(e) => {
+                    return Ok(ZoneFileRead::Invalid(Error::invalid_input(format!(
+                        "invalid null bitmap buffer index: {e}"
+                    ))));
+                }
+            };
             let bytes = index_file.read_global_buffer(idx).await?;
-            decoded_bytes += bytes.len();
-            Some(RowAddrTreeMap::deserialize_from(bytes.as_ref())?)
+            payload_bytes += bytes.len();
+            match RowAddrTreeMap::deserialize_from(bytes.as_ref()) {
+                Ok(rows) => Some(rows),
+                Err(error) => return Ok(ZoneFileRead::Invalid(error)),
+            }
         }
         _ => None,
     };
@@ -985,14 +1015,14 @@ async fn read_zone_file(store: &dyn IndexStore, with_null_rows: bool) -> Result<
         .metadata
         .get(NULL_BITMAP_POLICY_META_KEY)
         .is_none_or(|value| value != "false");
-    Ok(ZoneFile {
+    Ok(ZoneFileRead::File(ZoneFile {
         zone_maps,
         rows_per_zone,
         store_null_bitmap,
         null_rows,
         stores_null_rows,
-        decoded_bytes,
-    })
+        payload_bytes,
+    }))
 }
 
 /// The `rows_per_zone` a ZoneMap file was written with, from its schema
@@ -3858,7 +3888,7 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
 }
 
 mod stored;
-pub use stored::StoredZones;
+pub use stored::{StoredZones, StoredZonesLoad};
 
 #[cfg(test)]
 mod tests;

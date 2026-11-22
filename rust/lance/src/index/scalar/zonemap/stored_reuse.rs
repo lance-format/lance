@@ -18,7 +18,7 @@ use arrow_schema::DataType;
 use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::{
-    ReusedZones, StoredZones, ZONEMAP_INDEX_FILENAME, ZoneMapIndexBuilderParams,
+    ReusedZones, StoredZones, StoredZonesLoad, ZONEMAP_INDEX_FILENAME, ZoneMapIndexBuilderParams,
     ZoneMapIndexVersion,
 };
 use lance_table::format::{Fragment, IndexMetadata};
@@ -29,7 +29,7 @@ use roaring::RoaringBitmap;
 use crate::index::loading::{load_all_indices_by_name, load_stored_indices};
 use crate::index::provenance::has_overlay_newer_than;
 use crate::index::segment::segment_has_zonemap_details;
-use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
+use crate::{Dataset, Result, dataset::index::LanceIndexStoreExt};
 
 /// Largest stored size of a segment's zone map file that a build loads to
 /// reuse its zones. A larger segment, or one whose size the manifest does
@@ -62,12 +62,14 @@ pub(super) struct StoredZoneReuse {
     /// Segments not opened because of their stored size.
     pub sources_skipped: usize,
     /// Segments whose version or configuration does not match the build, or
-    /// whose file did not decode.
+    /// whose file was read but is not a valid zone file.
     pub sources_unusable: usize,
     /// Stored bytes of the segment files loaded.
     pub stored_bytes: u64,
-    /// In-memory bytes those files decoded to.
-    pub decoded_bytes: usize,
+    /// Sum over the files loaded of the Arrow memory of the zone record
+    /// batch plus the serialized length of the null-position buffer. Not the
+    /// memory of the parsed zones or null positions, and not a peak.
+    pub payload_bytes: usize,
 }
 
 impl StoredZoneReuse {
@@ -79,7 +81,7 @@ impl StoredZoneReuse {
             sources_skipped: 0,
             sources_unusable: 0,
             stored_bytes: 0,
-            decoded_bytes: 0,
+            payload_bytes: 0,
         }
     }
 }
@@ -234,15 +236,14 @@ pub(super) async fn reuse_stored_zones(
         };
         let version = ZoneMapIndexVersion::from_metadata(segment.index_version as u32)?;
         let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
-        // A file that does not decode as this build's zones is not a source;
-        // a storage failure is the build's failure.
-        let source = match StoredZones::load(&store, version, &offered).await {
-            Ok(source) => source,
-            Err(error @ (Error::IO { .. } | Error::NotFound { .. })) => return Err(error),
-            Err(error) => {
+        // A failed read fails the build; bytes read that do not validate
+        // only make this segment unusable.
+        let source = match StoredZones::load(&store, version, &offered).await? {
+            StoredZonesLoad::Loaded(source) => source,
+            StoredZonesLoad::Rejected(reason) => {
                 log::warn!(
-                    "zone map segment {} cannot supply stored zones: its file did not decode: \
-                     {error}",
+                    "zone map segment {} cannot supply stored zones: its file is not valid: \
+                     {reason}",
                     segment.uuid
                 );
                 reuse.sources_unusable += 1;
@@ -250,7 +251,7 @@ pub(super) async fn reuse_stored_zones(
             }
         };
         reuse.stored_bytes += size;
-        reuse.decoded_bytes += source.decoded_bytes();
+        reuse.payload_bytes += source.payload_bytes();
         if let Some(reason) =
             source.incompatibility(data_type, params.rows_per_zone(), keep_null_positions)
         {

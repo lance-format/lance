@@ -14,7 +14,7 @@ use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
 use roaring::RoaringBitmap;
 
-use super::{StoredZones, matches_target_zones};
+use super::{StoredZones, StoredZonesLoad, matches_target_zones};
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::zoned::ZoneBound;
@@ -22,8 +22,21 @@ use crate::scalar::zonemap::{
     ReusedZones, ScannedZones, ZoneMapIndex, ZoneMapIndexBuilder, ZoneMapIndexBuilderParams,
     ZoneMapIndexVersion, ZoneMapSegmentBase, ZoneMapStatistics, write_zonemap_segment,
 };
+use crate::scalar::{IndexFile, IndexReader, IndexStore, IndexWriter};
 
 const ROWS_PER_ZONE: u64 = 4;
+
+/// [`StoredZones::load`] that expects the file to load.
+async fn load(
+    store: &dyn IndexStore,
+    version: ZoneMapIndexVersion,
+    fragments: &RoaringBitmap,
+) -> StoredZones {
+    match StoredZones::load(store, version, fragments).await.unwrap() {
+        StoredZonesLoad::Loaded(stored) => stored,
+        StoredZonesLoad::Rejected(reason) => panic!("rejected: {reason}"),
+    }
+}
 
 fn record(fragment_id: u64, start: u64, length: usize) -> ZoneMapStatistics {
     ZoneMapStatistics {
@@ -163,9 +176,7 @@ async fn raw_loader_returns_the_requested_fragments_as_the_index_load_does() {
     write_segment(&store, &[(0, 10), (1, 7), (2, 13)], true).await;
 
     let wanted = RoaringBitmap::from_iter([0u32, 2]);
-    let stored = StoredZones::load(store.as_ref(), ZoneMapIndexVersion::V1, &wanted)
-        .await
-        .unwrap();
+    let stored = load(store.as_ref(), ZoneMapIndexVersion::V1, &wanted).await;
     let index = ZoneMapIndex::load(
         store.clone(),
         None,
@@ -181,7 +192,7 @@ async fn raw_loader_returns_the_requested_fragments_as_the_index_load_does() {
     assert_eq!(stored.rows_per_zone(), ROWS_PER_ZONE);
     assert!(stored.store_null_bitmap());
     assert!(stored.has_null_bitmap());
-    assert!(stored.decoded_bytes() > 0);
+    assert!(stored.payload_bytes() > 0);
     assert_eq!(
         stored.incompatibility(&DataType::Float64, ROWS_PER_ZONE, true),
         None
@@ -219,9 +230,7 @@ async fn stored_zones_are_written_back_unchanged() {
     let store = local_store(&dir);
     write_segment(&store, &[(0, 10), (1, 7)], true).await;
     let wanted = RoaringBitmap::from_iter([0u32, 1]);
-    let stored = StoredZones::load(store.as_ref(), ZoneMapIndexVersion::V1, &wanted)
-        .await
-        .unwrap();
+    let stored = load(store.as_ref(), ZoneMapIndexVersion::V1, &wanted).await;
 
     let mut reused = ReusedZones::new(true);
     assert!(reused.reuse_stored(&stored, 0, 10).unwrap());
@@ -282,9 +291,7 @@ async fn incompatible_sources_are_named() {
     let store = local_store(&dir);
     write_segment(&store, &[(0, 8)], false).await;
     let wanted = RoaringBitmap::from_iter([0u32]);
-    let stored = StoredZones::load(store.as_ref(), ZoneMapIndexVersion::V1, &wanted)
-        .await
-        .unwrap();
+    let stored = load(store.as_ref(), ZoneMapIndexVersion::V1, &wanted).await;
     assert!(!stored.store_null_bitmap());
     assert!(!stored.has_null_bitmap());
     // Same configuration: compatible.
@@ -311,12 +318,236 @@ async fn incompatible_sources_are_named() {
     assert!(reused.reuse_stored(&stored, 0, 8).unwrap());
 
     // The same file read as version 0 is never a current-version source.
-    let as_v0 = StoredZones::load(store.as_ref(), ZoneMapIndexVersion::V0, &wanted)
-        .await
-        .unwrap();
+    let as_v0 = load(store.as_ref(), ZoneMapIndexVersion::V0, &wanted).await;
     assert!(
         as_v0
             .incompatibility(&DataType::Float64, ROWS_PER_ZONE, false)
             .is_some()
     );
+}
+
+/// Where [`FaultyStore`] makes the zone file fail or look different.
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    /// `read_range` fails with this kind of error.
+    ReadRange(ReadError),
+    /// `read_global_buffer` fails with this kind of error.
+    GlobalBuffer(ReadError),
+    /// The schema names a null-position buffer index that does not parse.
+    BadBufferIndex,
+    /// The null-position buffer read is not a serialized row-address map.
+    GarbageBuffer,
+}
+
+/// The shapes a read failure can arrive in from the file reader.
+#[derive(Debug, Clone, Copy)]
+enum ReadError {
+    /// `Error::Shared` around an IO error, as a batched read returns it.
+    Shared,
+    /// `Error::Wrapped`, as a decoder task returns it.
+    Wrapped,
+}
+
+impl ReadError {
+    fn error(self) -> lance_core::Error {
+        let io = lance_core::Error::io("injected read failure");
+        match self {
+            Self::Shared => lance_core::Error::Shared {
+                source: Arc::new(io),
+            },
+            Self::Wrapped => lance_core::Error::wrapped(Box::new(io)),
+        }
+    }
+}
+
+struct FaultyReader {
+    inner: Arc<dyn IndexReader>,
+    fault: Fault,
+    schema: lance_core::datatypes::Schema,
+}
+
+#[async_trait::async_trait]
+impl IndexReader for FaultyReader {
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> lance_core::Result<RecordBatch> {
+        self.inner.read_record_batch(n, batch_size).await
+    }
+    async fn read_global_buffer(&self, index: u32) -> lance_core::Result<bytes::Bytes> {
+        match self.fault {
+            Fault::GlobalBuffer(error) => Err(error.error()),
+            Fault::GarbageBuffer => Ok(bytes::Bytes::from_static(&[0xff, 0xff, 0xff, 0x7f, 1])),
+            _ => self.inner.read_global_buffer(index).await,
+        }
+    }
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> lance_core::Result<RecordBatch> {
+        match self.fault {
+            Fault::ReadRange(error) => Err(error.error()),
+            _ => self.inner.read_range(range, projection).await,
+        }
+    }
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        self.inner.num_batches(batch_size).await
+    }
+    fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        &self.schema
+    }
+}
+
+/// An index store whose files open normally and then fail or misreport as
+/// `fault` says.
+#[derive(Debug, Clone)]
+struct FaultyStore {
+    inner: Arc<dyn IndexStore>,
+    fault: Fault,
+}
+
+impl lance_core::deepsize::DeepSizeOf for FaultyStore {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        0
+    }
+}
+
+#[async_trait::async_trait]
+impl IndexStore for FaultyStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn clone_arc(&self) -> Arc<dyn IndexStore> {
+        Arc::new(self.clone())
+    }
+    fn io_parallelism(&self) -> usize {
+        self.inner.io_parallelism()
+    }
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_priority(io_priority),
+            fault: self.fault,
+        })
+    }
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_buffer_size(bytes),
+            fault: self.fault,
+        })
+    }
+    async fn new_index_file(
+        &self,
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> lance_core::Result<Box<dyn IndexWriter>> {
+        self.inner.new_index_file(name, schema).await
+    }
+    async fn open_index_file(&self, name: &str) -> lance_core::Result<Arc<dyn IndexReader>> {
+        let inner = self.inner.open_index_file(name).await?;
+        let mut schema = inner.schema().clone();
+        if matches!(self.fault, Fault::BadBufferIndex) {
+            schema
+                .metadata
+                .insert("null_bitmap".to_string(), "not-an-index".to_string());
+        }
+        Ok(Arc::new(FaultyReader {
+            inner,
+            fault: self.fault,
+            schema,
+        }))
+    }
+    async fn copy_index_file(
+        &self,
+        name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> lance_core::Result<IndexFile> {
+        self.inner.copy_index_file(name, dest_store).await
+    }
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> lance_core::Result<IndexFile> {
+        self.inner.rename_index_file(name, new_name).await
+    }
+    async fn delete_index_file(&self, name: &str) -> lance_core::Result<()> {
+        self.inner.delete_index_file(name).await
+    }
+    async fn list_files_with_sizes(&self) -> lance_core::Result<Vec<IndexFile>> {
+        self.inner.list_files_with_sizes().await
+    }
+}
+
+#[tokio::test]
+async fn read_failures_fail_the_load_whatever_their_variant() {
+    let dir = TempObjDir::default();
+    let store = local_store(&dir);
+    write_segment(&store, &[(0, 10), (1, 7)], true).await;
+    let wanted = RoaringBitmap::from_iter([0u32, 1]);
+    for fault in [
+        Fault::ReadRange(ReadError::Shared),
+        Fault::ReadRange(ReadError::Wrapped),
+        Fault::GlobalBuffer(ReadError::Shared),
+        Fault::GlobalBuffer(ReadError::Wrapped),
+    ] {
+        let faulty = FaultyStore {
+            inner: store.clone(),
+            fault,
+        };
+        let result = StoredZones::load(&faulty, ZoneMapIndexVersion::V1, &wanted).await;
+        let error = result.expect_err("a failed read is an error, not a rejection");
+        assert!(
+            error.to_string().contains("injected read failure"),
+            "{fault:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_bytes_are_rejected() {
+    let dir = TempObjDir::default();
+    let store = local_store(&dir);
+    write_segment(&store, &[(0, 10)], true).await;
+    let wanted = RoaringBitmap::from_iter([0u32]);
+    for fault in [Fault::BadBufferIndex, Fault::GarbageBuffer] {
+        let faulty = FaultyStore {
+            inner: store.clone(),
+            fault,
+        };
+        let outcome = StoredZones::load(&faulty, ZoneMapIndexVersion::V1, &wanted)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, StoredZonesLoad::Rejected(_)),
+            "{fault:?}: {outcome:?}"
+        );
+    }
+
+    // A valid Lance file without zone columns.
+    let other_dir = TempObjDir::default();
+    let other = local_store(&other_dir);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "unrelated",
+        DataType::Int64,
+        false,
+    )]));
+    let mut writer = other
+        .new_index_file("zonemap.lance", schema.clone())
+        .await
+        .unwrap();
+    writer
+        .write_record_batch(
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+    let outcome = StoredZones::load(other.as_ref(), ZoneMapIndexVersion::V1, &wanted)
+        .await
+        .unwrap();
+    let StoredZonesLoad::Rejected(reason) = outcome else {
+        panic!("a file without zone columns is rejected: {outcome:?}");
+    };
+    assert!(reason.contains("min"), "{reason}");
 }
