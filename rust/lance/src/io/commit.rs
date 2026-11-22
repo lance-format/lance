@@ -249,8 +249,9 @@ async fn cleanup_minted_index_dirs(
         return;
     }
     let location = match dataset
+        .table_state
         .commit_handler
-        .resolve_latest_location(&dataset.base, &dataset.object_store)
+        .resolve_latest_location(&dataset.table_state.base, &dataset.table_state.object_store)
         .await
     {
         Ok(location) => location,
@@ -265,7 +266,13 @@ async fn cleanup_minted_index_dirs(
     // Read without touching the dataset caches: loading a manifest through
     // `Dataset` also decodes its inline transaction into the session cache,
     // which would replace the caller's in-memory transaction for that version.
-    let manifest = match read_manifest(&dataset.object_store, &location.path, location.size).await {
+    let manifest = match read_manifest(
+        &dataset.table_state.object_store,
+        &location.path,
+        location.size,
+    )
+    .await
+    {
         Ok(manifest) => manifest,
         Err(error) => {
             log::warn!(
@@ -275,7 +282,12 @@ async fn cleanup_minted_index_dirs(
             return;
         }
     };
-    let referenced = match read_manifest_indexes(&dataset.object_store, &location, &manifest).await
+    let referenced = match read_manifest_indexes(
+        &dataset.table_state.object_store,
+        &location,
+        &manifest,
+    )
+    .await
     {
         Ok(indices) => indices
             .into_iter()
@@ -1979,7 +1991,7 @@ struct MintedIndexDirs {
     /// Directories minted by this call, from the input transaction and every
     /// rebased transaction.
     uuids: HashSet<Uuid>,
-    /// Whether the attempted manifest write could have landed.
+    /// Whether any attempted manifest write could have landed.
     has_unverified_write: bool,
 }
 
@@ -2067,7 +2079,6 @@ impl<'a> CommitTransactionOptions<'a> {
     pub(crate) fn with_tagged_frag_reuse_trim(mut self) -> Self {
         self.tagged_frag_reuse_trim = true;
         self
-
     }
 
     pub(crate) fn with_reclaim_on_loss(mut self, reclaim_on_loss: ReclaimOnLoss) -> Self {
@@ -2495,8 +2506,7 @@ async fn commit_transaction_inner(
 
         // Try to commit the manifest
         original_dataset.ensure_branch_exists().await?;
-        // From here until `verify_commit_outcome` clears it, a manifest write
-        // of unclear fate exists and cleanup must stay off.
+        let had_unverified_write = minted.has_unverified_write;
         minted.has_unverified_write = true;
         let result = write_manifest_file(
             object_store,
@@ -2565,17 +2575,11 @@ async fn commit_transaction_inner(
                         .await?;
                         return Ok((committed_manifest, location));
                     }
-                    // Confirmed loss: another writer owns the version (or,
-                    // for handlers that detect conflicts before writing, the
-                    // attempt never landed). Only a different key can be retried.
                     CommitOutcome::Foreign { duplicate_append } => {
-                        minted.has_unverified_write = false;
+                        minted.has_unverified_write = had_unverified_write;
                         duplicate_append
                     }
-                    CommitOutcome::Absent => {
-                        minted.has_unverified_write = false;
-                        false
-                    }
+                    CommitOutcome::Absent => false,
                     CommitOutcome::Unknown => {
                         return Err(Error::commit_status_unknown_source(
                             target_version,
@@ -2658,7 +2662,7 @@ async fn commit_transaction_inner(
                             }
                         );
                         if matches!(outcome, CommitOutcome::Foreign { .. }) {
-                            minted.has_unverified_write = false;
+                            minted.has_unverified_write = had_unverified_write;
                         }
                         cleanup_transaction_file(
                             object_store,
@@ -2712,20 +2716,21 @@ mod tests {
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use futures::future::join_all;
+    use futures::future::{BoxFuture, join_all};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, LANCE_UNENFORCED_PRIMARY_KEY, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::ConcreteFileVersion;
     use lance_index::IndexType;
+    use lance_io::object_writer::WriteResult;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
-        commit_handler_from_url,
+        commit_handler_from_url, write_manifest_file_to_path,
     };
     use lance_table::transaction::resolve_arrow_field_ids;
     use lance_testing::datagen::generate_random_array;
@@ -5091,6 +5096,7 @@ mod tests {
         let index_dir = dataset.indices_dir().join(index.uuid.to_string());
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .read_dir(index_dir.clone())
                 .await
@@ -5100,13 +5106,14 @@ mod tests {
 
         cleanup_minted_index_dirs(
             &dataset,
-            dataset.object_store.as_ref(),
+            dataset.table_state.object_store.as_ref(),
             &HashSet::from([index.uuid]),
         )
         .await;
 
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .read_dir(index_dir)
                 .await
@@ -5116,11 +5123,89 @@ mod tests {
         );
     }
 
-    /// When another writer wins the target version,
-    /// the attempt is verified as not landed and the directory it minted is
-    /// reclaimed.
+    #[derive(Debug)]
+    struct ConflictOnFailedWrite;
+
+    #[async_trait::async_trait]
+    impl CommitLock for ConflictOnFailedWrite {
+        type Lease = Self;
+
+        async fn lock(&self, _: u64) -> std::result::Result<Self::Lease, CommitError> {
+            Ok(Self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommitLease for ConflictOnFailedWrite {
+        async fn release(&self, success: bool) -> std::result::Result<(), CommitError> {
+            assert!(!success);
+            Err(CommitError::CommitConflict)
+        }
+    }
+
+    fn delayed_manifest_path(path: &Path) -> Path {
+        Path::from(format!("{path}.delayed-test"))
+    }
+
+    #[derive(Debug)]
+    struct LockWithDelayedManifestWrite;
+
+    #[async_trait::async_trait]
+    impl CommitHandler for LockWithDelayedManifestWrite {
+        fn is_version_not_found_definitive(&self) -> bool {
+            ConflictOnFailedWrite.is_version_not_found_definitive()
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            _: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            fn time_out_manifest_write<'a>(
+                store: &'a ObjectStore,
+                manifest: &'a mut Manifest,
+                indices: Option<Vec<IndexMetadata>>,
+                path: &'a Path,
+                transaction: Option<lance_table::format::Transaction>,
+            ) -> BoxFuture<'a, Result<WriteResult>> {
+                Box::pin(async move {
+                    write_manifest_file_to_path(
+                        store,
+                        manifest,
+                        indices,
+                        &delayed_manifest_path(path),
+                        transaction,
+                    )
+                    .await
+                    .unwrap();
+                    Err(Error::io("simulated manifest write timeout"))
+                })
+            }
+
+            ConflictOnFailedWrite
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    time_out_manifest_write,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::foreign(false)]
+    #[case::late_lock_write(true)]
     #[tokio::test]
-    async fn test_foreign_commit_outcome_reclaims_minted_index_dir() {
+    async fn test_minted_index_dir_after_commit_conflict(#[case] late_write: bool) {
         let tmp = TempStrDir::default();
         let uri = tmp.as_str();
         let schema = simple_schema();
@@ -5140,6 +5225,7 @@ mod tests {
         let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .read_dir(index_dir.clone())
                 .await
@@ -5147,16 +5233,24 @@ mod tests {
                 .is_empty()
         );
 
-        // A foreign transaction lands at the version this attempt targets, so
-        // the conditional put conflicts and verification reports `Foreign`.
-        let mut foreign_manifest = dataset.manifest.as_ref().clone();
-        foreign_manifest.version = dataset.manifest.version + 1;
-        let foreign_transaction = Transaction::new(
-            dataset.manifest.version,
-            Operation::ReserveFragments { num_fragments: 1 },
-            None,
-        );
-        let handler = inject_foreign_commit_handler(foreign_manifest, &foreign_transaction);
+        let target_version = dataset.manifest.version + 1;
+        let target = dataset
+            .table_state
+            .manifest_location
+            .naming_scheme
+            .manifest_path(&dataset.table_state.base, target_version);
+        let handler: Arc<dyn CommitHandler> = if late_write {
+            Arc::new(LockWithDelayedManifestWrite)
+        } else {
+            let mut foreign_manifest = dataset.manifest.as_ref().clone();
+            foreign_manifest.version = target_version;
+            let foreign_transaction = Transaction::new(
+                dataset.manifest.version,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            );
+            inject_foreign_commit_handler(foreign_manifest, &foreign_transaction)
+        };
 
         let transaction = Transaction::new(
             segment.dataset_version,
@@ -5166,14 +5260,13 @@ mod tests {
             },
             None,
         );
-        // One attempt only: the foreign commit is a one-shot injection.
         let commit_config = CommitConfig {
             num_retries: 1,
             ..Default::default()
         };
         let error = commit_transaction(
             &dataset,
-            dataset.object_store.as_ref(),
+            dataset.table_state.object_store.as_ref(),
             handler.as_ref(),
             &transaction,
             CommitTransactionOptions::new(
@@ -5186,20 +5279,48 @@ mod tests {
         )
         .await
         .expect_err("a commit that lost the version must fail");
-        assert!(
-            !error.is_commit_status_unknown(),
-            "a verified foreign owner is a definite loss, got: {error:?}"
-        );
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error}");
 
-        assert!(
+        if late_write {
+            assert_eq!(
+                Dataset::open(uri).await.unwrap().version().version,
+                dataset.version().version
+            );
+            assert!(
+                !dataset
+                    .table_state
+                    .object_store
+                    .read_dir(index_dir)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the timed-out manifest write must keep its index directory"
+            );
             dataset
+                .table_state
                 .object_store
-                .read_dir(index_dir)
+                .rename_if_not_exists(&delayed_manifest_path(&target), &target)
                 .await
-                .unwrap()
-                .is_empty(),
-            "the index directory of a verified-foreign attempt must be reclaimed"
-        );
+                .unwrap();
+            let latest = Dataset::open(uri).await.unwrap();
+            assert_eq!(latest.version().version, dataset.version().version + 1);
+            let mut scan = latest.scan();
+            scan.filter("x = 2").unwrap().use_scalar_index(true);
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+            assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
+        } else {
+            assert!(
+                dataset
+                    .table_state
+                    .object_store
+                    .read_dir(index_dir)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the index directory of a verified-foreign attempt must be reclaimed"
+            );
+        }
     }
 
     /// A commit whose manifest lands but is reported as a conflict (the

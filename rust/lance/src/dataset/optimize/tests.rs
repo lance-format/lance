@@ -441,6 +441,7 @@ async fn frag_reuse_watermarks(dataset: &Dataset) -> Vec<u64> {
 /// index directory.
 async fn index_dir_names(dataset: &Dataset) -> HashSet<String> {
     dataset
+        .table_state
         .object_store
         .read_dir(dataset.indices_dir())
         .await
@@ -485,6 +486,7 @@ enum Race {
         excluded: &'static [u32],
     },
     DeleteThenError,
+    ConflictWithoutWrite,
 }
 
 #[derive(Debug, Default)]
@@ -574,6 +576,7 @@ impl CommitHandler for RaceBeforeRewrite {
                         .await
                         .unwrap();
                 }
+                Race::ConflictWithoutWrite => return Err(CommitError::CommitConflict),
                 Race::DeleteThenError => {
                     handle.delete("i < 10").await.unwrap();
                     return Err(CommitError::OtherError(Error::io(

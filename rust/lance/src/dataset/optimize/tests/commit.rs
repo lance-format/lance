@@ -1829,3 +1829,29 @@ async fn test_v0_rebase_reclaims_restamped_details_dir() {
     assert!(handler.races.lock().unwrap().is_empty());
     assert_eq!(reuse_details_dirs(uri), before, "restamped details leaked");
 }
+
+#[tokio::test]
+async fn test_foreign_rewrite_retry_preserves_dirs_after_absent_conflict() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+
+    handler.arm(&dataset, vec![Race::ConflictWithoutWrite, Race::Delete]);
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the Delete must preempt the retry");
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "{error}"
+    );
+    assert!(handler.races.lock().unwrap().is_empty());
+    let after = index_dir_names(&dataset).await;
+    assert!(
+        after.is_superset(&before) && after.len() == before.len() + 1,
+        "the unresolved first attempt must keep its index directory"
+    );
+}

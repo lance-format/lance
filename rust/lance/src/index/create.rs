@@ -1280,6 +1280,7 @@ mod tests {
     /// stored index directory.
     async fn index_dir_names(dataset: &Dataset) -> HashSet<String> {
         dataset
+            .table_state
             .object_store
             .read_dir(dataset.indices_dir())
             .await

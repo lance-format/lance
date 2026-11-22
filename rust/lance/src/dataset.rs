@@ -146,8 +146,8 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
-    CommitTransactionOptions, ReclaimOnLoss, commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, fix_schema,
+    CommitTransactionOptions, ReclaimOnLoss, commit_detached_transaction, commit_new_dataset,
+    commit_transaction, detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now};

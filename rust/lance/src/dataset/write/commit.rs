@@ -1763,6 +1763,7 @@ mod tests {
         let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .read_dir(index_dir.clone())
                 .await
@@ -1794,6 +1795,7 @@ mod tests {
         );
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .read_dir(index_dir.clone())
                 .await
