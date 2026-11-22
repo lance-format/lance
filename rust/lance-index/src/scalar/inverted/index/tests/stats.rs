@@ -1658,7 +1658,7 @@ fn test_legacy_per_doc_positions_deep_size_counts_only_referenced_slice() {
     );
 
     // The `Positions` cache wrapper must report the same slice-aware size.
-    let wrapped = Positions(storage).deep_size_of();
+    let wrapped = Positions::from(storage).deep_size_of();
     assert!(
         wrapped < full_backing / 4,
         "Positions deep_size_of {wrapped}B must not count the {full_backing}B shared buffer"

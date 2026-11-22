@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -4057,12 +4057,13 @@ async fn load_compound_partition(
                 Vec::new()
             } else {
                 partition
-                    .load_posting_lists(
+                    .load_posting_lists_with_policy(
                         tokens.as_ref(),
                         params.as_ref(),
                         operator,
                         scorer.as_ref(),
                         metrics.as_ref(),
+                        super::index::PostingLoadOptions::read_ahead().with_file_position_cursor(),
                     )
                     .await?
                     .postings
@@ -4597,7 +4598,12 @@ async fn compound_search_impl(
             let cpu_plan = plan.clone();
             let cpu_mask = mask.clone();
             let cpu_metrics = metrics.clone();
-            let collected = spawn_cpu(move || {
+            let reads_positions = partitions
+                .iter()
+                .flat_map(|p| &p.leaves)
+                .flat_map(|leaf| &leaf.postings)
+                .any(PostingIterator::has_file_positions);
+            let collected = super::index::run_fts_scoring(reads_positions, move || {
                 collect_loaded_partitions(
                     partitions,
                     &cpu_plan,

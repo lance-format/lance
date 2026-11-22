@@ -616,7 +616,7 @@ impl PostingListReader {
                     for slot in 0..group_len {
                         let start_offset = offsets.value_offsets()[slot] as usize;
                         let end_offset = offsets.value_offsets()[slot + 1] as usize;
-                        positions.push((start + slot as u32, Positions(
+                        positions.push((start + slot as u32, Positions::from(
                             CompressedPositionStorage::SharedStream(SharedPositionStream::new(
                                 codec,
                                 values.values()[start_offset..end_offset].to_vec(),
@@ -733,7 +733,10 @@ impl PostingListReader {
     ) {
         if with_position && let Some(positions) = posting_list.take_positions() {
             warm_cache
-                .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
+                .insert_with_key(
+                    &PositionKey { token_id },
+                    Arc::new(Positions::from(positions)),
+                )
                 .await;
         }
     }
@@ -967,67 +970,99 @@ impl PostingListReader {
         token_id: u32,
         metrics: &dyn MetricsCollector,
     ) -> Result<CompressedPositionStorage> {
-        let result = self.index_cache.get_or_insert_with_key_hit(PositionKey { token_id }, || async move {
-            let positions = match self.positions_layout {
-                PositionsLayout::None => {
-                    return Err(Error::invalid_input(
-                        "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                    ));
+        let positions = self.cached_positions(token_id, metrics).await?;
+        match &positions.0 {
+            CachedPositions::Resident(storage) => Ok(storage.clone()),
+            CachedPositions::File(file) => {
+                let file = file.clone();
+                match spawn_blocking(move || file.materialize()).await? {
+                    Ok(storage) => Ok(storage),
+                    Err(_) => self.origin_positions(token_id).await,
                 }
-                PositionsLayout::LegacyPerDoc => {
-                    let batch = self
-                        .reader
-                        .get().await?
-                        .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
-                        .await
-                        .map_err(|e| match e {
-                            Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
-                            e => e,
-                        })?;
-                    CompressedPositionStorage::LegacyPerDoc(
-                        batch[POSITION_COL].as_list::<i32>().value(0).as_list::<i32>().clone(),
-                    )
-                }
-                PositionsLayout::SharedStream(codec) => {
-                    let batch = self
-                        .reader
-                        .get().await?
-                        .read_range(
-                            self.posting_list_range(token_id),
-                            Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
-                        )
-                        .await
-                        .map_err(|e| match e {
-                            Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
-                            e => e,
-                        })?;
-                    let bytes = bytes::Bytes::from(
-                        batch[COMPRESSED_POSITION_COL]
-                            .as_binary::<i64>()
-                            .value(0)
-                            .to_vec(),
-                    );
-                    let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
-                        .as_list::<i32>()
-                        .value(0)
-                        .as_primitive::<UInt32Type>()
-                        .values()
-                        .to_vec();
-                    CompressedPositionStorage::SharedStream(SharedPositionStream::new(
-                        codec,
-                        block_offsets,
-                        bytes,
-                    ))
-                }
-            };
-            Result::Ok(Positions(positions))
-        }).await;
+            }
+        }
+    }
+
+    pub(super) async fn cached_positions(
+        &self,
+        token_id: u32,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<Positions>> {
+        let result = self
+            .index_cache
+            .get_or_insert_with_key_hit(PositionKey { token_id }, || async {
+                self.origin_positions(token_id).await.map(Positions::from)
+            })
+            .await;
         match &result {
             Ok((_, true)) => metrics.record_index_cache_hit(),
             _ => metrics.record_index_cache_miss(),
         }
         let (positions, _) = result?;
-        Ok(positions.0.clone())
+        Ok(positions)
+    }
+
+    pub(in super::super) async fn origin_positions(
+        &self,
+        token_id: u32,
+    ) -> Result<CompressedPositionStorage> {
+        let positions = match self.positions_layout {
+            PositionsLayout::None => {
+                return Err(Error::invalid_input(
+                    "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
+                ));
+            }
+            PositionsLayout::LegacyPerDoc => {
+                let batch = self
+                    .reader
+                    .get().await?
+                    .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
+                    .await
+                    .map_err(|e| match e {
+                        Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
+                        e => e,
+                    })?;
+                CompressedPositionStorage::LegacyPerDoc(
+                    batch[POSITION_COL]
+                        .as_list::<i32>()
+                        .value(0)
+                        .as_list::<i32>()
+                        .clone(),
+                )
+            }
+            PositionsLayout::SharedStream(codec) => {
+                let batch = self
+                    .reader
+                    .get().await?
+                    .read_range(
+                        self.posting_list_range(token_id),
+                        Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
+                        e => e,
+                    })?;
+                let bytes = bytes::Bytes::from(
+                    batch[COMPRESSED_POSITION_COL]
+                        .as_binary::<i64>()
+                        .value(0)
+                        .to_vec(),
+                );
+                let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
+                    .as_list::<i32>()
+                    .value(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .to_vec();
+                CompressedPositionStorage::SharedStream(SharedPositionStream::new(
+                    codec,
+                    block_offsets,
+                    bytes,
+                ))
+            }
+        };
+        Ok(positions)
     }
 
     fn posting_list_range(&self, token_id: u32) -> Range<usize> {

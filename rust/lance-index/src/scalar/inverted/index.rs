@@ -115,6 +115,7 @@ mod posting_prewarm;
 mod posting_reader;
 mod prewarm;
 mod scheduling;
+pub(super) use scheduling::run_fts_scoring;
 mod search;
 mod search_candidates;
 mod token_set;

@@ -6,7 +6,61 @@ use super::*;
 /// New type just to allow Positions implement DeepSizeOf so it can be put
 /// in the cache.
 #[derive(Clone)]
-pub struct Positions(pub(in super::super) CompressedPositionStorage);
+pub struct Positions(pub(in super::super) CachedPositions);
+
+#[derive(Clone)]
+pub(in super::super) enum CachedPositions {
+    Resident(CompressedPositionStorage),
+    File(Arc<FilePositions>),
+}
+
+impl From<CompressedPositionStorage> for Positions {
+    fn from(storage: CompressedPositionStorage) -> Self {
+        Self(CachedPositions::Resident(storage))
+    }
+}
+
+/// An immutable complete cache value. Only the block directory lives in RAM.
+/// Each read uses the same file generation whose directory was decoded.
+pub(in super::super) struct FilePositions {
+    pub(in super::super) reader: Arc<dyn lance_core::cache::CacheFileReader>,
+    pub(in super::super) body_offset: usize,
+    pub(in super::super) raw_start: usize,
+    pub(in super::super) block_offsets: Vec<u32>,
+    pub(in super::super) codec: PositionStreamCodec,
+}
+
+impl FilePositions {
+    pub(in super::super) fn block(&self, index: usize) -> Result<bytes::Bytes> {
+        let offset = self.block_offsets.get(index).ok_or_else(|| {
+            Error::io(format!(
+                "positions cache has no directory entry for block {index}"
+            ))
+        })?;
+        let start = self.raw_start + *offset as usize;
+        let end = self
+            .block_offsets
+            .get(index + 1)
+            .map_or_else(|| self.reader.len(), |&end| self.raw_start + end as usize);
+        let bytes = self.reader.read_range(start..end)?;
+        if bytes.len() != end - start {
+            return Err(Error::io(format!(
+                "positions cache short read for block {index}"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn materialize(&self) -> Result<CompressedPositionStorage> {
+        let bytes = self.reader.read_range(self.raw_start..self.reader.len())?;
+        if bytes.len() != self.reader.len() - self.raw_start {
+            return Err(Error::io("positions cache short whole-stream read"));
+        }
+        Ok(CompressedPositionStorage::SharedStream(
+            SharedPositionStream::new(self.codec, self.block_offsets.clone(), bytes),
+        ))
+    }
+}
 
 /// Charge retained Arrow allocations once per cached group, including unused
 /// capacity and array objects. A slice keeps its backing allocation alive.
@@ -89,7 +143,13 @@ pub(super) fn sliced_cache_bytes(array: &dyn Array) -> usize {
 
 impl DeepSizeOf for Positions {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.0.deep_size_of_children(context)
+        match &self.0 {
+            CachedPositions::Resident(storage) => storage.deep_size_of_children(context),
+            CachedPositions::File(file) => {
+                std::mem::size_of::<FilePositions>()
+                    + file.block_offsets.capacity() * std::mem::size_of::<u32>()
+            }
+        }
     }
 }
 
@@ -338,6 +398,21 @@ impl SharedPositionStream {
     pub fn block(&self, index: usize) -> &[u8] {
         let range = self.block_range(index);
         &self.bytes[range]
+    }
+
+    pub(in super::super) fn owned_block(&self, index: usize) -> Result<bytes::Bytes> {
+        if index >= self.block_count() {
+            return Err(Error::index(format!(
+                "canonical positions have no block {index}"
+            )));
+        }
+        let range = self.block_range(index);
+        if range.start > range.end || range.end > self.bytes.len() {
+            return Err(Error::index(format!(
+                "invalid canonical positions range {range:?}"
+            )));
+        }
+        Ok(self.bytes.slice(range))
     }
 
     pub fn bytes(&self) -> &[u8] {

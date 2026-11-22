@@ -1134,7 +1134,8 @@ impl InvertedIndex {
                                     params.as_ref(),
                                     operator,
                                     metrics.as_ref(),
-                                    PostingLoadOptions::cache_aware_exact(),
+                                    PostingLoadOptions::cache_aware_exact()
+                                        .with_file_position_cursor(),
                                     partition_term_ids,
                                 )
                                 .await?
@@ -1168,7 +1169,10 @@ impl InvertedIndex {
                     // Iterators are built here rather than during the load so
                     // their decode buffers are allocated and freed by the same
                     // thread that runs WAND.
-                    let results = spawn_cpu(move || {
+                    let reads_positions = loaded
+                        .iter()
+                        .any(|(_, _, _, _, postings)| postings.has_file_positions());
+                    let results = run_fts_scoring(reads_positions, move || {
                         let mut results = Vec::with_capacity(loaded.len());
                         for (partition_ordinal, part, lengths, visibility, postings) in loaded {
                             let LoadedPostings {

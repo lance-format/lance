@@ -495,18 +495,26 @@ struct PositionMatchSummary {
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct PostingLoadOptions {
     read_policy: PostingReadPolicy,
+    file_position_cursor: bool,
 }
 
 impl PostingLoadOptions {
-    pub(super) const fn read_ahead() -> Self {
+    pub(in super::super) fn with_file_position_cursor(mut self) -> Self {
+        self.file_position_cursor = true;
+        self
+    }
+
+    pub(in super::super) const fn read_ahead() -> Self {
         Self {
             read_policy: PostingReadPolicy::ReadAhead,
+            file_position_cursor: false,
         }
     }
 
     pub(in super::super) const fn cache_aware_exact() -> Self {
         Self {
             read_policy: PostingReadPolicy::CacheAwareExact,
+            file_position_cursor: false,
         }
     }
 }
@@ -1419,6 +1427,7 @@ impl InvertedPartition {
     ) -> Result<Option<FetchedPostings>> {
         let PostingLoadOptions {
             read_policy: requested_read_policy,
+            file_position_cursor,
         } = options;
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
@@ -1471,25 +1480,49 @@ impl InvertedPartition {
                     token_id,
                 );
                 async move {
-                    let posting = match read_policy {
-                        PostingReadPolicy::ReadAhead => {
-                            self.inverted_list
-                                .posting_list(token_id, is_phrase_query, metrics)
-                                .await?
+                    // Same-position alternatives need fully materialized positions
+                    // when they are unioned before WAND starts.
+                    let allow_file = file_position_cursor && is_phrase_query && !has_expansions;
+                    let mut posting = self
+                        .inverted_list
+                        .posting_list_with_policy(
+                            token_id,
+                            is_phrase_query && !allow_file,
+                            metrics,
+                            read_policy,
+                        )
+                        .await?;
+                    let mut file = None;
+                    if allow_file && !posting.has_position() {
+                        let positions = self
+                            .inverted_list
+                            .cached_positions(token_id, metrics)
+                            .await?;
+                        match &positions.0 {
+                            CachedPositions::Resident(storage) => {
+                                posting.set_positions(storage.clone())
+                            }
+                            CachedPositions::File(entry) => match &posting {
+                                PostingList::Compressed(list)
+                                    if entry.block_offsets.len() == list.blocks.len()
+                                        && self.inverted_list.positions_layout
+                                            == PositionsLayout::SharedStream(entry.codec) =>
+                                {
+                                    file = Some(entry.clone());
+                                }
+                                _ => posting.set_positions(
+                                    self.inverted_list.origin_positions(token_id).await?,
+                                ),
+                            },
                         }
-                        PostingReadPolicy::CacheAwareExact => {
-                            self.inverted_list
-                                .posting_list_with_policy(
-                                    token_id,
-                                    is_phrase_query,
-                                    metrics,
-                                    read_policy,
-                                )
-                                .await?
-                        }
-                    };
-
-                    Result::Ok((token_id, token_index, position, posting))
+                    }
+                    Result::Ok(FetchedPosting {
+                        token_id,
+                        token_index,
+                        position,
+                        list: posting,
+                        file,
+                    })
                 }
             });
         // A leaf usually reads a handful of postings; joining them directly
@@ -1506,12 +1539,10 @@ impl InvertedPartition {
 
         let needs_union = loaded_postings
             .windows(2)
-            .any(|window| window[0].2 == window[1].2);
+            .any(|window| window[0].position == window[1].position);
         if (is_and_query || is_phrase_query)
             && !needs_union
-            && loaded_postings
-                .iter()
-                .any(|(_, _, _, posting)| posting.is_empty())
+            && loaded_postings.iter().any(|p| p.list.is_empty())
         {
             return Ok(None);
         }
@@ -1529,6 +1560,7 @@ impl InvertedPartition {
 
         Ok(Some(FetchedPostings {
             postings: loaded_postings,
+            origin: self.inverted_list.clone(),
             num_docs: self.docs.len(),
             is_and_query,
             is_phrase_query,
@@ -1697,15 +1729,25 @@ impl InvertedPartition {
     }
 }
 
+/// A token and its query position, with an optional immutable file reader
+/// consumed by the phrase iterator. Alternative expansions always use RAM.
+struct FetchedPosting {
+    token_id: u32,
+    token_index: usize,
+    position: u32,
+    list: PostingList,
+    file: Option<Arc<FilePositions>>,
+}
+
 /// Postings one partition read for a query leaf, before any iterator exists.
 ///
 /// Building iterators allocates per-cursor decode state, so the modern search
 /// path defers [`Self::into_loaded`] to the CPU task that runs WAND and later
 /// frees that state on the same thread.
 pub(super) struct FetchedPostings {
-    /// `(token_id, token_index, position, posting)` sorted by
-    /// `(position, token_id)`; `token_index` indexes the fetched `Tokens`.
-    postings: Vec<(u32, usize, u32, PostingList)>,
+    /// Sorted by (query position, token ID).
+    postings: Vec<FetchedPosting>,
+    origin: Arc<PostingListReader>,
     num_docs: usize,
     is_and_query: bool,
     is_phrase_query: bool,
@@ -1715,6 +1757,10 @@ pub(super) struct FetchedPostings {
 }
 
 impl FetchedPostings {
+    pub(super) fn has_file_positions(&self) -> bool {
+        self.postings.iter().any(|posting| posting.file.is_some())
+    }
+
     /// Build the iterators; `tokens` must be the tokens these postings were
     /// fetched for.
     pub(super) fn into_loaded(
@@ -1724,6 +1770,7 @@ impl FetchedPostings {
     ) -> Result<LoadedPostings> {
         let Self {
             postings: loaded_postings,
+            origin,
             num_docs,
             is_and_query,
             is_phrase_query,
@@ -1731,15 +1778,13 @@ impl FetchedPostings {
             docs_for_union,
         } = self;
         if docs_for_union.is_none() {
-            let impact_safe = loaded_postings
-                .iter()
-                .all(|(_, _, _, posting)| posting.has_impacts());
+            let impact_safe = loaded_postings.iter().all(|p| p.list.has_impacts());
             let no_impact_fallback = !impact_safe;
             if no_impact_fallback {
-                for (_, token_index, _, posting) in &loaded_postings {
-                    if !posting.has_impacts() {
+                for posting in &loaded_postings {
+                    if !posting.list.has_impacts() {
                         validate_no_impact_scorer_upper_bound(
-                            tokens.get_token(*token_index),
+                            tokens.get_token(posting.token_index),
                             impact_scorer,
                         )?;
                     }
@@ -1749,18 +1794,21 @@ impl FetchedPostings {
             return Ok(LoadedPostings {
                 postings: loaded_postings
                     .into_iter()
-                    .map(|(token_id, token_index, position, posting)| {
-                        let token = tokens.get_token(token_index);
-                        let needs_scorer_upper_bound = !posting.has_impacts();
+                    .map(|fetched| {
+                        let token = tokens.get_token(fetched.token_index);
+                        let needs_scorer_upper_bound = !fetched.list.has_impacts();
                         let query_weight = impact_scorer.query_weight(token);
-                        let posting = PostingIterator::with_query_weight(
+                        let mut posting = PostingIterator::with_query_weight(
                             token.to_owned(),
-                            token_id,
-                            position,
+                            fetched.token_id,
+                            fetched.position,
                             query_weight,
-                            posting,
+                            fetched.list,
                             num_docs,
                         );
+                        if let Some(file) = fetched.file {
+                            posting.set_file_positions(file, origin.clone());
+                        }
                         if needs_scorer_upper_bound {
                             posting.with_scorer_upper_bound()
                         } else {
@@ -1776,14 +1824,12 @@ impl FetchedPostings {
             });
         }
 
-        let no_impact_fallback = loaded_postings
-            .iter()
-            .any(|(_, _, _, posting)| !posting.has_impacts());
+        let no_impact_fallback = loaded_postings.iter().any(|p| !p.list.has_impacts());
         if no_impact_fallback {
-            for (_, token_index, _, posting) in &loaded_postings {
-                if !posting.has_impacts() {
+            for posting in &loaded_postings {
+                if !posting.list.has_impacts() {
                     validate_no_impact_scorer_upper_bound(
-                        tokens.get_token(*token_index),
+                        tokens.get_token(posting.token_index),
                         impact_scorer,
                     )?;
                 }
@@ -1795,13 +1841,12 @@ impl FetchedPostings {
         let mut grouped_postings = Vec::new();
         let mut grouped_expansions = Vec::new();
         let mut iter = loaded_postings.into_iter().peekable();
-        while let Some((token_id, token_index, position, posting)) = iter.next() {
-            let mut group = vec![(token_id, token_index, posting)];
-            while matches!(iter.peek(), Some((_, _, next_position, _)) if *next_position == position)
-            {
-                let (token_id, token_index, _, posting) =
-                    iter.next().expect("peeked item must exist");
-                group.push((token_id, token_index, posting));
+        while let Some(first) = iter.next() {
+            let position = first.position;
+            let mut group = vec![(first.token_id, first.token_index, first.list)];
+            while iter.peek().is_some_and(|p| p.position == position) {
+                let item = iter.next().expect("peeked item must exist");
+                group.push((item.token_id, item.token_index, item.list));
             }
 
             let (token_id, token_index, posting) = if group.len() == 1 {

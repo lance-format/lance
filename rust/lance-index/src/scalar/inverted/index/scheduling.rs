@@ -64,9 +64,72 @@ impl Drop for SearchGuard<'_> {
     }
 }
 
+/// File-backed phrase cursors perform blocking reads and on a cache fault
+/// may await canonical I/O that itself uses Tokio's blocking pool. A separate
+/// worker pool leaves both the runtime and its CPU/IO workers available.
+pub(in crate::scalar::inverted) async fn run_fts_scoring<T: Send + 'static>(
+    reads_positions: bool,
+    score: impl FnOnce() -> lance_core::Result<T> + Send + 'static,
+) -> lance_core::Result<T> {
+    if !reads_positions {
+        return lance_core::utils::tokio::spawn_cpu(score).await;
+    }
+    static FILE_SCORERS: std::sync::LazyLock<
+        Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+    > = std::sync::LazyLock::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(lance_core::utils::tokio::get_num_compute_intensive_cpus().clamp(1, 32))
+            .thread_name(|i| format!("lance-fts-read-{i}"))
+            .build()
+    });
+    let pool = FILE_SCORERS
+        .as_ref()
+        .map_err(|e| lance_core::Error::io(e.to_string()))?;
+    let runtime = tokio::runtime::Handle::current();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pool.spawn_fifo(move || {
+        if tx.is_closed() {
+            return;
+        }
+        let _runtime = runtime.enter();
+        let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            score,
+        )));
+    });
+    match rx
+        .await
+        .map_err(|e| lance_core::Error::internal(e.to_string()))?
+    {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_scoring_leaves_tokio_blocking_capacity_for_origin_reads() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::run_fts_scoring(true, || {
+                    tokio::runtime::Handle::current()
+                        .block_on(async { Ok(tokio::task::spawn_blocking(|| 41).await? + 1) })
+                }),
+            )
+            .await
+        });
+        rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        assert_eq!(result.unwrap().unwrap(), 42);
+    }
 
     #[rstest::rstest]
     #[case::remote(128, 2, 32, 128, 128)]

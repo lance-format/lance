@@ -23,7 +23,9 @@ use crate::scalar::inverted::encoding::{
     seek_packed_doc_positions,
 };
 use crate::scalar::inverted::impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData};
-use crate::scalar::inverted::index::PositionStreamCodec;
+use crate::scalar::inverted::index::{
+    FilePositions, PositionStreamCodec, PostingListReader, SharedPositionStream,
+};
 use crate::scalar::inverted::scorer::{BM25_DOC_WEIGHT_UPPER_BOUND, Scorer, idf};
 use crate::scalar::inverted::{
     CompressedPositionStorage, CompressedPostingList, DocInfo, PostingList, RawDocInfo,
@@ -225,6 +227,47 @@ impl GroupedTermScorer {
     }
 }
 
+/// Only attached to cursors dispatched to the blocking search pool. The
+/// canonical reader is bound to the same partition and snapshot as this term.
+struct FilePositionCursor {
+    entry: Arc<FilePositions>,
+    origin: Arc<PostingListReader>,
+    recovered: std::sync::OnceLock<SharedPositionStream>,
+}
+
+impl FilePositionCursor {
+    fn block(&self, token_id: u32, block_idx: usize) -> Result<bytes::Bytes> {
+        if let Some(stream) = self.recovered.get() {
+            return stream.owned_block(block_idx);
+        }
+        match self.entry.block(block_idx) {
+            Ok(block) => Ok(block),
+            Err(error) => {
+                tracing::warn!(token_id, block_idx, %error, "reading positions from canonical index after cache I/O failure");
+                // This worker is allowed to wait. Resume the same WAND cursor
+                // so already published thresholds and top-k state stay valid.
+                let storage = tokio::runtime::Handle::current()
+                    .block_on(self.origin.origin_positions(token_id))?;
+                let CompressedPositionStorage::SharedStream(stream) = storage else {
+                    return Err(Error::index(
+                        "canonical positions stream layout differs from cache",
+                    ));
+                };
+                if stream.codec() != self.entry.codec
+                    || stream.block_count() != self.entry.block_offsets.len()
+                {
+                    return Err(Error::index(
+                        "canonical positions directory differs from cache",
+                    ));
+                }
+                let block = stream.owned_block(block_idx)?;
+                let _ = self.recovered.set(stream);
+                Ok(block)
+            }
+        }
+    }
+}
+
 pub struct PostingIterator {
     token: String,
     pub(super) token_id: u32,
@@ -247,6 +290,7 @@ pub struct PostingIterator {
     // keeps repeated cursor creation allocation-free without lending a slice
     // out of the interior-mutable compressed state.
     pub(super) position_scratch: RefCell<Option<Vec<u32>>>,
+    file_positions: Option<Arc<FilePositionCursor>>,
 
     // for compressed posting list
     pub(super) compressed: Option<UnsafeCell<CompressedState>>,
@@ -268,6 +312,7 @@ pub(super) struct CompressedState {
     // never read positions, so both are allocated on first use.
     buffer: Option<Box<[u32; MAX_POSTING_BLOCK_SIZE]>>,
     position_block_idx: Option<usize>,
+    file_block: Option<(usize, bytes::Bytes)>,
     position_values: Vec<u32>,
     position_offsets: Vec<usize>,
     // Seek state for PackedDelta position blocks: the lazily-built group
@@ -302,6 +347,7 @@ impl CompressedState {
             impact_bound_computations: 0,
             buffer: None,
             position_block_idx: None,
+            file_block: None,
             position_values: Vec::new(),
             position_offsets: Vec::new(),
             position_group_offsets: Vec::new(),
@@ -766,11 +812,28 @@ impl PostingIterator {
             approximate_upper_bound,
             use_scorer_upper_bound: false,
             grouped_terms: None,
+            file_positions: None,
             position_scratch: RefCell::new(Some(Vec::new())),
             compressed,
         };
         posting.refresh_current_doc();
         posting
+    }
+
+    pub(in crate::scalar::inverted) fn set_file_positions(
+        &mut self,
+        entry: Arc<FilePositions>,
+        origin: Arc<PostingListReader>,
+    ) {
+        self.file_positions = Some(Arc::new(FilePositionCursor {
+            entry,
+            origin,
+            recovered: Default::default(),
+        }));
+    }
+
+    pub(in crate::scalar::inverted) fn has_file_positions(&self) -> bool {
+        self.file_positions.is_some()
     }
 
     pub(in crate::scalar::inverted) fn with_scorer_upper_bound(mut self) -> Self {
@@ -817,6 +880,7 @@ impl PostingIterator {
             approximate_upper_bound: self.approximate_upper_bound,
             use_scorer_upper_bound: self.use_scorer_upper_bound,
             grouped_terms: self.grouped_terms.clone(),
+            file_positions: self.file_positions.clone(),
             position_scratch: RefCell::new(Some(Vec::new())),
             compressed,
         };
@@ -1010,90 +1074,103 @@ impl PostingIterator {
                     self.position as i32,
                 ))
             }
-            PostingList::Compressed(ref list) => match list.positions.as_ref().ok_or_else(|| {
-                Error::index(format!(
-                    "positions are missing for token {:?} (token id {}, query position {})",
-                    self.token, self.token_id, self.position
-                ))
-            })? {
-                CompressedPositionStorage::LegacyPerDoc(positions) => {
+            PostingList::Compressed(ref list) => {
+                if let Some(CompressedPositionStorage::LegacyPerDoc(positions)) = &list.positions {
                     let positions = positions.value(self.index);
                     let positions = decompress_positions(positions.as_binary());
-                    Ok(PositionCursor::new(
+                    return Ok(PositionCursor::new(
                         PositionValues::Owned(positions),
                         self.position as i32,
-                    ))
+                    ));
                 }
-                CompressedPositionStorage::SharedStream(stream) => {
-                    let block_idx = self.index >> list.block_shift();
-                    let block_offset = self.index & list.block_mask();
-                    let compressed =
-                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
-                    match stream.codec() {
-                        PositionStreamCodec::PackedDelta => {
-                            // Seekable layout: decode only the candidate doc's
-                            // positions. Per-block seek state resets when the
-                            // block cursor moves; the group header index and
-                            // varint tail fill in lazily as candidates touch
-                            // them.
-                            if compressed.position_block_idx != Some(block_idx) {
-                                compressed.position_group_offsets.clear();
-                                compressed.position_group_offsets.push(0);
-                                compressed.position_tail.clear();
-                                compressed.position_unpacked_group_idx = None;
-                                compressed.position_offsets.clear();
-                                compressed
-                                    .position_offsets
-                                    .reserve(compressed.freqs.len() + 1);
-                                compressed.position_offsets.push(0);
-                                let mut offset = 0usize;
-                                for &freq in &compressed.freqs {
-                                    offset += freq as usize;
-                                    compressed.position_offsets.push(offset);
-                                }
-                                compressed.position_total_deltas = offset;
-                                compressed.position_block_idx = Some(block_idx);
+                let block_idx = self.index >> list.block_shift();
+                let block_offset = self.index & list.block_mask();
+                let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                let (codec, block) = if let Some(file) = &self.file_positions {
+                    if !matches!(&compressed.file_block, Some((idx, _)) if *idx == block_idx) {
+                        compressed.file_block =
+                            Some((block_idx, file.block(self.token_id, block_idx)?));
+                    }
+                    let (_, bytes) = compressed
+                        .file_block
+                        .as_ref()
+                        .ok_or_else(|| Error::internal("missing cached positions block"))?;
+                    (file.entry.codec, bytes.as_ref())
+                } else if let Some(CompressedPositionStorage::SharedStream(stream)) =
+                    &list.positions
+                {
+                    (stream.codec(), stream.block(block_idx))
+                } else {
+                    return Err(Error::index(format!(
+                        "positions are missing for token {:?} (token id {}, query position {})",
+                        self.token, self.token_id, self.position
+                    )));
+                };
+                match codec {
+                    PositionStreamCodec::PackedDelta => {
+                        // Seekable layout: decode only the candidate doc's
+                        // positions. Per-block seek state resets when the
+                        // block cursor moves; the group header index and
+                        // varint tail fill in lazily as candidates touch
+                        // them.
+                        if compressed.position_block_idx != Some(block_idx) {
+                            compressed.position_group_offsets.clear();
+                            compressed.position_group_offsets.push(0);
+                            compressed.position_tail.clear();
+                            compressed.position_unpacked_group_idx = None;
+                            compressed.position_offsets.clear();
+                            compressed
+                                .position_offsets
+                                .reserve(compressed.freqs.len() + 1);
+                            compressed.position_offsets.push(0);
+                            let mut offset = 0usize;
+                            for &freq in &compressed.freqs {
+                                offset += freq as usize;
+                                compressed.position_offsets.push(offset);
                             }
-                            let delta_start = compressed.position_offsets[block_offset];
-                            let delta_end = compressed.position_offsets[block_offset + 1];
-                            let mut position_values = self
-                                .position_scratch
-                                .borrow_mut()
-                                .take()
-                                .unwrap_or_default();
-                            if let Err(error) = seek_packed_doc_positions(
-                                stream.block(block_idx),
-                                compressed.position_total_deltas,
-                                delta_start..delta_end,
-                                &mut compressed.position_group_offsets,
-                                compressed
-                                    .position_unpacked_group
-                                    .get_or_insert_with(|| Box::new([0; BLOCK_SIZE])),
-                                &mut compressed.position_unpacked_group_idx,
-                                &mut compressed.position_tail,
-                                &mut position_values,
-                            ) {
-                                *self.position_scratch.borrow_mut() = Some(position_values);
-                                return Err(Error::index(format!(
-                                    "failed to decode positions for token {:?} (token id {}, query position {}) at posting index {}: {error}",
-                                    self.token, self.token_id, self.position, self.index
-                                )));
-                            }
-                            Ok(PositionCursor::new(
-                                PositionValues::Recycled(RecycledPositionValues::new(
-                                    position_values,
-                                    &self.position_scratch,
-                                )),
-                                self.position as i32,
-                            ))
+                            compressed.position_total_deltas = offset;
+                            compressed.position_block_idx = Some(block_idx);
                         }
-                        PositionStreamCodec::VarintDocDelta => {
-                            if compressed.position_block_idx != Some(block_idx) {
-                                compressed.position_values.clear();
-                                decode_position_stream_block(
-                                    stream.block(block_idx),
+                        let delta_start = compressed.position_offsets[block_offset];
+                        let delta_end = compressed.position_offsets[block_offset + 1];
+                        let mut position_values = self
+                            .position_scratch
+                            .borrow_mut()
+                            .take()
+                            .unwrap_or_default();
+                        if let Err(error) = seek_packed_doc_positions(
+                            block,
+                            compressed.position_total_deltas,
+                            delta_start..delta_end,
+                            &mut compressed.position_group_offsets,
+                            compressed
+                                .position_unpacked_group
+                                .get_or_insert_with(|| Box::new([0; BLOCK_SIZE])),
+                            &mut compressed.position_unpacked_group_idx,
+                            &mut compressed.position_tail,
+                            &mut position_values,
+                        ) {
+                            *self.position_scratch.borrow_mut() = Some(position_values);
+                            return Err(Error::index(format!(
+                                "failed to decode positions for token {:?} (token id {}, query position {}) at posting index {}: {error}",
+                                self.token, self.token_id, self.position, self.index
+                            )));
+                        }
+                        Ok(PositionCursor::new(
+                            PositionValues::Recycled(RecycledPositionValues::new(
+                                position_values,
+                                &self.position_scratch,
+                            )),
+                            self.position as i32,
+                        ))
+                    }
+                    PositionStreamCodec::VarintDocDelta => {
+                        if compressed.position_block_idx != Some(block_idx) {
+                            compressed.position_values.clear();
+                            decode_position_stream_block(
+                                    block,
                                     compressed.freqs.as_slice(),
-                                    stream.codec(),
+                                    codec,
                                     &mut compressed.position_values,
                                 )
                                 .map_err(|error| {
@@ -1102,39 +1179,37 @@ impl PostingIterator {
                                         self.token, self.token_id, self.position
                                     ))
                                 })?;
-                                compressed.position_offsets.clear();
-                                compressed
-                                    .position_offsets
-                                    .reserve(compressed.freqs.len() + 1);
-                                compressed.position_offsets.push(0);
-                                let mut offset = 0usize;
-                                for &freq in &compressed.freqs {
-                                    offset += freq as usize;
-                                    compressed.position_offsets.push(offset);
-                                }
-                                compressed.position_block_idx = Some(block_idx);
+                            compressed.position_offsets.clear();
+                            compressed
+                                .position_offsets
+                                .reserve(compressed.freqs.len() + 1);
+                            compressed.position_offsets.push(0);
+                            let mut offset = 0usize;
+                            for &freq in &compressed.freqs {
+                                offset += freq as usize;
+                                compressed.position_offsets.push(offset);
                             }
-                            let start = compressed.position_offsets[block_offset];
-                            let end = compressed.position_offsets[block_offset + 1];
-                            let mut position_values = self
-                                .position_scratch
-                                .borrow_mut()
-                                .take()
-                                .unwrap_or_default();
-                            position_values.clear();
-                            position_values
-                                .extend_from_slice(&compressed.position_values[start..end]);
-                            Ok(PositionCursor::new(
-                                PositionValues::Recycled(RecycledPositionValues::new(
-                                    position_values,
-                                    &self.position_scratch,
-                                )),
-                                self.position as i32,
-                            ))
+                            compressed.position_block_idx = Some(block_idx);
                         }
+                        let start = compressed.position_offsets[block_offset];
+                        let end = compressed.position_offsets[block_offset + 1];
+                        let mut position_values = self
+                            .position_scratch
+                            .borrow_mut()
+                            .take()
+                            .unwrap_or_default();
+                        position_values.clear();
+                        position_values.extend_from_slice(&compressed.position_values[start..end]);
+                        Ok(PositionCursor::new(
+                            PositionValues::Recycled(RecycledPositionValues::new(
+                                position_values,
+                                &self.position_scratch,
+                            )),
+                            self.position as i32,
+                        ))
                     }
                 }
-            },
+            }
         }
     }
 

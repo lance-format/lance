@@ -34,7 +34,7 @@ use arrow_array::{
     Array, Float32Array, LargeBinaryArray, ListArray, RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheFileReader};
 use lance_core::{Error, Result};
 
 use crate::cache_pb::{
@@ -45,9 +45,9 @@ use crate::cache_pb::{
 
 use super::impact::ImpactSkipData;
 use super::index::{
-    CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
-    Positions, PostingList, PostingListGroup, PostingListGroupStorage, PostingTailCodec,
-    SharedPositionStream,
+    CachedPositions, CompressedPositionStorage, CompressedPostingList, FilePositions,
+    PlainPostingList, PositionStreamCodec, Positions, PostingList, PostingListGroup,
+    PostingListGroupStorage, PostingTailCodec, SharedPositionStream,
 };
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 
@@ -524,8 +524,105 @@ impl CacheCodecImpl for Positions {
     const TYPE_ID: &'static str = "lance.fts.Positions";
     const CURRENT_VERSION: u32 = 1;
 
+    const SUPPORTS_FILE_READER: bool = true;
+
+    fn decode_from_reader(
+        reader: Arc<dyn CacheFileReader>,
+        body_offset: usize,
+        version: u32,
+    ) -> Result<Option<Self>> {
+        if version != Self::CURRENT_VERSION {
+            return Ok(None);
+        }
+        // The existing Arrow IPC directory is self-delimiting. Grow the prefix
+        // only when it is too short. Oversized directories use whole-entry decode.
+        const MAX_DIRECTORY_PREFIX: usize = 8 * 1024 * 1024;
+        let limit = reader.len().min(MAX_DIRECTORY_PREFIX);
+        let mut len = limit.min(4096);
+        loop {
+            let prefix = reader.read_range(0..len)?;
+            if prefix.len() != len || body_offset > prefix.len() {
+                return Err(Error::io("truncated positions directory"));
+            }
+            let mut entry = CacheEntryReader::new(&prefix, body_offset, version);
+            let header: PositionsHeader = entry.read_header()?;
+            let storage = PbPositionStorage::try_from(header.position_storage)
+                .map_err(|_| Error::io("invalid positions cache storage kind"))?;
+            if storage != PbPositionStorage::Shared {
+                return Ok(None);
+            }
+            let codec = PbPositionStreamCodec::try_from(header.position_stream_codec)
+                .map_err(|_| Error::io("invalid positions cache stream codec"))?;
+            if let Ok(directory) = entry.read_ipc() {
+                let tail = entry.body();
+                if let Some(raw_len) = tail.get(..8) {
+                    let raw_len = usize::try_from(u64::from_le_bytes(
+                        raw_len
+                            .try_into()
+                            .map_err(|_| Error::io("invalid positions length field"))?,
+                    ))
+                    .map_err(|_| Error::io("positions cache stream exceeds address space"))?;
+                    let raw_start = len - tail.len() + 8;
+                    if raw_start.checked_add(raw_len) != Some(reader.len()) {
+                        return Err(Error::io("positions cache stream length mismatch"));
+                    }
+                    let offsets = directory
+                        .column_by_name(BLOCK_OFFSETS_COLUMN)
+                        .and_then(|col| col.as_primitive_opt::<UInt32Type>())
+                        .ok_or_else(|| Error::io("invalid positions cache block directory"))?;
+                    let values = offsets.values();
+                    if offsets.null_count() != 0
+                        || values.first().map_or(raw_len != 0, |&offset| offset != 0)
+                        || !values.windows(2).all(|pair| pair[0] <= pair[1])
+                        || values
+                            .last()
+                            .is_some_and(|&offset| offset as usize > raw_len)
+                    {
+                        return Err(Error::io("invalid positions cache block offsets"));
+                    }
+                    return Ok(Some(Positions(CachedPositions::File(Arc::new(
+                        FilePositions {
+                            reader,
+                            body_offset,
+                            raw_start,
+                            block_offsets: values.to_vec(),
+                            codec: proto_to_position_stream_codec(codec),
+                        },
+                    )))));
+                }
+            }
+            if len == limit {
+                if limit < reader.len() {
+                    return Ok(None);
+                }
+                return Err(Error::io(
+                    "truncated or malformed positions cache IPC directory",
+                ));
+            }
+            len = (len * 2).min(limit);
+        }
+    }
+
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        let (position_storage, position_stream_codec) = match &self.0 {
+        let storage = match &self.0 {
+            CachedPositions::Resident(storage) => storage,
+            CachedPositions::File(file) => {
+                // Preserve the original body and bound transient memory if this
+                // complete value is serialized by a different cache backend.
+                let mut offset = file.body_offset;
+                while offset < file.reader.len() {
+                    let end = offset.saturating_add(64 * 1024).min(file.reader.len());
+                    let bytes = file.reader.read_range(offset..end)?;
+                    if bytes.len() != end - offset {
+                        return Err(Error::io("truncated positions cache body"));
+                    }
+                    w.raw_writer().write_all(&bytes)?;
+                    offset = end;
+                }
+                return Ok(());
+            }
+        };
+        let (position_storage, position_stream_codec) = match storage {
             CompressedPositionStorage::LegacyPerDoc(_) => {
                 (PbPositionStorage::Legacy, PbPositionStreamCodec::default())
             }
@@ -539,14 +636,14 @@ impl CacheCodecImpl for Positions {
             position_stream_codec: position_stream_codec as i32,
         };
         w.write_header(&header)?;
-        write_position_sections(w, &self.0)
+        write_position_sections(w, storage)
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
         let header: PositionsHeader = r.read_header()?;
         let stream_codec = proto_to_position_stream_codec(header.position_stream_codec());
         read_position_sections(r, header.position_storage(), stream_codec)?
-            .map(Self)
+            .map(Self::from)
             .ok_or_else(|| {
                 Error::io("Positions cache entry cannot encode the None variant".to_string())
             })
@@ -1192,11 +1289,16 @@ mod tests {
 
     #[test]
     fn positions_legacy_roundtrip() {
-        let positions = Positions(CompressedPositionStorage::LegacyPerDoc(legacy_positions(
+        let positions = Positions::from(CompressedPositionStorage::LegacyPerDoc(legacy_positions(
             &[&[1, 2, 3], &[], &[10]],
         )));
         let restored = roundtrip_positions(&positions);
-        assert_position_storage_eq(&positions.0, &restored.0);
+        let (super::CachedPositions::Resident(expected), super::CachedPositions::Resident(actual)) =
+            (&positions.0, &restored.0)
+        else {
+            panic!("whole-entry codec should return resident positions")
+        };
+        assert_position_storage_eq(expected, actual);
     }
 
     #[test]
@@ -1206,9 +1308,14 @@ mod tests {
             vec![0u32, 8],
             Bytes::from(vec![0xAAu8; 24]),
         );
-        let positions = Positions(CompressedPositionStorage::SharedStream(stream));
+        let positions = Positions::from(CompressedPositionStorage::SharedStream(stream));
         let restored = roundtrip_positions(&positions);
-        assert_position_storage_eq(&positions.0, &restored.0);
+        let (super::CachedPositions::Resident(expected), super::CachedPositions::Resident(actual)) =
+            (&positions.0, &restored.0)
+        else {
+            panic!("whole-entry codec should return resident positions")
+        };
+        assert_position_storage_eq(expected, actual);
     }
 
     #[test]
@@ -1348,6 +1455,116 @@ mod tests {
                 .serialize(&any, &mut buf)
                 .unwrap();
             buf
+        }
+
+        #[derive(Debug)]
+        struct FileFixture {
+            data: Bytes,
+            reads: std::sync::Mutex<Vec<std::ops::Range<usize>>>,
+        }
+
+        impl lance_core::cache::CacheFileReader for FileFixture {
+            fn len(&self) -> usize {
+                self.data.len()
+            }
+
+            fn read_range(&self, range: std::ops::Range<usize>) -> Result<Bytes> {
+                self.reads.lock().unwrap().push(range.clone());
+                if self.data.get(range.clone()).is_none() {
+                    return Err(Error::io("fixture read outside cache value"));
+                }
+                Ok(self.data.slice(range))
+            }
+        }
+
+        fn positions_file(offsets: Vec<u32>, payload: Vec<u8>) -> Arc<FileFixture> {
+            let positions = Positions::from(CompressedPositionStorage::SharedStream(
+                SharedPositionStream::new(
+                    PositionStreamCodec::PackedDelta,
+                    offsets,
+                    Bytes::from(payload),
+                ),
+            ));
+            Arc::new(FileFixture {
+                data: serialize_typed_entry(positions).into(),
+                reads: Default::default(),
+            })
+        }
+
+        #[test]
+        fn positions_file_reads_selected_block_and_preserves_whole_value() {
+            let mut payload = vec![0x11; 32768];
+            payload[16001..16339].fill(0x22);
+            let file = positions_file(vec![0, 16001, 16339], payload);
+            let codec = CacheCodec::from_impl::<Positions>();
+            let value = codec
+                .deserialize_from_reader(file.clone())
+                .unwrap()
+                .unwrap();
+            let positions = value.downcast_ref::<Positions>().unwrap();
+            let super::super::CachedPositions::File(stream) = &positions.0 else {
+                panic!("expected file-backed positions");
+            };
+            let untouched = stream.raw_start + 16339;
+            assert!(
+                file.reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|range| range.end <= untouched)
+            );
+            file.reads.lock().unwrap().clear();
+            assert_eq!(stream.block(1).unwrap().as_ref(), &[0x22; 338]);
+            {
+                let reads = file.reads.lock().unwrap();
+                assert_eq!(reads.len(), 1);
+                assert_eq!(reads[0], stream.raw_start + 16001..untouched);
+            }
+            let mut serialized = Vec::new();
+            codec.serialize(&value, &mut serialized).unwrap();
+            assert_eq!(serialized.as_slice(), file.data.as_ref());
+            assert!(codec.deserialize(&serialized.into()).hit().is_some());
+        }
+
+        #[test]
+        fn positions_file_rejects_invalid_directory_and_truncation() {
+            let codec = CacheCodec::from_impl::<Positions>();
+            for offsets in [vec![1], vec![0, 20, 15], vec![0, 60], Vec::new()] {
+                let err = codec
+                    .deserialize_from_reader(positions_file(offsets, vec![0; 32]))
+                    .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("invalid positions cache block offsets"),
+                    "{err}"
+                );
+            }
+            let good = positions_file(vec![0], vec![0x33; 8192]);
+            let short = FileFixture {
+                data: good.data.slice(..good.data.len() - 1),
+                reads: Default::default(),
+            };
+            let err = codec.deserialize_from_reader(Arc::new(short)).unwrap_err();
+            assert!(err.to_string().contains("stream length mismatch"), "{err}");
+        }
+
+        #[test]
+        fn legacy_positions_file_requests_whole_entry_decode() {
+            let positions = Positions::from(CompressedPositionStorage::LegacyPerDoc(
+                legacy_positions(&[&[2]]),
+            ));
+            let file = Arc::new(FileFixture {
+                data: serialize_typed_entry(positions).into(),
+                reads: Default::default(),
+            });
+            let codec = CacheCodec::from_impl::<Positions>();
+            assert!(
+                codec
+                    .deserialize_from_reader(file.clone())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(codec.deserialize(&file.data).hit().is_some());
         }
 
         /// Serialize an entry through the full codec (envelope + body).

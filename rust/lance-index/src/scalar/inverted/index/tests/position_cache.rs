@@ -188,7 +188,7 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
     assert!(
         matches!(
             positions.as_ref().0,
-            CompressedPositionStorage::LegacyPerDoc(_)
+            CachedPositions::Resident(CompressedPositionStorage::LegacyPerDoc(_))
         ),
         "positions should be stored in the dedicated position cache"
     );
