@@ -32,7 +32,9 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
+use futures::{
+    FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::BoxFuture, stream::BoxStream,
+};
 use lance_core::{Error, ROW_ID_FIELD, Result, deepsize::DeepSizeOf, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
@@ -298,6 +300,65 @@ impl ScalarIndexExec {
         self.segment_uuids.as_ref()
     }
 
+    /// Evaluate the same row-id upper bound consumed by a selection-vector prefilter.
+    ///
+    /// This is only used when the physical prefilter input is this node itself.
+    /// Wrapped or data-rechecked inputs must still execute their complete stream.
+    pub(crate) fn prefilter_mask_future(&self) -> BoxFuture<'static, Result<RowAddrMask>> {
+        let expr = self.expr.clone();
+        let dataset = self.dataset.clone();
+        let plan_metrics = self.metrics.clone();
+        let fragment_scope = self.fragment_scope.clone();
+        let segment_uuids = self.segment_uuids.clone();
+        async move {
+            let metrics = IndexMetrics::new(&plan_metrics, 0);
+            let mask = {
+                let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
+                let _timer = search_time.timer();
+                match (fragment_scope.as_deref(), segment_uuids.as_deref()) {
+                    (Some(fragments), _) if fragments.is_empty() => RowAddrMask::allow_nothing(),
+                    (Some(fragments), segment_uuids) => {
+                        expr.evaluate_prefilter(
+                            &ScopedScalarIndexLoader {
+                                dataset: dataset.as_ref(),
+                                fragments: Some(fragments),
+                                segment_uuids,
+                            },
+                            &metrics,
+                        )
+                        .await?
+                    }
+                    (None, Some(segment_uuids)) => {
+                        expr.evaluate_prefilter(
+                            &ScopedScalarIndexLoader {
+                                dataset: dataset.as_ref(),
+                                fragments: None,
+                                segment_uuids: Some(segment_uuids),
+                            },
+                            &metrics,
+                        )
+                        .await?
+                    }
+                    (None, None) => expr.evaluate_prefilter(dataset.as_ref(), &metrics).await?,
+                }
+            };
+            // This consumer only owns the candidate bound. Record that bound,
+            // rather than inventing a lower-bound count or rebuilding it for metrics.
+            record_bound(
+                &mask,
+                SCALAR_INDEX_MAX_ALLOWED_METRIC,
+                SCALAR_INDEX_MAX_BLOCKED_METRIC,
+                &plan_metrics,
+            );
+            // Keep the ordinary coverage validation (including its errors). Only
+            // the sidecar encoding is omitted: SelectionVectorToPrefilter discards
+            // that sidecar and consumes precisely the decoded result.upper.
+            Self::result_coverage(&expr, dataset.as_ref(), fragment_scope.as_deref()).await?;
+            Ok(mask)
+        }
+        .boxed()
+    }
+
     #[async_recursion]
     pub async fn fragments_covered_by_index_query(
         index_expr: &ScalarIndexExpr,
@@ -326,6 +387,18 @@ impl ScalarIndexExec {
                     })
             }
         }
+    }
+
+    async fn result_coverage(
+        expr: &ScalarIndexExpr,
+        dataset: &Dataset,
+        fragment_scope: Option<&RoaringBitmap>,
+    ) -> Result<RoaringBitmap> {
+        let mut covered = Self::fragments_covered_by_index_query(expr, dataset).await?;
+        if let Some(fragment_scope) = fragment_scope {
+            covered &= fragment_scope;
+        }
+        Ok(covered)
     }
 
     async fn do_execute(
@@ -370,11 +443,8 @@ impl ScalarIndexExec {
             }
         };
         Self::record_match_bounds(&query_result, &plan_metrics);
-        let mut fragments_covered_by_result =
-            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
-        if let Some(fragment_scope) = fragment_scope {
-            fragments_covered_by_result &= fragment_scope.as_ref();
-        }
+        let fragments_covered_by_result =
+            Self::result_coverage(&expr, dataset.as_ref(), fragment_scope.as_deref()).await?;
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
@@ -1376,7 +1446,7 @@ impl ExecutionPlan for MaterializeIndexExec {
 mod tests {
     use datafusion::physical_plan::StatisticsArgs;
     use datafusion::physical_plan::StatisticsContext;
-    use std::{ops::Bound, sync::Arc};
+    use std::{collections::HashSet, ops::Bound, sync::Arc};
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
@@ -1418,9 +1488,10 @@ mod tests {
         },
     };
     use lance_select::{
-        NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrTreeMap,
-        RowSetOps, result::IndexExprResultWireFormat,
+        IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet,
+        RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
     };
+    use roaring::RoaringBitmap;
     use rstest::rstest;
 
     use crate::{
@@ -1881,6 +1952,17 @@ mod tests {
             assert_eq!(result.lower.selected(id), [0, 8, 9, 10, 11].contains(&id));
             assert_eq!(result.upper.selected(id), [0, 8, 9, 10, 11].contains(&id));
         }
+        // The typed boundary must keep translating the address-domain leaf
+        // before combining it with this legacy stable-row-id index.
+        let plan = ScalarIndexExec::new(
+            Arc::new(dataset),
+            expression,
+            IndexExprResultWireFormat::TwoMask,
+        );
+        assert_eq!(
+            plan.prefilter_mask_future().await.unwrap(),
+            result.upper.drop_nulls(),
+        );
     }
 
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
@@ -1919,11 +2001,14 @@ mod tests {
                 schema.fields().len(),
             );
 
+            let typed = plan.prefilter_mask_future().await.unwrap();
             let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
             assert_eq!(stream.schema(), schema);
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
             assert_eq!(batches.len(), 1);
             assert_eq!(batches[0].schema(), schema);
+            let (decoded, _) = IndexExprResult::deserialize(&batches[0]).unwrap();
+            assert_eq!(typed, decoded.upper);
         };
 
         let plan = ScalarIndexExec::new(
@@ -1935,10 +2020,63 @@ mod tests {
 
         verify(plan, schema).await;
 
-        let plan = ScalarIndexExec::new(dataset, query, IndexExprResultWireFormat::TwoMask);
+        let plan = ScalarIndexExec::new(
+            dataset.clone(),
+            query.clone(),
+            IndexExprResultWireFormat::TwoMask,
+        );
         let schema = IndexExprResultWireFormat::TwoMask.schema().clone();
 
         verify(plan, schema).await;
+
+        let segment_uuids: Arc<HashSet<_>> = Arc::new(
+            dataset
+                .load_indices_by_name("ordered_idx")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|segment| segment.uuid)
+                .collect(),
+        );
+        let plan = ScalarIndexExec::new(
+            dataset.clone(),
+            query.clone(),
+            IndexExprResultWireFormat::TwoMask,
+        )
+        .with_segment_uuids(segment_uuids.clone());
+        verify(plan, IndexExprResultWireFormat::TwoMask.schema().clone()).await;
+
+        let plan = ScalarIndexExec::new(
+            dataset.clone(),
+            query.clone(),
+            IndexExprResultWireFormat::TwoMask,
+        )
+        .with_fragment_scope(RoaringBitmap::from_iter([0]))
+        .with_segment_uuids(segment_uuids);
+        verify(plan, IndexExprResultWireFormat::TwoMask.schema().clone()).await;
+
+        let plan = ScalarIndexExec::new(
+            dataset.clone(),
+            query.clone(),
+            IndexExprResultWireFormat::TwoMask,
+        )
+        .with_fragment_scope(RoaringBitmap::new());
+        verify(plan, IndexExprResultWireFormat::TwoMask.schema().clone()).await;
+
+        // Selecting no index segments must fail in both paths, not silently
+        // fall back to an unrestricted scalar index search.
+        let plan = ScalarIndexExec::new(dataset, query, IndexExprResultWireFormat::TwoMask)
+            .with_segment_uuids(Arc::new(HashSet::new()));
+        let typed_error = plan.prefilter_mask_future().await.unwrap_err();
+        assert!(matches!(typed_error, lance_core::Error::Internal { .. }));
+        assert!(typed_error.to_string().contains("no usable index"));
+        let wire_error = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(wire_error.to_string().contains("no usable index"));
     }
 
     /// The node always emits a two-row batch, so `output_rows` says nothing
@@ -1990,8 +2128,34 @@ mod tests {
         assert_eq!(bounds, [Some(47), None, Some(47), None]);
 
         // Negating it turns both bounds into block lists of the same rows
-        let bounds = run(ScalarIndexExpr::Not(Box::new(less_than_47))).await;
+        let bounds = run(ScalarIndexExpr::Not(Box::new(less_than_47.clone()))).await;
         assert_eq!(bounds, [None, Some(47), None, Some(47)]);
+
+        // A typed prefilter consumes only the upper bound. Keep its count,
+        // without claiming a lower bound or a serialized output it never built.
+        let typed = ScalarIndexExec::new(dataset, less_than_47, IndexExprResultWireFormat::TwoMask);
+        typed.prefilter_mask_future().await.unwrap();
+        let metrics = typed.metrics().unwrap();
+        assert_eq!(
+            metrics
+                .find_count(SCALAR_INDEX_MAX_ALLOWED_METRIC)
+                .unwrap()
+                .value(),
+            47,
+        );
+        assert!(
+            metrics
+                .find_count(SCALAR_INDEX_MIN_ALLOWED_METRIC)
+                .is_none()
+        );
+        assert!(
+            metrics
+                .find_count(SCALAR_INDEX_MIN_BLOCKED_METRIC)
+                .is_none()
+        );
+        assert!(!metrics.iter_times().any(|(name, _)| {
+            name.as_ref() == lance_datafusion::utils::SCALAR_INDEX_SER_TIME_METRIC
+        }));
     }
 
     /// Every batch of the stream applies the shared deletion mask: deleted

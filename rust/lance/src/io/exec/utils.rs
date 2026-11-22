@@ -50,6 +50,7 @@ use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
 use tracing::Instrument;
 
 use super::row_addr_mask::MaskAndLoader;
+use super::scalar_index::ScalarIndexExec;
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
 
@@ -350,10 +351,12 @@ fn shared_prefilter_future(
                     future: {
                         async move {
                             let result = async move {
-                                let stream = source.execute(partition, context)?;
                                 if is_scalar_index_query {
-                                    Box::new(SelectionVectorToPrefilter(stream)).load().await
+                                    scalar_index_prefilter_loader(&source, partition, context)?
+                                        .load()
+                                        .await
                                 } else {
+                                    let stream = source.execute(partition, context)?;
                                     Box::new(FilteredRowIdsToPrefilter::new(stream))
                                         .load()
                                         .await
@@ -431,8 +434,7 @@ fn prefilter_mask_future(
                 ));
                 None
             } else {
-                let stream = src_node.execute(partition, context)?;
-                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+                Some(scalar_index_prefilter_loader(src_node, partition, context)?)
             }
         }
         PreFilterSource::None => None,
@@ -592,6 +594,34 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
 
 // Utility to convert a serialized selection vector into a prefilter
 pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
+
+struct ScalarIndexToPrefilter(BoxFuture<'static, Result<RowAddrMask>>);
+
+#[async_trait]
+impl FilterLoader for ScalarIndexToPrefilter {
+    async fn load(self: Box<Self>) -> Result<RowAddrMask> {
+        self.0.await
+    }
+}
+
+/// Preserve the physical input boundary: only a direct scalar-index node may
+/// hand off an owned mask. Wrappers can recheck data or restrict coverage and
+/// therefore must execute and decode their original stream.
+pub(crate) fn scalar_index_prefilter_loader(
+    source: &Arc<dyn ExecutionPlan>,
+    partition: usize,
+    context: Arc<datafusion::execution::TaskContext>,
+) -> Result<Box<dyn FilterLoader>> {
+    if let Some(scalar) = source.downcast_ref::<ScalarIndexExec>() {
+        Ok(Box::new(ScalarIndexToPrefilter(
+            scalar.prefilter_mask_future(),
+        )))
+    } else {
+        Ok(Box::new(SelectionVectorToPrefilter(
+            source.execute(partition, context)?,
+        )))
+    }
+}
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
@@ -1388,7 +1418,7 @@ mod tests {
     use super::{
         FilteredRowIdsToPrefilter, InstrumentedChildInputStream, PreFilterSource, ReplayExec,
         SharedPreFilterExec, SharedPreFilterMaterialization, prefilter_mask_future,
-        shared_prefilter_future,
+        scalar_index_prefilter_loader, shared_prefilter_future,
     };
 
     #[test]
@@ -1447,6 +1477,37 @@ mod tests {
             "prefilter_build_time",
         ] {
             assert!(collected.sum_by_name(name).unwrap().as_usize() > 0);
+        }
+    }
+
+    #[rstest]
+    #[case::two_mask(IndexExprResultWireFormat::TwoMask)]
+    #[case::legacy_three_variant(IndexExprResultWireFormat::ThreeVariant)]
+    #[tokio::test]
+    async fn scalar_prefilter_unknown_plan_preserves_upper(
+        #[case] wire_format: IndexExprResultWireFormat,
+    ) {
+        let allowed = || RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(1_u64..4));
+        let definite = || RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([2_u64]));
+        for result in [
+            IndexExprResult::exact(allowed()),
+            IndexExprResult::at_least(definite()),
+            IndexExprResult::new(definite(), allowed()),
+        ] {
+            let batch = result
+                .serialize(&RoaringBitmap::from_iter([0]), wire_format)
+                .unwrap();
+            let expected = result.upper;
+            // This unknown physical node must execute its stream. In particular,
+            // legacy refined results decode as AtMost(upper), not lower.
+            let source: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(batch));
+            let actual =
+                scalar_index_prefilter_loader(&source, 0, Arc::new(TaskContext::default()))
+                    .unwrap()
+                    .load()
+                    .await
+                    .unwrap();
+            assert_eq!(actual, expected);
         }
     }
 
