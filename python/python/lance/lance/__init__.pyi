@@ -554,6 +554,7 @@ class _Dataset:
         row_indices: List[int],
         columns: Optional[List[str]] = None,
         columns_with_transform: Optional[List[Tuple[str, str]]] = None,
+        io_parallelism: Optional[int] = None,
     ) -> pa.RecordBatch: ...
     def take_rows(
         self,

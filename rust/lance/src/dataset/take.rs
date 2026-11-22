@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
+use std::ops::Range;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index_with;
@@ -24,6 +28,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
@@ -109,6 +114,20 @@ pub async fn take(
     offsets: &[u64],
     projection: ProjectionRequest,
 ) -> Result<RecordBatch> {
+    take_with_io_parallelism(dataset, offsets, projection, None).await
+}
+
+pub async fn take_with_io_parallelism(
+    dataset: &Dataset,
+    offsets: &[u64],
+    projection: ProjectionRequest,
+    io_parallelism: Option<u32>,
+) -> Result<RecordBatch> {
+    if io_parallelism == Some(0) {
+        return Err(Error::invalid_input(
+            "take io_parallelism must be greater than 0, got 0",
+        ));
+    }
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
     if offsets.is_empty() {
         return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
@@ -120,11 +139,14 @@ pub async fn take(
     let fragments = dataset.get_fragments();
     let addrs = row_offsets_to_row_addresses(&fragments, offsets).await?;
 
-    let builder = TakeBuilder::try_new_from_addresses(
+    let mut builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
         addrs,
         Arc::new(projection),
     )?;
+    if let Some(io_parallelism) = io_parallelism {
+        builder = builder.with_io_parallelism(io_parallelism);
+    }
 
     take_rows(builder).await
 }
@@ -196,6 +218,20 @@ async fn do_take_rows(
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
+    let read_config = match builder.io_parallelism {
+        Some(io_parallelism) => {
+            let config = SchedulerConfig::new(SchedulerConfig::max_bandwidth_bytes(
+                io_parallelism as usize,
+            ));
+            read_config.with_scan_scheduler(ScanScheduler::new_with_io_parallelism(
+                builder.dataset.object_store.clone(),
+                config,
+                NonZeroU32::new(io_parallelism)
+                    .expect("io_parallelism is validated before take_rows"),
+            ))
+        }
+        None => read_config,
+    };
     let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
@@ -468,6 +504,7 @@ pub struct TakeBuilder {
     with_row_address: bool,
     missing_row_policy: MissingRowPolicy,
     ignore_deletions: bool,
+    io_parallelism: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -492,6 +529,7 @@ impl TakeBuilder {
             with_row_address: false,
             missing_row_policy: MissingRowPolicy::default(),
             ignore_deletions: false,
+            io_parallelism: None,
         })
     }
 
@@ -509,6 +547,7 @@ impl TakeBuilder {
             with_row_address: false,
             missing_row_policy: MissingRowPolicy::default(),
             ignore_deletions: false,
+            io_parallelism: None,
         })
     }
 
@@ -533,6 +572,32 @@ impl TakeBuilder {
         self
     }
 
+    /// Sets the maximum active primary-base data-file reads for this take.
+    ///
+    /// Current-format files in that base share one scheduler with this request
+    /// ceiling. The value overrides the store's per-scheduler default but not
+    /// fragment-reader fanout, so actual concurrency may be lower. Legacy v1,
+    /// additional-base, and non-data-file reads keep their existing schedulers.
+    /// Must be greater than zero.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let batch = dataset
+    ///     .take_builder(&[0, 1, 2], dataset.schema().clone())?
+    ///     .with_io_parallelism(64)
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = batch;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_io_parallelism(mut self, io_parallelism: u32) -> Self {
+        self.io_parallelism = Some(io_parallelism);
+        self
+    }
+
     pub(super) fn with_missing_row_policy(mut self, policy: MissingRowPolicy) -> Self {
         self.missing_row_policy = policy;
         self
@@ -540,6 +605,11 @@ impl TakeBuilder {
 
     /// Execute the take operation and return a single batch
     pub async fn execute(self) -> Result<RecordBatch> {
+        if self.io_parallelism == Some(0) {
+            return Err(Error::invalid_input(
+                "TakeBuilder io_parallelism must be greater than 0, got 0",
+            ));
+        }
         take_rows(self).await
     }
 
@@ -645,13 +715,18 @@ mod test {
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
     use lance_core::utils::deletion::DeletionVector;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use lance_io::stream::RecordBatchStream;
     use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use crate::dataset::{
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
@@ -2011,6 +2086,164 @@ mod test {
         // Take an empty selection.
         let values = dataset.take_rows(&[], projection).await.unwrap();
         assert_eq!(RecordBatch::new_empty(data.schema()), values);
+    }
+
+    #[tokio::test]
+    async fn test_take_rows_with_io_parallelism() {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Arc::new(
+            Dataset::write(batches, "memory://", Some(write_params))
+                .await
+                .unwrap(),
+        );
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        // Rows from four fragments, out of order.
+        let indices = [5_u64 << 32, (4_u64 << 32) + 39, 39, (2_u64 << 32) + 20];
+
+        // One request at a time across all fragments still returns every row.
+        let expected = dataset
+            .take_rows(&indices, projection.clone())
+            .await
+            .unwrap();
+        let values = dataset
+            .take_builder(&indices, projection.clone())
+            .unwrap()
+            .with_io_parallelism(1)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(expected, values);
+
+        // The public logical-offset API takes the same path and also handles an
+        // empty selection without constructing a scheduler.
+        let logical_indices = [399, 0, 199, 40];
+        let expected = dataset
+            .take(&logical_indices, projection.clone())
+            .await
+            .unwrap();
+        let values = dataset
+            .take_with_io_parallelism(&logical_indices, projection.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(expected, values);
+        let empty = dataset
+            .take_with_io_parallelism(&[], projection.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(empty, dataset.take(&[], projection.clone()).await.unwrap());
+
+        let error = dataset
+            .take_with_io_parallelism(&indices, projection.clone(), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("io_parallelism"), "{error}");
+
+        let error = dataset
+            .take_builder(&indices, projection)
+            .unwrap()
+            .with_io_parallelism(0)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("io_parallelism"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_take_rows_enforces_io_parallelism_across_fragments() {
+        let data = test_batch(0..400);
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            batches,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 40,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let peak_reads = Arc::new(AtomicUsize::new(0));
+
+        // Increment immediately before the artificial delay and decrement after
+        // it. The interval therefore exposes how many data-file GETs the take's
+        // scheduler allowed to proceed concurrently.
+        let mut completed_policy = ProxyObjectStorePolicy::new();
+        let completed_active = active_reads.clone();
+        completed_policy.set_before_policy(
+            "complete_take_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    completed_active.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let delayed = Arc::new(ThrottledStore::new(
+            Arc::new(ProxyObjectStore::new(
+                dataset.object_store.inner.clone(),
+                Arc::new(Mutex::new(completed_policy)),
+            )),
+            ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(10),
+                ..Default::default()
+            },
+        ));
+        let mut started_policy = ProxyObjectStorePolicy::new();
+        let started_active = active_reads.clone();
+        let started_peak = peak_reads.clone();
+        started_policy.set_before_policy(
+            "start_take_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    let active = started_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    started_peak.fetch_max(active, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        Arc::make_mut(&mut dataset.object_store).inner = Arc::new(ProxyObjectStore::new(
+            delayed,
+            Arc::new(Mutex::new(started_policy)),
+        ));
+
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        // Logical offsets touch all ten fragments in reverse order.
+        let indices = (0_u64..10)
+            .rev()
+            .map(|fragment| fragment * 40)
+            .collect::<Vec<_>>();
+        let fragment_fanout = dataset.object_store.io_parallelism().min(indices.len());
+        let uncapped = dataset.take(&indices, projection.clone()).await.unwrap();
+        let uncapped_peak = peak_reads.load(Ordering::SeqCst);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        if fragment_fanout > 2 {
+            assert!(
+                uncapped_peak > 2,
+                "uncapped take must exceed the tested cap, observed {uncapped_peak}"
+            );
+        } else {
+            assert_eq!(uncapped_peak, fragment_fanout);
+        }
+
+        peak_reads.store(0, Ordering::SeqCst);
+        let capped = dataset
+            .take_with_io_parallelism(&indices, projection, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(capped, uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), fragment_fanout.min(2));
     }
 
     #[rstest]

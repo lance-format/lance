@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import operator
 import os
 import random
 import re
@@ -1718,6 +1719,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         indices: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        io_parallelism: Optional[int] = None,
     ) -> pa.Table:
         """Select rows of data by index.
 
@@ -1729,17 +1732,38 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
+        io_parallelism: int, optional
+            Maximum primary-base data-file reads active in this take. This
+            overrides the store's per-scheduler default but does not increase
+            fragment-reader fanout, so actual concurrency may be lower. Files
+            in additional bases are unaffected.
 
         Returns
         -------
         table : pyarrow.Table
         """
+        if io_parallelism is not None:
+            if isinstance(io_parallelism, bool):
+                raise TypeError("io_parallelism must be an integer, not bool")
+            try:
+                io_parallelism = operator.index(io_parallelism)
+            except TypeError as err:
+                raise TypeError("io_parallelism must be an integer") from err
+            if io_parallelism <= 0:
+                raise ValueError("io_parallelism must be greater than 0")
         columns_with_transform = None
         if isinstance(columns, dict):
             columns_with_transform = list(columns.items())
             columns = None
         return pa.Table.from_batches(
-            [self._ds.take(indices, columns, columns_with_transform)]
+            [
+                self._ds.take(
+                    indices,
+                    columns,
+                    columns_with_transform,
+                    io_parallelism=io_parallelism,
+                )
+            ]
         )
 
     def _take_rows(
