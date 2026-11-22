@@ -1166,6 +1166,31 @@ async fn optimize_ivf_pq_indices(
     let metric_type = first_idx.metric_type;
     let dim = first_idx.ivf.dimension();
 
+    let start_pos = existing_indices
+        .len()
+        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
+    let indices_to_merge = existing_indices[start_pos..]
+        .iter()
+        .map(|idx| {
+            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
+                "optimizing vector index: it is not a IVF index".to_string(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Every page of a segment keeps the width its file was opened with, so a
+    // segment that cannot be merged is refused here, before the shuffle.
+    for idx in &indices_to_merge {
+        if let Some(segment_pq) = idx.sub_index.as_any().downcast_ref::<PQIndex>() {
+            segment_pq.check_codes_readable().map_err(|err| match err {
+                Error::NotSupported { source, .. } => Error::not_supported(format!(
+                    "optimizing vector index segment {}: {source}",
+                    idx.uuid
+                )),
+                other => other,
+            })?;
+        }
+    }
+
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
     let ivf = lance_index::vector::ivf::IvfTransformer::with_pq(
         first_idx.ivf.centroids.clone().unwrap(),
@@ -1194,18 +1219,6 @@ async fn optimize_ivf_pq_indices(
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
-    let start_pos = existing_indices
-        .len()
-        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
-
-    let indices_to_merge = existing_indices[start_pos..]
-        .iter()
-        .map(|idx| {
-            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
-                "optimizing vector index: it is not a IVF index".to_string(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
     write_pq_partitions(
         writer.as_mut(),
         &mut ivf_mut,
@@ -2142,7 +2155,7 @@ impl RemapPageTask {
             .push(page.row_ids.as_ref().unwrap().len() as u32);
         let original_pq = transpose(
             page.code.as_ref().unwrap(),
-            page.pq.code_dim(),
+            page.code_bytes_per_vector(),
             page.row_ids.as_ref().unwrap().len(),
         );
         write_pq_partition_payload(

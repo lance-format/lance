@@ -1323,6 +1323,7 @@ impl Dataset {
                             uuid,
                             vector_index,
                             lazy_reader,
+                            read_metadata_offset(&tailing_bytes)?,
                             frag_reuse_index,
                         )
                         .await?;

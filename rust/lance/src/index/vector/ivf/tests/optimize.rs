@@ -4,7 +4,7 @@
 //! Tests for optimizing IVF indices.
 
 use super::*;
-use lance_io::utils::{read_last_block, read_version};
+use lance_io::utils::{read_last_block, read_metadata_offset, read_version};
 
 /// Building a merge filter loads a row-id sequence per covered fragment under
 /// stable row ids, and an optimize pass that only appends a delta reads no existing
@@ -492,8 +492,11 @@ async fn test_optimize_ivf_hnsw_binary_vectors() {
     assert!(recall >= 0.5, "recall: {recall}, row ids: {ids:?}");
 }
 
+#[rstest::rstest]
+#[case::pq8(8)]
+#[case::pq4(4)]
 #[tokio::test]
-async fn test_optimize_ivf_pq_legacy_segments() {
+async fn test_optimize_ivf_pq_legacy_segments(#[case] num_bits: u8) {
     // The shared-model validation in `optimize_vector_indices` runs before
     // the v1/v2 dispatch and inspects every segment, so a legacy
     // (v1-format) IVF_PQ segment used to panic in `sub_index_type()` /
@@ -522,9 +525,7 @@ async fn test_optimize_ivf_pq_legacy_segments() {
     let mut dataset = Dataset::write(batches, "memory://", None).await.unwrap();
 
     // A genuine legacy (0, 1) index file, as shipped Lance versions wrote.
-    // (8-bit codes: reading legacy 4-bit codes back is broken independently
-    // of optimize, so this test keeps to the 8-bit layout.)
-    let mut params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 10);
+    let mut params = VectorIndexParams::ivf_pq(2, num_bits, 4, MetricType::L2, 10);
     params.version(IndexFileVersion::Legacy);
     dataset
         .create_index(&["vector"], IndexType::Vector, None, &params, false)
@@ -547,6 +548,17 @@ async fn test_optimize_ivf_pq_legacy_segments() {
 
     // The merged legacy index covers the appended rows and serves ANN.
     let indices = dataset.load_indices().await.unwrap();
+    let path = dataset
+        .indices_dir()
+        .join(indices[0].uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let reader = dataset.object_store.open(&path).await.unwrap();
+    let footer = read_last_block(reader.as_ref()).await.unwrap();
+    assert_eq!(
+        read_metadata_offset(&footer).unwrap(),
+        (512 + 256) * (4 * num_bits as usize / 8 + 8),
+        "the merged file stores every row at the packed width"
+    );
     let index = dataset
         .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
         .await

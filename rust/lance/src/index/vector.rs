@@ -2050,6 +2050,7 @@ pub(crate) async fn open_vector_index(
     uuid: &Uuid,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
+    metadata_offset: usize,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
@@ -2096,11 +2097,23 @@ pub(crate) async fn open_vector_index(
                     )));
                 };
                 let pq = ProductQuantizer::from_proto(pq_proto, metric_type)?;
-                last_stage = Some(Arc::new(PQIndex::new(
-                    pq,
-                    metric_type,
-                    frag_reuse_index.clone(),
-                )));
+                let num_rows = vec_idx
+                    .stages
+                    .iter()
+                    .filter_map(|stage| match stage.stage.as_ref() {
+                        Some(Stage::Ivf(ivf)) => Some(ivf.lengths.iter()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .map(|len| *len as usize)
+                    .sum();
+                let is_packed = pq::stores_packed_codes(&pq, num_rows, metadata_offset);
+                let pq_index = PQIndex::new(pq, metric_type, frag_reuse_index.clone());
+                last_stage = Some(Arc::new(if is_packed {
+                    pq_index
+                } else {
+                    pq_index.with_unpacked_codes()
+                }));
             }
             Some(Stage::Diskann(_)) => {
                 return Err(Error::index(
