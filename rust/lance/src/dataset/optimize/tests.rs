@@ -484,9 +484,7 @@ enum Race {
     CompactEagerlyElsewhere {
         excluded: &'static [u32],
     },
-    /// Rejects the rewrite's manifest write with an injected I/O error, so
-    /// verification finds no manifest at the target version.
-    Reject,
+    DeleteThenError,
 }
 
 #[derive(Debug, Default)]
@@ -576,7 +574,8 @@ impl CommitHandler for RaceBeforeRewrite {
                         .await
                         .unwrap();
                 }
-                Race::Reject => {
+                Race::DeleteThenError => {
+                    handle.delete("i < 10").await.unwrap();
                     return Err(CommitError::OtherError(Error::io(
                         "injected rewrite commit failure",
                     )));

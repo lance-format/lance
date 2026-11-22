@@ -21,6 +21,7 @@ use lance_table::io::commit::{
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use crate::Dataset;
 use crate::dataset::WriteParams;
@@ -829,6 +830,7 @@ pub enum AmbiguousFailure {
     LandAndErrorWithoutVerification,
     /// Do not apply the commit; report an I/O error.
     FailOutright,
+    LandAfterError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -836,6 +838,12 @@ enum AmbiguousFailureTarget {
     Any,
     Rewrite,
     ReserveFragments,
+}
+
+#[derive(Debug)]
+struct DelayedManifestWrite {
+    release: oneshot::Sender<()>,
+    task: JoinHandle<std::result::Result<ManifestLocation, CommitError>>,
 }
 
 /// A commit handler for tests that can make a commit physically land while
@@ -860,6 +868,7 @@ pub struct AmbiguousCommitHandler {
     /// Number of version resolutions requested (a proxy for how often commit
     /// verification ran).
     resolve_calls: AtomicUsize,
+    delayed_write: Mutex<Option<DelayedManifestWrite>>,
 }
 
 impl Default for AmbiguousCommitHandler {
@@ -871,6 +880,7 @@ impl Default for AmbiguousCommitHandler {
             resolve_not_found_remaining: AtomicUsize::new(0),
             not_found_is_definitive: AtomicBool::new(true),
             resolve_calls: AtomicUsize::new(0),
+            delayed_write: Mutex::new(None),
         }
     }
 }
@@ -895,6 +905,12 @@ impl AmbiguousCommitHandler {
         self.resolve_not_found_remaining
             .store(count, Ordering::SeqCst);
         self.not_found_is_definitive.store(false, Ordering::SeqCst);
+    }
+
+    pub async fn land_delayed_write(&self) -> ManifestLocation {
+        let write = self.delayed_write.lock().unwrap().take().unwrap();
+        write.release.send(()).unwrap();
+        write.task.await.unwrap().unwrap()
     }
 
     pub fn resolve_calls(&self) -> usize {
@@ -985,6 +1001,30 @@ impl CommitHandler for AmbiguousCommitHandler {
                 }
                 Err(CommitError::OtherError(lance_core::Error::io(
                     "simulated ambiguous commit failure",
+                )))
+            }
+            Some(AmbiguousFailure::LandAfterError) => {
+                let (release, wait) = oneshot::channel();
+                let mut manifest = manifest.clone();
+                let base_path = base_path.clone();
+                let object_store = object_store.clone();
+                let task = tokio::spawn(async move {
+                    wait.await.unwrap();
+                    ConditionalPutCommitHandler
+                        .commit(
+                            &mut manifest,
+                            indices,
+                            &base_path,
+                            &object_store,
+                            manifest_writer,
+                            naming_scheme,
+                            transaction,
+                        )
+                        .await
+                });
+                *self.delayed_write.lock().unwrap() = Some(DelayedManifestWrite { release, task });
+                Err(CommitError::OtherError(lance_core::Error::io(
+                    "simulated manifest write timeout",
                 )))
             }
             Some(AmbiguousFailure::FailOutright) => Err(CommitError::OtherError(

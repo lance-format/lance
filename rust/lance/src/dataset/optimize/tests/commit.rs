@@ -4,6 +4,7 @@
 //! Compaction tests for the commit contract area.
 
 use super::*;
+use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
 
 /// Distributed compaction on a tagged table: the tasks are planned at V,
 /// another writer's disjoint deferred compaction lands at V+1, and the
@@ -1561,9 +1562,9 @@ async fn test_rewrite_commit_failure_preserves_or_reclaims_index_dirs(
                     .contains("simulated outright commit failure"),
                 "unexpected error: {error}"
             );
-            assert_eq!(
-                after, before,
-                "a verified-absent commit must reclaim the directory it minted"
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "an absent manifest must leave the minted directory in place"
             );
             assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
         }
@@ -1637,6 +1638,47 @@ async fn test_rewrite_commit_failure_preserves_or_reclaims_index_dirs(
     }
 }
 
+#[tokio::test]
+async fn test_rewrite_manifest_landing_after_verification_keeps_index_dir() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+    let resolve_calls_before = handler.resolve_calls();
+    handler.fail_next_rewrite(AmbiguousFailure::LandAfterError);
+
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the simulated timeout must surface");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated manifest write timeout")
+    );
+    assert!(!error.is_commit_status_unknown());
+    assert!(handler.resolve_calls() > resolve_calls_before);
+    let before_landing = Dataset::open(uri).await.unwrap();
+    let location = handler.land_delayed_write().await;
+    assert_eq!(location.version, before_landing.version().version + 1);
+
+    let latest = Dataset::open(uri).await.unwrap();
+    assert_eq!(latest.version().version, location.version);
+    let filter = "i >= 20 AND i < 40";
+    let plan = latest
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_indexed_query_matches(uri, filter).await;
+    let after = index_dir_names(&latest).await;
+    assert!(after.is_superset(&before));
+    assert_eq!(after.len(), before.len() + 1);
+}
+
 /// Between retries the directories must survive, because the retry reuses
 /// the same UUIDs. The second attempt succeeds after a non-conflicting append
 /// preempted the first.
@@ -1706,9 +1748,8 @@ async fn install_external_tagged_history(dataset: &mut Dataset) {
 
 /// A tagged deferred compaction whose first attempt loses to a non-conflicting
 /// append: the rebase assembles an entry whose details spill to a new
-/// directory, and the retry is verified not to have landed. That rebased
-/// directory must be reclaimed; everything present before the failure,
-/// including the installed history's own directory, must stay.
+/// directory. A concurrent Delete takes the retry's target version. Only the
+/// rebased directory should be reclaimed.
 #[tokio::test]
 async fn test_tagged_rebase_details_dir_reclaimed_after_verified_loss() {
     let dir = TempStrDir::default();
@@ -1720,7 +1761,7 @@ async fn test_tagged_rebase_details_dir_reclaimed_after_verified_loss() {
     let before_details = reuse_details_dirs(uri);
     assert_eq!(before_details.len(), 1);
 
-    handler.arm(&dataset, vec![Race::Append, Race::Reject]);
+    handler.arm(&dataset, vec![Race::Append, Race::DeleteThenError]);
     let error = compact_files(
         &mut dataset,
         CompactionOptions {
@@ -1754,4 +1795,37 @@ async fn test_tagged_rebase_details_dir_reclaimed_after_verified_loss() {
         before_details,
         "only the installed history may keep its details file"
     );
+}
+
+#[tokio::test]
+async fn test_v0_rebase_reclaims_restamped_details_dir() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let history = commit_padding_reuse_history(&mut dataset, inline_padding_capacity() + 1).await;
+    assert_eq!(history.index_version, 0);
+    assert!(stores_reuse_details_externally(&history));
+    let before = reuse_details_dirs(uri);
+    assert_eq!(before, HashSet::from([history.uuid.to_string()]));
+
+    handler.arm(&dataset, vec![Race::Append, Race::Delete]);
+    let error = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..reclaim_options()
+        },
+        None,
+    )
+    .await
+    .expect_err("the Delete must preempt the rebased rewrite");
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "unexpected error: {error}"
+    );
+    assert!(handler.races.lock().unwrap().is_empty());
+    assert_eq!(reuse_details_dirs(uri), before, "restamped details leaked");
 }
