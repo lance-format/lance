@@ -475,7 +475,10 @@ impl CacheCodec {
         let Some(decode) = self.file_decoder else {
             return Ok(None);
         };
-        let (offset, version) = self.read_range_envelope(&|range| reader.read_range(range))?;
+        // A matching file envelope has a known length. Read it in one I/O.
+        let header_len = ENVELOPE_ID_OFFSET + self.type_id.len() + ENVELOPE_VERSION_BYTES;
+        let header = reader.read_range(0..header_len)?;
+        let (offset, version) = self.validate_range_envelope(&header)?;
         decode(reader, offset, version)
     }
 
@@ -486,12 +489,19 @@ impl CacheCodec {
     /// Read and validate the envelope of a range-read entry, returning the
     /// body offset and the entry's `type_version`.
     fn read_range_envelope(&self, reader: &dyn CacheRangeReader) -> Result<(usize, u32)> {
-        // A matching envelope must contain this exact type ID. Reading its
-        // expected length also avoids a second disk read just to size the ID.
-        let header_len = ENVELOPE_ID_OFFSET + self.type_id.len() + ENVELOPE_VERSION_BYTES;
-        let header = reader.read_range(0..header_len)?;
-        let envelope = parse_envelope(&header)
-            .ok_or_else(|| Error::invalid_input("invalid cache envelope"))?;
+        let prefix = reader.read_range(0..ENVELOPE_ID_OFFSET)?;
+        let id_bytes = prefix
+            .get(ENVELOPE_ID_OFFSET - 2..ENVELOPE_ID_OFFSET)
+            .ok_or_else(|| Error::invalid_input("short cache envelope"))?;
+        let id_len = u16::from_le_bytes(id_bytes.try_into().unwrap()) as usize;
+        let header =
+            reader.read_range(0..(ENVELOPE_ID_OFFSET + id_len + ENVELOPE_VERSION_BYTES))?;
+        self.validate_range_envelope(&header)
+    }
+
+    fn validate_range_envelope(&self, header: &Bytes) -> Result<(usize, u32)> {
+        let envelope =
+            parse_envelope(header).ok_or_else(|| Error::invalid_input("invalid cache envelope"))?;
         if envelope.type_id != self.type_id || envelope.type_version > self.version {
             return Err(Error::invalid_input("incompatible cache entry"));
         }
