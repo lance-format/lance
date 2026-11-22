@@ -17,11 +17,13 @@ use uuid::Uuid;
 
 use super::{
     CommittedSegmentSource, ReusedSegment, STALE_REUSE_SOURCE_ERROR,
-    UNSUPPORTED_REUSE_SOURCE_ERROR, merge_committed_index_segments_with_budget,
+    UNSUPPORTED_REUSE_SOURCE_ERROR, merge_committed_index_segments_accounted,
+    merge_committed_index_segments_with_budget,
 };
 use crate::dataset::WriteParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::cleanup::CleanupPolicyBuilder;
+use crate::index::scalar::zonemap::ZoneMapMergeBudget;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 use crate::{Dataset, Error};
 
@@ -607,55 +609,64 @@ async fn test_reuse_merge_refuses_over_budget() {
     assert_eq!(manifest_segments(uri).await, before);
 }
 
-/// The admission check compares against the metadata estimate itself: a
-/// budget of exactly the estimate is admitted, one byte less is refused.
+/// The admission check compares against its own accounting: a budget of
+/// exactly the bytes a merge was admitted with is admitted again, one byte
+/// less is refused at the merge stage, after every source was loaded.
 #[tokio::test]
-async fn test_reuse_merge_admits_exactly_its_estimate() {
+async fn test_reuse_merge_admits_exactly_its_accounted_bytes() {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let dataset = segments_then_append(uri, &[vec![0, 1], vec![2, 3]]).await;
-    let committed = segments(&dataset).await;
-    let sources = committed
+    let sources = segments(&dataset)
+        .await
         .iter()
         .map(|segment| source_of(&dataset, segment))
         .collect::<Vec<_>>();
-    let estimate = super::estimate_merge_bytes(&dataset, &committed)
+    let mut budget = ZoneMapMergeBudget::new(u64::MAX);
+    merge_committed_index_segments_accounted(&dataset, &sources, vec![], &mut budget)
         .await
         .unwrap();
-    assert!(estimate > 0);
-    assert!(estimate <= super::REUSE_MERGE_BUDGET_BYTES);
+    let needed = budget.needed_bytes;
+    assert!(needed > 0);
+    assert!(needed <= super::REUSE_MERGE_BUDGET_BYTES);
 
-    let error =
-        merge_committed_index_segments_with_budget(&dataset, &sources, vec![], estimate - 1)
-            .await
-            .unwrap_err();
+    let error = merge_committed_index_segments_with_budget(&dataset, &sources, vec![], needed - 1)
+        .await
+        .unwrap_err();
     assert_error_prefix(&error, UNSUPPORTED_REUSE_SOURCE_ERROR);
-    let merged = merge_committed_index_segments_with_budget(&dataset, &sources, vec![], estimate)
+    assert!(error.to_string().contains("for the merge"), "{error}");
+    let merged = merge_committed_index_segments_with_budget(&dataset, &sources, vec![], needed)
         .await
         .unwrap();
     assert_eq!(merged.fragment_bitmap, Some(bitmap(0..4)));
 }
 
-/// A source whose values the file metadata cannot bound in memory (strings)
-/// is refused visibly instead of estimated, and nothing is published.
-#[tokio::test]
-async fn test_reuse_merge_refuses_source_without_safe_estimate() {
-    let dir = TempStrDir::default();
-    let uri = dir.as_str();
+const STRING_INDEX: &str = "s_zm";
+const STRING_FILTERS: [&str; 3] = ["s >= 'value-03500'", "s < 'value-00010'", "s IS NULL"];
+
+/// A table of `BASE_FRAGMENTS` fragments with a nullable Utf8 column `s`
+/// (every seventh row null) and one committed ZoneMap segment per fragment
+/// group; then fragment 4 is appended and the table cleaned up and reopened.
+async fn string_segments_then_append(uri: &str, groups: &[Vec<u32>]) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "s",
         DataType::Utf8,
-        false,
+        true,
     )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(arrow_array::StringArray::from_iter_values(
-            (0..4000).map(|row| format!("value-{row:05}")),
-        ))],
-    )
-    .unwrap();
+    let batch = |start: i32, count: i32| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from_iter(
+                (start..start + count).map(|row| (row % 7 != 3).then(|| format!("value-{row:05}"))),
+            ))],
+        )
+        .unwrap()
+    };
     let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        RecordBatchIterator::new(
+            vec![Ok(batch(0, BASE_FRAGMENTS * ROWS_PER_FRAGMENT))],
+            schema.clone(),
+        ),
         uri,
         Some(WriteParams {
             max_rows_per_file: ROWS_PER_FRAGMENT as usize,
@@ -665,35 +676,170 @@ async fn test_reuse_merge_refuses_source_without_safe_estimate() {
     .await
     .unwrap();
     let params = zonemap_params();
-    for fragments in [vec![0, 1], vec![2, 3]] {
+    for fragments in groups {
         let segment = CreateIndexBuilder::new(&mut dataset, &["s"], IndexType::ZoneMap, &params)
-            .name("s_zm".to_string())
+            .name(STRING_INDEX.to_string())
             .replace(true)
-            .fragments(fragments)
+            .fragments(fragments.clone())
             .execute_uncommitted()
             .await
             .unwrap();
         dataset
-            .commit_existing_index_segments("s_zm", "s", vec![segment])
+            .commit_existing_index_segments(STRING_INDEX, "s", vec![segment])
             .await
             .unwrap();
     }
-    let committed = dataset.load_indices_by_name("s_zm").await.unwrap();
-    assert_eq!(committed.len(), 2);
-    let sources = committed
+    let appended = batch(BASE_FRAGMENTS * ROWS_PER_FRAGMENT, ROWS_PER_FRAGMENT);
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    cleanup_and_reopen(dataset, uri).await
+}
+
+async fn string_sources(dataset: &Dataset) -> Vec<CommittedSegmentSource> {
+    let mut committed = dataset.load_indices_by_name(STRING_INDEX).await.unwrap();
+    committed.sort_by_key(|segment| segment.fragment_bitmap.as_ref().and_then(|b| b.min()));
+    committed
         .iter()
-        .map(|segment| source_of(&dataset, segment))
-        .collect::<Vec<_>>();
-    let error = dataset
+        .map(|segment| source_of(dataset, segment))
+        .collect()
+}
+
+async fn matching_string_rows(dataset: &Dataset, filter: &str, use_index: bool) -> Vec<u64> {
+    let mut scan = dataset.scan();
+    scan.project(&["s"]).unwrap();
+    scan.with_row_id();
+    scan.filter(filter).unwrap();
+    scan.use_scalar_index(use_index);
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut rows = batch
+        .column_by_name(ROW_ID)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    rows.sort_unstable();
+    rows
+}
+
+fn index_dirs(uri: &str) -> HashSet<String> {
+    std::fs::read_dir(format!("{uri}/_indices"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// String sources are admitted by their loaded size like any other: the
+/// merge reads no table data, and the published segment answers string
+/// range and null queries exactly like a scan.
+#[tokio::test]
+async fn test_reuse_merges_string_sources_without_data_reads() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let mut dataset = string_segments_then_append(uri, &[vec![0, 1], vec![2, 3]]).await;
+    let sources = string_sources(&dataset).await;
+    assert_eq!(sources.len(), 2);
+
+    let classes = FileClasses::capture(&dataset);
+    dataset.object_store.io_stats_incremental();
+    let merged = dataset
         .merge_committed_index_segments(&sources, vec![])
+        .await
+        .unwrap();
+    let merged_uuid = merged.uuid;
+    dataset
+        .commit_reused_index_segments(
+            STRING_INDEX,
+            "s",
+            vec![ReusedSegment {
+                segment: merged,
+                sources,
+                fresh_fragments: RoaringBitmap::new(),
+                fresh_read_version: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let io = dataset.object_store.io_stats_incremental();
+    let data_reads = classes.data_reads(&io, true);
+    assert!(
+        data_reads.is_empty(),
+        "fragment data was read: {data_reads:?}"
+    );
+
+    let dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    let live = dataset.load_indices_by_name(STRING_INDEX).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].uuid, merged_uuid);
+    assert_eq!(live[0].fragment_bitmap, Some(bitmap(0..4)));
+    for filter in STRING_FILTERS {
+        let indexed = matching_string_rows(&dataset, filter, true).await;
+        let scanned = matching_string_rows(&dataset, filter, false).await;
+        assert!(!scanned.is_empty(), "filter {filter}");
+        assert_eq!(indexed, scanned, "filter {filter}");
+
+        let mut scan = dataset.scan();
+        scan.filter(filter).unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "filter {filter}: {plan}");
+    }
+}
+
+/// A string merge over its budget is refused: with a budget below the
+/// first source's loaded size, loading stops after that source; with a
+/// budget one byte below its accounted need, the merge stage refuses.
+/// Neither writes an index file, and the index is unchanged.
+#[tokio::test]
+async fn test_reuse_merge_refuses_over_budget_string_sources() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let dataset = string_segments_then_append(uri, &[vec![0, 1], vec![2, 3]]).await;
+    let sources = string_sources(&dataset).await;
+    let before = dataset.load_indices_by_name(STRING_INDEX).await.unwrap();
+    let dirs_before = index_dirs(uri);
+
+    let error = merge_committed_index_segments_with_budget(&dataset, &sources, vec![], 1)
         .await
         .unwrap_err();
     assert_error_prefix(&error, UNSUPPORTED_REUSE_SOURCE_ERROR);
     assert!(
-        error.to_string().contains("no safe memory estimate"),
+        error
+            .to_string()
+            .contains("the first 1 of 2 ZoneMap segments"),
         "{error}"
     );
-    assert_eq!(dataset.load_indices_by_name("s_zm").await.unwrap().len(), 2);
+
+    let mut budget = ZoneMapMergeBudget::new(u64::MAX);
+    let admitted =
+        merge_committed_index_segments_accounted(&dataset, &sources, vec![], &mut budget)
+            .await
+            .unwrap();
+    // The admitted merge wrote its output; the refused ones below must not.
+    let mut dirs_after_admitted = dirs_before.clone();
+    dirs_after_admitted.insert(admitted.uuid.to_string());
+    assert_eq!(index_dirs(uri), dirs_after_admitted);
+
+    let error = merge_committed_index_segments_with_budget(
+        &dataset,
+        &sources,
+        vec![],
+        budget.needed_bytes - 1,
+    )
+    .await
+    .unwrap_err();
+    assert_error_prefix(&error, UNSUPPORTED_REUSE_SOURCE_ERROR);
+    assert!(error.to_string().contains("for the merge"), "{error}");
+
+    assert_eq!(index_dirs(uri), dirs_after_admitted);
+    let dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    let after = dataset.load_indices_by_name(STRING_INDEX).await.unwrap();
+    assert_eq!(
+        after.iter().map(|s| s.uuid).collect::<Vec<_>>(),
+        before.iter().map(|s| s.uuid).collect::<Vec<_>>()
+    );
 }
 
 /// A compaction that rewrites a declared source's fragments after the merge

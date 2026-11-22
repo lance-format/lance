@@ -534,14 +534,6 @@ impl IndexReader for CurrentIndexReader {
         // at open, so it's already in metadata here (no extra I/O).
         Some(self.0.metadata().file_size())
     }
-
-    fn global_buffer_size_bytes(&self, index: u32) -> Option<u64> {
-        self.0
-            .metadata()
-            .file_buffers
-            .get(index as usize)
-            .map(|buffer| buffer.size)
-    }
 }
 
 #[async_trait]

@@ -546,10 +546,8 @@ pub trait DatasetIndexExt {
     /// [`STALE_REUSE_SOURCE_ERROR`](crate::index::STALE_REUSE_SOURCE_ERROR).
     /// Sources a fragment reuse history may still remap, tables with a tagged
     /// or stable-row-id reuse history, sources that cannot be merged with each
-    /// other, sources whose file metadata gives no safe memory bound (values
-    /// that are not fixed width, such as strings), and merges estimated to
-    /// exceed the memory budget are refused
-    /// with a message starting with
+    /// other, and merges that exceed the memory budget are refused with a
+    /// message starting with
     /// [`UNSUPPORTED_REUSE_SOURCE_ERROR`](crate::index::UNSUPPORTED_REUSE_SOURCE_ERROR).
     ///
     /// `fresh` holds segments built with
@@ -559,6 +557,15 @@ pub trait DatasetIndexExt {
     /// oldest committed source's dataset version (the oldest fresh version
     /// without committed sources). Publish it with
     /// [`Self::commit_reused_index_segments`].
+    ///
+    /// Memory is admitted from what is actually loaded, for every value
+    /// type: sources are loaded one at a time and each one's in-memory size
+    /// (zones including string, binary or nested bounds, plus null
+    /// positions) is charged as it is loaded; once all are loaded, the merge
+    /// output and temporaries are estimated from those sizes. Exceeding the
+    /// budget at either point refuses the merge before anything is written.
+    /// The transient memory of loading one segment is not bounded, the same
+    /// as for any query that loads it.
     async fn merge_committed_index_segments(
         &self,
         _sources: &[CommittedSegmentSource],

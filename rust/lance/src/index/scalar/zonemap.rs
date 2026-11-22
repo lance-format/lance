@@ -65,7 +65,27 @@ pub(in crate::index) async fn merge_segments(
             *coverage = union.clone();
         }
     }
-    merge_segments_by_coverage(dataset, sources, staged, disjoint).await
+    merge_segments_by_coverage(dataset, sources, staged, disjoint, None).await
+}
+
+/// Memory admission of a ZoneMap segment merge, accounted from what is
+/// actually loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::index) struct ZoneMapMergeBudget {
+    /// Bytes the loaded sources plus the estimated merge temporaries may
+    /// use.
+    pub budget_bytes: u64,
+    /// After an admitted merge: the bytes it was admitted with.
+    pub needed_bytes: u64,
+}
+
+impl ZoneMapMergeBudget {
+    pub(in crate::index) fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            needed_bytes: 0,
+        }
+    }
 }
 
 /// Merge source ZoneMap segments, filtering each by the coverage paired with
@@ -77,6 +97,7 @@ pub(in crate::index) async fn merge_segments_by_coverage(
     sources: Vec<(IndexMetadata, RoaringBitmap)>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
     disjoint: bool,
+    budget: Option<&mut ZoneMapMergeBudget>,
 ) -> Result<IndexMetadata> {
     let Some((first_segment, _)) = sources.first() else {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -91,9 +112,27 @@ pub(in crate::index) async fn merge_segments_by_coverage(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
+    fn as_zonemap<'a>(
+        segment_uuid: &Uuid,
+        scalar_index: &'a Arc<dyn ScalarIndex>,
+    ) -> Result<&'a ZoneMapIndex> {
+        scalar_index
+            .as_any()
+            .downcast_ref::<ZoneMapIndex>()
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "merge_existing_index_segments: expected zonemap segment {}, got {:?}",
+                    segment_uuid,
+                    scalar_index.index_type()
+                ))
+            })
+    }
     let mut scalar_indices = Vec::with_capacity(sources.len());
     let mut fragment_bitmap = RoaringBitmap::new();
-    for (segment, coverage) in &sources {
+    // With a budget, sources are loaded one at a time and each one's actual
+    // in-memory size is charged as soon as it is loaded.
+    let mut loaded_bytes = 0u64;
+    for (position, (segment, coverage)) in sources.iter().enumerate() {
         fragment_bitmap |= coverage;
         let scalar_index = super::open_scalar_index_with_plan(
             dataset,
@@ -104,22 +143,42 @@ pub(in crate::index) async fn merge_segments_by_coverage(
             &NoOpMetricsCollector,
         )
         .await?;
+        if let Some(budget) = budget.as_deref() {
+            let loaded = as_zonemap(&segment.uuid, &scalar_index)?.loaded_size_bytes();
+            loaded_bytes = loaded_bytes.saturating_add(loaded);
+            if loaded_bytes > budget.budget_bytes {
+                return Err(Error::not_supported(format!(
+                    "the first {} of {} ZoneMap segments to merge already hold {loaded_bytes} \
+                     bytes once loaded, over the {} byte budget",
+                    position + 1,
+                    sources.len(),
+                    budget.budget_bytes
+                )));
+            }
+        }
         scalar_indices.push((segment.uuid, scalar_index));
     }
 
     let mut source_indices = Vec::with_capacity(scalar_indices.len());
     for ((segment_uuid, scalar_index), (_, coverage)) in scalar_indices.iter().zip(&sources) {
-        let zonemap_index = scalar_index
-            .as_any()
-            .downcast_ref::<ZoneMapIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected zonemap segment {}, got {:?}",
-                    segment_uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        source_indices.push((zonemap_index, coverage));
+        source_indices.push((as_zonemap(segment_uuid, scalar_index)?, coverage));
+    }
+    if let Some(budget) = budget {
+        let indices = source_indices
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        let merge_bytes = lance_index::scalar::zonemap::estimate_zonemap_merge_bytes(&indices);
+        let needed_bytes = loaded_bytes.saturating_add(merge_bytes);
+        if needed_bytes > budget.budget_bytes {
+            return Err(Error::not_supported(format!(
+                "merging these ZoneMap segments needs an estimated {needed_bytes} bytes \
+                 ({loaded_bytes} loaded plus {merge_bytes} for the merge), over the {} byte \
+                 budget",
+                budget.budget_bytes
+            )));
+        }
+        budget.needed_bytes = needed_bytes;
     }
 
     let new_uuid = Uuid::new_v4();

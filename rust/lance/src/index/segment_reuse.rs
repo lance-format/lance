@@ -15,8 +15,6 @@ use std::collections::HashSet;
 
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::scalar::DEFAULT_MATERIALIZATION_BUDGET_BYTES;
-use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::zonemap::{ZoneMapIndex, estimate_zonemap_merge_bytes};
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
 use lance_table::system_index::frag_reuse::retention::{
@@ -25,13 +23,13 @@ use lance_table::system_index::frag_reuse::retention::{
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::api::IntoIndexSegment;
 use crate::index::frag_reuse::load_frag_reuse_index_details;
 use crate::index::frag_reuse_with_stable_row_ids::has_frag_reuse_with_stable_row_ids;
 use crate::index::loading::load_all_indices;
 use crate::index::provenance::prune_stale_segment_coverage;
+use crate::index::scalar::zonemap::ZoneMapMergeBudget;
 use crate::index::segment::{
     segment_has_zonemap_details, validate_segment_index_details, validate_segment_metadata,
     validate_segment_params_compatible,
@@ -223,36 +221,37 @@ async fn check_reuse_history(
     Ok(())
 }
 
-/// Admission estimate of the memory the merge needs: decoded sources, output
-/// and temporaries, null positions included, bounded from each source's file
-/// metadata before anything is decoded. A source whose metadata gives no
-/// safe bound refuses the merge. This is an estimate made before loading, not
-/// allocator accounting.
-async fn estimate_merge_bytes(dataset: &Dataset, segments: &[IndexMetadata]) -> Result<u64> {
-    let mut inputs = Vec::with_capacity(segments.len());
-    for segment in segments {
-        let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
-        let input = ZoneMapIndex::merge_input_from_metadata(&store)
-            .await
-            .map_err(|error| match error {
-                Error::NotSupported { .. } => unsupported(format!(
-                    "segment {}: no safe memory estimate: {error}",
-                    segment.uuid
-                )),
-                other => other,
-            })?;
-        inputs.push(input);
-    }
-    Ok(estimate_zonemap_merge_bytes(&inputs))
-}
-
 /// [`DatasetIndexExt::merge_committed_index_segments`](crate::index::DatasetIndexExt::merge_committed_index_segments)
 /// with an explicit memory budget.
+///
+/// Admission is accounted from what is actually loaded, the same for every
+/// value type: the segments are loaded one at a time and each one's
+/// in-memory size (zones including the heap bytes of their bounds, plus null
+/// positions) is charged as soon as it is loaded; loading stops and the
+/// merge is refused as soon as the total exceeds the budget. Once all are
+/// loaded, the merge's own output and temporaries are estimated from those
+/// sizes and the merge is refused if the total exceeds the budget. A refused
+/// merge writes nothing.
+///
+/// Not bounded: the transient memory of loading one segment (its read and
+/// decoded file pages), the same as for any query that loads that segment.
 pub async fn merge_committed_index_segments_with_budget(
     dataset: &Dataset,
     sources: &[CommittedSegmentSource],
     fresh: Vec<IndexMetadata>,
     budget_bytes: u64,
+) -> Result<IndexMetadata> {
+    let mut budget = ZoneMapMergeBudget::new(budget_bytes);
+    merge_committed_index_segments_accounted(dataset, sources, fresh, &mut budget).await
+}
+
+/// [`merge_committed_index_segments_with_budget`], recording in `budget`
+/// the bytes an admitted merge was admitted with.
+pub(in crate::index) async fn merge_committed_index_segments_accounted(
+    dataset: &Dataset,
+    sources: &[CommittedSegmentSource],
+    fresh: Vec<IndexMetadata>,
+    budget: &mut ZoneMapMergeBudget,
 ) -> Result<IndexMetadata> {
     if sources.is_empty() && fresh.is_empty() {
         return Err(Error::invalid_input(
@@ -314,14 +313,6 @@ pub async fn merge_committed_index_segments_with_budget(
     check_reuse_history(dataset, &indices, &all).await?;
     validate_segment_params_compatible(&[], &all).map_err(unsupported)?;
 
-    let estimate = estimate_merge_bytes(dataset, &all).await?;
-    if estimate > budget_bytes {
-        return Err(unsupported(format!(
-            "merging these segments is estimated to need {estimate} bytes, over the \
-             {budget_bytes} byte budget"
-        )));
-    }
-
     let output_version = committed
         .iter()
         .map(|segment| segment.dataset_version)
@@ -329,13 +320,18 @@ pub async fn merge_committed_index_segments_with_budget(
         .or_else(|| fresh.iter().map(|segment| segment.dataset_version).min())
         .expect("non-empty");
     let pairs = all.into_iter().zip(coverages).collect::<Vec<_>>();
-    let mut merged =
-        crate::index::scalar::zonemap::merge_segments_by_coverage(dataset, pairs, None, true)
-            .await
-            .map_err(|error| match error {
-                Error::NotSupported { .. } | Error::InvalidInput { .. } => unsupported(error),
-                other => other,
-            })?;
+    let mut merged = crate::index::scalar::zonemap::merge_segments_by_coverage(
+        dataset,
+        pairs,
+        None,
+        true,
+        Some(budget),
+    )
+    .await
+    .map_err(|error| match error {
+        Error::NotSupported { .. } | Error::InvalidInput { .. } => unsupported(error),
+        other => other,
+    })?;
     // The oldest source version keeps overlay masking conservative.
     merged.dataset_version = output_version;
     Ok(merged)

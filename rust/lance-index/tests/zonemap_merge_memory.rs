@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Checks that the ZoneMap merge admission estimate, computed from file
-//! metadata only, bounds the memory actually allocated while loading the
-//! sources and merging them.
+//! Checks that ZoneMap merge admission bounds the memory actually allocated:
+//! a loaded segment holds no more than its `loaded_size_bytes`, and merging
+//! loaded segments allocates no more than `estimate_zonemap_merge_bytes` on
+//! top of them. The transient memory of loading is reported, not bounded.
 //!
 //! This test binary installs a counting global allocator, so it holds a
 //! single test that runs its cases one after another.
@@ -13,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -124,53 +125,69 @@ async fn write_source(source: &Source, rows_per_zone: u64, store: &dyn IndexStor
     builder.write_index(store).await.unwrap();
 }
 
-/// Peak bytes allocated beyond the starting point while loading the
-/// sources from `stores` and merging them, and the estimate for them.
-async fn measure(stores: &[Arc<LanceIndexStore>], coverages: &[RoaringBitmap]) -> (u64, u64, u64) {
-    let mut inputs = Vec::new();
-    for store in stores {
-        inputs.push(
-            ZoneMapIndex::merge_input_from_metadata(store.as_ref())
-                .await
-                .unwrap(),
-        );
-    }
-    let estimate = estimate_zonemap_merge_bytes(&inputs);
+/// What one case measured, in bytes.
+struct Measured {
+    /// Held by the loaded sources once loading finished.
+    retained: u64,
+    /// Sum of the sources' `loaded_size_bytes`.
+    loaded_size: u64,
+    /// Peak while loading, beyond the starting point (not bounded).
+    load_peak: u64,
+    /// Peak while merging, beyond what the loaded sources hold.
+    merge_peak: u64,
+    /// `estimate_zonemap_merge_bytes` of the loaded sources.
+    merge_estimate: u64,
+}
 
+/// Loads the sources from `stores` and merges them, measuring both steps.
+async fn measure(stores: &[Arc<LanceIndexStore>], coverages: &[RoaringBitmap]) -> Measured {
     let dest_dir = TempObjDir::default();
     let dest = store(&dest_dir);
     let cache = LanceCache::no_cache();
     let details = prost_types::Any::default();
 
     let baseline = CURRENT.load(Ordering::SeqCst);
-    let load_peak;
     PEAK.store(baseline, Ordering::SeqCst);
-    {
-        let mut loaded = Vec::new();
-        for store in stores {
-            let index = ZoneMapIndexPlugin
-                .load_index(store.clone(), &details, 1, None, &cache)
-                .await
-                .unwrap();
-            loaded.push(index);
-        }
-        load_peak = PEAK.load(Ordering::SeqCst).saturating_sub(baseline) as u64;
-        let sources = loaded
-            .iter()
-            .zip(coverages)
-            .map(|(index, coverage)| {
-                (
-                    index.as_any().downcast_ref::<ZoneMapIndex>().unwrap(),
-                    coverage,
-                )
-            })
-            .collect::<Vec<_>>();
-        merge_zonemap_indices_by_coverage(&sources, dest.as_ref())
+    let mut loaded = Vec::new();
+    for store in stores {
+        let index = ZoneMapIndexPlugin
+            .load_index(store.clone(), &details, 1, None, &cache)
             .await
             .unwrap();
+        loaded.push(index);
     }
-    let peak = PEAK.load(Ordering::SeqCst).saturating_sub(baseline) as u64;
-    (peak, load_peak, estimate)
+    let after_load = CURRENT.load(Ordering::SeqCst);
+    let load_peak = PEAK.load(Ordering::SeqCst).saturating_sub(baseline) as u64;
+    let retained = after_load.saturating_sub(baseline) as u64;
+
+    let sources = loaded
+        .iter()
+        .zip(coverages)
+        .map(|(index, coverage)| {
+            (
+                index.as_any().downcast_ref::<ZoneMapIndex>().unwrap(),
+                coverage,
+            )
+        })
+        .collect::<Vec<_>>();
+    let indices = sources.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    let loaded_size = indices.iter().map(|index| index.loaded_size_bytes()).sum();
+    let merge_estimate = estimate_zonemap_merge_bytes(&indices);
+    drop(indices);
+
+    let before_merge = CURRENT.load(Ordering::SeqCst);
+    PEAK.store(before_merge, Ordering::SeqCst);
+    merge_zonemap_indices_by_coverage(&sources, dest.as_ref())
+        .await
+        .unwrap();
+    let merge_peak = PEAK.load(Ordering::SeqCst).saturating_sub(before_merge) as u64;
+    Measured {
+        retained,
+        loaded_size,
+        load_peak,
+        merge_peak,
+        merge_estimate,
+    }
 }
 
 fn int64_fragment(rows: usize, null_every: Option<usize>) -> ArrayRef {
@@ -290,23 +307,100 @@ fn cases() -> Vec<Case> {
                 )],
             }],
         },
+        Case {
+            name: "utf8 short (8 bytes)",
+            rows_per_zone: 16,
+            sources: (0..2)
+                .map(|source| Source {
+                    fragments: (source * 4..source * 4 + 4)
+                        .map(|f| (f, utf8_fragment(f, 25_000, 8, None)))
+                        .collect(),
+                })
+                .collect(),
+        },
+        Case {
+            name: "utf8 long (1 KiB)",
+            rows_per_zone: 16,
+            sources: (0..2)
+                .map(|source| Source {
+                    fragments: (source * 2..source * 2 + 2)
+                        .map(|f| (f, utf8_fragment(f, 5_000, 1024, None)))
+                        .collect(),
+                })
+                .collect(),
+        },
+        Case {
+            name: "utf8 with nulls and all-null zones",
+            rows_per_zone: 16,
+            sources: (0..2)
+                .map(|source| Source {
+                    fragments: (source * 4..source * 4 + 4)
+                        .map(|f| (f, utf8_fragment(f, 25_000, 24, Some(5))))
+                        .collect(),
+                })
+                .collect(),
+        },
+        Case {
+            name: "large utf8 (64 bytes)",
+            rows_per_zone: 16,
+            sources: vec![Source {
+                fragments: (0..4)
+                    .map(|f| {
+                        let values = utf8_values(f, 25_000, 64, None);
+                        (f, Arc::new(LargeStringArray::from(values)) as ArrayRef)
+                    })
+                    .collect(),
+            }],
+        },
+        Case {
+            name: "binary (256 bytes)",
+            rows_per_zone: 16,
+            sources: vec![Source {
+                fragments: (0..4)
+                    .map(|f| {
+                        let values = utf8_values(f, 10_000, 256, None);
+                        let values = values
+                            .iter()
+                            .map(|value| value.as_deref().map(str::as_bytes))
+                            .collect::<Vec<_>>();
+                        (f, Arc::new(BinaryArray::from(values)) as ArrayRef)
+                    })
+                    .collect(),
+            }],
+        },
     ]
 }
 
-async fn inputs_zones(stores: &[Arc<LanceIndexStore>]) -> u64 {
-    let mut zones = 0;
-    for store in stores {
-        zones += ZoneMapIndex::merge_input_from_metadata(store.as_ref())
-            .await
-            .unwrap()
-            .num_zones;
-    }
-    zones
+/// `rows` strings of `width` bytes for fragment `fragment`; with
+/// `null_every`, every such row is null and so is every row of each 40th
+/// run of 32 rows, which leaves some zones of 16 rows all null.
+fn utf8_values(
+    fragment: u32,
+    rows: usize,
+    width: usize,
+    null_every: Option<usize>,
+) -> Vec<Option<String>> {
+    (0..rows)
+        .map(|row| {
+            let null = null_every.is_some_and(|every| row % every == 0 || (row / 32) % 40 == 7);
+            (!null).then(|| {
+                let key = format!("{fragment:04}-{:07}", row * 7919 % 1_000_003);
+                let mut value = key.repeat(width.div_ceil(key.len()));
+                value.truncate(width);
+                value
+            })
+        })
+        .collect()
+}
+
+fn utf8_fragment(fragment: u32, rows: usize, width: usize, null_every: Option<usize>) -> ArrayRef {
+    Arc::new(StringArray::from(utf8_values(
+        fragment, rows, width, null_every,
+    )))
 }
 
 #[tokio::test]
-async fn test_merge_estimate_bounds_measured_peak() {
-    check_variable_width_values_are_refused().await;
+async fn test_merge_admission_bounds_measured_memory() {
     let mut report = Vec::new();
     for case in cases() {
         let dirs = case
@@ -318,35 +412,29 @@ async fn test_merge_estimate_bounds_measured_peak() {
         let mut coverages = Vec::new();
         for (source, store) in case.sources.iter().zip(&stores) {
             write_source(source, case.rows_per_zone, store.as_ref()).await;
-            let input = ZoneMapIndex::merge_input_from_metadata(store.as_ref())
-                .await
-                .unwrap();
-            let has_nulls = source
-                .fragments
-                .iter()
-                .any(|(_, values)| values.null_count() > 0);
-            // The null positions are stored even when there are none; then
-            // they serialize to a few bytes.
-            assert!(input.null_bitmap_bytes > 0, "{}", case.name);
-            if !has_nulls {
-                assert!(input.null_bitmap_bytes <= 64, "{}", case.name);
-            }
-            assert!(input.num_zones > 0 && input.file_bytes > 0, "{}", case.name);
             coverages.push(RoaringBitmap::from_iter(
                 source.fragments.iter().map(|(fragment_id, _)| *fragment_id),
             ));
         }
-        let (peak, load_peak, estimate) = measure(&stores, &coverages).await;
+        let m = measure(&stores, &coverages).await;
+        let admitted = m.loaded_size + m.merge_estimate;
+        let used = m.retained + m.merge_peak;
         report.push(format!(
-            "{}: zones {}, measured peak {peak} bytes (loading {load_peak}), estimate \
-             {estimate} bytes ({:.2}x)",
+            "{}: loaded size {} >= retained {} ({:.2}x); merge estimate {} >= merge peak {} \
+             ({:.2}x); admitted {admitted} >= used {used} ({:.2}x); load transient peak {}",
             case.name,
-            inputs_zones(&stores).await,
-            estimate as f64 / peak.max(1) as f64
+            m.loaded_size,
+            m.retained,
+            m.loaded_size as f64 / m.retained.max(1) as f64,
+            m.merge_estimate,
+            m.merge_peak,
+            m.merge_estimate as f64 / m.merge_peak.max(1) as f64,
+            admitted as f64 / used.max(1) as f64,
+            m.load_peak,
         ));
         assert!(
-            peak <= estimate,
-            "{}: measured peak {peak} bytes exceeds the estimate {estimate} bytes\n{}",
+            m.retained <= m.loaded_size && m.merge_peak <= m.merge_estimate,
+            "{}: measured memory exceeds the admission\n{}",
             case.name,
             report.join("\n")
         );
@@ -356,27 +444,4 @@ async fn test_merge_estimate_bounds_measured_peak() {
     for line in &report {
         eprintln!("{line}");
     }
-}
-
-/// Values whose decoded size the file metadata does not bound are refused,
-/// not estimated.
-async fn check_variable_width_values_are_refused() {
-    let dir = TempObjDir::default();
-    let store = store(&dir);
-    let source = Source {
-        fragments: vec![(
-            0,
-            Arc::new(StringArray::from_iter_values(
-                (0..100).map(|row| format!("value-{row}")),
-            )) as ArrayRef,
-        )],
-    };
-    write_source(&source, 16, store.as_ref()).await;
-    let error = ZoneMapIndex::merge_input_from_metadata(store.as_ref())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, lance_core::Error::NotSupported { .. }),
-        "{error}"
-    );
 }

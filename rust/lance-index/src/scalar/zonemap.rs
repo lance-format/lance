@@ -38,7 +38,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
 use datafusion_execution::SendableRecordBatchStream;
-use lance_select::{RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
@@ -1453,186 +1453,159 @@ fn remap_zone(
     Ok(zones)
 }
 
-/// What bounds the memory of merging one ZoneMap segment, read from its
-/// file metadata without decoding zones or null positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ZoneMapMergeInput {
-    /// Zones stored in the file.
-    pub num_zones: u64,
-    /// Width in bytes of one `min` or `max` value.
-    pub value_width: u64,
-    /// Serialized size of the stored null positions; 0 when none are stored.
-    pub null_bitmap_bytes: u64,
-    /// Size of the ZoneMap file.
-    pub file_bytes: u64,
-}
-
-/// Bytes per zone of the fixed-width columns of a ZoneMap file: three
-/// `UInt32` counts and three `UInt64` bounds.
+/// Allowance for allocator rounding and bookkeeping of one heap allocation.
+const HEAP_ALLOCATION_OVERHEAD_BYTES: u64 = 16;
+/// Bytes charged per fragment entry of a null position tree: the key and
+/// value with the slack of a partly filled B-tree node.
+const NULL_TREE_ENTRY_BYTES: u64 =
+    3 * (std::mem::size_of::<u32>() + std::mem::size_of::<RowAddrSelection>()) as u64;
+/// Bytes charged per slot of a roaring bitmap's container vector: the
+/// container's key and store descriptor.
+const ROARING_CONTAINER_SLOT_BYTES: u64 = 48;
+/// Heap size of one roaring bitset container (1024 `u64` words).
+const ROARING_BITSET_CONTAINER_BYTES: u64 = 8192;
+/// Fixed allowance for the headers of one null position set.
+const NULL_ROWS_FIXED_BYTES: u64 = 4096;
+/// Inline bytes charged per value of a rebuilt `min` or `max` column: the
+/// widest fixed-width value (256-bit decimals) or a 64-bit offset.
+const BOUND_COLUMN_INLINE_BYTES: u64 = 32;
+/// Bytes per zone of the other columns of a ZoneMap file: three `UInt32`
+/// counts and three `UInt64` bounds.
 const ZONE_FIXED_COLUMN_BYTES: u64 = 3 * 4 + 3 * 8;
+/// Allowance per rebuilt column for its validity bitmap header, alignment
+/// and padding.
+const COLUMN_PADDING_BYTES: u64 = 256;
 /// Columns of a ZoneMap file: `min`, `max` and the six above.
 const ZONE_FILE_COLUMNS: u64 = 8;
-/// Per-buffer allowance for Arrow alignment and padding; every column has at
-/// most a values and a validity buffer.
-const ARROW_BUFFER_PADDING_BYTES: u64 = 2 * 64;
-/// Ratio bounding the in-memory size of deserialized null positions to their
-/// serialized size. The worst shapes are many containers or fragments with a
-/// single null each: a container serializes to at least 6 bytes and an entry
-/// to at least 26, while in memory each costs a container slot, a heap
-/// allocation and (per fragment) a tree entry, about 10x and 6x.
-const NULL_BITMAP_DECODED_FACTOR: u64 = 12;
-/// Fixed allowance for the tree and vector headers of one null position set.
-const NULL_BITMAP_FIXED_BYTES: u64 = 4096;
-/// The modeled total is raised by 1/this for allocations too small or too
-/// scattered to model one by one (per-zone temporaries, allocator rounding).
+/// The modeled merge temporaries are raised by 1/this for allocations too
+/// small or too scattered to model one by one.
 const UNMODELED_ALLOWANCE_DIVISOR: u64 = 4;
 
-impl ZoneMapMergeInput {
-    /// Decoded `RecordBatch` of `num_zones` zones with values `value_width`
-    /// wide, including validity buffers and padding.
-    fn batch_bytes(num_zones: u64, value_width: u64) -> u64 {
-        let per_zone = 2 * value_width + ZONE_FIXED_COLUMN_BYTES;
-        let per_column = num_zones.div_ceil(8) + ARROW_BUFFER_PADDING_BYTES;
-        num_zones
-            .saturating_mul(per_zone)
-            .saturating_add(ZONE_FILE_COLUMNS * per_column)
+/// Heap bytes a zone bound holds beyond its inline `ScalarValue`, from
+/// [`ScalarValue::size`]: the capacity of string and binary values and the
+/// full array memory of nested values, plus an allocator allowance. A nested
+/// value that shares buffers with others is counted in full each time,
+/// which only overstates.
+fn bound_heap_bytes(value: &ScalarValue) -> u64 {
+    let heap = value
+        .size()
+        .saturating_sub(std::mem::size_of::<ScalarValue>()) as u64;
+    if heap == 0 {
+        0
+    } else {
+        heap.saturating_add(HEAP_ALLOCATION_OVERHEAD_BYTES)
     }
+}
 
-    /// Decoded zone statistics, as held by a loaded index.
-    fn zones_bytes(num_zones: u64) -> u64 {
-        num_zones.saturating_mul(std::mem::size_of::<ZoneMapStatistics>() as u64)
-    }
-
-    /// Deserialized null positions.
-    fn null_rows_bytes(&self) -> u64 {
-        if self.null_bitmap_bytes == 0 {
-            return 0;
+/// Bound on the in-memory size of a null position set: the B-tree entries,
+/// each bitmap's container vector with room for growth, and each container's
+/// heap (array containers at their capacity, run containers at twice their
+/// serialized size, bitset containers at 8 KiB), with an allocator
+/// allowance per container.
+fn null_rows_bytes(null_rows: &RowAddrTreeMap) -> u64 {
+    let mut bytes = NULL_ROWS_FIXED_BYTES;
+    for (_, selection) in null_rows.iter() {
+        bytes = bytes.saturating_add(NULL_TREE_ENTRY_BYTES);
+        if let RowAddrSelection::Partial(bitmap) = selection {
+            let stats = bitmap.statistics();
+            let containers = u64::from(stats.n_containers);
+            bytes = bytes
+                .saturating_add(2 * containers * ROARING_CONTAINER_SLOT_BYTES)
+                .saturating_add(containers * HEAP_ALLOCATION_OVERHEAD_BYTES)
+                // Counted by roaring as 4 bytes per `u16` of capacity.
+                .saturating_add(stats.n_bytes_array_containers)
+                .saturating_add(2 * stats.n_bytes_run_containers)
+                .saturating_add(
+                    u64::from(stats.n_bitset_containers) * ROARING_BITSET_CONTAINER_BYTES,
+                );
         }
-        self.null_bitmap_bytes
-            .saturating_mul(NULL_BITMAP_DECODED_FACTOR)
-            .saturating_add(NULL_BITMAP_FIXED_BYTES)
     }
-
-    /// What a loaded source holds until the merge finishes.
-    fn loaded_bytes(&self) -> u64 {
-        Self::zones_bytes(self.num_zones).saturating_add(self.null_rows_bytes())
-    }
-
-    /// Transient memory of loading the source: the encoded pages, the
-    /// decoded batch and a copy of it, the raw null buffer and the copy
-    /// deserialization makes of it.
-    fn load_transient_bytes(&self) -> u64 {
-        self.file_bytes
-            .saturating_add(Self::batch_bytes(self.num_zones, self.value_width).saturating_mul(2))
-            .saturating_add(self.null_bitmap_bytes.saturating_mul(2))
-    }
-}
-
-/// Conservative estimate of the peak memory of loading `inputs` and merging
-/// them into one segment with [`merge_zonemap_indices_by_coverage`]: the
-/// loaded sources, plus the larger of one source's load temporaries and the
-/// merge's own output and temporaries (the merged zones with vector growth,
-/// the stable sort's scratch copy of them, one source's cloned null
-/// positions, the merged null positions, the output batch with the writer's
-/// encoded copy and the serialized null buffer), plus a quarter of that for
-/// unmodeled small allocations.
-///
-/// The estimate assumes no fragment reuse remapping during the merge.
-pub fn estimate_zonemap_merge_bytes(inputs: &[ZoneMapMergeInput]) -> u64 {
-    let total_zones = inputs.iter().map(|input| input.num_zones).sum::<u64>();
-    let value_width = inputs
-        .iter()
-        .map(|input| input.value_width)
-        .max()
-        .unwrap_or(0);
-    let loaded = inputs
-        .iter()
-        .map(ZoneMapMergeInput::loaded_bytes)
-        .fold(0u64, u64::saturating_add);
-    let load_transient = inputs
-        .iter()
-        .map(ZoneMapMergeInput::load_transient_bytes)
-        .max()
-        .unwrap_or(0);
-    let null_rows = inputs
-        .iter()
-        .map(ZoneMapMergeInput::null_rows_bytes)
-        .fold(0u64, u64::saturating_add);
-    let null_buffers = inputs
-        .iter()
-        .map(|input| input.null_bitmap_bytes)
-        .fold(0u64, u64::saturating_add);
-    let largest_null_rows = inputs
-        .iter()
-        .map(ZoneMapMergeInput::null_rows_bytes)
-        .max()
-        .unwrap_or(0);
-    // Up to twice the zones for the growth of the merged vector, once more
-    // for the scratch buffer of the stable sort.
-    let merge = ZoneMapMergeInput::zones_bytes(total_zones)
-        .saturating_mul(3)
-        .saturating_add(largest_null_rows)
-        .saturating_add(null_rows)
-        .saturating_add(ZoneMapMergeInput::batch_bytes(total_zones, value_width).saturating_mul(2))
-        .saturating_add(null_buffers)
-        .saturating_add(NULL_BITMAP_FIXED_BYTES);
-    let modeled = loaded.saturating_add(load_transient.max(merge));
-    modeled.saturating_add(modeled / UNMODELED_ALLOWANCE_DIVISOR)
-}
-
-/// Width in bytes of one decoded zone bound of `data_type`, when the
-/// decoded value has no heap part whose size the file metadata leaves open.
-fn fixed_zone_value_width(data_type: &DataType) -> Option<u64> {
-    if matches!(data_type, DataType::Boolean) {
-        return Some(1);
-    }
-    data_type.primitive_width().map(|width| width as u64)
+    bytes
 }
 
 impl ZoneMapIndex {
-    /// Read what bounds the memory of merging the segment in `store` from
-    /// its file metadata, without decoding zones or null positions.
-    ///
-    /// Fails with `NotSupported` when the metadata does not give a safe
-    /// bound: values that are not fixed width (strings, binary, nested
-    /// types), or a file reader that does not report the file or null buffer
-    /// size.
-    pub async fn merge_input_from_metadata(store: &dyn IndexStore) -> Result<ZoneMapMergeInput> {
-        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
-        let schema = index_file.schema();
-        let value_type = schema
-            .field("min")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?
-            .data_type();
-        let value_width = fixed_zone_value_width(&value_type).ok_or_else(|| {
-            Error::not_supported(format!(
-                "cannot bound the memory of merging ZoneMap values of type {value_type} \
-                 from file metadata"
-            ))
-        })?;
-        let file_bytes = index_file.file_size_bytes().ok_or_else(|| {
-            Error::not_supported("the ZoneMap file reader does not report the file size")
-        })?;
-        let null_bitmap_bytes = match schema.metadata.get(NULL_BITMAP_META_KEY) {
-            Some(idx_str) => {
-                let idx = idx_str.parse::<u32>().map_err(|e| {
-                    Error::invalid_input(format!("invalid null bitmap buffer index: {e}"))
-                })?;
-                index_file.global_buffer_size_bytes(idx).ok_or_else(|| {
-                    Error::not_supported(
-                        "the ZoneMap file reader does not report the null bitmap size",
-                    )
-                })?
-            }
-            None => 0,
-        };
-        Ok(ZoneMapMergeInput {
-            num_zones: index_file.num_rows() as u64,
-            value_width,
-            null_bitmap_bytes,
-            file_bytes,
-        })
+    /// Heap bytes of this segment's zone bounds: [`bound_heap_bytes`] of
+    /// every `min` and `max`.
+    fn bounds_heap_bytes(&self) -> u64 {
+        self.zones
+            .iter()
+            .map(|zone| bound_heap_bytes(&zone.min).saturating_add(bound_heap_bytes(&zone.max)))
+            .fold(0u64, u64::saturating_add)
     }
+
+    fn null_rows_bytes(&self) -> u64 {
+        self.null_rows.as_ref().map_or(0, null_rows_bytes)
+    }
+
+    /// Memory this loaded segment holds for as long as it is loaded: its
+    /// zones (including the heap bytes of string, binary and nested bounds)
+    /// and its null positions. This is counted from what was actually
+    /// loaded, for every value type.
+    ///
+    /// It does not count the transient memory of loading the segment (the
+    /// read and decoded file pages, freed once the zones are parsed); that is
+    /// the same as for any query that loads the segment.
+    pub fn loaded_size_bytes(&self) -> u64 {
+        let zones = (self.zones.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<ZoneMapStatistics>() as u64);
+        zones
+            .saturating_add(self.bounds_heap_bytes())
+            .saturating_add(self.null_rows_bytes())
+    }
+}
+
+/// Conservative estimate of the memory that merging the loaded `sources`
+/// with [`merge_zonemap_indices_by_coverage`] needs on top of the sources
+/// themselves ([`ZoneMapIndex::loaded_size_bytes`]), computed from what the
+/// sources actually hold: the merged zones with vector growth and the
+/// stable sort's scratch, their cloned bounds, one source's cloned null
+/// positions, the merged null positions, the output batch, the writer's
+/// encoded copy of it and the serialized null positions, plus a quarter of
+/// that for unmodeled small allocations. Every zone is counted, whether or
+/// not its fragment is kept.
+///
+/// The estimate assumes no fragment reuse remapping during the merge.
+pub fn estimate_zonemap_merge_bytes(sources: &[&ZoneMapIndex]) -> u64 {
+    let zones = sources
+        .iter()
+        .map(|source| source.zones.len() as u64)
+        .sum::<u64>();
+    let bounds_heap = sources
+        .iter()
+        .map(|source| source.bounds_heap_bytes())
+        .fold(0u64, u64::saturating_add);
+    let null_rows = sources
+        .iter()
+        .map(|source| source.null_rows_bytes())
+        .fold(0u64, u64::saturating_add);
+    let largest_null_rows = sources
+        .iter()
+        .map(|source| source.null_rows_bytes())
+        .max()
+        .unwrap_or(0);
+
+    // Up to twice the zones for the growth of the merged vector, once more
+    // for the scratch buffer of the stable sort, and a clone of every bound.
+    let merged_zones = zones
+        .saturating_mul(3 * std::mem::size_of::<ZoneMapStatistics>() as u64)
+        .saturating_add(bounds_heap);
+    // The bound columns are built by growing builders: up to twice their
+    // values while the last growth copies them, so three times in all.
+    let batch = bounds_heap
+        .saturating_mul(3)
+        .saturating_add(
+            zones.saturating_mul(2 * BOUND_COLUMN_INLINE_BYTES + ZONE_FIXED_COLUMN_BYTES),
+        )
+        .saturating_add(zones.div_ceil(8).saturating_mul(ZONE_FILE_COLUMNS))
+        .saturating_add(ZONE_FILE_COLUMNS * COLUMN_PADDING_BYTES);
+    // The serialized null positions are no larger than their in-memory
+    // bound, which already covers the merged set.
+    let modeled = merged_zones
+        .saturating_add(largest_null_rows)
+        .saturating_add(null_rows.saturating_mul(2))
+        .saturating_add(batch.saturating_mul(2))
+        .saturating_add(NULL_ROWS_FIXED_BYTES);
+    modeled.saturating_add(modeled / UNMODELED_ALLOWANCE_DIVISOR)
 }
 
 /// Merge caller-selected ZoneMap segments into one self-contained segment.

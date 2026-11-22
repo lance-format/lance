@@ -318,12 +318,6 @@ pub trait IndexReader: Send + Sync {
     fn file_size_bytes(&self) -> Option<u64> {
         None
     }
-
-    /// Size in bytes of global buffer `index`, from the file metadata the
-    /// reader already holds (no extra I/O), else `None`.
-    fn global_buffer_size_bytes(&self, _index: u32) -> Option<u64> {
-        None
-    }
 }
 
 /// Trait abstracting I/O away from index logic
