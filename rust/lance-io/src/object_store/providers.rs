@@ -1206,6 +1206,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_does_not_retain_storage_options_provider() {
+        /// Holds the registry like a namespace client held by a real provider.
+        #[derive(Debug)]
+        struct RegistryHoldingStorageOptionsProvider {
+            // The accessor owns this provider, and this provider owns the
+            // registry. A cache key that retained the accessor closes the cycle.
+            _registry: Arc<ObjectStoreRegistry>,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageOptionsProvider for RegistryHoldingStorageOptionsProvider {
+            async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+                Ok(None)
+            }
+
+            fn provider_id(&self) -> String {
+                "registry-holding-provider".to_string()
+            }
+        }
+
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let provider = Arc::new(RegistryHoldingStorageOptionsProvider {
+            _registry: registry.clone(),
+        });
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor.clone()),
+            ..Default::default()
+        };
+        let store = registry
+            .get_store(Url::parse("file:///tmp").unwrap(), &params)
+            .await
+            .unwrap();
+        assert_eq!(store.scheme(), "file");
+        let provider_weak = Arc::downgrade(&provider);
+
+        drop(store);
+        drop(params);
+        drop(accessor);
+        drop(provider);
+        drop(registry);
+
+        assert!(
+            provider_weak.upgrade().is_none(),
+            "the object store cache retained the storage options provider"
+        );
+    }
+
+    #[tokio::test]
     async fn test_new_store_bypasses_cache() {
         let registry = ObjectStoreRegistry::default();
         let url = Url::parse("memory://test").unwrap();
