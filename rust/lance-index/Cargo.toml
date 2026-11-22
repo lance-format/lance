@@ -12,6 +12,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc = { workspace = true, optional = true }
 arc-swap = { workspace = true, features = ["weak"] }
 arrow.workspace = true
 arrow-array.workspace = true
@@ -97,6 +98,7 @@ serial_test.workspace = true
 chrono.workspace = true
 
 [features]
+fts-format-research = ["dep:libc"]
 # Retained for compatibility; protobuf sources are now checked in.
 protoc = []
 jieba-rs = ["tokenizer-jieba"]
