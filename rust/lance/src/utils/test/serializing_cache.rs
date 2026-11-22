@@ -4,12 +4,49 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Future;
 use lance_core::Result;
-use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend};
+use lance_core::cache::{
+    CacheBackend, CacheCodec, CacheEntry, CacheFileReader, InternalCacheKey, MokaCacheBackend,
+};
+
+#[derive(Debug)]
+struct ByteReader {
+    bytes: Bytes,
+    opened: AtomicBool,
+    state: Arc<FileReadState>,
+}
+
+#[derive(Default, Debug)]
+pub struct FileReadState {
+    pub block_reads: AtomicUsize,
+    pub fail_payload: AtomicBool,
+}
+
+impl CacheFileReader for ByteReader {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn read_range(&self, range: std::ops::Range<usize>) -> Result<Bytes> {
+        if self.opened.load(Ordering::Acquire) {
+            self.state.block_reads.fetch_add(1, Ordering::Relaxed);
+            if self.state.fail_payload.load(Ordering::Relaxed) {
+                return Err(lance_core::Error::io(
+                    "test cache file read failed after open",
+                ));
+            }
+        }
+        if self.bytes.get(range.clone()).is_none() {
+            return Err(lance_core::Error::io("test cache read outside payload"));
+        }
+        Ok(self.bytes.slice(range))
+    }
+}
 
 #[derive(Debug)]
 struct SerializedEntry {
@@ -35,20 +72,28 @@ struct SerializedStore {
 pub struct SerializingCacheBackend {
     serialized: Arc<SerializedStore>,
     l1: MokaCacheBackend,
+    file_reads: Option<Arc<FileReadState>>,
 }
 
 impl SerializingCacheBackend {
     pub fn new() -> Self {
         Self {
             serialized: Arc::new(SerializedStore::default()),
+            file_reads: None,
             l1: MokaCacheBackend::with_capacity(256 * 1024 * 1024),
         }
+    }
+
+    pub fn with_file_reader(mut self, reads: Arc<FileReadState>) -> Self {
+        self.file_reads = Some(reads);
+        self
     }
 
     /// Recreate the backend over the same serialized bytes and an empty L1.
     pub fn restart(&self) -> Self {
         Self {
             serialized: self.serialized.clone(),
+            file_reads: self.file_reads.clone(),
             l1: MokaCacheBackend::with_capacity(256 * 1024 * 1024),
         }
     }
@@ -85,6 +130,22 @@ impl CacheBackend for SerializingCacheBackend {
             .await
             .get(key)
             .map(|entry| entry.bytes.clone())?;
+        if let Some(state) = &self.file_reads
+            && codec.supports_file_reader()
+        {
+            let reader = Arc::new(ByteReader {
+                bytes: bytes.clone(),
+                state: state.clone(),
+                opened: AtomicBool::new(false),
+            });
+            if let Some(value) = codec
+                .deserialize_from_reader(reader.clone())
+                .expect("fixture was written by the codec")
+            {
+                reader.opened.store(true, Ordering::Release);
+                return Some(value);
+            }
+        }
         codec.deserialize(&bytes).hit()
     }
 

@@ -62,8 +62,8 @@ pub mod telemetry;
 pub use backend::{CacheBackend, CacheEntry, CacheLoader, CacheTier, ImmediateCacheRead};
 pub use backend_uri::{build_from_uri, parse_backend_uri};
 pub use codec::{
-    CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, CacheRangeReader, MAGIC,
-    has_cache_envelope,
+    CacheCodec, CacheCodecImpl, CacheDecode, CacheFileReader, CacheMissReason, CacheRangeReader,
+    MAGIC, has_cache_envelope,
 };
 pub use diagnostics::{
     CacheActivity, CacheBackendDiagnostics, CacheBackendKind, CacheByTypeDiagnostics,

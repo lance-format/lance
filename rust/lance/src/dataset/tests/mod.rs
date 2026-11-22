@@ -9,6 +9,7 @@ mod dataset_clustering_metadata;
 mod dataset_common;
 mod dataset_concurrency_store;
 mod dataset_fts_combined_fields;
+mod dataset_fts_file_positions;
 mod dataset_fts_plan_state;
 #[cfg(feature = "geo")]
 mod dataset_geo;

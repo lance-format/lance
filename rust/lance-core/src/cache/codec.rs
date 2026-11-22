@@ -199,6 +199,21 @@ impl<F: Fn(std::ops::Range<usize>) -> Result<Bytes>> CacheRangeReader for F {
     }
 }
 
+/// Bounded reads from one immutable incarnation of a cached value. The backend
+/// keeps the file and its capacity charge alive for as long as a decoded value
+/// references this reader. All reads are blocking and must return exactly the
+/// requested logical bytes, or an error.
+pub trait CacheFileReader: std::fmt::Debug + Send + Sync {
+    /// Logical length of the complete serialized entry, excluding I/O padding.
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn read_range(&self, range: std::ops::Range<usize>) -> Result<Bytes>;
+}
+
 /// Serialization trait for cache entries.
 ///
 /// **Experimental**: the serialized format is not yet covered by a stability
@@ -218,6 +233,22 @@ impl<F: Fn(std::ops::Range<usize>) -> Result<Bytes>> CacheRangeReader for F {
 /// The read sequence mirroring the write sequence for each `type_version` is
 /// the invariant the implementor owns.
 pub trait CacheCodecImpl: Send + Sync {
+    /// Whether the codec can retain a backend-owned immutable file.
+    const SUPPORTS_FILE_READER: bool = false;
+
+    /// Decode metadata and retain the reader for later payload access. Return
+    /// `None` for a valid layout that needs the regular whole-entry decoder.
+    fn decode_from_reader(
+        _reader: Arc<dyn CacheFileReader>,
+        _body_offset: usize,
+        _version: u32,
+    ) -> Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
     /// Whether this body supports gathering sorted, unique row offsets.
     const SUPPORTS_ROW_SELECTION: bool = false;
     fn deserialize_rows(
@@ -279,6 +310,7 @@ pub trait CacheCodecImpl: Send + Sync {
 
 pub(crate) type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
 
+type FileDecoder = fn(Arc<dyn CacheFileReader>, usize, u32) -> Result<Option<ArcAny>>;
 type RowDecoder = fn(&dyn CacheRangeReader, usize, u32, &[u32]) -> Result<ArcAny>;
 type RowPlanner =
     fn(&dyn CacheRangeReader, usize, u32, &[u32]) -> Result<Option<Vec<std::ops::Range<usize>>>>;
@@ -297,6 +329,7 @@ const ENVELOPE_VERSION_BYTES: usize = 4;
 /// a direct impl).
 #[derive(Copy, Clone)]
 pub struct CacheCodec {
+    file_decoder: Option<FileDecoder>,
     row_decoder: Option<RowDecoder>,
     row_planner: Option<RowPlanner>,
     memory_priority: u8,
@@ -347,6 +380,7 @@ impl CacheCodec {
         deserialize_body: fn(&mut CacheEntryReader<'_>) -> Result<ArcAny>,
     ) -> Self {
         Self {
+            file_decoder: None,
             row_decoder: None,
             row_planner: None,
             memory_priority: 0,
@@ -361,6 +395,14 @@ impl CacheCodec {
     /// Create a `CacheCodec` from a [`CacheCodecImpl`] implementation.
     pub fn from_impl<T: CacheCodecImpl + 'static>() -> Self {
         Self {
+            file_decoder: if T::SUPPORTS_FILE_READER {
+                Some(|reader, offset, version| {
+                    Ok(T::decode_from_reader(reader, offset, version)?
+                        .map(|entry| Arc::new(entry) as ArcAny))
+                })
+            } else {
+                None
+            },
             row_decoder: if T::SUPPORTS_ROW_SELECTION {
                 Some(|reader, offset, version, rows| {
                     Ok(Arc::new(T::deserialize_rows(reader, offset, version, rows)?) as ArcAny)
@@ -419,20 +461,35 @@ impl CacheCodec {
         (self.serialize_body)(value, &mut entry_writer)
     }
 
+    pub fn supports_file_reader(&self) -> bool {
+        self.file_decoder.is_some()
+    }
+
+    /// Decode using an immutable file instead of reading its full payload.
+    /// `Ok(None)` requests the whole-entry decoder. An error indicates an
+    /// unreadable entry; the backend should use its origin loader.
+    pub fn deserialize_from_reader(
+        &self,
+        reader: Arc<dyn CacheFileReader>,
+    ) -> Result<Option<ArcAny>> {
+        let Some(decode) = self.file_decoder else {
+            return Ok(None);
+        };
+        let (offset, version) = self.read_range_envelope(&|range| reader.read_range(range))?;
+        decode(reader, offset, version)
+    }
+
     pub fn supports_row_selection(&self) -> bool {
         self.row_decoder.is_some()
     }
 
     /// Read and validate the envelope of a range-read entry, returning the
     /// body offset and the entry's `type_version`.
-    fn read_row_envelope(&self, reader: &dyn CacheRangeReader) -> Result<(usize, u32)> {
-        let prefix = reader.read_range(0..ENVELOPE_ID_OFFSET)?;
-        let id_bytes = prefix
-            .get(ENVELOPE_ID_OFFSET - 2..ENVELOPE_ID_OFFSET)
-            .ok_or_else(|| Error::invalid_input("short cache envelope"))?;
-        let id_len = u16::from_le_bytes(id_bytes.try_into().unwrap()) as usize;
-        let header =
-            reader.read_range(0..(ENVELOPE_ID_OFFSET + id_len + ENVELOPE_VERSION_BYTES))?;
+    fn read_range_envelope(&self, reader: &dyn CacheRangeReader) -> Result<(usize, u32)> {
+        // A matching envelope must contain this exact type ID. Reading its
+        // expected length also avoids a second disk read just to size the ID.
+        let header_len = ENVELOPE_ID_OFFSET + self.type_id.len() + ENVELOPE_VERSION_BYTES;
+        let header = reader.read_range(0..header_len)?;
         let envelope = parse_envelope(&header)
             .ok_or_else(|| Error::invalid_input("invalid cache envelope"))?;
         if envelope.type_id != self.type_id || envelope.type_version > self.version {
@@ -451,7 +508,7 @@ impl CacheCodec {
             let decoder = self
                 .row_decoder
                 .ok_or_else(|| Error::invalid_input("row selection unsupported"))?;
-            let (body_offset, version) = self.read_row_envelope(reader)?;
+            let (body_offset, version) = self.read_range_envelope(reader)?;
             decoder(reader, body_offset, version, rows)
         };
         match decode() {
@@ -471,7 +528,7 @@ impl CacheCodec {
         rows: &[u32],
     ) -> Option<Vec<std::ops::Range<usize>>> {
         let planner = self.row_planner?;
-        let (body_offset, version) = self.read_row_envelope(reader).ok()?;
+        let (body_offset, version) = self.read_range_envelope(reader).ok()?;
         planner(reader, body_offset, version, rows).ok().flatten()
     }
 
