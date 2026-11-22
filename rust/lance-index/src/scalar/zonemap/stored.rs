@@ -169,7 +169,7 @@ pub(super) fn matches_target_zones(
 impl ReusedZones {
     /// Take fragment `fragment_id`'s statistics whole from a committed
     /// segment. Accepted only when the segment holds exactly the fragment's
-    /// target zones (see [`matches_target_zones`]) with a known NaN sign
+    /// target zones (see `matches_target_zones`) with a known NaN sign
     /// split, and, when this accumulator keeps null positions, positions
     /// inside the fragment that agree with the records' null counts. The
     /// records are kept as stored. Returns `false`, keeping nothing, when
