@@ -836,6 +836,7 @@ pub mod tests {
             dataset.manifest_location.naming_scheme,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1044,6 +1045,7 @@ pub mod tests {
             dataset.manifest_location.naming_scheme,
             None,
             false,
+            None,
         )
         .await
         .unwrap_err();
