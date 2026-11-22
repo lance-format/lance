@@ -672,8 +672,8 @@ mod tests {
     use super::super::impact::{ImpactSkipData, ImpactSkipDataBuilder};
     use super::super::index::{
         CompressedPositionStorage, CompressedPostingList, IMPACT_COL, POSTING_BLOCK_SIZE_KEY,
-        POSTING_COL, PlainPostingList, PositionStreamCodec, Positions, PostingList,
-        PostingListGroup, PostingTailCodec, SharedPositionStream,
+        POSTING_COL, PlainPostingList, PositionStreamCodec, PositionStreamSource, Positions,
+        PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
     };
     use super::super::tokenizer::LEGACY_BLOCK_SIZE;
 
@@ -1527,6 +1527,40 @@ mod tests {
         }
 
         #[test]
+        fn shared_stream_views_expose_the_same_payload_and_offsets() {
+            let expected = vec![0xa5; 16384];
+            let file = positions_file(vec![0, 49, 8192], expected.clone());
+            let codec = CacheCodec::from_impl::<Positions>();
+            let whole = codec.deserialize(&file.data).hit().unwrap();
+            let selective = codec
+                .deserialize_from_reader(file.clone())
+                .unwrap()
+                .unwrap();
+            let whole = whole.downcast_ref::<Positions>().unwrap();
+            let selective = selective.downcast_ref::<Positions>().unwrap();
+            let (codec_a, offsets_a, PositionStreamSource::Resident(bytes)) =
+                whole.shared_stream_source().unwrap()
+            else {
+                panic!("expected resident stream");
+            };
+            file.reads.lock().unwrap().clear();
+            let (codec_b, offsets_b, PositionStreamSource::File { reader, raw_start }) =
+                selective.shared_stream_source().unwrap()
+            else {
+                panic!("expected file stream");
+            };
+            assert!(file.reads.lock().unwrap().is_empty());
+            assert_eq!(codec_a, codec_b);
+            assert_eq!(offsets_a, &[0, 49, 8192]);
+            assert_eq!(offsets_b, offsets_a);
+            assert_eq!(bytes, expected.as_slice());
+            assert_eq!(
+                reader.read_range(raw_start..reader.len()).unwrap().as_ref(),
+                bytes
+            );
+        }
+
+        #[test]
         fn positions_file_rejects_invalid_directory_and_truncation() {
             let codec = CacheCodec::from_impl::<Positions>();
             for offsets in [vec![1], vec![0, 20, 15], vec![0, 60], Vec::new()] {
@@ -1553,6 +1587,7 @@ mod tests {
             let positions = Positions::from(CompressedPositionStorage::LegacyPerDoc(
                 legacy_positions(&[&[2]]),
             ));
+            assert!(positions.shared_stream_source().is_none());
             let file = Arc::new(FileFixture {
                 data: serialize_typed_entry(positions).into(),
                 reads: Default::default(),

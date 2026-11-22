@@ -8,6 +8,43 @@ use super::*;
 #[derive(Clone)]
 pub struct Positions(pub(in super::super) CachedPositions);
 
+/// The compressed payload of a shared positions stream. Block offsets are
+/// relative to this payload, including when it starts inside a cache file.
+#[derive(Debug)]
+pub enum PositionStreamSource<'a> {
+    Resident(&'a [u8]),
+    File {
+        reader: &'a dyn lance_core::cache::CacheFileReader,
+        raw_start: usize,
+    },
+}
+
+impl Positions {
+    /// Borrow the codec, block offsets and payload from the same immutable
+    /// value. A cache can size a RAM admission before copying either section.
+    /// Legacy per-document positions have no shared stream.
+    pub fn shared_stream_source(
+        &self,
+    ) -> Option<(PositionStreamCodec, &[u32], PositionStreamSource<'_>)> {
+        match &self.0 {
+            CachedPositions::Resident(CompressedPositionStorage::SharedStream(stream)) => Some((
+                stream.codec(),
+                stream.block_offsets(),
+                PositionStreamSource::Resident(stream.bytes()),
+            )),
+            CachedPositions::File(file) => Some((
+                file.codec,
+                file.block_offsets.as_ref(),
+                PositionStreamSource::File {
+                    reader: file.reader.as_ref(),
+                    raw_start: file.raw_start,
+                },
+            )),
+            CachedPositions::Resident(CompressedPositionStorage::LegacyPerDoc(_)) => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(in super::super) enum CachedPositions {
     Resident(CompressedPositionStorage),
