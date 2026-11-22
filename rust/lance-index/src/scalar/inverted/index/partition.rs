@@ -228,6 +228,20 @@ impl FuzzyAutomaton {
             Ok(Self::Unicode(levenshtein))
         }
     }
+
+    /// Whether `candidate` is accepted by this fuzzy automaton (exact prefix +
+    /// bounded edit distance), matching FST dictionary traversal byte-for-byte.
+    #[inline]
+    pub(in crate::scalar::inverted) fn matches_str(&self, candidate: &str) -> bool {
+        let mut state = self.start();
+        for &byte in candidate.as_bytes() {
+            state = self.accept(&state, byte);
+            if !self.can_match(&state) {
+                return false;
+            }
+        }
+        self.is_match(&state)
+    }
 }
 
 impl Automaton for FuzzyAutomaton {

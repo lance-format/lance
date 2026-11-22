@@ -36,6 +36,7 @@ pub use combined::{
 };
 pub use compound::{
     PreparedFtsGlobalStatistics, PreparedFtsQueryLeaf, compound_search,
+    compound_search_prepared_leaves, compound_search_prepared_leaves_with_score_floor,
     compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
     compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
     exclusive_scaled_score_floor, materialized_compound_top_k, prepare_fts_global_statistics,
