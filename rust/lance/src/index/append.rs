@@ -19,10 +19,11 @@ use lance_index::{
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{
         CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
-        inverted::InvertedIndex,
+        inverted::{InvertedIndex, METADATA_FILE},
         json,
         lance_format::LanceIndexStore,
         list_element::ListElementIndex,
+        registry::{TrainingCriteria, TrainingOrdering},
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
         zonemap::ZoneMapIndexVersion,
@@ -2149,6 +2150,56 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     new_dataset_version,
                 ))
             }
+        } else if options.num_indices_to_merge == Some(0)
+            && let Some(resolved) = &resolved_fts
+            && old_indices
+                .iter()
+                .all(|idx| super::segment::segment_has_inverted_details(idx))
+            && let Some(reference) = old_indices.last()
+            && reference
+                .files
+                .as_ref()
+                .is_some_and(|files| files.iter().any(|file| file.path == METADATA_FILE))
+        {
+            // A partitioned FTS segment trains a delta from new rows alone. Its
+            // metadata has the tokenizer and posting format; opening its partitions
+            // (or those of any sibling) would only populate the reader cache.
+            // Legacy segments without partition metadata keep their rebuild path.
+            if unindexed.is_empty() {
+                return Ok(None);
+            }
+            let params = super::scalar::load_scalar_segment_params(&dataset, reference).await?;
+            let fts_params = serde_json::from_str(params.params.as_deref().unwrap_or("{}"))?;
+            let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_id();
+            let data = load_fts_training_data(
+                &dataset,
+                resolved,
+                &criteria,
+                Some(unindexed.to_vec()),
+                true,
+                None,
+                &fts_params,
+            )
+            .await?;
+            let new_uuid = Uuid::new_v4();
+            let created_index = super::scalar::build_scalar_index(
+                &dataset,
+                &resolved.canonical_path,
+                new_uuid,
+                &params,
+                true,
+                None,
+                Some((data, criteria)),
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await?;
+            Ok((
+                new_uuid,
+                Vec::new(),
+                base_unindexed_bitmap,
+                created_index,
+                dataset.manifest.version,
+            ))
         } else {
             let mut indices = Vec::with_capacity(old_indices.len());
             for idx in old_indices {

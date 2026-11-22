@@ -5,6 +5,7 @@
 
 mod clone_commit;
 mod count_pushdown;
+mod fts_append;
 mod fts_plan_reconstruction;
 mod json_write;
 mod label_list_optimize;
