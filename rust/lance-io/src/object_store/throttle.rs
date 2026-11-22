@@ -61,26 +61,21 @@ const DELETE_CONCURRENCY: usize = 10;
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
-/// Regrettably, this information is not fully exposed by the `object_store` crate.
-/// There is no generic mechanism for a custom object store to return a throttle error.
-///
-/// However, the builtin object stores all use RetryError when retries are configured and
-/// throttle errors are returned.  Sadly, RetryError is not a public type, so we have to
-/// infer it from the error message.  This is potentially dangerous because these errors
-/// often include the URI itself and that URI could have any characters in it (e.g. if we
-/// look for 429 then we might match a 429 in a UUID).These error messages currently look like:
-///
-/// ", after ... retries, max_retries: ..., retry_timeout: ..."
-///
-/// So, as a crude heuristic, which should work for the builtin object stores, but won't
-/// work for custom object stores, we simply look for the string "retries, max_retries"
-/// in the error message.
+/// Native cloud stores wrap HTTP errors in a private `RetryError`. Inspect the
+/// underlying error message for a 503, including responses without a body or
+/// retry count. Keep the existing message checks for other store implementations.
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
+        let is_service_unavailable = source.source().is_some_and(|cause| {
+            cause
+                .to_string()
+                .starts_with("Server returned non-2xx status code: 503 ")
+        });
         let message = source.to_string();
         let lowercase = message.to_ascii_lowercase();
-        lowercase.contains("retries, max_retries")
+        is_service_unavailable
+            || lowercase.contains("retries, max_retries")
             || lowercase.contains("serverbusy")
             || lowercase.contains("server busy")
             || lowercase.contains("egress is over the account limit")
@@ -1675,6 +1670,45 @@ mod tests {
             msg,
             expected
         );
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_retries_s3_head_with_bodyless_503_and_no_client_retries() {
+        use object_store::RetryConfig;
+        use object_store::aws::AmazonS3Builder;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_endpoint(server.uri())
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+
+        let config = AimdThrottleConfig {
+            max_retries: 1,
+            min_backoff_ms: 0,
+            max_backoff_ms: 0,
+            ..Default::default()
+        };
+        let store = AimdThrottledStore::new(Arc::new(store), config).unwrap();
+        let err = store.head(&Path::from("object")).await.unwrap_err();
+        assert!(err.to_string().contains("status code: 503"));
+        assert!(is_throttle_error(&err));
     }
 
     #[test]
