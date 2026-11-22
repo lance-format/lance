@@ -156,6 +156,7 @@ pub async fn take_with_io_parallelism(
 async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
+    io_parallelism: Option<NonZeroU32>,
 ) -> Result<RecordBatch> {
     // If we need row addresses in output, add to projection's output expressions
     let projection = if builder.with_row_address {
@@ -218,16 +219,20 @@ async fn do_take_rows(
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
-    let read_config = match builder.io_parallelism {
+    let store_parallelism = builder.dataset.object_store.io_parallelism();
+    let fragment_concurrency = match io_parallelism {
+        Some(io_parallelism) => store_parallelism.min(io_parallelism.get() as usize),
+        None => store_parallelism,
+    };
+    let read_config = match io_parallelism {
         Some(io_parallelism) => {
             let config = SchedulerConfig::new(SchedulerConfig::max_bandwidth_bytes(
-                io_parallelism as usize,
+                io_parallelism.get() as usize,
             ));
             read_config.with_scan_scheduler(ScanScheduler::new_with_io_parallelism(
                 builder.dataset.object_store.clone(),
                 config,
-                NonZeroU32::new(io_parallelism)
-                    .expect("io_parallelism is validated before take_rows"),
+                io_parallelism,
             ))
         }
         None => read_config,
@@ -294,7 +299,7 @@ async fn do_take_rows(
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-            .buffered(builder.dataset.object_store.io_parallelism())
+            .buffered(fragment_concurrency)
             .try_collect()
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
@@ -332,7 +337,7 @@ async fn do_take_rows(
                     read_config.clone().with_row_address(true),
                 )
             })
-            .buffered(builder.dataset.object_store.io_parallelism())
+            .buffer_unordered(fragment_concurrency)
             .try_collect::<Vec<_>>()
             .await?;
         let one_batch = if batches.len() > 1 {
@@ -410,13 +415,21 @@ async fn do_take_rows(
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
+    let io_parallelism = builder
+        .io_parallelism
+        .map(|io_parallelism| {
+            NonZeroU32::new(io_parallelism).ok_or_else(|| {
+                Error::invalid_input("TakeBuilder io_parallelism must be greater than 0, got 0")
+            })
+        })
+        .transpose()?;
     if builder.is_empty() {
         return builder.empty_batch();
     }
 
     let projection = builder.projection.clone();
 
-    do_take_rows(builder, projection).await
+    do_take_rows(builder, projection, io_parallelism).await
 }
 
 fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
@@ -605,11 +618,6 @@ impl TakeBuilder {
 
     /// Execute the take operation and return a single batch
     pub async fn execute(self) -> Result<RecordBatch> {
-        if self.io_parallelism == Some(0) {
-            return Err(Error::invalid_input(
-                "TakeBuilder io_parallelism must be greater than 0, got 0",
-            ));
-        }
         take_rows(self).await
     }
 
@@ -2131,6 +2139,25 @@ mod test {
             .await
             .unwrap();
         assert_eq!(expected, values);
+        // Large caps (including u32::MAX) must work without over-allocating.
+        let values = dataset
+            .take_with_io_parallelism(&logical_indices, projection.clone(), u32::MAX)
+            .await
+            .unwrap();
+        assert_eq!(expected, values);
+
+        // Sorted multi-fragment selections take the ordered path.
+        let sorted_logical_indices = [0, 40, 199, 399];
+        let sorted_expected = dataset
+            .take(&sorted_logical_indices, projection.clone())
+            .await
+            .unwrap();
+        let sorted_values = dataset
+            .take_with_io_parallelism(&sorted_logical_indices, projection.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(sorted_expected, sorted_values);
+
         let empty = dataset
             .take_with_io_parallelism(&[], projection.clone(), 1)
             .await
@@ -2145,7 +2172,17 @@ mod test {
         assert!(error.to_string().contains("io_parallelism"), "{error}");
 
         let error = dataset
-            .take_builder(&indices, projection)
+            .take_builder(&indices, projection.clone())
+            .unwrap()
+            .with_io_parallelism(0)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("io_parallelism"), "{error}");
+
+        let error = dataset
+            .take_builder(&[], projection)
             .unwrap()
             .with_io_parallelism(0)
             .execute()
@@ -2237,11 +2274,29 @@ mod test {
 
         peak_reads.store(0, Ordering::SeqCst);
         let capped = dataset
-            .take_with_io_parallelism(&indices, projection, 2)
+            .take_with_io_parallelism(&indices, projection.clone(), 2)
             .await
             .unwrap();
 
         assert_eq!(capped, uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), fragment_fanout.min(2));
+
+        // Sorted multi-fragment takes must enforce the same cap.
+        let sorted_indices = (0_u64..10)
+            .map(|fragment| fragment * 40)
+            .collect::<Vec<_>>();
+        let sorted_uncapped = dataset
+            .take(&sorted_indices, projection.clone())
+            .await
+            .unwrap();
+        peak_reads.store(0, Ordering::SeqCst);
+        let sorted_capped = dataset
+            .take_with_io_parallelism(&sorted_indices, projection, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(sorted_capped, sorted_uncapped);
         assert_eq!(active_reads.load(Ordering::SeqCst), 0);
         assert_eq!(peak_reads.load(Ordering::SeqCst), fragment_fanout.min(2));
     }
