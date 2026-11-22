@@ -10,7 +10,7 @@ use object_store::path::Path;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU32};
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,10 +63,13 @@ struct PrioritiesInFlight {
     in_flight: Vec<u128>,
 }
 
+const MAX_INITIAL_IN_FLIGHT_CAPACITY: u32 = 256;
+
 impl PrioritiesInFlight {
     fn new(capacity: u32) -> Self {
+        let initial_capacity = (capacity.min(MAX_INITIAL_IN_FLIGHT_CAPACITY) as usize) * 2;
         Self {
-            in_flight: Vec::with_capacity(capacity as usize * 2),
+            in_flight: Vec::with_capacity(initial_capacity),
         }
     }
 
@@ -1014,7 +1017,9 @@ impl SchedulerConfig {
     /// for callers that must reason about it without holding the store — to divide it between
     /// several schedulers, say.
     pub fn max_bandwidth_bytes(io_parallelism: usize) -> u64 {
-        MAX_BANDWIDTH_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64
+        MAX_BANDWIDTH_BYTES_PER_IO_THREAD
+            .saturating_mul(io_parallelism.max(1) as u64)
+            .min(i64::MAX as u64)
     }
 
     pub fn with_lite_scheduler(self) -> Self {
@@ -1038,12 +1043,35 @@ impl ScanScheduler {
     /// the option is absent. Fail-fast cancellation is scoped to the physical
     /// tasks of one logical request and does not affect other requests.
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
+        Self::new_inner(object_store, config, None)
+    }
+
+    /// Create a scheduler with a caller-supplied request concurrency limit.
+    ///
+    /// This selects the standard scheduler because the lite scheduler does not
+    /// enforce a request concurrency limit.
+    pub fn new_with_io_parallelism(
+        object_store: Arc<ObjectStore>,
+        config: SchedulerConfig,
+        io_parallelism: NonZeroU32,
+    ) -> Arc<Self> {
+        Self::new_inner(object_store, config, Some(io_parallelism))
+    }
+
+    fn new_inner(
+        object_store: Arc<ObjectStore>,
+        config: SchedulerConfig,
+        io_parallelism: Option<NonZeroU32>,
+    ) -> Arc<Self> {
         let error_mode = object_store.scheduler_error_mode();
-        let io_capacity = object_store.io_parallelism();
+        let io_capacity = io_parallelism
+            .map(|io_parallelism| io_parallelism.get() as usize)
+            .unwrap_or_else(|| object_store.io_parallelism());
         let stats = IoStats::new();
-        let use_lite = config
-            .use_lite_scheduler
-            .unwrap_or_else(|| object_store.prefers_lite_scheduler());
+        let use_lite = io_parallelism.is_none()
+            && config
+                .use_lite_scheduler
+                .unwrap_or_else(|| object_store.prefers_lite_scheduler());
         let io_queue = if use_lite {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
@@ -3171,6 +3199,127 @@ mod tests {
         fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
             Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
         }
+    }
+
+    #[tokio::test]
+    async fn test_io_parallelism_overrides_store() {
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, vec![0; 1000].into())
+            .await
+            .unwrap();
+
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let max_in_flight = Arc::new(AtomicU64::new(0));
+        let first_two_started = Arc::new(tokio::sync::Barrier::new(2));
+        let mut obj_store = MockObjectStore::default();
+        let (in_flight_copy, max_in_flight_copy, first_two_started_copy) = (
+            in_flight.clone(),
+            max_in_flight.clone(),
+            first_two_started.clone(),
+        );
+        obj_store
+            .expect_get_opts()
+            .returning(move |location, options| {
+                let in_flight = in_flight_copy.clone();
+                let max_in_flight = max_in_flight_copy.clone();
+                let first_two_started = first_two_started_copy.clone();
+                let base_store = base_store.clone();
+                let location = location.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    if now <= 2 {
+                        first_two_started.wait().await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    base_store.get_opts(&location, options).await
+                }
+                .boxed()
+            });
+        // The store allows 8 requests at once; the scheduler is limited to 2.
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(obj_store),
+            Url::parse("mem://").unwrap(),
+            Some(10),
+            None,
+            false,
+            false,
+            8,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        // Asking for the lite scheduler too must not lift the limit.
+        let config = SchedulerConfig::default_for_testing().with_lite_scheduler();
+        let scheduler =
+            ScanScheduler::new_with_io_parallelism(obj_store, config, NonZeroU32::new(2).unwrap());
+        let file_scheduler = scheduler
+            .open_file(&some_path, &CachedFileSize::new(1000))
+            .await
+            .unwrap();
+
+        let reads = (0..8).map(|i| file_scheduler.submit_single(i * 100..i * 100 + 10, 0));
+        tokio::time::timeout(Duration::from_secs(5), futures::future::try_join_all(reads))
+            .await
+            .expect("two reads should reach the barrier")
+            .unwrap();
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_large_io_parallelism_caps_preallocation() {
+        assert_eq!(
+            SchedulerConfig::max_bandwidth_bytes(u32::MAX as usize),
+            MAX_BANDWIDTH_BYTES_PER_IO_THREAD * u32::MAX as u64
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            SchedulerConfig::max_bandwidth_bytes(usize::MAX),
+            i64::MAX as u64
+        );
+
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, vec![42u8; 64].into())
+            .await
+            .unwrap();
+
+        let obj_store = Arc::new(ObjectStore::new(
+            base_store,
+            Url::parse("mem://").unwrap(),
+            Some(10),
+            None,
+            false,
+            false,
+            u32::MAX as usize,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+
+        // Standard scheduler with NonZeroU32::MAX must not over-allocate.
+        let config = SchedulerConfig::new(SchedulerConfig::max_bandwidth_bytes(u32::MAX as usize));
+        let scheduler =
+            ScanScheduler::new_with_io_parallelism(obj_store.clone(), config, NonZeroU32::MAX);
+        let file_scheduler = scheduler
+            .open_file(&some_path, &CachedFileSize::new(64))
+            .await
+            .unwrap();
+        let bytes = file_scheduler.submit_single(0..16, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), [42u8; 16].as_slice());
+
+        // Lite scheduler with a huge store io_parallelism must also avoid over-allocation.
+        let lite_scheduler = ScanScheduler::new(
+            obj_store,
+            SchedulerConfig::default_for_testing().with_lite_scheduler(),
+        );
+        let lite_file_scheduler = lite_scheduler
+            .open_file(&some_path, &CachedFileSize::new(64))
+            .await
+            .unwrap();
+        let lite_bytes = lite_file_scheduler.submit_single(0..16, 0).await.unwrap();
+        assert_eq!(lite_bytes.as_ref(), [42u8; 16].as_slice());
     }
 
     #[tokio::test]
