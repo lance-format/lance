@@ -127,6 +127,32 @@ pub struct ObjectStoreRegistryStats {
 /// Serializes the builds of one cached store key.
 type BuildLock = Arc<tokio::sync::Mutex<()>>;
 
+// Retain the allocation so replacing a provider cannot reuse its identity while
+// an old cache entry or in-flight build still holds the key.
+#[derive(Clone, Debug)]
+struct ProviderIdentity(Arc<dyn ObjectStoreProvider>);
+
+impl PartialEq for ProviderIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ProviderIdentity {}
+
+impl std::hash::Hash for ProviderIdentity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&Arc::as_ptr(&self.0).cast::<()>(), state);
+    }
+}
+
+type StoreKey = (
+    ProviderIdentity,
+    String,
+    ObjectStoreParams,
+    SchedulerErrorMode,
+);
+
 /// A registry of object store providers.
 ///
 /// Use [`Self::default()`] to create one with the available default providers.
@@ -157,11 +183,10 @@ pub struct ObjectStoreRegistry {
     // Cache of object stores currently in use. We use a weak reference so the
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
-    active_stores:
-        RwLock<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), Weak<ObjectStore>>>,
+    active_stores: RwLock<HashMap<StoreKey, Weak<ObjectStore>>>,
     // Held by `get_store` while it builds the store for a key, so concurrent
     // cold calls for that key wait for one build instead of each making one.
-    building: Mutex<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), BuildLock>>,
+    building: Mutex<HashMap<StoreKey, BuildLock>>,
     // Floor for `prune_threshold`; 0 disables the sweep.
     min_prune_threshold: AtomicUsize,
     // Cache size at which `get_store` sweeps out dead entries before inserting.
@@ -421,7 +446,12 @@ impl ObjectStoreRegistry {
         let store_prefix =
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_path = crate::object_store::metrics_base(&store_prefix, &base_path);
-        let cache_key = (cache_path.clone(), params.clone(), scheduler_error_mode);
+        let cache_key = (
+            ProviderIdentity(provider.clone()),
+            cache_path.clone(),
+            params.clone(),
+            scheduler_error_mode,
+        );
 
         // Check if we have a cached store for this base path and params
         {
@@ -1055,6 +1085,50 @@ mod tests {
         assert!(stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])));
         let stats = registry.stats();
         assert_eq!((stats.hits, stats.misses), (7, 1));
+    }
+
+    #[rstest]
+    #[case::cached(false)]
+    #[case::building(true)]
+    #[tokio::test(start_paused = true)]
+    async fn test_replacing_provider_uses_new_store(#[case] is_building: bool) {
+        let registry = Arc::new(ObjectStoreRegistry::empty());
+        let original = Arc::new(SlowProvider::default());
+        registry.insert("slowmem", original.clone());
+        let url = Url::parse("slowmem:///").unwrap();
+        let params = ObjectStoreParams::default();
+        let old_registry = registry.clone();
+        let old_url = url.clone();
+        let old_params = params.clone();
+        let old_open =
+            tokio::spawn(
+                async move { old_registry.get_store(old_url, &old_params).await.unwrap() },
+            );
+        tokio::task::yield_now().await;
+        assert_eq!(original.builds.load(Ordering::Relaxed), 1);
+        if !is_building {
+            // The completed task retains the store and its live cache entry.
+            tokio::time::sleep(Duration::from_millis(101)).await;
+            assert!(old_open.is_finished());
+        }
+        registry.insert("slowmem", Arc::new(SchedulerModeIgnoringStoreProvider));
+        let new_store = registry.get_store(url.clone(), &params).await.unwrap();
+        if is_building {
+            assert!(!old_open.is_finished());
+        }
+        let old_store = old_open.await.unwrap();
+        assert!(!Arc::ptr_eq(&old_store, &new_store));
+        let reopened = registry.get_store(url, &params).await.unwrap();
+        assert!(Arc::ptr_eq(&new_store, &reopened));
+
+        let path = Path::from("data");
+        old_store.put(&path, b"old").await.unwrap();
+        new_store.put(&path, b"new").await.unwrap();
+        assert_eq!(
+            old_store.read_one_all(&path).await.unwrap().as_ref(),
+            b"old"
+        );
+        assert_eq!(reopened.read_one_all(&path).await.unwrap().as_ref(), b"new");
     }
 
     #[tokio::test(start_paused = true)]
