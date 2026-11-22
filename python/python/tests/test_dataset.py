@@ -1223,6 +1223,25 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+def test_take_with_io_parallelism(tmp_path: Path):
+    table = pa.table({"a": range(8), "b": [str(i) for i in range(8)]})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
+    indices = [7, 0, 4, 2]
+
+    expected = dataset.take(indices)
+    assert dataset.take(indices, io_parallelism=None) == expected
+    assert dataset.take(indices, io_parallelism=1) == expected
+    assert dataset.take(indices, io_parallelism=np.int64(1)) == expected
+
+    for invalid in (0, -1):
+        with pytest.raises(ValueError, match="io_parallelism must be greater than 0"):
+            dataset.take(indices, io_parallelism=invalid)
+
+    for invalid in (True, False, 0.0, -1.5):
+        with pytest.raises(TypeError, match="io_parallelism must be an integer"):
+            dataset.take(indices, io_parallelism=invalid)
+
+
 @pytest.mark.parametrize("columns", [["a", "nope"], ["s.nope"], ["a.b"]])
 def test_take_unknown_column(tmp_path: Path, columns):
     table = pa.table({"a": [1, 10], "s": pa.array([{"x": 2}, {"x": 20}])})
