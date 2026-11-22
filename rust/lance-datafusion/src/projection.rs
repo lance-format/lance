@@ -318,7 +318,7 @@ impl ProjectionPlan {
                 }
             } else {
                 // Regular data column - validate it exists in base schema
-                if base.schema().field(&field.name).is_none() {
+                if !base.schema().fields.iter().any(|f| f.name == field.name) {
                     return Err(Error::invalid_input(format!(
                         "Column '{}' not found in schema",
                         field.name
@@ -837,6 +837,22 @@ mod tests {
         let output = plan.output_schema().unwrap();
         let output_field = output.field_with_name("meta").unwrap();
         assert!(is_json_field(output_field));
+    }
+
+    #[rstest::rstest]
+    #[case::plain("plain")]
+    #[case::embedded_backtick("a`b")]
+    #[case::quoted_name("`a`")]
+    fn test_from_schema_preserves_literal_names(#[case] name: &str) {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(name, DataType::Int32, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let plan = ProjectionPlan::from_schema(Arc::new(schema.clone()), &schema).unwrap();
+
+        assert_eq!(plan.physical_projection.to_arrow_schema(), arrow_schema);
+        assert_eq!(plan.output_schema().unwrap().as_ref(), &arrow_schema);
     }
 
     fn nested_base_schema() -> Schema {

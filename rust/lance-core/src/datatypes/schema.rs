@@ -572,7 +572,7 @@ impl Schema {
     fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for field in other.fields.iter() {
-            if let Some(candidate_field) = self.field(&field.name) {
+            if let Some(candidate_field) = self.fields.iter().find(|f| f.name == field.name) {
                 candidates.push(candidate_field.do_intersection(field, ignore_types)?);
             }
         }
@@ -666,7 +666,7 @@ impl Schema {
                 )));
             }
 
-            if let Some(self_field) = self.field(&field.name) {
+            if let Some(self_field) = self.fields.iter().find(|f| f.name == field.name) {
                 new_fields.push(self_field.project_by_field(field, on_type_mismatch)?);
             } else if matches!(on_missing, OnMissing::Error) {
                 return Err(Error::schema(format!("Field {} not found", field.name)));
@@ -2830,6 +2830,40 @@ mod tests {
         wide.push("`s.a`".to_string());
         let err = schema.project(&wide).unwrap_err();
         assert!(matches!(err, Error::FieldNotFound { .. }), "{err}");
+    }
+
+    #[rstest]
+    #[case::plain("plain")]
+    #[case::embedded_backtick("a`b")]
+    #[case::quoted_name("`a`")]
+    fn test_schema_operations_preserve_literal_names(
+        #[case] name: &str,
+        #[values("project", "intersection", "intersection_ignore_types")] operation: &str,
+    ) {
+        // Keep a sibling that would match if the literal name "`a`" were unquoted.
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(name, DataType::Int32, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.validate_writable().unwrap();
+
+        // These names work through path-based APIs when properly escaped.
+        let path = format_field_path(&[name]);
+        assert_eq!(schema.field(&path).unwrap().name, name);
+        assert_eq!(schema.project(&[path]).unwrap().fields[0].name, name);
+
+        let actual = match operation {
+            "project" => {
+                schema.project_by_schema(&arrow_schema, OnMissing::Error, OnTypeMismatch::Error)
+            }
+            "intersection" => schema.intersection(&schema),
+            "intersection_ignore_types" => schema.intersection_ignore_types(&schema),
+            _ => unreachable!(),
+        }
+        .expect("Schema operations must accept literal top-level field names");
+
+        assert_eq!(ArrowSchema::from(&actual), arrow_schema);
     }
 
     #[test]
