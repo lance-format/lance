@@ -580,17 +580,15 @@ impl CacheCodecImpl for Positions {
                     {
                         return Err(Error::io("invalid positions cache block offsets"));
                     }
-                    return Ok(Some(Positions(CachedPositions::File(Arc::new(
-                        FilePositions {
-                            reader,
-                            body_offset,
-                            raw_start,
-                            // Retain the IPC buffer so the file reader's RAM reservation
-                            // lives as long as the decoded directory.
-                            block_offsets: values.clone(),
-                            codec: proto_to_position_stream_codec(codec),
-                        },
-                    )))));
+                    return Ok(Some(Self(CachedPositions::File(Arc::new(FilePositions {
+                        reader,
+                        body_offset,
+                        raw_start,
+                        // Retain the IPC buffer so the file reader's RAM reservation
+                        // lives as long as the decoded directory.
+                        block_offsets: values.clone(),
+                        codec: proto_to_position_stream_codec(codec),
+                    })))));
                 }
             }
             if len == limit {
