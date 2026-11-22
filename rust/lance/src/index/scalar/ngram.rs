@@ -119,6 +119,7 @@ pub(in crate::index) async fn merge_segments(
                 Some(fragment_bitmap.iter().collect()),
                 None,
                 Arc::new(NoopIndexBuildProgress),
+                None,
             )
             .await?,
             dataset.manifest.version,

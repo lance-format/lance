@@ -80,6 +80,7 @@ pub(in crate::index) async fn merge_segments(
             None,
             None,
             Arc::new(lance_index::progress::NoopIndexBuildProgress),
+            None,
         )
         .await?;
 
@@ -119,6 +120,7 @@ pub(in crate::index) async fn merge_segments(
         Some(fragment_ids),
         None,
         Arc::new(lance_index::progress::NoopIndexBuildProgress),
+        None,
     )
     .await?;
 

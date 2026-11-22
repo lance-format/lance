@@ -880,13 +880,9 @@ impl ZoneMapIndex {
         store: &dyn IndexStore,
         version: ZoneMapIndexVersion,
     ) -> Result<RecordBatch> {
-        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
-        let zone_maps = index_file
-            .read_range(0..index_file.num_rows(), None)
-            .await?;
-        let rows_per_zone = rows_per_zone_from_schema(index_file.schema());
-        let (data_type, zones) = parse_zones(&zone_maps, version)?;
-        zone_statistics_batch(&zones, &data_type, rows_per_zone)
+        let file = read_zone_file(store, false).await?;
+        let (data_type, zones) = parse_zones(&file.zone_maps, version)?;
+        zone_statistics_batch(&zones, &data_type, file.rows_per_zone)
     }
 
     /// Load the scalar index from storage, decoding the file under the
@@ -901,36 +897,16 @@ impl ZoneMapIndex {
     where
         Self: Sized,
     {
-        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
-        let zone_maps = index_file
-            .read_range(0..index_file.num_rows(), None)
-            .await?;
-        let file_schema = index_file.schema();
-        let rows_per_zone = rows_per_zone_from_schema(file_schema);
-
-        let null_rows = if let Some(idx_str) = file_schema.metadata.get(NULL_BITMAP_META_KEY) {
-            let idx = idx_str.parse::<u32>().map_err(|e| {
-                Error::invalid_input(format!("invalid null bitmap buffer index: {e}"))
-            })?;
-            let bytes = index_file.read_global_buffer(idx).await?;
-            Some(RowAddrTreeMap::deserialize_from(bytes.as_ref())?)
-        } else {
-            None
-        };
-        let store_null_bitmap = file_schema
-            .metadata
-            .get(NULL_BITMAP_POLICY_META_KEY)
-            .is_none_or(|value| value != "false");
-
+        let file = read_zone_file(store.as_ref(), true).await?;
         Ok(Arc::new(Self::try_from_serialized(
-            zone_maps,
+            file.zone_maps,
             store,
             fri,
             index_cache,
-            rows_per_zone,
-            null_rows,
+            file.rows_per_zone,
+            file.null_rows,
             use_seeds,
-            store_null_bitmap,
+            file.store_null_bitmap,
             version,
         )?))
     }
@@ -962,6 +938,61 @@ impl ZoneMapIndex {
             null_rows,
         })
     }
+}
+
+/// A ZoneMap file as read from storage: its zone records, the
+/// configuration its schema metadata records and, when asked for, its null
+/// positions. The index load, [`ZoneMapIndex::load_zone_statistics`] and the
+/// stored-zone reader all read a file through this and decode the records
+/// with [`parse_zones`], so a file is read and validated the same way
+/// whichever of them reads it.
+struct ZoneFile {
+    zone_maps: RecordBatch,
+    rows_per_zone: u64,
+    store_null_bitmap: bool,
+    /// `None` when not requested or when the file stores no positions.
+    null_rows: Option<RowAddrTreeMap>,
+    /// Whether the file stores null positions, requested or not.
+    stores_null_rows: bool,
+    /// In-memory bytes of the zone records and the null-position buffer read.
+    decoded_bytes: usize,
+}
+
+/// Read the ZoneMap file of `store`, with its null positions when
+/// `with_null_rows` is set.
+async fn read_zone_file(store: &dyn IndexStore, with_null_rows: bool) -> Result<ZoneFile> {
+    let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
+    let zone_maps = index_file
+        .read_range(0..index_file.num_rows(), None)
+        .await?;
+    let file_schema = index_file.schema();
+    let rows_per_zone = rows_per_zone_from_schema(file_schema);
+    let null_buffer = file_schema.metadata.get(NULL_BITMAP_META_KEY);
+    let stores_null_rows = null_buffer.is_some();
+    let mut decoded_bytes = zone_maps.get_array_memory_size();
+    let null_rows = match null_buffer {
+        Some(idx_str) if with_null_rows => {
+            let idx = idx_str.parse::<u32>().map_err(|e| {
+                Error::invalid_input(format!("invalid null bitmap buffer index: {e}"))
+            })?;
+            let bytes = index_file.read_global_buffer(idx).await?;
+            decoded_bytes += bytes.len();
+            Some(RowAddrTreeMap::deserialize_from(bytes.as_ref())?)
+        }
+        _ => None,
+    };
+    let store_null_bitmap = file_schema
+        .metadata
+        .get(NULL_BITMAP_POLICY_META_KEY)
+        .is_none_or(|value| value != "false");
+    Ok(ZoneFile {
+        zone_maps,
+        rows_per_zone,
+        store_null_bitmap,
+        null_rows,
+        stores_null_rows,
+        decoded_bytes,
+    })
 }
 
 /// The `rows_per_zone` a ZoneMap file was written with, from its schema
@@ -2877,9 +2908,10 @@ pub enum SeedOutcome {
     Rejected,
 }
 
-/// Target zones assembled from valid write seeds, ready for
-/// [`build_zonemap_segment`]. Zones are keyed by `(fragment, zone index)`;
-/// a zone fed only partly from seeds is completed by the scan.
+/// Target zones assembled from valid write seeds and from the stored zones
+/// of committed segments, ready for [`build_zonemap_segment`]. Zones are
+/// keyed by `(fragment, zone index)`; a zone fed only partly from seeds is
+/// completed by the scan.
 #[derive(Debug, Default)]
 pub struct ReusedZones {
     zones: HashMap<(u64, u64), ZoneMapStatistics>,
@@ -2893,6 +2925,11 @@ pub struct ReusedZones {
     pub reused_records: usize,
     /// Fragments that had a seed which could not be used; they are scanned.
     pub rejected_fragments: Vec<u64>,
+    /// Fragments whose zones were taken whole from a committed segment
+    /// (see [`ReusedZones::reuse_stored`]).
+    pub stored_fragments: Vec<u64>,
+    /// Stored zone records taken from committed segments.
+    pub stored_records: usize,
 }
 
 impl ReusedZones {
@@ -2914,6 +2951,8 @@ impl ReusedZones {
         self.partial_fragments.extend(other.partial_fragments);
         self.rejected_fragments.extend(other.rejected_fragments);
         self.reused_records += other.reused_records;
+        self.stored_fragments.extend(other.stored_fragments);
+        self.stored_records += other.stored_records;
     }
 
     pub fn num_zones(&self) -> usize {
@@ -3817,6 +3856,9 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
         })
         .collect()
 }
+
+mod stored;
+pub use stored::StoredZones;
 
 #[cfg(test)]
 mod tests;

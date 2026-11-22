@@ -30,6 +30,11 @@ use crate::index::append::SeedHarvester;
 use crate::index::scalar::{TrainingRows, TrainingScanOptions, scan_training_data};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
+mod stored_reuse;
+use stored_reuse::StoredZoneReuse;
+#[cfg(test)]
+pub use stored_reuse::TEST_STORED_ZONE_ADMISSION_BYTES;
+
 /// Merge one caller-defined group of source ZoneMap segments into a single segment.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
@@ -140,6 +145,19 @@ pub struct SeedReuseReport {
     pub total_seed_bytes: usize,
     /// Whether a physical row mask was given to the scan.
     pub masked: bool,
+    /// Fragments whose zones came whole from a committed segment.
+    pub stored_fragments: Vec<u64>,
+    /// Committed segments loaded and used for their stored zones.
+    pub stored_sources: usize,
+    /// Committed segments not opened because of their stored size.
+    pub skipped_sources: usize,
+    /// Committed segments whose version or configuration did not match, or
+    /// whose file did not decode.
+    pub unusable_sources: usize,
+    /// Stored bytes of the committed segment files loaded.
+    pub stored_bytes: u64,
+    /// In-memory bytes those files decoded to.
+    pub stored_decoded_bytes: usize,
 }
 
 #[cfg(test)]
@@ -406,6 +424,7 @@ async fn assemble_segment(
     data_type: &DataType,
     fragments: &[Fragment],
     harvester: Option<SeedHarvester<'_>>,
+    stored: StoredZoneReuse,
     criteria: &TrainingCriteria,
     store: &dyn IndexStore,
     progress: &dyn IndexBuildProgress,
@@ -418,39 +437,51 @@ async fn assemble_segment(
     let harvester = harvester.as_ref();
     let concurrency = harvest_concurrency(dataset);
     let scans = scan_concurrency(dataset);
+    let StoredZoneReuse {
+        zones: mut reused,
+        fragments: stored_fragments,
+        sources_used: stored_sources,
+        sources_skipped: skipped_sources,
+        sources_unusable: unusable_sources,
+        stored_bytes,
+        decoded_bytes: stored_decoded_bytes,
+    } = stored;
+    // Fragments summarized from committed segments are not read at all.
     // Type-erased so the enclosing future's `Send` bound does not depend
     // on the stages' borrowed lifetimes.
-    let mut results: BoxStream<'_, Result<BatchResult<'_>>> =
-        futures::stream::iter(fragments.iter())
-            .map(|fragment| {
-                plan_fragment(
-                    dataset,
-                    harvester,
-                    fragment,
-                    &counters,
-                    rows_per_zone,
-                    data_type,
-                    keep_positions,
-                    legacy_storage,
-                )
-            })
-            .buffered(concurrency)
-            .try_chunks(ZONEMAP_SCAN_BATCH_FRAGMENTS)
-            .map(|plans| {
-                scan_batch(
-                    dataset,
-                    column,
-                    criteria,
-                    data_type,
-                    rows_per_zone,
-                    keep_positions,
-                    plans.map_err(|err| err.1),
-                )
-            })
-            .buffered(scans)
-            .boxed();
+    let mut results: BoxStream<'_, Result<BatchResult<'_>>> = futures::stream::iter(
+        fragments
+            .iter()
+            .filter(|fragment| !stored_fragments.contains(&fragment.id)),
+    )
+    .map(|fragment| {
+        plan_fragment(
+            dataset,
+            harvester,
+            fragment,
+            &counters,
+            rows_per_zone,
+            data_type,
+            keep_positions,
+            legacy_storage,
+        )
+    })
+    .buffered(concurrency)
+    .try_chunks(ZONEMAP_SCAN_BATCH_FRAGMENTS)
+    .map(|plans| {
+        scan_batch(
+            dataset,
+            column,
+            criteria,
+            data_type,
+            rows_per_zone,
+            keep_positions,
+            plans.map_err(|err| err.1),
+        )
+    })
+    .buffered(scans)
+    .boxed();
 
-    let mut reused = ReusedZones::new(keep_positions);
     let mut scanned = ScannedZones::default();
     let mut scanned_fragments: Vec<u64> = Vec::new();
     let mut scanned_rows = 0u64;
@@ -483,7 +514,9 @@ async fn assemble_segment(
     let max_live_seed_bytes = counters.max_live_seed_bytes.into_inner();
     let max_concurrent_harvests = counters.max_in_flight.into_inner();
     log::info!(
-        "zone map segment for {column}: {} fragments from seeds, {} partly, {} scanned in {scan_count} scans ({scanned_rows} rows, {} seed records, {total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once over {max_concurrent_harvests} concurrent harvests)",
+        "zone map segment for {column}: {} fragments from committed segments ({} stored records from {stored_sources} segments, {stored_bytes} stored bytes, {stored_decoded_bytes} decoded bytes, {skipped_sources} segments over the admission limit, {unusable_sources} not matching), {} fragments from seeds, {} partly, {} scanned in {scan_count} scans ({scanned_rows} rows, {} seed records, {total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once over {max_concurrent_harvests} concurrent harvests)",
+        reused.stored_fragments.len(),
+        reused.stored_records,
         reused.reused_fragments.len(),
         reused.partial_fragments.len(),
         scanned_fragments.len(),
@@ -504,6 +537,12 @@ async fn assemble_segment(
             harvest_concurrency: concurrency,
             total_seed_bytes,
             masked,
+            stored_fragments: reused.stored_fragments.clone(),
+            stored_sources,
+            skipped_sources,
+            unusable_sources,
+            stored_bytes,
+            stored_decoded_bytes,
         })
     });
     let refreshed: Vec<u64> = fragments.iter().map(|fragment| fragment.id).collect();
@@ -530,12 +569,15 @@ fn fragments_by_id(dataset: &Dataset, ids: Vec<u32>) -> Result<Vec<Fragment>> {
 }
 
 /// Train a new ZoneMap segment over `fragment_ids` (all fragments when
-/// `None`), reusing the write seeds those fragments already carry and
-/// scanning only the rows they do not cover.
+/// `None`). Each fragment's statistics come whole from the first that
+/// applies: the stored zones of a committed segment of the index named
+/// `index_name` (none when `None`), the write seed the fragment carries,
+/// or a scan of the rows the seed does not cover.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::index) async fn build_segment_with_seeds(
     dataset: &Dataset,
     column: &str,
+    index_name: Option<&str>,
     params: ZoneMapIndexBuilderParams,
     data_type: &DataType,
     fragment_ids: Option<Vec<u32>>,
@@ -553,6 +595,10 @@ pub(in crate::index) async fn build_segment_with_seeds(
         .use_seeds_for(data_type)
         .then(|| SeedHarvester::for_column(dataset, column))
         .flatten();
+    let stored = stored_reuse::reuse_stored_zones(
+        dataset, index_name, column, data_type, &params, &fragments,
+    )
+    .await?;
     progress.stage_complete("load_data").await?;
     assemble_segment(
         dataset,
@@ -561,6 +607,7 @@ pub(in crate::index) async fn build_segment_with_seeds(
         data_type,
         &fragments,
         harvester,
+        stored,
         criteria,
         store,
         progress,
@@ -594,6 +641,7 @@ pub(in crate::index) async fn update_segment(
         None
     };
     let data_type = zone_map.value_type().clone();
+    let stored = StoredZoneReuse::none(zone_map.has_null_bitmap());
     assemble_segment(
         dataset,
         column,
@@ -601,6 +649,7 @@ pub(in crate::index) async fn update_segment(
         &data_type,
         unindexed,
         harvester,
+        stored,
         criteria,
         store,
         &NoopIndexBuildProgress,

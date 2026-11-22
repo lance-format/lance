@@ -293,7 +293,7 @@ fn fragment_field_files<'a>(
 }
 
 /// Whether `fragment` has an overlay on an `indexed` field committed after `version`.
-fn has_overlay_newer_than(
+pub(crate) fn has_overlay_newer_than(
     fragment: &Fragment,
     version: u64,
     indexed: &HashSet<i32>,

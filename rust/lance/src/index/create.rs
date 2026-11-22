@@ -527,6 +527,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         self.fragments.clone(),
                         preprocessed_data,
                         progress.clone(),
+                        Some(index_name.as_str()),
                     )
                     .await?
                 }
@@ -555,6 +556,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     self.fragments.clone(),
                     None,
                     progress.clone(),
+                    Some(index_name.as_str()),
                 )
                 .await?
             }
@@ -574,6 +576,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     self.fragments.clone(),
                     None,
                     progress.clone(),
+                    Some(index_name.as_str()),
                 )
                 .await?
             }
@@ -898,6 +901,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 None,
                 None,
                 self.progress.clone(),
+                Some(index_name.as_str()),
             )
             .await?;
             let metadata = IndexMetadata {
@@ -978,6 +982,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 Some(fragment_ids.clone()),
                 None,
                 progress.clone(),
+                Some(index_name.as_str()),
             )
             .await?;
 

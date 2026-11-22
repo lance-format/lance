@@ -485,18 +485,32 @@ async fn test_create_index_keeps_configured_boundaries(
     // The report matches the interval arithmetic: fragment 0 (no seed) is
     // scanned whole, the others reuse whole records and scan crossings.
     // `val` is a narrow column: past half its rows in crossing records a
-    // fragment is scanned whole rather than in scattered intervals.
+    // fragment is scanned whole rather than in scattered intervals. When the
+    // target size is the fixture index's own, fragment 0 instead comes whole
+    // from that index's committed segment, which comes before seeds.
     let report = &reports[0];
+    let from_segment = s == t;
+    if from_segment {
+        assert_eq!(report.stored_fragments, vec![0]);
+    } else {
+        assert!(report.stored_fragments.is_empty());
+    }
+    let fragment_0_rows = if from_segment { 0 } else { N as u64 };
     let crossing = crossing_rows(N as u64, s, t);
     let rescanned = if crossing * 2 > N as u64 {
         N as u64
     } else {
         crossing
     };
-    assert_eq!(report.scanned_rows, N as u64 + 5 * rescanned, "{s} -> {t}");
+    assert_eq!(
+        report.scanned_rows,
+        fragment_0_rows + 5 * rescanned,
+        "{s} -> {t}"
+    );
     if rescanned == 0 {
         assert_eq!(report.reused_fragments, vec![1, 2, 3, 4, 5]);
-        assert_eq!(report.scanned_fragments, vec![0]);
+        let expected: Vec<u64> = if from_segment { vec![] } else { vec![0] };
+        assert_eq!(report.scanned_fragments, expected);
     } else if rescanned == N as u64 {
         assert!(report.reused_fragments.is_empty());
         assert!(report.partial_fragments.is_empty());
@@ -505,8 +519,14 @@ async fn test_create_index_keeps_configured_boundaries(
         assert_eq!(report.partial_fragments, vec![1, 2, 3, 4, 5]);
         assert_eq!(report.scanned_fragments, vec![0, 1, 2, 3, 4, 5]);
     }
-    assert!(report.masked);
-    assert_eq!(report.scans, 1, "six fragments fit one scan batch");
+    // Nothing to scan means no scan at all.
+    let scans_anything = !report.scanned_fragments.is_empty();
+    assert_eq!(report.masked, scans_anything);
+    assert_eq!(
+        report.scans,
+        usize::from(scans_anything),
+        "six fragments fit one scan batch"
+    );
     // Seeds are read through a bounded window and dropped once folded: the
     // raw bytes held at once never exceed that many seeds, and the window
     // is never wider than the configured harvest concurrency.
@@ -525,9 +545,9 @@ async fn test_create_index_keeps_configured_boundaries(
     let seeded_pages = pages_per_fragment(&seeded, "val", &seeded_reads);
     let control_pages = pages_per_fragment(&control, "val", &control_reads);
     for ((fragment, pages), (_, full)) in seeded_pages.iter().zip(&control_pages) {
-        if *fragment == 0 {
+        if *fragment == 0 && !from_segment {
             assert!(*pages > 4096, "fragment 0 scanned: {pages}");
-        } else if rescanned == 0 {
+        } else if *fragment == 0 || rescanned == 0 {
             assert!(
                 *pages < 4096,
                 "fragment {fragment} reused but read {pages} page bytes"
@@ -801,7 +821,8 @@ async fn test_harvester_resolves_field_paths() {
     assert!(SeedHarvester::for_column(&dataset, "missing").is_none());
 
     // The create path formats the column as a quoted path and still reuses
-    // the appended fragment's seed.
+    // the appended fragment's seed; fragment 0 comes from the replaced
+    // index's committed segment.
     let (_, reports) = with_reports(async {
         dataset
             .create_index(
@@ -816,7 +837,8 @@ async fn test_harvester_resolves_field_paths() {
     })
     .await;
     assert_eq!(reports[0].reused_fragments, vec![1]);
-    assert_eq!(reports[0].scanned_fragments, vec![0]);
+    assert_eq!(reports[0].stored_fragments, vec![0]);
+    assert!(reports[0].scanned_fragments.is_empty());
 }
 
 /// A zero zone size is refused before any segment is written, also for a
@@ -1036,14 +1058,8 @@ async fn test_seeds_follow_the_index_configuration() {
     assert_index_matches_scan_with(&dataset, VAL_FILTERS, false).await;
 
     // A bitmap-keeping index of the same size must scan that fragment for
-    // its positions, and its own appends then carry positions.
-    create_index(
-        &mut dataset,
-        "val",
-        &zone_map_params(1000, true, true),
-        None,
-    )
-    .await;
+    // its positions (the bitmap-less segment cannot supply them), and its
+    // own appends then carry positions.
     let (_, reports) = with_reports(create_index(
         &mut dataset,
         "val",
@@ -1051,7 +1067,20 @@ async fn test_seeds_follow_the_index_configuration() {
         None,
     ))
     .await;
+    assert!(reports[0].stored_fragments.is_empty());
+    assert_eq!(reports[0].unusable_sources, 1);
     assert_eq!(reports[0].scanned_fragments, vec![0, 1]);
+    // Built again with the same configuration, both fragments come from the
+    // bitmap-keeping segment.
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports[0].stored_fragments, vec![0, 1]);
+    assert!(reports[0].scanned_fragments.is_empty());
     append(&mut dataset, 2 * N..3 * N).await;
     let positions = seed_positions(&dataset, 2, "val").await.unwrap();
     assert_eq!(

@@ -825,6 +825,7 @@ async fn rebuild_scalar_segment(
         return crate::index::scalar::zonemap::build_segment_with_seeds(
             dataset,
             field_path,
+            None,
             zone_map_params,
             zone_map.value_type(),
             Some(fragment_ids),
@@ -853,6 +854,7 @@ async fn rebuild_scalar_segment(
         None,
         Some((training_data, update_criteria.data_criteria.clone())),
         Arc::new(NoopIndexBuildProgress),
+        None,
     )
     .await
 }
@@ -2231,6 +2233,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             None,
                             Some((new_data_stream, update_criteria.data_criteria.clone())),
                             Arc::new(NoopIndexBuildProgress),
+                            None,
                         )
                         .await?;
                         return Ok(Some(IndexMergeResults {
@@ -2335,6 +2338,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 None,
                                 Some((new_data_stream, update_criteria.data_criteria.clone())),
                                 Arc::new(NoopIndexBuildProgress),
+                                None,
                             )
                             .await?,
                             dataset.manifest.version,

@@ -508,6 +508,10 @@ pub(in crate::index) fn shared_segment_domain(
 }
 
 /// Build a Scalar Index (returns details to store in the manifest)
+///
+/// `index_name` is the logical index the build belongs to, when the caller
+/// knows it. A zone map trained from the table then also reuses the stored
+/// zones of that index's committed segments; `None` disables that.
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 pub(super) async fn build_scalar_index(
@@ -519,6 +523,7 @@ pub(super) async fn build_scalar_index(
     fragment_ids: Option<Vec<u32>>,
     preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
+    index_name: Option<&str>,
 ) -> Result<CreatedIndex> {
     let inverted_params = (params.index_type.eq_ignore_ascii_case("inverted")
         || params.index_type.eq_ignore_ascii_case("fts"))
@@ -566,9 +571,10 @@ pub(super) async fn build_scalar_index(
     let training_request =
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
-    // A zone map trained from the table reuses the write seeds its fragments
-    // already carry and scans only the fragments without one. A caller that
-    // supplies the rows itself has already chosen what to train from.
+    // A zone map trained from the table reuses the stored zones of the
+    // index's committed segments and the write seeds its fragments already
+    // carry, and scans only what neither covers. A caller that supplies the
+    // rows itself has already chosen what to train from.
     if train
         && preprocessed_data.is_none()
         && params
@@ -592,6 +598,7 @@ pub(super) async fn build_scalar_index(
         return zonemap::build_segment_with_seeds(
             dataset,
             column,
+            index_name,
             zone_map_params,
             &value_type,
             fragment_ids,

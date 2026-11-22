@@ -341,6 +341,33 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
     }
 }
 
+/// The index section as the manifest stores it, served from the session cache.
+///
+/// Unlike [`load_all_indices`], a fragment bitmap is the one stored: an
+/// untagged fragment reuse history does not project it onto compaction
+/// destinations.
+pub(crate) async fn load_stored_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
+    let metadata_key = IndexMetadataKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    };
+    dataset
+        .index_cache
+        .get_or_insert_with_key(metadata_key, || async {
+            let loaded = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await?;
+            warn_about_unsupported_indices(&loaded);
+            warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
+            Ok(loaded)
+        })
+        .await
+}
+
 /// Every index the manifest names, including any this build has no reader for.
 ///
 /// Separate from [`DatasetIndexExt::load_indices`] because the two answer
@@ -358,20 +385,7 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
         store_identity: &dataset.object_store.store_prefix,
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
-    let mut indices = dataset
-        .index_cache
-        .get_or_insert_with_key(metadata_key, || async {
-            let loaded = read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
-                &dataset.manifest,
-            )
-            .await?;
-            warn_about_unsupported_indices(&loaded);
-            warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
-            Ok(loaded)
-        })
-        .await?;
+    let mut indices = load_stored_indices(dataset).await?;
 
     // Infer details for legacy vector indices (once per index name, concurrently).
     // This may run on indices that were opportunistically cached during Dataset::open
