@@ -390,22 +390,38 @@ multiplicatively. During sustained success, the rate increases additively. This 
 
 Local and in-memory stores are **not** throttled.
 
-The AIMD throttle can be tuned via storage options or environment variables. Storage options take precedence
-over environment variables:
+Tune each AIMD controller independently using `lance_aimd_<category>_<setting>` or its
+uppercase environment variable. The categories are `read` (GET and HEAD), `write`,
+`delete`, and `list`. Lance resolves each controller setting in this order.
 
-| Setting            | Storage Option Key              | Env Var                         | Default |
+1. Category storage option, for example `lance_aimd_read_max_rate`.
+2. Category environment variable, for example `LANCE_AIMD_READ_MAX_RATE`.
+3. Generic storage option, for example `lance_aimd_max_rate`.
+4. Generic environment variable, for example `LANCE_AIMD_MAX_RATE`.
+5. Category default.
+
+| Controller setting | Generic storage option          | Generic environment variable    | Default |
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
 | Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000   |
 | Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
 | Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
-| Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
 
-Under sustained success, the default rate grows from 2000 to 10000 requests/s
-in about 27 seconds. Each operation category has its own rate controller.
-The ceiling is a client-side tuning parameter, not a storage-provider limit;
-override it to match the workload and the store's throttling behavior.
+Burst capacity and retry settings are shared across categories. Each takes its
+generic storage option first, then its uppercase environment variable, then its default.
+
+| Shared setting       | Storage option              | Environment variable       | Default |
+| -------------------- | --------------------------- | -------------------------- | ------- |
+| Burst capacity       | `lance_aimd_burst_capacity` | `LANCE_AIMD_BURST_CAPACITY` | 100     |
+| Max retries          | `lance_aimd_max_retries`    | `LANCE_AIMD_MAX_RETRIES`    | 3       |
+| Min backoff (ms)     | `lance_aimd_min_backoff_ms` | `LANCE_AIMD_MIN_BACKOFF_MS` | 100     |
+| Max backoff (ms)     | `lance_aimd_max_backoff_ms` | `LANCE_AIMD_MAX_BACKOFF_MS` | 300     |
+
+Rates are in requests per second. The controller adds the increment after each
+one-second success window. Setting the max rate to `0` removes the client-side
+ceiling while leaving AIMD feedback active. Cloud stores with the same bucket
+and store parameters share each category's budget within a process.
 
 ## Fragment Sizing
 

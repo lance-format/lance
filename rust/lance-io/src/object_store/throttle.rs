@@ -190,147 +190,105 @@ impl AimdThrottleConfig {
         }
     }
 
-    /// Build an `AimdThrottleConfig` from storage options and environment variables.
+    /// Build an AIMD configuration from storage options and environment variables.
     ///
-    /// Storage options take precedence over environment variables, which take
-    /// precedence over defaults. A single AIMD config is applied to all four
-    /// operation categories (read/write/delete/list).
+    /// Each controller setting (`initial_rate`, `min_rate`, `max_rate`,
+    /// `decrease_factor`, and `additive_increment`) accepts a category-specific
+    /// key such as `lance_aimd_read_max_rate`. Categories are `read`, `write`,
+    /// `delete`, and `list`. Each setting resolves in this order: category
+    /// storage option, category environment variable, generic storage option,
+    /// generic environment variable, then the category default.
     ///
-    /// | Setting              | Storage Option Key               | Env Var                          | Default |
-    /// |----------------------|----------------------------------|----------------------------------|---------|
-    /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
-    /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
-    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 10000   |
-    /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
-    /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
-    /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
-    /// | Max retries          | `lance_aimd_max_retries`         | `LANCE_AIMD_MAX_RETRIES`         | 3       |
-    /// | Min backoff ms       | `lance_aimd_min_backoff_ms`      | `LANCE_AIMD_MIN_BACKOFF_MS`      | 100     |
-    /// | Max backoff ms       | `lance_aimd_max_backoff_ms`      | `LANCE_AIMD_MAX_BACKOFF_MS`      | 300     |
+    /// Burst capacity and retry/backoff settings are shared by all categories.
+    /// They accept the generic storage option and its uppercase environment
+    /// variable, for example `lance_aimd_max_retries` and `LANCE_AIMD_MAX_RETRIES`.
     pub fn from_storage_options(
         storage_options: Option<&HashMap<String, String>>,
     ) -> lance_core::Result<Self> {
-        fn resolve_f64(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: f64,
-        ) -> lance_core::Result<f64> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<f64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<f64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
+        Self::from_options_and_env(storage_options, |key| std::env::var(key).ok())
+    }
 
-        fn resolve_u32(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: u32,
-        ) -> lance_core::Result<u32> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<u32>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<u32>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
-
-        fn resolve_usize(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: usize,
-        ) -> lance_core::Result<usize> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<usize>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<usize>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
-
-        fn resolve_u64(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: u64,
-        ) -> lance_core::Result<u64> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<u64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<u64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
-
-        let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
-        let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
-        let max_rate = resolve_f64(
-            "lance_aimd_max_rate",
+    fn from_options_and_env(
+        storage_options: Option<&HashMap<String, String>>,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> lance_core::Result<Self> {
+        let options = AimdOptions {
             storage_options,
-            AimdConfig::default().max_rate,
-        )?;
-        let decrease_factor = resolve_f64("lance_aimd_decrease_factor", storage_options, 0.5)?;
-        let additive_increment =
-            resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
-        let burst_capacity = resolve_u32("lance_aimd_burst_capacity", storage_options, 100)?;
-        let max_retries = resolve_usize("lance_aimd_max_retries", storage_options, 3)?;
-        let min_backoff_ms = resolve_u64("lance_aimd_min_backoff_ms", storage_options, 100)?;
-        let max_backoff_ms = resolve_u64("lance_aimd_max_backoff_ms", storage_options, 300)?;
-
-        let aimd = AimdConfig::default()
-            .with_initial_rate(initial_rate)
-            .with_min_rate(min_rate)
-            .with_max_rate(max_rate)
-            .with_decrease_factor(decrease_factor)
-            .with_additive_increment(additive_increment);
-
+            get_env,
+        };
+        let defaults = Self::default();
         Ok(Self {
-            max_retries,
-            min_backoff_ms,
-            max_backoff_ms,
-            ..Self::default()
-                .with_aimd(aimd)
-                .with_burst_capacity(burst_capacity)
+            read: options.controller("read", defaults.read)?,
+            write: options.controller("write", defaults.write)?,
+            delete: options.controller("delete", defaults.delete)?,
+            list: options.controller("list", defaults.list)?,
+            burst_capacity: options.resolve(
+                "lance_aimd_burst_capacity",
+                None,
+                defaults.burst_capacity,
+            )?,
+            max_retries: options.resolve("lance_aimd_max_retries", None, defaults.max_retries)?,
+            min_backoff_ms: options.resolve(
+                "lance_aimd_min_backoff_ms",
+                None,
+                defaults.min_backoff_ms,
+            )?,
+            max_backoff_ms: options.resolve(
+                "lance_aimd_max_backoff_ms",
+                None,
+                defaults.max_backoff_ms,
+            )?,
+        })
+    }
+}
+
+struct AimdOptions<'a, F> {
+    storage_options: Option<&'a HashMap<String, String>>,
+    get_env: F,
+}
+
+impl<F: Fn(&str) -> Option<String>> AimdOptions<'_, F> {
+    fn resolve<T: std::str::FromStr>(
+        &self,
+        generic_key: &str,
+        category_key: Option<&str>,
+        default: T,
+    ) -> lance_core::Result<T> {
+        for key in category_key.into_iter().chain(std::iter::once(generic_key)) {
+            if let Some(value) = self.storage_options.and_then(|options| options.get(key)) {
+                return value.parse().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{value}'"
+                    ))
+                });
+            }
+            let env_key = key.to_ascii_uppercase();
+            if let Some(value) = (self.get_env)(&env_key) {
+                return value.parse().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{value}'"
+                    ))
+                });
+            }
+        }
+        Ok(default)
+    }
+
+    fn controller(&self, category: &str, defaults: AimdConfig) -> lance_core::Result<AimdConfig> {
+        let resolve = |field, default| {
+            self.resolve(
+                &format!("lance_aimd_{field}"),
+                Some(&format!("lance_aimd_{category}_{field}")),
+                default,
+            )
+        };
+        Ok(AimdConfig {
+            initial_rate: resolve("initial_rate", defaults.initial_rate)?,
+            min_rate: resolve("min_rate", defaults.min_rate)?,
+            max_rate: resolve("max_rate", defaults.max_rate)?,
+            decrease_factor: resolve("decrease_factor", defaults.decrease_factor)?,
+            additive_increment: resolve("additive_increment", defaults.additive_increment)?,
+            ..defaults
         })
     }
 }
@@ -1519,6 +1477,97 @@ mod tests {
     use rstest::rstest;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    #[rstest]
+    #[case::category_option(Some("8000"), Some("7000"), Some("6000"), Some("5000"), 8000.0)]
+    #[case::category_env(None, Some("7000"), Some("6000"), Some("5000"), 7000.0)]
+    #[case::generic_option(None, None, Some("6000"), Some("5000"), 6000.0)]
+    #[case::generic_env(None, None, None, Some("5000"), 5000.0)]
+    #[case::category_default(None, None, None, None, AimdThrottleConfig::default().read.max_rate)]
+    fn test_read_rate_option_precedence(
+        #[case] category_option: Option<&str>,
+        #[case] category_env: Option<&str>,
+        #[case] generic_option: Option<&str>,
+        #[case] generic_env: Option<&str>,
+        #[case] expected: f64,
+    ) {
+        let storage_options = [
+            ("lance_aimd_read_max_rate", category_option),
+            ("lance_aimd_max_rate", generic_option),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
+        .collect();
+        let config = AimdThrottleConfig::from_options_and_env(Some(&storage_options), |key| {
+            match key {
+                "LANCE_AIMD_READ_MAX_RATE" => category_env,
+                "LANCE_AIMD_MAX_RATE" => generic_env,
+                _ => None,
+            }
+            .map(str::to_owned)
+        })
+        .unwrap();
+
+        assert_eq!(config.read.max_rate, expected);
+        let generic_rate = generic_option
+            .or(generic_env)
+            .map(|value| value.parse::<f64>().unwrap())
+            .unwrap_or(AimdThrottleConfig::default().write.max_rate);
+        for category in [config.write, config.delete, config.list] {
+            assert_eq!(category.max_rate, generic_rate);
+        }
+    }
+
+    #[test]
+    fn test_controller_options_resolve_per_field_and_category() {
+        let params = params_with(&[
+            ("lance_aimd_initial_rate", "1000"),
+            ("lance_aimd_read_initial_rate", "3000"),
+            ("lance_aimd_read_max_rate", "0"),
+            ("lance_aimd_write_min_rate", "25"),
+            ("lance_aimd_delete_decrease_factor", "0.25"),
+            ("lance_aimd_max_retries", "0"),
+        ]);
+        let config =
+            AimdThrottleConfig::from_options_and_env(params.storage_options(), |key| match key {
+                "LANCE_AIMD_ADDITIVE_INCREMENT" => Some("100".to_owned()),
+                "LANCE_AIMD_LIST_ADDITIVE_INCREMENT" => Some("800".to_owned()),
+                "LANCE_AIMD_BURST_CAPACITY" => Some("150".to_owned()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert!(config.is_disabled());
+        assert_eq!(config.burst_capacity, 150);
+        assert_eq!(config.read.initial_rate, 3000.0);
+        assert_eq!(config.read.max_rate, 0.0);
+        assert_eq!(config.write.min_rate, 25.0);
+        assert_eq!(config.delete.decrease_factor, 0.25);
+        assert_eq!(config.list.additive_increment, 800.0);
+        for category in [&config.write, &config.delete, &config.list] {
+            assert_eq!(category.initial_rate, 1000.0);
+        }
+        for category in [&config.read, &config.write, &config.delete] {
+            assert_eq!(category.additive_increment, 100.0);
+        }
+    }
+
+    #[test]
+    fn test_invalid_category_option_reports_the_selected_source() {
+        let params = params_with(&[("lance_aimd_max_rate", "6000")]);
+        let err = AimdThrottleConfig::from_options_and_env(params.storage_options(), |key| {
+            (key == "LANCE_AIMD_READ_MAX_RATE").then(|| "invalid".to_owned())
+        })
+        .unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("LANCE_AIMD_READ_MAX_RATE"));
+
+        let params = params_with(&[("lance_aimd_read_max_rate", "invalid")]);
+        let err = AimdThrottleConfig::from_options_and_env(params.storage_options(), |_| None)
+            .unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("lance_aimd_read_max_rate"));
+    }
 
     const THROTTLE_ERROR_RESPONSE: &str = "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s - Server returned non-2xx status code: 503: x-ms-request-id: azure-request-id";
 
