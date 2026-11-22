@@ -279,6 +279,30 @@ pub struct ManifestLocation {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
+impl ManifestLocation {
+    /// Build a location from an external store's registered final or staging path.
+    ///
+    /// ```
+    /// use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+    /// let location = ManifestLocation::from_external_path(3, "table/_versions/3.manifest")?;
+    /// assert_eq!(location.naming_scheme, ManifestNamingScheme::V1);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn from_external_path(version: u64, path: &str) -> Result<Self> {
+        let path = Path::parse(path).map_err(|e| Error::invalid_input(e.to_string()))?;
+        let naming_scheme = external_manifest::detect_naming_scheme_from_path(&path)?;
+        Ok(Self {
+            version,
+            path,
+            naming_scheme,
+            size: None,
+            e_tag: None,
+            identity: None,
+            last_modified: None,
+        })
+    }
+}
+
 impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     type Error = Error;
 

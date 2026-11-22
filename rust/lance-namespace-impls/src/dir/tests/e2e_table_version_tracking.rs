@@ -3,6 +3,16 @@
 
 use super::*;
 
+use arrow::array::{ArrayRef, Int32Array};
+use arrow::record_batch::RecordBatch;
+use lance::dataset::builder::DatasetBuilder;
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
+use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+use lance_io::object_store::ObjectStore;
+use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use object_store::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Tracking wrapper around a namespace that counts method invocations.
@@ -309,6 +319,272 @@ async fn test_external_manifest_store_invokes_namespace_apis() {
         initial_describe_calls + 1,
         "describe_table_version should have been called exactly once during checkout to version 1"
     );
+}
+
+/// A namespace with an independently recorded location and optional byte size.
+#[derive(Debug)]
+struct RegisteredVersion {
+    table_uri: String,
+    record: TableVersion,
+    listed_path: Option<String>,
+}
+
+#[async_trait]
+impl LanceNamespace for RegisteredVersion {
+    fn namespace_id(&self) -> String {
+        "registered-version".to_string()
+    }
+
+    async fn describe_table(&self, _: DescribeTableRequest) -> Result<DescribeTableResponse> {
+        Ok(DescribeTableResponse {
+            location: Some(self.table_uri.clone()),
+            managed_versioning: Some(true),
+            ..Default::default()
+        })
+    }
+
+    async fn describe_table_version(
+        &self,
+        request: DescribeTableVersionRequest,
+    ) -> Result<DescribeTableVersionResponse> {
+        assert_eq!(request.version, Some(self.record.version));
+        Ok(DescribeTableVersionResponse::new(self.record.clone()))
+    }
+
+    async fn list_table_versions(
+        &self,
+        _: ListTableVersionsRequest,
+    ) -> Result<ListTableVersionsResponse> {
+        let mut record = self.record.clone();
+        if let Some(path) = &self.listed_path {
+            record.manifest_path.clone_from(path);
+        }
+        Ok(ListTableVersionsResponse::new(vec![record]))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RegisteredSize {
+    Omitted,
+    Matching,
+    Mismatched,
+    Negative,
+}
+
+#[rstest]
+#[case::registered_path(ManifestNamingScheme::V2, ManifestNamingScheme::V2, false)]
+#[case::v1_to_v2(ManifestNamingScheme::V1, ManifestNamingScheme::V2, false)]
+#[case::v2_to_v1(ManifestNamingScheme::V2, ManifestNamingScheme::V1, false)]
+#[case::finalized_after_list(ManifestNamingScheme::V2, ManifestNamingScheme::V2, true)]
+#[tokio::test]
+async fn test_registered_manifest_size(
+    #[case] registered_scheme: ManifestNamingScheme,
+    #[case] current_scheme: ManifestNamingScheme,
+    #[case] listed_staging: bool,
+    #[values(
+        RegisteredSize::Omitted,
+        RegisteredSize::Matching,
+        RegisteredSize::Mismatched,
+        RegisteredSize::Negative
+    )]
+    registered_size: RegisteredSize,
+) {
+    let temp_dir = TempStdDir::default();
+    let uri = temp_dir.to_str().unwrap();
+    let batch =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef)])
+            .unwrap();
+    let schema = batch.schema();
+    let data = RecordBatchIterator::new([Ok(batch)], schema);
+    let params = WriteParams {
+        enable_v2_manifest_paths: current_scheme == ManifestNamingScheme::V2,
+        max_rows_per_file: 1,
+        max_rows_per_group: 1,
+        ..Default::default()
+    };
+    let written = Dataset::write(data, uri, Some(params)).await.unwrap();
+    let size = written.manifest_location().size.unwrap() as i64;
+    let path = registered_scheme.manifest_path(&written.branch_location().path, 1);
+    let namespace = Arc::new(RegisteredVersion {
+        table_uri: uri.to_string(),
+        listed_path: listed_staging.then(|| format!("{path}-staged")),
+        record: TableVersion {
+            manifest_size: match registered_size {
+                RegisteredSize::Omitted => None,
+                RegisteredSize::Matching => Some(size),
+                RegisteredSize::Mismatched => Some(size + 1),
+                RegisteredSize::Negative => Some(-1),
+            },
+            ..TableVersion::new(1, path.to_string())
+        },
+    });
+
+    for version in [Some(1), None] {
+        let builder = DatasetBuilder::from_namespace(namespace.clone(), vec!["t".to_string()])
+            .await
+            .unwrap();
+        let opened = match version {
+            Some(version) => builder.with_version(version).load().await,
+            None => builder.load().await,
+        };
+        match registered_size {
+            RegisteredSize::Mismatched => {
+                let err = opened.expect_err("the registered size contradicts the recovered object");
+                assert!(
+                    matches!(err.find_root(), lance_core::Error::CorruptFile { .. }),
+                    "{err}"
+                );
+                assert!(
+                    err.to_string().contains(&format!(
+                        "external store expected {}, object store returned {size}",
+                        size + 1
+                    )),
+                    "{err}"
+                );
+            }
+            RegisteredSize::Negative => {
+                let err = opened.expect_err("a finalized manifest cannot have a negative size");
+                assert!(
+                    matches!(err.find_root(), lance_core::Error::InvalidInput { .. }),
+                    "{err}"
+                );
+                assert!(
+                    err.to_string().contains("negative manifest size -1"),
+                    "{err}"
+                );
+            }
+            RegisteredSize::Matching | RegisteredSize::Omitted => {
+                let opened = opened.unwrap();
+                assert_eq!(
+                    opened.manifest_location().path,
+                    written.manifest_location().path
+                );
+                if registered_scheme != current_scheme && current_scheme == ManifestNamingScheme::V1
+                {
+                    assert_eq!(opened.manifest_location().size, None);
+                }
+                assert_eq!(opened.count_rows(None).await.unwrap(), 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_registered_manifest_size_when_both_canonical_paths_are_missing() {
+    let base = Path::from("t");
+    let namespace = Arc::new(RegisteredVersion {
+        table_uri: "memory://t".to_string(),
+        record: TableVersion {
+            manifest_size: Some(100),
+            ..TableVersion::new(
+                1,
+                ManifestNamingScheme::V2.manifest_path(&base, 1).to_string(),
+            )
+        },
+        listed_path: None,
+    });
+    let table_id = vec!["t".to_string()];
+    let handler = ExternalManifestCommitHandler {
+        external_manifest_store: Arc::new(LanceNamespaceExternalManifestStore::new(
+            namespace.clone(),
+            table_id.clone(),
+            base.clone(),
+        )),
+    };
+    // A registered destination still prevents a clone from starting here.
+    let latest = handler
+        .resolve_latest_location(&base, &ObjectStore::memory())
+        .await
+        .unwrap();
+    assert_eq!(
+        latest.path,
+        ManifestNamingScheme::V1.manifest_path(&base, 1)
+    );
+    let err = DatasetBuilder::from_namespace(namespace, table_id)
+        .await
+        .unwrap()
+        .with_version(1)
+        .load()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::DatasetNotFound { .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("1.manifest"), "{err}");
+}
+
+#[rstest]
+#[case::without_etag(None)]
+#[case::same_etag_at_different_keys(Some("1"))]
+#[tokio::test]
+async fn test_registered_manifest_size_on_refreshed_external_path(
+    #[case] store_etag: Option<&'static str>,
+) {
+    let base = Path::from("t");
+    let refreshed = base.clone().join("catalog-v1.manifest");
+    let canonical = ManifestNamingScheme::V2.manifest_path(&base, 1);
+    let namespace = RegisteredVersion {
+        table_uri: "memory://t".to_string(),
+        record: TableVersion {
+            manifest_size: Some(4),
+            ..TableVersion::new(1, refreshed.to_string())
+        },
+        listed_path: Some(format!("{canonical}-staged")),
+    };
+    let handler = ExternalManifestCommitHandler {
+        external_manifest_store: Arc::new(LanceNamespaceExternalManifestStore::new(
+            Arc::new(namespace),
+            vec!["t".to_string()],
+            base.clone(),
+        )),
+    };
+    let mut objects = ObjectStore::memory();
+    let mut policy = ProxyObjectStorePolicy::new();
+    policy.set_obj_meta_policy(
+        "key-scoped-etag",
+        Arc::new(move |_: &str, mut meta: object_store::ObjectMeta| {
+            meta.e_tag = store_etag.map(str::to_string);
+            Ok(meta)
+        }),
+    );
+    objects.inner = Arc::new(ProxyObjectStore::new(
+        objects.inner.clone(),
+        Arc::new(Mutex::new(policy)),
+    ));
+    objects
+        .put_payload(&canonical, b"old!".as_slice().into())
+        .await
+        .unwrap();
+    assert_eq!(
+        objects.stat(&canonical).await.unwrap().e_tag.as_deref(),
+        store_etag
+    );
+
+    // A same-size canonical file cannot stand in for the refreshed registry key.
+    let missing = handler
+        .resolve_latest_location(&base, &objects)
+        .await
+        .unwrap();
+    assert_eq!(missing.path, refreshed);
+    assert_eq!(missing.size, None);
+
+    objects
+        .put_payload(&refreshed, b"new!".as_slice().into())
+        .await
+        .unwrap();
+    assert_eq!(
+        objects.stat(&refreshed).await.unwrap().e_tag.as_deref(),
+        store_etag
+    );
+    let present = handler
+        .resolve_latest_location(&base, &objects)
+        .await
+        .unwrap();
+    assert_eq!(present.path, refreshed);
+    // Neither the existing handle nor the manifest cache can identify the new key.
+    assert_eq!(present.e_tag, None);
+    assert_eq!(present.size, None);
 }
 
 #[tokio::test]

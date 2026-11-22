@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use lance_core::Result;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
-    CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
+    CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest, TableVersion,
 };
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
@@ -86,11 +86,8 @@ impl LanceNamespaceExternalManifestStore {
     fn branch_for_base(&self, base: &str) -> Result<Option<String>> {
         BranchLocation::branch_of(self.table_root.as_ref(), base)
     }
-}
 
-#[async_trait]
-impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
-    async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
+    async fn describe_version(&self, base_uri: &str, version: u64) -> Result<TableVersion> {
         let request = DescribeTableVersionRequest {
             id: Some(self.table_id.clone()),
             version: Some(version as i64),
@@ -110,11 +107,10 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             Err(e) => return Err(e),
         };
 
-        // Namespace returns full path (relative to object store root)
-        Ok(response.version.manifest_path)
+        Ok(*response.version)
     }
 
-    async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
+    async fn latest_version(&self, base_uri: &str) -> Result<Option<TableVersion>> {
         let request = ListTableVersionsRequest {
             id: Some(self.table_id.clone()),
             descending: Some(true),
@@ -133,17 +129,58 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             Err(e) => return Err(e),
         };
 
-        if response.versions.is_empty() {
-            return Ok(None);
+        Ok(response.versions.into_iter().next())
+    }
+
+    fn manifest_location(version: u64, record: TableVersion) -> Result<ManifestLocation> {
+        let mut location = ManifestLocation::from_external_path(version, &record.manifest_path)?;
+        // Staged paths still use the finalizer's live source observation.
+        if location.path.extension() == Some("manifest")
+            && let Some(size) = record.manifest_size
+        {
+            location.size = Some(u64::try_from(size).map_err(|_| {
+                lance_core::Error::invalid_input(format!(
+                    "Namespace returned negative manifest size {size} for version {version} at {}",
+                    location.path
+                ))
+            })?);
         }
+        Ok(location)
+    }
+}
 
-        let version = &response.versions[0];
+#[async_trait]
+impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
+    async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
+        Ok(self
+            .describe_version(base_uri, version)
+            .await?
+            .manifest_path)
+    }
 
-        // Namespace returns full path (relative to object store root)
-        Ok(Some((
-            version.version as u64,
-            version.manifest_path.clone(),
-        )))
+    async fn get_manifest_location(
+        &self,
+        base_uri: &str,
+        version: u64,
+    ) -> Result<ManifestLocation> {
+        Self::manifest_location(version, self.describe_version(base_uri, version).await?)
+    }
+
+    async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
+        Ok(self
+            .latest_version(base_uri)
+            .await?
+            .map(|v| (v.version as u64, v.manifest_path)))
+    }
+
+    async fn get_latest_manifest_location(
+        &self,
+        base_uri: &str,
+    ) -> Result<Option<ManifestLocation>> {
+        self.latest_version(base_uri)
+            .await?
+            .map(|v| Self::manifest_location(v.version as u64, v))
+            .transpose()
     }
 
     /// Put the manifest to the namespace store.
