@@ -1733,10 +1733,14 @@ class LanceDataset(pa.dataset.Dataset):
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
         io_parallelism: int, optional
-            Maximum primary-base data-file reads active in this take. This
-            overrides the store's per-scheduler default but does not increase
-            fragment-reader fanout, so actual concurrency may be lower. Files
-            in additional bases are unaffected.
+            Maximum active fragment-reader data and overlay reads in the
+            primary base for this take. This overrides the store's
+            per-scheduler default and caps fragment-reader fanout at
+            ``min(store_parallelism, io_parallelism)``, without increasing
+            fanout above the store default, so actual concurrency may be lower.
+            Legacy v1 files, additional-base per-file schedulers, and auxiliary
+            metadata or lineage reads (such as deletion vectors and spilled
+            row-ID or row-version sequences) keep their existing schedulers.
 
         Returns
         -------

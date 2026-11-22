@@ -3270,10 +3270,14 @@ mod tests {
     #[tokio::test]
     async fn test_large_io_parallelism_caps_preallocation() {
         assert_eq!(
+            SchedulerConfig::max_bandwidth_bytes(u32::MAX as usize),
+            MAX_BANDWIDTH_BYTES_PER_IO_THREAD * u32::MAX as u64
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
             SchedulerConfig::max_bandwidth_bytes(usize::MAX),
             i64::MAX as u64
         );
-        assert!(SchedulerConfig::max_bandwidth_bytes(u32::MAX as usize) <= i64::MAX as u64);
 
         let some_path = Path::parse("foo").unwrap();
         let base_store = Arc::new(InMemory::new());

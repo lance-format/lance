@@ -337,7 +337,7 @@ async fn do_take_rows(
                     read_config.clone().with_row_address(true),
                 )
             })
-            .buffer_unordered(fragment_concurrency)
+            .buffered(fragment_concurrency)
             .try_collect::<Vec<_>>()
             .await?;
         let one_batch = if batches.len() > 1 {
@@ -585,13 +585,16 @@ impl TakeBuilder {
         self
     }
 
-    /// Sets the maximum active primary-base data-file reads for this take.
+    /// Sets the maximum active fragment-reader data reads in the primary base for this take.
     ///
-    /// Current-format files in that base share one scheduler with this request
-    /// ceiling. The value overrides the store's per-scheduler default but not
-    /// fragment-reader fanout, so actual concurrency may be lower. Legacy v1,
-    /// additional-base, and non-data-file reads keep their existing schedulers.
-    /// Must be greater than zero.
+    /// Current-format primary-base data and overlay files opened through the
+    /// fragment reader share one scheduler with this request ceiling, and
+    /// fragment-reader fanout is capped at `min(store_parallelism, io_parallelism)`.
+    /// This does not increase fragment-reader fanout above the store default, so
+    /// actual concurrency may be lower. Legacy v1 files, additional-base
+    /// schedulers, and auxiliary metadata or lineage reads (such as deletion
+    /// vectors and spilled row-ID or row-version sequences) keep their existing
+    /// schedulers. Must be greater than zero.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -2299,6 +2302,120 @@ mod test {
         assert_eq!(sorted_capped, sorted_uncapped);
         assert_eq!(active_reads.load(Ordering::SeqCst), 0);
         assert_eq!(peak_reads.load(Ordering::SeqCst), fragment_fanout.min(2));
+    }
+
+    #[tokio::test]
+    async fn test_take_rows_enforces_io_parallelism_across_data_files_in_fragment() {
+        let data = test_batch(0..40);
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            batches,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 40,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add three extra column files to the same fragment so a single-fragment
+        // take opens and reads four data files concurrently.
+        for col_name in ["c1", "c2", "c3"] {
+            let extra_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, false),
+                ArrowField::new(col_name, DataType::Int32, false),
+            ]));
+            let extra_batch = RecordBatch::try_new(
+                extra_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..40)),
+                    Arc::new(Int32Array::from_iter_values(100..140)),
+                ],
+            )
+            .unwrap();
+            dataset
+                .merge(
+                    RecordBatchIterator::new([Ok(extra_batch)], extra_schema),
+                    "i",
+                    "i",
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 4);
+
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let peak_reads = Arc::new(AtomicUsize::new(0));
+
+        let mut completed_policy = ProxyObjectStorePolicy::new();
+        let completed_active = active_reads.clone();
+        completed_policy.set_before_policy(
+            "complete_single_frag_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    completed_active.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let delayed = Arc::new(ThrottledStore::new(
+            Arc::new(ProxyObjectStore::new(
+                dataset.object_store.inner.clone(),
+                Arc::new(Mutex::new(completed_policy)),
+            )),
+            ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(20),
+                ..Default::default()
+            },
+        ));
+        let mut started_policy = ProxyObjectStorePolicy::new();
+        let started_active = active_reads.clone();
+        let started_peak = peak_reads.clone();
+        started_policy.set_before_policy(
+            "start_single_frag_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    let active = started_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    started_peak.fetch_max(active, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        Arc::make_mut(&mut dataset.object_store).inner = Arc::new(ProxyObjectStore::new(
+            delayed,
+            Arc::new(Mutex::new(started_policy)),
+        ));
+
+        let projection = dataset.schema().clone();
+        let indices = [20_u64, 0];
+        let uncapped = dataset.take(&indices, projection.clone()).await.unwrap();
+        let uncapped_peak = peak_reads.load(Ordering::SeqCst);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert!(
+            uncapped_peak > 2,
+            "uncapped multi-file single-fragment take must exceed cap 2, observed {uncapped_peak}"
+        );
+
+        peak_reads.store(0, Ordering::SeqCst);
+        let capped_two = dataset
+            .take_with_io_parallelism(&indices, projection.clone(), 2)
+            .await
+            .unwrap();
+        assert_eq!(capped_two, uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), 2);
+
+        peak_reads.store(0, Ordering::SeqCst);
+        let capped_one = dataset
+            .take_with_io_parallelism(&indices, projection, 1)
+            .await
+            .unwrap();
+        assert_eq!(capped_one, uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), 1);
     }
 
     #[rstest]

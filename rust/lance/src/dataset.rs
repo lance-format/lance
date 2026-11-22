@@ -2214,11 +2214,16 @@ impl Dataset {
         take::take(self, row_indices, projection.into()).await
     }
 
-    /// Take rows with a maximum number of active primary-base data-file reads.
+    /// Take rows with a maximum number of active fragment-reader data reads in the primary base.
     ///
-    /// The value overrides the store's per-scheduler default but does not
-    /// increase fragment-reader fanout, so actual concurrency may be lower.
-    /// It must be greater than zero.
+    /// Current-format primary-base data and overlay files opened through the
+    /// fragment reader share one scheduler with this request ceiling, and
+    /// fragment-reader fanout is capped at `min(store_parallelism, io_parallelism)`.
+    /// This does not increase fragment-reader fanout above the store default, so
+    /// actual concurrency may be lower. Legacy v1 files, additional-base
+    /// schedulers, and auxiliary metadata or lineage reads (such as deletion
+    /// vectors and spilled row-ID or row-version sequences) keep their existing
+    /// schedulers. It must be greater than zero.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
