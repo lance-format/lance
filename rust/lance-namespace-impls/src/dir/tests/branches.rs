@@ -297,19 +297,21 @@ async fn test_describe_table_snapshot_selectors_in_tree_named_directory() {
     let described = ns.describe_table(request.clone()).await.unwrap();
     assert_eq!(described.version, Some(2));
     assert_eq!(described.schema.unwrap().fields[0].name, "dev_id");
-    let error = ns
-        .describe_table(DescribeTableRequest {
-            branch: Some("events.lance".into()),
-            version: Some(1),
-            ..request
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        namespace_code(&error),
-        Some(ErrorCode::TableBranchNotFound),
-        "{error}"
-    );
+    // Only a readable selected manifest can establish whether this table is a branch.
+    for (version, expected) in [
+        (1, ErrorCode::TableBranchNotFound),
+        (99, ErrorCode::TableVersionNotFound),
+    ] {
+        let error = ns
+            .describe_table(DescribeTableRequest {
+                branch: Some("events.lance".into()),
+                version: Some(version),
+                ..request.clone()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(namespace_code(&error), Some(expected), "{error}");
+    }
 }
 
 #[tokio::test]

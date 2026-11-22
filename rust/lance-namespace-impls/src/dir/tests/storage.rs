@@ -333,7 +333,7 @@ fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Sessio
 // Fault-injection store: returns a runtime-toggleable result from
 // `list_with_delimiter` (the call `check_table_status` makes) and delegates
 // everything else, so a table can be created before failures are injected.
-use futures::stream::BoxStream;
+use futures::{TryStreamExt, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     PutMultipartOptions, PutPayload, PutResult, Result as OSResult,
@@ -347,6 +347,7 @@ enum ListBehavior {
     Internal,
     NotFound,
     EmptyListing,
+    WithoutEtags,
 }
 
 #[derive(Debug)]
@@ -381,7 +382,14 @@ impl OSObjectStore for FailingListStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-        self.target.get_opts(location, options).await
+        let mut result = self.target.get_opts(location, options).await?;
+        if matches!(
+            *self.behavior.lock().unwrap(),
+            Some(ListBehavior::WithoutEtags)
+        ) {
+            result.meta.e_tag = None;
+        }
+        Ok(result)
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
@@ -396,13 +404,28 @@ impl OSObjectStore for FailingListStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.target.list(prefix)
+        let entries = self.target.list(prefix);
+        if matches!(
+            *self.behavior.lock().unwrap(),
+            Some(ListBehavior::WithoutEtags)
+        ) {
+            entries
+                .map_ok(|mut meta| {
+                    meta.e_tag = None;
+                    meta
+                })
+                .boxed()
+        } else {
+            entries
+        }
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         let behavior = *self.behavior.lock().unwrap();
         match behavior {
-            None => self.target.list_with_delimiter(prefix).await,
+            None | Some(ListBehavior::WithoutEtags) => {
+                self.target.list_with_delimiter(prefix).await
+            }
             Some(ListBehavior::EmptyListing) => Ok(ListResult {
                 common_prefixes: Vec::new(),
                 objects: Vec::new(),
@@ -506,6 +529,69 @@ async fn create_named_dir_table(namespace: &DirectoryNamespace, name: &str) {
         .create_table(create_req, Bytes::from(ipc_data))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_describe_table_snapshot_selectors_recreated_branch() {
+    use lance::dataset::ColumnAlteration;
+
+    let (writer, temp) = create_test_namespace().await;
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    let registry =
+        build_failing_list_session(Arc::new(Mutex::new(Some(ListBehavior::WithoutEtags))))
+            .store_registry();
+    let session = Arc::new(Session::new(0, 1024 * 1024, registry));
+    let reader = DirectoryNamespaceBuilder::new(file_object_store_uri(temp.to_str().unwrap()))
+        .session(session.clone())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        branch: Some("dev.lance".into()),
+        version: Some(2),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    for field in ["old_id", "new_id"] {
+        let mut dev = main.create_branch("dev.lance", 1, None).await.unwrap();
+        dev.alter_columns(&[ColumnAlteration::new("id".into()).rename(field.into())])
+            .await
+            .unwrap();
+        dev.migrate_manifest_paths_v2().await.unwrap();
+        let meta = reader
+            .object_store
+            .inner
+            .head(&dev.manifest_location().path)
+            .await
+            .unwrap();
+        assert!(meta.e_tag.is_none());
+        let described = reader.describe_table(request.clone()).await.unwrap();
+        assert_eq!(
+            described.schema.unwrap().fields[0].name,
+            field,
+            "DescribeTable must resolve the selected snapshot after a same-name branch recreation"
+        );
+        let listing = DirectoryNamespaceBuilder::new(file_object_store_uri(
+            temp.as_ref().join("users.lance/tree").to_str().unwrap(),
+        ))
+        .session(session.clone())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+        let alias = listing
+            .describe_table(DescribeTableRequest {
+                id: Some(vec!["dev".into()]),
+                ..request.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alias.schema.unwrap().fields[0].name, field);
+        main.delete_branch("dev.lance").await.unwrap();
+    }
 }
 
 /// Regression test for the throttling-induced TableNotFound bug: a storage

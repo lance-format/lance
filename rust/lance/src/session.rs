@@ -563,6 +563,26 @@ impl Session {
         self.store_registry.clone()
     }
 
+    /// Clone this session with an additional namespace for both caches.
+    ///
+    /// Equal prefixes reuse entries. Different prefixes isolate entries while
+    /// sharing the original cache capacity, providers, and runtime settings.
+    ///
+    /// ```
+    /// use lance::session::Session;
+    ///
+    /// let session = Session::default();
+    /// let scoped = session.with_cache_key_prefix("generation-1");
+    /// assert!(std::sync::Arc::ptr_eq(&session.store_registry(), &scoped.store_registry()));
+    /// ```
+    pub fn with_cache_key_prefix(&self, prefix: &str) -> Self {
+        Self {
+            index_cache: GlobalIndexCache(self.index_cache.0.with_key_prefix(prefix)),
+            metadata_cache: GlobalMetadataCache(self.metadata_cache.0.with_key_prefix(prefix)),
+            ..self.clone()
+        }
+    }
+
     /// Get a reference to the raw metadata cache (for use in index reconstruction).
     pub fn file_metadata_cache(&self) -> &LanceCache {
         &self.metadata_cache.0

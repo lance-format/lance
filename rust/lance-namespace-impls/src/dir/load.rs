@@ -3,7 +3,7 @@
 
 use lance::dataset::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::{BranchLocation, Refs};
+use lance::dataset::refs::{BranchIdentifier, BranchLocation, Refs};
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -186,7 +186,7 @@ impl DirectoryNamespace {
             }
             None => {
                 let dataset = self
-                    .open_directory_version(&table_uri, version, None)
+                    .open_directory_version(&table_uri, version, None, None)
                     .await?;
                 if request.branch.is_some() && dataset.manifest().branch.is_some() {
                     return Err(NamespaceError::Unsupported {
@@ -248,8 +248,21 @@ impl DirectoryNamespace {
         uri: &str,
         version: Option<u64>,
         branch: Option<&str>,
+        identifier: Option<&BranchIdentifier>,
     ) -> Result<Dataset> {
-        let builder = self.configured_builder(uri);
+        let mut builder = self.configured_builder(uri);
+        if branch.is_some()
+            && let Some(session) = &self.session
+        {
+            // A branch URI and version can be reused after deletion. Modern branch
+            // refs end in a generation UUID. A legacy ref (parent version zero)
+            // or a manifest opened to discover its branch has no such guarantee.
+            let prefix = match identifier.and_then(|id| id.version_mapping.last()) {
+                Some((version, uuid)) if *version > 0 => std::borrow::Cow::Borrowed(uuid.as_str()),
+                _ => std::borrow::Cow::Owned(uuid::Uuid::new_v4().simple().to_string()),
+            };
+            builder = builder.with_session(session.with_cache_key_prefix(&prefix).into());
+        }
         let builder = match version {
             Some(version) => builder.with_version(version),
             None => builder,
@@ -285,55 +298,39 @@ impl DirectoryNamespace {
             path,
             branch: None,
         };
-        let refs = Refs::new(store.clone(), handler.clone(), root.clone());
-        let expected = match refs.branches().get_identifier(Some(branch)).await {
-            Ok(identifier) => identifier,
+        let refs = Refs::new(store, handler, root.clone());
+        let map_error = |err| match err {
+            Error::IO { .. } => Self::classify_storage_error(err),
+            _ => Self::map_branch_error(err, branch, table_uri),
+        };
+        let (location, expected) = match refs.branches().get_identifier(Some(branch)).await {
+            Ok(identifier) => (root.find_branch(Some(branch))?, identifier),
             Err(err @ Error::RefNotFound { .. }) => {
-                // The listing may expose a branch as a table. Only a manifest at
-                // the listed URI can establish that it belongs to the requested branch.
+                // A table listed directly beneath a tree directory may itself
+                // be a branch. Establish its owner from the selected snapshot
+                // before using that owner's identifier to validate the read.
                 let listed = BranchLocation {
                     branch: Some(branch.to_owned()),
                     ..root
                 };
-                if listed.find_main().is_ok() {
-                    match self
-                        .open_directory_version(table_uri, version, Some(branch))
-                        .await
-                    {
-                        Ok(dataset) if dataset.manifest().branch.as_deref() == Some(branch) => {
-                            dataset
-                                .branch_identifier()
-                                .await
-                                .map_err(|err| Self::map_branch_error(err, branch, table_uri))?;
-                            return Ok(dataset);
-                        }
-                        Ok(_) => {}
-                        Err(selected_error) => {
-                            let tip = handler
-                                .resolve_latest_location(&listed.path, &store)
-                                .await?;
-                            let manifest = lance_table::io::manifest::read_manifest_proto(
-                                &store, &tip.path, tip.size,
-                            )
-                            .await?;
-                            if manifest.branch.as_deref() == Some(branch) {
-                                return Err(selected_error);
-                            }
-                        }
-                    }
+                if listed.find_main().is_err() {
+                    return Err(map_error(err));
                 }
-                return Err(Self::map_branch_error(err, branch, table_uri));
+                let selected = self
+                    .open_directory_version(table_uri, version, Some(branch), None)
+                    .await?;
+                if selected.manifest().branch.as_deref() != Some(branch) {
+                    return Err(map_error(err));
+                }
+                let identifier = selected.branch_identifier().await.map_err(map_error)?;
+                (listed, identifier)
             }
-            Err(err) => return Err(Self::map_branch_error(err, branch, table_uri)),
+            Err(err) => return Err(map_error(err)),
         };
-        let location = root.find_branch(Some(branch))?;
         let dataset = self
-            .open_directory_version(&location.uri, version, Some(branch))
+            .open_directory_version(&location.uri, version, Some(branch), Some(&expected))
             .await?;
-        let actual = dataset
-            .branch_identifier()
-            .await
-            .map_err(|err| Self::map_branch_error(err, branch, table_uri))?;
+        let actual = dataset.branch_identifier().await.map_err(map_error)?;
         if dataset.manifest().branch.as_deref() != Some(branch) || actual != expected {
             return Err(NamespaceError::ConcurrentModification {
                 message: format!("Branch '{branch}' changed while describing '{table_uri}'"),
