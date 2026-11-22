@@ -2214,6 +2214,38 @@ impl Dataset {
         take::take(self, row_indices, projection.into()).await
     }
 
+    /// Take rows with a maximum number of active fragment-reader data reads in the primary base.
+    ///
+    /// Current-format primary-base data and overlay files opened through the
+    /// fragment reader share one scheduler with this request ceiling, and
+    /// fragment-reader fanout is capped at `min(store_parallelism, io_parallelism)`.
+    /// This does not increase fragment-reader fanout above the store default, so
+    /// actual concurrency may be lower. Legacy v1 files, additional-base
+    /// schedulers, and auxiliary metadata or lineage reads (such as deletion
+    /// vectors and spilled row-ID or row-version sequences) keep their existing
+    /// schedulers. It must be greater than zero.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let rows = dataset
+    ///     .take_with_io_parallelism(&[0, 1, 2], dataset.schema().clone(), 64)
+    ///     .await?;
+    /// # let _ = rows;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip_all, fields(num_rows=row_indices.len(), io_parallelism))]
+    pub async fn take_with_io_parallelism(
+        &self,
+        row_indices: &[u64],
+        projection: impl Into<ProjectionRequest>,
+        io_parallelism: u32,
+    ) -> Result<RecordBatch> {
+        take::take_with_io_parallelism(self, row_indices, projection.into(), Some(io_parallelism))
+            .await
+    }
+
     /// Take Rows by the internal ROW ids.
     ///
     /// In Lance format, each row has a unique `u64` id, which is used to identify the row globally.

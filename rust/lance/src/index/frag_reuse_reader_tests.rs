@@ -1098,7 +1098,7 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
         let index = indices.iter().find(|index| index.name == name).unwrap();
         let metrics = lance_index::metrics::LocalMetricsCollector::default();
         if column == "vector" {
-            // The generic open's probe misses on a per-segment key.
+            // The generic open must also reuse portable state after a remap.
             dataset
                 .open_generic_index(column, &index.uuid, &metrics)
                 .await
@@ -1198,8 +1198,8 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
     for (column, name) in segments {
         assert_eq!(
             index_loads(&dataset, column, name).await,
-            1,
-            "{name} reloads"
+            usize::from(column != "vector"),
+            "portable vector state survives; scalar decoded content still reloads: {name}"
         );
         assert_eq!(
             index_loads(&dataset, column, name).await,

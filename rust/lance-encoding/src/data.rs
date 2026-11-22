@@ -28,7 +28,9 @@ use arrow_array::{
         UInt32Type, UInt64Type,
     },
 };
-use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
+use arrow_buffer::{
+    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, Buffer, MutableBuffer, NullBuffer,
+};
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
 use arrow_select::dictionary::garbage_collect_dictionary;
@@ -379,8 +381,15 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
 
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.values.len() / self.bytes_per_value as usize) as u64;
+        let data = if self.values.is_empty() {
+            // A zero-capacity Vec<u8> has a byte-aligned dangling pointer.
+            // Arrow validates alignment even for empty wider primitive arrays.
+            LanceBuffer::from(Buffer::from(MutableBuffer::new(0)))
+        } else {
+            LanceBuffer::from(self.values)
+        };
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::from(self.values),
+            data,
             bits_per_value: self.bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
@@ -2941,6 +2950,30 @@ mod tests {
     };
 
     use arrow_array::Array;
+
+    #[rstest]
+    #[case::u16(DataType::UInt16, 16)]
+    #[case::i64(DataType::Int64, 64)]
+    #[case::decimal128(DataType::Decimal128(38, 0), 128)]
+    fn test_empty_fixed_width_builder_preserves_arrow_alignment(
+        #[case] data_type: DataType,
+        #[case] bits_per_value: u64,
+    ) {
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(vec![0_u128]),
+            bits_per_value,
+            num_values: 1,
+            block_info: BlockInfo::new(),
+        });
+        let mut builder = DataBlockBuilder::with_capacity_estimate(0);
+        builder.append(&block, 0..0).unwrap();
+        let array = builder
+            .finish()
+            .into_arrow(data_type.clone(), true)
+            .unwrap();
+        assert_eq!(array.data_type(), &data_type);
+        assert_eq!(array.len(), 0);
+    }
 
     #[test]
     fn test_sliced_to_data_block() {

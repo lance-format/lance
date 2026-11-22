@@ -2,8 +2,112 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
+
+use futures::{Stream, TryStreamExt};
+use lance_core::Result;
 
 use super::format::{DEFAULT_FTS_SEARCH_CHUNK, configured_fts_search_chunk};
+
+// A large partition can retain much more position data than a small one. Bound
+// the data queued with each CPU task independently of the partition count.
+// One indivisible partition may exceed this target and is scored alone.
+const SCORING_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+fn ready_scoring_chunks<T, S, W>(
+    loads: S,
+    max_items: usize,
+    max_bytes: usize,
+    weight: W,
+) -> impl Stream<Item = Result<Vec<T>>>
+where
+    S: Stream<Item = Result<T>>,
+    W: Fn(&T) -> usize,
+{
+    debug_assert!(
+        max_items > 0 && max_bytes > 0,
+        "scoring chunk item and byte targets must be positive"
+    );
+    let mut loads = Box::pin(loads);
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut pending = None;
+    let mut finished = false;
+    futures::stream::poll_fn(move |cx| {
+        if finished {
+            return Poll::Ready(None);
+        }
+        loop {
+            let (item, bytes) = match pending.take() {
+                Some(item) => item,
+                None => match loads.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(item))) => {
+                        let bytes = weight(&item);
+                        (item, bytes)
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        finished = true;
+                        batch.clear();
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    Poll::Ready(None) => {
+                        finished = true;
+                        return Poll::Ready(
+                            (!batch.is_empty()).then(|| Ok(std::mem::take(&mut batch))),
+                        );
+                    }
+                    Poll::Pending if batch.is_empty() => return Poll::Pending,
+                    Poll::Pending => {
+                        batch_bytes = 0;
+                        return Poll::Ready(Some(Ok(std::mem::take(&mut batch))));
+                    }
+                },
+            };
+            if !batch.is_empty() && batch_bytes.saturating_add(bytes) > max_bytes {
+                // Retain only the next item, rather than materializing a whole
+                // count-based chunk before splitting it into smaller tasks.
+                pending = Some((item, bytes));
+                batch_bytes = 0;
+                return Poll::Ready(Some(Ok(std::mem::take(&mut batch))));
+            }
+            batch_bytes = batch_bytes.saturating_add(bytes);
+            batch.push(item);
+            if batch.len() >= max_items || batch_bytes >= max_bytes {
+                batch_bytes = 0;
+                return Poll::Ready(Some(Ok(std::mem::take(&mut batch))));
+            }
+        }
+    })
+}
+
+/// Consume ready inputs before unrelated reads finish. The caller retains its
+/// original bounded I/O window; at most two CPU batches and one pending input
+/// are retained here. The byte target bounds queued cache references, not RSS
+/// or the upstream decoder's working memory.
+pub(super) async fn score_ready_partitions<T, R, S, W, F>(
+    loads: S,
+    chunk_size: usize,
+    weight: W,
+    has_file_positions: impl Fn(&T) -> bool,
+    score: F,
+) -> Result<Vec<R>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    S: Stream<Item = Result<T>>,
+    W: Fn(&T) -> usize,
+    F: Fn(Vec<T>) -> Result<Vec<R>> + Clone + Send + 'static,
+{
+    ready_scoring_chunks(loads, chunk_size, SCORING_BATCH_BYTES, weight)
+        .map_ok(move |loaded| {
+            let score = score.clone();
+            let reads_positions = loaded.iter().any(&has_file_positions);
+            run_fts_scoring(reads_positions, move || score(loaded))
+        })
+        .try_buffer_unordered(2)
+        .try_concat()
+        .await
+}
 
 /// Preserve the original partition-load window when scoring batches shrink.
 pub(super) fn buffered_search_chunks(
@@ -75,7 +179,7 @@ pub(in crate::scalar::inverted) async fn run_fts_scoring<T: Send + 'static>(
         return lance_core::utils::tokio::spawn_cpu(score).await;
     }
     static FILE_SCORERS: std::sync::LazyLock<
-        Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+        std::result::Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
     > = std::sync::LazyLock::new(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(lance_core::utils::tokio::get_num_compute_intensive_cpus().clamp(1, 32))
@@ -108,6 +212,208 @@ pub(in crate::scalar::inverted) async fn run_fts_scoring<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn ready_partition_releases_before_pending_load() {
+        let released = std::sync::Arc::new(AtomicUsize::new(0));
+        let progress = released.clone();
+        let loads = futures::stream::once(async { Ok(7) }).chain(futures::stream::once(async {
+            // The next read cannot acquire its resource until the first
+            // result has been consumed, even though both fit one CPU batch.
+            while progress.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+            Ok(11)
+        }));
+        let mut result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            score_ready_partitions(
+                loads,
+                16,
+                |_| 1,
+                |_| false,
+                move |items| {
+                    released.fetch_add(items.len(), Ordering::Release);
+                    Ok(items)
+                },
+            ),
+        )
+        .await
+        .expect("ready work must not wait for the whole I/O window")
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, vec![7, 11]);
+    }
+
+    #[tokio::test]
+    async fn ready_scoring_bounds_retained_batches() {
+        struct Input(std::sync::Arc<AtomicUsize>, usize);
+        impl Drop for Input {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let loads = futures::stream::iter(0..33).map(|id| {
+            let count = live.fetch_add(1, Ordering::Relaxed) + 1;
+            peak.fetch_max(count, Ordering::Relaxed);
+            Ok(Input(live.clone(), id))
+        });
+        let mut result = score_ready_partitions(
+            loads,
+            4,
+            |_| 1,
+            |_| false,
+            |items| {
+                assert!(items.len() <= 4);
+                Ok(items.into_iter().map(|item| item.1).collect())
+            },
+        )
+        .await
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, (0..33).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::Relaxed) <= 8);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ready_scoring_limits_bytes_without_splitting_partitions() {
+        let mib = 1024 * 1024;
+        let weights = [12 * mib, 8 * mib, 8 * mib, 20 * mib, usize::MAX, 0];
+        let loads = futures::stream::iter(weights.into_iter().enumerate().map(Ok));
+        let mut result = score_ready_partitions(
+            loads,
+            16,
+            |item| item.1,
+            |_| false,
+            |items| {
+                let bytes = items.iter().map(|item| item.1).sum::<usize>();
+                assert!(bytes <= SCORING_BATCH_BYTES || items.len() == 1);
+                Ok(items.into_iter().map(|item| item.0).collect())
+            },
+        )
+        .await
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, (0..weights.len()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn ready_scoring_limits_zero_byte_item_count() {
+        let batches = ready_scoring_chunks(
+            futures::stream::iter((0..7).map(Ok)),
+            2,
+            SCORING_BATCH_BYTES,
+            |_| 0,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert!(batches.iter().all(|batch| batch.len() <= 2));
+        assert_eq!(batches.concat(), (0..7).collect::<Vec<_>>());
+    }
+
+    struct WeightedInput {
+        live: std::sync::Arc<AtomicUsize>,
+        bytes: usize,
+        id: usize,
+    }
+
+    impl Drop for WeightedInput {
+        fn drop(&mut self) {
+            self.live.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_scoring_releases_weighted_inputs() {
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let bytes = 12 * 1024 * 1024;
+        let loads = futures::stream::iter(0..17).map(|id| {
+            let retained = live.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            peak.fetch_max(retained, Ordering::Relaxed);
+            Ok(WeightedInput {
+                live: live.clone(),
+                bytes,
+                id,
+            })
+        });
+        let mut result = score_ready_partitions(
+            loads,
+            16,
+            |item| item.bytes,
+            |_| false,
+            |items| Ok(items.into_iter().map(|item| item.id).collect()),
+        )
+        .await
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, (0..17).collect::<Vec<_>>());
+        // Two submitted batches plus the next partition that did not fit.
+        assert!(peak.load(Ordering::Relaxed) <= 3 * bytes);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ready_scoring_drop_releases_pending_input() {
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let bytes = 12 * 1024 * 1024;
+        let loads = futures::stream::iter(0..3).map(|id| {
+            live.fetch_add(bytes, Ordering::Relaxed);
+            Ok(WeightedInput {
+                live: live.clone(),
+                bytes,
+                id,
+            })
+        });
+        let mut batches = Box::pin(ready_scoring_chunks(
+            loads,
+            16,
+            SCORING_BATCH_BYTES,
+            |item| item.bytes,
+        ));
+        let first = batches.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(live.load(Ordering::Relaxed), 2 * bytes);
+        drop(first);
+        drop(batches);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ready_scoring_error_releases_unsubmitted_input() {
+        let live = std::sync::Arc::new(AtomicUsize::new(12));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let scored = calls.clone();
+        let loads = futures::stream::iter([
+            Ok(WeightedInput {
+                live: live.clone(),
+                bytes: 12,
+                id: 0,
+            }),
+            Err(lance_core::Error::index("load failed")),
+        ]);
+        let error = score_ready_partitions(
+            loads,
+            16,
+            |item| item.bytes,
+            |_| false,
+            move |items| {
+                scored.fetch_add(1, Ordering::Relaxed);
+                Ok(items.into_iter().map(|item| item.id).collect())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&error, lance_core::Error::Index { .. }));
+        assert!(error.to_string().contains("load failed"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn file_scoring_leaves_tokio_blocking_capacity_for_origin_reads() {
@@ -120,15 +426,24 @@ mod tests {
         let result = rt.block_on(async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                super::run_fts_scoring(true, || {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { Ok(tokio::task::spawn_blocking(|| 41).await? + 1) })
-                }),
+                score_ready_partitions(
+                    futures::stream::iter([Ok(41)]),
+                    1,
+                    |_| 1,
+                    |_| true,
+                    |items| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            Ok(vec![
+                                tokio::task::spawn_blocking(move || items[0] + 1).await?,
+                            ])
+                        })
+                    },
+                ),
             )
             .await
         });
         rt.shutdown_timeout(std::time::Duration::from_secs(1));
-        assert_eq!(result.unwrap().unwrap(), 42);
+        assert_eq!(result.unwrap().unwrap(), vec![42]);
     }
 
     #[rstest::rstest]

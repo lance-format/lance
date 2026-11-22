@@ -119,6 +119,7 @@ pub(super) use scheduling::run_fts_scoring;
 mod search;
 mod search_candidates;
 mod token_set;
+mod whole_positions;
 
 pub use cache::*;
 pub use doc_set::*;

@@ -982,7 +982,7 @@ impl InvertedPartition {
         })
     }
 
-    fn map(&self, token: &str) -> Option<u32> {
+    pub(super) fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
     }
 
@@ -1761,6 +1761,44 @@ impl FetchedPostings {
         self.postings.iter().any(|posting| posting.file.is_some())
     }
 
+    /// Approximate the cache-backed payload held until this partition is scored.
+    /// Group slices can retain whole Arrow allocations. Shared position streams
+    /// already track the capacity accepted by their ownership checks.
+    pub(super) fn retained_bytes(&self) -> usize {
+        Self::retained_posting_bytes(&self.postings)
+    }
+
+    fn retained_posting_bytes(postings: &[FetchedPosting]) -> usize {
+        let mut context = lance_core::deepsize::Context::default();
+        postings.iter().fold(0usize, |total, fetched| {
+            let bytes = match &fetched.list {
+                PostingList::Plain(posting) => posting.deep_size_of_children(&mut context),
+                PostingList::Compressed(posting) => {
+                    let positions = match &posting.positions {
+                        Some(CompressedPositionStorage::LegacyPerDoc(positions)) => {
+                            super::cache::retained_cache_bytes(positions, &mut context)
+                        }
+                        Some(CompressedPositionStorage::SharedStream(positions)) => {
+                            positions.size()
+                        }
+                        None => 0,
+                    };
+                    let impacts = posting.impacts.as_ref().map_or(0, |impacts| {
+                        super::cache::retained_cache_bytes(impacts.entries(), &mut context)
+                    });
+                    super::cache::retained_cache_bytes(&posting.blocks, &mut context)
+                        .saturating_add(positions)
+                        .saturating_add(impacts)
+                }
+            };
+            let directory = fetched
+                .file
+                .as_ref()
+                .map_or(0, |file| file.retained_bytes());
+            total.saturating_add(bytes).saturating_add(directory)
+        })
+    }
+
     /// Build the iterators; `tokens` must be the tokens these postings were
     /// fetched for.
     pub(super) fn into_loaded(
@@ -1943,6 +1981,34 @@ mod tests {
 
     use super::*;
     use crate::scalar::inverted::document_tokenizer::DocType;
+
+    #[test]
+    fn fetched_postings_weight_counts_shared_backing_once() {
+        let unrelated = vec![7u8; 32 * 1024];
+        // VarintDelta tail: document 0, frequency 1. The preceding value is
+        // outside this posting but its allocation remains owned by the slice.
+        let blocks = LargeBinaryArray::from_iter_values([unrelated.as_slice(), &[0, 1]]);
+        let backing = blocks.get_buffer_memory_size();
+        let posting = PostingList::Compressed(CompressedPostingList::new(
+            blocks.slice(1, 1),
+            1.0,
+            1,
+            PostingTailCodec::VarintDelta,
+            128,
+            None,
+            None,
+        ));
+        let postings = [0, 1].map(|token_id| FetchedPosting {
+            token_id,
+            token_index: token_id as usize,
+            position: token_id,
+            list: posting.clone(),
+            file: None,
+        });
+        let retained = FetchedPostings::retained_posting_bytes(&postings);
+        assert!(retained >= backing);
+        assert!(retained < 2 * backing);
+    }
 
     fn dictionary(terms: &[&str]) -> TokenSet {
         let mut dictionary = TokenSet::default();
