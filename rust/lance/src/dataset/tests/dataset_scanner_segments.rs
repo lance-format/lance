@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
-use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch};
+use arrow_array::{
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch,
+    RecordBatchIterator, StringArray, record_batch,
+};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
-use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::DocumentGranularity;
-use lance_index::scalar::inverted::query::PhraseQuery;
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
+};
+use lance_index::scalar::inverted::{DocumentGranularity, SCORE_COL};
+use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -24,6 +29,9 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_io::utils::tracking_store::IOTracker;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::format::Fragment;
+use lance_table::format::overlay::OverlayCoverage;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
 use rstest::rstest;
 use uuid::Uuid;
@@ -34,6 +42,7 @@ use crate::dataset::scanner::test_dataset::{
     TestVectorDataset, assert_query_index_field, batch_knn_two_queries,
 };
 use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap, Scanner};
+use crate::dataset::tests::dataset_overlay_index_masking::commit_overlay;
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::scalar::inverted::fts_index_fragment_bitmap;
@@ -1090,6 +1099,323 @@ async fn test_fts_respects_fragment_list() {
             .unwrap()
             .as_primitive::<Int32Type>();
         assert_eq!(i_array.values(), &[expected_i]);
+    }
+}
+
+/// A full-text query shape a distributed engine may split by fragment.
+#[derive(Clone, Copy, Debug)]
+enum SplitQuery {
+    ExactOr,
+    ExactAnd,
+    /// Fuzziness left to the dataset planner, which resolves it to an exact match.
+    AutoFuzziness,
+    Fuzzy,
+    Phrase,
+    BooleanShould,
+    BooleanMustNot,
+    MultiMatch,
+}
+
+fn text_match(terms: &str, fuzziness: Option<u32>, operator: Operator) -> FtsQuery {
+    MatchQuery::new(terms.to_string())
+        .with_column(Some("text".to_string()))
+        .with_fuzziness(fuzziness)
+        .with_operator(operator)
+        .into()
+}
+
+impl SplitQuery {
+    fn query(self) -> FtsQuery {
+        match self {
+            Self::ExactOr => text_match("grape fig", Some(0), Operator::Or),
+            Self::ExactAnd => text_match("grape fig", Some(0), Operator::And),
+            Self::AutoFuzziness => text_match("grape", None, Operator::Or),
+            Self::Fuzzy => text_match("grap", Some(1), Operator::Or),
+            Self::Phrase => PhraseQuery::new("grape fig".to_string())
+                .with_column(Some("text".to_string()))
+                .into(),
+            Self::BooleanShould => BooleanQuery::new([
+                (Occur::Should, text_match("grape", Some(0), Operator::Or)),
+                (Occur::Should, text_match("honey", Some(0), Operator::Or)),
+            ])
+            .into(),
+            Self::BooleanMustNot => BooleanQuery::new([
+                (Occur::Must, text_match("grape", Some(0), Operator::Or)),
+                (Occur::MustNot, text_match("fig", Some(0), Operator::Or)),
+            ])
+            .into(),
+            Self::MultiMatch => MultiMatchQuery::try_new(
+                "grape".to_string(),
+                vec!["text".to_string(), "title".to_string()],
+            )
+            .unwrap()
+            .into(),
+        }
+    }
+
+    /// Whether the planner scores rows of unindexed fragments against the whole corpus,
+    /// so selecting some of those fragments leaves every score unchanged. Only a root
+    /// exact Match or row-level Phrase is planned that way
+    /// (https://github.com/lance-format/lance/issues/9058).
+    fn has_global_unindexed_corpus(self) -> bool {
+        matches!(
+            self,
+            Self::ExactOr | Self::ExactAnd | Self::AutoFuzziness | Self::Phrase
+        )
+    }
+}
+
+const SPLIT_ROWS_PER_FRAGMENT: usize = 60;
+
+/// Seeded texts for one fragment, drawn from the first `width` words of a shared
+/// vocabulary so that term statistics differ between fragments.
+fn split_texts(seed: u64, width: usize) -> Vec<String> {
+    const VOCAB: [&str; 10] = [
+        "apple", "banana", "cherry", "date", "elder", "fig", "grape", "honey", "kiwi", "lemon",
+    ];
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..SPLIT_ROWS_PER_FRAGMENT)
+        .map(|_| {
+            let len = rng.random_range(3..13);
+            (0..len)
+                .map(|_| VOCAB[rng.random_range(0..width)])
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// Six fragments, with two rows deleted after indexing. `text` is indexed as the
+/// segments {0, 1}, {2} and {3}, then {4} and {5} unless `has_unindexed_tail` appends
+/// those two fragments after indexing. `title` has one segment over the fragments that
+/// exist when it is built. `has_overlay` rewrites the `text` of three indexed rows.
+async fn split_merge_dataset(
+    has_unindexed_tail: bool,
+    has_overlay: bool,
+    use_stable_row_ids: bool,
+) -> Dataset {
+    const WIDTHS: [usize; 6] = [7, 10, 8, 3, 9, 10];
+    let fragment = |position: usize| {
+        let start = (position * SPLIT_ROWS_PER_FRAGMENT) as i32;
+        let batch = record_batch!(
+            (
+                "id",
+                Int32,
+                (start..start + SPLIT_ROWS_PER_FRAGMENT as i32).collect::<Vec<_>>()
+            ),
+            ("text", Utf8, split_texts(position as u64, WIDTHS[position])),
+            (
+                "title",
+                Utf8,
+                split_texts(position as u64 + 100, WIDTHS[position])
+            )
+        )
+        .unwrap();
+        let schema = batch.schema();
+        RecordBatchIterator::new(vec![Ok(batch)], schema)
+    };
+    let indexed_count = if has_unindexed_tail { 4 } else { 6 };
+    let params = WriteParams {
+        enable_stable_row_ids: use_stable_row_ids,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(fragment(0), "memory://", Some(params))
+        .await
+        .unwrap();
+    for position in 1..indexed_count {
+        dataset.append(fragment(position), None).await.unwrap();
+    }
+    let fragment_ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let mut groups = vec![fragment_ids[..2].to_vec()];
+    groups.extend(fragment_ids[2..].iter().map(|id| vec![*id]));
+    let text_params = InvertedIndexParams::default().with_position(true);
+    let mut segments = Vec::with_capacity(groups.len());
+    for group in groups {
+        segments.push(
+            dataset
+                .create_index_builder(&["text"], IndexType::Inverted, &text_params)
+                .name("text_idx".to_string())
+                .fragments(group)
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("text_idx", "text", segments)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["title"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    for position in indexed_count..WIDTHS.len() {
+        dataset.append(fragment(position), None).await.unwrap();
+    }
+    if has_overlay {
+        // Overlay rows in fragments that different subsets of the test select.
+        for (fragment_id, offsets, texts) in [
+            (
+                fragment_ids[0],
+                vec![2, 5],
+                vec!["grape fig grape", "honey grape"],
+            ),
+            (fragment_ids[2], vec![1], vec!["fig grape honey"]),
+        ] {
+            dataset = commit_overlay(
+                dataset,
+                &format!("split_merge_text_overlay_{fragment_id}"),
+                fragment_id as u64,
+                // Field 1 is `text`.
+                &[1],
+                OverlayCoverage::dense(RoaringBitmap::from_iter(offsets)),
+                vec![Arc::new(StringArray::from(texts))],
+            )
+            .await;
+        }
+    }
+    dataset.delete("id = 61 OR id = 125").await.unwrap();
+    dataset
+}
+
+/// `(id, _score)` of the rows `query` returns over `fragments`, or over the whole
+/// dataset when `fragments` is `None`.
+async fn split_scores(
+    dataset: &Dataset,
+    query: &FtsQuery,
+    fragments: Option<&[Fragment]>,
+    fast_search: bool,
+    filter: Option<&str>,
+    limit: Option<i64>,
+) -> Vec<(i32, f32)> {
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id", SCORE_COL])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap()
+        .limit(limit, None)
+        .unwrap();
+    if fast_search {
+        scanner.fast_search();
+    }
+    if let Some(filter) = filter {
+        scanner.prefilter(true).filter(filter).unwrap();
+    }
+    if let Some(fragments) = fragments {
+        scanner.with_fragments(fragments.to_vec());
+    }
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<Int32Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    ids.iter().copied().zip(scores.iter().copied()).collect()
+}
+
+fn top_scores(mut scores: Vec<f32>, k: usize) -> Vec<f32> {
+    scores.sort_by(|a, b| b.total_cmp(a));
+    scores.truncate(k);
+    scores
+}
+
+/// A full-text search split into fragment subsets, each returning its own top k, merges
+/// by `_score` into the top k of one scan over the whole dataset. This is the contract a
+/// distributed engine relies on to search the subsets independently: every row must
+/// score as it does in the whole scan, whatever fragments are selected with it.
+#[rstest]
+#[tokio::test]
+async fn test_fts_fragment_split_merges_to_whole_scan_top_k(
+    #[values(
+        SplitQuery::ExactOr,
+        SplitQuery::ExactAnd,
+        SplitQuery::AutoFuzziness,
+        SplitQuery::Fuzzy,
+        SplitQuery::Phrase,
+        SplitQuery::BooleanShould,
+        SplitQuery::BooleanMustNot,
+        SplitQuery::MultiMatch
+    )]
+    shape: SplitQuery,
+    #[values(false, true)] has_unindexed_tail: bool,
+    #[values(false, true)] has_overlay: bool,
+    #[values(false, true)] use_stable_row_ids: bool,
+) {
+    const TOP_K: usize = 5;
+    let dataset = split_merge_dataset(has_unindexed_tail, has_overlay, use_stable_row_ids).await;
+    let query = shape.query();
+    let fragments = dataset.fragments();
+    // The subsets split the {0, 1} segment and join fragments of different segments;
+    // with an unindexed tail, {3, 4} also joins an indexed and an unindexed fragment.
+    let subsets = [
+        &fragments[0..1],
+        &fragments[1..3],
+        &fragments[3..5],
+        &fragments[5..6],
+    ];
+    for fast_search in [false, true] {
+        // Fast search scores only committed index segments, so no selection moves a
+        // score. Without it, overlaid rows, and the unindexed rows of the shapes
+        // `has_global_unindexed_corpus` excludes, score with statistics that depend on the
+        // rows the query reads (https://github.com/lance-format/lance/issues/9058).
+        let depends_on_selection =
+            has_overlay || (has_unindexed_tail && !shape.has_global_unindexed_corpus());
+        if !fast_search && depends_on_selection {
+            continue;
+        }
+        for filter in [None, Some("id % 3 <> 0")] {
+            let context = format!(
+                "{shape:?}, has_unindexed_tail={has_unindexed_tail}, has_overlay={has_overlay}, \
+                 stable_row_ids={use_stable_row_ids}, fast_search={fast_search}, \
+                 filter={filter:?}"
+            );
+            let whole = split_scores(&dataset, &query, None, fast_search, filter, None).await;
+            assert!(
+                whole.len() > TOP_K,
+                "only {} matches: {context}",
+                whole.len()
+            );
+            let whole_scores: HashMap<i32, f32> = whole.iter().copied().collect();
+            let mut merged = Vec::with_capacity(subsets.len() * TOP_K);
+            for subset in subsets {
+                let subset_ids: Vec<u64> = subset.iter().map(|f| f.id).collect();
+                let rows = split_scores(
+                    &dataset,
+                    &query,
+                    Some(subset),
+                    fast_search,
+                    filter,
+                    Some(TOP_K as i64),
+                )
+                .await;
+                for (id, score) in rows {
+                    let whole_score = whole_scores.get(&id).unwrap_or_else(|| {
+                        panic!("row {id} from fragments {subset_ids:?} is not in the whole scan: {context}")
+                    });
+                    assert!(
+                        (score - whole_score).abs() < 1e-4,
+                        "row {id} scores {score} in fragments {subset_ids:?} but {whole_score} \
+                         in the whole scan: {context}"
+                    );
+                    merged.push(score);
+                }
+            }
+            let whole_top = top_scores(whole.iter().map(|(_, score)| *score).collect(), TOP_K);
+            let merged_top = top_scores(merged, TOP_K);
+            assert!(
+                merged_top.len() == whole_top.len()
+                    && merged_top
+                        .iter()
+                        .zip(&whole_top)
+                        .all(|(merged, whole)| (merged - whole).abs() < 1e-4),
+                "merged top {TOP_K} {merged_top:?} differs from the whole scan {whole_top:?}: \
+                 {context}"
+            );
+        }
     }
 }
 
