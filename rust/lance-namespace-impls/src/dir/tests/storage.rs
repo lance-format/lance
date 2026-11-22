@@ -127,6 +127,88 @@ async fn test_list_versions_under_ordering_and_limit() {
     seed_and_check(&ns_fs).await;
 }
 
+#[tokio::test]
+async fn test_list_table_versions_pagination_mixed_manifests_and_cleanup() {
+    use lance_table::io::commit::{
+        ManifestNamingScheme::{V1, V2},
+        VERSIONS_DIR,
+    };
+
+    let ns = DirectoryNamespaceBuilder::new("memory://version-pages")
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let table = ns.table_path("events");
+    for (scheme, version) in [
+        (V1, 2),
+        (V2, 5),
+        (V1, 7),
+        (V1, 10),
+        (V2, 11),
+        (V1, 12),
+        (V2, 20),
+    ] {
+        ns.object_store
+            .put(&scheme.manifest_path(&table, version), b"m")
+            .await
+            .unwrap();
+    }
+    let dir = table.clone().join(VERSIONS_DIR);
+    for filename in [
+        "1.manifest-staging",
+        "1.backup.manifest",
+        "d9223372036854775809.manifest",
+    ] {
+        ns.object_store
+            .put(&dir.clone().join(filename), b"other")
+            .await
+            .unwrap();
+    }
+    ns.object_store
+        .put(&dir.join("staging").join("1.manifest"), b"other")
+        .await
+        .unwrap();
+
+    let mut request = ListTableVersionsRequest {
+        id: Some(vec!["events".into()]),
+        limit: Some(2),
+        ..Default::default()
+    };
+    let first = ns.list_table_versions(request.clone()).await.unwrap();
+    let numbers = |rows: &[TableVersion]| rows.iter().map(|row| row.version).collect::<Vec<_>>();
+    assert_eq!(numbers(&first.versions), [2, 5]);
+    request.page_token = Some(first.page_token.expect("expected a continuation"));
+    for (scheme, version) in [(V2, 5), (V1, 7)] {
+        ns.object_store
+            .inner
+            .delete(&scheme.manifest_path(&table, version))
+            .await
+            .unwrap();
+    }
+    request.limit = Some(-1);
+    let rest = ns.list_table_versions(request.clone()).await.unwrap();
+    assert_eq!(numbers(&rest.versions), [10, 11, 12, 20]);
+    assert!(rest.page_token.is_none());
+    request.limit = Some(0);
+    let empty = ns.list_table_versions(request.clone()).await.unwrap();
+    assert!(empty.versions.is_empty());
+    assert!(empty.page_token.is_none());
+
+    // A logical cursor ending at 10 cannot distinguish two manifests for version 10.
+    ns.object_store
+        .put(&V2.manifest_path(&table, 10), b"conflict")
+        .await
+        .unwrap();
+    request.limit = Some(1);
+    let err = ns.list_table_versions(request).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Multiple manifests for version 10")
+    );
+    assert_eq!(mutation_error_code(err), ErrorCode::Internal);
+}
+
 /// A retained staging blob sorts ahead of the newest committed manifest;
 /// if scheme detection reads it, the `descending, limit=1` hot path falls
 /// back to consuming the whole directory. Asserts the consumption bound.

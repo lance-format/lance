@@ -6,12 +6,25 @@ use std::collections::HashMap;
 use futures::TryStreamExt;
 use lance_core::Result;
 use lance_namespace::error::NamespaceError;
-use lance_namespace::models::{CreateTableVersionResponse, TableVersion};
+use lance_namespace::models::{
+    CreateTableVersionResponse, ListTableVersionsResponse, TableVersion,
+};
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStoreExt, PutMode, PutOptions};
 
 use super::DirectoryNamespace;
+
+fn table_version(version: u64, meta: ObjectMeta) -> TableVersion {
+    TableVersion {
+        version: version as i64,
+        manifest_path: meta.location.to_string(),
+        manifest_size: Some(meta.size as i64),
+        e_tag: meta.e_tag,
+        timestamp_millis: Some(meta.last_modified.timestamp_millis()),
+        metadata: None,
+    }
+}
 
 /// Inputs for resolving an already-published `create_table_version` target.
 pub(super) struct ExistingTableVersionResolve<'a> {
@@ -275,6 +288,99 @@ impl DirectoryNamespace {
             .await
     }
 
+    /// Page by logical version so cleanup or a manifest naming migration does
+    /// not invalidate the last version returned to a client.
+    pub(super) async fn list_ascending_version_page(
+        &self,
+        table_uri: &str,
+        limit: Option<i32>,
+        page_token: Option<&str>,
+    ) -> Result<ListTableVersionsResponse> {
+        let after = page_token
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                token
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|v| *v >= 0 && v.to_string() == token)
+                    .ok_or_else(|| NamespaceError::InvalidInput {
+                        message: format!("Invalid table version page_token '{token}'"),
+                    })
+            })
+            .transpose()?;
+        let limit = limit.and_then(|n| usize::try_from(n).ok());
+        if limit == Some(0) {
+            return Ok(ListTableVersionsResponse::default());
+        }
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        let versions_dir = table_path.clone().join(VERSIONS_DIR);
+        let mut manifests = self.object_store.list_objects(Some(&versions_dir));
+        let mut versions = Vec::new();
+        let keep = limit.map(|n| n + 1);
+        while let Some(meta) =
+            manifests
+                .try_next()
+                .await
+                .map_err(|err| NamespaceError::Internal {
+                    message: format!("Failed to list manifest files under '{versions_dir}': {err}"),
+                })?
+        {
+            let Some(filename) = meta.location.filename() else {
+                continue;
+            };
+            let Some(scheme) = ManifestNamingScheme::detect_scheme(filename) else {
+                continue;
+            };
+            let Some(version) = scheme.parse_version(filename) else {
+                continue;
+            };
+            // A recursive listing can include staged, nested and detached objects.
+            if scheme.manifest_path(&table_path, version) != meta.location
+                || after.is_some_and(|after| version <= after as u64)
+            {
+                continue;
+            }
+            versions.push(table_version(version, meta));
+            if let Some(keep) = keep
+                && versions.len() >= keep.saturating_mul(2)
+            {
+                // Compact in batches. Storage order need not match numeric order,
+                // even on a lexically ordered store with mixed manifest layouts.
+                versions.select_nth_unstable_by_key(keep, |v| v.version);
+                versions.truncate(keep);
+            }
+        }
+        versions.sort_unstable_by_key(|v| v.version);
+        if let Some(keep) = keep {
+            versions.truncate(keep);
+        }
+        if let Some(pair) = versions
+            .windows(2)
+            .find(|pair| pair[0].version == pair[1].version)
+        {
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "Multiple manifests for version {}: '{}' and '{}'",
+                    pair[0].version, pair[0].manifest_path, pair[1].manifest_path
+                ),
+            }
+            .into());
+        }
+        let page_token = if let Some(limit) = limit
+            && versions.len() > limit
+        {
+            versions.truncate(limit);
+            versions.last().map(|last| last.version.to_string())
+        } else {
+            None
+        };
+        Ok(ListTableVersionsResponse {
+            versions,
+            page_token,
+            ..Default::default()
+        })
+    }
+
     /// List committed manifest versions under `table_path/_versions/`.
     /// `table_path` must be an object-store `Path`; converting a URI to a path
     /// can miss manifests on Windows.
@@ -307,14 +413,7 @@ impl DirectoryNamespace {
             let Some(actual_version) = Self::manifest_version_from_filename(filename) else {
                 return false;
             };
-            out.push(TableVersion {
-                version: actual_version as i64,
-                manifest_path: meta.location.to_string(),
-                manifest_size: Some(meta.size as i64),
-                e_tag: meta.e_tag,
-                timestamp_millis: Some(meta.last_modified.timestamp_millis()),
-                metadata: None,
-            });
+            out.push(table_version(actual_version, meta));
             true
         };
 
