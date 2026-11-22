@@ -36,12 +36,12 @@ use crate::object_store::{
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{
-        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
-        shared_throttle_state, with_throttling,
+        AimdThrottleConfig, AimdThrottleState, Transport, cloud_http_connector,
+        reject_http_connector_for_opendal, shared_throttle_state, with_throttling,
     },
 };
 use lance_core::error::{Error, Result};
-use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::{aimd::AimdConfig, parse::str_is_truthy};
 
 mod conditional_copy;
 
@@ -81,6 +81,17 @@ impl ResolvedS3StorageOptions {
 
     fn effective_endpoint(&self) -> Option<&str> {
         effective_s3_endpoint(&self.options)
+    }
+
+    fn throttle_defaults(&self, is_s3_express: bool, use_opendal: bool) -> AimdThrottleConfig {
+        let defaults = AimdThrottleConfig::default();
+        if is_s3_express || use_opendal || self.effective_endpoint().is_some() {
+            return defaults;
+        }
+        // AWS general-purpose S3 sustains at least 11,000 GET/HEAD requests/s
+        // per partitioned prefix. Preserve the existing startup rate for
+        // independent processes that may be reading the same prefix.
+        defaults.with_read_aimd(AimdConfig::default().with_max_rate(11_000.0))
     }
 
     fn requires_constant_size_upload_parts(&self) -> bool {
@@ -274,7 +285,8 @@ impl ObjectStoreProvider for AwsStoreProvider {
         // Keyed like the registry cache so per-dataset stores share the bucket's budget.
         let store_prefix =
             self.calculate_object_store_prefix(&base_path, params.storage_options())?;
-        let throttle_state = shared_throttle_state(&store_prefix, params)?;
+        let throttle_defaults = resolved_s3_options.throttle_defaults(is_s3_express, use_opendal);
+        let throttle_state = shared_throttle_state(&store_prefix, params, throttle_defaults)?;
 
         let (inner, paginated_lister) = if use_opendal {
             reject_http_connector_for_opendal(params)?;
@@ -1411,6 +1423,31 @@ mod tests {
             authorization.contains(&format!("/{region}/s3/aws4_request")),
             "expected region {region} in {authorization}"
         );
+    }
+
+    #[test]
+    fn test_s3_read_rate_defaults() {
+        let native = ResolvedS3StorageOptions::new(HashMap::new(), None, None);
+        let defaults = native.throttle_defaults(false, false);
+        assert_eq!(defaults.read.max_rate, 11_000.0);
+        for category in [defaults.write, defaults.delete, defaults.list] {
+            assert_eq!(category.max_rate, AimdConfig::default().max_rate);
+        }
+        let custom = ResolvedS3StorageOptions::new(
+            HashMap::from([(
+                AmazonS3ConfigKey::Endpoint,
+                "https://s3.example.com".to_string(),
+            )]),
+            None,
+            None,
+        );
+        for config in [
+            native.throttle_defaults(true, false),
+            native.throttle_defaults(false, true),
+            custom.throttle_defaults(false, false),
+        ] {
+            assert_eq!(config.read.max_rate, AimdConfig::default().max_rate);
+        }
     }
 
     #[test]

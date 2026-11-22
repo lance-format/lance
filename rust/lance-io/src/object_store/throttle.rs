@@ -205,10 +205,11 @@ impl AimdThrottleConfig {
     pub fn from_storage_options(
         storage_options: Option<&HashMap<String, String>>,
     ) -> lance_core::Result<Self> {
-        Self::from_options_and_env(storage_options, |key| std::env::var(key).ok())
+        Self::default().resolve_options(storage_options, |key| std::env::var(key).ok())
     }
 
-    fn from_options_and_env(
+    fn resolve_options(
+        self,
         storage_options: Option<&HashMap<String, String>>,
         get_env: impl Fn(&str) -> Option<String>,
     ) -> lance_core::Result<Self> {
@@ -216,27 +217,26 @@ impl AimdThrottleConfig {
             storage_options,
             get_env,
         };
-        let defaults = Self::default();
         Ok(Self {
-            read: options.controller("read", defaults.read)?,
-            write: options.controller("write", defaults.write)?,
-            delete: options.controller("delete", defaults.delete)?,
-            list: options.controller("list", defaults.list)?,
+            read: options.controller("read", self.read)?,
+            write: options.controller("write", self.write)?,
+            delete: options.controller("delete", self.delete)?,
+            list: options.controller("list", self.list)?,
             burst_capacity: options.resolve(
                 "lance_aimd_burst_capacity",
                 None,
-                defaults.burst_capacity,
+                self.burst_capacity,
             )?,
-            max_retries: options.resolve("lance_aimd_max_retries", None, defaults.max_retries)?,
+            max_retries: options.resolve("lance_aimd_max_retries", None, self.max_retries)?,
             min_backoff_ms: options.resolve(
                 "lance_aimd_min_backoff_ms",
                 None,
-                defaults.min_backoff_ms,
+                self.min_backoff_ms,
             )?,
             max_backoff_ms: options.resolve(
                 "lance_aimd_max_backoff_ms",
                 None,
-                defaults.max_backoff_ms,
+                self.max_backoff_ms,
             )?,
         })
     }
@@ -588,8 +588,10 @@ static SHARED_THROTTLE_STATES: LazyLock<
 pub(crate) fn shared_throttle_state(
     store_prefix: &str,
     params: &ObjectStoreParams,
+    defaults: AimdThrottleConfig,
 ) -> lance_core::Result<Option<AimdThrottleState>> {
-    let config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+    let config =
+        defaults.resolve_options(params.storage_options(), |key| std::env::var(key).ok())?;
     if config.is_disabled() {
         return Ok(None);
     }
@@ -1442,10 +1444,10 @@ mod tests {
     #[test]
     fn test_shared_throttle_state_follows_store_identity() {
         let params = ObjectStoreParams::default();
-        let a = shared_throttle_state("s3$shared-bucket", &params)
+        let a = shared_throttle_state("s3$shared-bucket", &params, Default::default())
             .unwrap()
             .unwrap();
-        let b = shared_throttle_state("s3$shared-bucket", &params)
+        let b = shared_throttle_state("s3$shared-bucket", &params, Default::default())
             .unwrap()
             .unwrap();
         // Two stores of one bucket, e.g. two datasets in dataset label mode, draw
@@ -1455,7 +1457,7 @@ mod tests {
         assert!(Arc::ptr_eq(&a.delete, &b.delete));
         assert!(Arc::ptr_eq(&a.list, &b.list));
 
-        let other = shared_throttle_state("s3$other-bucket", &params)
+        let other = shared_throttle_state("s3$other-bucket", &params, Default::default())
             .unwrap()
             .unwrap();
         assert!(!Arc::ptr_eq(&a.read, &other.read));
@@ -1467,7 +1469,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            shared_throttle_state("s3$shared-bucket", &disabled)
+            shared_throttle_state("s3$shared-bucket", &disabled, Default::default())
                 .unwrap()
                 .is_none()
         );
@@ -1483,7 +1485,7 @@ mod tests {
     #[case::category_env(None, Some("7000"), Some("6000"), Some("5000"), 7000.0)]
     #[case::generic_option(None, None, Some("6000"), Some("5000"), 6000.0)]
     #[case::generic_env(None, None, None, Some("5000"), 5000.0)]
-    #[case::category_default(None, None, None, None, AimdThrottleConfig::default().read.max_rate)]
+    #[case::category_default(None, None, None, None, 12_345.0)]
     fn test_read_rate_option_precedence(
         #[case] category_option: Option<&str>,
         #[case] category_env: Option<&str>,
@@ -1498,15 +1500,18 @@ mod tests {
         .into_iter()
         .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
         .collect();
-        let config = AimdThrottleConfig::from_options_and_env(Some(&storage_options), |key| {
-            match key {
-                "LANCE_AIMD_READ_MAX_RATE" => category_env,
-                "LANCE_AIMD_MAX_RATE" => generic_env,
-                _ => None,
-            }
-            .map(str::to_owned)
-        })
-        .unwrap();
+        let defaults = AimdThrottleConfig::default()
+            .with_read_aimd(AimdConfig::default().with_max_rate(12_345.0));
+        let config = defaults
+            .resolve_options(Some(&storage_options), |key| {
+                match key {
+                    "LANCE_AIMD_READ_MAX_RATE" => category_env,
+                    "LANCE_AIMD_MAX_RATE" => generic_env,
+                    _ => None,
+                }
+                .map(str::to_owned)
+            })
+            .unwrap();
 
         assert_eq!(config.read.max_rate, expected);
         let generic_rate = generic_option
@@ -1528,8 +1533,8 @@ mod tests {
             ("lance_aimd_delete_decrease_factor", "0.25"),
             ("lance_aimd_max_retries", "0"),
         ]);
-        let config =
-            AimdThrottleConfig::from_options_and_env(params.storage_options(), |key| match key {
+        let config = AimdThrottleConfig::default()
+            .resolve_options(params.storage_options(), |key| match key {
                 "LANCE_AIMD_ADDITIVE_INCREMENT" => Some("100".to_owned()),
                 "LANCE_AIMD_LIST_ADDITIVE_INCREMENT" => Some("800".to_owned()),
                 "LANCE_AIMD_BURST_CAPACITY" => Some("150".to_owned()),
@@ -1555,15 +1560,17 @@ mod tests {
     #[test]
     fn test_invalid_category_option_reports_the_selected_source() {
         let params = params_with(&[("lance_aimd_max_rate", "6000")]);
-        let err = AimdThrottleConfig::from_options_and_env(params.storage_options(), |key| {
-            (key == "LANCE_AIMD_READ_MAX_RATE").then(|| "invalid".to_owned())
-        })
-        .unwrap_err();
+        let err = AimdThrottleConfig::default()
+            .resolve_options(params.storage_options(), |key| {
+                (key == "LANCE_AIMD_READ_MAX_RATE").then(|| "invalid".to_owned())
+            })
+            .unwrap_err();
         assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
         assert!(err.to_string().contains("LANCE_AIMD_READ_MAX_RATE"));
 
         let params = params_with(&[("lance_aimd_read_max_rate", "invalid")]);
-        let err = AimdThrottleConfig::from_options_and_env(params.storage_options(), |_| None)
+        let err = AimdThrottleConfig::default()
+            .resolve_options(params.storage_options(), |_| None)
             .unwrap_err();
         assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
         assert!(err.to_string().contains("lance_aimd_read_max_rate"));
@@ -1601,7 +1608,11 @@ mod tests {
     fn test_shared_throttle_state_rejects_an_unsamplable_backoff_range(
         #[case] options: &[(&str, &str)],
     ) {
-        let Err(err) = shared_throttle_state("s3$backoff-bucket", &params_with(options)) else {
+        let Err(err) = shared_throttle_state(
+            "s3$backoff-bucket",
+            &params_with(options),
+            Default::default(),
+        ) else {
             panic!("an unsamplable backoff range must be rejected");
         };
         assert!(
@@ -1621,7 +1632,7 @@ mod tests {
             ("lance_aimd_max_backoff_ms", "250"),
         ]);
         assert!(
-            shared_throttle_state("s3$equal-bounds-bucket", &params)
+            shared_throttle_state("s3$equal-bounds-bucket", &params, Default::default())
                 .unwrap()
                 .is_some()
         );
@@ -1636,7 +1647,7 @@ mod tests {
             ("lance_aimd_min_backoff_ms", "500"),
         ]);
         assert!(
-            shared_throttle_state("s3$disabled-bucket", &params)
+            shared_throttle_state("s3$disabled-bucket", &params, Default::default())
                 .unwrap()
                 .is_none()
         );

@@ -404,7 +404,7 @@ uppercase environment variable. The categories are `read` (GET and HEAD), `write
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
-| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000   |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000 (11000 for native S3 reads) |
 | Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
 | Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
 
@@ -422,6 +422,14 @@ Rates are in requests per second. The controller adds the increment after each
 one-second success window. Setting the max rate to `0` removes the client-side
 ceiling while leaving AIMD feedback active. Cloud stores with the same bucket
 and store parameters share each category's budget within a process.
+
+The 11000 requests/s read ceiling applies to the built-in Amazon S3 client for
+general purpose buckets using the default AWS endpoint. S3 Express, custom S3
+endpoints, OpenDAL, GCS, and Azure use the 10000 requests/s default ceiling.
+AWS reports at least 11000 GET/HEAD requests/s per partitioned prefix. The Lance
+ceiling applies per bucket and store configuration in each process, so several
+processes can send more than one controller's ceiling to a shared prefix.
+See [the AWS S3 announcement](https://aws.amazon.com/about-aws/whats-new/2026/11/amazon-s3-increases-read-request-rate/).
 
 ## Fragment Sizing
 
