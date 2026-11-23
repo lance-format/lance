@@ -3,20 +3,22 @@
 
 //! Protobuf transaction carrier for the manifest write path.
 //!
-//! [`Transaction`] carries an already-encoded protobuf transaction to
-//! [`crate::io::commit::CommitHandler`] implementations and the
-//! [`crate::io::commit::ManifestWriter`]. A commit path passes it as an
-//! `Option` after deciding whether the manifest should include an inline copy;
-//! `None` leaves the transaction section empty.
+//! [`Transaction`] holds a [`pb::Transaction`] message in memory so commit
+//! handlers and the [`crate::io::commit::ManifestWriter`] can pass it without
+//! depending on the higher-level transaction builder. A commit path passes it
+//! as an `Option` after deciding whether the manifest should include an inline
+//! copy; `None` leaves the transaction section empty.
 //!
-//! The protobuf is built and validated before wrapping, so converting back with
-//! `From<Transaction> for pb::Transaction` moves the value at the write boundary.
+//! The manifest writer serializes the message into wire bytes with
+//! `write_protobuf`. Callers can also construct the wrapper directly through
+//! [`Transaction::inner`] or `From<pb::Transaction>`, so the wrapper itself does
+//! not establish how the message was built or that it was validated.
 
 use crate::format::pb;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transaction {
-    /// The encoded transaction carried to the manifest writer.
+    /// The protobuf message carried to the manifest writer.
     pub inner: pb::Transaction,
 }
 
@@ -67,7 +69,8 @@ pub fn operation_may_change_schema(transaction: &pb::Transaction) -> bool {
     }
 }
 
-/// Write-boundary conversion: serialize using protobuf at the last step.
+/// Write-boundary conversion: move the protobuf message out without another
+/// conversion.
 impl From<Transaction> for pb::Transaction {
     fn from(tx: Transaction) -> Self {
         tx.inner
