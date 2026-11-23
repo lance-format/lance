@@ -64,6 +64,7 @@ use crate::io::exec::{
 use crate::session::index_caches::QuantizedRefinementOptions;
 use crate::{Error, Result};
 
+use super::source::ScanOptions;
 use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
@@ -954,17 +955,16 @@ impl Scanner {
             // but the most common case is that fragments newer than the vector index are also
             // newer than the scalar indices.
             let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                false,
-                false,
+                ScanOptions {
+                    with_row_id: true,
+                    // We are re-ordering anyways, so no need to get data in a deterministic order.
+                    ordered: false,
+                    ..Default::default()
+                },
                 vector_scan_projection,
                 Arc::new(fallback_fragments),
                 // Can't pushdown limit/offset in an ANN search
                 None,
-                // We are re-ordering anyways, so no need to get data in a deterministic order.
-                false,
             );
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
@@ -996,8 +996,9 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node =
-                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_proj)?;
+            let mut stale_node = self
+                .row_addrs_take(stale_rows.physical_selection(), take_proj)
+                .await?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }

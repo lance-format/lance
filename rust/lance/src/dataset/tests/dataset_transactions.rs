@@ -8,8 +8,8 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
-    UpdateBuilder, write_manifest_file,
+    ColumnAlteration, NewColumnTransform, ReadParams, TRANSACTIONS_DIR, UpdateBuilder,
+    write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
@@ -642,12 +642,13 @@ async fn test_inline_transaction() {
     )
     .await
     .unwrap();
+    let build_config = lance_table::format::ManifestBuildConfig::default();
     let (mut manifest, indices) = tx
         .build_manifest(
             Some(ds.manifest.as_ref()),
             ds.load_indices().await.unwrap().as_ref().clone(),
             &tx_file,
-            &ManifestWriteConfig::default().to_build_config(),
+            &build_config,
         )
         .unwrap();
     let location = write_manifest_file(
@@ -660,7 +661,7 @@ async fn test_inline_transaction() {
         } else {
             Some(indices.clone())
         },
-        &ManifestWriteConfig::default(),
+        &build_config,
         ds.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.

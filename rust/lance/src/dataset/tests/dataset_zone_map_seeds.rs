@@ -1894,8 +1894,9 @@ fn serialized_round_trip(transaction: &Transaction) -> Transaction {
 /// Commit a copy of the latest manifest with the zone seed bits cleared, the
 /// way a build that predates the flag left a seeded index behind, and reopen.
 async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
-    use crate::dataset::{ManifestWriteConfig, write_manifest_file};
+    use crate::dataset::write_manifest_file;
     use crate::index::loading::load_all_indices;
+    use lance_table::format::ManifestBuildConfig;
 
     let mut manifest = dataset.manifest.as_ref().clone();
     manifest.reader_feature_flags &= !FLAG_ZONE_WRITE_SEEDS;
@@ -1908,10 +1909,7 @@ async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
         &dataset.base,
         &mut manifest,
         Some(indices),
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         dataset.manifest_location.naming_scheme,
         None,
         false,

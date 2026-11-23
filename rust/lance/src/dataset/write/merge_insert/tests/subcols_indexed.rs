@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use arrow_array::LargeBinaryArray;
 
 /// Four rows keyed by `interval_idx` with `cells` (a `list<struct>`) null,
 /// and a BTree index on the key so the merge takes the indexed join path.
@@ -431,4 +432,145 @@ async fn test_merge_insert_partial_list_struct(
     );
     assert_eq!(ds.latest_version_id().await.unwrap(), version);
     assert_eq!(ds.scan().try_into_batch().await.unwrap(), target);
+}
+
+/// Both the indexed take and the unindexed scan must project the same struct
+/// children. Lists require complete items, so use a struct to exercise supported
+/// partial updates while preserving the omitted timestamp child.
+#[rstest::rstest]
+#[case::indexed_update_all(false, false)]
+#[case::indexed_update_if(false, true)]
+#[case::mixed_update_all(true, false)]
+#[case::mixed_update_if(true, true)]
+#[tokio::test]
+async fn test_indexed_partial_update_if_nested_subset(
+    #[case] unindexed_fragment: bool,
+    #[case] with_condition: bool,
+) {
+    let cells = StructArray::new(
+        vec![
+            Field::new("idx", DataType::Int32, true),
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("data", DataType::LargeBinary, true),
+        ]
+        .into(),
+        vec![
+            Arc::new(Int32Array::from(vec![None, None, Some(-1), None])),
+            Arc::new(Int64Array::from(vec![None, None, Some(42), None])),
+            Arc::new(LargeBinaryArray::from(vec![
+                None,
+                None,
+                Some(&b"old"[..]),
+                None,
+            ])),
+        ],
+        Some(vec![false, false, true, false].into()),
+    );
+    let target = RecordBatch::try_from_iter_with_nullable([
+        (
+            "interval_idx",
+            Arc::new(Int64Array::from(vec![0, 2, 1, 3])) as ArrayRef,
+            true,
+        ),
+        (
+            "t_start",
+            Arc::new(Int64Array::from(vec![0; 4])) as ArrayRef,
+            true,
+        ),
+        ("cells", Arc::new(cells) as ArrayRef, true),
+    ])
+    .unwrap();
+    let indexed = if unindexed_fragment {
+        target.slice(0, 2)
+    } else {
+        target.clone()
+    };
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new([Ok(indexed)], target.schema()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["interval_idx"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    if unindexed_fragment {
+        ds.append(
+            RecordBatchIterator::new([Ok(target.slice(2, 2))], target.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        ds.get_fragments().len(),
+        if unindexed_fragment { 2 } else { 1 }
+    );
+    let cells = StructArray::from(
+        record_batch!(
+            ("idx", Int32, [1, 2]),
+            ("data", LargeBinary, [&b"a"[..], &b"bb"[..]])
+        )
+        .unwrap(),
+    );
+    let source = RecordBatch::try_from_iter_with_nullable([
+        (
+            "interval_idx",
+            Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef,
+            true,
+        ),
+        ("cells", Arc::new(cells) as ArrayRef, true),
+    ])
+    .unwrap();
+    let when_matched = if with_condition {
+        WhenMatched::update_if(&ds, "target.interval_idx = 0 OR target.cells.idx = -1").unwrap()
+    } else {
+        WhenMatched::UpdateAll
+    };
+    let (ds, stats) = merge_indexed(ds, source, when_matched, true).await.unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    let after = ds
+        .scan()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "interval_idx".into(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(after.num_rows(), 4);
+    assert_eq!(
+        after["interval_idx"].as_primitive::<arrow_array::types::Int64Type>(),
+        &Int64Array::from(vec![0, 1, 2, 3])
+    );
+    assert_eq!(
+        after["t_start"].as_primitive::<arrow_array::types::Int64Type>(),
+        target["t_start"].as_primitive::<arrow_array::types::Int64Type>()
+    );
+    let cells = after["cells"].as_struct();
+    for row in 0..4 {
+        assert_eq!(cells.is_valid(row), row < 2, "row {row}");
+    }
+    assert_eq!(
+        cells["idx"].as_primitive::<Int32Type>(),
+        &Int32Array::from(vec![Some(1), Some(2), None, None])
+    );
+    assert_eq!(
+        cells["timestamp"].as_primitive::<arrow_array::types::Int64Type>(),
+        &Int64Array::from(vec![None, Some(42), None, None])
+    );
+    assert_eq!(
+        cells["data"].as_binary::<i64>(),
+        &LargeBinaryArray::from(vec![Some(&b"a"[..]), Some(&b"bb"[..]), None, None])
+    );
 }

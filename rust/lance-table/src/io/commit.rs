@@ -60,7 +60,9 @@ use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
     aws_credential_types::provider::ProvideCredentials,
     aws_credential_types::provider::error::CredentialsError,
-    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
+    lance_io::object_store::{
+        StorageOptions, providers::aws::build_aws_credential_with_storage_options,
+    },
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
@@ -1312,13 +1314,14 @@ pub async fn commit_handler_from_url(
 
             let provider_scheme = storage_options_raw.aws_provider_scheme()?;
 
-            let (aws_creds, region) = build_aws_credential(
+            let (aws_creds, region) = build_aws_credential_with_storage_options(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
                 accessor,
                 provider_scheme,
+                &storage_options_raw,
             )
             .await?;
 

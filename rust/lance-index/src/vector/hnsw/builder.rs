@@ -28,6 +28,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
+use super::remap::remap_graph_connected;
 use super::{
     HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
 };
@@ -1725,6 +1726,33 @@ impl IvfSubIndex for HNSW {
     // wire.
     fn read_columns() -> Option<&'static [&'static str]> {
         Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
+    }
+
+    fn positional_rows(metadata: &str) -> Result<Option<usize>> {
+        // Legacy files may leave an empty partition's metadata blank; such a
+        // partition has no graph to realign.
+        if metadata.is_empty() {
+            return Ok(None);
+        }
+        let metadata: HnswMetadata = serde_json::from_str(metadata).map_err(|e| {
+            Error::index(format!(
+                "Failed to decode HNSW metadata: {e}, json: {metadata}"
+            ))
+        })?;
+        Ok(Some(match metadata.level_offsets.as_slice() {
+            [start, end, ..] => end.saturating_sub(*start),
+            _ => 0,
+        }))
+    }
+
+    /// Dropping the removed nodes can strand survivors whose every path from
+    /// the entry point ran through them; only then is the graph repaired.
+    fn remap_positions(
+        data: RecordBatch,
+        new_ids: &[Option<u32>],
+        storage: &impl VectorStore,
+    ) -> Result<RecordBatch> {
+        remap_graph_connected(&data, new_ids, storage)
     }
 
     #[instrument(level = "debug", skip(self, query, storage, prefilter, metrics))]

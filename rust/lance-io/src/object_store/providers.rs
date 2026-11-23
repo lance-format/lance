@@ -127,6 +127,41 @@ pub struct ObjectStoreRegistryStats {
 /// Serializes the builds of one cached store key.
 type BuildLock = Arc<tokio::sync::Mutex<()>>;
 
+/// Identity of one cached object store.
+///
+/// The storage options accessor is represented by its scoped `accessor_id()`
+/// rather than by the `Arc` itself. Keeping the `Arc` here would let the maps
+/// retain everything the accessor owns, including a namespace client and its
+/// session, which in turn owns this registry. The full params still drive the
+/// actual build; only the cache key strips the accessor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObjectStoreCacheKey {
+    cache_path: String,
+    params: ObjectStoreParams,
+    accessor_id: Option<String>,
+    scheduler_error_mode: SchedulerErrorMode,
+}
+
+impl ObjectStoreCacheKey {
+    fn new(
+        cache_path: String,
+        params: &ObjectStoreParams,
+        scheduler_error_mode: SchedulerErrorMode,
+    ) -> Self {
+        let mut params = params.clone();
+        let accessor_id = params
+            .storage_options_accessor
+            .take()
+            .map(|accessor| accessor.accessor_id());
+        Self {
+            cache_path,
+            params,
+            accessor_id,
+            scheduler_error_mode,
+        }
+    }
+}
+
 /// A registry of object store providers.
 ///
 /// Use [`Self::default()`] to create one with the available default providers.
@@ -157,11 +192,10 @@ pub struct ObjectStoreRegistry {
     // Cache of object stores currently in use. We use a weak reference so the
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
-    active_stores:
-        RwLock<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), Weak<ObjectStore>>>,
+    active_stores: RwLock<HashMap<ObjectStoreCacheKey, Weak<ObjectStore>>>,
     // Held by `get_store` while it builds the store for a key, so concurrent
     // cold calls for that key wait for one build instead of each making one.
-    building: Mutex<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), BuildLock>>,
+    building: Mutex<HashMap<ObjectStoreCacheKey, BuildLock>>,
     // Floor for `prune_threshold`; 0 disables the sweep.
     min_prune_threshold: AtomicUsize,
     // Cache size at which `get_store` sweeps out dead entries before inserting.
@@ -421,7 +455,7 @@ impl ObjectStoreRegistry {
         let store_prefix =
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_path = crate::object_store::metrics_base(&store_prefix, &base_path);
-        let cache_key = (cache_path.clone(), params.clone(), scheduler_error_mode);
+        let cache_key = ObjectStoreCacheKey::new(cache_path.clone(), params, scheduler_error_mode);
 
         // Check if we have a cached store for this base path and params
         {
@@ -1202,6 +1236,55 @@ mod tests {
             err.to_string()
                 .contains(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_does_not_retain_storage_options_provider() {
+        /// Holds the registry like a namespace client held by a real provider.
+        #[derive(Debug)]
+        struct RegistryHoldingStorageOptionsProvider {
+            // The accessor owns this provider, and this provider owns the
+            // registry. A cache key that retained the accessor closes the cycle.
+            _registry: Arc<ObjectStoreRegistry>,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageOptionsProvider for RegistryHoldingStorageOptionsProvider {
+            async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+                Ok(None)
+            }
+
+            fn provider_id(&self) -> String {
+                "registry-holding-provider".to_string()
+            }
+        }
+
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let provider = Arc::new(RegistryHoldingStorageOptionsProvider {
+            _registry: registry.clone(),
+        });
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor.clone()),
+            ..Default::default()
+        };
+        let store = registry
+            .get_store(Url::parse("file:///tmp").unwrap(), &params)
+            .await
+            .unwrap();
+        assert_eq!(store.scheme(), "file");
+        let provider_weak = Arc::downgrade(&provider);
+
+        drop(store);
+        drop(params);
+        drop(accessor);
+        drop(provider);
+        drop(registry);
+
+        assert!(
+            provider_weak.upgrade().is_none(),
+            "the object store cache retained the storage options provider"
         );
     }
 
