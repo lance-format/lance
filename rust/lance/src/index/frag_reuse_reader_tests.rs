@@ -2346,6 +2346,106 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
 }
 
 #[tokio::test]
+async fn committed_sources_own_their_manifest_bitmap_in_every_plan() {
+    use crate::index::frag_reuse::{
+        FriQueryPlanKey, SegmentRemappingPlan, open_row_id_remapping, plan_staged_segments,
+    };
+
+    let mut dataset = fixture().await;
+    let params = ScalarIndexParams::default();
+    let fragments: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let mut segments = Vec::new();
+    for fragment in &fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("i_idx".into())
+                .replace(true)
+                .fragments(vec![*fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("i_idx", "i", segments)
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    let manifest = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+    let fri = manifest
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .unwrap();
+    let committed = manifest
+        .iter()
+        .find(|index| index.name == "i_idx")
+        .unwrap()
+        .clone();
+    let stored = committed.fragment_bitmap.clone().unwrap();
+    // The caller holds the derived listing entry, whose bitmap is the
+    // rewritten coverage rather than the manifest's.
+    let derived = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.uuid == committed.uuid)
+        .unwrap()
+        .clone();
+    assert_ne!(derived.fragment_bitmap.as_ref(), Some(&stored));
+    let mut staged = derived.clone();
+    staged.uuid = Uuid::new_v4();
+
+    let ownership = |plan: &SegmentRemappingPlan| match plan {
+        SegmentRemappingPlan::Translate { ownership, .. } => ownership.clone(),
+        other => panic!("expected a translation, got {other:?}"),
+    };
+    let plans = plan_staged_segments(&dataset, &[derived.clone(), staged.clone()])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ownership(&plans[&committed.uuid]).map(|ownership| ownership.stored),
+        Some(stored.clone()),
+        "a committed source owns its manifest bitmap, not the caller's"
+    );
+    assert_eq!(
+        ownership(&plans[&staged.uuid]),
+        None,
+        "a staged source admits every resolved row"
+    );
+
+    open_row_id_remapping(&dataset, &committed, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let snapshot = dataset
+        .index_cache
+        .with_key_prefix(dataset.manifest_location.path.as_ref())
+        .get_with_key(&FriQueryPlanKey {
+            fri_uuid: &fri.uuid,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ownership(&snapshot.segments[&committed.uuid]).map(|ownership| ownership.stored),
+        Some(stored)
+    );
+}
+
+#[tokio::test]
 async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     use crate::index::frag_reuse::{ResolvedRemapping, open_row_id_remapping};
 

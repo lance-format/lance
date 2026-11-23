@@ -188,6 +188,22 @@ pub struct SegmentPlanParts {
     pub path: Vec<usize>,
 }
 
+/// Which stored rows a committed segment may translate: those starting in its
+/// stored bitmap or in a descendant of it, or passing through it on the way.
+/// Writers that merge segments store translated addresses under the union of
+/// the sources' stored bitmaps, so a row may start at a descendant.
+///
+/// Descendant membership admits a row stored at a descendant fragment without
+/// proving it originated from this segment's own source; it exists to keep
+/// segments written by merges of earlier versions readable.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SegmentOwnership {
+    /// The segment's stored bitmap in the manifest.
+    pub(crate) stored: RoaringBitmap,
+    /// Every fragment reachable from `stored` through retained transitions.
+    pub(crate) descendants: RoaringBitmap,
+}
+
 /// A validated FRI graph whose mapping payloads are opened only when needed.
 pub struct FragmentReuseIndex {
     ledger: Arc<FragReuseLedger>,
@@ -365,6 +381,62 @@ impl FragmentReuseIndex {
             .collect()
     }
 
+    /// The ownership of a committed segment whose manifest bitmap is `stored`.
+    pub(crate) fn segment_ownership(&self, stored: &RoaringBitmap) -> SegmentOwnership {
+        SegmentOwnership {
+            stored: stored.clone(),
+            descendants: self.reachable(stored, true),
+        }
+    }
+
+    /// Every fragment reached from `fragments` through retained transitions,
+    /// following them to their destinations (`forward`) or to their sources.
+    /// Each transition is expanded once, so the walk is linear in the ledger.
+    fn reachable(&self, fragments: &RoaringBitmap, forward: bool) -> RoaringBitmap {
+        self.reachable_with_visits(fragments, forward).0
+    }
+
+    /// [`Self::reachable`] and the number of endpoint digests it visited.
+    fn reachable_with_visits(
+        &self,
+        fragments: &RoaringBitmap,
+        forward: bool,
+    ) -> (RoaringBitmap, usize) {
+        let transitions = self.ledger.transitions();
+        // Every endpoint on one side of a transition leads to the same
+        // transition, so it is expanded only the first time it is reached.
+        let mut expanded = vec![false; transitions.len()];
+        let mut reached = RoaringBitmap::new();
+        let mut visits = 0;
+        let mut pending: Vec<u32> = fragments.iter().collect();
+        while let Some(fragment) = pending.pop() {
+            let index = if forward {
+                self.ledger.consumer(fragment)
+            } else {
+                self.ledger.producer(fragment)
+            };
+            let Some(index) = index else {
+                continue;
+            };
+            if std::mem::replace(&mut expanded[index], true) {
+                continue;
+            }
+            let next = if forward {
+                transitions[index].destinations()
+            } else {
+                transitions[index].sources()
+            };
+            for digest in next {
+                visits += 1;
+                let id = digest.id as u32;
+                if reached.insert(id) {
+                    pending.push(id);
+                }
+            }
+        }
+        (reached, visits)
+    }
+
     /// The translation identity of one segment: a hash of everything that
     /// decides its translated output, so cached objects that embed translated
     /// addresses can be keyed by it and go cold only when that state changes.
@@ -386,14 +458,36 @@ impl FragmentReuseIndex {
         excluded: &RoaringBitmap,
         path: &[usize],
     ) -> [u8; 32] {
+        self.translation_fingerprint_with_ownership(coverage, excluded, None, path)
+    }
+
+    /// [`Self::translation_fingerprint`] of a segment translated under
+    /// `ownership`. Ownership is hashed with its descendants, and `excluded`
+    /// also hashed on `coverage` and its ancestors: a stored row starting in
+    /// `excluded` is dropped, which changes the output only for a start from
+    /// which `coverage` is reachable. Without ownership the identity is
+    /// unchanged from before ownership existed.
+    pub(crate) fn translation_fingerprint_with_ownership(
+        &self,
+        coverage: &RoaringBitmap,
+        excluded: &RoaringBitmap,
+        ownership: Option<&SegmentOwnership>,
+        path: &[usize],
+    ) -> [u8; 32] {
         let transitions = self.ledger.transitions();
-        let path_destinations: RoaringBitmap = path
+        let mut relevant: RoaringBitmap = path
             .iter()
             .flat_map(|&index| transitions[index].destinations())
             .map(|destination| destination.id as u32)
             .collect();
+        let tag: &[u8] = if ownership.is_some() {
+            relevant |= coverage | &self.reachable(coverage, false);
+            b"fri-translation/2"
+        } else {
+            b"fri-translation/1"
+        };
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"fri-translation/1");
+        hasher.update(tag);
         hasher.update(&[u8::from(self.ledger.has_unsupported_transitions())]);
         hasher.update(b"coverage");
         // The serialized form is canonical for a given set; the hasher
@@ -402,9 +496,17 @@ impl FragmentReuseIndex {
             .serialize_into(&mut hasher)
             .expect("hashing a bitmap cannot fail");
         hasher.update(b"excluded");
-        (excluded & path_destinations)
+        (excluded & relevant)
             .serialize_into(&mut hasher)
             .expect("hashing a bitmap cannot fail");
+        if let Some(ownership) = ownership {
+            hasher.update(b"ownership");
+            for bitmap in [&ownership.stored, &ownership.descendants] {
+                bitmap
+                    .serialize_into(&mut hasher)
+                    .expect("hashing a bitmap cannot fail");
+            }
+        }
         hasher.update(b"path");
         for &index in path {
             hasher.update(transitions[index].fingerprint());
@@ -415,25 +517,46 @@ impl FragmentReuseIndex {
     /// Remap physical row IDs through supported lineage, stopping at live fragments.
     /// Missing or deleted paths produce `None`. Input order and duplicates are preserved.
     pub async fn remap_row_ids(self: &Arc<Self>, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        self.remap_row_ids_excluding(row_ids, &RoaringBitmap::new())
+        self.remap_row_ids_excluding(row_ids, &RoaringBitmap::new(), None)
             .await
     }
 
     /// Drop paths that enter fragments supplied by other selected index segments.
     /// Check after each mapping, not only at live destinations: branches may reconverge.
-    /// Starting addresses are not excluded because legacy metadata can already describe
-    /// projected coverage rather than the original addresses stored in an index.
+    ///
+    /// Without `ownership` starting addresses are not excluded, because legacy
+    /// metadata can already describe projected coverage rather than the
+    /// original addresses stored in an index. With it, a row starting in
+    /// `excluded_fragments` is dropped (a sibling's direct coverage wins at the
+    /// start as on every hop), and a row is kept only if its start lies in the
+    /// stored bitmap or its descendants, or some hop output lies in the stored
+    /// bitmap (projected legacy metadata).
     pub(super) async fn remap_row_ids_excluding(
         self: &Arc<Self>,
         row_ids: &[u64],
         excluded_fragments: &RoaringBitmap,
+        ownership: Option<&SegmentOwnership>,
     ) -> Result<Vec<Option<u64>>> {
+        let fragment = |row_id: u64| RowAddress::from(row_id).fragment_id();
         let mut result = Vec::with_capacity(row_ids.len());
         for batch in row_ids.chunks(64 * 1024) {
             let mut output: Vec<_> = batch.iter().copied().map(Some).collect();
+            let mut owned: Vec<bool> = batch
+                .iter()
+                .map(|&row_id| {
+                    ownership.is_none_or(|ownership| {
+                        ownership.stored.contains(fragment(row_id))
+                            || ownership.descendants.contains(fragment(row_id))
+                    })
+                })
+                .collect();
             let mut pending: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
             for (position, address) in output.iter_mut().enumerate() {
                 let current = RowAddress::from(batch[position]);
+                if ownership.is_some() && excluded_fragments.contains(current.fragment_id()) {
+                    *address = None;
+                    continue;
+                }
                 if self.live_fragments.contains(current.fragment_id()) {
                     continue;
                 }
@@ -464,6 +587,8 @@ impl FragmentReuseIndex {
                     });
                     output[position] = address;
                     if let Some(current) = address {
+                        owned[position] |= ownership
+                            .is_some_and(|ownership| ownership.stored.contains(fragment(current)));
                         let current = RowAddress::from(current);
                         if self.live_fragments.contains(current.fragment_id()) {
                             continue;
@@ -474,6 +599,11 @@ impl FragmentReuseIndex {
                             output[position] = None;
                         }
                     }
+                }
+            }
+            for (address, owned) in output.iter_mut().zip(owned) {
+                if !owned {
+                    *address = None;
                 }
             }
             result.extend(output);
@@ -1907,7 +2037,7 @@ pub mod tests {
         let inputs = [0, 1, 2, 3, 9].map(|f| u64::from(RowAddress::new_from_parts(f, 1)));
         assert_eq!(
             mapping
-                .remap_row_ids_excluding(&inputs, &RoaringBitmap::from_iter([2]))
+                .remap_row_ids_excluding(&inputs, &RoaringBitmap::from_iter([2]), None)
                 .await
                 .unwrap(),
             vec![
@@ -1935,6 +2065,622 @@ pub mod tests {
                 .map(|coverage| coverage & mapping.live_fragments.as_ref())
                 .collect::<Vec<_>>(),
             vec![RoaringBitmap::new(), RoaringBitmap::from_iter([3])]
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_is_part_of_the_translation_identity() {
+        let reader = chain_reader().await;
+        let provenance = vec![
+            RoaringBitmap::from_iter([0]),
+            RoaringBitmap::from_iter([1]),
+            RoaringBitmap::from_iter([4]),
+        ];
+        let plans = reader.segment_plans(&provenance);
+        let ownership: Vec<_> = provenance
+            .iter()
+            .map(|stored| reader.segment_ownership(stored))
+            .collect();
+        // F0 and F1 are rewritten into F2 and F3, then into F4 and F5; F4 is
+        // never rewritten.
+        for ownership in &ownership[..2] {
+            assert_eq!(
+                ownership.descendants,
+                RoaringBitmap::from_iter([2, 3, 4, 5])
+            );
+        }
+        assert!(ownership[2].descendants.is_empty());
+
+        let fingerprint = |plan: &SegmentPlanParts,
+                           excluded: &RoaringBitmap,
+                           ownership: Option<&SegmentOwnership>| {
+            reader.translation_fingerprint_with_ownership(
+                &plan.coverage,
+                excluded,
+                ownership,
+                &plan.path,
+            )
+        };
+        let x = &plans[0];
+        let base = fingerprint(x, &x.excluded, Some(&ownership[0]));
+        assert_eq!(base, fingerprint(x, &x.excluded, Some(&ownership[0])));
+        assert_eq!(
+            fingerprint(x, &x.excluded, None),
+            reader.translation_fingerprint(&x.coverage, &x.excluded, &x.path),
+            "the public identity is the one without ownership"
+        );
+        assert_ne!(
+            base,
+            fingerprint(x, &x.excluded, None),
+            "admitting every resolved row differs from owning"
+        );
+        assert_ne!(
+            base,
+            fingerprint(x, &x.excluded, Some(&ownership[1])),
+            "a different stored bitmap changes the identity"
+        );
+        assert_ne!(
+            base,
+            fingerprint(
+                x,
+                &x.excluded,
+                Some(&reader.segment_ownership(&RoaringBitmap::from_iter([0, 99])))
+            ),
+            "a wider stored bitmap changes the identity"
+        );
+        // F1 is an ancestor of X's coverage: excluding it at the start
+        // matters only under ownership.
+        let mut on_source = x.excluded.clone();
+        on_source.remove(1);
+        assert_ne!(base, fingerprint(x, &on_source, Some(&ownership[0])));
+        assert_eq!(
+            fingerprint(x, &x.excluded, None),
+            fingerprint(x, &on_source, None)
+        );
+        let mut off_path = x.excluded.clone();
+        off_path.insert(99);
+        assert_eq!(
+            base,
+            fingerprint(x, &off_path, Some(&ownership[0])),
+            "an exclusion that cannot reach the coverage leaves the identity unchanged"
+        );
+    }
+
+    /// `(sources, destinations, kept)` of one ordered-compaction transition.
+    type CompactionStep<'a> = (&'a [(u32, u64)], &'a [(u32, u64)], &'a [(u32, u32)]);
+
+    /// An inline ordered-compaction history with loaded mapping readers. Each
+    /// transition is `(sources, destinations, kept)`: fragments as
+    /// `(id, physical_rows)` and the surviving source rows as
+    /// `(fragment, offset)`; a source row not kept was deleted.
+    async fn ordered_reader(
+        transitions: &[CompactionStep<'_>],
+        live: &[u32],
+    ) -> Arc<FragmentReuseIndex> {
+        let transitions = transitions
+            .iter()
+            .map(|&(sources, destinations, kept)| {
+                let mut changed_row_addrs = Vec::new();
+                roaring::RoaringTreemap::from_iter(kept.iter().map(|&(fragment, offset)| {
+                    u64::from(RowAddress::new_from_parts(fragment, offset))
+                }))
+                .serialize_into(&mut changed_row_addrs)
+                .unwrap();
+                let source = |&(id, physical_rows): &(u32, u64)| FragmentDigest {
+                    id: u64::from(id),
+                    physical_rows,
+                    num_deleted_rows: physical_rows
+                        - kept.iter().filter(|(fragment, _)| *fragment == id).count() as u64,
+                };
+                let destination = |&(id, physical_rows): &(u32, u64)| FragmentDigest {
+                    id: u64::from(id),
+                    physical_rows,
+                    num_deleted_rows: 0,
+                };
+                Transition {
+                    sources: sources.iter().map(source).collect(),
+                    destinations: destinations.iter().map(destination).collect(),
+                    mapping: Some(transition::Mapping::OrderedCompaction(
+                        pb::fragment_reuse_index_details::OrderedCompaction { changed_row_addrs },
+                    )),
+                }
+            })
+            .collect();
+        let details = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(
+                1,
+                &InlineContent {
+                    legacy_versions: vec![],
+                    transitions,
+                }
+                .encode_to_vec(),
+            ),
+        };
+        let ledger = FragReuseLedger::decode(1, &details, |_| async { panic!("inline history") })
+            .await
+            .unwrap();
+        Arc::new(FragmentReuseIndex {
+            live_fragments: Arc::new(live.iter().copied().collect()),
+            readers: ledger
+                .transitions()
+                .iter()
+                .map(|t| {
+                    let Mapping::OrderedCompaction(remap) = t.mapping() else {
+                        unreachable!()
+                    };
+                    CachedMapping::uncached(Arc::new(OrderedCompactionMapping::new(remap.clone())))
+                })
+                .collect(),
+            ledger: Arc::new(ledger),
+        })
+    }
+
+    fn addr(fragment: u32, offset: u32) -> u64 {
+        u64::from(RowAddress::new_from_parts(fragment, offset))
+    }
+
+    /// Translate `inputs` as committed segment `segment` of the group
+    /// `provenance`, before the final coverage filter.
+    async fn translate_as(
+        mapping: &Arc<FragmentReuseIndex>,
+        provenance: &[RoaringBitmap],
+        segment: usize,
+        inputs: &[u64],
+    ) -> Vec<Option<u64>> {
+        let plan = &mapping.segment_plans(provenance)[segment];
+        let ownership = mapping.segment_ownership(&provenance[segment]);
+        mapping
+            .remap_row_ids_excluding(inputs, &plan.excluded, Some(&ownership))
+            .await
+            .unwrap()
+    }
+
+    /// `translate_as` without ownership: the admission before it existed.
+    async fn translate_unowned(
+        mapping: &Arc<FragmentReuseIndex>,
+        provenance: &[RoaringBitmap],
+        segment: usize,
+        inputs: &[u64],
+    ) -> Vec<Option<u64>> {
+        let plan = &mapping.segment_plans(provenance)[segment];
+        mapping
+            .remap_row_ids_excluding(inputs, &plan.excluded, None)
+            .await
+            .unwrap()
+    }
+
+    // {0,1} -> 25 and {10,11} -> 24; F0 holds two rows, the second deleted.
+    async fn merge_reader() -> Arc<FragmentReuseIndex> {
+        ordered_reader(
+            &[
+                (&[(0, 2), (1, 1)], &[(25, 2)], &[(0, 0), (1, 0)]),
+                (&[(10, 1), (11, 1)], &[(24, 2)], &[(10, 0), (11, 0)]),
+            ],
+            &[24, 25],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_start_joined_with_an_owned_fragment_is_dropped() {
+        // A was built over {10, 11} and narrowed to {11} when F10 was
+        // rewritten in place and re-indexed by B; {10, 11} -> 20 then joins
+        // them.
+        let mapping = ordered_reader(
+            &[(&[(10, 1), (11, 1)], &[(20, 2)], &[(10, 0), (11, 0)])],
+            &[20],
+        )
+        .await;
+        let provenance = [
+            RoaringBitmap::from_iter([11]),
+            RoaringBitmap::from_iter([10]),
+        ];
+        let plans = mapping.segment_plans(&provenance);
+        assert!(plans[0].coverage.contains(20));
+        assert!(plans[1].coverage.contains(20));
+        let a = translate_as(&mapping, &provenance, 0, &[addr(10, 0), addr(11, 0)]).await;
+        let b = translate_as(&mapping, &provenance, 1, &[addr(10, 0)]).await;
+        assert_eq!(a, vec![None, Some(addr(20, 1))]);
+        assert_eq!(b, vec![Some(addr(20, 0))]);
+        let mut served: Vec<_> = a.into_iter().chain(b).flatten().collect();
+        served.sort_unstable();
+        assert_eq!(
+            served,
+            vec![addr(20, 0), addr(20, 1)],
+            "each row exactly once"
+        );
+        // Without ownership A's stale row lands beside B's.
+        assert_eq!(
+            translate_unowned(&mapping, &provenance, 0, &[addr(10, 0), addr(11, 0)]).await,
+            vec![Some(addr(20, 0)), Some(addr(20, 1))]
+        );
+    }
+
+    #[tokio::test]
+    async fn translated_rows_need_ownership_on_their_path() {
+        let mapping = merge_reader().await;
+        // S owns {1, 10, 11}; the sibling owns {0}. Both cover F25.
+        let provenance = [
+            RoaringBitmap::from_iter([1, 10, 11]),
+            RoaringBitmap::from_iter([0]),
+        ];
+        let inputs = [
+            addr(0, 0),
+            addr(1, 0),
+            addr(10, 0),
+            addr(11, 0),
+            addr(25, 0),
+        ];
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![
+                None,
+                Some(addr(25, 1)),
+                Some(addr(24, 0)),
+                Some(addr(24, 1)),
+                Some(addr(25, 0)),
+            ],
+            "S's row in the sibling's F0 is dropped at its start; a row S stores at F25 \
+             is admitted because F25 descends from S's stored bitmap, which keeps merged \
+             segments written by earlier versions readable and does not prove the row \
+             originated from S"
+        );
+        assert_eq!(
+            translate_as(&mapping, &provenance, 1, &inputs[..1]).await,
+            vec![Some(addr(25, 0))]
+        );
+        // The unrestricted remap still follows every path.
+        assert_eq!(
+            mapping.remap_row_ids(&inputs).await.unwrap(),
+            vec![
+                Some(addr(25, 0)),
+                Some(addr(25, 1)),
+                Some(addr(24, 0)),
+                Some(addr(24, 1)),
+                Some(addr(25, 0)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_is_checked_across_a_chain() {
+        // {0} -> 20, then {20, 1} -> 25. Y owns {0}; S owns {1}.
+        let mapping = ordered_reader(
+            &[
+                (&[(0, 1)], &[(20, 1)], &[(0, 0)]),
+                (&[(20, 1), (1, 1)], &[(25, 2)], &[(20, 0), (1, 0)]),
+            ],
+            &[25],
+        )
+        .await;
+        let provenance = [RoaringBitmap::from_iter([1]), RoaringBitmap::from_iter([0])];
+        let inputs = [addr(0, 0), addr(1, 0)];
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![None, Some(addr(25, 1))]
+        );
+        assert_eq!(
+            translate_as(&mapping, &provenance, 1, &inputs[..1]).await,
+            vec![Some(addr(25, 0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn projected_ownership_admits_rows_by_their_final_fragment() {
+        let mapping = merge_reader().await;
+        // Legacy projected metadata: the bitmap names the destinations while
+        // the stored addresses are still the sources'.
+        let provenance = [RoaringBitmap::from_iter([24, 25])];
+        let inputs = [addr(0, 0), addr(1, 0), addr(10, 0), addr(11, 0)];
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![
+                Some(addr(25, 0)),
+                Some(addr(25, 1)),
+                Some(addr(24, 0)),
+                Some(addr(24, 1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn split_destinations_admit_only_owned_landings() {
+        // {0, 1} -> {2, 3}: F0's first two rows land in F2, its third in F3.
+        let split: CompactionStep<'_> = (
+            &[(0, 3), (1, 1)],
+            &[(2, 2), (3, 2)],
+            &[(0, 0), (0, 1), (0, 2), (1, 0)],
+        );
+        let provenance = [RoaringBitmap::from_iter([2]), RoaringBitmap::from_iter([3])];
+        let inputs = [addr(0, 0), addr(0, 2)];
+        let mapping = ordered_reader(&[split], &[2, 3]).await;
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![Some(addr(2, 0)), None]
+        );
+        // A further {2, 3} -> 25 keeps the verdict made at the split.
+        let mapping = ordered_reader(
+            &[
+                split,
+                (
+                    &[(2, 2), (3, 2)],
+                    &[(25, 4)],
+                    &[(2, 0), (2, 1), (3, 0), (3, 1)],
+                ),
+            ],
+            &[25],
+        )
+        .await;
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![Some(addr(25, 0)), None]
+        );
+        // Without the sibling in the group nothing is excluded; ownership
+        // alone drops the path through F3.
+        assert_eq!(
+            translate_as(&mapping, &provenance[..1], 0, &inputs).await,
+            vec![Some(addr(25, 0)), None]
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_never_restores_a_deleted_row() {
+        let mapping = merge_reader().await;
+        let provenance = [RoaringBitmap::from_iter([0, 99])];
+        // F0's second row was deleted; F99 has no live path.
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &[addr(0, 1), addr(99, 0)]).await,
+            vec![None, None]
+        );
+    }
+
+    /// Layout written by merges of earlier versions: stored bitmap {0, 12},
+    /// rows already at the live addresses {10, 11, 12} after 0 -> {10, 11}.
+    const SPLIT_ZERO: CompactionStep<'static> = (&[(0, 2)], &[(10, 1), (11, 1)], &[(0, 0), (0, 1)]);
+    const MERGE_TEN_ELEVEN: CompactionStep<'static> =
+        (&[(10, 1), (11, 1)], &[(20, 2)], &[(10, 0), (11, 0)]);
+
+    #[tokio::test]
+    async fn merged_segments_admit_rows_at_descendants_of_their_bitmap() {
+        let provenance = [RoaringBitmap::from_iter([0, 12])];
+        let inputs = [addr(10, 0), addr(11, 0), addr(12, 0)];
+        let mapping = ordered_reader(&[SPLIT_ZERO], &[10, 11, 12]).await;
+        assert_eq!(
+            mapping.segment_plans(&provenance)[0].coverage,
+            RoaringBitmap::from_iter([10, 11, 12])
+        );
+        assert_eq!(
+            mapping.segment_ownership(&provenance[0]).descendants,
+            RoaringBitmap::from_iter([10, 11])
+        );
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            inputs.map(Some).to_vec()
+        );
+        // A later {10, 11} -> 20 keeps every row.
+        let mapping = ordered_reader(&[SPLIT_ZERO, MERGE_TEN_ELEVEN], &[12, 20]).await;
+        assert_eq!(
+            mapping.segment_plans(&provenance)[0].coverage,
+            RoaringBitmap::from_iter([12, 20])
+        );
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![Some(addr(20, 0)), Some(addr(20, 1)), Some(addr(12, 0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_already_merged_at_a_descendant_stay_admitted() {
+        // Known limitation: in a layout written by a merge of an earlier version, the reader
+        // cannot tell a withdrawn-origin entry at F24 from a legitimate one; recovery is a rebuild.
+        let mapping = ordered_reader(
+            &[
+                (&[(2, 1), (3, 1)], &[(10, 1), (11, 1)], &[(2, 0), (3, 0)]),
+                (&[(0, 1), (1, 1)], &[(24, 2)], &[(0, 0), (1, 0)]),
+            ],
+            &[10, 11, 24],
+        )
+        .await;
+        let provenance = [RoaringBitmap::from_iter([0, 1, 10, 11])];
+        let inputs = [addr(10, 0), addr(11, 0), addr(24, 0), addr(24, 1)];
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            inputs.map(Some).to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_on_a_descendant_takes_the_start() {
+        // D is built directly on F10, then {10, 11} -> 20.
+        let mapping = ordered_reader(&[SPLIT_ZERO, MERGE_TEN_ELEVEN], &[12, 20]).await;
+        let provenance = [
+            RoaringBitmap::from_iter([0, 12]),
+            RoaringBitmap::from_iter([10]),
+        ];
+        let plans = mapping.segment_plans(&provenance);
+        assert_eq!(plans[0].coverage, RoaringBitmap::from_iter([12, 20]));
+        assert_eq!(plans[1].coverage, RoaringBitmap::from_iter([20]));
+        assert_eq!(
+            mapping.segment_ownership(&provenance[0]).descendants,
+            RoaringBitmap::from_iter([10, 11, 20])
+        );
+        let inputs = [addr(10, 0), addr(11, 0), addr(12, 0)];
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![None, Some(addr(20, 1)), Some(addr(12, 0))]
+        );
+        assert_eq!(
+            translate_as(&mapping, &provenance, 1, &inputs[..1]).await,
+            vec![Some(addr(20, 0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn descendants_and_start_exclusion_follow_a_chain() {
+        // ... then {20, 12} -> 30.
+        let mapping = ordered_reader(
+            &[
+                SPLIT_ZERO,
+                MERGE_TEN_ELEVEN,
+                (
+                    &[(20, 2), (12, 1)],
+                    &[(30, 3)],
+                    &[(20, 0), (20, 1), (12, 0)],
+                ),
+            ],
+            &[30],
+        )
+        .await;
+        let inputs = [addr(10, 0), addr(11, 0), addr(12, 0)];
+        let alone = [RoaringBitmap::from_iter([0, 12])];
+        assert_eq!(
+            translate_as(&mapping, &alone, 0, &inputs).await,
+            vec![Some(addr(30, 0)), Some(addr(30, 1)), Some(addr(30, 2))]
+        );
+        // D built directly on F11 before the two compactions.
+        let provenance = [
+            RoaringBitmap::from_iter([0, 12]),
+            RoaringBitmap::from_iter([11]),
+        ];
+        assert!(mapping.segment_plans(&provenance)[0].coverage.contains(30));
+        assert_eq!(
+            translate_as(&mapping, &provenance, 0, &inputs).await,
+            vec![Some(addr(30, 0)), None, Some(addr(30, 2))]
+        );
+        assert_eq!(
+            translate_as(&mapping, &provenance, 1, &inputs[1..2]).await,
+            vec![Some(addr(30, 1))]
+        );
+    }
+
+    /// `(start, forward, reached)` of one walk.
+    type Walk<'a> = (&'a [u32], bool, &'a [u32]);
+    /// `(name, history, live fragments, walks)` of one ledger shape.
+    type Shape<'a> = (&'a str, &'a [CompactionStep<'a>], &'a [u32], &'a [Walk<'a>]);
+
+    #[tokio::test]
+    async fn reachable_follows_every_transition_on_the_path() {
+        let cases: [Shape<'_>; 4] = [
+            (
+                "chain",
+                &[
+                    (&[(0, 1)], &[(1, 1)], &[(0, 0)]),
+                    (&[(1, 1)], &[(2, 1)], &[(1, 0)]),
+                ],
+                &[2],
+                &[
+                    (&[0], true, &[1, 2]),
+                    (&[0, 1], true, &[1, 2]),
+                    (&[2], true, &[]),
+                    (&[2], false, &[0, 1]),
+                    (&[0], false, &[]),
+                ],
+            ),
+            (
+                "split",
+                &[(&[(0, 2)], &[(1, 1), (2, 1)], &[(0, 0), (0, 1)])],
+                &[1, 2],
+                &[
+                    (&[0], true, &[1, 2]),
+                    (&[1], false, &[0]),
+                    (&[1, 2], false, &[0]),
+                ],
+            ),
+            (
+                "join",
+                &[(&[(0, 1), (1, 1)], &[(2, 2)], &[(0, 0), (1, 0)])],
+                &[2],
+                &[
+                    (&[0], true, &[2]),
+                    (&[0, 1], true, &[2]),
+                    (&[2], false, &[0, 1]),
+                ],
+            ),
+            (
+                "diamond",
+                &[
+                    (&[(0, 2)], &[(1, 1), (2, 1)], &[(0, 0), (0, 1)]),
+                    (&[(1, 1), (2, 1)], &[(3, 2)], &[(1, 0), (2, 0)]),
+                ],
+                &[3],
+                &[
+                    (&[0], true, &[1, 2, 3]),
+                    (&[1], true, &[3]),
+                    (&[1, 2], true, &[3]),
+                    (&[3], false, &[0, 1, 2]),
+                    (&[1], false, &[0]),
+                ],
+            ),
+        ];
+        for (shape, steps, live, walks) in cases {
+            let mapping = ordered_reader(steps, live).await;
+            for &(start, forward, expected) in walks {
+                assert_eq!(
+                    mapping.reachable(&start.iter().copied().collect(), forward),
+                    expected.iter().copied().collect::<RoaringBitmap>(),
+                    "{shape}: from {start:?}, forward: {forward}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reachable_expands_a_wide_transition_once() {
+        const WIDTH: u32 = 2_000;
+        let sources: Vec<(u32, u64)> = (0..WIDTH).map(|id| (id, 1)).collect();
+        let destinations: Vec<(u32, u64)> = (WIDTH..2 * WIDTH).map(|id| (id, 1)).collect();
+        let kept: Vec<(u32, u32)> = (0..WIDTH).map(|id| (id, 0)).collect();
+        let mapping = ordered_reader(
+            &[(sources.as_slice(), destinations.as_slice(), kept.as_slice())],
+            &[],
+        )
+        .await;
+        let source_ids: RoaringBitmap = (0..WIDTH).collect();
+        let destination_ids: RoaringBitmap = (WIDTH..2 * WIDTH).collect();
+        let bound = 2 * WIDTH as usize;
+        for (start, forward, expected) in [
+            (&source_ids, true, &destination_ids),
+            (&destination_ids, false, &source_ids),
+        ] {
+            let (reached, visits) = mapping.reachable_with_visits(start, forward);
+            assert_eq!(&reached, expected, "forward: {forward}");
+            assert!(
+                visits <= bound,
+                "forward: {forward}: {visits} digest visits exceed {bound}"
+            );
+            assert_eq!(
+                visits, WIDTH as usize,
+                "forward: {forward}: the transition is expanded once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn segments_owning_every_start_translate_as_before() {
+        let mapping = merge_reader().await;
+        let provenance = [
+            RoaringBitmap::from_iter([0, 1]),
+            RoaringBitmap::from_iter([10, 11]),
+        ];
+        for (segment, inputs) in [
+            (0, vec![addr(0, 0), addr(0, 1), addr(1, 0)]),
+            (1, vec![addr(10, 0), addr(11, 0)]),
+        ] {
+            assert_eq!(
+                translate_as(&mapping, &provenance, segment, &inputs).await,
+                translate_unowned(&mapping, &provenance, segment, &inputs).await
+            );
+        }
+        assert_eq!(
+            translate_as(
+                &mapping,
+                &provenance,
+                0,
+                &[addr(0, 0), addr(0, 1), addr(1, 0)]
+            )
+            .await,
+            vec![Some(addr(25, 0)), None, Some(addr(25, 1))]
         );
     }
 

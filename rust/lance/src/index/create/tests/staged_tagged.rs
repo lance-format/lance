@@ -11,6 +11,8 @@
 //! live coverage the reader derives for the group (the destinations it covers
 //! completely), never a destination the group cannot serve.
 
+mod released_in_place;
+
 use super::*;
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::index::frag_reuse_reader::SegmentPlanParts;
+use crate::index::frag_reuse_reader::{SegmentOwnership, SegmentPlanParts};
 use crate::index::frag_reuse_v0_cache::{
     V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
 };
@@ -189,6 +189,10 @@ pub(crate) enum SegmentRemappingPlan {
     Translate {
         coverage: RoaringBitmap,
         excluded_fragments: RoaringBitmap,
+        /// Which stored rows the segment may translate, from its manifest
+        /// bitmap; `None` without one (a staged segment), which admits every
+        /// resolved row.
+        ownership: Option<SegmentOwnership>,
         fingerprint: [u8; 32],
     },
     /// Committed metadata exists but the reader derives no query coverage
@@ -259,10 +263,15 @@ impl DeepSizeOf for FriQueryPlan {
                 SegmentRemappingPlan::Translate {
                     coverage,
                     excluded_fragments,
+                    ownership,
                     fingerprint,
                 } => {
                     coverage.serialized_size()
                         + excluded_fragments.serialized_size()
+                        + ownership.as_ref().map_or(0, |ownership| {
+                            ownership.stored.serialized_size()
+                                + ownership.descendants.serialized_size()
+                        })
                         + fingerprint.len()
                 }
                 _ => 0,
@@ -391,11 +400,20 @@ async fn fri_query_plan(
                     // mappings can merge them with this segment's
                     // contribution.
                     let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
-                    let fingerprint =
-                        mapping.translation_fingerprint(&coverage, &parts.excluded, &parts.path);
+                    let ownership = source
+                        .fragment_bitmap
+                        .as_ref()
+                        .map(|stored| mapping.segment_ownership(stored));
+                    let fingerprint = mapping.translation_fingerprint_with_ownership(
+                        &coverage,
+                        &parts.excluded,
+                        ownership.as_ref(),
+                        &parts.path,
+                    );
                     SegmentRemappingPlan::Translate {
                         coverage,
                         excluded_fragments: parts.excluded,
+                        ownership,
                         fingerprint,
                     }
                 } else if unverifiable.contains(&source.name) {
@@ -589,7 +607,8 @@ pub(crate) type StagedRemappingPlans = HashMap<Uuid, SegmentRemappingPlan>;
 ///
 /// Every step is the one `fri_query_plan` runs per committed group
 /// (`may_need_translation`, `segment_plans`, `translation_fingerprint`), so a
-/// staged segment translates exactly as it would once committed: its
+/// staged segment translates as it would once committed, except for the
+/// ownership only a manifest bitmap establishes: its
 /// provenance is its stored bitmap, its siblings for direct coverage and
 /// exclusions are the other staged segments, and a destination the group only
 /// partly covers is simply absent from its coverage (the caller shrinks what it
@@ -627,16 +646,31 @@ pub(crate) async fn plan_staged_segments(
         })
         .collect::<lance_core::Result<_>>()?;
     let parts = mapping.segment_plans(&provenance);
+    let manifest_bitmaps: HashMap<Uuid, &RoaringBitmap> = stored
+        .iter()
+        .filter_map(|entry| Some((entry.uuid, entry.fragment_bitmap.as_ref()?)))
+        .collect();
     let mut plans = HashMap::with_capacity(segments.len());
     for (segment, parts) in segments.iter().zip(parts) {
         let plan = if !mapping.may_need_translation(segment.fragment_bitmap.as_ref()) {
             SegmentRemappingPlan::Identity
         } else {
-            let fingerprint =
-                mapping.translation_fingerprint(&parts.coverage, &parts.excluded, &parts.path);
+            // A committed source owns what its manifest bitmap says, whichever
+            // bitmap the caller holds. A staged source keeps admitting every
+            // resolved row: its admission is not decided here.
+            let ownership = manifest_bitmaps
+                .get(&segment.uuid)
+                .map(|stored| mapping.segment_ownership(stored));
+            let fingerprint = mapping.translation_fingerprint_with_ownership(
+                &parts.coverage,
+                &parts.excluded,
+                ownership.as_ref(),
+                &parts.path,
+            );
             SegmentRemappingPlan::Translate {
                 coverage: parts.coverage,
                 excluded_fragments: parts.excluded,
+                ownership,
                 fingerprint,
             }
         };
@@ -779,6 +813,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
                         mapping,
                         RoaringBitmap::new(),
                         RoaringBitmap::new(),
+                        None,
                     )),
                     fingerprint,
                 },
@@ -787,6 +822,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
         SegmentRemappingPlan::Translate {
             coverage,
             excluded_fragments,
+            ownership,
             fingerprint,
         } => Ok(Some((
             fri.uuid,
@@ -795,6 +831,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
                     mapping,
                     coverage.clone(),
                     excluded_fragments.clone(),
+                    ownership.clone(),
                 )),
                 fingerprint: *fingerprint,
             },
