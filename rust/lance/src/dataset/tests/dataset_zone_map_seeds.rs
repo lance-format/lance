@@ -3607,22 +3607,24 @@ async fn test_config_seed_boundary_matrix(
         .await;
 }
 
-/// One stored or expected zone: fragment id, zone start, zone length, null
-/// count, min, max, NaN count and negative NaN count.
-type BoundaryZone = (
-    u64,
-    u64,
-    u64,
-    u32,
-    Option<i64>,
-    Option<i64>,
-    u32,
-    Option<u32>,
-);
+/// One stored or expected zone of the ZoneMap index on `val`.
+#[derive(Debug, Clone, PartialEq)]
+struct BoundaryZone {
+    fragment_id: u64,
+    /// Offset of the zone's first row within its fragment.
+    zone_start: u64,
+    zone_length: u64,
+    null_count: u32,
+    min: Option<i64>,
+    max: Option<i64>,
+    nan_count: u32,
+    negative_nan_count: Option<u32>,
+}
 
 /// Every zone stored by the ZoneMap index on `val`, across all its segments,
 /// equals the zone computed from the generator: zones of `index_rows_per_zone`
-/// rows restart at each fragment's first row, the last one short.
+/// rows restart at each fragment's first row, the last one short, and
+/// `zone_start` is the offset within the fragment.
 /// `fragment_ranges` maps each fragment id to its generator positions.
 async fn assert_boundary_zone_statistics(
     dataset: &Dataset,
@@ -3664,22 +3666,22 @@ async fn assert_boundary_zone_statistics(
         let zone_start = batch["zone_start"].as_primitive::<UInt64Type>();
         let zone_length = batch["zone_length"].as_primitive::<UInt64Type>();
         for row in 0..batch.num_rows() {
-            stored.push((
-                fragment_id.value(row),
-                zone_start.value(row),
-                zone_length.value(row),
-                null_count.value(row),
-                min.is_valid(row).then(|| min.value(row)),
-                max.is_valid(row).then(|| max.value(row)),
-                nan_count.value(row),
-                negative_nan_count
+            stored.push(BoundaryZone {
+                fragment_id: fragment_id.value(row),
+                zone_start: zone_start.value(row),
+                zone_length: zone_length.value(row),
+                null_count: null_count.value(row),
+                min: min.is_valid(row).then(|| min.value(row)),
+                max: max.is_valid(row).then(|| max.value(row)),
+                nan_count: nan_count.value(row),
+                negative_nan_count: negative_nan_count
                     .is_valid(row)
                     .then(|| negative_nan_count.value(row)),
-            ));
+            });
         }
         batches.push(batch);
     }
-    stored.sort_unstable_by_key(|zone| (zone.0, zone.1));
+    stored.sort_unstable_by_key(|zone| (zone.fragment_id, zone.zone_start));
 
     let zone_rows = index_rows_per_zone as i64;
     let mut expected: Vec<BoundaryZone> = Vec::new();
@@ -3689,20 +3691,20 @@ async fn assert_boundary_zone_statistics(
             let end = (start + zone_rows).min(positions.end);
             let values: Vec<Option<i64>> = (start..end).map(boundary_value).collect();
             let non_null = values.iter().flatten();
-            expected.push((
-                *fragment_id,
-                (start - positions.start) as u64,
-                (end - start) as u64,
-                values.iter().filter(|v| v.is_none()).count() as u32,
-                non_null.clone().min().copied(),
-                non_null.max().copied(),
-                0,
-                Some(0),
-            ));
+            expected.push(BoundaryZone {
+                fragment_id: *fragment_id,
+                zone_start: (start - positions.start) as u64,
+                zone_length: (end - start) as u64,
+                null_count: values.iter().filter(|v| v.is_none()).count() as u32,
+                min: non_null.clone().min().copied(),
+                max: non_null.max().copied(),
+                nan_count: 0,
+                negative_nan_count: Some(0),
+            });
             start = end;
         }
     }
-    expected.sort_unstable_by_key(|zone| (zone.0, zone.1));
+    expected.sort_unstable_by_key(|zone| (zone.fragment_id, zone.zone_start));
 
     assert_eq!(
         stored.len(),
@@ -3710,17 +3712,8 @@ async fn assert_boundary_zone_statistics(
         "{context}: zone count, stored {batches:?}"
     );
     for (stored, expected) in stored.iter().zip(&expected) {
-        // `zone_start` is accepted as a fragment-local offset or as the row
-        // address of the zone's first row.
-        let row_address = (expected.0 << 32) | expected.1;
-        assert!(
-            stored.1 == expected.1 || stored.1 == row_address,
-            "{context}: zone start of {expected:?}, stored {stored:?} in {batches:?}"
-        );
-        let mut normalized = *stored;
-        normalized.1 = expected.1;
         assert_eq!(
-            normalized, *expected,
+            stored, expected,
             "{context}: zone {expected:?}, stored {stored:?} in {batches:?}"
         );
     }
