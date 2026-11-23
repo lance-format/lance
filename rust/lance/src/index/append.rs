@@ -2078,17 +2078,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .map(|index| index.dataset_version)
                     .min()
                     .unwrap_or(dataset.manifest.version);
-                removed_indices.iter().for_each(|idx| {
-                    frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-                });
-                for removed in removed_indices.iter() {
-                    if let Some(effective) =
-                        removed.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
-                    {
-                        frag_bitmap |= &effective;
-                    }
-                }
-
                 // Metadata must come from an actual merge source. Older incompatible
                 // segments outside the selected suffix may describe a different model.
                 let (reference_metadata, reference_index) =
@@ -2098,6 +2087,20 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 .to_string(),
                         )
                     })?;
+                for removed in &removed_indices {
+                    let stored = removed.fragment_bitmap.as_ref().ok_or_else(|| {
+                        Error::index(format!(
+                            "Vector index merge: segment {} is missing fragment coverage",
+                            removed.uuid
+                        ))
+                    })?;
+                    frag_bitmap |= stored;
+                }
+                // Tagged histories need the source IDs for translation. Legacy IVF_PQ
+                // copies retired row addresses, so its bitmap must still reserve those IDs.
+                if tagged_coverage.is_none() && !reference_index.as_any().is::<IVFIndex>() {
+                    frag_bitmap &= dataset.table_state.fragment_bitmap.as_ref();
+                }
                 let index_details = removed_indices
                     .iter()
                     .rev()
@@ -4191,6 +4194,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_vector_merge_drops_deleted_fragment_from_stored_coverage() {
+        let fragment = |id| {
+            lance_datagen::gen_batch()
+                .col("id", array::fill::<UInt32Type>(id))
+                .col(
+                    "vector",
+                    array::cycle_vec(array::fill::<Float32Type>(id as f32), 4.into()),
+                )
+                .into_reader_rows(1.into(), 1.into())
+        };
+        let mut dataset = Dataset::write(fragment(0), "memory://", None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        for id in [1, 2] {
+            dataset.append(fragment(id), None).await.unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            if id == 2 {
+                // The first merge covered both 0 and 1, so its segment survives deletion.
+                dataset.delete("id = 0").await.unwrap();
+            }
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(2))
+                .await
+                .unwrap();
+        }
+
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].fragment_bitmap.as_ref(),
+            Some(&RoaringBitmap::from_iter([1, 2]))
+        );
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .nearest("vector", &Float32Array::from(vec![0.0; 4]), 2)
+            .unwrap()
+            .fast_search()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result["id"].as_primitive::<UInt32Type>().values(), &[1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_vector_merge_keeps_deleted_fragment_with_stored_postings() {
+        let dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        // Migrate the overlapping bitmaps written by 0.21 before merging the two deltas.
+        dataset.index_statistics("vector_idx").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+        dataset
+            .delete(&format!("_rowid < {}", RowAddress::FRAGMENT_SIZE))
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.table_state.fragment_bitmap.as_ref(),
+            &RoaringBitmap::from_iter([1])
+        );
+        let before = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_ne!(after[0].uuid, before[0].uuid);
+        assert_eq!(
+            after[0].fragment_bitmap.as_ref(),
+            Some(&RoaringBitmap::from_iter([0, 1]))
+        );
     }
 
     #[tokio::test]
