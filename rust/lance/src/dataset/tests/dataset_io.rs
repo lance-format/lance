@@ -20,7 +20,7 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    DatasetRuntimeConfig, ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    DatasetRuntimeConfig, ReadParams, deep_clone_copy_parallelism,
     parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
     write_manifest_file,
 };
@@ -28,7 +28,7 @@ use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
-use lance_table::format::DataStorageFormat;
+use lance_table::format::{DataStorageFormat, ManifestBuildConfig};
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -1856,18 +1856,7 @@ async fn test_write_manifest(
         &dataset.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         dataset.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
@@ -1932,10 +1921,7 @@ async fn test_clone_rejects_unknown_writer_requirements() {
         &dataset.base,
         &mut unknown_writer,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         dataset.manifest_location.naming_scheme,
         None,
         true,
@@ -2052,10 +2038,7 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
         &dataset.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         dataset.manifest_location.naming_scheme,
         None,
         false,
@@ -2162,10 +2145,7 @@ async fn same_fragment_mixed_v2_files_validate_and_scan() {
         &dataset.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         dataset.manifest_location.naming_scheme,
         None,
         false,
@@ -2195,10 +2175,7 @@ async fn test_restore_rejects_unknown_target_flags() {
         .into_reader_rows(RowCount::from(1), BatchCount::from(1));
     let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
 
-    let write_config = ManifestWriteConfig {
-        auto_set_feature_flags: false,
-        ..Default::default()
-    };
+    let write_config = ManifestBuildConfig::default().with_auto_set_feature_flags(false);
     let mut unknown_manifest = dataset.manifest.as_ref().clone();
     unknown_manifest.version = 2;
     unknown_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
@@ -2269,10 +2246,7 @@ async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
         &dataset.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         dataset.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
@@ -2849,10 +2823,7 @@ async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
         &source.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         source.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
@@ -2897,10 +2868,7 @@ async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
         &source.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         source.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
@@ -5490,18 +5458,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
         &dataset.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
         dataset.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.

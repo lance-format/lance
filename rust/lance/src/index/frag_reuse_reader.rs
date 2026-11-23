@@ -832,7 +832,7 @@ pub mod tests {
             &dataset.base,
             &mut manifest,
             Some(indices),
-            &crate::dataset::ManifestWriteConfig::default(),
+            &lance_table::format::ManifestBuildConfig::default(),
             dataset.manifest_location.naming_scheme,
             None,
             false,

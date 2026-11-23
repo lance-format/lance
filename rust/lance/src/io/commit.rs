@@ -59,8 +59,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions, write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
     ReadSnapshot, validate_frag_reuse_history,
@@ -72,6 +71,7 @@ use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
+use crate::utils::temporal::timestamp_to_nanos;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
@@ -437,12 +437,15 @@ async fn do_commit_new_dataset(
     base_path: &Path,
     uri: &str,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
     session: Arc<Session>,
     inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let build_config = build_config
+        .clone()
+        .with_timestamp_nanos(timestamp_to_nanos(None));
     let mut transaction = transaction.clone();
     if let Operation::Overwrite { schema, .. } = &mut transaction.operation {
         crate::dataset::write::assign_new_table_field_ids(schema, inherited_field_ids)?;
@@ -551,7 +554,7 @@ async fn do_commit_new_dataset(
         None
     };
 
-    let transaction_file = if !write_config.disable_transaction_file() {
+    let transaction_file = if !build_config.disable_transaction_file() {
         match write_transaction_file(object_store, base_path, &pb_transaction).await {
             Ok(transaction_file) => transaction_file,
             Err(err) => {
@@ -634,12 +637,8 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         }
     } else {
-        let (manifest, indices) = transaction.build_manifest(
-            None,
-            vec![],
-            &transaction_file,
-            &write_config.to_build_config(),
-        )?;
+        let (manifest, indices) =
+            transaction.build_manifest(None, vec![], &transaction_file, &build_config)?;
         (manifest, indices)
     };
 
@@ -657,7 +656,7 @@ async fn do_commit_new_dataset(
         } else {
             Some(indices.clone())
         },
-        write_config,
+        &build_config,
         manifest_naming_scheme,
         inline_transaction.then(|| pb_transaction.into()),
         may_change_schema,
@@ -789,7 +788,7 @@ pub(crate) async fn commit_new_dataset(
     base_path: &Path,
     uri: &str,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
     session: Arc<Session>,
@@ -802,7 +801,7 @@ pub(crate) async fn commit_new_dataset(
         base_path,
         uri,
         transaction,
-        write_config,
+        build_config,
         manifest_naming_scheme,
         metadata_cache,
         session,
@@ -1314,14 +1313,14 @@ pub(crate) async fn do_commit_detached_transaction(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
     // Definitions are allocated against the version chain: a detached
     // manifest's ids and field-identity activation would be invisible to it.
-    if write_config.has_clustering_definitions() {
+    if build_config.clustering_definitions().is_some() {
         return Err(Error::invalid_input(
             "a clustering definitions list cannot be committed detached",
         ));
@@ -1356,7 +1355,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
-    let transaction_file = if !write_config.disable_transaction_file() {
+    let transaction_file = if !build_config.disable_transaction_file() {
         write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
     } else {
         String::new()
@@ -1374,7 +1373,8 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
-        let build_config = build_config_for_attempt(dataset, transaction, write_config).await?;
+        let attempt_build_config =
+            build_config_for_attempt(dataset, transaction, build_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
@@ -1382,7 +1382,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    &build_config,
+                    &attempt_build_config,
                     &transaction_file,
                     &dataset.manifest,
                 )
@@ -1392,14 +1392,18 @@ pub(crate) async fn do_commit_detached_transaction(
                 // Nothing is settled about a tagged fragment reuse entry
                 // on a detached commit: a tagged rewrite entry was refused
                 // above and a trim never commits detached.
-                let prepared =
-                    prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
-                        .await?;
+                let prepared = prepare_attempt(
+                    dataset,
+                    transaction,
+                    &attempt_build_config,
+                    FragReuseUpdate::None,
+                )
+                .await?;
                 let (mut manifest, mut indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
-                    &build_config,
+                    &attempt_build_config,
                     None,
                 )?;
                 finish_built_manifest(dataset, transaction, &mut manifest, &mut indices).await?;
@@ -1478,7 +1482,7 @@ pub(crate) async fn do_commit_detached_transaction(
             } else {
                 Some(indices.clone())
             },
-            write_config,
+            &attempt_build_config,
             ManifestNamingScheme::V2,
             inline_tx.take(),
             may_change_schema,
@@ -1589,7 +1593,7 @@ pub(crate) async fn commit_detached_transaction(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
@@ -1599,7 +1603,7 @@ pub(crate) async fn commit_detached_transaction(
         object_store,
         commit_handler,
         transaction,
-        write_config,
+        build_config,
         commit_config,
         retry_timeout,
     )
@@ -1610,16 +1614,16 @@ pub(crate) async fn commit_detached_transaction(
 
 /// The build config for one commit attempt against `dataset`'s current manifest.
 ///
-/// An operation that carries rows' lineage over from existing fragments needs
-/// their sequences at build time, and the build cannot read the ones spilled to
-/// data files; they are read here, per attempt, so a rebase onto a newer
-/// manifest sees that manifest's fragments.
+/// Resolves the commit timestamp through this crate's mockable clock and loads
+/// spilled row lineage when the operation needs existing lineage sequences.
 async fn build_config_for_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
 ) -> Result<ManifestBuildConfig> {
-    let mut config = write_config.to_build_config();
+    let mut config = build_config
+        .clone()
+        .with_timestamp_nanos(timestamp_to_nanos(None));
     let reads_existing_lineage = match &transaction.operation {
         // An update resolves its new fragments' created-at versions from the
         // existing fragments unless their writer placed them, and refreshes
@@ -1639,8 +1643,8 @@ async fn build_config_for_attempt(
         _ => false,
     };
     if reads_existing_lineage {
-        config.spilled_row_lineage =
-            load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+        let lineage = load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+        config = config.with_spilled_row_lineage(lineage);
     }
     Ok(config)
 }
@@ -1812,20 +1816,74 @@ async fn record_successful_commit(
     dataset.ensure_branch_exists().await
 }
 
+/// Options for [`commit_transaction`].
+pub(crate) struct CommitTransactionOptions<'a> {
+    pub build_config: &'a ManifestBuildConfig,
+    pub commit_config: &'a CommitConfig,
+    pub retry_timeout: Duration,
+    pub manifest_naming_scheme: ManifestNamingScheme,
+    pub affected_rows: Option<&'a RowAddrTreeMap>,
+    pub expected_latest_version: Option<u64>,
+    /// Whether this commit is a tagged fragment-reuse-index trim derived by the
+    /// maintenance path against the current manifest entry (`FragReuseUpdate::Trim`).
+    pub tagged_frag_reuse_trim: bool,
+}
+
+impl<'a> CommitTransactionOptions<'a> {
+    pub(crate) fn new(
+        build_config: &'a ManifestBuildConfig,
+        commit_config: &'a CommitConfig,
+        manifest_naming_scheme: ManifestNamingScheme,
+    ) -> Self {
+        Self {
+            build_config,
+            commit_config,
+            retry_timeout: default_commit_retry_timeout(),
+            manifest_naming_scheme,
+            affected_rows: None,
+            expected_latest_version: None,
+            tagged_frag_reuse_trim: false,
+        }
+    }
+
+    pub(crate) fn with_retry_timeout(mut self, retry_timeout: Duration) -> Self {
+        self.retry_timeout = retry_timeout;
+        self
+    }
+
+    pub(crate) fn with_affected_rows(mut self, affected_rows: Option<&'a RowAddrTreeMap>) -> Self {
+        self.affected_rows = affected_rows;
+        self
+    }
+
+    pub(crate) fn with_expected_latest_version(mut self, version: u64) -> Self {
+        self.expected_latest_version = Some(version);
+        self
+    }
+
+    pub(crate) fn with_tagged_frag_reuse_trim(mut self) -> Self {
+        self.tagged_frag_reuse_trim = true;
+        self
+    }
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
-    commit_config: &CommitConfig,
-    retry_timeout: Duration,
-    manifest_naming_scheme: ManifestNamingScheme,
-    affected_rows: Option<&RowAddrTreeMap>,
-    expected_latest_version: Option<u64>,
+    options: CommitTransactionOptions<'_>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let CommitTransactionOptions {
+        build_config,
+        commit_config,
+        retry_timeout,
+        manifest_naming_scheme,
+        affected_rows,
+        expected_latest_version,
+        tagged_frag_reuse_trim,
+    } = options;
     dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -1901,7 +1959,7 @@ pub(crate) async fn commit_transaction(
     // read, not from the handle it was submitted through, which may already
     // be at a later, activated version.
     let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
-        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+        && build_config.allocates_clustering_definitions(&read_version_dataset.manifest))
     .then(|| read_version_dataset.schema().clone());
 
     while backoff.attempt() < num_attempts {
@@ -2017,7 +2075,7 @@ pub(crate) async fn commit_transaction(
         // copy would tie the verdict to the payload size instead.
         let may_change_schema = operation_may_change_schema(&pb_transaction);
 
-        current_transaction_file = if !write_config.disable_transaction_file() {
+        current_transaction_file = if !build_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
         } else {
             String::new()
@@ -2033,8 +2091,8 @@ pub(crate) async fn commit_transaction(
         // Build an up-to-date manifest from the transaction and current
         // manifest: prepare the index list against this attempt's manifest
         // first, then build from the prepared result.
-        let build_config =
-            build_config_for_attempt(&dataset, &attempt_transaction, write_config).await?;
+        let attempt_build_config =
+            build_config_for_attempt(&dataset, &attempt_transaction, build_config).await?;
         let (mut manifest, mut indices) = match attempt_transaction.operation {
             Operation::Restore { version } => {
                 // A restore reinstates its snapshot's index list and entry
@@ -2044,7 +2102,7 @@ pub(crate) async fn commit_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    &build_config,
+                    &attempt_build_config,
                     transaction_file,
                     &dataset.manifest,
                 )
@@ -2053,17 +2111,21 @@ pub(crate) async fn commit_transaction(
             _ => {
                 let frag_reuse = match tagged_rewrite.take() {
                     Some(assembly) => FragReuseUpdate::Rewrite(assembly),
-                    None if write_config.tagged_frag_reuse_trim() => FragReuseUpdate::Trim,
+                    None if tagged_frag_reuse_trim => FragReuseUpdate::Trim,
                     None => FragReuseUpdate::None,
                 };
-                let prepared =
-                    prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
-                        .await?;
+                let prepared = prepare_attempt(
+                    &dataset,
+                    &attempt_transaction,
+                    &attempt_build_config,
+                    frag_reuse,
+                )
+                .await?;
                 let (mut manifest, mut indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
-                    &build_config,
+                    &attempt_build_config,
                     read_version_state,
                 )?;
                 finish_built_manifest(&dataset, &attempt_transaction, &mut manifest, &mut indices)
@@ -2150,7 +2212,7 @@ pub(crate) async fn commit_transaction(
             } else {
                 Some(indices.clone())
             },
-            write_config,
+            &attempt_build_config,
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
             may_change_schema,
@@ -4456,7 +4518,8 @@ mod tests {
             Operation::Append { fragments: vec![] },
             None,
         );
-        let write_config = ManifestWriteConfig::default().with_transaction_file_disabled();
+        let build_config = ManifestBuildConfig::default().with_disable_transaction_file(true);
+        let commit_config = CommitConfig::default();
 
         handler.fail_next(AmbiguousFailure::LandAndConflict);
         let (manifest, _) = commit_transaction(
@@ -4464,12 +4527,12 @@ mod tests {
             dataset.object_store.as_ref(),
             handler.as_ref(),
             &transaction,
-            &write_config,
-            &CommitConfig::default(),
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
-            dataset.manifest_location.naming_scheme,
-            None,
-            None,
+            CommitTransactionOptions::new(
+                &build_config,
+                &commit_config,
+                dataset.manifest_location.naming_scheme,
+            )
+            .with_retry_timeout(DEFAULT_COMMIT_RETRY_TIMEOUT),
         )
         .await
         .expect("the inline transaction must identify the landed commit");
