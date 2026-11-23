@@ -83,26 +83,65 @@ public final class VectorTrainer {
   /**
    * Train a PQ codebook for the given dataset column.
    *
-   * <p>The {@code distanceType} controls the geometry used to fit the codebook (notably, Cosine
-   * normalizes training data before k-means) and must match the distance type later passed to
-   * per-fragment index builds. If they disagree the codebook is shaped for one geometry while
-   * encoding happens against another and recall will silently degrade.
+   * <p>Training uses the column vectors, normalized for cosine. For IVF PQ builds that use
+   * residuals, use {@link #trainPqCodebook(Dataset, String, PQBuildParams, DistanceType, float[])}
+   * with the centroids used to build that index.
    *
    * @param dataset the dataset to sample training data from
    * @param column the vector column name
    * @param params PQ build parameters (numSubVectors, numBits, sampleRate, etc.)
    * @param distanceType distance metric used during codebook training
-   * @return a flattened array of codebook entries laid out as [num_centroids][dimension]
+   * @return the flattened PQ codebook for {@link PQBuildParams.Builder#setCodebook(float[])}
    */
   public static float[] trainPqCodebook(
       Dataset dataset, String column, PQBuildParams params, DistanceType distanceType) {
+    return trainPqCodebookInternal(dataset, column, params, distanceType, null);
+  }
+
+  /**
+   * Train a PQ codebook for an IVF index using its pretrained centroids.
+   *
+   * <p>For L2 and cosine, training uses the residual between each vector and its assigned centroid.
+   * Cosine normalizes vectors before computing residuals. Dot trains on the original vectors. Use
+   * the same distance type and IVF centroids when building the index.
+   *
+   * <pre>{@code
+   * DistanceType metric = DistanceType.L2;
+   * float[] centroids = VectorTrainer.trainIvfCentroids(dataset, column, ivfParams, metric);
+   * float[] codebook = VectorTrainer.trainPqCodebook(dataset, column, pqParams, metric, centroids);
+   * }</pre>
+   *
+   * @param dataset the dataset to sample training data from
+   * @param column the vector column name
+   * @param params PQ build parameters (numSubVectors, numBits, sampleRate, etc.)
+   * @param distanceType distance metric of the IVF index
+   * @param centroids Float32 IVF centers laid out as [numPartitions][dimension]
+   * @return the flattened PQ codebook for {@link PQBuildParams.Builder#setCodebook(float[])}
+   * @throws IllegalArgumentException if the centroid array is null or has an invalid shape
+   */
+  public static float[] trainPqCodebook(
+      Dataset dataset,
+      String column,
+      PQBuildParams params,
+      DistanceType distanceType,
+      float[] centroids) {
+    Preconditions.checkArgument(centroids != null, "centroids cannot be null");
+    return trainPqCodebookInternal(dataset, column, params, distanceType, centroids);
+  }
+
+  private static float[] trainPqCodebookInternal(
+      Dataset dataset,
+      String column,
+      PQBuildParams params,
+      DistanceType distanceType,
+      float[] centroids) {
     Preconditions.checkArgument(dataset != null, "dataset cannot be null");
     Preconditions.checkArgument(
         column != null && !column.isEmpty(), "column cannot be null or empty");
     Preconditions.checkArgument(params != null, "params cannot be null");
     Preconditions.checkArgument(distanceType != null, "distanceType cannot be null");
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
-      return nativeTrainPqCodebook(dataset, column, params, distanceType.toString());
+      return nativeTrainPqCodebook(dataset, column, params, distanceType.toString(), centroids);
     }
   }
 
@@ -110,5 +149,5 @@ public final class VectorTrainer {
       Dataset dataset, String column, IvfBuildParams params, String distanceType);
 
   private static native float[] nativeTrainPqCodebook(
-      Dataset dataset, String column, PQBuildParams params, String distanceType);
+      Dataset dataset, String column, PQBuildParams params, String distanceType, float[] centroids);
 }
