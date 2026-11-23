@@ -1508,6 +1508,7 @@ async fn test_commit_existing_index_segments_rejects_mixed_index_detail_types() 
         files: seg0.files.clone(),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     let err = dataset

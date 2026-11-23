@@ -162,6 +162,7 @@ fn encode_filtered_read(
     state: &SessionState,
     table: pb::TableIdentifier,
 ) -> Result<pb::FilteredReadExecProto> {
+    exec.dataset().ensure_published()?;
     let dataset_schema: ArrowSchema = exec.dataset().schema().into();
     let plan = exec.plan();
     for expr in exec

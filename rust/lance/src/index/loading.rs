@@ -353,6 +353,9 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 /// reservation, replace and removal selection, explicit drop - answers that
 /// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
+    if let Some(staged) = &dataset.staged_indices {
+        return Ok(staged.clone());
+    }
     let metadata_key = IndexMetadataKey {
         version: dataset.manifest.version,
         store_identity: &dataset.object_store.store_prefix,
@@ -1203,6 +1206,12 @@ impl Dataset {
         purpose: frag_reuse::OpenPurpose,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
+        if !index_meta.local_fragment_aliases.is_empty() {
+            return Err(Error::not_supported(format!(
+                "Vector segment {} stores provisional fragment ids",
+                index_meta.uuid
+            )));
+        }
         let uuid = &index_meta.uuid;
         let object_store = self.object_store_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;

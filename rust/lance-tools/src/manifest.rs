@@ -10,10 +10,10 @@ use lance_table::feature_flags::{
     FLAG_BASE_PATHS, FLAG_COVERED_INDEX_METADATA, FLAG_DELETION_FILES,
     FLAG_DISABLE_TRANSACTION_FILE, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX,
     FLAG_FRAGMENT_TREE, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_INLINE_DELETIONS,
-    FLAG_MANAGED_BLOBS, FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS,
-    FLAG_OBJECT_METADATA, FLAG_ROW_ADDR_INDICES, FLAG_SPILLED_ROW_LINEAGE, FLAG_STABLE_ROW_IDS,
-    FLAG_TABLE_CONFIG, FLAG_UNKNOWN, FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-    FLAG_USE_V2_FORMAT_DEPRECATED, FLAG_ZONE_WRITE_SEEDS,
+    FLAG_LOCAL_FRAGMENT_ALIASES, FLAG_MANAGED_BLOBS, FLAG_MIXED_DATA_FILE_VERSIONS,
+    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA, FLAG_ROW_ADDR_INDICES,
+    FLAG_SPILLED_ROW_LINEAGE, FLAG_STABLE_ROW_IDS, FLAG_TABLE_CONFIG, FLAG_UNKNOWN,
+    FLAG_UNSTABLE_DATA_OVERLAY_FILES, FLAG_USE_V2_FORMAT_DEPRECATED, FLAG_ZONE_WRITE_SEEDS,
 };
 use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::{
@@ -1347,6 +1347,7 @@ fn format_feature_flags(flags: u64) -> String {
         (FLAG_OBJECT_METADATA, "object_metadata"),
         (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
         (FLAG_INLINE_DELETIONS, "inline_deletions"),
+        (FLAG_LOCAL_FRAGMENT_ALIASES, "local_fragment_aliases"),
     ];
     let mut names = known_flags
         .iter()
@@ -1623,6 +1624,7 @@ mod tests {
             (FLAG_OBJECT_METADATA, "object_metadata"),
             (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
             (FLAG_INLINE_DELETIONS, "inline_deletions"),
+            (FLAG_LOCAL_FRAGMENT_ALIASES, "local_fragment_aliases"),
         ];
         let rendered = format_feature_flags(FLAG_UNKNOWN - 1);
         for (_, name) in known_flags {

@@ -27,7 +27,7 @@ use pyo3::types::{PyDict, PyList};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -117,6 +117,14 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             Ok(value) => value.extract()?,
             Err(_) => HashMap::new(),
         };
+        let local_fragment_aliases: BTreeMap<u32, u32> =
+            match ob.getattr(intern!(ob.py(), "local_fragment_aliases")) {
+                Ok(value) => value.extract()?,
+                Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(ob.py()) => {
+                    BTreeMap::new()
+                }
+                Err(err) => return Err(err),
+            };
 
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
@@ -132,6 +140,7 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             files,
             clustering_id,
             metadata,
+            local_fragment_aliases,
         }))
     }
 }
@@ -175,6 +184,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let kwargs = PyDict::new(py);
         kwargs.set_item(intern!(py, "clustering_id"), self.0.clustering_id)?;
         kwargs.set_item(intern!(py, "metadata"), self.0.metadata.clone())?;
+        kwargs.set_item(
+            intern!(py, "local_fragment_aliases"),
+            self.0.local_fragment_aliases.clone(),
+        )?;
         cls.call(
             (
                 uuid,

@@ -1555,6 +1555,7 @@ impl ManifestNamespace {
             files: Some(index_files_to_table(trained_index.created_index.files)),
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         })
     }
 

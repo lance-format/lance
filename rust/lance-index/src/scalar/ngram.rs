@@ -578,6 +578,26 @@ impl NGramIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         results_are_row_addresses: bool,
     ) -> Result<CreatedIndex> {
+        let remappers = vec![frag_reuse_index; segment_stores.len()];
+        Self::merge_segments_with_remappers(
+            segment_stores,
+            new_data,
+            dest_store,
+            old_data_filters,
+            &remappers,
+            results_are_row_addresses,
+        )
+        .await
+    }
+
+    pub async fn merge_segments_with_remappers(
+        segment_stores: &[Arc<dyn IndexStore>],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        old_data_filters: &[Option<super::OldIndexDataFilter>],
+        remappers: &[Option<Arc<dyn RowIdRemapper>>],
+        results_are_row_addresses: bool,
+    ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         // Pure consolidation has no new rows, so skip `train` (and its
         // worker-per-partition tokenization pipeline) entirely.
@@ -590,7 +610,7 @@ impl NGramIndex {
                 new_data_spills,
                 segment_stores,
                 old_data_filters,
-                frag_reuse_index,
+                remappers,
                 dest_store,
             )
             .await?;
@@ -1855,7 +1875,7 @@ impl NGramIndexBuilder {
         new_data_spills: Vec<usize>,
         segment_stores: &[Arc<dyn IndexStore>],
         old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remappers: &[Option<Arc<dyn RowIdRemapper>>],
         dest_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
         if old_data_filters.len() != segment_stores.len() {
@@ -1864,6 +1884,14 @@ impl NGramIndexBuilder {
                  ({} segments) but got {}",
                 segment_stores.len(),
                 old_data_filters.len()
+            )));
+        }
+        if remappers.len() != segment_stores.len() {
+            return Err(Error::invalid_input(format!(
+                "NGram merge: expected one remapper per source segment \
+                 ({} segments) but got {}",
+                segment_stores.len(),
+                remappers.len()
             )));
         }
 
@@ -1880,7 +1908,7 @@ impl NGramIndexBuilder {
         if segment_stores.len() == 1 {
             let seg_stream = Self::open_segment_stream(
                 segment_stores[0].clone(),
-                frag_reuse_index,
+                remappers[0].clone(),
                 old_data_filters[0].clone(),
             )
             .await?;
@@ -1897,26 +1925,33 @@ impl NGramIndexBuilder {
         let mut spills = new_data_spills;
         let next_spill = spills.iter().copied().max().map_or(0, |id| id + 1);
         let mut tasks = Vec::new();
-        for (offset, (stores, filters)) in segment_stores
+        for (offset, ((stores, filters), seg_remappers)) in segment_stores
             .chunks(2)
             .zip(old_data_filters.chunks(2))
+            .zip(remappers.chunks(2))
             .enumerate()
         {
             let out = next_spill + offset;
             spills.push(out);
             let spill_store = self.spill_store.clone();
-            let fri = frag_reuse_index.clone();
             let s0 = stores[0].clone();
             let f0 = filters[0].clone();
-            let second = (stores.len() == 2).then(|| (stores[1].clone(), filters[1].clone()));
+            let r0 = seg_remappers[0].clone();
+            let second = (stores.len() == 2).then(|| {
+                (
+                    stores[1].clone(),
+                    filters[1].clone(),
+                    seg_remappers[1].clone(),
+                )
+            });
             tasks.push(lance_core::utils::tokio::spawn(async move {
                 let mut writer = spill_store
                     .new_index_file(&Self::spill_filename(out), POSTINGS_SCHEMA.clone())
                     .await?;
-                let mut left = Self::open_segment_stream(s0, fri.clone(), f0).await?;
+                let mut left = Self::open_segment_stream(s0, r0, f0).await?;
                 match second {
-                    Some((s1, f1)) => {
-                        let right = Self::open_segment_stream(s1, fri, f1).await?;
+                    Some((s1, f1, r1)) => {
+                        let right = Self::open_segment_stream(s1, r1, f1).await?;
                         // `merge_spill_streams` finishes the writer itself.
                         Self::merge_spill_streams(left, right, writer.as_mut()).await?;
                     }

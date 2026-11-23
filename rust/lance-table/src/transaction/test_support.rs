@@ -61,6 +61,7 @@ pub fn sample_index_metadata(name: &str) -> IndexMetadata {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     }
 }
 
