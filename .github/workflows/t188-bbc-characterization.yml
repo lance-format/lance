@@ -33,7 +33,7 @@ jobs:
           cargo --version
           rustc --version
       - name: Test score, range and boundary contracts
-        run: cargo test --locked --profile ci -p lance-index --features lance-io/huggingface,lance-io/azure --lib research_bbc_scores_match_exhaustive_selection
+        run: cargo test --locked --profile ci -p lance-index --features lance-io/huggingface,lance-io/default --lib research_bbc_scores_match_exhaustive_selection
       - name: Compare dense RQ to scalar with identical inputs
         if: success() || failure()
-        run: cargo test --locked --profile ci -p lance-index --features lance-io/huggingface,lance-io/azure --lib test_raw_query_multi_bit_topk_dense_matches_sparse
+        run: cargo test --locked --profile ci -p lance-index --features lance-io/huggingface,lance-io/default --lib test_raw_query_multi_bit_topk_dense_matches_sparse
