@@ -3938,14 +3938,29 @@ impl PartialEq for TypedZone {
 /// zone statistics equal those computed from the generated arrays, and
 /// indexed filters match a scan.
 #[rstest::rstest]
+#[case::boolean(DataType::Boolean, &["col = true"])]
+#[case::int8(DataType::Int8, INT_FILTERS)]
 #[case::int32(DataType::Int32, INT_FILTERS)]
+#[case::int64(DataType::Int64, INT_FILTERS)]
+#[case::uint16(DataType::UInt16, INT_FILTERS)]
+#[case::uint64(DataType::UInt64, INT_FILTERS)]
+#[case::float32(DataType::Float32, FLOAT_FILTERS)]
 #[case::float64(DataType::Float64, FLOAT_FILTERS)]
-#[case::utf8(DataType::Utf8, STRING_FILTERS)]
+#[case::date32(DataType::Date32, &["col >= DATE '2022-02-07'"])]
 #[case::timestamp_ms(
     DataType::Timestamp(TimeUnit::Millisecond, None),
     &["col >= TIMESTAMP '2023-11-14 22:13:50'"]
 )]
-#[case::boolean(DataType::Boolean, &["col = true"])]
+#[case::timestamp_ns_utc(DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), &[])]
+#[case::duration_us(DataType::Duration(TimeUnit::Microsecond), &[])]
+#[case::time32_s(
+    DataType::Time32(TimeUnit::Second),
+    &["col >= arrow_cast(1800, 'Time32(Second)')"]
+)]
+#[case::utf8(DataType::Utf8, STRING_FILTERS)]
+#[case::large_utf8(DataType::LargeUtf8, STRING_FILTERS)]
+#[case::binary(DataType::Binary, &["col >= X'000000000000001E'"])]
+#[case::large_binary(DataType::LargeBinary, &["col >= X'000000000000001E'"])]
 #[case::decimal128(DataType::Decimal128(38, 4), &["col >= 30"])]
 #[tokio::test]
 async fn test_config_seed_boundary_per_type(
@@ -3954,7 +3969,7 @@ async fn test_config_seed_boundary_per_type(
     #[values(false, true)] index_store_null_bitmap: bool,
 ) {
     use arrow::array::{AsArray, BooleanArray, new_null_array};
-    use arrow::datatypes::{Float64Type, UInt32Type, UInt64Type};
+    use arrow::datatypes::{Float32Type, Float64Type, UInt32Type, UInt64Type};
     use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
 
@@ -4097,9 +4112,12 @@ async fn test_config_seed_boundary_per_type(
         while offset < column.len() {
             let length = INDEX_ROWS_PER_ZONE.min(column.len() - offset);
             let zone = column.slice(offset, length);
-            let floats = zone.as_primitive_opt::<Float64Type>();
-            let is_nan =
-                |row: usize| floats.is_some_and(|f| f.is_valid(row) && f.value(row).is_nan());
+            let doubles = zone.as_primitive_opt::<Float64Type>();
+            let singles = zone.as_primitive_opt::<Float32Type>();
+            let is_nan = |row: usize| {
+                doubles.is_some_and(|f| f.is_valid(row) && f.value(row).is_nan())
+                    || singles.is_some_and(|f| f.is_valid(row) && f.value(row).is_nan())
+            };
             let keep: Vec<bool> = (0..length)
                 .map(|row| zone.is_valid(row) && !is_nan(row))
                 .collect();
