@@ -6,11 +6,11 @@
 use super::current_thread::{UringCurrentThreadReader, push_request};
 use super::current_thread_future::UringCurrentThreadFuture;
 use super::future::UringReadFuture;
-use super::reader::{CacheKey, HANDLE_CACHE};
+use super::reader::UringFileHandle;
 use super::requests::{IoRequest, PendingRequests, RequestState};
 use super::thread::push_to_sq;
 use crate::object_store::ObjectStore;
-use crate::utils::tracking_store::IOTracker;
+use crate::traits::Reader;
 use bytes::BytesMut;
 use io_uring::IoUring;
 use lance_core::Result;
@@ -439,7 +439,7 @@ fn test_thread_exit_waits_for_reads_in_flight() -> Result<()> {
 }
 
 /// A read that the current-thread reader has queued, but not yet submitted, must still read its
-/// own file after the reader and the cached handle are dropped and another file is opened.
+/// own file after the reader is dropped and another file is opened.
 #[tokio::test(flavor = "current_thread")]
 async fn test_queued_read_keeps_its_file_open() -> Result<()> {
     skip_if_no_thread_local_uring!();
@@ -451,21 +451,21 @@ async fn test_queued_read_keeps_its_file_open() -> Result<()> {
     let uri = format!("file+uring://{}", file.path().to_str().unwrap());
     let (_, path) = ObjectStore::from_uri(&uri).await?;
 
+    // The cache can retain its file reference after invalidation until reclamation runs.
+    let handle = Arc::new(UringFileHandle::new(file.reopen()?, path));
+    let queued_file = Arc::downgrade(&handle.file);
     let reader =
-        UringCurrentThreadReader::open(&path, 4096, None, Arc::new(IOTracker::default())).await?;
-    let cache_key = CacheKey::new(&path, reader.block_size());
-    let cached_file = Arc::downgrade(&HANDLE_CACHE.get(&cache_key).await.unwrap().handle.file);
+        UringCurrentThreadReader::from_uncached_handle_for_test(handle, expected_data.len());
     // The read is queued here and submitted only when the future is first polled.
-    let read = reader.get_range(0..4096);
+    let read = reader.get_range(0..expected_data.len());
     drop(reader);
-    HANDLE_CACHE.invalidate(&cache_key).await;
-    HANDLE_CACHE.run_pending_tasks().await;
-    assert!(
-        cached_file.strong_count() == 1,
+    assert_eq!(
+        queued_file.strong_count(),
+        1,
         "only the queued request must keep the file open"
     );
     // Had the file been closed, this would likely take over its descriptor number.
-    let (_other_file, _) = create_test_file(4096)?;
+    let (_other_file, _) = create_test_file(expected_data.len())?;
 
     let data = read.await.unwrap();
     assert_eq!(data.as_ref(), expected_data.as_slice());

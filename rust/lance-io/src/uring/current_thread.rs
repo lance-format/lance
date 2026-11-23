@@ -300,6 +300,16 @@ impl DeepSizeOf for UringCurrentThreadReader {
 }
 
 impl UringCurrentThreadReader {
+    #[cfg(test)]
+    pub(super) fn from_uncached_handle_for_test(handle: Arc<UringFileHandle>, size: usize) -> Self {
+        Self {
+            handle,
+            block_size: DEFAULT_URING_BLOCK_SIZE,
+            size,
+            io_tracker: Arc::new(IOTracker::default()),
+        }
+    }
+
     /// Open a file with thread-local io_uring
     ///
     /// This reuses the file handle caching infrastructure from UringReader
