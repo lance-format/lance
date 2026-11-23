@@ -264,15 +264,13 @@ enum CommitOutcome {
 const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 
 /// Determine whether a failed commit attempt actually landed, by comparing
-/// the complete transaction recorded in the manifest at `version` with this
-/// attempt's transaction.
+/// the manifest at `version` with this attempt. A keyed append has a unique
+/// transaction file, which identifies the attempt even if another writer
+/// submitted the same transaction.
 ///
-/// The comparison is done between durable (protobuf) forms: the in-memory
-/// [`Transaction`] can carry state that is intentionally not serialized
-/// (e.g. the frag reuse payload attached to a rewrite), so comparing the
-/// read-back transaction against the in-memory one would misclassify our own
-/// landed commit as foreign. A keyed append also checks the attempt's unique
-/// transaction file, since two submissions can carry identical transactions.
+/// For unkeyed commits, compare the durable (protobuf) forms. The in-memory
+/// [`Transaction`] can carry state that is intentionally not serialized (e.g.
+/// the frag reuse payload attached to a rewrite).
 ///
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
@@ -302,13 +300,19 @@ async fn verify_commit_outcome(
             .await
         {
             Ok(Some((manifest, location))) => {
+                if keyed_append
+                    .is_some_and(|(_, file)| manifest.transaction_file.as_deref() == Some(file))
+                {
+                    return CommitOutcome::Ours {
+                        manifest: Box::new(manifest),
+                        location,
+                    };
+                }
                 match read_manifest_transaction(object_store, base_path, &manifest, &location).await
                 {
                     Ok(Some(committed_transaction)) => {
-                        let same_attempt = keyed_append.is_none_or(|(_, file)| {
-                            manifest.transaction_file.as_deref() == Some(file)
-                        });
-                        return if same_attempt && committed_transaction == transaction_pb {
+                        return if keyed_append.is_none() && committed_transaction == transaction_pb
+                        {
                             CommitOutcome::Ours {
                                 manifest: Box::new(manifest),
                                 location,
@@ -2345,7 +2349,7 @@ pub(crate) async fn commit_transaction(
                 };
                 let next_attempt_i = backoff.attempt() + 1;
 
-                if backoff.attempt() == 0 {
+                if !duplicate_append && backoff.attempt() == 0 {
                     // We add 10% buffer here, to allow concurrent writes to complete.
                     // We pass the first attempt's time to the backoff so it's used
                     // as the unit for backoff time slots. The catch-up before the
@@ -4429,6 +4433,15 @@ mod tests {
 
     const APPEND_KEY_PROPERTY: &str = "job_id";
 
+    async fn create_append_test_dataset(uri: &str) -> Arc<Dataset> {
+        Arc::new(
+            InsertBuilder::new(uri)
+                .execute(vec![simple_batch(&simple_schema(), vec![0])])
+                .await
+                .unwrap(),
+        )
+    }
+
     async fn stage_append(dataset: Arc<Dataset>, value: i32, key: &str) -> Transaction {
         InsertBuilder::new(dataset)
             .with_params(&WriteParams {
@@ -4488,12 +4501,7 @@ mod tests {
         #[case] same_transaction: bool,
     ) {
         let tmp = TempStrDir::default();
-        let dataset = Arc::new(
-            InsertBuilder::new(tmp.as_str())
-                .execute(vec![simple_batch(&simple_schema(), vec![0])])
-                .await
-                .unwrap(),
-        );
+        let dataset = create_append_test_dataset(tmp.as_str()).await;
         let first_key = "job-a";
         let mut first = stage_append(dataset.clone(), 1, first_key).await;
         let second = if same_transaction {
@@ -4564,12 +4572,7 @@ mod tests {
         #[case] outcome_unknown: bool,
     ) {
         let tmp = TempStrDir::default();
-        let dataset = Arc::new(
-            InsertBuilder::new(tmp.as_str())
-                .execute(vec![simple_batch(&simple_schema(), vec![0])])
-                .await
-                .unwrap(),
-        );
+        let dataset = create_append_test_dataset(tmp.as_str()).await;
         let transaction = stage_append(dataset.clone(), 1, "job-a").await;
         let handler = Arc::new(crate::utils::test::AmbiguousCommitHandler::default());
         handler.fail_next(failure);
@@ -4602,18 +4605,41 @@ mod tests {
         assert_eq!(duplicate.append_already_committed_version(), Some(2));
         let latest = Dataset::open(tmp.as_str()).await.unwrap();
         assert_eq!(latest.version().version, 3);
-        assert_eq!(latest.count_rows(None).await.unwrap(), 3);
+        assert_eq!(
+            latest.scan().try_into_batch().await.unwrap(),
+            simple_batch(&simple_schema(), vec![0, 1, 2]),
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None)]
+    #[case::empty(Some(""))]
+    #[tokio::test]
+    async fn test_append_idempotency_requires_a_key(#[case] key: Option<&str>) {
+        let mut transaction = Transaction::new(1, Operation::Append { fragments: vec![] }, None);
+        transaction.transaction_properties = key.map(|key| {
+            Arc::new(HashMap::from([(
+                APPEND_KEY_PROPERTY.to_string(),
+                key.to_string(),
+            )]))
+        });
+        let error = CommitBuilder::new("memory://")
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("requires a nonempty transaction property")
+        );
     }
 
     #[tokio::test]
     async fn test_append_idempotency_refuses_missing_history() {
         let tmp = TempStrDir::default();
-        let dataset = Arc::new(
-            InsertBuilder::new(tmp.as_str())
-                .execute(vec![simple_batch(&simple_schema(), vec![0])])
-                .await
-                .unwrap(),
-        );
+        let dataset = create_append_test_dataset(tmp.as_str()).await;
         let transaction = stage_append(dataset.clone(), 1, "job-a").await;
         let builder = CommitBuilder::new(dataset.clone())
             .with_append_idempotency_property(APPEND_KEY_PROPERTY);

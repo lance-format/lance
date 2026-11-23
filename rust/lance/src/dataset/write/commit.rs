@@ -325,13 +325,16 @@ impl<'a> CommitBuilder<'a> {
     /// submission of a logical append. If an append with the same property value
     /// has already committed on this branch after `read_version`, the call returns
     /// an error with [`Error::append_already_committed_version`] and publishes no
-    /// version. The first append wins even when the staged fragments differ. Use
-    /// distinct values for distinct appends. If the intervening history is
-    /// incomplete and there is no known match, the commit fails.
+    /// version. The first append wins even when the staged fragments differ. It
+    /// may also reference the same staged files. Use distinct values for distinct
+    /// appends, and retain the base version and intervening history for as long
+    /// as the append can be retried. If there is a gap and no known match, the
+    /// commit fails.
     ///
-    /// Each writer submitting the logical append must opt in to prevent concurrent
-    /// duplicates. This option is for individual, non-detached append transactions
-    /// against an existing dataset version.
+    /// A committed append is matched by its stored property, including appends
+    /// written before this option was introduced. Every writer submitting the
+    /// logical append concurrently must use the option. This is for individual,
+    /// non-detached appends to an existing dataset.
     ///
     /// ```
     /// # use lance::dataset::CommitBuilder;
