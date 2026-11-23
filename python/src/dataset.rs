@@ -1412,12 +1412,13 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
+    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None, io_parallelism = None))]
     fn take<'py>(
         self_: PyRef<'py, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
+        io_parallelism: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let projection = match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
@@ -1432,8 +1433,18 @@ impl Dataset {
             (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }?;
+        let ds = self_.ds.clone();
+        let read = async move {
+            match io_parallelism {
+                Some(io_parallelism) => {
+                    ds.take_with_io_parallelism(&row_indices, projection, io_parallelism)
+                        .await
+                }
+                None => ds.take(&row_indices, projection).await,
+            }
+        };
         let batch = rt()
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
+            .block_on(Some(self_.py()), read)?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())

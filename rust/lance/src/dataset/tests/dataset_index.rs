@@ -5558,11 +5558,29 @@ async fn test_fts_9058_match_planner_domains(
         }
         return;
     }
+    if matches!(control, RestrictedMatchControl::Fuzzy) {
+        // Fuzzy queries share one corpus-wide prepared vocabulary/scorer across
+        // indexed and flat arms and defer candidate filters to emission so
+        // prefilters never shift the capped expansion budget.
+        assert!(explanation.contains("MatchCorpus"), "{evidence:#}");
+        assert!(
+            !flat_child_counts.is_empty(),
+            "missing flat path: {evidence:#}"
+        );
+        assert!(
+            flat_child_counts.iter().all(|count| *count == 2),
+            "fuzzy flat path must defer candidate filtering to emission: {evidence:#}"
+        );
+        assert_eq!(batch.num_rows(), 1, "wrong candidates: {evidence:#}");
+        assert!(scores.iter().all(|score| score.is_finite()), "{evidence:#}");
+        assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
+        return;
+    }
     assert!(
         !explanation.contains("MatchCorpus"),
         "unrelated query acquired restricted corpus execution: {evidence:#}"
     );
-    // Fuzzy and Boolean queries keep their existing candidate filtering paths.
+    // Boolean queries keep their existing candidate filtering paths.
     assert!(
         !flat_child_counts.is_empty(),
         "missing flat path: {evidence:#}"

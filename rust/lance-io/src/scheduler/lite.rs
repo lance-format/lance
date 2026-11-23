@@ -264,10 +264,13 @@ struct PrioritiesInFlight {
     in_flight: Vec<u128>,
 }
 
+const MAX_INITIAL_IN_FLIGHT_CAPACITY: u64 = 256;
+
 impl PrioritiesInFlight {
     fn new(capacity: u64) -> Self {
+        let initial_capacity = (capacity.min(MAX_INITIAL_IN_FLIGHT_CAPACITY) as usize) * 2;
         Self {
-            in_flight: Vec::with_capacity(capacity as usize * 2),
+            in_flight: Vec::with_capacity(initial_capacity),
         }
     }
 

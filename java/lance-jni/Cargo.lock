@@ -2678,7 +2678,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3900,7 +3900,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3974,7 +3974,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -4027,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4065,7 +4065,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4097,7 +4097,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion-exec"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4122,7 +4122,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4131,7 +4131,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4165,7 +4165,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4227,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4300,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4323,7 +4323,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4368,7 +4368,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4406,7 +4406,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -4423,7 +4423,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "argminmax",
  "arrow-array",
@@ -4438,7 +4438,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4501,7 +4501,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4554,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "15.0.0-beta.25"
+version = "15.0.0-beta.27"
 dependencies = [
  "frostem",
  "icu_segmenter",

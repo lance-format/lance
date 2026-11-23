@@ -3955,7 +3955,7 @@ async fn prepare_compound_query(
     params: &FtsSearchParams,
     metrics: &dyn MetricsCollector,
     base_scorer: Option<Arc<MemBM25Scorer>>,
-    prepared_match: Option<Arc<PreparedBm25Query>>,
+    prepared_leaves: Option<&[Arc<PreparedBm25Query>]>,
 ) -> Result<(CompoundScorerPlan, Vec<PreparedLeaf>)> {
     let first_index = indices
         .first()
@@ -3971,27 +3971,33 @@ async fn prepare_compound_query(
         )));
     }
 
-    let mut leaves = Vec::with_capacity(leaf_queries.len());
-    if prepared_match.is_some() && leaf_queries.len() != 1 {
-        return Err(Error::internal(
-            "prepared Match replay requires exactly one compound FTS leaf",
-        ));
+    if let Some(prepared_leaves) = prepared_leaves
+        && prepared_leaves.len() != leaf_queries.len()
+    {
+        return Err(Error::invalid_input(format!(
+            "prepared compound FTS leaves count ({}) does not match query leaf count ({})",
+            prepared_leaves.len(),
+            leaf_queries.len()
+        )));
     }
-    for leaf in leaf_queries {
+    let mut leaves = Vec::with_capacity(leaf_queries.len());
+    for (leaf_idx, leaf) in leaf_queries.into_iter().enumerate() {
         let effective_params = leaf.effective_params(params);
-        let tokens = tokenize_leaf(first_index, &leaf, &effective_params)?;
-        let prepared = match &prepared_match {
-            Some(prepared) => prepared.clone(),
-            None => Arc::new(
-                prepare_bm25_query(
-                    indices,
-                    tokens,
-                    &effective_params,
-                    Some(metrics),
-                    base_scorer.clone(),
+        let prepared = match prepared_leaves {
+            Some(prepared_leaves) => prepared_leaves[leaf_idx].clone(),
+            None => {
+                let tokens = tokenize_leaf(first_index, &leaf, &effective_params)?;
+                Arc::new(
+                    prepare_bm25_query(
+                        indices,
+                        tokens,
+                        &effective_params,
+                        Some(metrics),
+                        base_scorer.clone(),
+                    )
+                    .await?,
                 )
-                .await?,
-            ),
+            }
         };
         leaves.push(PreparedLeaf {
             query: prepared,
@@ -4439,15 +4445,13 @@ pub async fn compound_search_prepared_match(
             "prepared Match replay requires a root Match query",
         ));
     }
-    compound_search_impl(
+    compound_search_prepared_leaves(
         indices,
         query,
         params,
         prefilter,
         metrics,
-        None,
-        None,
-        Some(prepared_match),
+        std::slice::from_ref(&prepared_match),
     )
     .await
 }
@@ -4469,6 +4473,53 @@ pub async fn compound_search_prepared_match_with_score_floor(
             "prepared Match replay requires a root Match query",
         ));
     }
+    compound_search_prepared_leaves_with_score_floor(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        std::slice::from_ref(&prepared_match),
+        score_floor,
+    )
+    .await
+}
+
+/// Execute a compound FTS query using one canonical prepared vocabulary/scorer
+/// pair per leaf in DFS traversal order (supporting multi-leaf fuzzy compounds
+/// over segment subsets).
+pub async fn compound_search_prepared_leaves(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_leaves: &[Arc<PreparedBm25Query>],
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        None,
+        None,
+        Some(prepared_leaves),
+    )
+    .await
+}
+
+/// Like [`compound_search_prepared_leaves`] with an inclusive initial score floor.
+#[doc(hidden)]
+pub async fn compound_search_prepared_leaves_with_score_floor(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_leaves: &[Arc<PreparedBm25Query>],
+    score_floor: f32,
+) -> Result<(Vec<u64>, Vec<f32>)> {
     compound_search_impl(
         indices,
         query,
@@ -4477,7 +4528,7 @@ pub async fn compound_search_prepared_match_with_score_floor(
         metrics,
         None,
         Some(score_floor),
-        Some(prepared_match),
+        Some(prepared_leaves),
     )
     .await
 }
@@ -4494,7 +4545,7 @@ async fn compound_search_impl(
     metrics: Arc<dyn MetricsCollector>,
     base_scorer: Option<Arc<MemBM25Scorer>>,
     initial_score_floor: Option<f32>,
-    prepared_match: Option<Arc<PreparedBm25Query>>,
+    prepared_leaves: Option<&[Arc<PreparedBm25Query>]>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     if limit == 0 {
@@ -4506,7 +4557,7 @@ async fn compound_search_impl(
         params,
         metrics.as_ref(),
         base_scorer,
-        prepared_match,
+        prepared_leaves,
     )
     .await?;
     prefilter.wait_for_ready().await?;
