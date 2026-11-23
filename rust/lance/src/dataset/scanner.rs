@@ -349,6 +349,29 @@ impl ExprFilter {
     #[allow(unused)]
     #[instrument(level = "trace", name = "filter_to_df", skip_all)]
     pub fn to_datafusion(&self, dataset_schema: &Schema, full_schema: &Schema) -> Result<Expr> {
+        let expr = self.to_unoptimized_datafusion(dataset_schema, full_schema)?;
+        match self {
+            Self::Sql(sql) => Planner::new(Arc::new(ArrowSchema::from(full_schema)))
+                .optimize_expr(expr)
+                .map_err(|e| {
+                    Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
+                }),
+            Self::Substrait(_) => Planner::new(Arc::new(ArrowSchema::from(dataset_schema)))
+                .optimize_expr(expr.clone())
+                .map_err(|e| {
+                    Error::invalid_input(format!(
+                        "Error optimizing substrait filter: {expr:?} ({e})"
+                    ))
+                }),
+            Self::Datafusion(_) => Ok(expr),
+        }
+    }
+
+    pub(super) fn to_unoptimized_datafusion(
+        &self,
+        _dataset_schema: &Schema,
+        full_schema: &Schema,
+    ) -> Result<Expr> {
         match self {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
@@ -357,34 +380,22 @@ impl ExprFilter {
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let ret_field = filter.to_field(&df_schema)?.1;
-                let ret_type = ret_field.data_type();
-                if ret_type != &DataType::Boolean {
+                if ret_field.data_type() != &DataType::Boolean {
                     return Err(Error::invalid_input_source(
                         format!("The filter {} does not return a boolean", filter).into(),
                     ));
                 }
-
-                let optimized = planner.optimize_expr(filter).map_err(|e| {
-                    Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
-                })?;
-                Ok(optimized)
+                Ok(filter)
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
                 use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
                 let ctx = get_session_context(&LanceExecutionOptions::default());
-                let state = ctx.state();
-                let schema = Arc::new(ArrowSchema::from(dataset_schema));
-                let expr = parse_substrait(expr, schema.clone(), &ctx.state())
+                let schema = Arc::new(ArrowSchema::from(_dataset_schema));
+                parse_substrait(expr, schema, &ctx.state())
                     .now_or_never()
-                    .expect("could not parse the Substrait filter in a synchronous fashion")?;
-                let planner = Planner::new(schema);
-                planner.optimize_expr(expr.clone()).map_err(|e| {
-                    Error::invalid_input(format!(
-                        "Error optimizing substrait filter: {expr:?} ({e})"
-                    ))
-                })
+                    .expect("could not parse the Substrait filter in a synchronous fashion")
             }
             #[cfg(not(feature = "substrait"))]
             Self::Substrait(_) => Err(Error::not_supported_source(

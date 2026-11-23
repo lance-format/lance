@@ -7,7 +7,9 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
-use datafusion_expr::ExprSchemable;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_expr::utils::{conjunction, split_conjunction_owned};
+use datafusion_expr::{Expr, ExprSchemable, Volatility};
 use lance_core::{Error, Result};
 use lance_datafusion::planner::Planner;
 use lance_file::version::ConcreteFileVersion;
@@ -31,6 +33,8 @@ impl Dataset {
     /// This reads index and dataset metadata without scanning data files. It
     /// retains fragments that lack usable index coverage or cannot be ruled out.
     /// Apply the original filter to the candidates using the same snapshot.
+    /// Predicates with query-scoped or volatile functions and segments that
+    /// require row-level address translation are handled conservatively.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -46,21 +50,34 @@ impl Dataset {
     /// # }
     /// ```
     pub async fn candidate_fragment_ids(&self, filter: ExprFilter) -> Result<RoaringBitmap> {
-        let schema = Arc::new(ArrowSchema::from(self.schema()));
-        let expr = filter.to_datafusion(self.schema(), self.schema())?;
+        let filter_schema = self.scan().filterable_schema()?;
+        let schema = Arc::new(ArrowSchema::from(filter_schema.as_ref()));
+        let expr = filter.to_unoptimized_datafusion(self.schema(), &filter_schema)?;
         let df_schema = DFSchema::try_from(schema.clone())?;
         if expr.get_type(&df_schema)? != DataType::Boolean {
             return Err(Error::invalid_input(format!(
                 "The filter {expr} does not return a boolean"
             )));
         }
-        let expr = Planner::new(schema).optimize_expr(expr)?;
         let all_fragments = self.fragment_bitmap.as_ref();
         if all_fragments.is_empty()
             || self.manifest.data_storage_format.lance_file_format() == ConcreteFileVersion::V1
         {
             return Ok(all_fragments.clone());
         }
+
+        // Query-scoped functions such as now() may be evaluated again on workers.
+        // Discard their conjuncts before the optimizer can turn them into literals.
+        let mut immutable_conjuncts = Vec::new();
+        for conjunct in split_conjunction_owned(expr) {
+            if is_immutable(&conjunct)? {
+                immutable_conjuncts.push(conjunct);
+            }
+        }
+        let Some(expr) = conjunction(immutable_conjuncts) else {
+            return Ok(all_fragments.clone());
+        };
+        let expr = Planner::new(schema).optimize_expr(expr)?;
 
         let indices = self.load_indices().await?;
         let pruning_indices: Vec<_> = indices
@@ -169,9 +186,26 @@ impl Dataset {
     }
 }
 
+fn is_immutable(expr: &Expr) -> Result<bool> {
+    let mut immutable = true;
+    expr.apply(|node| {
+        if let Expr::ScalarFunction(call) = node
+            && call.func.signature().volatility != Volatility::Immutable
+        {
+            immutable = false;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(immutable)
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow_array::{RecordBatchIterator, UInt64Array, record_batch};
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, TimestampMillisecondArray,
+        UInt64Array, record_batch,
+    };
     use lance_core::ROW_ADDR;
     use lance_core::utils::address::RowAddress;
     use lance_index::IndexType;
@@ -350,6 +384,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fragment_pruning_accepts_scanner_system_columns() {
+        let mut dataset = write_dataset(false).await;
+        build_segments(
+            &mut dataset,
+            "price",
+            BuiltinIndexType::ZoneMap,
+            &[&[0, 1, 2]],
+        )
+        .await;
+        let address = u64::from(RowAddress::new_from_parts(1, 0));
+        assert_candidates(
+            &dataset,
+            &format!("price >= 10 AND _rowaddr = {address}"),
+            &[1, 2],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_fragment_pruning_skips_query_scoped_and_volatile_predicates() {
+        let batch = RecordBatch::try_from_iter([
+            ("price", Arc::new(Int32Array::from(vec![0, 10])) as ArrayRef),
+            (
+                "event_ts",
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    4_102_444_800_000,
+                    4_102_531_200_000,
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                max_rows_per_group: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        build_segments(&mut dataset, "price", BuiltinIndexType::ZoneMap, &[&[0, 1]]).await;
+        build_segments(
+            &mut dataset,
+            "event_ts",
+            BuiltinIndexType::ZoneMap,
+            &[&[0, 1]],
+        )
+        .await;
+
+        // A literal time permits pruning. A query-scoped time can differ across
+        // the driver and workers, so only the independent price conjunct can prune.
+        assert_candidates(&dataset, "event_ts <= TIMESTAMP '2099-12-31 00:00:00'", &[]).await;
+        assert_candidates(
+            &dataset,
+            "event_ts <= TIMESTAMP '2100-01-01 00:00:00'",
+            &[0],
+        )
+        .await;
+        for (filter, expected) in [
+            ("event_ts <= now()", &[0, 1][..]),
+            ("price >= 10 AND event_ts <= now()", &[1]),
+            ("price >= 10 OR event_ts <= now()", &[0, 1]),
+            ("price >= 10 AND random() < 0.5", &[1]),
+        ] {
+            let candidates = dataset
+                .candidate_fragment_ids(ExprFilter::Sql(filter.into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                candidates,
+                RoaringBitmap::from_iter(expected.iter().copied()),
+                "{filter}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_fragment_pruning_after_compaction() {
         let mut dataset = write_dataset(false).await;
         build_segments(
@@ -376,7 +489,7 @@ mod tests {
         let current_id = dataset.fragments()[0].id as u32;
         assert_ne!(current_id, 0);
         assert_candidates(&dataset, "price = 0", &[current_id]).await;
-        assert_candidates(&dataset, "price > 100", &[]).await;
+        assert_candidates(&dataset, "price > 100", &[current_id]).await;
         assert_candidates(&snapshot, "price = 0", &[0]).await;
     }
 }

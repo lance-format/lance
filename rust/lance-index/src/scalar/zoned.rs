@@ -21,8 +21,6 @@ use lance_core::{ROW_ADDR, Result};
 use lance_select::RowAddrTreeMap;
 use roaring::RoaringBitmap;
 
-use crate::scalar::SearchResult;
-
 /// Minimum number of scanned rows to dispatch to the CPU pool at once.
 ///
 /// This is a floor, not a target: zones are never divided, so a single zone
@@ -671,15 +669,6 @@ pub(super) fn matching_zone_fragments<T: AsRef<ZoneBound>>(
     }
     metrics.record_comparisons(comparisons);
     Ok(fragments)
-}
-
-pub(super) fn matching_row_fragments(result: &SearchResult) -> Option<RoaringBitmap> {
-    match result {
-        SearchResult::Exact(rows) | SearchResult::AtMost(rows) => {
-            Some(rows.selected_rows().iter().map(|(&id, _)| id).collect())
-        }
-        SearchResult::AtLeast(_) => None,
-    }
 }
 
 /// Helper that retrains zones from `stream` and appends them to the existing
