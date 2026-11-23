@@ -22,7 +22,7 @@
 //! - `lance.zone_write_seeds.enabled`: `"true"` collects a zone map seed for
 //!   every top-level column of a candidate scalar type that no seeded
 //!   ZoneMap index covers, so a ZoneMap index created later can be built
-//!   from seeds instead of scanning. Nested, vector, dictionary, view,
+//!   from seeds instead of scanning. Nested, vector, dictionary,
 //!   extension and blob columns are never seeded by the config. Absent
 //!   or `"false"` disables this.
 //! - `lance.zone_write_seeds.rows_per_zone`: rows per seed zone for those
@@ -576,7 +576,6 @@ mod tests {
     #[case::fixed_size_binary_narrow(DataType::FixedSizeBinary(4), false)]
     #[case::fixed_size_binary_wide(DataType::FixedSizeBinary(16), false)]
     #[case::decimal128(DataType::Decimal128(10, 2), true)]
-    #[case::utf8_view(DataType::Utf8View, false)]
     #[case::null(DataType::Null, false)]
     #[case::fixed_size_list(
         DataType::FixedSizeList(
