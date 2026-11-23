@@ -16,8 +16,9 @@ use lance_core::utils::blob::validate_managed_reference;
 /// the batch and must be written with
 /// [`crate::dataset::fragment::FileFragment::write_columns_with_blob_sources`]
 /// or [`crate::Dataset::write_data_file_part_with_blob_sources`]. The writer
-/// replaces them with ordinary persisted Blob descriptors before encoding.
-/// Only trusted code should build these arrays and resolve the payloads.
+/// resolves every Packed descriptor in those arrays through this map. Use
+/// [`Self::add_blob_file`] to carry an existing Packed or Dedicated value
+/// forward. Only trusted code should build the arrays and resolve payloads.
 #[derive(Debug, Default)]
 pub struct BlobWriteSources {
     sources: Vec<BlobWriteObject>,
@@ -48,7 +49,7 @@ impl BlobWriteSources {
     /// # fn example() -> lance::Result<()> {
     /// let mut sources = BlobWriteSources::default();
     /// let descriptor = sources.add_uploaded_blob(
-    ///     Path::from("_blobs/functions/attempt-12/value.payload"), 1024,
+    ///     Path::from("_blobs/ingest/attempt-12/value.payload"), 1024,
     /// )?;
     /// # let _ = descriptor;
     /// # Ok(())
@@ -76,8 +77,8 @@ impl BlobWriteSources {
 
     /// Register the resolved range of an existing Blob, for example when
     /// carrying an ordinary sidecar forward from a staged file. Lance copies
-    /// the range using the source's store. The caller must retain it until the
-    /// copy completes.
+    /// the range using the source's store. The caller must keep the bytes
+    /// available and immutable until the copy completes.
     pub fn add_blob_file(&mut self, file: BlobFile) -> Result<BlobDescriptor> {
         let size = file.size();
         self.add(BlobWriteObject::Stored(file), size)

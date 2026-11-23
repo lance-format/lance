@@ -1162,14 +1162,16 @@ fn nested_blob_source_batch(item: Field, values: ArrayRef, managed: bool) -> Rec
 }
 
 #[rstest]
-#[case::ordinary_fragment(false, false)]
-#[case::ordinary_parts(false, true)]
-#[case::managed_fragment(true, false)]
-#[case::managed_parts(true, true)]
+#[case::ordinary_fragment(false, false, None)]
+#[case::ordinary_parts(false, true, None)]
+#[case::managed_fragment(true, false, None)]
+#[case::managed_parts(true, true, None)]
+#[case::managed_parts_registered_base(true, true, Some(7))]
 #[tokio::test]
 async fn completed_blob_uploads_round_trip_through_nested_columns(
     #[case] managed: bool,
     #[case] parts: bool,
+    #[case] base_id: Option<u32>,
 ) {
     let directory = TempDir::default();
     let uri = directory.std_path().join("table");
@@ -1182,17 +1184,26 @@ async fn completed_blob_uploads_round_trip_through_nested_columns(
         uri,
         Some(WriteParams {
             data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: base_id.map(|id| {
+                vec![BasePath {
+                    id,
+                    name: Some("output".into()),
+                    path: format!("{}/output", directory.path_str()),
+                    is_dataset_root: false,
+                }]
+            }),
             ..Default::default()
         }),
     )
     .await
     .unwrap();
-    let relative = Path::from("_blobs/functions/attempt-1/value.payload");
-    let absolute: Path = dataset.base.parts().chain(relative.parts()).collect();
-    let empty_relative = Path::from("_blobs/functions/attempt-1/empty.payload");
-    let empty_absolute: Path = dataset.base.parts().chain(empty_relative.parts()).collect();
+    let root = dataset.blob_base_path(base_id).unwrap();
+    let relative = Path::from("_blobs/ingest/attempt-1/value.payload");
+    let absolute: Path = root.parts().chain(relative.parts()).collect();
+    let empty_relative = Path::from("_blobs/ingest/attempt-1/empty.payload");
+    let empty_absolute: Path = root.parts().chain(empty_relative.parts()).collect();
     let payload = Bytes::from(vec![0x6D; 128 * 1024]);
-    let store = dataset.object_store(None).await.unwrap();
+    let store = dataset.object_store(base_id).await.unwrap();
     store
         .put_payload(&absolute, payload.clone().into())
         .await
@@ -1209,7 +1220,7 @@ async fn completed_blob_uploads_round_trip_through_nested_columns(
     let empty = sources.add_uploaded_blob(empty_relative, 0).unwrap();
     // The object would fail to resolve if either kind of null parent lost its validity.
     let ignored = sources
-        .add_uploaded_blob(Path::from("_blobs/functions/attempt-1/missing.payload"), 10)
+        .add_uploaded_blob(Path::from("_blobs/ingest/attempt-1/missing.payload"), 10)
         .unwrap();
     let mut replacement = BlobDescriptorArrayBuilder::for_field(&item).unwrap();
     replacement
@@ -1227,7 +1238,7 @@ async fn completed_blob_uploads_round_trip_through_nested_columns(
     let options = FileWriterOptions::default();
     let replacement = if parts {
         let target = DataFileTarget::new(
-            None,
+            base_id,
             Arc::new(dataset.schema().clone()),
             ConcreteFileVersion::V2_2,
         )
@@ -1279,16 +1290,20 @@ async fn completed_blob_uploads_round_trip_through_nested_columns(
         .column_by_name("blob_uri")
         .unwrap()
         .as_string::<i32>();
-    if managed {
+    let ids = descriptors
+        .column_by_name("blob_id")
+        .unwrap()
+        .as_primitive::<arrow_array::types::UInt32Type>();
+    if let Some(id) = base_id {
+        assert_eq!(kind.value(0), BlobKind::ManagedWithBase as u8);
+        assert_eq!(ids.value(0), id);
+        assert_eq!(uri.value(0), relative.as_ref());
+    } else if managed {
         assert_eq!(kind.value(0), BlobKind::Managed as u8);
         assert_eq!(uri.value(0), relative.as_ref());
     } else {
         assert_eq!(kind.value(0), BlobKind::Packed as u8);
         if parts {
-            let ids = descriptors
-                .column_by_name("blob_id")
-                .unwrap()
-                .as_primitive::<arrow_array::types::UInt32Type>();
             assert_eq!(ids.value(0), 99);
         }
     }

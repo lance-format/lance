@@ -998,9 +998,6 @@ fn blob_range(offset: u64, size: u64) -> Result<(BlobRange, u64)> {
     Ok((BlobRange { offset, size }, next_offset))
 }
 
-// Bound the request even for readers whose range stream buffers the entire range.
-const BLOB_COPY_RANGE_SIZE: usize = 8 * 1024 * 1024;
-
 /// Writes payload ranges into one object without choosing their addressing scheme.
 ///
 /// Each write takes ownership of the active upload so a partial failure or
@@ -1062,11 +1059,12 @@ impl BlobObjectWriter {
         &mut self,
         reader: &dyn Reader,
         range: Range<usize>,
+        max_request_size: usize,
     ) -> Result<BlobRange> {
         let (value, next_offset) = blob_range(self.offset, range.len() as u64)?;
         let mut writer = self.take_writer()?;
-        for start in (range.start..range.end).step_by(BLOB_COPY_RANGE_SIZE) {
-            let end = start.saturating_add(BLOB_COPY_RANGE_SIZE).min(range.end);
+        for start in (range.start..range.end).step_by(max_request_size) {
+            let end = start.saturating_add(max_request_size).min(range.end);
             let copied = writer.copy_range_from_reader(reader, start..end).await?;
             if copied != end - start {
                 return Err(Error::io(format!(
@@ -1391,8 +1389,11 @@ impl DedicatedBlobWriter {
         &mut self,
         reader: &dyn Reader,
         range: Range<usize>,
+        max_request_size: usize,
     ) -> Result<()> {
-        self.upload.write_blob_from_reader(reader, range).await?;
+        self.upload
+            .write_blob_from_reader(reader, range, max_request_size)
+            .await?;
         Ok(())
     }
 

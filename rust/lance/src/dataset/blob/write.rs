@@ -41,6 +41,8 @@ use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 pub(super) const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
+// Some Reader implementations buffer a whole requested range.
+const BLOB_SOURCE_MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
 /// The `_blobs/<uuid>.blob` payload objects a write created.
 ///
@@ -185,7 +187,11 @@ impl BlobPack {
             BlobWriteSource::Bytes(data) => self.writer.write_blob(data).await?,
             BlobWriteSource::Reader(source) => {
                 self.writer
-                    .write_blob_from_reader(source.reader.as_ref(), source.reader_range()?)
+                    .write_blob_from_reader(
+                        source.reader.as_ref(),
+                        source.reader_range()?,
+                        source.max_request_size,
+                    )
                     .await?
             }
         };
@@ -234,6 +240,7 @@ struct BlobReaderSource {
     reader: Box<dyn Reader>,
     start: u64,
     size: u64,
+    max_request_size: usize,
 }
 
 /// A blob payload source used by packed and dedicated writers.
@@ -511,7 +518,11 @@ impl BlobPreprocessor {
                 BlobWriteSource::Bytes(data) => writer.write_blob(data).await?,
                 BlobWriteSource::Reader(source) => {
                     writer
-                        .write_blob_from_reader(source.reader.as_ref(), source.reader_range()?)
+                        .write_blob_from_reader(
+                            source.reader.as_ref(),
+                            source.reader_range()?,
+                            source.max_request_size,
+                        )
                         .await?
                 }
             };
@@ -533,7 +544,11 @@ impl BlobPreprocessor {
             BlobWriteSource::Bytes(data) => writer.write(data).await?,
             BlobWriteSource::Reader(source) => {
                 writer
-                    .write_from_reader(source.reader.as_ref(), source.reader_range()?)
+                    .write_from_reader(
+                        source.reader.as_ref(),
+                        source.reader_range()?,
+                        source.max_request_size,
+                    )
                     .await?;
             }
         }
@@ -770,6 +785,7 @@ impl BlobPreprocessor {
             reader: store.open(&path).await?,
             start,
             size,
+            max_request_size: BLOB_SOURCE_MAX_REQUEST_SIZE,
         };
         if size > dedicated_threshold as u64 {
             self.write_dedicated(BlobWriteSource::Reader(&source)).await
@@ -851,6 +867,7 @@ impl BlobPreprocessor {
                             reader: source.store.open(&source.path).await?,
                             start: positions.value(row),
                             size: sizes.value(row),
+                            max_request_size: usize::MAX,
                         };
                         self.write_packed(pack_file_threshold, BlobWriteSource::Reader(&source))
                             .await?
@@ -976,6 +993,7 @@ impl BlobPreprocessor {
                     reader,
                     start: position,
                     size,
+                    max_request_size: usize::MAX,
                 })
             }
             (None, None) => {
@@ -984,6 +1002,7 @@ impl BlobPreprocessor {
                     reader,
                     start: 0,
                     size,
+                    max_request_size: usize::MAX,
                 })
             }
             _ => Err(Error::invalid_input(format!(
@@ -1947,13 +1966,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_external_blob_source_read_all_empty_range_returns_empty_bytes() {
+    async fn test_blob_reader_source_read_all_empty_range_returns_empty_bytes() {
         let store = reject_empty_range_store();
         let reader = store.open(&Path::from("blobs/test.bin")).await.unwrap();
-        let source = ExternalBlobSource {
+        let source = BlobReaderSource {
             reader,
             start: 0,
             size: 0,
+            max_request_size: usize::MAX,
         };
 
         assert!(source.read_all().await.unwrap().is_empty());
