@@ -3400,7 +3400,11 @@ async fn append_boundary_fragment(
                     .map(Ok::<RecordBatch, arrow_schema::ArrowError>),
                 boundary_schema(),
             ),
-            None,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: (positions.end - positions.start) as usize,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -3562,21 +3566,49 @@ async fn test_config_seed_boundary_matrix(
         assert_eq!(report.reused_records, 18, "{context}: {report:?}");
         assert_eq!(report.scanned_rows, 59, "{context}: {report:?}");
     } else {
-        // TODO(expectation): every 32-row seed record spans several 8-row
-        // index zones; whether such fragments are reported partial or
-        // scanned is not established by the existing tests.
-        assert!(
-            scanned.contains(&creating),
-            "{context}: the creating fragment is never reused: {report:?}"
+        // In this fixture every 32-row record crosses 8-row index zones and
+        // none fits, so each appended seed is rejected before any reuse is
+        // recorded and its fragment is scanned in full.
+        assert_eq!(
+            (seed_rows_per_zone, index_rows_per_zone, rows_per_fragment),
+            (32, 8, 64),
+            "{context}: expectation only derived for this shape"
         );
+        assert!(reused.is_empty(), "{context}: {report:?}");
+        assert!(partial.is_empty(), "{context}: {report:?}");
+        let mut all_fragments = appended.clone();
+        all_fragments.push(creating);
+        all_fragments.sort_unstable();
+        assert_eq!(scanned, all_fragments, "{context}: {report:?}");
+        assert_eq!(report.reused_records, 0, "{context}: {report:?}");
+        // The creating fragment's 11 rows plus three fully scanned 64-row
+        // fragments.
+        assert_eq!(report.scanned_rows, 203, "{context}: {report:?}");
     }
 
     // Positions at an index zone boundary inside the first appended fragment,
     // and just before and after the first boundary between appended fragments.
     let first_appended = BOUNDARY_CREATE_ROWS;
-    let zone_boundary = first_appended + (index_rows_per_zone as i64).min(rows_per_fragment);
-    let fragment_boundary = first_appended + rows_per_fragment;
-    let total_rows = BOUNDARY_CREATE_ROWS + BOUNDARY_APPENDED_FRAGMENTS * rows_per_fragment;
+    assert_boundary_predicates(
+        &dataset,
+        BOUNDARY_CREATE_ROWS + BOUNDARY_APPENDED_FRAGMENTS * rows_per_fragment,
+        first_appended + (index_rows_per_zone as i64).min(rows_per_fragment),
+        first_appended + rows_per_fragment,
+        &context,
+    )
+    .await;
+}
+
+/// Range, null and equality predicates around `zone_boundary` and
+/// `fragment_boundary` return the rows the generator yields for positions
+/// `0..total_rows`, with and without the scalar index.
+async fn assert_boundary_predicates(
+    dataset: &Dataset,
+    total_rows: i64,
+    zone_boundary: i64,
+    fragment_boundary: i64,
+    context: &str,
+) {
     let generated: BoundaryRows = (0..total_rows).map(|p| (p, boundary_value(p))).collect();
     let oracle = |keep: &dyn Fn(Option<i64>) -> bool| -> BoundaryRows {
         generated
@@ -3611,9 +3643,137 @@ async fn test_config_seed_boundary_matrix(
     }
 
     for (filter, expected) in cases {
-        let indexed = boundary_query(&dataset, &filter, true).await;
-        let unindexed = boundary_query(&dataset, &filter, false).await;
+        let indexed = boundary_query(dataset, &filter, true).await;
+        let unindexed = boundary_query(dataset, &filter, false).await;
         assert_eq!(unindexed, expected, "{context}: unindexed {filter}");
         assert_eq!(indexed, expected, "{context}: indexed {filter}");
     }
+}
+
+/// Configured seeds at production zone sizes serve a ZoneMap index over one
+/// appended fragment whose length no zone size divides. Seed records are
+/// `seed_rows_per_zone` rows from the fragment start with a short final
+/// record; with seed records no larger than index zones, a record is reused
+/// when it lies inside one index zone and scanned when it straddles an index
+/// zone boundary.
+#[rstest::rstest]
+#[case::small_seed_crosses_index_boundary(8192, 1_000_000, 1_050_000, 100_003)]
+#[case::equal_sizes_short_final_zone(1_000_000, 1_000_000, 1_050_000, 100_003)]
+#[case::equal_small_sizes(8192, 8192, 20_000, 4_099)]
+#[tokio::test]
+async fn test_config_seed_boundary_real_sizes(
+    #[case] seed_rows_per_zone: u64,
+    #[case] index_rows_per_zone: u64,
+    #[case] rows_per_fragment: i64,
+    #[case] batch_size: i64,
+) {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let context = format!(
+        "seed {seed_rows_per_zone}, index {index_rows_per_zone}, \
+         fragment {rows_per_fragment}, batch {batch_size}"
+    );
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(
+            [Ok(boundary_rows(0..BOUNDARY_CREATE_ROWS))],
+            boundary_schema(),
+        ),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let creating = dataset.fragments()[0].id;
+    enable_zone_write_seeds(&mut dataset, seed_rows_per_zone).await;
+    let first_appended = BOUNDARY_CREATE_ROWS;
+    append_boundary_fragment(
+        &mut dataset,
+        first_appended..first_appended + rows_per_fragment,
+        batch_size,
+    )
+    .await;
+    let fragments = dataset.fragments().clone();
+    assert_eq!(fragments.len(), 2, "{context}");
+    let appended = fragments[1].id;
+    assert_eq!(
+        seed_locator_rows_per_zone(&dataset, &fragments[1], "val").await,
+        Some(seed_rows_per_zone),
+        "{context}"
+    );
+
+    // Expected reuse, computed from the sizes alone.
+    let seed = seed_rows_per_zone as i64;
+    let index = index_rows_per_zone as i64;
+    assert!(
+        seed <= index,
+        "{context}: expectation assumes seed <= index"
+    );
+    let records: Vec<(i64, i64)> = (0..rows_per_fragment)
+        .step_by(seed as usize)
+        .map(|start| (start, (start + seed).min(rows_per_fragment)))
+        .collect();
+    let crossing: Vec<&(i64, i64)> = records
+        .iter()
+        .filter(|(start, end)| start / index != (end - 1) / index)
+        .collect();
+    let expected_reused_records = (records.len() - crossing.len()) as i64;
+    let expected_scanned_rows =
+        BOUNDARY_CREATE_ROWS + crossing.iter().map(|(start, end)| end - start).sum::<i64>();
+
+    let params = config_seed_index_params(index_rows_per_zone);
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{context}: {reports:?}");
+    let report = &reports[0];
+    let mut scanned = report.scanned_fragments.clone();
+    scanned.sort_unstable();
+    if crossing.is_empty() {
+        assert_eq!(
+            report.reused_fragments,
+            vec![appended],
+            "{context}: {report:?}"
+        );
+        assert!(report.partial_fragments.is_empty(), "{context}: {report:?}");
+        assert_eq!(scanned, vec![creating], "{context}: {report:?}");
+    } else {
+        // A partly reused fragment is listed as both partial and scanned.
+        assert!(report.reused_fragments.is_empty(), "{context}: {report:?}");
+        assert_eq!(
+            report.partial_fragments,
+            vec![appended],
+            "{context}: {report:?}"
+        );
+        let mut all_fragments = vec![creating, appended];
+        all_fragments.sort_unstable();
+        assert_eq!(scanned, all_fragments, "{context}: {report:?}");
+    }
+    assert_eq!(
+        report.reused_records,
+        expected_reused_records.try_into().unwrap(),
+        "{context}: {report:?}"
+    );
+    assert_eq!(
+        report.scanned_rows,
+        expected_scanned_rows.try_into().unwrap(),
+        "{context}: {report:?}"
+    );
+
+    // With a single appended fragment the fragment boundary is the one
+    // between the creating fragment and the appended fragment.
+    assert_boundary_predicates(
+        &dataset,
+        BOUNDARY_CREATE_ROWS + rows_per_fragment,
+        first_appended + index.min(rows_per_fragment),
+        first_appended,
+        &context,
+    )
+    .await;
 }
