@@ -1863,6 +1863,10 @@ impl PreFilter for SegmentPreFilter {
         self.base.is_empty()
     }
 
+    fn deletions_only(&self) -> bool {
+        self.base.only_deletions()
+    }
+
     fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
         self.base.is_empty() && self.ownership_mask.selects_all(rows)
     }

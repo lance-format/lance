@@ -33,7 +33,7 @@ use super::{
     HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
 };
 use crate::metrics::MetricsCollector;
-use crate::prefilter::PreFilter;
+use crate::prefilter::{PreFilter, sample_blocked_share};
 use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
@@ -47,6 +47,14 @@ use crate::vector::graph::{
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{ApproxMode, Query, RqGraphScoring, VECTOR_RESULT_SCHEMA};
+
+/// Rows [`HNSW::search_past_deletions`] samples to size its over-fetch.
+const DELETION_SAMPLES: usize = 64;
+/// Above this sampled share of deleted rows the over-fetch costs more than
+/// applying the mask during traversal.
+const MAX_DELETED_SHARE: f64 = 0.75;
+/// Candidates fetched beyond the sampled estimate, to absorb its error.
+const MIN_DELETION_OVERFETCH: usize = 8;
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
@@ -457,6 +465,53 @@ impl HNSW {
     }
 
     /// Returns the top-`k` results and the number of distances computed.
+    /// Searches unfiltered and applies a deletions-only mask to the candidates,
+    /// instead of walking every row of the partition to build a bitset first.
+    /// Returns no results unless they are as complete as the masked search's:
+    /// `top_k` survivors, or every row the graph could reach.
+    fn search_past_deletions(
+        &self,
+        query: &ArrayRef,
+        k: usize,
+        top_k: usize,
+        params: &HnswQueryParams,
+        storage: &impl VectorStore,
+        prefilter: &dyn PreFilter,
+    ) -> Result<(Option<Vec<OrderedNode>>, usize)> {
+        // A range bound can leave the beam short for reasons other than an
+        // exhausted graph, so completeness cannot be told from its length.
+        if params.lower_bound.is_some() || params.upper_bound.is_some() {
+            return Ok((None, 0));
+        }
+        let mask = prefilter.mask();
+        let deleted_share = sample_blocked_share(&mask, storage.len(), DELETION_SAMPLES, |id| {
+            storage.row_id(id)
+        });
+        if deleted_share > MAX_DELETED_SHARE {
+            return Ok((None, 0));
+        }
+        // Widen the beam so that about `ef` of its candidates survive the mask,
+        // as they would if the mask were applied during traversal.
+        let widen = 1.0 / (1.0 - deleted_share);
+        let beam = HnswQueryParams {
+            ef: (params.ef as f64 * widen).ceil() as usize,
+            ..*params
+        };
+        let fetch = (k as f64 * widen).ceil() as usize + MIN_DELETION_OVERFETCH;
+        let (mut results, comparisons) =
+            self.search_basic(query.clone(), fetch, &beam, None, storage)?;
+        let found = results.len();
+        results.retain(|node| mask.selected(storage.row_id(node.id)));
+        let exhausted = found < fetch.min(beam.ef);
+        // The sample undershot if the mask took over a quarter of the
+        // candidates the search was sized to keep.
+        let is_thinned = results.len() * 4 < k.min(found) * 3;
+        if (results.len() < top_k && !exhausted) || is_thinned {
+            return Ok((None, comparisons));
+        }
+        Ok((Some(results), comparisons))
+    }
+
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
     pub fn search_basic(
         &self,
@@ -1785,7 +1840,15 @@ impl IvfSubIndex for HNSW {
         let rerank_query = query.clone();
         // A reranking search keeps `ef` candidates on every path for `VectorStore::rerank`.
         let (top_k, k) = (k, if params.reranks() { params.ef } else { k });
-        let (mut results, comparisons) = if prefilter.is_empty() {
+        let (past_deletions, deletion_comparisons) =
+            if !prefilter.is_empty() && prefilter.deletions_only() {
+                self.search_past_deletions(&query, k, top_k, &params, storage, prefilter.as_ref())?
+            } else {
+                (None, 0)
+            };
+        let (mut results, comparisons) = if let Some(results) = past_deletions {
+            (results, 0)
+        } else if prefilter.is_empty() {
             self.search_basic(query, k, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
@@ -1823,7 +1886,7 @@ impl IvfSubIndex for HNSW {
                 self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
             }
         };
-        metrics.record_comparisons(comparisons);
+        metrics.record_comparisons(deletion_comparisons + comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
         if params.reranks() && storage.rerank(rerank_query, params.dist_q_c, &mut results) {
@@ -2010,7 +2073,7 @@ mod tests {
         ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
-    use crate::prefilter::{NoFilter, PreFilter};
+    use crate::prefilter::{NoFilter, PreFilter, sample_blocked_share};
     use crate::vector::Query;
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
@@ -2036,6 +2099,8 @@ mod tests {
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,
+        deletions_only: bool,
+        row_id_scans: AtomicUsize,
     }
 
     #[async_trait]
@@ -2052,7 +2117,12 @@ mod tests {
             self.mask.clone()
         }
 
+        fn deletions_only(&self) -> bool {
+            self.deletions_only
+        }
+
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.row_id_scans.fetch_add(1, Ordering::Relaxed);
             self.mask.selected_indices(row_ids)
         }
     }
@@ -2893,6 +2963,16 @@ mod tests {
             mask: Arc::new(lance_select::RowAddrMask::from_allowed(
                 lance_select::RowAddrTreeMap::from_iter(allowed),
             )),
+            deletions_only: false,
+            row_id_scans: AtomicUsize::new(0),
+        })
+    }
+
+    fn deletion_prefilter(deleted: Vec<u64>) -> Arc<MaskPreFilter> {
+        Arc::new(MaskPreFilter {
+            mask: Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter(deleted))),
+            deletions_only: true,
+            row_id_scans: AtomicUsize::new(0),
         })
     }
 
@@ -3118,6 +3198,8 @@ mod tests {
                 mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
                     allowed,
                 ))),
+                deletions_only: false,
+                row_id_scans: AtomicUsize::new(0),
             });
             let batch = hnsw
                 .search(
@@ -3146,6 +3228,30 @@ mod tests {
         // the graph. Both must include the lower bound and exclude the upper.
         assert_eq!(search_row_ids(vec![0, 1, 2]), vec![0]);
         assert_eq!(search_row_ids((0..60).collect()), vec![0]);
+
+        // A deletions-only mask is not searched past under a range bound: a
+        // short beam there does not mean the graph is exhausted.
+        let filter = deletion_prefilter(vec![5]);
+        let batch = hnsw
+            .search(
+                query.clone(),
+                10,
+                HnswQueryParams {
+                    ef: TOTAL,
+                    lower_bound: Some(0.0),
+                    upper_bound: Some(1.0),
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                    rq_graph_scoring: Default::default(),
+                },
+                store.as_ref(),
+                filter.clone(),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let row_ids = batch[lance_core::ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        assert_eq!(row_ids.values().to_vec(), vec![0]);
+        assert_eq!(filter.row_id_scans.load(Ordering::Relaxed), 1);
     }
 
     /// Every dispatch path reports exactly the distances it computed: the
@@ -3227,6 +3333,142 @@ mod tests {
         for use_acorn in [false, true] {
             reported(masked_prefilter(dense.clone()), use_acorn);
         }
+
+        // Deletions-only masks. Sparse deletions are searched past. Deleting the
+        // query's nearest rows misleads the sample, so that search is abandoned
+        // for the masked traversal and both are reported.
+        let sparse: Vec<u64> = (0..TOTAL as u64).step_by(200).collect();
+        reported(deletion_prefilter(sparse), false);
+        let nearest = brute_force_topk_masked(&counting.inner, query_key.clone(), 60, |_| true);
+        let nearest: Vec<u64> = nearest.into_iter().map(u64::from).collect();
+        let rest: Vec<u64> = (0..TOTAL as u64)
+            .filter(|id| !nearest.contains(id))
+            .collect();
+        assert!(
+            reported(deletion_prefilter(nearest), false) > reported(masked_prefilter(rest), false)
+        );
+    }
+
+    /// Deleting candidates the sample misses must not shorten the result: the
+    /// speculative search is abandoned for the masked one, which returns `k`.
+    #[rstest]
+    #[case::ef_equals_k(10, 1)]
+    #[case::larger_ef(50, 9)]
+    fn test_deletion_sample_miss_keeps_k(#[case] ef: usize, #[case] deleted_count: usize) {
+        const TOTAL: usize = 1024;
+        const DIM: usize = 32;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
+        )
+        .unwrap();
+        let query = fsl.value(0);
+        let params = HnswQueryParams {
+            ef,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+            rq_graph_scoring: Default::default(),
+        };
+        let sampled: Vec<u64> = (0..64_u64)
+            .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % TOTAL as u64)
+            .collect();
+        let (candidates, _) = hnsw
+            .search_basic(query.clone(), 18, &params, None, &store)
+            .unwrap();
+        let deleted: Vec<u64> = candidates
+            .iter()
+            .map(|node| store.row_id(node.id))
+            .filter(|id| !sampled.contains(id))
+            .take(deleted_count)
+            .collect();
+        assert_eq!(deleted.len(), deleted_count);
+        let filter = deletion_prefilter(deleted.clone());
+        let share = sample_blocked_share(&filter.mask(), TOTAL, 64, |id| store.row_id(id));
+        assert_eq!(share, 0.0);
+
+        let batch = hnsw
+            .search(
+                query,
+                10,
+                params,
+                &store,
+                filter.clone(),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(batch.num_rows(), 10);
+        let row_ids = batch[lance_core::ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values();
+        assert!(row_ids.iter().all(|id| !deleted.contains(id)));
+        assert_eq!(filter.row_id_scans.load(Ordering::Relaxed), 1);
+    }
+
+    /// A deletions-only mask is checked on the candidates of an unfiltered
+    /// search whose beam is widened by the sampled share of deleted rows. Only
+    /// dense deletions fall back to scanning the partition's row ids. The
+    /// query is row 0, itself deleted in the sparse and moderate cases.
+    #[rstest]
+    #[case::sparse(|id| id % 200 != 0, 0)]
+    #[case::moderate(|id| id % 10 >= 3, 0)]
+    #[case::dense(|id| id % 8 == 7, 1)]
+    fn test_search_past_deletions(#[case] passes: fn(u32) -> bool, #[case] row_id_scans: usize) {
+        const DIM: usize = 32;
+        const TOTAL: usize = 1024;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
+        )
+        .unwrap();
+        let k = 10;
+        let query = fsl.value(0);
+        let filter =
+            deletion_prefilter((0..TOTAL as u64).filter(|id| !passes(*id as u32)).collect());
+
+        let batch = hnsw
+            .search(
+                query.clone(),
+                k,
+                HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                    rq_graph_scoring: Default::default(),
+                },
+                &store,
+                filter.clone(),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        let row_ids = batch[lance_core::ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values();
+        assert_eq!(row_ids.len(), k);
+        assert!(row_ids.iter().all(|id| passes(*id as u32)));
+        let truth = brute_force_topk_masked(&store, query, k, passes);
+        let hits = row_ids
+            .iter()
+            .filter(|id| truth.contains(&(**id as u32)))
+            .count();
+        assert!(hits * 2 >= k, "recall {hits}/{k} below 0.5");
+        assert_eq!(filter.row_id_scans.load(Ordering::Relaxed), row_id_scans);
     }
 
     /// When ACORN under-delivers, the query re-runs the basic traversal and the
