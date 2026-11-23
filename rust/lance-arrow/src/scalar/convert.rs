@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::*;
 use half::f16;
 
-use crate::ArrowScalar;
+use super::ArrowScalar;
 
 macro_rules! impl_from_primitive {
     ($native_ty:ty, $array_ty:ty) => {
