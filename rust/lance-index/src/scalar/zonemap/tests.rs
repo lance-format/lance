@@ -6806,3 +6806,119 @@ fn test_seed_writer_without_positions_writes_counts_only() {
     let nulls: Vec<u32> = records.iter().map(|r| r.null_count).collect();
     assert_eq!(nulls, vec![2, 1, 1]);
 }
+
+fn fixed_size_binary_scalar(value: [u8; 16]) -> ScalarValue {
+    ScalarValue::FixedSizeBinary(16, Some(value.to_vec()))
+}
+
+/// A FixedSizeBinary column gets real per-zone bounds in unsigned byte order,
+/// so equality and range queries prune zones instead of keeping all of them.
+#[tokio::test]
+async fn test_fixed_size_binary_zonemap_prunes() {
+    let data_type = DataType::FixedSizeBinary(16);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(VALUE_COLUMN_NAME, data_type.clone(), true),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
+    ]));
+    // Two rows per zone: [0x01.., 0x02..], [0x05.., null], [0x09.., 0x08..].
+    let values: Vec<Option<[u8; 16]>> = vec![
+        Some([0x02; 16]),
+        Some([0x01; 16]),
+        Some([0x05; 16]),
+        None,
+        Some([0x09; 16]),
+        Some([0x08; 16]),
+    ];
+    let column: arrow_array::ArrayRef = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            values.iter().copied(),
+            16,
+        )
+        .unwrap(),
+    );
+    let row_addr: arrow_array::ArrayRef =
+        Arc::new(UInt64Array::from_iter_values(0..values.len() as u64));
+    let batch = RecordBatch::try_new(schema.clone(), vec![column, row_addr]).unwrap();
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream::once(std::future::ready(Ok(batch))),
+    ));
+
+    let tmpdir = TempObjDir::default();
+    let test_store = local_store(&tmpdir);
+    ZoneMapIndexPlugin::train_zonemap_index(
+        stream,
+        test_store.as_ref(),
+        Some(ZoneMapIndexBuilderParams::new(2)),
+        &NoopIndexBuildProgress,
+    )
+    .await
+    .unwrap();
+    let index = ZoneMapIndex::load(
+        test_store.clone(),
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(index.zones.len(), 3);
+    let bounds: Vec<(ScalarValue, ScalarValue)> = index
+        .zones
+        .iter()
+        .map(|zone| (zone.min.clone(), zone.max.clone()))
+        .collect();
+    assert_eq!(
+        bounds,
+        vec![
+            (
+                fixed_size_binary_scalar([0x01; 16]),
+                fixed_size_binary_scalar([0x02; 16])
+            ),
+            (
+                fixed_size_binary_scalar([0x05; 16]),
+                fixed_size_binary_scalar([0x05; 16])
+            ),
+            (
+                fixed_size_binary_scalar([0x08; 16]),
+                fixed_size_binary_scalar([0x09; 16])
+            ),
+        ]
+    );
+    assert_eq!(index.zones[1].null_count, 1);
+
+    let matching_zones = |query: SargableQuery| -> Vec<usize> {
+        index
+            .zones
+            .iter()
+            .enumerate()
+            .filter(|(_, zone)| index.evaluate_zone_against_query(zone, &query).unwrap())
+            .map(|(i, _)| i)
+            .collect()
+    };
+    assert_eq!(
+        matching_zones(SargableQuery::Equals(fixed_size_binary_scalar([0x05; 16]))),
+        vec![1]
+    );
+    assert_eq!(
+        matching_zones(SargableQuery::Equals(fixed_size_binary_scalar([0x03; 16]))),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        matching_zones(SargableQuery::Range(
+            Bound::Excluded(fixed_size_binary_scalar([0x05; 16])),
+            Bound::Unbounded,
+        )),
+        vec![2]
+    );
+    assert_eq!(
+        matching_zones(SargableQuery::IsIn(vec![
+            fixed_size_binary_scalar([0x01; 16]),
+            fixed_size_binary_scalar([0x09; 16]),
+        ])),
+        vec![0, 2]
+    );
+    assert_eq!(matching_zones(SargableQuery::IsNull()), vec![1]);
+}

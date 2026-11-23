@@ -39,6 +39,8 @@
 //! String & binary types are supported.  Binary comparison will be used for string types to calculate the min and the
 //! max.  This works for ASCII but may be surprising for special characters.  For example, "é" would sort after "z".
 //!
+//! Fixed-size binary is supported with the same unsigned lexicographic byte order as binary.
+//!
 //! In addition, string view and binary view types are supported.
 //!
 //! # Unsupported Types
@@ -413,8 +415,8 @@ macro_rules! find_extrema_float {
 }
 
 macro_rules! find_extrema_bytes {
-    ($array:expr, $cast:ident :: < $offset:ty >) => {{
-        let typed = $array.$cast::<$offset>();
+    (@typed $typed:expr) => {{
+        let typed = $typed;
         let mut min_idx: Option<usize> = None;
         let mut max_idx: Option<usize> = None;
         let mut min_val = None;
@@ -435,6 +437,12 @@ macro_rules! find_extrema_bytes {
         }
         (min_idx, max_idx)
     }};
+    ($array:expr, $cast:ident :: < $offset:ty >) => {
+        find_extrema_bytes!(@typed $array.$cast::<$offset>())
+    };
+    ($array:expr, $cast:ident) => {
+        find_extrema_bytes!(@typed $array.$cast())
+    };
 }
 
 fn find_min_max(array: &ArrayRef) -> Result<(Option<ArrowScalar>, Option<ArrowScalar>)> {
@@ -544,6 +552,9 @@ fn find_min_max_indices(array: &ArrayRef) -> Result<(Option<usize>, Option<usize
         // Binary types
         Binary => find_extrema_bytes!(array, as_binary::<i32>),
         LargeBinary => find_extrema_bytes!(array, as_binary::<i64>),
+        // Unsigned lexicographic byte order, matching the FixedSizeBinary arm
+        // of `arrow_ord::ord::make_comparator`.
+        FixedSizeBinary(_) => find_extrema_bytes!(array, as_fixed_size_binary),
 
         // For unsupported types we skip min/max (and nan_count).
         // null_count and buffer_memory are already tracked above.
@@ -780,6 +791,77 @@ mod tests {
         let stats = acc.finish();
         assert_eq!(format!("{}", stats.min.unwrap()), "false");
         assert_eq!(format!("{}", stats.max.unwrap()), "true");
+    }
+
+    fn fixed_size_binary(values: &[Option<[u8; 16]>]) -> ArrayRef {
+        Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.iter().copied(), 16)
+                .unwrap(),
+        )
+    }
+
+    fn fixed_size_binary_value(scalar: &ArrowScalar) -> Vec<u8> {
+        scalar.as_array().as_fixed_size_binary().value(0).to_vec()
+    }
+
+    /// Fixed-size binary orders by unsigned bytes, first byte most significant.
+    #[test]
+    fn test_fixed_size_binary_stats_with_nulls() {
+        let mut low = [0xFF; 16];
+        low[0] = 0x01;
+        let mut high = [0x00; 16];
+        high[0] = 0x80;
+        let mid = [0x10; 16];
+        let array = fixed_size_binary(&[Some(mid), None, Some(high), Some(low), None]);
+        let mut acc = StatisticsAccumulator::new(&DataType::FixedSizeBinary(16));
+        acc.update(&array).unwrap();
+        let stats = acc.finish();
+        let min = stats.min.unwrap();
+        let max = stats.max.unwrap();
+        assert_eq!(min.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(fixed_size_binary_value(&min), low.to_vec());
+        assert_eq!(fixed_size_binary_value(&max), high.to_vec());
+        assert_eq!(stats.null_count, 2);
+        assert_eq!(stats.nan_count, None);
+    }
+
+    #[test]
+    fn test_fixed_size_binary_all_nulls() {
+        let array = fixed_size_binary(&[None, None, None]);
+        let mut acc = StatisticsAccumulator::new(&DataType::FixedSizeBinary(16));
+        acc.update(&array).unwrap();
+        let stats = acc.finish();
+        assert!(stats.min.is_none());
+        assert!(stats.max.is_none());
+        assert_eq!(stats.null_count, 3);
+    }
+
+    #[test]
+    fn test_fixed_size_binary_multiple_updates_and_merge() {
+        let mut acc = StatisticsAccumulator::new(&DataType::FixedSizeBinary(16));
+        acc.update(&fixed_size_binary(&[Some([0x20; 16]), None]))
+            .unwrap();
+        acc.update(&fixed_size_binary(&[Some([0x05; 16]), Some([0x30; 16])]))
+            .unwrap();
+        let before_merge = acc.statistics();
+        assert_eq!(
+            fixed_size_binary_value(before_merge.min.as_ref().unwrap()),
+            vec![0x05; 16]
+        );
+        assert_eq!(
+            fixed_size_binary_value(before_merge.max.as_ref().unwrap()),
+            vec![0x30; 16]
+        );
+
+        let mut other = StatisticsAccumulator::new(&DataType::FixedSizeBinary(16));
+        other
+            .update(&fixed_size_binary(&[Some([0xF0; 16]), None]))
+            .unwrap();
+        acc.merge(&other).unwrap();
+        let stats = acc.finish();
+        assert_eq!(fixed_size_binary_value(&stats.min.unwrap()), vec![0x05; 16]);
+        assert_eq!(fixed_size_binary_value(&stats.max.unwrap()), vec![0xF0; 16]);
+        assert_eq!(stats.null_count, 2);
     }
 
     #[rstest]
