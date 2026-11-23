@@ -3906,3 +3906,225 @@ async fn test_config_seed_boundary_real_sizes(
     )
     .await;
 }
+
+/// One stored or expected zone of the ZoneMap index on `col`; `min` and `max`
+/// are one-element arrays of the column's type.
+#[derive(Debug, PartialEq)]
+struct TypedZone {
+    fragment_id: u64,
+    zone_start: u64,
+    zone_length: u64,
+    null_count: u32,
+    nan_count: u32,
+    min: ArrayRef,
+    max: ArrayRef,
+}
+
+/// The boundary shape where reused and scanned seed records mix (seed zones
+/// of 8 rows, index zones of 20, 64-row fragments written in 13-row batches),
+/// for each type family and both null-bitmap settings of the index. Stored
+/// zone statistics equal those computed from the generated arrays, and
+/// indexed filters match a scan.
+#[rstest::rstest]
+#[case::int32(DataType::Int32, INT_FILTERS)]
+#[case::float64(DataType::Float64, FLOAT_FILTERS)]
+#[case::utf8(DataType::Utf8, STRING_FILTERS)]
+#[case::timestamp_ms(
+    DataType::Timestamp(TimeUnit::Millisecond, None),
+    &["col >= TIMESTAMP '2023-11-14 22:13:50'"]
+)]
+#[case::boolean(DataType::Boolean, &["col = true"])]
+#[case::decimal128(DataType::Decimal128(38, 4), &["col >= 30"])]
+#[tokio::test]
+async fn test_config_seed_boundary_per_type(
+    #[case] data_type: DataType,
+    #[case] filters: &'static [&'static str],
+    #[values(false, true)] index_store_null_bitmap: bool,
+) {
+    use arrow::array::{AsArray, BooleanArray, new_null_array};
+    use arrow::datatypes::{Float64Type, UInt32Type, UInt64Type};
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
+
+    use crate::dataset::index::LanceIndexStoreExt;
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    const SEED_ROWS_PER_ZONE: u64 = 8;
+    const INDEX_ROWS_PER_ZONE: usize = 20;
+    const CREATE_ROWS: i64 = 11;
+    const APPENDED_FRAGMENTS: i64 = 2;
+    const FRAGMENT_ROWS: i64 = 64;
+    const BATCH_ROWS: i64 = 13;
+
+    let context = format!("{data_type}, index store_null_bitmap {index_store_null_bitmap}");
+    let dir = TempStrDir::default();
+    let schema = typed_schema(&data_type);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(typed_rows(&data_type, 0..CREATE_ROWS))], schema.clone()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let creating = dataset.fragments()[0].id;
+    enable_zone_write_seeds(&mut dataset, SEED_ROWS_PER_ZONE).await;
+    let mut fragment_ranges = vec![(creating, 0..CREATE_ROWS)];
+    for k in 0..APPENDED_FRAGMENTS {
+        let start = CREATE_ROWS + k * FRAGMENT_ROWS;
+        let end = start + FRAGMENT_ROWS;
+        let batches: Vec<RecordBatch> = (start..end)
+            .step_by(BATCH_ROWS as usize)
+            .map(|b| typed_rows(&data_type, b..(b + BATCH_ROWS).min(end)))
+            .collect();
+        dataset
+            .append(
+                RecordBatchIterator::new(
+                    batches
+                        .into_iter()
+                        .map(Ok::<RecordBatch, arrow_schema::ArrowError>),
+                    schema.clone(),
+                ),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: FRAGMENT_ROWS as usize,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        fragment_ranges.push((dataset.fragments().last().unwrap().id, start..end));
+    }
+    assert_eq!(
+        dataset.fragments().len(),
+        fragment_ranges.len(),
+        "{context}"
+    );
+    let mut appended: Vec<u64> = fragment_ranges[1..].iter().map(|(id, _)| *id).collect();
+    appended.sort_unstable();
+    let mut all_fragments = appended.clone();
+    all_fragments.push(creating);
+    all_fragments.sort_unstable();
+
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": INDEX_ROWS_PER_ZONE,
+            "use_seeds": true,
+            "store_null_bitmap": index_store_null_bitmap,
+        }));
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["col"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{context}: {reports:?}");
+    let report = &reports[0];
+    let sorted = |ids: &[u64]| {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    // Per 64-row fragment, the 8-row records [16,24) and [56,64) cross an
+    // index zone boundary and are scanned; the other six are reused.
+    assert!(report.reused_fragments.is_empty(), "{context}: {report:?}");
+    assert_eq!(
+        sorted(&report.partial_fragments),
+        appended,
+        "{context}: {report:?}"
+    );
+    assert_eq!(
+        sorted(&report.scanned_fragments),
+        all_fragments,
+        "{context}: {report:?}"
+    );
+    assert_eq!(report.reused_records, 12, "{context}: {report:?}");
+    assert_eq!(report.scanned_rows, 11 + 2 * 16, "{context}: {report:?}");
+
+    let col = field_id(&dataset, "col");
+    let indices = dataset.load_indices().await.unwrap();
+    let mut batches = Vec::new();
+    let mut stored: Vec<TypedZone> = Vec::new();
+    for segment in indices.iter().filter(|index| index.fields == vec![col]) {
+        let store = LanceIndexStore::from_dataset_for_existing(&dataset, segment)
+            .await
+            .unwrap();
+        let version = ZoneMapIndexVersion::from_metadata(segment.index_version as u32).unwrap();
+        let batch = ZoneMapIndex::load_zone_statistics(&store, version)
+            .await
+            .unwrap();
+        let null_count = batch["null_count"].as_primitive::<UInt32Type>();
+        let nan_count = batch["nan_count"].as_primitive::<UInt32Type>();
+        let fragment_id = batch["fragment_id"].as_primitive::<UInt64Type>();
+        let zone_start = batch["zone_start"].as_primitive::<UInt64Type>();
+        let zone_length = batch["zone_length"].as_primitive::<UInt64Type>();
+        for row in 0..batch.num_rows() {
+            stored.push(TypedZone {
+                fragment_id: fragment_id.value(row),
+                zone_start: zone_start.value(row),
+                zone_length: zone_length.value(row),
+                null_count: null_count.value(row),
+                nan_count: nan_count.value(row),
+                min: batch["min"].slice(row, 1),
+                max: batch["max"].slice(row, 1),
+            });
+        }
+        batches.push(batch);
+    }
+    assert!(!batches.is_empty(), "{context}: no index on col");
+    stored.sort_unstable_by_key(|zone| (zone.fragment_id, zone.zone_start));
+
+    // Min and max exclude nulls and NaN; the rest is ordered by Arrow's sort,
+    // which orders floats totally.
+    let mut expected: Vec<TypedZone> = Vec::new();
+    for (fragment_id, positions) in &fragment_ranges {
+        let column = typed_column(&data_type, positions.clone());
+        let mut offset = 0;
+        while offset < column.len() {
+            let length = INDEX_ROWS_PER_ZONE.min(column.len() - offset);
+            let zone = column.slice(offset, length);
+            let floats = zone.as_primitive_opt::<Float64Type>();
+            let is_nan =
+                |row: usize| floats.is_some_and(|f| f.is_valid(row) && f.value(row).is_nan());
+            let keep: Vec<bool> = (0..length)
+                .map(|row| zone.is_valid(row) && !is_nan(row))
+                .collect();
+            let values = arrow::compute::filter(zone.as_ref(), &BooleanArray::from(keep)).unwrap();
+            let (min, max) = if values.is_empty() {
+                (new_null_array(&data_type, 1), new_null_array(&data_type, 1))
+            } else {
+                let order = arrow::compute::sort_to_indices(values.as_ref(), None, None).unwrap();
+                let ordered = arrow::compute::take(values.as_ref(), &order, None).unwrap();
+                (ordered.slice(0, 1), ordered.slice(ordered.len() - 1, 1))
+            };
+            expected.push(TypedZone {
+                fragment_id: *fragment_id,
+                zone_start: offset as u64,
+                zone_length: length as u64,
+                null_count: zone.null_count() as u32,
+                nan_count: (0..length).filter(|row| is_nan(*row)).count() as u32,
+                min,
+                max,
+            });
+            offset += length;
+        }
+    }
+
+    assert_eq!(
+        stored.len(),
+        expected.len(),
+        "{context}: zone count, stored {batches:?}"
+    );
+    for (stored, expected) in stored.iter().zip(&expected) {
+        assert_eq!(
+            stored, expected,
+            "{context}: zone {expected:?}, stored {stored:?} in {batches:?}"
+        );
+    }
+
+    let mut all_filters: Vec<&str> = filters.to_vec();
+    all_filters.extend(["col IS NULL", "col IS NOT NULL"]);
+    assert_indexed_ids_match_scan(&dataset, &all_filters, &context).await;
+}
