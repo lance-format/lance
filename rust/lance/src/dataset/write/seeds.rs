@@ -20,20 +20,25 @@
 //! asks for them ([`ZoneWriteSeedsConfig`]):
 //!
 //! - `lance.zone_write_seeds.enabled`: `"true"` collects a zone map seed for
-//!   every top-level column of a supported scalar type that no seeded
+//!   every top-level column of a candidate scalar type that no seeded
 //!   ZoneMap index covers, so a ZoneMap index created later can be built
 //!   from seeds instead of scanning. Nested, vector, dictionary, view,
 //!   extension and blob columns are never seeded by the config. Absent
-//!   or `"false"` disables this; any other value is treated as disabled with
-//!   a warning.
+//!   or `"false"` disables this.
 //! - `lance.zone_write_seeds.rows_per_zone`: rows per seed zone for those
-//!   columns, a positive integer. Absent, zero or unparsable values use
-//!   [`ROWS_PER_ZONE_DEFAULT`] (the latter two with a warning).
+//!   columns, an integer in `1..=u32::MAX`. Absent, it is
+//!   [`ROWS_PER_ZONE_DEFAULT`].
+//!
+//! Setting either key to an invalid value, or any other key under
+//! `lance.zone_write_seeds.`, is rejected by the commit that sets it.
 //!
 //! A column with a seeded ZoneMap index keeps following that index's
-//! `rows_per_zone`. Enable the setting with [`Dataset::update_config`]; the
-//! commit that sets it also sets the seed feature flags, and writes based on
-//! later versions embed the seeds.
+//! `rows_per_zone`. When a seeded index's requirements cannot be resolved
+//! for a file (its details or stored null-bitmap policy cannot be read), the
+//! column falls back to the configured seed if the setting is on. Enable the
+//! setting with [`Dataset::update_config`]; the commit that sets it also sets
+//! the seed feature flags, and writes based on later versions embed the
+//! seeds.
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,6 +50,9 @@ use lance_file::version::ConcreteFileVersion;
 use lance_index::pbold;
 use lance_index::scalar::seed::IndexSeedWriter;
 use lance_index::scalar::zonemap::{ROWS_PER_ZONE_DEFAULT, ZoneMapSeedWriter};
+pub use lance_table::feature_flags::{
+    ZONE_WRITE_SEEDS_ENABLED_KEY, ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY,
+};
 use lance_table::format::{IndexMetadata, Manifest};
 
 use super::GenericWriter;
@@ -57,12 +65,6 @@ use crate::index::{loading::load_all_indices, segment::index_is_usable};
 /// reported once per process and at debug level afterwards.
 static SEED_CONFLICT_WARNED: std::sync::Once = std::sync::Once::new();
 
-/// Dataset config key that enables zone map seeds for columns without a
-/// seeded ZoneMap index (`"true"` / `"false"`).
-pub const ZONE_WRITE_SEEDS_ENABLED_KEY: &str = "lance.zone_write_seeds.enabled";
-/// Dataset config key for the rows per seed zone of those columns.
-pub const ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY: &str = "lance.zone_write_seeds.rows_per_zone";
-
 /// The dataset-level zone write seed setting, parsed from the dataset config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneWriteSeedsConfig {
@@ -73,9 +75,12 @@ pub struct ZoneWriteSeedsConfig {
 impl ZoneWriteSeedsConfig {
     /// The setting in `config`, or `None` when it is disabled.
     ///
-    /// Invalid values never fail a write: an unparsable `enabled` disables
-    /// the setting and an invalid `rows_per_zone` falls back to
-    /// [`ROWS_PER_ZONE_DEFAULT`], both with a warning.
+    /// Values are validated when they are set
+    /// (`validate_zone_write_seeds_config`), so this read is lenient: an
+    /// unparsable `enabled` disables the setting and an invalid
+    /// `rows_per_zone` falls back to [`ROWS_PER_ZONE_DEFAULT`], both with a
+    /// warning. That only matters for a manifest written by a build that did
+    /// not validate them.
     pub fn from_config(config: &HashMap<String, String>) -> Option<Self> {
         let enabled = config.get(ZONE_WRITE_SEEDS_ENABLED_KEY)?;
         match enabled.parse::<bool>() {
@@ -92,11 +97,12 @@ impl ZoneWriteSeedsConfig {
         let rows_per_zone = match config.get(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY) {
             None => ROWS_PER_ZONE_DEFAULT,
             Some(value) => match value.parse::<u64>() {
-                Ok(rows) if rows > 0 => rows,
+                Ok(rows) if rows > 0 && rows <= u64::from(u32::MAX) => rows,
                 _ => {
                     log::warn!(
-                        "ignoring {ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY}={value:?}: expected a \
-                         positive integer; using {ROWS_PER_ZONE_DEFAULT}"
+                        "ignoring {ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY}={value:?}: expected an \
+                         integer between 1 and {}; using {ROWS_PER_ZONE_DEFAULT}",
+                        u32::MAX
                     );
                     ROWS_PER_ZONE_DEFAULT
                 }
@@ -123,8 +129,8 @@ impl SeedCollector {
     /// A column gets a seed writer when an existing, usable index on it asks
     /// for one through its plugin and the dataset already carries the feature
     /// flags that seed format requires. With zone write seeds enabled in the
-    /// dataset config ([`ZoneWriteSeedsConfig`]), every other column the zone
-    /// map supports gets a zone map seed under the same flag rule.
+    /// dataset config ([`ZoneWriteSeedsConfig`]), every other column of a
+    /// candidate scalar type gets a zone map seed under the same flag rule.
     /// `consult_indices` is false for writes that discard the dataset's
     /// indices (overwrite), where seeds have no consumer.
     pub async fn for_write(
@@ -224,7 +230,11 @@ enum SeedWriterPurpose {
 
 /// The seed writers that the usable indices in `indices` request for the
 /// top-level columns of `schema`, plus, when `config` is set, a zone map seed
-/// of the configured size for every other column the zone map supports.
+/// of the configured size for every other column of a candidate scalar type.
+///
+/// When a seeded index's requirements cannot be resolved for a file (its
+/// details or stored null-bitmap policy cannot be read), the column falls
+/// back to the configured seed if the setting is on.
 ///
 /// `dataset` resolves index details that are not inline in the metadata; it
 /// only has to share its index store with `indices`, which may belong to a
@@ -371,7 +381,9 @@ async fn seed_writers_for(
         ));
     }
     // Configured seeds have no index whose null bitmap they could feed. A
-    // writer that cannot be created is skipped rather than failing the write.
+    // column whose seed writer cannot be constructed gets no configured
+    // seed; errors while observing batches or finishing a seed still fail
+    // the write, as for index-requested seeds.
     for (field, rows_per_zone) in config_columns {
         match ZoneMapSeedWriter::new(&field.name, rows_per_zone, field.data_type()) {
             Ok(writer) => writers.push(Box::new(writer.with_null_positions(false))),
@@ -384,10 +396,10 @@ async fn seed_writers_for(
     Ok(writers)
 }
 
-/// Whether the dataset config seeds `field`: flat scalar columns only, whose
-/// zone statistics are cheap to collect on every write. Blob and
-/// extension-typed columns are excluded because the written values are not
-/// the column's logical values.
+/// Whether the dataset config seeds `field`: flat columns of a candidate
+/// scalar type only. The list is a conservative gate, not a guarantee about
+/// collection cost. Blob and extension-typed columns are excluded because
+/// the written values are not the column's logical values.
 fn config_seed_supports(field: &Field) -> bool {
     if field.is_blob() || field.is_blob_v2() || field.extension_name().is_some() {
         return false;
@@ -525,6 +537,10 @@ mod tests {
     )]
     #[case::unparsable_size(
         &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "many")],
+        Some(ROWS_PER_ZONE_DEFAULT)
+    )]
+    #[case::too_large_size(
+        &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "4294967296")],
         Some(ROWS_PER_ZONE_DEFAULT)
     )]
     fn test_zone_write_seeds_config_from_config(

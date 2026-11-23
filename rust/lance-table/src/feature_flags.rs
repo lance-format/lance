@@ -308,6 +308,55 @@ pub fn validate_auto_cleanup_config(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Prefix of the dataset config keys that control zone write seeds.
+pub const ZONE_WRITE_SEEDS_CONFIG_PREFIX: &str = "lance.zone_write_seeds.";
+/// Dataset config key that enables zone map seeds for columns without a
+/// seeded ZoneMap index (`"true"` / `"false"`).
+pub const ZONE_WRITE_SEEDS_ENABLED_KEY: &str = "lance.zone_write_seeds.enabled";
+/// Dataset config key for the rows per seed zone of those columns.
+pub const ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY: &str = "lance.zone_write_seeds.rows_per_zone";
+
+/// Validate a change to the zone write seed configuration.
+///
+/// `lance.zone_write_seeds.enabled` must be `"true"` or `"false"`, and
+/// `lance.zone_write_seeds.rows_per_zone` an integer in `1..=u32::MAX`:
+/// per-zone null and NaN counts are 32-bit, as are the row offsets a zone
+/// spans within a fragment. No other key may use the prefix. Call before
+/// publishing a change to these keys.
+pub fn validate_zone_write_seeds_config(manifest: &Manifest) -> Result<()> {
+    for (key, value) in manifest.config.iter() {
+        if !key.starts_with(ZONE_WRITE_SEEDS_CONFIG_PREFIX) {
+            continue;
+        }
+        match key.as_str() {
+            ZONE_WRITE_SEEDS_ENABLED_KEY => {
+                if value != "true" && value != "false" {
+                    return Err(Error::invalid_input(format!(
+                        "{key} must be \"true\" or \"false\", got {value:?}"
+                    )));
+                }
+            }
+            ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY => {
+                let valid = value
+                    .parse::<u64>()
+                    .is_ok_and(|rows| rows > 0 && rows <= u64::from(u32::MAX));
+                if !valid {
+                    return Err(Error::invalid_input(format!(
+                        "{key} must be an integer between 1 and {}, got {value:?}",
+                        u32::MAX
+                    )));
+                }
+            }
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Unknown zone write seeds configuration key: {key}={value:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
     manifest: &mut Manifest,
@@ -1014,6 +1063,41 @@ mod tests {
         inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
         assert_eq!(destination.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
         assert_eq!(destination.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+    }
+
+    #[rstest::rstest]
+    #[case::absent(&[])]
+    #[case::enabled(&[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true")])]
+    #[case::disabled(&[(ZONE_WRITE_SEEDS_ENABLED_KEY, "false")])]
+    #[case::size(&[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "8")])]
+    #[case::size_without_enabled(&[(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "1")])]
+    #[case::largest_size(&[(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "4294967295")])]
+    #[case::unrelated_key(&[("lance.zone_write_seedsx", "1"), ("other.key", "x")])]
+    fn test_zone_write_seeds_config_accepts_valid_values(#[case] entries: &[(&str, &str)]) {
+        let mut manifest = empty_manifest();
+        for (key, value) in entries {
+            manifest.config.insert(key.to_string(), value.to_string());
+        }
+        validate_zone_write_seeds_config(&manifest).unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::enabled_yes(ZONE_WRITE_SEEDS_ENABLED_KEY, "yes")]
+    #[case::enabled_uppercase(ZONE_WRITE_SEEDS_ENABLED_KEY, "TRUE")]
+    #[case::enabled_empty(ZONE_WRITE_SEEDS_ENABLED_KEY, "")]
+    #[case::zero_size(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "0")]
+    #[case::negative_size(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "-4")]
+    #[case::garbage_size(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "many")]
+    #[case::too_large_size(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "4294967296")]
+    #[case::unknown_key("lance.zone_write_seeds.rows_per_zonee", "8")]
+    fn test_zone_write_seeds_config_rejects_invalid_values(#[case] key: &str, #[case] value: &str) {
+        let mut manifest = empty_manifest();
+        manifest.config.insert(key.to_string(), value.to_string());
+        let error = validate_zone_write_seeds_config(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains(key), "{message}");
+        assert!(message.contains(&format!("{value:?}")), "{message}");
     }
 
     #[test]
