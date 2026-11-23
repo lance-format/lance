@@ -4,6 +4,92 @@
 //! Compaction tests for the index remap contract area.
 
 use super::*;
+use crate::dataset::builder::DatasetBuilder;
+use crate::utils::test::FailingProxyStore;
+use lance_index::scalar::btree::BTREE_LOOKUP_NAME;
+use lance_io::object_store::ObjectStoreParams;
+
+#[rstest]
+#[case::missing_lookup(false)]
+#[case::read_failure_after_planning(true)]
+#[tokio::test]
+async fn compaction_propagates_index_open_error(#[case] fail_after_planning: bool) {
+    let dir = TempStrDir::default();
+    let uri = url::Url::from_directory_path(dir.as_str())
+        .unwrap()
+        .as_str()
+        .replacen("file:", "file-object-store:", 1);
+    let mut original = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_dataset(&uri, FragmentCount::from(2), FragmentRowCount::from(2))
+        .await
+        .unwrap();
+    create_scalar_index(&mut original, "i", false).await;
+    let indices = read_manifest_indexes(
+        &original.object_store,
+        &original.manifest_location,
+        &original.manifest,
+    )
+    .await
+    .unwrap();
+    let [index] = indices.as_slice() else {
+        panic!("expected a single BTree segment");
+    };
+    assert_eq!(
+        index.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0, 1]))
+    );
+
+    let failing = Arc::new(FailingProxyStore::new());
+    let mut dataset = DatasetBuilder::from_uri(&uri)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(failing.clone()),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    let options = CompactionOptions::default();
+    if fail_after_planning {
+        let tasks = execute_compaction_plan(&dataset, &options).await;
+        failing.fail_when("get_opts", BTREE_LOOKUP_NAME, "injected BTree read failure");
+        let error = commit_compaction(
+            &mut dataset,
+            tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error.find_root(), Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("injected BTree read failure"),
+            "{error}"
+        );
+    } else {
+        let lookup = original
+            .indices_dir()
+            .join(index.uuid.to_string())
+            .join(BTREE_LOOKUP_NAME);
+        original.object_store.delete(&lookup).await.unwrap();
+        let error = compact_files(&mut dataset, options, None)
+            .await
+            .unwrap_err();
+        assert!(error.is_not_found(), "{error:?}");
+        assert!(error.to_string().contains(BTREE_LOOKUP_NAME), "{error}");
+    }
+
+    let latest = Dataset::open(&uri).await.unwrap();
+    let stored = read_manifest_indexes(
+        &latest.object_store,
+        &latest.manifest_location,
+        &latest.manifest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(latest.fragments(), original.fragments());
+    assert_eq!(stored, indices);
+}
 
 #[tokio::test]
 async fn test_stable_row_indices() {
