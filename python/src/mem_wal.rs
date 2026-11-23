@@ -33,7 +33,6 @@ use lance_arrow::deepcopy::deep_copy_batch;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
-use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -44,6 +43,7 @@ use crate::dataset::Dataset as PyDataset;
 use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::LanceSchema as PyLanceSchema;
+use crate::utils::parse_distance_type;
 
 /// Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
 #[pyfunction(name = "_evaluate_sharding_spec", signature = (batch, spec, schema))]
@@ -1010,20 +1010,6 @@ pub(crate) fn get_pk_columns(ds: &LanceDataset) -> PyResult<Vec<String>> {
         ));
     }
     Ok(pk_fields.iter().map(|f| f.name.clone()).collect())
-}
-
-/// Parse distance type string to DistanceType enum.
-fn parse_distance_type(s: &str) -> PyResult<DistanceType> {
-    match s.to_lowercase().as_str() {
-        "l2" | "euclidean" => Ok(DistanceType::L2),
-        "cosine" => Ok(DistanceType::Cosine),
-        "dot" | "inner_product" => Ok(DistanceType::Dot),
-        "hamming" => Ok(DistanceType::Hamming),
-        _ => Err(PyValueError::new_err(format!(
-            "Unknown distance_type '{}'. Valid values: 'l2', 'cosine', 'dot', 'hamming'",
-            s
-        ))),
-    }
 }
 
 /// Get the vector dimension from the dataset schema for a given column.

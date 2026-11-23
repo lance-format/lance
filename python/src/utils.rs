@@ -43,6 +43,11 @@ use pyo3::{
     types::PyIterator,
 };
 
+/// Parse a Python-facing distance metric with the shared Rust parser.
+pub(crate) fn parse_distance_type(distance_type: &str) -> PyResult<DistanceType> {
+    DistanceType::try_from(distance_type).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// A wrapper around a JSON string that converts to a Python object
 /// using json.loads when marshalling to Python.
 #[derive(Debug, Clone)]
@@ -104,9 +109,7 @@ impl KMeans {
         max_iters: u32,
         centroids_arr: Option<&Bound<PyAny>>,
     ) -> PyResult<Self> {
-        let metric_type: DistanceType = metric_type
-            .try_into()
-            .map_err(|e| PyValueError::new_err(format!("Invalid metric_type: {}", e)))?;
+        let metric_type = parse_distance_type(metric_type)?;
         let trained_kmeans = if let Some(arr) = centroids_arr {
             let data = ArrayData::from_pyarrow_bound(arr)?;
             if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
@@ -258,8 +261,7 @@ impl Hnsw {
         let vectors = concat(&array_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
         std::mem::drop(data);
 
-        let dt = DistanceType::try_from(distance_type)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let dt = parse_distance_type(distance_type)?;
 
         let hnsw = rt()
             .runtime

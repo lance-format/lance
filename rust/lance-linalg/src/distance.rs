@@ -306,7 +306,7 @@ impl TryFrom<&str> for DistanceType {
         match s.to_lowercase().as_str() {
             "l2" | "euclidean" => Ok(Self::L2),
             "cosine" => Ok(Self::Cosine),
-            "dot" => Ok(Self::Dot),
+            "dot" | "inner_product" => Ok(Self::Dot),
             "hamming" => Ok(Self::Hamming),
             _ => Err(ArrowError::InvalidArgumentError(format!(
                 "Metric type '{s}' is not supported"
@@ -348,6 +348,24 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
+
+    #[test]
+    fn test_distance_type_from_str() {
+        for (raw, expected) in [
+            ("L2", DistanceType::L2),
+            ("euclidean", DistanceType::L2),
+            ("Cosine", DistanceType::Cosine),
+            ("dot", DistanceType::Dot),
+            ("inner_product", DistanceType::Dot),
+            ("Hamming", DistanceType::Hamming),
+        ] {
+            assert_eq!(DistanceType::try_from(raw).unwrap(), expected);
+        }
+
+        let error = DistanceType::try_from("manhattan").unwrap_err();
+        assert!(matches!(error, ArrowError::InvalidArgumentError(_)));
+        assert!(error.to_string().contains("'manhattan' is not supported"));
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

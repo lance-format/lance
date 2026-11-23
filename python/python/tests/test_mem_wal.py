@@ -646,6 +646,21 @@ def test_lsm_vector_search_filter_binding(tmp_path):
         )
 
 
+def test_lsm_vector_search_planner_distance_type(tmp_path):
+    ds = lance.write_dataset(
+        _vector_search_table(range(10)),
+        str(tmp_path / "vec"),
+        schema=_vector_search_schema(),
+    )
+    ds.initialize_mem_wal()
+
+    # inner_product remains an alias for dot.
+    LsmVectorSearchPlanner(ds, [], "vector", distance_type="inner_product")
+
+    with pytest.raises(ValueError, match="Metric type 'manhattan' is not supported"):
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="manhattan")
+
+
 VECTOR_DIM = 32
 ROWS_PER_BATCH = 50
 NUM_WRITE_ROUNDS = 3
