@@ -39,8 +39,7 @@ pub(crate) async fn merge_segments(
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "BTree", &segments)?;
-    merge.ensure_details("BTree", "BTreeIndexDetails")?;
-    merge.require_shared_domain(dataset, "BTree")?;
+    merge.reject_legacy_segments_on_stable(dataset, "BTree")?;
     let (fragment_bitmap, old_data_filters) =
         merge.per_segment_filters(dataset, staged, true).await?;
 

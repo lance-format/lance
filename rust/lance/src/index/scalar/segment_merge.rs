@@ -94,33 +94,30 @@ impl<'a> SegmentMerge<'a> {
         self.dataset_version
     }
 
-    /// Refuse a segment whose manifest details name another index type.
-    pub(in crate::index) fn ensure_details(
-        &self,
-        index_type: &str,
-        details_suffix: &str,
-    ) -> Result<()> {
-        let segment = self.segments[0];
-        if let Some(details) = segment.index_details.as_ref()
-            && !details.type_url.ends_with(details_suffix)
-        {
-            return Err(Error::invalid_input(format!(
-                "Segment '{}' is not a {} segment (details type_url = '{}')",
-                segment.uuid, index_type, details.type_url
-            )));
-        }
-        Ok(())
-    }
-
-    /// The domain every source stores rows in. A merge copies stored identifiers
-    /// as-is, so sources must agree and a pre-migration segment cannot join a
-    /// stable-row-id table.
-    pub(in crate::index) fn require_shared_domain(
+    /// Refuse a pre-migration segment on a stable-row-id table. Without stable
+    /// row ids the two identifiers are the same numbering, so such a segment
+    /// remains valid input there.
+    pub(in crate::index) fn reject_legacy_segments_on_stable(
         &self,
         dataset: &Dataset,
         index_type: &str,
-    ) -> Result<bool> {
-        super::shared_segment_domain(dataset, index_type, &self.segments)
+    ) -> Result<()> {
+        if !dataset.manifest.uses_stable_row_ids() {
+            return Ok(());
+        }
+        if let Some(segment) = self
+            .segments
+            .iter()
+            .find(|segment| !segment.results_are_row_addrs())
+        {
+            return Err(Error::invalid_input(format!(
+                "{index_type} merge_segments: segment {} predates row-address-domain support \
+                 and cannot be merged on a dataset with stable row IDs; rebuild it first (e.g. \
+                 with create_index(..., replace: true))",
+                segment.uuid,
+            )));
+        }
+        Ok(())
     }
 
     /// One old-data filter per source, and the live coverage they keep.
@@ -294,15 +291,16 @@ where
 {
     let mut sources = Vec::with_capacity(segments.len());
     for &segment in segments {
-        let opened = open_dyn_source(
-            dataset,
-            field_path,
-            segment,
-            staged.and_then(|plans| plans.get(&segment.uuid)),
-        )
-        .await?;
-        let source = downcast_source::<T>(&opened, segment, index_type)?;
-        sources.push(Arc::new(source.clone()));
+        sources.push(
+            open_source(
+                dataset,
+                field_path,
+                segment,
+                staged.and_then(|plans| plans.get(&segment.uuid)),
+                index_type,
+            )
+            .await?,
+        );
     }
     Ok(sources)
 }

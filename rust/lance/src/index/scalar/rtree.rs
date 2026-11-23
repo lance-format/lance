@@ -21,7 +21,7 @@ pub(in crate::index) async fn merge_segments(
     // Without stable row ids the two domains coincide, so once a row-id-domain
     // segment is refused on a stable-row-id dataset the filters can always be
     // address-domain. `RTreeIndex::merge_segments` keeps the sources' own domain.
-    merge.require_shared_domain(dataset, "RTree")?;
+    super::shared_segment_domain(dataset, "RTree", merge.segments())?;
     let (fragment_bitmap, old_data_filters) =
         merge.per_segment_filters(dataset, staged, true).await?;
 

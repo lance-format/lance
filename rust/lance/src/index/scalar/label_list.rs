@@ -62,8 +62,7 @@ pub(in crate::index) async fn merge_segments(
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "LabelList", &segments)?;
-    merge.ensure_details("LabelList", "LabelListIndexDetails")?;
-    merge.require_shared_domain(dataset, "LabelList")?;
+    merge.reject_legacy_segments_on_stable(dataset, "LabelList")?;
     let field_id = merge.field_id();
 
     let (effective_old_frags, deleted_old_frags) = merge.coverage_union(dataset)?;

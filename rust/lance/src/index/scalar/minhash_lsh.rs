@@ -27,7 +27,7 @@ pub(in crate::index) async fn merge_segments(
     // The merged segment is always written in the current (row-address)
     // format with each source's identifiers copied as-is, so a pre-migration
     // segment's row ids would be misread as addresses wherever the two differ.
-    merge.require_shared_domain(dataset, "MinHash LSH")?;
+    merge.reject_legacy_segments_on_stable(dataset, "MinHash LSH")?;
     // Current segments store addresses. A legacy segment can only reach here
     // without stable row IDs, where its IDs are also physical addresses.
     let (fragment_bitmap, filters) = merge.per_segment_filters(dataset, staged, true).await?;
@@ -103,6 +103,7 @@ mod tests {
     use lance_index::scalar::{
         BuiltinIndexType, IndexStore, ScalarIndexParams, index_files_to_table,
     };
+    use lance_table::format::IndexMetadata;
     use roaring::RoaringBitmap;
     use rstest::rstest;
     use uuid::Uuid;
@@ -149,6 +150,164 @@ mod tests {
     fn params() -> ScalarIndexParams {
         ScalarIndexParams::for_builtin(BuiltinIndexType::MinHashLsh)
             .with_params(&serde_json::json!({"num_hashes": 32, "num_bands": 8}))
+    }
+
+    /// Rewrite a freshly built MinHash segment in the pre-migration row-id
+    /// layout: `_rowid` replaces `_rowaddr`, stored addresses become row ids,
+    /// and the file metadata is stamped at version 0. No historical MinHash
+    /// fixture exists, so the v0 artifact is produced from a current segment.
+    async fn rewrite_as_row_id_domain(
+        dataset: &Dataset,
+        segment: &IndexMetadata,
+        enable_stable_row_ids: bool,
+    ) -> IndexMetadata {
+        let source = LanceIndexStore::from_dataset_for_existing(dataset, segment)
+            .await
+            .unwrap();
+        let legacy_uuid = Uuid::new_v4();
+        let legacy = LanceIndexStore::from_dataset_for_new(dataset, &legacy_uuid).unwrap();
+        let mut files = Vec::new();
+        for name in [BANDS_FILENAME, SIGNATURES_FILENAME] {
+            let reader = source.open_index_file(name).await.unwrap();
+            let batch = reader.read_range(0..reader.num_rows(), None).await.unwrap();
+            let mut metadata = reader.schema().metadata.clone();
+            metadata.insert("minhash_lsh_index_version".into(), "0".into());
+            let old_schema = batch.schema();
+            let fields = old_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    if field.name() == lance_core::ROW_ADDR {
+                        Arc::new(field.as_ref().clone().with_name(lance_core::ROW_ID))
+                    } else {
+                        field.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new(fields));
+            let mut columns = batch.columns().to_vec();
+            if name == SIGNATURES_FILENAME && enable_stable_row_ids {
+                let ids = batch[lance_core::ROW_ADDR].as_primitive::<UInt64Type>();
+                columns[0] = Arc::new(UInt64Array::from_iter_values(
+                    ids.values()
+                        .iter()
+                        .map(|address| (address >> 32) * 2 + (address & 0xffff_ffff)),
+                ));
+            }
+            let mut writer = legacy.new_index_file(name, schema.clone()).await.unwrap();
+            writer
+                .write_record_batch(RecordBatch::try_new(schema, columns).unwrap())
+                .await
+                .unwrap();
+            if name == BANDS_FILENAME {
+                let key = "minhash_lsh_page_table_buffer";
+                let buffer = reader
+                    .read_global_buffer(metadata[key].parse().unwrap())
+                    .await
+                    .unwrap();
+                let id = writer.add_global_buffer(buffer).await.unwrap();
+                metadata.insert(key.into(), id.to_string());
+            }
+            files.push(writer.finish_with_metadata(metadata).await.unwrap());
+        }
+        IndexMetadata {
+            uuid: legacy_uuid,
+            index_version: 0,
+            files: Some(index_files_to_table(files)),
+            ..segment.clone()
+        }
+    }
+
+    /// A non-stable-row-id table may hold a pre-migration v0 segment beside a
+    /// current v1 segment for disjoint fragments: both store the same numbers,
+    /// so the merge writes one v1 segment covering both. A stable-row-id table
+    /// cannot, because the legacy segment's ids are not addresses.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_legacy_and_current_disjoint_segments(
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch(0..4))], schema()),
+            dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        fragment_ids.sort_unstable();
+        assert_eq!(fragment_ids.len(), 2);
+        let params = params();
+
+        let legacy =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::MinHashLsh, &params)
+                .name(INDEX_NAME.into())
+                .fragments(vec![fragment_ids[0]])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let legacy = rewrite_as_row_id_domain(&dataset, &legacy, enable_stable_row_ids).await;
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "text", vec![legacy.clone()])
+            .await
+            .unwrap();
+
+        let current =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::MinHashLsh, &params)
+                .name(INDEX_NAME.into())
+                .fragments(vec![fragment_ids[1]])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        assert!(current.results_are_row_addrs());
+
+        let merged = dataset
+            .merge_existing_index_segments(vec![legacy, current])
+            .await;
+        if enable_stable_row_ids {
+            let err = merged.unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("cannot be merged"), "{err}");
+            // The committed legacy segment still answers for its fragment.
+            assert_eq!(
+                search_text_ids(dataset.scan().fast_search(), row_text(0), 1).await,
+                vec![0]
+            );
+            return;
+        }
+
+        let merged = merged.unwrap();
+        assert_eq!(merged.index_version, MINHASH_LSH_INDEX_VERSION as i32);
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            fragment_ids
+        );
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "text", vec![merged])
+            .await
+            .unwrap();
+
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        for id in [0, 3] {
+            assert_eq!(
+                search_text_ids(reopened.scan().fast_search(), row_text(id), 1).await,
+                vec![id]
+            );
+        }
     }
 
     async fn write(uri: &str, ids: std::ops::Range<i32>, rows_per_file: usize) -> Dataset {
@@ -819,71 +978,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut segment =
+        let segment =
             CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::MinHashLsh, &params())
                 .name(INDEX_NAME.into())
                 .execute_uncommitted()
                 .await
                 .unwrap();
-
-        // Rewrite the freshly trained segment's files as a pre-migration
-        // (row-id domain) layout: rename `_rowaddr` to `_rowid`, convert each
-        // stored address into the dataset's row id (with stable row ids, its
-        // logical id; otherwise the address itself), and stamp file version 0.
-        let source = LanceIndexStore::from_dataset_for_existing(&dataset, &segment)
-            .await
-            .unwrap();
-        let legacy_uuid = Uuid::new_v4();
-        let legacy = LanceIndexStore::from_dataset_for_new(&dataset, &legacy_uuid).unwrap();
-        let mut files = Vec::new();
-        for name in [BANDS_FILENAME, SIGNATURES_FILENAME] {
-            let reader = source.open_index_file(name).await.unwrap();
-            let batch = reader.read_range(0..reader.num_rows(), None).await.unwrap();
-            let mut metadata = reader.schema().metadata.clone();
-            metadata.insert("minhash_lsh_index_version".into(), "0".into());
-            let old_schema = batch.schema();
-            let fields = old_schema
-                .fields()
-                .iter()
-                .map(|field| {
-                    if field.name() == lance_core::ROW_ADDR {
-                        Arc::new(field.as_ref().clone().with_name(lance_core::ROW_ID))
-                    } else {
-                        field.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let schema = Arc::new(Schema::new(fields));
-            let mut columns = batch.columns().to_vec();
-            if name == SIGNATURES_FILENAME && enable_stable_row_ids {
-                let ids = batch[lance_core::ROW_ADDR].as_primitive::<UInt64Type>();
-                columns[0] = Arc::new(UInt64Array::from_iter_values(
-                    ids.values()
-                        .iter()
-                        .map(|address| (address >> 32) * 2 + (address & 0xffff_ffff)),
-                ));
-            }
-            let mut writer = legacy.new_index_file(name, schema.clone()).await.unwrap();
-            writer
-                .write_record_batch(RecordBatch::try_new(schema, columns).unwrap())
-                .await
-                .unwrap();
-            if name == BANDS_FILENAME {
-                let key = "minhash_lsh_page_table_buffer";
-                let buffer = reader
-                    .read_global_buffer(metadata[key].parse().unwrap())
-                    .await
-                    .unwrap();
-                let id = writer.add_global_buffer(buffer).await.unwrap();
-                metadata.insert(key.into(), id.to_string());
-            }
-            files.push(writer.finish_with_metadata(metadata).await.unwrap());
-        }
-        segment.uuid = legacy_uuid;
-        segment.index_version = 0;
-        segment.files = Some(index_files_to_table(files));
+        let legacy_segment =
+            rewrite_as_row_id_domain(&dataset, &segment, enable_stable_row_ids).await;
+        let legacy_uuid = legacy_segment.uuid;
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "text", vec![segment])
+            .commit_existing_index_segments(INDEX_NAME, "text", vec![legacy_segment])
             .await
             .unwrap();
 
