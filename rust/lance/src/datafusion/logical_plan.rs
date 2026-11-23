@@ -16,6 +16,7 @@ use datafusion::{
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 
 use crate::Dataset;
+use crate::dataset::scanner::ScanOptions;
 
 #[async_trait]
 impl TableProvider for Dataset {
@@ -62,15 +63,8 @@ impl TableProvider for Dataset {
         };
 
         let scan_range = limit.map(|l| 0..l as u64);
-        let plan: Arc<dyn ExecutionPlan> = scanner.scan(
-            false,
-            false,
-            false,
-            false,
-            false,
-            scan_range,
-            projections.into(),
-        );
+        let plan: Arc<dyn ExecutionPlan> =
+            scanner.scan(ScanOptions::default(), scan_range, projections.into());
 
         Ok(plan)
     }

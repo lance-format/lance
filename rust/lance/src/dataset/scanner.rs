@@ -22,6 +22,7 @@ pub mod test_dataset;
 mod vector;
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
+pub(crate) use source::ScanOptions;
 pub use source::TakeOperation;
 
 use std::collections::HashSet;
