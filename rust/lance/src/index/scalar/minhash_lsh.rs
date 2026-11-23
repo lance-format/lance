@@ -264,6 +264,7 @@ mod tests {
         let current =
             CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::MinHashLsh, &params)
                 .name(INDEX_NAME.into())
+                .replace(true)
                 .fragments(vec![fragment_ids[1]])
                 .execute_uncommitted()
                 .await
