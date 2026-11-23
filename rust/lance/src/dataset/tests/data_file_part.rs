@@ -14,16 +14,17 @@ use std::{
 
 use arrow::array::AsArray;
 use arrow_array::{
-    ArrayRef, LargeBinaryArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
-    UInt64Array, types::Int32Type,
+    Array, ArrayRef, LargeBinaryArray, LargeListArray, ListArray, RecordBatch, RecordBatchIterator,
+    StringArray, StructArray, UInt64Array, new_null_array, types::Int32Type,
 };
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
 use lance_core::{
     Error,
-    datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling},
+    datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling, BlobKind},
     utils::{
         blob::blob_path,
         tempfile::TempDir,
@@ -39,10 +40,14 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
+use object_store::path::Path;
 use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use rstest::rstest;
 
-use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
+use crate::blob::{
+    BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobFile, BlobWriteSources, blob_field,
+};
+use crate::dataset::blob::test_util::{managed_blob_schema, recording_range_store};
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::write::WriteParams;
@@ -1118,6 +1123,264 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
         .concat_data_file_parts(&target, &[part])
         .await
         .unwrap();
+}
+
+fn nested_blob_source_batch(item: Field, values: ArrayRef, managed: bool) -> RecordBatch {
+    let item = Arc::new(item);
+    let list_validity = Some(NullBuffer::from(vec![true, false, true]));
+    let list = ListArray::try_new(
+        item.clone(),
+        OffsetBuffer::new(vec![0i32, 3, 4, 5].into()),
+        values.clone(),
+        list_validity.clone(),
+    )
+    .unwrap();
+    let large_list = LargeListArray::try_new(
+        item,
+        OffsetBuffer::new(vec![0i64, 3, 4, 5].into()),
+        values,
+        list_validity,
+    )
+    .unwrap();
+    let nested = StructArray::try_new(
+        vec![
+            Field::new("small", list.data_type().clone(), true),
+            Field::new("large", large_list.data_type().clone(), true),
+        ]
+        .into(),
+        vec![Arc::new(list), Arc::new(large_list)],
+        Some(NullBuffer::from(vec![true, true, false])),
+    )
+    .unwrap();
+    let fields = vec![Field::new("nested", nested.data_type().clone(), true)];
+    let schema = if managed {
+        managed_blob_schema(fields)
+    } else {
+        ArrowSchema::new(fields)
+    };
+    RecordBatch::try_new(Arc::new(schema), vec![Arc::new(nested)]).unwrap()
+}
+
+#[rstest]
+#[case::ordinary_fragment(false, false)]
+#[case::ordinary_parts(false, true)]
+#[case::managed_fragment(true, false)]
+#[case::managed_parts(true, true)]
+#[tokio::test]
+async fn completed_blob_uploads_round_trip_through_nested_columns(
+    #[case] managed: bool,
+    #[case] parts: bool,
+) {
+    let directory = TempDir::default();
+    let uri = directory.std_path().join("table");
+    let uri = uri.to_str().unwrap();
+    let item = blob_field("item", true);
+    let original =
+        nested_blob_source_batch(item.clone(), new_null_array(item.data_type(), 5), managed);
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(original.clone())], original.schema()),
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let relative = Path::from("_blobs/functions/attempt-1/value.payload");
+    let absolute: Path = dataset.base.parts().chain(relative.parts()).collect();
+    let empty_relative = Path::from("_blobs/functions/attempt-1/empty.payload");
+    let empty_absolute: Path = dataset.base.parts().chain(empty_relative.parts()).collect();
+    let payload = Bytes::from(vec![0x6D; 128 * 1024]);
+    let store = dataset.object_store(None).await.unwrap();
+    store
+        .put_payload(&absolute, payload.clone().into())
+        .await
+        .unwrap();
+    store
+        .put_payload(&empty_absolute, Bytes::new().into())
+        .await
+        .unwrap();
+
+    let mut sources = BlobWriteSources::default();
+    let uploaded = sources
+        .add_uploaded_blob(relative.clone(), payload.len() as u64)
+        .unwrap();
+    let empty = sources.add_uploaded_blob(empty_relative, 0).unwrap();
+    // The object would fail to resolve if either kind of null parent lost its validity.
+    let ignored = sources
+        .add_uploaded_blob(Path::from("_blobs/functions/attempt-1/missing.payload"), 10)
+        .unwrap();
+    let mut replacement = BlobDescriptorArrayBuilder::for_field(&item).unwrap();
+    replacement
+        .extend([
+            uploaded,
+            crate::BlobDescriptor::Null,
+            empty,
+            ignored.clone(),
+            ignored,
+        ])
+        .unwrap();
+    let (item, values) = replacement.finish().unwrap().into_parts();
+    let batch = nested_blob_source_batch(item, values, managed);
+    let fragment = only_fragment(&dataset);
+    let options = FileWriterOptions::default();
+    let replacement = if parts {
+        let target = DataFileTarget::new(
+            None,
+            Arc::new(dataset.schema().clone()),
+            ConcreteFileVersion::V2_2,
+        )
+        .unwrap();
+        let ids = (!managed).then_some(99..105);
+        let part = dataset
+            .write_data_file_part_with_blob_sources(
+                &target,
+                ids,
+                stream::iter([Ok((batch, sources))]),
+                options,
+            )
+            .await
+            .unwrap();
+        let (target, part): (DataFileTarget, DataFilePart) =
+            serde_json::from_slice(&serde_json::to_vec(&(target, part)).unwrap()).unwrap();
+        let data_file = dataset
+            .concat_data_file_parts(&target, &[part])
+            .await
+            .unwrap();
+        DataReplacementGroup(fragment.id() as u64, data_file)
+    } else {
+        // The caller may project the fields without carrying schema metadata.
+        let mut schema = dataset.schema().clone();
+        schema.metadata.clear();
+        fragment
+            .write_columns_with_blob_sources(stream::iter([Ok((batch, sources))]), &schema, options)
+            .await
+            .unwrap()
+    };
+    let published = commit(&dataset, replacement).await.unwrap();
+    if !managed {
+        // Published ordinary values must have their own storage.
+        store.delete(&absolute).await.unwrap();
+        store.delete(&empty_absolute).await.unwrap();
+    }
+    let reopened = Dataset::open(uri).await.unwrap();
+    assert_eq!(reopened.version_id(), published.version_id());
+    assert_eq!(reopened.manifest.has_managed_blobs(), managed);
+    let descriptors = reopened.scan().try_into_batch().await.unwrap();
+    let nested = descriptors["nested"].as_struct();
+    let list = nested.column_by_name("small").unwrap().as_list::<i32>();
+    let descriptors = list.values().as_struct();
+    let kind = descriptors
+        .column_by_name("kind")
+        .unwrap()
+        .as_primitive::<arrow_array::types::UInt8Type>();
+    let uri = descriptors
+        .column_by_name("blob_uri")
+        .unwrap()
+        .as_string::<i32>();
+    if managed {
+        assert_eq!(kind.value(0), BlobKind::Managed as u8);
+        assert_eq!(uri.value(0), relative.as_ref());
+    } else {
+        assert_eq!(kind.value(0), BlobKind::Packed as u8);
+        if parts {
+            let ids = descriptors
+                .column_by_name("blob_id")
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt32Type>();
+            assert_eq!(ids.value(0), 99);
+        }
+    }
+    let decoded = reopened
+        .scan()
+        .blob_handling(BlobHandling::AllBinary)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let nested = decoded["nested"].as_struct();
+    assert!(nested.is_null(2));
+    let small = nested.column_by_name("small").unwrap().as_list::<i32>();
+    let large = nested.column_by_name("large").unwrap().as_list::<i64>();
+    assert!(small.is_null(1));
+    assert!(large.is_null(1));
+    for list in [small.value(0), large.value(0)] {
+        assert_eq!(
+            list.as_binary::<i64>().iter().collect::<Vec<_>>(),
+            [Some(payload.as_ref()), None, Some(b"".as_slice()),]
+        );
+    }
+}
+
+#[tokio::test]
+async fn fragment_copies_registered_blob_ranges_with_bounded_requests() {
+    const MAX_REQUEST: usize = 8 * 1024 * 1024;
+    let field = blob_field("blob", true);
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![field.clone()])),
+        vec![new_null_array(field.data_type(), 3)],
+    )
+    .unwrap();
+    let dataset = dataset_of(batch, LanceFileVersion::V2_2).await;
+    let mut source_data = vec![0x13; MAX_REQUEST + 64];
+    source_data[MAX_REQUEST..].fill(0x71);
+    let source_data = Bytes::from(source_data);
+    let (store, recorded) = recording_range_store(source_data.clone());
+    let path = Path::from("existing-sidecar");
+    let ranges = [5..9, 7..(128 * 1024 + 7), 9..(MAX_REQUEST + 27)];
+    let mut sources = BlobWriteSources::default();
+    let mut blobs = BlobDescriptorArrayBuilder::for_field(&field).unwrap();
+    for range in &ranges {
+        let file = BlobFile::new_packed(
+            store.clone(),
+            path.clone(),
+            range.start as u64,
+            range.len() as u64,
+        );
+        blobs.push(sources.add_blob_file(file).unwrap()).unwrap();
+    }
+    let (prepared_field, prepared_values) = blobs.finish().unwrap().into_parts();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![prepared_field])),
+        vec![prepared_values],
+    )
+    .unwrap();
+    let replacement = only_fragment(&dataset)
+        .write_columns_with_blob_sources(
+            stream::iter([Ok((batch, sources))]),
+            dataset.schema(),
+            FileWriterOptions::default(),
+        )
+        .await
+        .unwrap();
+    let requests = recorded.requested_ranges();
+    assert!(
+        requests
+            .iter()
+            .all(|range| range.end - range.start <= MAX_REQUEST as u64),
+        "{requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|range| range.end == (MAX_REQUEST + 27) as u64),
+        "{requests:?}"
+    );
+    let dataset = Arc::new(commit(&dataset, replacement).await.unwrap());
+    let files = dataset
+        .take_blobs_by_indices(&[0, 1, 2], "blob")
+        .await
+        .unwrap();
+    for ((file, range), expected) in
+        files
+            .into_iter()
+            .zip(ranges)
+            .zip([BlobKind::Inline, BlobKind::Packed, BlobKind::Dedicated])
+    {
+        let file = file.unwrap();
+        assert_eq!(file.kind(), expected);
+        assert_eq!(file.read().await.unwrap(), source_data.slice(range));
+    }
 }
 
 /// Pages a single part holds when its writer is given `options`.

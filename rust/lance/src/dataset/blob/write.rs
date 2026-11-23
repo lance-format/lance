@@ -344,7 +344,7 @@ impl BlobPreprocessField {
 }
 
 impl BlobReaderSource {
-    /// Return the logical payload size after applying any external slice.
+    /// Return the logical payload size after applying the source range.
     fn size(&self) -> u64 {
         self.size
     }
@@ -353,19 +353,19 @@ impl BlobReaderSource {
     fn reader_range(&self) -> Result<Range<usize>> {
         let start = usize::try_from(self.start).map_err(|_| {
             Error::invalid_input(format!(
-                "External blob position {} does not fit into usize",
+                "Blob source position {} does not fit into usize",
                 self.start
             ))
         })?;
         let size = usize::try_from(self.size).map_err(|_| {
             Error::invalid_input(format!(
-                "External blob size {} does not fit into usize",
+                "Blob source size {} does not fit into usize",
                 self.size
             ))
         })?;
         let end = start.checked_add(size).ok_or_else(|| {
             Error::invalid_input(format!(
-                "External blob range overflows usize: position={}, size={}",
+                "Blob source range overflows usize: position={}, size={}",
                 self.start, self.size
             ))
         })?;
@@ -393,13 +393,10 @@ impl BlobReaderSource {
 
 impl BlobWriteSource<'_> {
     /// Return the payload size for a value that can be packed.
-    fn size(&self) -> usize {
+    fn size(&self) -> u64 {
         match self {
-            Self::Bytes(data) => data.len(),
-            Self::Reader(source) => source
-                .size()
-                .try_into()
-                .expect("packed and inline blobs must fit into usize"),
+            Self::Bytes(data) => data.len() as u64,
+            Self::Reader(source) => source.size(),
         }
     }
 }
@@ -551,7 +548,7 @@ impl BlobPreprocessor {
         let max_pack_size = self
             .pack_file_size_override
             .unwrap_or(field_pack_file_threshold);
-        let len = source.size() as u64;
+        let len = source.size();
         let needs_new_pack = self.current_pack.as_ref().is_none_or(|pack| {
             pack.max_size != max_pack_size
                 || pack

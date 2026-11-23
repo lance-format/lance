@@ -717,6 +717,35 @@ impl BlobDescriptorArrayBuilder {
         Self::new_with_metadata(column, true, metadata)
     }
 
+    /// Create a prepared builder using an existing logical Blob v2 field.
+    ///
+    /// This preserves its name, nullability and metadata, including when the
+    /// field is a child of a struct or list.
+    ///
+    /// ```
+    /// use lance::{BlobDescriptorArrayBuilder, blob_field};
+    /// # fn example() -> lance::Result<()> {
+    /// let field = blob_field("item", false);
+    /// let mut builder = BlobDescriptorArrayBuilder::for_field(&field)?;
+    /// builder.push_inline(b"example".as_slice())?;
+    /// let prepared = builder.finish()?;
+    /// assert!(!prepared.field().is_nullable());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn for_field(field: &Field) -> Result<Self> {
+        if !field.is_blob_v2() {
+            return Err(Error::invalid_input(format!(
+                "Field '{}' is not a Blob v2 field",
+                field.name()
+            )));
+        }
+        Ok(Self {
+            field: logical_to_prepared_blob_field(field)?,
+            values: Vec::new(),
+        })
+    }
+
     pub(crate) fn new_with_metadata(
         column: impl Into<String>,
         nullable: bool,

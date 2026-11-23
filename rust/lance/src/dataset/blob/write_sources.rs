@@ -57,7 +57,7 @@ impl BlobWriteSources {
     pub fn add_uploaded_blob(&mut self, relative_path: Path, size: u64) -> Result<BlobDescriptor> {
         let relative_path = validate_managed_reference(relative_path.as_ref(), 0, size)?;
         let mut parts = relative_path.parts();
-        if parts.next().map(|part| part.as_ref() == BLOBS_DIR) != Some(true)
+        if !parts.next().is_some_and(|part| part.as_ref() == BLOBS_DIR)
             || parts.count() != 3
             || relative_path.extension() != Some("payload")
         {
