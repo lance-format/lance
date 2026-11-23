@@ -228,6 +228,11 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         IndexOrderingCapability::Unordered
     }
 
+    /// Whether this plugin can return fragment candidates without scanning data.
+    fn supports_fragment_pruning(&self) -> bool {
+        false
+    }
+
     /// The version of the index plugin
     ///
     /// We assume that indexes are not forwards compatible.  If an index was written with a

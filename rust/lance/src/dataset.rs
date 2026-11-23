@@ -71,6 +71,7 @@ pub mod delta;
 pub mod expire;
 pub mod files;
 pub mod fragment;
+mod fragment_pruning;
 pub(crate) mod fragment_slice;
 mod hash_joiner;
 pub mod index;

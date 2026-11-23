@@ -19,6 +19,9 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{ROW_ADDR, Result};
 use lance_select::RowAddrTreeMap;
+use roaring::RoaringBitmap;
+
+use crate::scalar::SearchResult;
 
 /// Minimum number of scanned rows to dispatch to the CPU pool at once.
 ///
@@ -644,6 +647,39 @@ where
     }
 
     Ok(crate::scalar::SearchResult::at_most(row_addr_tree_map))
+}
+
+/// Collect matching fragments without constructing row ranges.
+pub(super) fn matching_zone_fragments<T: AsRef<ZoneBound>>(
+    zones: &[T],
+    metrics: &dyn crate::metrics::MetricsCollector,
+    mut zone_matches: impl FnMut(&T) -> Result<bool>,
+) -> Result<RoaringBitmap> {
+    let mut fragments = RoaringBitmap::new();
+    let mut comparisons = 0;
+    for zone in zones {
+        let bound = zone.as_ref();
+        let fragment_id = u32::try_from(bound.fragment_id).map_err(|_| {
+            Error::invalid_input(format!("Invalid zone fragment ID {}", bound.fragment_id))
+        })?;
+        if bound.length != 0 && !fragments.contains(fragment_id) {
+            comparisons += 1;
+            if zone_matches(zone)? {
+                fragments.insert(fragment_id);
+            }
+        }
+    }
+    metrics.record_comparisons(comparisons);
+    Ok(fragments)
+}
+
+pub(super) fn matching_row_fragments(result: &SearchResult) -> Option<RoaringBitmap> {
+    match result {
+        SearchResult::Exact(rows) | SearchResult::AtMost(rows) => {
+            Some(rows.selected_rows().iter().map(|(&id, _)| id).collect())
+        }
+        SearchResult::AtLeast(_) => None,
+    }
 }
 
 /// Helper that retrains zones from `stream` and appends them to the existing
