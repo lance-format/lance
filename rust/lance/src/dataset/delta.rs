@@ -114,7 +114,7 @@ impl DatasetDeltaBuilder {
 
     /// Compare the current dataset version against the specified version.
     ///
-    /// The delta will automatically order the versions so that `begin_version` < `end_version`.
+    /// The delta automatically orders the versions so that `begin_version` <= `end_version`.
     /// Cannot be used together with explicit `with_begin_version` and `with_end_version`.
     pub fn compared_against_version(mut self, version: u64) -> Self {
         self.compared_against_version = Some(version);
@@ -232,6 +232,8 @@ impl DatasetDeltaBuilder {
 }
 
 /// APIs for exploring changes between two versions of a dataset.
+///
+/// Accessors reject reversed version or date ranges.
 pub struct DatasetDelta {
     /// The base version number for comparison.
     pub(crate) begin_version: u64,
@@ -261,7 +263,13 @@ impl DatasetDelta {
     /// If no date window is set, returns the explicit `begin_version`/`end_version` stored on
     /// the struct.
     async fn resolve_range(&self) -> Result<(u64, u64)> {
-        if let (Some(begin_ts), Some(end_ts)) = (self.begin_timestamp, self.end_timestamp) {
+        let dates = (self.begin_timestamp, self.end_timestamp);
+        let (begin_version, end_version) = if let (Some(begin_ts), Some(end_ts)) = dates {
+            if begin_ts > end_ts {
+                return Err(Error::invalid_input(format!(
+                    "begin date {begin_ts} is newer than end date {end_ts}"
+                )));
+            }
             // Load all dataset versions and fold them to a version interval matching the date window
             let versions = self.base_dataset.versions().await?;
             let mut begin_version: u64 = 0;
@@ -276,8 +284,8 @@ impl DatasetDelta {
                     end_version = v.version;
                 }
             }
-            Ok((begin_version, end_version))
-        } else if let (Some(begin_ts), None) = (self.begin_timestamp, self.end_timestamp) {
+            (begin_version, end_version)
+        } else if let (Some(begin_ts), None) = dates {
             // Open-ended range: use latest version as end
             let versions = self.base_dataset.versions().await?;
             let mut begin_version: u64 = 0;
@@ -287,16 +295,25 @@ impl DatasetDelta {
                 }
             }
             let end_version = self.base_dataset.latest_version_id().await?;
-            Ok((begin_version, end_version))
+            (begin_version, end_version)
         } else {
             // No date window: use the pre-resolved version interval
-            Ok((self.begin_version, self.end_version))
+            (self.begin_version, self.end_version)
+        };
+        if begin_version > end_version {
+            return Err(Error::invalid_input(format!(
+                "begin version {begin_version} is newer than end version {end_version}"
+            )));
         }
+        Ok((begin_version, end_version))
     }
 
     /// Listing the transactions between two versions.
     pub async fn list_transactions(&self) -> Result<Vec<Transaction>> {
         let (begin_version, end_version) = self.resolve_range().await?;
+        if begin_version == end_version {
+            return Ok(Vec::new());
+        }
         stream::iter((begin_version + 1)..=end_version)
             .map(|version| {
                 let base_dataset = self.base_dataset.clone();
@@ -353,13 +370,6 @@ impl DatasetDelta {
     /// ```
     pub async fn get_deleted_row_ids(&self) -> Result<DatasetRecordBatchStream> {
         let (begin_version, end_version) = self.resolve_range().await?;
-        if begin_version > end_version {
-            // A reversed range would report the rows the range added as
-            // deleted.
-            return Err(Error::invalid_input(format!(
-                "begin version {begin_version} is newer than end version {end_version}"
-            )));
-        }
         let schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
         // Version 0 is the empty snapshot: nothing is live at it, so nothing
         // is deleted relative to it.
@@ -1406,7 +1416,6 @@ mod tests {
     #[case::empty_snapshot(0, 0)]
     #[case::same_version(1, 1)]
     #[case::unchanged_range(2, 3)]
-    #[case::reversed_range(3, 1)]
     #[tokio::test]
     async fn test_delta_pruning_empty(#[case] begin: u64, #[case] end: u64) {
         let mut dataset = create_test_dataset(4, 1, "value", true).await;
@@ -1420,6 +1429,11 @@ mod tests {
             .with_end_version(end)
             .build()
             .unwrap();
+        assert_eq!(
+            delta.list_transactions().await.unwrap().len() as u64,
+            end - begin
+        );
+        assert!(collect_deleted(&delta).await.is_empty());
         for stream in [
             delta.get_inserted_rows().await.unwrap(),
             delta.get_updated_rows().await.unwrap(),
@@ -1512,10 +1526,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_no_transaction() {
-        let ds = create_test_dataset(1_000, 10, "value", false).await;
+        let ds = create_test_dataset(2, 1, "value", false).await;
         let delta = ds.delta().compared_against_version(1).build().unwrap();
-        let result = delta.list_transactions().await;
-        assert_eq!(result.unwrap().len(), 0);
+        assert!(delta.list_transactions().await.unwrap().is_empty());
+
+        let delta = ds
+            .delta()
+            .with_begin_version(u64::MAX)
+            .with_end_version(u64::MAX)
+            .build()
+            .unwrap();
+        assert!(delta.list_transactions().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2288,6 +2309,7 @@ mod tests {
 
         for builder in builders {
             let delta = builder.build().unwrap();
+            assert_eq!(delta.list_transactions().await.unwrap().len(), 2);
             let stream = match change {
                 RowChange::Inserted => delta.get_inserted_rows().await,
                 RowChange::Updated => delta.get_updated_rows().await,
@@ -2814,22 +2836,39 @@ mod tests {
         );
     }
 
-    /// A reversed range would report the rows the range added as deleted.
+    #[rstest]
+    #[case::versions(false, "begin version 2 is newer than end version 1")]
+    #[case::dates(
+        true,
+        "begin date 1970-01-01 00:00:15 UTC is newer than end date 1970-01-01 00:00:14 UTC"
+    )]
     #[tokio::test]
-    async fn test_deleted_row_ids_rejects_a_reversed_range() {
+    async fn test_delta_rejects_reversed_ranges(#[case] by_date: bool, #[case] message: &str) {
         let dir = lance_core::utils::tempfile::TempStrDir::default();
-        write_dataset_temp(&dir, 0, 10, 1, "v1", true, false).await;
-        let ds = write_dataset_temp(&dir, 10, 10, 1, "v2", true, true).await;
-        let delta = ds
-            .delta()
-            .with_begin_version(2)
-            .with_end_version(1)
-            .build()
-            .unwrap();
-        let Err(err) = delta.get_deleted_row_ids().await else {
-            panic!("a reversed range must be rejected")
+        MockClock::set_system_time(std::time::Duration::from_secs(10));
+        write_dataset_temp(&dir, 0, 2, 1, "v1", true, false).await;
+        MockClock::set_system_time(std::time::Duration::from_secs(20));
+        let ds = write_dataset_temp(&dir, 2, 2, 1, "v2", true, true).await;
+        let builder = if by_date {
+            // Both timestamps map to v1. The date order still matters.
+            ds.delta()
+                .with_begin_date(chrono::DateTime::from_timestamp(15, 0).unwrap())
+                .with_end_date(chrono::DateTime::from_timestamp(14, 0).unwrap())
+        } else {
+            ds.delta().with_begin_version(2).with_end_version(1)
         };
-        assert!(err.to_string().contains("newer than end version"), "{err}");
+        let delta = builder.build().unwrap();
+        for result in [
+            delta.list_transactions().await.map(drop),
+            delta.get_inserted_rows().await.map(drop),
+            delta.get_updated_rows().await.map(drop),
+            delta.get_upserted_rows().await.map(drop),
+            delta.get_deleted_row_ids().await.map(drop),
+        ] {
+            let err = result.expect_err("a reversed range must be rejected");
+            assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+            assert!(err.to_string().contains(message), "{err}");
+        }
     }
 
     /// A window opening before v1 resolves begin to the version-0 sentinel:

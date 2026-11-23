@@ -149,6 +149,32 @@ def test_delta_validation_errors():
         ds.delta(compared_against=1, begin_version=1, end_version=1)
 
 
+@pytest.mark.parametrize(
+    "method",
+    [
+        "list_transactions",
+        "get_inserted_rows",
+        "get_updated_rows",
+        "get_deleted_row_ids",
+    ],
+)
+@pytest.mark.parametrize("begin_version", [2, 3], ids=["existing", "missing"])
+def test_delta_rejects_reversed_version_range(method, begin_version):
+    ds = write_dataset(
+        pa.table({"id": [1, 2]}),
+        "memory://",
+        max_rows_per_file=1,
+        enable_stable_row_ids=True,
+    )
+    ds.insert(pa.table({"id": [3]}))
+    delta = ds.delta(begin_version=begin_version, end_version=1)
+
+    with pytest.raises(
+        ValueError, match=f"begin version {begin_version} is newer than end version 1"
+    ):
+        getattr(delta, method)()
+
+
 @pytest.mark.parametrize("method", ["get_inserted_rows", "get_updated_rows"])
 @pytest.mark.parametrize("begin_version", [0, 1, 3])
 def test_delta_row_changes_require_stable_row_ids(method, begin_version):
