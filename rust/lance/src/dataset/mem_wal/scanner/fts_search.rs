@@ -1229,7 +1229,7 @@ impl LsmFtsSearchPlanner {
         })?;
 
         if limit == Some(0) {
-            return zero_candidate_plan(merged);
+            return zero_candidate_plan(merged, lex_ordering);
         }
 
         let per_partition_sorted: Arc<dyn ExecutionPlan> = Arc::new(

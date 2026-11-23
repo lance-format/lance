@@ -2894,8 +2894,10 @@ async fn test_fts_ordered_limit_offset(
 
 /// A zero candidate budget must stop at the leaf sort boundary without building
 /// a zero-fetch `SortExec`, which DataFusion turns into a `TopK` heap that
-/// asserts `k > 0`. A filter keeps the root Match off the corpus planner so the
-/// indexed, flat, and mixed leaf plans actually reach that boundary.
+/// asserts `k > 0`. A non-default WAND factor keeps the root Match off the
+/// corpus planner, whose own zero branch would short-circuit before index
+/// coverage is known, so the indexed, flat, and mixed leaf plans actually reach
+/// that boundary.
 #[rstest]
 #[case::flat(false, false)]
 #[case::indexed(true, false)]
@@ -2945,23 +2947,50 @@ async fn test_fts_zero_candidate_limit_at_leaf_sort(
 
     let mut scanner = dataset.scan();
     scanner
-        .filter("id >= 0")
-        .unwrap()
         .project(&["id", SCORE_COL])
         .unwrap()
         .full_text_search(
             FullTextSearchQuery::new("needle".into())
                 .with_column("text".into())
                 .unwrap()
+                .wand_factor(Some(2.0))
                 .limit(Some(0)),
         )
-        .unwrap()
-        .limit(Some(2), None)
         .unwrap();
     let expected_schema = scanner.schema().await.unwrap();
-    let batch = scanner.try_into_batch().await.unwrap();
-    assert_eq!(batch.num_rows(), 0);
-    assert_eq!(batch.schema(), expected_schema);
+    let plan_text = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !plan_text.contains("EmptyExec"),
+        "the zero-candidate query must reach the leaf boundary, not the corpus short circuit:\n{plan_text}"
+    );
+    if !has_index || has_append {
+        assert!(
+            plan_text.contains("SortExec"),
+            "flat and mixed leaf plans must reach the revised sort boundary:\n{plan_text}"
+        );
+    }
+    // No outer pagination: the optimized plan itself must stay single-partition,
+    // especially when the leaf fallback unions indexed and flat children.
+    let plan = scanner.create_plan().await.unwrap();
+    assert_eq!(plan.schema(), expected_schema);
+    assert_eq!(
+        plan.properties().output_partitioning().partition_count(),
+        1,
+        "the optimized zero-candidate leaf plan must expose one partition"
+    );
+    let batches: Vec<RecordBatch> = plan
+        .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
+    for batch in &batches {
+        assert_eq!(batch.schema(), expected_schema);
+    }
 }
 
 /// The MultiMatch fallback aggregates per-field hits and sorts them. A partial

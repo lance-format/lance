@@ -26,7 +26,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, expressions};
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -291,11 +291,17 @@ fn has_complete_hybrid_fts_coverage(
 /// heap that asserts `k > 0`. Filtering with a false predicate keeps the input
 /// schema and still executes the child, so checks that only run during
 /// execution (notably `combined_fields` tokenizer compatibility) still report
-/// their errors. Coalescing preserves the single-partition output the sort it
-/// replaces would have produced.
-pub fn zero_candidate_plan(input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+/// their errors. The coalesce gives the sort its single input partition, and a
+/// fetch-less sort is not a distribution-only operator, so `EnforceDistribution`
+/// cannot strip the single-partition output. The sort also consumes the whole
+/// child stream, which keeps those errors observable.
+pub fn zero_candidate_plan(
+    input: Arc<dyn ExecutionPlan>,
+    ordering: LexOrdering,
+) -> Result<Arc<dyn ExecutionPlan>> {
     let filtered = Arc::new(LanceFilterExec::try_new(lit(false), input)?);
-    Ok(Arc::new(CoalescePartitionsExec::new(filtered)))
+    let single_partition = Arc::new(CoalescePartitionsExec::new(filtered));
+    Ok(Arc::new(SortExec::new(ordering, single_partition)))
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -1568,10 +1574,10 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
-                if params.limit == Some(0) {
-                    return zero_candidate_plan(fts_node);
-                }
                 let sort_exprs = Self::fts_score_sort_exprs(fts_node.schema().as_ref())?;
+                if params.limit == Some(0) {
+                    return zero_candidate_plan(fts_node, sort_exprs.into());
+                }
 
                 // `params.limit` is the recursive planning contract. Compound
                 // parents pass `None` when they require every candidate.
@@ -2295,13 +2301,14 @@ impl Scanner {
                 ));
             }
         };
+        if params.limit == Some(0) {
+            let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
+            return zero_candidate_plan(plan, sort_exprs.into());
+        }
         let plan = Arc::new(RepartitionExec::try_new(
             plan,
             Partitioning::RoundRobinBatch(1),
         )?);
-        if params.limit == Some(0) {
-            return zero_candidate_plan(plan);
-        }
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
             options: SortOptions {
@@ -2684,7 +2691,8 @@ impl Scanner {
             )?)
         };
         let plan: Arc<dyn ExecutionPlan> = if params.limit == Some(0) {
-            zero_candidate_plan(scored_plan)?
+            let sort_exprs = Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?;
+            zero_candidate_plan(scored_plan, sort_exprs.into())?
         } else {
             Arc::new(
                 SortExec::new(
