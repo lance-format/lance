@@ -20,12 +20,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::compute::take;
 use arrow::pyarrow::*;
-use arrow_array::{RecordBatchReader, make_array};
+use arrow_array::cast::AsArray;
+use arrow_array::{RecordBatch, RecordBatchReader, StructArray, UInt64Array, make_array};
 use arrow_data::ArrayData;
+use arrow_schema::ArrowError;
+use futures::{Stream, TryStreamExt};
 use lance::dataset::scanner::{
     ColumnOrdering, ExecutionSummaryCounts, QueryFilter, RowAddrTreeMap,
 };
+use lance_arrow::RecordBatchExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::inverted::query::Occur;
@@ -38,10 +43,11 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::MetricType;
 use pyo3::exceptions::{PyKeyError, PyValueError};
-use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::pyclass;
 use pyo3::types::{PyBytes, PyDict};
+use pyo3::{import_exception, intern};
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 use ::lance::dataset::scanner::Scanner as LanceScanner;
 
@@ -50,6 +56,8 @@ use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::logical_arrow_schema;
 use crate::utils::PyLance;
+
+import_exception!(pyarrow, ArrowInvalid);
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
@@ -181,6 +189,36 @@ impl Scanner {
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
+    fn take_sorted_positions(
+        self_: PyRef<'_, Self>,
+        positions: Vec<u64>,
+    ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, u64)> {
+        if !positions.is_sorted() {
+            return Err(PyValueError::new_err("positions must be sorted"));
+        }
+        let scanner = self_.scanner.clone();
+        let scan = async move {
+            let stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            take_sorted_positions(stream, &positions)
+                .await
+                .map_err(|err| ArrowInvalid::new_err(err.to_string()))
+        };
+        let py = Some(self_.py());
+        // Drive the scan from the caller thread when possible. A consumer task
+        // on the runtime competes with the workers producing the batches.
+        let (batches, matched) = match Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| rt().spawn(py, scan))
+            }
+            Ok(_) => rt().spawn(py, scan),
+            Err(_) => rt().block_on(py, scan),
+        }??;
+        Ok((batches.into_iter().map(PyArrowType).collect(), matched))
+    }
+
     fn to_pyarrow(
         self_: PyRef<'_, Self>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
@@ -193,6 +231,30 @@ impl Scanner {
 
         Ok(PyArrowType(Box::new(reader)))
     }
+}
+
+async fn take_sorted_positions(
+    mut stream: impl Stream<Item = ::lance::Result<RecordBatch>> + Unpin,
+    mut positions: &[u64],
+) -> Result<(Vec<RecordBatch>, u64), ArrowError> {
+    let mut selected = Vec::new();
+    let mut matched = 0;
+    while let Some(batch) = stream.try_next().await? {
+        let batch_end = matched + batch.num_rows() as u64;
+        let count = positions.partition_point(|position| *position < batch_end);
+        if count != 0 {
+            let offsets =
+                UInt64Array::from_iter_values(positions[..count].iter().map(|pos| pos - matched));
+            let rows = take(&StructArray::from(batch.clone()), &offsets, None)?;
+            selected.push(batch.try_new_from_struct_array(rows.as_struct().clone())?);
+            positions = &positions[count..];
+            if positions.is_empty() {
+                return Ok((selected, batch_end));
+            }
+        }
+        matched = batch_end;
+    }
+    Ok((selected, matched))
 }
 
 impl FromPyObject<'_, '_> for PyLance<ColumnOrdering> {
@@ -675,5 +737,38 @@ impl PySearchFilter {
         Ok(Self {
             inner: QueryFilter::Vector(vector_query),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::task::Poll;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use futures::stream;
+
+    use super::take_sorted_positions;
+
+    #[tokio::test]
+    async fn take_positions_skips_empty_batches_and_stops() {
+        let values = Arc::new(Int64Array::from(vec![0, 1, 2, 3])) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([("id", values)]).unwrap();
+        let batches = [
+            batch.slice(0, 0),
+            batch.slice(0, 2),
+            batch.slice(2, 0),
+            batch.slice(2, 2),
+        ];
+        let mut batches = batches.into_iter();
+        let stream = stream::poll_fn(|_| {
+            Poll::Ready(Some(Ok(batches
+                .next()
+                .expect("polled past the last requested row"))))
+        });
+
+        let (selected, matched) = take_sorted_positions(stream, &[0, 2]).await.unwrap();
+        assert_eq!(selected, vec![batch.slice(0, 1), batch.slice(2, 1)]);
+        assert_eq!(matched, 4);
     }
 }
