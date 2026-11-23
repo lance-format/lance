@@ -1117,11 +1117,11 @@ impl InvertedIndexParams {
         if self.lower_case {
             builder = builder.filter_dynamic(LowerCaser);
         }
-        if self.stem {
-            builder = builder.filter_dynamic(Stemmer::new(self.language));
-        }
         if self.remove_stop_words {
             builder = builder.filter_dynamic(self.stop_word_filter()?);
+        }
+        if self.stem {
+            builder = builder.filter_dynamic(Stemmer::new(self.language));
         }
         if self.ascii_folding {
             builder = builder.filter_dynamic(AsciiFoldingFilter);
@@ -1932,6 +1932,28 @@ mod tests {
             tokens.is_empty(),
             "common English stop words leaked through the icu pipeline (stem={stem}): {tokens:?}"
         );
+    }
+
+    // Stop words are the words as written, so they must be removed before
+    // stemming: "owned" stems to the stop word "own", and "only" stems to
+    // "onli", which is not in the list.
+    #[rstest]
+    #[case::english("English", "owned only", &["own"])]
+    #[case::spanish_stop_words("Spanish", "para como pero datos", &["dat"])]
+    fn test_stop_words_are_removed_before_stemming(
+        #[case] language: &str,
+        #[case] text: &str,
+        #[case] expected: &[&str],
+    ) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .language(language)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search(text);
+        let tokens: Vec<String> =
+            std::iter::from_fn(|| stream.next().map(|t| t.text.clone())).collect();
+        assert_eq!(tokens, expected);
     }
 
     // Common Chinese function words/particles (了 是 在 的 有 我) are the
