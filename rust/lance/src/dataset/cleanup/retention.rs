@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Ordered cleanup rules, policy defaults and validation.
+//! Ordered retention rules, policy defaults and validation.
 
 use std::time::Duration;
 
@@ -47,23 +47,24 @@ fn deserialize_retention_duration<'de, D: Deserializer<'de>>(
 
 /// Ordered retention rules. By default, expire versions older than two weeks.
 ///
-/// Use with [`super::CleanupOperation::with_retention_policy`]. The legacy
-/// [`super::CleanupPolicy`] remains available for version and file-cleanup filters.
+/// Use with [`super::CleanupOperation::with_retention_policy`]. This is distinct
+/// from the dataset-level [`super::CleanupPolicy`], which selects manifests and
+/// controls file cleanup.
 /// ```
-/// # use lance::dataset::cleanup::retention::{CleanupPolicy, CleanupRule};
+/// # use lance::dataset::cleanup::{CleanupRule, RetentionPolicy};
 /// # use std::time::Duration;
-/// let policy = CleanupPolicy::new(vec![
+/// let policy = RetentionPolicy::new(vec![
 ///     CleanupRule::KeepOne { per_interval: Duration::from_secs(3600), older_than: Duration::from_secs(2 * 86_400) },
 ///     CleanupRule::RemoveAll { older_than: Duration::from_secs(30 * 86_400) },
 /// ]);
 /// ```
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CleanupPolicy {
+pub struct RetentionPolicy {
     pub(super) rules: Vec<CleanupRule>,
 }
 
-impl CleanupPolicy {
+impl RetentionPolicy {
     /// Create a policy from ordered rules, validated when applied to cleanup.
     pub fn new(rules: Vec<CleanupRule>) -> Self {
         Self { rules }
@@ -75,7 +76,7 @@ impl CleanupPolicy {
     }
 }
 
-impl Default for CleanupPolicy {
+impl Default for RetentionPolicy {
     fn default() -> Self {
         Self::new(vec![CleanupRule::RemoveAll {
             older_than: Duration::from_secs(14 * 86_400),
@@ -83,7 +84,18 @@ impl Default for CleanupPolicy {
     }
 }
 
-/// Parse a cleanup policy containing ordered rules with duration strings.
+/// Deprecated alias for [`RetentionPolicy`].
+///
+/// The ordered-rule type was renamed to distinguish it from the dataset-level
+/// [`CleanupPolicy`](super::CleanupPolicy), which selects manifests for file
+/// cleanup. Existing `retention::CleanupPolicy` code keeps compiling during
+/// migration.
+#[deprecated(
+    note = "use `RetentionPolicy` for ordered retention rules; `CleanupPolicy` remains the dataset-level cleanup filter"
+)]
+pub type CleanupPolicy = RetentionPolicy;
+
+/// Parse a retention policy containing ordered rules with duration strings.
 ///
 /// ```
 /// # use lance::dataset::cleanup::parse_cleanup_policy;
@@ -93,8 +105,8 @@ impl Default for CleanupPolicy {
 /// ]}"#)?;
 /// # Ok::<_, lance::Error>(())
 /// ```
-pub fn parse_cleanup_policy(value: &str) -> Result<CleanupPolicy> {
-    let policy: CleanupPolicy = serde_json::from_str(value).map_err(|error| {
+pub fn parse_cleanup_policy(value: &str) -> Result<RetentionPolicy> {
+    let policy: RetentionPolicy = serde_json::from_str(value).map_err(|error| {
         Error::invalid_input(format!("Invalid cleanup retention policy: {error}"))
     })?;
     validate_retention_policy(&policy.rules)?;
