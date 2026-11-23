@@ -14,7 +14,8 @@ use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    AutoCleanupParams, MergeInsertBuilder, NewColumnTransform, UpdateBuilder, WhenNotMatched,
+    AutoCleanupParams, MergeInsertBuilder, NewColumnTransform, TransactionReadSource,
+    UpdateBuilder, WhenNotMatched,
 };
 use crate::datatypes::Schema;
 use crate::io::commit::load_and_sort_new_transactions;
@@ -114,13 +115,19 @@ async fn test_low_io_transaction_child() {
         assert_eq!(dataset.get_fragments().len(), 2);
 
         // An empty history must finish too: no sender will publish a manifest.
-        let (current, transactions) = load_and_sort_new_transactions(&dataset).await.unwrap();
+        let (current, transactions) =
+            load_and_sort_new_transactions(&dataset, TransactionReadSource::SessionCache)
+                .await
+                .unwrap();
         assert_eq!(current.version().version, 1);
         assert!(transactions.is_empty());
 
         let stale = dataset.clone();
         dataset.append(reader(), None).await.unwrap();
-        let (current, transactions) = load_and_sort_new_transactions(&stale).await.unwrap();
+        let (current, transactions) =
+            load_and_sort_new_transactions(&stale, TransactionReadSource::SessionCache)
+                .await
+                .unwrap();
         assert_eq!(current.version().version, 2);
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].0, 2);

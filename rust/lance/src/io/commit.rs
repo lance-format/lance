@@ -59,7 +59,8 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions, write_manifest_file,
+    NewTransactionResult, TRANSACTIONS_DIR, TransactionReadSource, load_new_transactions,
+    write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
     ReadSnapshot, validate_frag_reuse_history,
@@ -1776,11 +1777,12 @@ async fn prepare_attempt(
 
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
+    source: TransactionReadSource,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
     let NewTransactionResult {
         dataset: new_ds,
         new_transactions,
-    } = load_new_transactions(dataset);
+    } = load_new_transactions(dataset, source);
     let new_transactions = new_transactions.try_collect::<Vec<_>>();
     let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
     txns.sort_by_key(|(version, _)| *version);
@@ -2028,8 +2030,13 @@ pub(crate) async fn commit_transaction(
             }
         } else if !strict_overwrite {
             let checked_since = dataset.manifest.version;
+            let source = if append_idempotency_key.is_some() {
+                TransactionReadSource::Storage
+            } else {
+                TransactionReadSource::SessionCache
+            };
             let (loaded_dataset, other_transactions) =
-                load_and_sort_new_transactions(&dataset).await?;
+                load_and_sort_new_transactions(&dataset, source).await?;
             dataset = loaded_dataset;
 
             ensure_can_write_manifest(&dataset.manifest)?;
@@ -2489,6 +2496,7 @@ mod tests {
     use super::*;
 
     use crate::Dataset;
+    use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::cleanup::CleanupPolicyBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{
@@ -3797,7 +3805,10 @@ mod tests {
         // Now load the dataset at version 1 and check that load_and_sort_new_transactions
         // returns transactions in order
         let dataset_v1 = dataset.checkout_version(1).await.unwrap();
-        let (_, transactions) = load_and_sort_new_transactions(&dataset_v1).await.unwrap();
+        let (_, transactions) =
+            load_and_sort_new_transactions(&dataset_v1, TransactionReadSource::SessionCache)
+                .await
+                .unwrap();
 
         // Verify transactions are sorted by version
         let versions: Vec<u64> = transactions.iter().map(|(v, _)| *v).collect();
@@ -4608,6 +4619,78 @@ mod tests {
         assert_eq!(
             latest.scan().try_into_batch().await.unwrap(),
             simple_batch(&simple_schema(), vec![0, 1, 2]),
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::old_key("old-job", false)]
+    #[case::new_key("new-job", true)]
+    #[tokio::test]
+    async fn test_append_idempotency_after_recreate_at_same_uri(
+        #[case] key: &str,
+        #[case] is_duplicate: bool,
+    ) {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let original = create_append_test_dataset(uri).await;
+        let old_append = stage_append(original.clone(), -1, "old-job").await;
+        let old_uuid = old_append.uuid.clone();
+        let original = CommitBuilder::new(original)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(old_append)
+            .await
+            .unwrap();
+        let session = original.session.clone();
+        std::fs::remove_dir_all(uri).unwrap();
+
+        let recreated = create_append_test_dataset(uri).await;
+        let mut new_append = stage_append(recreated.clone(), 1, "new-job").await;
+        // A spilled transaction is not prefetched when version 2 is loaded.
+        // This leaves the original table's cached version 2 in the session.
+        Arc::make_mut(new_append.transaction_properties.as_mut().unwrap())
+            .insert("padding".into(), "x".repeat(MAX_INLINE_TRANSACTION_BYTES));
+        let recreated = CommitBuilder::new(recreated)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(new_append)
+            .await
+            .unwrap();
+        assert_eq!(recreated.version().version, 2);
+        assert!(recreated.manifest.transaction_section.is_none());
+
+        let base = Arc::new(
+            DatasetBuilder::from_uri(uri)
+                .with_session(session)
+                .with_version(1)
+                .load()
+                .await
+                .unwrap(),
+        );
+        let (_, cached) =
+            load_and_sort_new_transactions(&base, TransactionReadSource::SessionCache)
+                .await
+                .unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].0, 2);
+        assert_eq!(cached[0].1.uuid, old_uuid);
+
+        let append = stage_append(base.clone(), 2, key).await;
+        let result = CommitBuilder::new(base)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(append)
+            .await;
+        let latest = Dataset::open(uri).await.unwrap();
+        let (expected_version, expected_values) = if is_duplicate {
+            let error = result.unwrap_err();
+            assert_eq!(error.append_already_committed_version(), Some(2));
+            (2, vec![0, 1])
+        } else {
+            assert_eq!(result.unwrap().version().version, 3);
+            (3, vec![0, 1, 2])
+        };
+        assert_eq!(latest.version().version, expected_version);
+        assert_eq!(
+            latest.scan().try_into_batch().await.unwrap(),
+            simple_batch(&simple_schema(), expected_values),
         );
     }
 
