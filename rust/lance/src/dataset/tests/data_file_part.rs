@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use arrow::array::AsArray;
@@ -27,7 +27,7 @@ use lance_core::{
     datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling, BlobKind},
     utils::{
         blob::blob_path,
-        tempfile::TempDir,
+        tempfile::{TempDir, TempStrDir},
         testing::{ProxyObjectStore, ProxyObjectStorePolicy},
     },
 };
@@ -40,17 +40,21 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
+use mock_instant::thread_local::MockClock;
 use object_store::path::Path;
 use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use rstest::rstest;
+use sha2::{Digest, Sha256};
 
 use crate::blob::{
     BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobFile, BlobWriteSources, blob_field,
 };
 use crate::dataset::blob::test_util::{managed_blob_schema, recording_range_store};
+use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
-use crate::dataset::write::WriteParams;
+use crate::dataset::write::{WriteMode, WriteParams};
 use crate::dataset::{DataFilePart, DataFileTarget, WriteDestination};
 use crate::{Dataset, Result};
 
@@ -180,6 +184,124 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
         batch["id"].as_primitive::<Int32Type>().values(),
         &[12, 13, 10, 11]
     );
+}
+
+#[tokio::test]
+async fn ordinary_blob_parts_survive_retained_version_cleanup() {
+    let dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        vec![blob_field("blob", false)],
+        HashMap::from([(MANAGED_BLOBS_META_KEY.to_string(), "false".to_string())]),
+    ));
+    let make_batch = |payloads: &[Vec<u8>]| {
+        let mut blobs = BlobArrayBuilder::new(payloads.len());
+        for payload in payloads {
+            blobs.push_bytes(payload).unwrap();
+        }
+        RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap()
+    };
+    let payloads: Vec<Vec<u8>> = [100 * 1024, 100 * 1024, 128 * 1024, 137 * 1024]
+        .into_iter()
+        .enumerate()
+        .map(|(row, size)| {
+            (0..size)
+                .map(|offset| ((offset * 17 + offset / 251 + row * 37) % 256) as u8)
+                .collect()
+        })
+        .collect();
+    let expected = payloads
+        .iter()
+        .map(|bytes| (bytes.len(), Sha256::digest(bytes)))
+        .collect::<Vec<_>>();
+
+    // The original version has its own ordinary sidecar, which cleanup can reclaim.
+    let original = make_batch(&[vec![0; 100 * 1024], vec![], vec![], vec![]]);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(original)], schema.clone()),
+        dir.as_str(),
+        Some(params.clone()),
+    )
+    .await
+    .unwrap();
+    let target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        ConcreteFileVersion::V2_2,
+    )
+    .unwrap();
+    let parts = [
+        write_part(&dataset, &target, Some(1..10), make_batch(&payloads[..2])).await,
+        write_part(&dataset, &target, Some(10..20), make_batch(&payloads[2..])).await,
+    ];
+    let data_file = dataset
+        .concat_data_file_parts(&target, &parts)
+        .await
+        .unwrap();
+    // The local store reports real mtimes, which cleanup compares with manifest times.
+    MockClock::set_system_time(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap(),
+    );
+    let replacement = DataReplacementGroup(only_fragment(&dataset).id() as u64, data_file);
+    let published = commit(&dataset, replacement).await.unwrap();
+    let retained_version = published.version_id();
+    target.finish(&published).await.unwrap();
+
+    // Only the retained manifest references the assembled file after the overwrite.
+    let latest = Dataset::write(
+        RecordBatchIterator::new([Ok(make_batch(&[vec![255]]))], schema.clone()),
+        dir.as_str(),
+        Some(WriteParams {
+            mode: WriteMode::Overwrite,
+            ..params
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(latest.version_id(), retained_version + 1);
+    assert_ne!(
+        only_fragment(&latest).metadata().files[0].path,
+        target.file_name
+    );
+    let policy = CleanupPolicyBuilder::default()
+        .retain_n_versions(&latest, 2)
+        .await
+        .unwrap()
+        .build();
+    let removed = latest.cleanup(policy).execute().await.unwrap();
+    assert_eq!(removed.old_versions, 1);
+    assert_eq!(removed.data_files_removed, 2); // Original data file and its sidecar.
+    assert_eq!(removed.failed_deletes, 0);
+
+    let retained = Arc::new(
+        DatasetBuilder::from_uri(dir.as_str())
+            .with_version(retained_version)
+            .load()
+            .await
+            .unwrap(),
+    );
+    let blobs = retained
+        .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
+        .await
+        .unwrap();
+    assert_eq!(blobs.len(), expected.len());
+    let sidecar_dir = retained.data_dir().join(target.data_file_key());
+    for (row, (blob, (length, digest))) in blobs.into_iter().zip(expected).enumerate() {
+        let blob = blob.unwrap();
+        assert!(matches!(
+            blob.kind(),
+            BlobKind::Packed | BlobKind::Dedicated
+        ));
+        assert!(blob.data_path().prefix_matches(&sidecar_dir));
+        let bytes = blob.read().await.unwrap();
+        assert_eq!(bytes.len(), length, "row {row}");
+        assert_eq!(Sha256::digest(&bytes), digest, "row {row}");
+    }
 }
 
 #[rstest]
