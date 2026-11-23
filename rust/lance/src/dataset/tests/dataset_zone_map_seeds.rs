@@ -3717,7 +3717,7 @@ async fn test_config_seed_boundary_real_sizes(
         .iter()
         .filter(|(start, end)| start / index != (end - 1) / index)
         .collect();
-    let expected_reused_records = (records.len() - crossing.len()) as i64;
+    let expected_reused_records = records.len() - crossing.len();
     let expected_scanned_rows =
         BOUNDARY_CREATE_ROWS + crossing.iter().map(|(start, end)| end - start).sum::<i64>();
 
@@ -3756,13 +3756,11 @@ async fn test_config_seed_boundary_real_sizes(
         assert_eq!(scanned, all_fragments, "{context}: {report:?}");
     }
     assert_eq!(
-        report.reused_records,
-        expected_reused_records.try_into().unwrap(),
+        report.reused_records, expected_reused_records,
         "{context}: {report:?}"
     );
     assert_eq!(
-        report.scanned_rows,
-        expected_scanned_rows.try_into().unwrap(),
+        report.scanned_rows, expected_scanned_rows as u64,
         "{context}: {report:?}"
     );
 
