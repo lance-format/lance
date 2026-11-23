@@ -608,13 +608,11 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 metrics.as_ref(),
             )
             .await?;
-            let representative_index = columns
-                .iter()
-                .flat_map(|column| column.indices.first())
-                .next();
-            let row_addr_to_row_id =
-                fts_row_addr_to_row_id(&ds_for_scope, representative_index).await?;
-            let address_domain = fts_segments_are_address_domain(&ds_for_scope, &all_segments);
+            // `all_segments` spans every target column, so this is also what
+            // rejects two columns' indexes that disagree on the domain: their
+            // postings are merged on the stored identifier alone.
+            let address_domain = fts_segments_are_address_domain(&ds_for_scope, &all_segments)?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
 
             if preset_base_scorer.is_some()
                 && covered_fragments

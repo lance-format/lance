@@ -746,8 +746,8 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             let indices =
                 open_fts_segments(&dataset, &column, segments_to_open, &metrics.index_metrics)
                     .await?;
-            let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, indices.first()).await?;
-            let address_domain = fts_segments_are_address_domain(&dataset, segments_to_open);
+            let address_domain = fts_segments_are_address_domain(&dataset, segments_to_open)?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, address_domain).await?;
             let first_index = indices.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {column} has no committed segments"
@@ -1161,9 +1161,9 @@ impl ExecutionPlan for CompoundQueryExec {
             let dataset_for_scope = dataset.clone();
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
+            let address_domain = fts_segments_are_address_domain(&dataset_for_scope, &segments)?;
             let row_addr_to_row_id =
-                fts_row_addr_to_row_id(&dataset_for_scope, indices.first()).await?;
-            let address_domain = fts_segments_are_address_domain(&dataset_for_scope, &segments);
+                fts_row_addr_to_row_id(&dataset_for_scope, address_domain).await?;
             if let Some(first_index) = indices.first() {
                 let snapshot = tokenize_compound_query(&query, first_index.as_ref())?;
                 tokenized_query.get_or_init(|| snapshot);
@@ -1787,7 +1787,9 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 .iter()
                 .flat_map(|selection| selection.segments.iter().cloned())
                 .collect::<Vec<_>>();
-            let address_domain = fts_segments_are_address_domain(&dataset, &selected_segments);
+            // `selected_segments` spans every target column of a cross-column
+            // query, so this also rejects columns whose indexes disagree.
+            let address_domain = fts_segments_are_address_domain(&dataset, &selected_segments)?;
             // DatasetPreFilter starts its deletion and filter prerequisites in
             // the background. Construct it before opening index segments so
             // both I/O paths can make progress concurrently.
@@ -1828,14 +1830,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 }
             }))
             .await?;
-            let row_addr_to_row_id = fts_row_addr_to_row_id(
-                &dataset,
-                opened_columns
-                    .iter()
-                    .flat_map(|(_, indices)| indices.first())
-                    .next(),
-            )
-            .await?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, address_domain).await?;
 
             let mut tokenizer_indices = HashMap::with_capacity(opened_columns.len());
             let mut partition_counts = HashMap::with_capacity(opened_columns.len());

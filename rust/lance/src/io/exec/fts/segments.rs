@@ -15,7 +15,6 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
-use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
 use lance_index::scalar::inverted::{CombinedFieldColumn, InvertedIndex, MemBM25Scorer};
@@ -44,20 +43,75 @@ pub(super) type RowAddrToRowId = dyn Fn(u64) -> Option<u64> + Send + Sync;
 /// row address are the same value, and `build_scalar_index` relabels a fresh
 /// build's segment to a pre-`INVERTED_ROW_ADDR_DOMAIN_VERSION` version in
 /// that case specifically so an old reader still understands it -- not
-/// because its stored values differ in kind. With stable row ids the two
-/// domains genuinely can differ, and then this defers to the first segment's
-/// own `results_are_row_addrs()` (uniform across a committed named index; see
-/// `append.rs`'s `legacy_domain_mismatch`), true unless it is a legacy
-/// segment predating that version.
+/// because its stored values differ in kind. Mixed labels are therefore both
+/// expected and harmless on such a dataset, and are not checked.
+///
+/// With stable row ids the two domains genuinely differ, and every segment
+/// reaching one query has to agree on which one it stores. A caller passes
+/// every segment the query will read, which for a multi-column query
+/// (`combined_fields`, a cross-column compound) spans *several named
+/// indexes*: their postings are merged on the stored identifier alone, so
+/// one column's row id `2` and another's row address `1 << 32` for the same
+/// row would be scored as two unrelated documents. Within a single named
+/// index that mix is already refused at write time -- `optimize_indices`'
+/// `legacy_domain_mismatch` rebuilds rather than merging across domains, and
+/// `manifest_build` rejects a commit that would publish one -- but nothing
+/// couples two columns' indexes, and nothing could: rebuilding one column's
+/// index is a legitimate commit on its own, and only a query spanning both
+/// makes the pair wrong. Disagreement is therefore rejected here, at the one
+/// point that sees every index a query reads.
 pub(super) fn fts_segments_are_address_domain(
     dataset: &Dataset,
     segments: &[IndexMetadata],
-) -> bool {
-    !dataset.manifest.uses_stable_row_ids()
-        || segments
-            .first()
-            .map(|segment| segment.results_are_row_addrs())
-            .unwrap_or(true)
+) -> Result<bool> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(true);
+    }
+    shared_segment_domain(segments)
+}
+
+/// The one domain every segment in `segments` agrees on, or an error naming
+/// the two that disagree. `true` for an empty set, which has nothing to
+/// contradict.
+///
+/// Within one named index a mixed set is already refused when it is committed
+/// (`manifest_build`'s per-name check), so reaching this with one is a sign of
+/// a manifest written by something other than that path. Across named indexes
+/// -- the columns of one multi-column query -- nothing refuses it at write
+/// time and nothing could: rebuilding one column's index is a legitimate
+/// commit on its own, and only a query spanning both makes the pair wrong.
+fn shared_segment_domain(segments: &[IndexMetadata]) -> Result<bool> {
+    let Some(first) = segments.first() else {
+        return Ok(true);
+    };
+    let first_is_row_addrs = first.results_are_row_addrs();
+    if let Some(other) = segments
+        .iter()
+        .find(|segment| segment.results_are_row_addrs() != first_is_row_addrs)
+    {
+        let describe = |segment: &IndexMetadata| {
+            format!(
+                "'{}' ({}, index_version {}) stores row {}",
+                segment.name,
+                segment.uuid,
+                segment.index_version,
+                if segment.results_are_row_addrs() {
+                    "addresses"
+                } else {
+                    "ids"
+                },
+            )
+        };
+        return Err(Error::invalid_input(format!(
+            "FTS index segments disagree on the identity domain they store: segment {} \
+             while segment {}. A query merges their postings on that identifier alone and \
+             cannot combine the two domains. Rebuild the older index with \
+             create_index(..., replace: true).",
+            describe(first),
+            describe(other),
+        )));
+    }
+    Ok(first_is_row_addrs)
 }
 
 /// Open one FTS segment as an [`InvertedIndex`].
@@ -119,9 +173,11 @@ pub(super) async fn open_fts_segments(
     // A segment persisted before `INVERTED_ROW_ADDR_DOMAIN_VERSION` stores row
     // ids, which can remain live in a sibling segment after a stable-row-id
     // row moves; a segment built since stores row addresses, which do not
-    // (see `SegmentRowDomain`). `results_are_row_addrs` is uniform across a
-    // named index's segments (`append.rs` rebuilds rather than mixes them),
-    // so the first segment's domain speaks for all of them.
+    // (see `SegmentRowDomain`). Opening is the chokepoint every indexed FTS
+    // path funnels through, so this is where a committed index whose segments
+    // disagree fails loudly rather than answering from two numbering systems
+    // at once.
+    fts_segments_are_address_domain(dataset, segments)?;
     let row_domain = match segments.first() {
         Some(first) if first.results_are_row_addrs() => SegmentRowDomain::RowAddress,
         _ => SegmentRowDomain::RowId,
@@ -135,9 +191,11 @@ pub(super) async fn open_fts_segments(
 }
 
 /// Build the row-address-to-row-id translation this query's final output
-/// needs, from `representative`'s domain -- every segment of a committed
-/// named index shares one domain (`append.rs`'s `legacy_domain_mismatch`
-/// forces a rebuild rather than letting them disagree).
+/// needs, for a query whose segments resolved to `address_domain` via
+/// [`fts_segments_are_address_domain`]. Taking the resolved domain rather
+/// than re-deriving one from a representative index keeps the translation of
+/// the results and the domain the postings and masks were read in from
+/// drifting apart -- on a multi-column query they are not the same index.
 ///
 /// `None` (a no-op) when the two coincide: no stable row ids, or a
 /// row-id-domain segment. The latter is a transient state right after a
@@ -154,11 +212,9 @@ pub(super) async fn open_fts_segments(
 /// narrower per-segment union.
 pub(super) async fn fts_row_addr_to_row_id(
     dataset: &Dataset,
-    representative: Option<&Arc<InvertedIndex>>,
+    address_domain: bool,
 ) -> Result<Option<Arc<RowAddrToRowId>>> {
-    if !dataset.manifest.uses_stable_row_ids()
-        || !representative.is_some_and(|index| index.results_are_row_addresses())
-    {
+    if !dataset.manifest.uses_stable_row_ids() || !address_domain {
         return Ok(None);
     }
     let fragment_ids = dataset
@@ -427,4 +483,95 @@ pub(super) async fn search_segments(
         .into_iter()
         .map(|std::cmp::Reverse(document)| document)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_index::scalar::inverted::INVERTED_ROW_ADDR_DOMAIN_VERSION;
+
+    fn segment(name: &str, index_version: i32) -> IndexMetadata {
+        IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![0],
+            covering_fields: Vec::new(),
+            name: name.to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            // `results_are_row_addrs` reads the details' type alongside the
+            // version, so the stub has to carry an FTS identity.
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.table.InvertedIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            index_version,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    const ADDR_VERSION: i32 = INVERTED_ROW_ADDR_DOMAIN_VERSION as i32;
+    const LEGACY_VERSION: i32 = ADDR_VERSION - 1;
+
+    #[test]
+    fn empty_and_uniform_segment_sets_resolve_to_one_domain() {
+        assert!(shared_segment_domain(&[]).unwrap());
+        assert!(
+            shared_segment_domain(&[
+                segment("title_idx", ADDR_VERSION),
+                segment("title_idx", ADDR_VERSION),
+            ])
+            .unwrap()
+        );
+        assert!(
+            !shared_segment_domain(&[
+                segment("title_idx", LEGACY_VERSION),
+                segment("title_idx", LEGACY_VERSION),
+            ])
+            .unwrap()
+        );
+    }
+
+    /// A manifest written outside `manifest_build`'s commit-time check can
+    /// still pair the two domains, and a multi-column query pairs two named
+    /// indexes that nothing checks together at all. Either way the read side
+    /// has to refuse rather than let one segment's domain speak for the rest.
+    #[test]
+    fn disagreeing_segments_are_rejected_and_both_are_named() {
+        for (left, right) in [("title_idx", "body_idx"), ("title_idx", "title_idx")] {
+            let error = shared_segment_domain(&[
+                segment(left, ADDR_VERSION),
+                segment(right, LEGACY_VERSION),
+            ])
+            .expect_err("disagreeing segments should be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains("disagree on the identity domain"),
+                "unexpected error: {message}"
+            );
+            assert!(
+                message.contains("stores row addresses") && message.contains("stores row ids"),
+                "error should say what each segment stores: {message}"
+            );
+            assert!(
+                message.contains(left) && message.contains(right),
+                "error should name both segments: {message}"
+            );
+        }
+    }
+
+    /// Order must not decide the outcome: the disagreement is symmetric.
+    #[test]
+    fn a_legacy_segment_first_is_rejected_too() {
+        assert!(
+            shared_segment_domain(&[
+                segment("title_idx", LEGACY_VERSION),
+                segment("body_idx", ADDR_VERSION),
+            ])
+            .is_err()
+        );
+    }
 }

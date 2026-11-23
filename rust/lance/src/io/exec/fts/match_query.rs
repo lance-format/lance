@@ -617,7 +617,7 @@ impl ExecutionPlan for MatchQueryExec {
             } else {
                 true
             };
-            let address_domain = fts_segments_are_address_domain(&ds, &segments);
+            let address_domain = fts_segments_are_address_domain(&ds, &segments)?;
             let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
@@ -716,7 +716,7 @@ impl ExecutionPlan for MatchQueryExec {
                 &metrics,
             )
             .await;
-            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, indices.first()).await?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
             let mut documents =
                 search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
                     .await?;

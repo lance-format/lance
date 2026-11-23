@@ -532,7 +532,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
-            let address_domain = fts_segments_are_address_domain(&ds, &segments);
+            let address_domain = fts_segments_are_address_domain(&ds, &segments)?;
             let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
@@ -605,7 +605,7 @@ impl ExecutionPlan for PhraseQueryExec {
             .await;
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
-            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, indices.first()).await?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
             let documents = search_segments(
                 &indices,
                 tokens,

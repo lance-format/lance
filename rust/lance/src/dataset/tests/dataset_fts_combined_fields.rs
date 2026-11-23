@@ -2692,3 +2692,178 @@ async fn test_fts_combined_fields_nested_columns() {
         );
     }
 }
+
+/// Rebuild `index_name`'s single committed segment the way a pre-
+/// `INVERTED_ROW_ADDR_DOMAIN_VERSION` writer would have written it: its stored
+/// identities are remapped from row addresses back to row ids, and its
+/// `index_version` is relabeled down to match. `addr_to_row_id` supplies that
+/// remapping for every row whose address differs from its id.
+///
+/// Unlike the relabel-only pattern the migration guard tests use, the returned
+/// segment's contents really are row-id domain, so a query reading it is
+/// reading the same bytes an index written before the migration holds.
+async fn legacy_row_id_segment(
+    ds: &Dataset,
+    index_name: &str,
+    column: &str,
+    addr_to_row_id: HashMap<u64, Option<u64>>,
+) -> lance_table::format::IndexMetadata {
+    use crate::dataset::index::LanceIndexStoreExt;
+    use crate::index::DatasetIndexInternalExt;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::index_files_to_table;
+    use lance_index::scalar::lance_format::LanceIndexStore;
+
+    let meta = ds.load_index_by_name(index_name).await.unwrap().unwrap();
+    let index = ds
+        .open_scalar_index(column, &meta.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let uuid = uuid::Uuid::new_v4();
+    let store = LanceIndexStore::from_dataset_for_new(ds, &uuid).unwrap();
+    let created = index
+        .remap(&RowAddrRemap::direct(addr_to_row_id), &store)
+        .await
+        .unwrap();
+    lance_table::format::IndexMetadata {
+        uuid,
+        index_version: 3,
+        index_details: Some(Arc::new(created.index_details)),
+        files: Some(index_files_to_table(created.files)),
+        ..meta
+    }
+}
+
+/// Two fragments of two rows each under stable row ids, both text columns
+/// indexed. Row id 2 lives at the head of fragment 1, so its row address
+/// (`1 << 32`) differs from its row id -- the gap the identity domain has to
+/// agree about.
+async fn two_fragment_domain_fixture(dir: &TempStrDir) -> Dataset {
+    let mut ds = write_fts_dataset(
+        dir,
+        combined_fields_batch(
+            vec![0, 1, 2, 3],
+            vec!["other", "other", "alpha", "other"],
+            vec!["other", "other", "beta", "other"],
+        ),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await;
+    create_inverted_indices(&mut ds, &["title", "body"], &combined_fields_test_params()).await;
+    ds
+}
+
+/// The second fragment's address -> row id remapping for the fixture above.
+fn second_fragment_addr_to_row_id() -> HashMap<u64, Option<u64>> {
+    HashMap::from([(1u64 << 32, Some(2)), ((1u64 << 32) | 1, Some(3))])
+}
+
+async fn fts_query_error(ds: &Dataset, query: FtsQuery) -> String {
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(10), None)
+        .unwrap()
+        .try_into_batch()
+        .await;
+    match result {
+        Ok(batch) => panic!(
+            "expected a mixed-domain query to be rejected, got {} rows",
+            batch.num_rows()
+        ),
+        Err(err) => err.to_string(),
+    }
+}
+
+/// Rebuilding one column's FTS index after the row-address migration leaves
+/// its sibling column on the older domain. A multi-column query merges the two
+/// columns' postings on the stored identifier alone, so row id `2` from one
+/// index and row address `1 << 32` from the other would score as two unrelated
+/// documents and an AND query would silently return nothing. Both query shapes
+/// that span columns have to reject the mix instead.
+#[rstest]
+#[case::combined_fields(false)]
+#[case::cross_column_compound(true)]
+#[tokio::test]
+async fn test_fts_mixed_domain_across_columns_is_rejected(#[case] compound: bool) {
+    let dir = TempStrDir::default();
+    let mut ds = two_fragment_domain_fixture(&dir).await;
+    let legacy =
+        legacy_row_id_segment(&ds, "title_idx", "title", second_fragment_addr_to_row_id()).await;
+    ds.commit_existing_index_segments("title_idx", "title", vec![legacy])
+        .await
+        .unwrap();
+
+    let query = if compound {
+        use lance_index::scalar::inverted::query::{BooleanQuery, Occur};
+        BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("alpha".into())
+                    .with_column(Some("title".into()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("beta".into())
+                    .with_column(Some("body".into()))
+                    .into(),
+            ),
+        ])
+        .into()
+    } else {
+        combined_query("alpha beta", Operator::And)
+    };
+
+    let err = fts_query_error(&ds, query).await;
+    assert!(
+        err.contains("disagree on the identity domain"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        err.contains("title_idx") && err.contains("body_idx"),
+        "error should name both disagreeing indexes: {err}"
+    );
+}
+
+/// `optimize_indices` refuses to merge segments whose domains disagree. This
+/// pins the other half: publishing one named index that holds both is refused
+/// at commit time too, so a mixed *within-index* set is not a state Lance's
+/// own writer can leave behind for a reader to puzzle over.
+#[tokio::test]
+async fn test_fts_mixed_domain_within_one_index_is_rejected_at_commit() {
+    let dir = TempStrDir::default();
+    let ds = two_fragment_domain_fixture(&dir).await;
+    let current = ds.load_index_by_name("title_idx").await.unwrap().unwrap();
+    let legacy =
+        legacy_row_id_segment(&ds, "title_idx", "title", second_fragment_addr_to_row_id()).await;
+
+    // Segments in one index must cover disjoint fragments, so split the
+    // fixture's two fragments between the address-domain original and the
+    // row-id-domain copy.
+    let address_segment = lance_table::format::IndexMetadata {
+        fragment_bitmap: Some(roaring::RoaringBitmap::from_iter([0u32])),
+        ..current
+    };
+    let row_id_segment = lance_table::format::IndexMetadata {
+        fragment_bitmap: Some(roaring::RoaringBitmap::from_iter([1u32])),
+        ..legacy
+    };
+    let mut ds = ds;
+    let error = ds
+        .commit_existing_index_segments("title_idx", "title", vec![address_segment, row_id_segment])
+        .await
+        .expect_err("a mixed-domain index should not be committable");
+    assert!(
+        error.to_string().contains("mixes row-ID and row-address"),
+        "unexpected error: {error}"
+    );
+}
