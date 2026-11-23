@@ -46,6 +46,7 @@ use lance_file::reader::{
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
+use lance_file::writer::FileWriterOptions;
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
@@ -75,7 +76,7 @@ use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::writer::{OverlayWriter, WriteOverlayError};
 use crate::dataset::overlay::{
-    OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
+    OverlayReadPlanner, OverlayReadSelection, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
 use crate::dataset::{Dataset, UpdateJoinOptions};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -1301,14 +1302,25 @@ impl FileFragment {
         dataset_schema: &Schema,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<Vec<(u32, u64)>> {
+        let read_config = FragReadConfig::default().with_scan_scheduler(scan_scheduler);
         let mut stats = Vec::new();
         for reader in self
-            .open_readers_with_full_metadata(
-                dataset_schema,
-                &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
-            )
+            .open_readers_with_full_metadata(dataset_schema, &read_config)
             .await?
         {
+            stats.extend(reader.storage_stats()?);
+        }
+        // An overlay's values live outside the base data files, but they are
+        // bytes their fields occupy on disk all the same.
+        let overlay_readers = try_join_all(self.metadata.overlays.iter().map(|overlay| {
+            self.open_reader_with_full_metadata(
+                &overlay.data_file,
+                Some(dataset_schema),
+                &read_config,
+            )
+        }))
+        .await?;
+        for reader in overlay_readers.into_iter().flatten() {
             stats.extend(reader.storage_stats()?);
         }
         Ok(stats)
@@ -2326,7 +2338,32 @@ impl FileFragment {
     ///
     /// This will always return the same number of rows as the input indices.
     /// If indices are out-of-bounds, this will return an error.
+    ///
+    /// The projection may include the `_rowid` and `_rowaddr` system columns
+    /// (for example from [`Schema::project_preserve_system_columns`]). They
+    /// are returned in the order they appear in the projection.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
+        // System columns are produced by the reader rather than read from data files.
+        let mut with_row_id = false;
+        let mut with_row_address = false;
+        let mut data_fields = Vec::with_capacity(projection.fields.len());
+        for field in &projection.fields {
+            match field.name.as_str() {
+                ROW_ID => with_row_id = true,
+                ROW_ADDR => with_row_address = true,
+                name if lance_core::is_system_column(name) => {
+                    return Err(Error::invalid_input(format!(
+                        "System column {name} is not supported by fragment take"
+                    )));
+                }
+                _ => data_fields.push(field.clone()),
+            }
+        }
+        let data_projection = Schema {
+            fields: data_fields,
+            metadata: projection.metadata.clone(),
+        };
+
         // Re-map the indices to row ids using the deletion vector
         let deletion_vector = self.get_deletion_vector().await?;
         let row_ids = if let Some(deletion_vector) = deletion_vector {
@@ -2341,15 +2378,31 @@ impl FileFragment {
                 .collect::<Vec<_>>();
             sorted_deleted_ids.sort();
 
-            Cow::Owned(resolve_actual_row_ids(indices, &sorted_deleted_ids))
+            Cow::Owned(resolve_actual_row_ids(indices, &sorted_deleted_ids)?)
         } else {
             Cow::Borrowed(indices)
         };
 
-        // Then call take rows
+        // Then call take rows. Keep an internal address for empty projections
+        // so the batch retains its row count.
+        let read_config = FragReadConfig::default()
+            .with_row_id(with_row_id)
+            .with_row_address(with_row_address || data_projection.fields.is_empty());
         let batch = self
-            .take_rows(&row_ids, projection, FragReadConfig::default())
+            .take_rows(&row_ids, &data_projection, read_config)
             .await?;
+
+        // Restore the requested column order and drop any internal address.
+        let batch_schema = batch.schema();
+        let column_indices = projection
+            .fields
+            .iter()
+            .map(|field| batch_schema.index_of(&field.name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = batch.project(&column_indices)?;
+        if projection.fields.is_empty() {
+            return Ok(batch);
+        }
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
         // for user-facing output.
@@ -2559,7 +2612,7 @@ impl FileFragment {
         let mut last_id = row_ids[0];
 
         for id in row_ids.iter().skip(1) {
-            if *id != last_id + 1 {
+            if last_id.checked_add(1) != Some(*id) {
                 return false;
             }
             last_id = *id;
@@ -2917,12 +2970,27 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        self.write_columns_with_file_writer_options(data, schema, FileWriterOptions::default())
+            .await
+    }
+
+    /// Write replacement column data with runtime file-writer options.
+    ///
+    /// This has the same format and commit semantics as [`Self::write_columns`].
+    /// The options control buffering and execution only; the fragment's
+    /// manifest still selects the file grammar and physical layout.
+    pub async fn write_columns_with_file_writer_options(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<super::transaction::DataReplacementGroup> {
         let write_version = self
             .dataset
             .manifest
             .data_storage_format
             .lance_file_format();
-        self.write_column_with_version(data, schema, write_version)
+        self.write_column_with_version_and_options(data, schema, write_version, file_writer_options)
             .await
     }
 
@@ -2951,6 +3019,22 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
         write_version: ConcreteFileVersion,
+    ) -> Result<super::transaction::DataReplacementGroup> {
+        self.write_column_with_version_and_options(
+            data,
+            schema,
+            write_version,
+            FileWriterOptions::default(),
+        )
+        .await
+    }
+
+    async fn write_column_with_version_and_options(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        write_version: ConcreteFileVersion,
+        file_writer_options: FileWriterOptions,
     ) -> Result<super::transaction::DataReplacementGroup> {
         versions::validate_write_version(
             self.dataset
@@ -2999,11 +3083,12 @@ impl FileFragment {
             true,
         )
         .await?;
-        let mut writer = versions::open_update_writer(
+        let mut writer = versions::open_update_writer_with_options(
             write_version,
             self.dataset.as_ref(),
             &writer_schema,
             has_blob_v2,
+            file_writer_options,
         )
         .await?;
         let staged_path = {
@@ -3348,24 +3433,35 @@ impl FileFragment {
 /// One binary search over the sorted deletions finds `k`. For example, if
 /// deleted rows are [2, 3, 5], the counts are [2, 2, 3], and row 4 has all
 /// three deletions before it, so it is at physical row 7.
-pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]) -> Vec<u32> {
-    row_ids
-        .iter()
-        .map(|&row_id| {
-            let logical_index = row_id as usize;
-            // Deletion ids are unique and ascending, so `deleted[j] >= j`.
-            let (mut lo, mut hi) = (0, sorted_deleted_ids.len());
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if sorted_deleted_ids[mid] as usize - mid <= logical_index {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
+pub(crate) fn resolve_actual_row_ids(
+    row_ids: &[u32],
+    sorted_deleted_ids: &[u32],
+) -> Result<Vec<u32>> {
+    let mut physical_offsets = Vec::with_capacity(row_ids.len());
+    for &row_id in row_ids {
+        let logical_index = row_id as usize;
+        // Deletion ids are unique and ascending, so `deleted[j] >= j`.
+        let (mut lo, mut hi) = (0, sorted_deleted_ids.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if sorted_deleted_ids[mid] as usize - mid <= logical_index {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
-            (logical_index + lo) as u32
-        })
-        .collect()
+        }
+        let physical_offset = u32::try_from(lo)
+            .ok()
+            .and_then(|deleted_rows| row_id.checked_add(deleted_rows))
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Logical row index {row_id} plus {lo} preceding deletions exceeds maximum physical row offset {}",
+                    u32::MAX
+                ))
+            })?;
+        physical_offsets.push(physical_offset);
+    }
+    Ok(physical_offsets)
 }
 
 // Cache key for file metadata
@@ -3916,22 +4012,12 @@ impl FragmentReader {
         let Some(overlay) = &self.overlay else {
             return Ok(merged);
         };
-        // The offset_in_frag of every row this read will return, materialized once.
-        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
-        // it lets us both prune overlays to the read and slice each batch's offsets
-        // below without reading any data. Only paid when the fragment has overlays.
-        //
-        // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
-        // yield a coverage bitmap directly (for pruning) and to slice per batch (for
-        // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
-        // wholesale — a larger refactor tracked separately.
-        let offsets_in_frag: Arc<Vec<u32>> =
-            Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
+        let selection = Arc::new(OverlayReadSelection::new(params, total_num_rows)?);
 
         // Open only the overlay readers this read touches (pruned by row selection).
         let plans = resolve_overlays(
             &overlay.planner,
-            &offsets_in_frag,
+            &selection,
             &overlay.fragment,
             &overlay.read_config,
         )
@@ -3942,21 +4028,22 @@ impl FragmentReader {
         let plans = Arc::new(plans);
 
         // Batches arrive in physical read order, so a running total of the rows seen
-        // so far gives each batch its starting offset_in_batch into `offsets_in_frag`.
+        // so far identifies its selection slice. Materialize only the batch's
+        // offsets when its future is polled, not while scheduling the whole read.
         let mut rows_seen = 0usize;
         let stream = merged
             .map(move |task| {
                 let num_rows = task.num_rows;
                 let start = rows_seen;
                 rows_seen += num_rows as usize;
-                let offsets_in_frag = offsets_in_frag.clone();
+                let selection = selection.clone();
                 let plans = plans.clone();
                 let inner = task.task;
                 ReadBatchTask {
                     num_rows,
                     task: async move {
-                        let batch_offsets = &offsets_in_frag[start..start + num_rows as usize];
-                        merge_overlay_batch(inner, batch_offsets, &plans).await
+                        let batch_selection = selection.batch(start, num_rows as usize)?;
+                        merge_overlay_batch(inner, &batch_selection, &plans).await
                     }
                     .boxed(),
                 }
@@ -4381,7 +4468,7 @@ impl FragmentReader {
 mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
+    use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatchIterator,
         StringArray,
@@ -4492,6 +4579,7 @@ mod tests {
         };
         use arrow_buffer::NullBuffer;
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use futures::{StreamExt, TryStreamExt};
         use lance_core::datatypes::Schema;
         use lance_file::version::LanceFileVersion;
         use lance_file::writer::FileWriterOptions;
@@ -4502,6 +4590,7 @@ mod tests {
         use roaring::RoaringBitmap;
         use rstest::rstest;
 
+        use crate::dataset::fragment::FragReadConfig;
         use crate::dataset::transaction::{DataOverlayGroup, Operation};
         use crate::dataset::{Dataset, WriteDestination, WriteParams};
 
@@ -5402,12 +5491,19 @@ mod tests {
         /// scan test uses single-batch fragments, so this is the only guard for the
         /// cross-batch (`start > 0`) path.
         #[rstest]
+        #[case::full(None)]
+        #[case::ranges(Some(vec![1..6, 8..10]))]
         #[tokio::test]
         async fn test_scan_multi_batch_overlay_slicing(
-            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+            #[values(
+                LanceFileVersion::V2_0,
+                LanceFileVersion::V2_1,
+                LanceFileVersion::V2_2,
+                LanceFileVersion::V2_3
+            )]
+            version: LanceFileVersion,
+            #[case] ranges: Option<Vec<std::ops::Range<u64>>>,
         ) {
-            use futures::TryStreamExt;
-
             // One fragment of 10 rows so the read can be chunked below.
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("id", DataType::Int32, true),
@@ -5447,15 +5543,37 @@ mod tests {
             .await;
 
             let frag = dataset.get_fragment(0).unwrap();
-            let mut scanner = frag.scan();
-            scanner.batch_size(4).project(&["val"]).unwrap();
-            let batches: Vec<RecordBatch> = scanner
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
+            let expected_rows: Vec<i32> = ranges.as_ref().map_or_else(
+                || (0..10).collect(),
+                |ranges| {
+                    ranges
+                        .iter()
+                        .flat_map(|r| r.clone().map(|i| i as i32))
+                        .collect()
+                },
+            );
+            let batches: Vec<RecordBatch> = if let Some(ranges) = ranges {
+                frag.open(&full_schema(&dataset), FragReadConfig::default())
+                    .await
+                    .unwrap()
+                    .read_ranges(ranges.into(), 4)
+                    .await
+                    .unwrap()
+                    .buffered(2)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            } else {
+                let mut scanner = frag.scan();
+                scanner.batch_size(4).project(&["val"]).unwrap();
+                scanner
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap()
+            };
             // Guard the guard: the read must actually span multiple batches, else
             // this would not exercise the cross-batch slice at all.
             assert!(
@@ -5466,7 +5584,8 @@ mod tests {
 
             let merged =
                 arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
-            let expected: Vec<i32> = (0..10)
+            let expected: Vec<i32> = expected_rows
+                .into_iter()
                 .map(|i| match i {
                     1 => 111,
                     5 => 555,
@@ -6417,6 +6536,137 @@ mod tests {
             .unwrap();
     }
 
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::contiguous(&[0, 1])]
+    #[case::sorted(&[0, 1, 1])]
+    #[case::unsorted(&[1, 0, 1])]
+    #[tokio::test]
+    async fn test_take_empty_projection(
+        #[case] indices: &[u32],
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(false, true)] delete_row: bool,
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        if delete_row {
+            dataset.delete("i = 1").await.unwrap();
+        }
+        let fragment = dataset.get_fragment(0).unwrap();
+        let projection = dataset.schema().project::<&str>(&[]).unwrap();
+        dataset.object_store.io_stats_incremental();
+        let batch = fragment.take(indices, &projection).await.unwrap();
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), indices.len());
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| !request.path.as_ref().contains("/data/"))
+        );
+        let invalid_offset = if delete_row { 2 } else { 3 };
+        let error = fragment
+            .take(&[invalid_offset], &projection)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Invalid read params"), "{error}");
+    }
+
+    #[rstest]
+    #[case::contiguous(&[0, 1], &[3, 4])]
+    #[case::unsorted_duplicates(&[1, 0, 1], &[4, 3, 4])]
+    #[tokio::test]
+    async fn test_take_system_columns(
+        #[case] indices: &[u32],
+        #[case] dataset_offsets: &[u64],
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(
+            &["_rowaddr", "i", "_rowid"][..],
+            &["_rowid"][..],
+            &["_rowaddr"][..],
+            &["_rowid", "_rowaddr"][..]
+        )]
+        columns: &[&str],
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Shift the fragment offsets away from the physical offsets.
+        dataset.delete("i = 3").await.unwrap();
+        let fragment = dataset.get_fragment(1).unwrap();
+
+        let projection = dataset
+            .schema()
+            .project_preserve_system_columns(columns)
+            .unwrap();
+        let batch = fragment.take(indices, &projection).await.unwrap();
+        let expected = dataset
+            .take(
+                dataset_offsets,
+                crate::dataset::ProjectionRequest::from_columns(
+                    columns.iter().copied(),
+                    dataset.schema(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch, expected);
+
+        let field_names = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(field_names, columns);
+        let expected_addrs = indices
+            .iter()
+            .map(|offset| u64::from(RowAddress::new_from_parts(1, offset + 1)))
+            .collect::<Vec<_>>();
+        if let Some(addrs) = batch.column_by_name(ROW_ADDR) {
+            assert_eq!(addrs.as_primitive::<UInt64Type>().values(), &expected_addrs);
+        }
+
+        let row_offset_projection = dataset
+            .schema()
+            .project_preserve_system_columns(&["i", "_rowoffset"])
+            .unwrap();
+        let error = fragment
+            .take(indices, &row_offset_projection)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
+
     /// A fragment with one data file per column group reads only the files
     /// that hold a requested field: the others are not even opened.
     #[tokio::test]
@@ -7318,20 +7568,23 @@ mod tests {
     fn test_resolve_actual_row_ids() {
         // Doc example on resolve_actual_row_ids: with deletions [2, 3, 5],
         // logical row 4 resolves to physical row 7.
-        assert_eq!(resolve_actual_row_ids(&[4], &[2, 3, 5]), vec![7]);
+        assert_eq!(resolve_actual_row_ids(&[4], &[2, 3, 5]).unwrap(), vec![7]);
 
         // Rows below every deletion map to themselves.
-        assert_eq!(resolve_actual_row_ids(&[0, 1], &[2, 3, 5]), vec![0, 1]);
+        assert_eq!(
+            resolve_actual_row_ids(&[0, 1], &[2, 3, 5]).unwrap(),
+            vec![0, 1]
+        );
         // Indices that land on deleted positions skip past them.
-        assert_eq!(resolve_actual_row_ids(&[2], &[2, 3, 5]), vec![4]);
-        assert_eq!(resolve_actual_row_ids(&[5], &[2, 3, 5]), vec![8]);
+        assert_eq!(resolve_actual_row_ids(&[2], &[2, 3, 5]).unwrap(), vec![4]);
+        assert_eq!(resolve_actual_row_ids(&[5], &[2, 3, 5]).unwrap(), vec![8]);
         // Repeated indices are resolved independently.
         assert_eq!(
-            resolve_actual_row_ids(&[0, 0, 1, 1], &[1]),
+            resolve_actual_row_ids(&[0, 0, 1, 1], &[1]).unwrap(),
             vec![0, 0, 2, 2]
         );
         // No deletions is the identity mapping.
-        assert_eq!(resolve_actual_row_ids(&[3, 7], &[]), vec![3, 7]);
+        assert_eq!(resolve_actual_row_ids(&[3, 7], &[]).unwrap(), vec![3, 7]);
     }
 
     #[test]
@@ -7352,7 +7605,10 @@ mod tests {
                 .collect();
             let indices: Vec<u32> = (0..live.len() as u32).rev().collect();
             let expected: Vec<u32> = indices.iter().map(|&i| live[i as usize]).collect();
-            assert_eq!(resolve_actual_row_ids(&indices, &deleted), expected);
+            assert_eq!(
+                resolve_actual_row_ids(&indices, &deleted).unwrap(),
+                expected
+            );
         }
     }
 
@@ -9256,5 +9512,59 @@ mod tests {
             "cache clones must share the per-scan scheduler map"
         );
         assert_eq!(cache.len(), 2);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fragment_logical_offset_overflow(
+        #[values(false, true)] stable_ids: bool,
+        #[values(false, true)] delete_row: bool,
+        #[values(false, true)] use_session: bool,
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids: stable_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        if delete_row {
+            dataset.delete("i = 1").await.unwrap();
+        }
+        let fragment = dataset.get_fragment(0).unwrap();
+        let session = fragment
+            .open_session(dataset.schema(), false)
+            .await
+            .unwrap();
+        let live = if use_session {
+            session.take(&[0, 1]).await.unwrap()
+        } else {
+            fragment.take(&[0, 1], dataset.schema()).await.unwrap()
+        };
+        assert_eq!(
+            live["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            if delete_row { &[0, 2] } else { &[0, 1] }
+        );
+        let error = if use_session {
+            session.take(&[u32::MAX]).await.unwrap_err()
+        } else {
+            fragment
+                .take(&[u32::MAX], dataset.schema())
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("4294967295"), "{error}");
     }
 }

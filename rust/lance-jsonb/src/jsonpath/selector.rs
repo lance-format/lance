@@ -842,15 +842,21 @@ impl<'a> Selector<'a> {
             (ExprValue::Values(lhses), ExprValue::Values(rhses)) => (lhses.clone(), rhses.clone()),
         };
 
+        // A wildcard comparison is existential: any pair comparing true
+        // selects the item, even when an earlier pair was incomparable.
+        // Incomparable pairs only surface as SQL-style unknown (None) when no
+        // pair compares true, so the result never depends on pair order.
+        let mut saw_unknown = false;
         for lval in lvals.iter() {
             for rval in rvals.iter() {
-                let res = self.compare_value(op, lval.clone(), rval.clone())?;
-                if res {
-                    return Some(true);
+                match self.compare_value(op, lval.clone(), rval.clone()) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => saw_unknown = true,
                 }
             }
         }
-        Some(false)
+        if saw_unknown { None } else { Some(false) }
     }
 
     fn compare_value(

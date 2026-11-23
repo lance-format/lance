@@ -1590,7 +1590,7 @@ class TestTableVersions:
     def test_create_and_batch_delete_table_versions(
         self, tmp_path, request, namespace_impl, request_kind
     ):
-        """Version methods preserve dict responses and support request models."""
+        """Every supported request form returns the response model."""
         use_request_model = request_kind == "model"
         mapping_type = UserDict if request_kind == "mapping" else dict
         if namespace_impl == "rest":
@@ -1615,14 +1615,10 @@ class TestTableVersions:
             if use_request_model
             else mapping_type(describe_req.model_dump())
         )
-        if use_request_model:
-            assert isinstance(described, DescribeTableVersionResponse)
-            assert described.version.version == 1
-            manifest_path = described.version.manifest_path
-        else:
-            assert isinstance(described, dict)
-            assert described.get("version")["version"] == 1
-            manifest_path = described["version"]["manifest_path"]
+        assert isinstance(described, DescribeTableVersionResponse)
+        assert described.version.version == 1
+        manifest_path = described.version.manifest_path
+        assert described.model_dump()["version"]["manifest_path"] == manifest_path
 
         # Stage a copy of the v1 manifest, as a writer would, and publish it as v2.
         manifest_name = posixpath.basename(manifest_path)
@@ -1641,12 +1637,9 @@ class TestTableVersions:
         created = ns_client.create_table_version(
             create_req if use_request_model else mapping_type(create_req.model_dump())
         )
-        if use_request_model:
-            assert isinstance(created, CreateTableVersionResponse)
-            assert created.version.version == 2
-        else:
-            assert isinstance(created, dict)
-            assert created.get("version")["version"] == 2
+        assert isinstance(created, CreateTableVersionResponse)
+        assert created.version.version == 2
+        assert created.model_dump()["version"]["version"] == 2
 
         delete_req = BatchDeleteTableVersionsRequest(
             id=table_id, ranges=[VersionRange(start_version=1, end_version=2)]
@@ -1654,12 +1647,9 @@ class TestTableVersions:
         deleted = ns_client.batch_delete_table_versions(
             delete_req if use_request_model else mapping_type(delete_req.model_dump())
         )
-        if use_request_model:
-            assert isinstance(deleted, BatchDeleteTableVersionsResponse)
-            assert deleted.deleted_count == 1
-        else:
-            assert isinstance(deleted, dict)
-            assert deleted["deleted_count"] == 1
+        assert isinstance(deleted, BatchDeleteTableVersionsResponse)
+        assert deleted.deleted_count == 1
+        assert deleted.model_dump()["deleted_count"] == 1
 
         listed = ns_client.list_table_versions(ListTableVersionsRequest(id=table_id))
         assert [v.version for v in listed.versions] == [2]

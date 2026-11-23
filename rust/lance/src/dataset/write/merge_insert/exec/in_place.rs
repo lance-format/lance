@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -10,7 +9,9 @@ use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext, context::SessionContext},
     physical_plan::{
@@ -23,6 +24,7 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
+use roaring::RoaringTreemap;
 
 use crate::Dataset;
 use crate::dataset::transaction::UpdateMode::RewriteColumns;
@@ -244,7 +246,7 @@ impl InPlaceMergeInsertExec {
         let on_columns = self.params.on.clone();
         let updated_rows = metrics.num_updated_rows.clone();
         let skipped_duplicates = metrics.num_skipped_duplicates.clone();
-        let mut seen_row_ids = HashSet::new();
+        let mut seen_row_ids = RoaringTreemap::new();
 
         let schema = output_schema.clone();
         let stream = input_stream.map(move |batch_result| -> DFResult<RecordBatch> {
@@ -468,6 +470,8 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let _baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let write_time =
+            MetricBuilder::new(&self.metrics).subset_time("merge_write_time", partition);
         let metrics = MergeInsertMetrics::new(&self.metrics, partition);
 
         let input_stream = self.input.execute(partition, context)?;
@@ -485,6 +489,8 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         let write_params = self.write_params.clone();
 
         let result_stream = stream::once(async move {
+            // Time lazy execution, including upstream waits, rather than stream construction.
+            let _write_timer = write_time.timer();
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // A guess: a compatible transaction can commit before this one, in
             // which case the real commit version is later. `matched_offsets`

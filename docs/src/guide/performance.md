@@ -93,7 +93,7 @@ debugging query performance.
 
 ### Memory Events
 
-Memory events are emitted while `LANCE_MEMORY_OBSERVE` turns memory observation on, which works on Linux only; [Observability](observability.md#memory-metrics) describes the switch and the index builds it observes. Every stage of an observed build emits an event when it starts and another when it completes, and so does the whole build, which `create_index` completes only after its commit. All events of one build carry its `operation_id`, unique within the process, and the `pid` of the process, which together tell apart builds that run at the same time. Ids start from a random value in every process, so a process that restarts with the same pid, as in a container, does not repeat them. A start without a completion marks work that failed, was cancelled, or was still running when the process died, for example because it exceeded its memory limit. For most scalar indices the `load_data` stage completes before the index is sorted or trained, so a build that dies in that work leaves only the start of the build itself open. A field without a value, such as the cgroup fields of a process outside a memory cgroup, is left out. In `pylance`, `LANCE_MEMORY_OBSERVE=1 LANCE_LOG="warn,lance::events::memory=info"` logs these events and no other Lance events. Peaks are lower bounds and cover the whole process, like the memory metrics.
+Memory events are emitted while memory observation is on, which works on Linux only; [Observability](observability.md#memory-metrics) describes how `LANCE_MEMORY_OBSERVE` or a call switches it on, and the index builds it observes. Every stage of an observed build emits an event when it starts and another when it completes, and so does the whole build, which `create_index` completes only after its commit. All events of one build carry its `operation_id`, unique within the process, and the `pid` of the process, which together tell apart builds that run at the same time. Ids start from a random value in every process, so a process that restarts with the same pid, as in a container, does not repeat them. A start without a completion marks work that failed, was cancelled, or was still running when the process died, for example because it exceeded its memory limit. For most scalar indices the `load_data` stage completes before the index is sorted or trained, so a build that dies in that work leaves only the start of the build itself open. A field without a value, such as the cgroup fields of a process outside a memory cgroup, is left out. In `pylance`, `LANCE_MEMORY_OBSERVE=1 LANCE_LOG="warn,lance::events::memory=info"` logs these events and no other Lance events. Peaks are lower bounds and cover the whole process, like the memory metrics.
 
 | Event           | Parameter            | Description                                                                                        |
 | --------------- | -------------------- | -------------------------------------------------------------------------------------------------- |
@@ -584,6 +584,19 @@ sizeof(data_type)` bytes. In practice, the training data dominates and these add
 comparison.
 
 If the dataset has fewer rows than `num_partitions * sample_rate`, the entire dataset is used for training instead.
+
+The sample of a fixed-size-list vector column is drawn as independent random rows. On object storage this costs about
+one request per sampled row once the sample is sparse, which can dominate training time on large tables. Set
+`LANCE_IVF_TRAINING_SAMPLE_BLOCK_ROWS` to read the IVF sample as random contiguous runs of that many rows instead:
+
+```shell
+export LANCE_IVF_TRAINING_SAMPLE_BLOCK_ROWS=64
+```
+
+Each run costs about one request, so the request count drops by roughly the run length. Rows inside a run are neighbors
+in the table, so when neighbors are similar (for example consecutive video frames) a longer run trains slightly worse
+centroids. The value must be a positive integer; unset or `1` keeps independent rows. Quantizer training samples are
+small and always use independent rows.
 
 #### Quantizer Training
 

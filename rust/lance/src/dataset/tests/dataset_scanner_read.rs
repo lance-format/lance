@@ -185,6 +185,26 @@ fn structural_list_test_values(kind: &str) -> ArrayRef {
                 Some(NullBuffer::from(vec![true, false, true, true, true, true])),
             ))
         }
+        // A struct whose only child is stored full-zip, so list structure reads use that page.
+        "binary_struct" | "vector_struct" => {
+            let child: ArrayRef = if kind == "binary_struct" {
+                structural_list_test_values("binary")
+            } else {
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    128,
+                    Arc::new(Float32Array::from_iter_values(
+                        (0..6 * 128).map(|v| v as f32),
+                    )),
+                    None,
+                ))
+            };
+            Arc::new(StructArray::new(
+                vec![ArrowField::new("value", child.data_type().clone(), true)].into(),
+                vec![child],
+                None,
+            ))
+        }
         "map" => {
             let mut builder =
                 MapBuilder::new(None, StringBuilder::new(), LargeBinaryBuilder::new());
@@ -667,6 +687,9 @@ async fn test_list_structure_omits_image_payload(
 #[rstest]
 #[case::primitive("int")]
 #[case::nested_structure("nested")]
+// The second file has no nulls, so its full-zip pages have no control words.
+#[case::full_zip_variable("binary_struct")]
+#[case::full_zip_fixed("vector_struct")]
 #[tokio::test]
 async fn test_list_structure_fixed_outer(
     #[case] kind: &str,
@@ -1069,6 +1092,47 @@ async fn test_strict_batch_size() {
 
     let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
     assert_eq!(batch_sizes, vec![10, 10, 1]);
+}
+
+/// `batch_size` caps the rows per batch when a filter is followed by a
+/// late-materialization take, which merges the small filtered batches
+#[rstest]
+#[tokio::test]
+async fn test_filtered_late_materialization_respects_batch_size(
+    #[values(7, 10, 20)] batch_size: usize,
+    #[values(MaterializationStyle::AllLate, MaterializationStyle::Heuristic)]
+    style: MaterializationStyle,
+) {
+    let dataset = lance_datagen::gen_batch()
+        .col("id", array::step::<Int64Type>())
+        .col("v", array::cycle::<Int64Type>(vec![0, 1, 2, 3, 4]))
+        .col("s", array::rand_utf8(ByteCount::from(32), false))
+        .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.batch_size(batch_size)
+        .project(&["s"])
+        .unwrap()
+        .filter("v = 2")
+        .unwrap()
+        .materialization_style(style);
+
+    let batches = scan
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+    assert_eq!(batch_sizes.iter().sum::<usize>(), 60);
+    assert!(
+        batch_sizes.iter().all(|&rows| rows <= batch_size),
+        "batch sizes {batch_sizes:?} exceed batch_size={batch_size}"
+    );
 }
 
 #[tokio::test]
@@ -2244,7 +2308,7 @@ async fn test_ann_with_deletion(
 
         assert_eq!(
             dataset.index_cache_entry_count().await,
-            2, // 2 for index metadata at version 1 and 2.
+            4, // Raw metadata and query listings at versions 1 and 2.
         );
         // Load the row-id lookup explicitly so cache counts are independent of
         // which scan path resolves stable row ids.
@@ -2260,8 +2324,8 @@ async fn test_ann_with_deletion(
         assert_eq!(
             dataset.index_cache_entry_count().await,
             // The vector index, its partitions and the segment ownership mask,
-            // plus versioned index metadata and the stable-row-id lookup.
-            6 + dataset.versions().await.unwrap().len() + usize::from(stable_row_ids)
+            // plus versioned raw metadata and query listings and the stable-row-id lookup.
+            6 + 2 * dataset.versions().await.unwrap().len() + usize::from(stable_row_ids)
         );
         assert_eq!(results.len(), 1);
         let batch = &results[0];

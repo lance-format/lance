@@ -18,6 +18,7 @@ use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
 use lance_index::vector::{
     ivf::{IvfBuildParams, storage::IvfModel},
     pq::{PQBuildParams, ProductQuantizer},
+    quantizer::QuantizerBuildParams,
 };
 use lance_linalg::distance::DistanceType;
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
@@ -292,7 +293,8 @@ async fn do_train_pq_model(
         dimension,
         distance_type,
         &params,
-        Some(&ivf_model),
+        // Dot builds encode raw vectors, so train on residuals only when the build does.
+        PQBuildParams::use_residual(distance_type).then_some(&ivf_model),
         fragment_ids.as_deref(),
     )
     .await

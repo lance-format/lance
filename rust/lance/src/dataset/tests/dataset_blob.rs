@@ -54,7 +54,7 @@ use lance_file::{
 };
 use lance_io::{
     ReadBatchParams,
-    object_store::{ObjectStore, ObjectStoreParams},
+    object_store::{ObjectStore, ObjectStoreParams, WrappingObjectStore},
     scheduler::{ScanScheduler, SchedulerConfig},
     stream::RecordBatchStream,
     utils::CachedFileSize,
@@ -64,7 +64,18 @@ use lance_table::format::BasePath;
 use rstest::rstest;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
+
+#[cfg(feature = "huggingface")]
+use lance_io::object_store::{
+    ObjectStoreProvider, ObjectStoreRegistry, StorageOptionsAccessor,
+    providers::huggingface::HuggingfaceStoreProvider,
+};
+#[cfg(feature = "huggingface")]
+use wiremock::matchers::{method, path_regex};
+#[cfg(feature = "huggingface")]
+use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
 
 #[rstest]
 #[case::inline("blob.kind = 0", vec![Some(1), None, Some(2)])]
@@ -2253,6 +2264,7 @@ async fn test_read_legacy_and_v2_blob_layouts_from_one_file() {
         dataset.manifest.version,
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
+            data_change: true,
         },
         None,
     );
@@ -2444,6 +2456,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
         uuid: Uuid::new_v4().hyphenated().to_string(),
         operation: Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
+            data_change: true,
         },
         tag: None,
         transaction_properties: None,
@@ -2625,6 +2638,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
         uuid: Uuid::new_v4().hyphenated().to_string(),
         operation: Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
+            data_change: true,
         },
         tag: None,
         transaction_properties: None,
@@ -3454,6 +3468,253 @@ async fn test_take_blob_v2_from_non_default_base_dedicated() {
     );
 }
 
+#[cfg(feature = "huggingface")]
+#[derive(Debug)]
+struct TestHfStoreProvider {
+    endpoint: String,
+}
+
+#[cfg(feature = "huggingface")]
+#[async_trait::async_trait]
+impl ObjectStoreProvider for TestHfStoreProvider {
+    async fn new_store(
+        &self,
+        base_path: url::Url,
+        params: &ObjectStoreParams,
+    ) -> Result<ObjectStore> {
+        HuggingfaceStoreProvider
+            .new_store_with_test_endpoint(base_path, params, &self.endpoint)
+            .await
+    }
+
+    fn extract_path(&self, url: &url::Url) -> Result<object_store::path::Path> {
+        HuggingfaceStoreProvider.extract_path(url)
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &url::Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        HuggingfaceStoreProvider.calculate_object_store_prefix(url, storage_options)
+    }
+
+    fn calculate_object_store_prefix_for_match(
+        &self,
+        url: &url::Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Option<String>> {
+        HuggingfaceStoreProvider.calculate_object_store_prefix_for_match(url, storage_options)
+    }
+}
+
+#[cfg(feature = "huggingface")]
+fn hf_range_response(body: &[u8], request: &MockRequest) -> ResponseTemplate {
+    let Some(range) = request
+        .headers
+        .get("range")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    let Some((start, end)) = range
+        .strip_prefix("bytes=")
+        .and_then(|range| range.split_once('-'))
+    else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    let Ok(start) = start.parse::<usize>() else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    if start >= body.len() {
+        return ResponseTemplate::new(416);
+    }
+    let end = end
+        .parse::<usize>()
+        .unwrap_or(body.len() - 1)
+        .min(body.len() - 1);
+    ResponseTemplate::new(206)
+        .insert_header(
+            "content-range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        )
+        .set_body_bytes(body[start..=end].to_vec())
+}
+
+/// Absolute blob URIs for two commit-pinned bases of one Hugging Face
+/// repository resolve through their per-base revision options to different
+/// base IDs while keeping the same relative descriptor path. A reader
+/// interleaves ranges from both bases in one session and sees each commit's
+/// bytes.
+#[cfg(feature = "huggingface")]
+#[tokio::test]
+async fn test_blob_v2_revision_pinned_hf_bases_isolate_reads() {
+    const COMMIT_A: &str = "1111111111111111111111111111111111111111";
+    const COMMIT_B: &str = "2222222222222222222222222222222222222222";
+    const TEST_AUTH: &str = "Bearer synthetic-test-token";
+    let body_a = Bytes::from_static(b"AAAA-1111-ZZZZ");
+    let body_b = Bytes::from_static(b"BBBB-2222-YYYY");
+
+    let server = MockServer::start().await;
+    let auth = Arc::new(std::sync::Mutex::new(Vec::new()));
+    for (commit, body) in [(COMMIT_A, body_a.clone()), (COMMIT_B, body_b.clone())] {
+        let auth = auth.clone();
+        let expected_path = format!(r"^/datasets/acme/repo/resolve/{commit}/data/payload\.bin$");
+        Mock::given(method("GET"))
+            .and(path_regex(expected_path))
+            .respond_with(move |request: &MockRequest| {
+                auth.lock().unwrap().push(
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(TEST_AUTH),
+                );
+                hf_range_response(&body, request)
+            })
+            .mount(&server)
+            .await;
+    }
+
+    let registry = ObjectStoreRegistry::default();
+    registry.insert(
+        "hf",
+        Arc::new(TestHfStoreProvider {
+            endpoint: server.uri(),
+        }),
+    );
+    let session = Arc::new(crate::session::Session::new(0, 0, Arc::new(registry)));
+
+    let dataset_dir = TempStrDir::default();
+    let base_a = format!("hf://datasets/acme/repo@{COMMIT_A}/data");
+    let base_b = format!("hf://datasets/acme/repo@{COMMIT_B}/data");
+    let uri_a = format!("hf://datasets/acme/repo@{COMMIT_A}/data/payload.bin");
+    let uri_b = format!("hf://datasets/acme/repo@{COMMIT_B}/data/payload.bin");
+    let blob_array = complete_blob_v2_array(
+        vec![None, None],
+        vec![Some(uri_a), Some(uri_b)],
+        vec![Some(0), Some(0)],
+        vec![Some(body_a.len() as u64), Some(body_b.len() as u64)],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        complete_blob_v2_field("blob", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from(vec![0, 1])), blob_array],
+    )
+    .unwrap();
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([
+                ("hf_token".to_string(), "synthetic-test-token".to_string()),
+                ("hf_download_mode".to_string(), "http".to_string()),
+                ("base_1.hf_revision".to_string(), COMMIT_A.to_string()),
+                ("base_2.hf_revision".to_string(), COMMIT_B.to_string()),
+            ]),
+        ))),
+        ..Default::default()
+    };
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dataset_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![
+                BasePath::new(1, base_a, None, false),
+                BasePath::new(2, base_b, None, false),
+            ]),
+            store_params: Some(store_params.clone()),
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let descriptors = dataset
+        .scan()
+        .project(&["blob"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let descriptor = descriptors.column(0).as_struct();
+    let kinds = descriptor
+        .column_by_name("kind")
+        .unwrap()
+        .as_primitive::<UInt8Type>();
+    let base_ids = descriptor
+        .column_by_name("blob_id")
+        .unwrap()
+        .as_primitive::<UInt32Type>();
+    let uris = descriptor
+        .column_by_name("blob_uri")
+        .unwrap()
+        .as_string::<i32>();
+    assert_eq!(kinds.value(0), BlobKind::External as u8);
+    assert_eq!(kinds.value(1), BlobKind::External as u8);
+    assert_eq!((base_ids.value(0), base_ids.value(1)), (1, 2));
+    assert_eq!(
+        (uris.value(0), uris.value(1)),
+        ("payload.bin", "payload.bin")
+    );
+
+    let dataset = Arc::new(
+        DatasetBuilder::from_uri(&dataset_dir)
+            .with_session(session)
+            .with_store_params(store_params)
+            .load()
+            .await
+            .unwrap(),
+    );
+    let store_a = dataset.object_store(Some(1)).await.unwrap();
+    let store_b = dataset.object_store(Some(2)).await.unwrap();
+    assert_eq!(
+        store_a.store_prefix,
+        format!("hf$datasets@acme/repo@{COMMIT_A}")
+    );
+    assert_eq!(
+        store_b.store_prefix,
+        format!("hf$datasets@acme/repo@{COMMIT_B}")
+    );
+    assert!(
+        !Arc::ptr_eq(&store_a, &store_b),
+        "commit-pinned bases of one repository must not share a cached store"
+    );
+
+    let blobs = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    let blob_a = blobs[0].as_ref().unwrap();
+    let blob_b = blobs[1].as_ref().unwrap();
+    assert_eq!(blob_a.data_path().to_string(), "data/payload.bin");
+    assert_eq!(blob_b.data_path().to_string(), "data/payload.bin");
+
+    for (range, expected_a, expected_b) in [
+        (0..4, &body_a[0..4], &body_b[0..4]),
+        (5..9, &body_a[5..9], &body_b[5..9]),
+        (10..14, &body_a[10..14], &body_b[10..14]),
+        (0..4, &body_a[0..4], &body_b[0..4]),
+    ] {
+        assert_eq!(
+            blob_a.read_range(range.clone()).await.unwrap().as_ref(),
+            expected_a
+        );
+        assert_eq!(blob_b.read_range(range).await.unwrap().as_ref(), expected_b);
+    }
+
+    let auth = auth.lock().unwrap();
+    assert!(!auth.is_empty(), "mock received no range request");
+    assert!(
+        auth.iter().all(|is_synthetic| *is_synthetic),
+        "mock request did not carry the synthetic test token"
+    );
+}
+
 #[tokio::test]
 async fn test_blob_v2_external_outside_base_denied_by_default() {
     let dataset_dir = TempDir::default();
@@ -3484,6 +3745,204 @@ async fn test_blob_v2_external_outside_base_denied_by_default() {
         err.to_string()
             .contains("outside registered external bases"),
         "{err:?}"
+    );
+}
+
+/// Counts HEAD requests and the peak number in flight, and holds each one open
+/// so that concurrent lookups overlap. `ThrottledStore` cannot be used: it does
+/// not support the local file store's `GetResultPayload::File`.
+#[derive(Debug, Default)]
+struct HeadProbe {
+    heads: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+}
+
+impl WrappingObjectStore for HeadProbe {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(HeadProbeStore {
+            target: original,
+            probe: Self {
+                heads: self.heads.clone(),
+                in_flight: self.in_flight.clone(),
+                peak_in_flight: self.peak_in_flight.clone(),
+            },
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+#[derive(Debug)]
+struct HeadProbeStore {
+    target: Arc<dyn object_store::ObjectStore>,
+    probe: HeadProbe,
+}
+
+impl std::fmt::Display for HeadProbeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeadProbeStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for HeadProbeStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !options.head {
+            return self.target.get_opts(location, options).await;
+        }
+        self.probe.heads.fetch_add(1, Ordering::SeqCst);
+        let in_flight = self.probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.probe
+            .peak_in_flight
+            .fetch_max(in_flight, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let result = self.target.get_opts(location, options).await;
+        self.probe.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+/// External blobs written without a range have no stored size. Reading a batch
+/// of them must look up each distinct object once, with the lookups overlapping.
+#[tokio::test]
+async fn test_external_blob_unknown_sizes_are_resolved_once_and_concurrently() {
+    const OBJECTS: usize = 16;
+    const ROWS_PER_OBJECT: usize = 2;
+
+    let dataset_dir = TempStrDir::default();
+    let external_dir = TempDir::default();
+    let payloads: Vec<Vec<u8>> = (0..OBJECTS).map(|i| vec![i as u8; i + 1]).collect();
+    let mut blobs = BlobArrayBuilder::new(OBJECTS * ROWS_PER_OBJECT);
+    for (i, payload) in payloads.iter().enumerate() {
+        let path = external_dir.std_path().join(format!("{i}.bin"));
+        std::fs::write(&path, payload).unwrap();
+        for _ in 0..ROWS_PER_OBJECT {
+            // No range, so the descriptor stores size 0.
+            blobs
+                .push_uri(format!("file://{}", path.display()))
+                .unwrap();
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dataset_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let probe = Arc::new(HeadProbe::default());
+    let dataset = DatasetBuilder::from_uri(&dataset_dir)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(probe.clone()),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .map(Arc::new)
+        .unwrap();
+
+    probe.heads.store(0, Ordering::SeqCst);
+    let indices: Vec<u64> = (0..(OBJECTS * ROWS_PER_OBJECT) as u64).collect();
+    let files = dataset
+        .take_blobs_by_indices(&indices, "blob")
+        .await
+        .unwrap();
+
+    for (row, file) in files.iter().enumerate() {
+        let payload = &payloads[row / ROWS_PER_OBJECT];
+        let file = file.as_ref().unwrap();
+        assert_eq!(file.size(), payload.len() as u64);
+        assert_eq!(file.read().await.unwrap().as_ref(), payload.as_slice());
+    }
+    assert_eq!(
+        probe.heads.load(Ordering::SeqCst),
+        OBJECTS,
+        "expected one HEAD per distinct object"
+    );
+    assert!(
+        probe.peak_in_flight.load(Ordering::SeqCst) > 1,
+        "size lookups were issued serially"
     );
 }
 

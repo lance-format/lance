@@ -17,6 +17,7 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_select::RowAddrMask;
 use lance_table::{
     format::{
@@ -25,6 +26,7 @@ use lance_table::{
     rowids::RowIdSequence,
 };
 use object_store::path::Path;
+use uuid::Uuid;
 
 use crate::dataset::transaction::Transaction;
 
@@ -130,20 +132,25 @@ pub struct DeletionFileKey<'a> {
 impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
+        let mut key = format!(
             "deletion/{}/{}/{}/{}",
             self.fragment_id,
             self.deletion_file.read_version,
             self.deletion_file.id,
             self.deletion_file.file_type.suffix()
-        ))
+        );
+        if let Some(path) = &self.deletion_file.path {
+            key.push('/');
+            key.push_str(path);
+        }
+        Cow::Owned(key)
     }
     fn type_name() -> &'static str {
         "DeletionVector"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 1)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -157,6 +164,13 @@ impl CacheKey for DeletionFileKey<'_> {
         if let Some(base_id) = self.deletion_file.base_id {
             builder.write_some();
             builder.write_u32(base_id);
+        } else {
+            builder.write_none();
+        }
+        // An explicit path identifies the file along with the fields above.
+        if let Some(path) = &self.deletion_file.path {
+            builder.write_some();
+            builder.write_str(path);
         } else {
             builder.write_none();
         }
@@ -317,6 +331,34 @@ impl CacheKey for RowVersionSequenceKey<'_> {
     }
 }
 
+/// Complete persisted inverted-index tokenizer parameters, independent of row
+/// remapping. Stored in the metadata cache so parameter checks never populate
+/// the index partition cache.
+#[derive(Debug)]
+pub struct InvertedIndexParamsKey<'a> {
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for InvertedIndexParamsKey<'_> {
+    type ValueType = InvertedIndexParams;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("inverted_params/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "InvertedIndexParams"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.inverted-params-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
 impl DSMetadataCache {
     /// Create a file-specific metadata cache with the given prefix.
     /// This is used by file readers and other components that need file-level caching.
@@ -342,6 +384,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
             inline: None,
         };
         cache
@@ -363,6 +406,43 @@ mod tests {
                 .get_with_key(&DeletionFileKey {
                     fragment_id: 2,
                     deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_file_key_separates_explicit_paths() {
+        let cache = LanceCache::with_capacity(4096);
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some("_deletions/a.bin".to_string()),
+            inline: None,
+        };
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file,
+                },
+                Arc::new(DeletionVector::NoDeletions),
+            )
+            .await;
+
+        let other_path = DeletionFile {
+            path: Some("_deletions/b.bin".to_string()),
+            ..deletion_file.clone()
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &other_path,
                 })
                 .await
                 .is_none()

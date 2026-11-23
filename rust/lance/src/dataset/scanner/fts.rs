@@ -37,7 +37,7 @@ use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery,
-    fill_fts_query_column,
+    fill_fts_query_column, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::{
     CombinedFieldsBM25Scorer, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
@@ -1832,7 +1832,9 @@ impl Scanner {
         })
     }
 
-    /// Use global append-only corpus statistics independently of the selected candidates.
+    /// Use global corpus statistics independently of the selected candidates: the
+    /// statistics stored in the index segments, which still count rows deleted after
+    /// indexing, plus those of the live rows in unindexed fragments.
     /// Exact root scalar-text matches and phrases share this corpus with and without
     /// candidate restrictions. Other query shapes retain their existing planner.
     async fn plan_corpus_query(
@@ -1870,11 +1872,6 @@ impl Scanner {
             || params.wand_factor != 1.0
             || params.phrase_slop.is_some()
             || match_query.document_granularity != Some(DocumentGranularity::Row)
-            || self
-                .dataset
-                .fragments()
-                .iter()
-                .any(|f| f.deletion_file.is_some())
         {
             return Ok(None);
         }
@@ -2055,34 +2052,54 @@ impl Scanner {
             return Ok(Arc::new(EmptyExec::new(output_schema)));
         }
 
+        let is_fuzzy = uses_fuzzy_expansion(query.fuzziness);
         let (match_plan, flat_match_plan, shared_scorer) = match &index {
             Some(index) => {
-                let unindexed_fragments = self
-                    .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
+                let all_unindexed = self.dataset.unindexed_fragments(&index.name).await?;
+                let unindexed_fragments = self.retain_target_fragments(all_unindexed.clone());
                 if !target_fragments.is_empty()
                     && unindexed_fragments.len() == target_fragments.len()
                 {
                     if self.fast_search {
                         return Ok(Arc::new(EmptyExec::new(output_schema)));
                     }
+                    let (flat_frags, flat_filter) = if is_fuzzy {
+                        let candidate_filter = self
+                            .prefilter_source(
+                                filter_plan,
+                                all_unindexed.iter().map(|f| f.id as u32).collect(),
+                            )
+                            .await?;
+                        (all_unindexed, FlatMatchFilter::AtEmission(candidate_filter))
+                    } else {
+                        (
+                            unindexed_fragments,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
+                        )
+                    };
                     let flat_match_plan = self
                         .plan_flat_match_query(
-                            unindexed_fragments,
+                            flat_frags,
                             IndexVisibility::from_physical_rows(
                                 self.dataset.clone(),
                                 HashMap::new(),
                             ),
                             query,
                             params,
-                            FlatMatchFilter::BeforeScoring(filter_plan),
+                            flat_filter,
                             None,
                         )
                         .await?;
                     return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
                 }
 
+                let overlay_scope = if is_fuzzy {
+                    self.dataset.fragments()
+                } else {
+                    target_fragments
+                };
                 let (stale_rows, preset_segments) = match self
-                    .fts_overlay_plan(&column, document_granularity, target_fragments)
+                    .fts_overlay_plan(&column, document_granularity, overlay_scope)
                     .await?
                 {
                     FtsOverlayPlan::Unchanged(segments) => (
@@ -2097,16 +2114,31 @@ impl Scanner {
                         if self.fast_search {
                             return Ok(Arc::new(EmptyExec::new(output_schema)));
                         }
+                        let (flat_frags, flat_filter) = if is_fuzzy {
+                            let all_frags = self.dataset.fragments().to_vec();
+                            let candidate_filter = self
+                                .prefilter_source(
+                                    filter_plan,
+                                    all_frags.iter().map(|f| f.id as u32).collect(),
+                                )
+                                .await?;
+                            (all_frags, FlatMatchFilter::AtEmission(candidate_filter))
+                        } else {
+                            (
+                                target_fragments.to_vec(),
+                                FlatMatchFilter::BeforeScoring(filter_plan),
+                            )
+                        };
                         let flat_match_plan = self
                             .plan_flat_match_query(
-                                target_fragments.to_vec(),
+                                flat_frags,
                                 IndexVisibility::from_physical_rows(
                                     self.dataset.clone(),
                                     HashMap::new(),
                                 ),
                                 query,
                                 params,
-                                FlatMatchFilter::BeforeScoring(filter_plan),
+                                flat_filter,
                                 None,
                             )
                             .await?;
@@ -2114,9 +2146,15 @@ impl Scanner {
                     }
                 };
                 let overlay_block = stale_rows.block_mask().await?;
-                let has_flat_path = !self.fast_search
-                    && (!unindexed_fragments.is_empty() || !stale_rows.is_empty());
-                let shared_scorer = (has_flat_path && document_granularity.is_list_element())
+                let flat_fragments = if is_fuzzy {
+                    all_unindexed
+                } else {
+                    unindexed_fragments
+                };
+                let has_flat_path =
+                    !self.fast_search && (!flat_fragments.is_empty() || !stale_rows.is_empty());
+                let shared_scorer = (has_flat_path
+                    && (document_granularity.is_list_element() || is_fuzzy))
                     .then(|| Arc::new(SharedFtsScorer::new()));
                 let mut match_exec = match preset_segments {
                     Some(segments) => MatchQueryExec::new_with_segments_and_document_granularity(
@@ -2144,13 +2182,28 @@ impl Scanner {
                 match_exec = match_exec.with_external_mask(self.external_row_mask.clone());
                 let match_plan = Some(Arc::new(match_exec) as Arc<dyn ExecutionPlan>);
                 let flat_match_plan = if has_flat_path {
+                    let flat_filter = if is_fuzzy {
+                        let candidate_filter = self
+                            .prefilter_source(
+                                filter_plan,
+                                self.dataset
+                                    .fragments()
+                                    .iter()
+                                    .map(|f| f.id as u32)
+                                    .collect(),
+                            )
+                            .await?;
+                        FlatMatchFilter::AtEmission(candidate_filter)
+                    } else {
+                        FlatMatchFilter::BeforeScoring(filter_plan)
+                    };
                     Some(
                         self.plan_flat_match_query(
-                            unindexed_fragments,
+                            flat_fragments,
                             stale_rows,
                             query,
                             params,
-                            FlatMatchFilter::BeforeScoring(filter_plan),
+                            flat_filter,
                             shared_scorer.clone(),
                         )
                         .await?,
@@ -2167,14 +2220,31 @@ impl Scanner {
                 if self.fast_search {
                     return Ok(Arc::new(EmptyExec::new(output_schema)));
                 }
-                // No index: flat search all target fragments
+                // No index: flat search all target fragments (for fuzzy, discover
+                // vocabulary over the unfiltered corpus and apply candidate
+                // restrictions at emission so filters never shift the expansion cap).
+                let (flat_frags, flat_filter) = if is_fuzzy {
+                    let all_frags = self.dataset.fragments().to_vec();
+                    let candidate_filter = self
+                        .prefilter_source(
+                            filter_plan,
+                            all_frags.iter().map(|f| f.id as u32).collect(),
+                        )
+                        .await?;
+                    (all_frags, FlatMatchFilter::AtEmission(candidate_filter))
+                } else {
+                    (
+                        target_fragments.to_vec(),
+                        FlatMatchFilter::BeforeScoring(filter_plan),
+                    )
+                };
                 let flat_match_plan = self
                     .plan_flat_match_query(
-                        target_fragments.to_vec(),
+                        flat_frags,
                         IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new()),
                         query,
                         params,
-                        FlatMatchFilter::BeforeScoring(filter_plan),
+                        flat_filter,
                         None,
                     )
                     .await?;

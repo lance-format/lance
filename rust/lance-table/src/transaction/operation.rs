@@ -14,6 +14,7 @@ use crate::format::overlay::DataOverlayFile;
 use crate::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::UpdateMap;
+use crate::transaction::action::CompositeOperation;
 use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
@@ -114,24 +115,21 @@ pub enum Operation {
         /// `groups`, and the manifest is the durable record of the history.
         frag_reuse_index: Option<IndexMetadata>,
     },
-    /// Replace data in a column in the dataset with new data. This is used for
-    /// null column population where we replace an entirely null column with a
-    /// new column that has data.
+    /// Replace the data files backing some fields of existing fragments with
+    /// new files, without moving rows. Each group names a fragment and one new
+    /// data file for it; a fragment can take several groups, applied in order
+    /// to the fragment as it stands at commit. [`Fragment::replace_files`]
+    /// says what happens to its files. Used for null column population, and
+    /// by compaction to repack columns into fewer files.
     ///
-    /// This operation will only allow replacing files that contain the same schema
-    /// e.g. if the original files contain columns A, B, C and the new files contain
-    /// only columns A, B then the operation is not allowed. As we would need to split
-    /// the original files into two files, one with column A, B and the other with column C.
-    ///
-    /// Corollary to the above: the operation will also not allow replacing files unless the
-    /// affected columns all have the same datafile layout across the fragments being replaced.
-    ///
-    /// e.g. if fragments being replaced contain files with different schema layouts on
-    /// the column being replaced, the operation is not allowed.
-    /// say `frag_1: [A] [B, C]` and `frag_2: [A, B] [C]` and we are trying to replace column A
-    /// with a new column A, the operation is not allowed.
+    /// [`Fragment::replace_files`]: crate::format::Fragment::replace_files
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
+        /// Whether the new files change any value. `false` means the values
+        /// were only moved to new files (a compaction repack): indices keep
+        /// their coverage of the replaced fields, overlays keep shadowing, and
+        /// no row is stamped as updated.
+        data_change: bool,
     },
     /// Attach overlay files to fragments, supplying new values for a subset of
     /// `(physical offset, field)` cells without rewriting the fragments' base
@@ -265,6 +263,14 @@ pub enum Operation {
     /// is assumed to conflict with everything.
     #[non_exhaustive]
     Unknown {},
+
+    /// A Transaction V2 operation: an ordered list of granular actions that
+    /// commit atomically as one manifest change.
+    ///
+    /// Unlike the variants above, this one is not a single named change -- it is
+    /// the composable form the others decompose into. See
+    /// [`super::action`] for the vocabulary and its stability caveats.
+    CompositeOperation(CompositeOperation),
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -316,6 +322,7 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+            Self::CompositeOperation(_) => write!(f, "CompositeOperation"),
         }
     }
 }
@@ -448,6 +455,7 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
+            Self::CompositeOperation(_) => "CompositeOperation",
         }
     }
 

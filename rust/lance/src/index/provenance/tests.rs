@@ -281,11 +281,9 @@ async fn test_reconstructed_coverage_follows_a_deferred_compaction() {
     // fragment 2 when the remap is missing, which would leave this nothing
     // to ask about and hide whether the guard is sensitive on its own.
     let plan = CompactionPlan {
-        tasks: vec![TaskData {
-            fragments: dataset.fragments().as_ref().clone(),
-            output_clustering_id: None,
-            output_metadata: Default::default(),
-        }],
+        tasks: vec![TaskData::rewrite_fragments(
+            dataset.fragments().as_ref().clone(),
+        )],
         read_version: dataset.version().version,
         options: CompactionOptions::default(),
     };
@@ -671,6 +669,7 @@ impl ModelFragment {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(self.deleted.len() as usize),
             base_id: None,
+            path: None,
             inline: None,
         });
         fragment.overlays = self

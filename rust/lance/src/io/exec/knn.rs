@@ -28,6 +28,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
 };
+use datafusion::prelude::SessionConfig;
 use datafusion::{common::ColumnStatistics, physical_plan::metrics::ExecutionPlanMetricsSet};
 use datafusion::{
     common::stats::Precision,
@@ -47,6 +48,7 @@ use lance_core::{
     ROW_ID_FIELD,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
+use lance_datafusion::exec::DefaultTargetPartitions;
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     INDEX_SEGMENTS_SKIPPED_METRIC, PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
@@ -72,7 +74,10 @@ use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, mask_selects_nothing};
 use crate::index::vector::ivf::VectorQueryContract;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
-use crate::session::index_caches::SegmentOwnershipMaskKey;
+use crate::session::index_caches::{
+    QuantizedRefinementCache, QuantizedRefinementKey, QuantizedRefinementOptions,
+    QuantizedRefinementResult, SegmentOwnershipMaskKey,
+};
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -1234,6 +1239,31 @@ pub fn new_knn_exec(
     external_mask: Option<Arc<RowAddrMask>>,
     quantized_refine_factor: Option<u32>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    new_knn_exec_with_refinement_cache(
+        dataset,
+        indices,
+        query,
+        prefilter_source,
+        overlay_block,
+        external_mask,
+        quantized_refine_factor,
+        None,
+    )
+}
+
+// Keep the public constructor's signature and conservative behavior for callers
+// that cannot prove the scanner-level eligibility conditions.
+#[allow(clippy::too_many_arguments)]
+pub fn new_knn_exec_with_refinement_cache(
+    dataset: Arc<Dataset>,
+    indices: &[IndexMetadata],
+    query: &Query,
+    prefilter_source: PreFilterSource,
+    overlay_block: Option<RowAddrMask>,
+    external_mask: Option<Arc<RowAddrMask>>,
+    quantized_refine_factor: Option<u32>,
+    refinement_cache_options: Option<QuantizedRefinementOptions>,
+) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
         indices.iter().map(|idx| idx.uuid).collect_vec(),
@@ -1257,6 +1287,7 @@ pub fn new_knn_exec(
         sub_index = sub_index.with_quantized_refine_factor(factor)?;
     }
 
+    sub_index.refinement_cache_options = refinement_cache_options;
     Ok(Arc::new(sub_index))
 }
 
@@ -1551,6 +1582,9 @@ pub struct ANNIvfSubIndexExec {
 
     /// Coarse-candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
+
+    /// Proven by the scanner; execution also checks masks and prefilters.
+    refinement_cache_options: Option<QuantizedRefinementOptions>,
 }
 
 impl ANNIvfSubIndexExec {
@@ -1584,6 +1618,7 @@ impl ANNIvfSubIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             quantized_refine_factor: None,
+            refinement_cache_options: None,
         })
     }
 
@@ -2028,16 +2063,41 @@ fn quantized_top_k(batch: &RecordBatch, query: &Query) -> Result<RecordBatch> {
 fn effective_query_parallelism(
     query: &Query,
     index: &dyn VectorIndex,
-    target_partitions: usize,
+    target_partitions: Option<usize>,
 ) -> usize {
-    let cpu_pool_size = get_num_compute_intensive_cpus()
-        .min(target_partitions)
-        .max(1);
+    let cpu_pool_size = capped_cpu_pool_size(get_num_compute_intensive_cpus(), target_partitions);
     effective_query_parallelism_for(
         query,
         cpu_pool_size,
         index.auto_query_parallelism(cpu_pool_size),
     )
+}
+
+/// The session's `target_partitions` when a caller set it, `None` when a Lance
+/// session left it at DataFusion's default.
+///
+/// A session Lance did not build carries no marker, so its value counts as set,
+/// and so does a value changed after Lance built the session. A later change
+/// to the default value itself cannot be told apart; set
+/// `LanceExecutionOptions::target_partition` to limit a session reliably.
+fn explicit_target_partitions(config: &SessionConfig) -> Option<usize> {
+    let target = config.target_partitions();
+    let is_default = config
+        .get_extension::<DefaultTargetPartitions>()
+        .is_some_and(|default| default.0 == target);
+    (!is_default).then_some(target)
+}
+
+/// Caps the CPU pool at `target_partitions` only when a caller set it (#7087).
+///
+/// DataFusion's default `target_partitions` is the core count. Capping at that
+/// would undo a `LANCE_CPU_THREADS` set above the core count, which is how callers
+/// oversubscribe partition search: each probed partition is loaded from object
+/// storage, so an 8-CPU container would otherwise load at most 8 at a time.
+fn capped_cpu_pool_size(cpu_pool_size: usize, target_partitions: Option<usize>) -> usize {
+    target_partitions
+        .map_or(cpu_pool_size, |target| cpu_pool_size.min(target))
+        .max(1)
 }
 
 fn effective_query_parallelism_for(
@@ -2055,7 +2115,57 @@ fn effective_query_parallelism_for(
 }
 
 impl ANNIvfSubIndexExec {
+    #[allow(clippy::too_many_arguments)]
     async fn search_partition(
+        index: Arc<dyn VectorIndex>,
+        query: Query,
+        part_id: usize,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<AnnIndexMetrics>,
+        seg_mask: Option<Arc<RowAddrMask>>,
+        quantized_refine_factor: Option<u32>,
+        result_cache: Option<Arc<QuantizedRefinementCache>>,
+    ) -> DataFusionResult<RecordBatch> {
+        let batch = if let (Some(cache), Some(_)) = (&result_cache, quantized_refine_factor) {
+            let key = QuantizedRefinementKey {
+                identity: cache.identity,
+                partition_id: part_id,
+                dist_q_c: query.dist_q_c,
+            };
+            let result = cache
+                .cache
+                .get_or_insert_with_key(key, || async {
+                    let batch = Self::compute_partition(
+                        index,
+                        query.clone(),
+                        part_id,
+                        pre_filter,
+                        metrics.clone(),
+                        seg_mask,
+                        quantized_refine_factor,
+                    )
+                    .await?;
+                    QuantizedRefinementResult::copy_from(&batch)
+                })
+                .await?;
+            result.0.clone()
+        } else {
+            Self::compute_partition(
+                index,
+                query,
+                part_id,
+                pre_filter,
+                metrics.clone(),
+                seg_mask,
+                quantized_refine_factor,
+            )
+            .await?
+        };
+        metrics.baseline_metrics.record_output(batch.num_rows());
+        Ok(batch)
+    }
+
+    async fn compute_partition(
         index: Arc<dyn VectorIndex>,
         query: Query,
         part_id: usize,
@@ -2148,7 +2258,6 @@ impl ANNIvfSubIndexExec {
                 .await?;
             restrict_to_segment(batch, seg_mask.as_deref())?
         };
-        metrics.baseline_metrics.record_output(batch.num_rows());
         Ok(batch)
     }
 
@@ -2185,9 +2294,10 @@ impl ANNIvfSubIndexExec {
         global_prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
-        target_partitions: usize,
+        target_partitions: Option<usize>,
         seg_mask: Option<Arc<RowAddrMask>>,
         quantized_refine_factor: Option<u32>,
+        result_cache: Option<Arc<QuantizedRefinementCache>>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -2339,6 +2449,7 @@ impl ANNIvfSubIndexExec {
                     let index = index.clone();
                     let seg_mask = seg_mask.clone();
                     let quantized_refine_factor = quantized_refine_factor;
+                    let result_cache = result_cache.clone();
                     async move {
                         metrics.partitions_searched.add(1);
                         let batch = Self::search_partition(
@@ -2349,6 +2460,7 @@ impl ANNIvfSubIndexExec {
                             metrics,
                             seg_mask,
                             quantized_refine_factor,
+                            result_cache,
                         )
                         .await?;
                         state.record_late_batch(batch.num_rows());
@@ -2374,9 +2486,10 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
-        target_partitions: usize,
+        target_partitions: Option<usize>,
         seg_mask: Option<Arc<RowAddrMask>>,
         quantized_refine_factor: Option<u32>,
+        result_cache: Option<Arc<QuantizedRefinementCache>>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
@@ -2428,6 +2541,7 @@ impl ANNIvfSubIndexExec {
                 let state = state.clone();
                 let seg_mask = seg_mask.clone();
                 let quantized_refine_factor = quantized_refine_factor;
+                let result_cache = result_cache.clone();
                 async move {
                     let batch = Self::search_partition(
                         index,
@@ -2437,6 +2551,7 @@ impl ANNIvfSubIndexExec {
                         metrics,
                         seg_mask,
                         quantized_refine_factor,
+                        result_cache,
                     )
                     .await?;
                     state.record_batch(&batch);
@@ -2511,6 +2626,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
                 quantized_refine_factor: self.quantized_refine_factor,
+                refinement_cache_options: self.refinement_cache_options,
             }
         } else {
             return Err(DataFusionError::Internal(
@@ -2527,9 +2643,15 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
-        let target_partitions = context.session_config().target_partitions();
+        let target_partitions = explicit_target_partitions(context.session_config());
         let query = self.query.clone();
         let quantized_refine_factor = self.quantized_refine_factor;
+        let cache_options = self.refinement_cache_options;
+        let cache_eligible = cache_options.is_some()
+            && quantized_refine_factor.is_some()
+            && matches!(self.prefilter_source, PreFilterSource::None)
+            && self.overlay_block.is_none()
+            && self.external_mask.is_none();
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
         let indices = self.indices.clone();
@@ -2640,9 +2762,18 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             let _open_timer = IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
+                        let result_cache = if let Some(options) = cache_options.filter(|_| cache_eligible && raw_index.index_type() == IndexType::IvfRq) {
+                            QuantizedRefinementCache::for_segment(&ds, index_metadata, &query, options).await?
+                        } else { None };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
                         let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref())?;
                         policy.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
+                        let result_cache = result_cache.zip(quantized_refine_factor).map(|(mut cache, factor)| {
+                            cache.identity = QuantizedRefinementKey::query_identity(
+                                cache.identity, &query, raw_index.metric_type(), factor,
+                            );
+                            Arc::new(cache)
+                        });
 
                         // A segment's index file may still physically contain rows for
                         // fragments that were pruned from its fragment_bitmap (e.g. after an
@@ -2670,6 +2801,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             target_partitions,
                             seg_mask.clone(),
                             quantized_refine_factor,
+                            result_cache.clone(),
                         );
                         let late_search = Self::late_search(
                             raw_index.clone(),
@@ -2683,6 +2815,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             target_partitions,
                             seg_mask,
                             quantized_refine_factor,
+                            result_cache,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -2981,6 +3114,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -3123,6 +3257,37 @@ mod tests {
 
         query.query_parallelism = 128;
         assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
+    }
+
+    #[rstest]
+    // An unset target leaves an oversubscribed pool alone.
+    #[case::default_target_oversubscribed(64, None, 64)]
+    // A caller-set target_partitions still caps the pool (#7087).
+    #[case::explicit_lower_target(64, Some(4), 4)]
+    #[case::explicit_higher_target(6, Some(16), 6)]
+    #[case::empty_pool(0, None, 1)]
+    fn test_capped_cpu_pool_size(
+        #[case] cpu_pool_size: usize,
+        #[case] target_partitions: Option<usize>,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(
+            capped_cpu_pool_size(cpu_pool_size, target_partitions),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_explicit_target_partitions() {
+        // A target equal to the core count is still explicit when a caller set it.
+        let cores = SessionConfig::new().target_partitions();
+        let explicit = SessionConfig::new().with_target_partitions(cores);
+        assert_eq!(explicit_target_partitions(&explicit), Some(cores));
+        let default = SessionConfig::new().with_extension(Arc::new(DefaultTargetPartitions(cores)));
+        assert_eq!(explicit_target_partitions(&default), None);
+        // A target changed after the session was built is explicit again.
+        let changed = default.with_target_partitions(cores + 1);
+        assert_eq!(explicit_target_partitions(&changed), Some(cores + 1));
     }
 
     #[test]
@@ -4174,7 +4339,8 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state,
-            usize::MAX,
+            None,
+            None,
             None,
             None,
         )
@@ -4226,7 +4392,8 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state,
-            usize::MAX,
+            None,
+            None,
             None,
             None,
         )
@@ -4291,7 +4458,8 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
+            None,
             None,
             None,
         )
@@ -4381,8 +4549,9 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask.clone()),
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -4415,8 +4584,9 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask),
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -4478,8 +4648,9 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask.clone()),
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -4496,8 +4667,9 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask),
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -4530,7 +4702,8 @@ mod tests {
             prefilter.clone(),
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
+            None,
             None,
             None,
         )
@@ -4550,7 +4723,8 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state,
-            usize::MAX,
+            None,
+            None,
             None,
             None,
         )
@@ -5008,6 +5182,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
 
         async fn multivector_scoring(
@@ -5843,8 +6018,8 @@ mod tests {
         struct MaskLoader(RowAddrMask);
         #[async_trait::async_trait]
         impl FilterLoader for MaskLoader {
-            async fn load(self: Box<Self>) -> Result<RowAddrMask> {
-                Ok(self.0)
+            async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
+                Ok(Arc::new(self.0))
             }
         }
         let owning = |fragments: &[u32]| {
@@ -5915,7 +6090,8 @@ mod tests {
                     empty_prefilter().await,
                     metrics.clone(),
                     state,
-                    usize::MAX,
+                    None,
+                    None,
                     None,
                     None,
                 )

@@ -18,7 +18,7 @@ use aws_config::ecs::EcsCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
-use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
     StaticCredentialProvider,
@@ -55,12 +55,14 @@ pub struct AwsStoreProvider;
 struct ResolvedS3StorageOptions {
     options: HashMap<AmazonS3ConfigKey, String>,
     profile_region: Option<String>,
+    profile_credentials: Option<SharedCredentialsProvider>,
 }
 
 impl ResolvedS3StorageOptions {
     fn new(
         mut options: HashMap<AmazonS3ConfigKey, String>,
         profile_config: Option<&SdkConfig>,
+        profile_credentials: Option<SharedCredentialsProvider>,
     ) -> Self {
         if effective_s3_endpoint(&options).is_none()
             && let Some(endpoint) = profile_config.and_then(SdkConfig::endpoint_url)
@@ -73,6 +75,7 @@ impl ResolvedS3StorageOptions {
         Self {
             options,
             profile_region,
+            profile_credentials,
         }
     }
 
@@ -112,13 +115,14 @@ impl AwsStoreProvider {
 
         let provider_scheme = storage_options.aws_provider_scheme()?;
 
-        let (aws_creds, region) = build_aws_credential(
+        let (aws_creds, region) = build_aws_credential_with_profile(
             params.s3_credentials_refresh_offset,
             params.aws_credentials.clone(),
             Some(&resolved_s3_options.options),
             region,
             accessor,
             provider_scheme,
+            resolved_s3_options.profile_credentials.clone(),
         )
         .await?;
 
@@ -250,13 +254,16 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .map(|v| str_is_truthy(v))
             .unwrap_or(false);
 
-        let profile_config = if std::env::var_os("AWS_PROFILE").is_some() {
-            Some(aws_config::load_defaults(BehaviorVersion::latest()).await)
-        } else {
-            None
-        };
-        let resolved_s3_options =
-            ResolvedS3StorageOptions::new(storage_options.as_s3_options(), profile_config.as_ref());
+        let explicit_profile = explicit_s3_profile(&storage_options);
+        let SelectedS3Profile {
+            config,
+            credentials,
+        } = select_s3_profile(explicit_profile).await;
+        let resolved_s3_options = ResolvedS3StorageOptions::new(
+            storage_options.as_s3_options(),
+            config.as_ref(),
+            credentials,
+        );
 
         // Determine S3 Express and constant size upload parts before building the store
         let is_s3_express = check_s3_express(&base_path, &storage_options);
@@ -302,6 +309,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
         Ok(ObjectStore {
             inner,
             external_blob_inner: None,
+            direct_local_io: false,
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
@@ -318,6 +326,62 @@ impl ObjectStoreProvider for AwsStoreProvider {
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
             paginated_lister,
         })
+    }
+}
+
+/// Storage option naming an AWS shared profile for one store.
+const AWS_PROFILE_STORAGE_OPTION: &str = "aws_profile";
+
+fn explicit_s3_profile(storage_options: &StorageOptions) -> Option<&str> {
+    storage_options
+        .0
+        .get(AWS_PROFILE_STORAGE_OPTION)
+        .map(String::as_str)
+        .filter(|profile| !profile.is_empty())
+}
+
+/// Load the AWS SDK config for the store's selected profile.
+///
+/// An explicit `aws_profile` storage option overrides the process-wide
+/// `AWS_PROFILE`. When neither is set, the store keeps using the ambient
+/// default credential chain without loading a profile config here.
+async fn load_s3_profile_config(profile_name: Option<&str>) -> Option<SdkConfig> {
+    if profile_name.is_none() && std::env::var_os("AWS_PROFILE").is_none() {
+        return None;
+    }
+
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(profile_name) = profile_name {
+        loader = loader.profile_name(profile_name);
+    }
+    Some(loader.load().await)
+}
+
+#[derive(Default)]
+struct SelectedS3Profile {
+    config: Option<SdkConfig>,
+    credentials: Option<SharedCredentialsProvider>,
+}
+
+impl SelectedS3Profile {
+    fn region(&self) -> Option<String> {
+        self.config
+            .as_ref()
+            .and_then(SdkConfig::region)
+            .map(|region| region.as_ref().to_string())
+    }
+}
+
+async fn select_s3_profile(explicit_profile: Option<&str>) -> SelectedS3Profile {
+    let config = load_s3_profile_config(explicit_profile).await;
+    let credentials = if explicit_profile.is_some() {
+        config.as_ref().and_then(SdkConfig::credentials_provider)
+    } else {
+        None
+    };
+    SelectedS3Profile {
+        config,
+        credentials,
     }
 }
 
@@ -394,6 +458,43 @@ pub enum AwsProviderScheme {
     Irsa,
 }
 
+/// Build AWS credentials with the store's explicit `aws_profile` option.
+///
+/// This keeps [`build_aws_credential`]'s precedence. An explicit profile also
+/// supplies the signing region when `region` is absent. Ambient `AWS_PROFILE`
+/// keeps the existing default-chain behavior.
+pub async fn build_aws_credential_with_storage_options(
+    credentials_refresh_offset: Duration,
+    credentials: Option<AwsCredentialProvider>,
+    storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
+    region: Option<String>,
+    storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
+    provider_scheme: Option<AwsProviderScheme>,
+    storage_options_raw: &StorageOptions,
+) -> Result<(AwsCredentialProvider, String)> {
+    let explicit_profile = explicit_s3_profile(storage_options_raw);
+    let profile = if explicit_profile.is_some() {
+        select_s3_profile(explicit_profile).await
+    } else {
+        SelectedS3Profile::default()
+    };
+    let region = if explicit_profile.is_some() {
+        region.or_else(|| profile.region())
+    } else {
+        region
+    };
+    build_aws_credential_with_profile(
+        credentials_refresh_offset,
+        credentials,
+        storage_options,
+        region,
+        storage_options_accessor,
+        provider_scheme,
+        profile.credentials,
+    )
+    .await
+}
+
 /// Build AWS credentials
 ///
 /// This resolves credentials from the following sources in order:
@@ -420,6 +521,29 @@ pub async fn build_aws_credential(
     region: Option<String>,
     storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
     provider_scheme: Option<AwsProviderScheme>,
+) -> Result<(AwsCredentialProvider, String)> {
+    build_aws_credential_with_profile(
+        credentials_refresh_offset,
+        credentials,
+        storage_options,
+        region,
+        storage_options_accessor,
+        provider_scheme,
+        None,
+    )
+    .await
+}
+
+/// Like [`build_aws_credential`], but uses `profile_credentials` from the
+/// store's selected profile before the ambient default chain.
+async fn build_aws_credential_with_profile(
+    credentials_refresh_offset: Duration,
+    credentials: Option<AwsCredentialProvider>,
+    storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
+    region: Option<String>,
+    storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
+    provider_scheme: Option<AwsProviderScheme>,
+    profile_credentials: Option<SharedCredentialsProvider>,
 ) -> Result<(AwsCredentialProvider, String)> {
     use aws_config::meta::region::RegionProviderChain;
     const DEFAULT_REGION: &str = "us-west-2";
@@ -506,6 +630,16 @@ pub async fn build_aws_credential(
         if let Some(creds) = extract_static_s3_credentials(opts) {
             return Ok((Arc::new(creds), region));
         }
+    }
+
+    if let Some(profile_credentials) = profile_credentials {
+        return Ok((
+            Arc::new(AwsCredentialAdapter::new(
+                Arc::new(profile_credentials),
+                credentials_refresh_offset,
+            )),
+            region,
+        ));
     }
 
     let credentials_provider = DefaultCredentialsChain::builder().build().await;
@@ -744,6 +878,8 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::object_store::test_utils::RecordingConnector;
@@ -962,29 +1098,35 @@ mod tests {
     async fn test_injected_aws_creds_option_is_used() {
         let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
         let registry = Arc::new(ObjectStoreRegistry::default());
+        let connector = Arc::new(RecordingConnector::default());
 
         let params = ObjectStoreParams {
             aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("region".to_string(), "us-east-1".to_string())]),
+            ))),
+            http_connector: Some(connector.clone()),
             ..ObjectStoreParams::default()
         };
-
-        // Not called yet
-        assert!(!mock_provider.called.load(Ordering::Relaxed));
 
         let (store, _) = ObjectStore::from_uri_and_params(registry, "s3://not-a-bucket", &params)
             .await
             .unwrap();
 
-        // fails, but we don't care
-        let _ = store
-            .open(&Path::parse("/").unwrap())
-            .await
-            .unwrap()
-            .get_range(0..1)
-            .await;
+        assert!(!mock_provider.called.load(Ordering::Relaxed));
+        assert!(connector.requests.lock().unwrap().is_empty());
 
-        // Not called yet
+        let result =
+            object_store::ObjectStoreExt::get(store.inner.as_ref(), &Path::from("file")).await;
+
         assert!(mock_provider.called.load(Ordering::Relaxed));
+        let error = result.unwrap_err();
+        assert!(matches!(error, object_store::Error::NotFound { .. }));
+        assert!(error.to_string().contains("file"), "{error}");
+        assert!(connector.connects.load(Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/file"), "{requests:?}");
     }
 
     #[tokio::test]
@@ -1000,7 +1142,7 @@ mod tests {
         let url = Url::parse("s3://test-bucket/path").unwrap();
 
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None);
         let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
 
         assert_eq!(region.as_deref(), Some("us-west-004"));
@@ -1019,7 +1161,7 @@ mod tests {
             ),
         ]);
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(explicit_options, Some(&profile_config));
+            ResolvedS3StorageOptions::new(explicit_options, Some(&profile_config), None);
         let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
 
         assert_eq!(region.as_deref(), Some("explicit-region"));
@@ -1035,7 +1177,7 @@ mod tests {
     async fn test_region_only_aws_profile_preserves_bucket_discovery() {
         let profile_config = load_test_profile("[profile selected]\nregion = us-east-1").await;
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None);
 
         let url = Url::parse("s3:///path").unwrap();
         let error = resolve_s3_region(&url, &resolved_s3_options)
@@ -1055,9 +1197,220 @@ mod tests {
         )
         .await;
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None);
 
         assert!(resolved_s3_options.requires_constant_size_upload_parts());
+    }
+
+    const S3_PROFILE_CHILD_ENV: &str = "LANCE_TEST_S3_PROFILE_CHILD";
+    const S3_PROFILE_ENDPOINT_ENV: &str = "LANCE_TEST_S3_PROFILE_ENDPOINT";
+    const S3_PROFILE_SCRUBBED_ENV: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+        "AWS_ENDPOINT_URL_DYNAMODB",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_EC2_METADATA_DISABLED",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ];
+
+    #[tokio::test]
+    async fn test_s3_profile_selection_through_public_store() {
+        if std::env::var_os(S3_PROFILE_CHILD_ENV).is_none() {
+            run_s3_profile_parent().await;
+        } else {
+            run_s3_profile_child().await;
+        }
+    }
+
+    async fn run_s3_profile_parent() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let credentials_path = dir.path().join("credentials");
+        std::fs::write(
+            &config_path,
+            "[profile secondary]\n\
+             region = ap-southeast-2\n\
+             \n\
+             [profile primary]\n\
+             region = eu-west-1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &credentials_path,
+            "[secondary]\n\
+             aws_access_key_id = TESTSECONDARY\n\
+             aws_secret_access_key = secondary-secret\n\
+             \n\
+             [primary]\n\
+             aws_access_key_id = TESTPRIMARY\n\
+             aws_secret_access_key = primary-secret\n",
+        )
+        .unwrap();
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            std::thread::current().name().unwrap(),
+            "--nocapture",
+        ]);
+        for &key in S3_PROFILE_SCRUBBED_ENV {
+            command.env_remove(key);
+        }
+        let output = command
+            .env(S3_PROFILE_CHILD_ENV, "1")
+            .env(S3_PROFILE_ENDPOINT_ENV, server.uri())
+            .env("AWS_CONFIG_FILE", &config_path)
+            .env("AWS_SHARED_CREDENTIALS_FILE", &credentials_path)
+            .env("AWS_PROFILE", "secondary")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child did not run exactly one test:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request recording is enabled");
+        let probes = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/probe"))
+            .collect::<Vec<_>>();
+        assert_eq!(probes.len(), 5, "{probes:?}");
+        let authorizations = probes
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+            })
+            .collect::<Vec<_>>();
+
+        assert_signed_as(authorizations[0], "TESTSECONDARY", "ap-southeast-2");
+        assert_signed_as(authorizations[1], "TESTPRIMARY", "eu-west-1");
+        assert_signed_as(authorizations[2], "TESTSECONDARY", "ap-southeast-2");
+        assert_signed_as(authorizations[3], "TESTSECONDARY", "ap-southeast-2");
+        assert_signed_as(authorizations[4], "TESTPRIMARY", "ca-central-1");
+    }
+
+    async fn run_s3_profile_child() {
+        let endpoint = std::env::var(S3_PROFILE_ENDPOINT_ENV).unwrap();
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let uri = "s3://bucket/prefix";
+
+        let secondary =
+            open_profile_store(registry.clone(), uri, &endpoint, Some("secondary"), None).await;
+        let primary =
+            open_profile_store(registry.clone(), uri, &endpoint, Some("primary"), None).await;
+
+        // Both stores exist before the first request, so opening the second one
+        // cannot change how the first store signs.
+        probe_store(&secondary).await;
+        probe_store(&primary).await;
+        probe_store(&secondary).await;
+
+        let ambient = open_profile_store(registry.clone(), uri, &endpoint, None, None).await;
+        probe_store(&ambient).await;
+
+        let explicit_region = open_profile_store(
+            registry,
+            uri,
+            &endpoint,
+            Some("primary"),
+            Some("ca-central-1"),
+        )
+        .await;
+        probe_store(&explicit_region).await;
+    }
+
+    async fn open_profile_store(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        endpoint: &str,
+        profile: Option<&str>,
+        region: Option<&str>,
+    ) -> Arc<ObjectStore> {
+        let mut options = HashMap::from([
+            ("aws_endpoint".to_string(), endpoint.to_string()),
+            ("aws_allow_http".to_string(), "true".to_string()),
+            ("client_max_retries".to_string(), "0".to_string()),
+            ("lance_aimd_max_retries".to_string(), "0".to_string()),
+        ]);
+        if let Some(profile) = profile {
+            options.insert("aws_profile".to_string(), profile.to_string());
+        }
+        if let Some(region) = region {
+            options.insert("region".to_string(), region.to_string());
+        }
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn probe_store(store: &ObjectStore) {
+        let result =
+            object_store::ObjectStoreExt::get(store.inner.as_ref(), &Path::from("probe")).await;
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+    }
+
+    fn assert_signed_as(authorization: Option<&str>, access_key: &str, region: &str) {
+        let authorization = authorization.expect("request should be signed");
+        assert!(
+            authorization.contains(&format!("Credential={access_key}/")),
+            "expected access key {access_key} in {authorization}"
+        );
+        assert!(
+            authorization.contains(&format!("/{region}/s3/aws4_request")),
+            "expected region {region} in {authorization}"
+        );
     }
 
     #[test]

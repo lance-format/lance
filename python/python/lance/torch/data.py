@@ -52,6 +52,20 @@ class ToTensorFn(Protocol):
     ) -> Union[dict[str, torch.Tensor], torch.Tensor]: ...
 
 
+def _is_blob_column(field: pa.Field) -> bool:
+    """Check if a field is a Blob v1 (``large_binary``) or Blob v2 column."""
+    if (
+        isinstance(field.type, pa.ExtensionType)
+        and field.type.extension_name == "lance.blob.v2"
+    ):
+        return True
+    return (
+        field.type == pa.large_binary()
+        and field.metadata is not None
+        and field.metadata.get(b"lance-encoding:blob") == b"true"
+    )
+
+
 def _is_bfloat16_type(t: pa.DataType) -> bool:
     """Check if a PyArrow type is the lance bfloat16 extension type."""
     return isinstance(t, pa.ExtensionType) and t.extension_name == "lance.bfloat16"
@@ -291,6 +305,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         cache : str or bool, optional
             If set true, the dataset will be cached on disk from the first iteration.
             The following iterations will read from the cache.
+            An interrupted first iteration discards its partial cache; the next
+            iteration rebuilds it from the source. Interrupting a later iteration
+            preserves the completed cache.
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
@@ -391,7 +408,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             elif self.shard_granularity == "fragment":
                 sampler = ShardedFragmentSampler(rank, world_size)
             else:
-                raise ValueError("Invalid shard_granularity: {}")
+                raise ValueError(f"Invalid shard_granularity: {self.shard_granularity}")
         else:
             sampler = self.sampler
 
@@ -402,6 +419,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
             ]
 
         stream: Iterable[pa.RecordBatch]
+        if (
+            self.cached_ds is not None
+            and not self.cached_ds.finished_origin_stream
+            and self.cached_ds.cache_dir is None
+        ):
+            # The first cache fill was cancelled and its partial files removed.
+            # Build a new scanner rather than reuse the interrupted source stream.
+            self.cached_ds = None
         if self.cached_ds:
             stream = self.cached_ds
         else:
@@ -450,19 +475,15 @@ class LanceDataset(torch.utils.data.IterableDataset):
             del batch
 
     def _blob_columns(self) -> List[str]:
-        """Returns True if one of the projected column is Large Blob encoded."""
+        """Returns the projected columns that are Blob (v1 or v2) encoded."""
         cols = self.columns
         if not cols:
             cols = self.dataset.schema.names
         blob_cols = []
         for col in cols:
             field = self.dataset.schema.field(col)
-            if (
-                field.type == pa.large_binary()
-                and field.metadata is not None
-                and field.metadata.get(b"lance-encoding:blob") == b"true"
-            ):
-                logging.debug("Column %s is a Large Blob column", col)
+            if _is_blob_column(field):
+                logging.debug("Column %s is a Blob column", col)
                 blob_cols.append(col)
         return blob_cols
 
@@ -518,22 +539,23 @@ def get_safe_loader(dataset, batch_size=32, num_workers=4, **kwargs):
         **kwargs: Additional DataLoader arguments. Note:
                  - Forces 'spawn' context for Windows compatibility
                  - Sets persistent_workers=True by default
+                 - Both defaults apply only when num_workers > 0
                  - User-provided args override defaults
 
     Returns:
         Configured DataLoader instance with process-safe settings
     """
 
-    # Force spawn context for Windows/multiprocessing compatibility
-    ctx = torch.multiprocessing.get_context("spawn")
-
-    # Configure default parameters with process safety
-    loader_args = {
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-        "persistent_workers": kwargs.pop("persistent_workers", True),
-        "multiprocessing_context": ctx,
-        **kwargs,  # User-provided arguments take priority
-    }
+    loader_args = {"batch_size": batch_size, "num_workers": num_workers}
+    # DataLoader rejects persistent_workers=True and multiprocessing_context
+    # when num_workers == 0, so only set them for multi-process loading.
+    if num_workers > 0:
+        loader_args["persistent_workers"] = True
+        # Force spawn context for Windows/multiprocessing compatibility
+        loader_args["multiprocessing_context"] = torch.multiprocessing.get_context(
+            "spawn"
+        )
+    # User-provided arguments take priority
+    loader_args.update(kwargs)
 
     return torch.utils.data.DataLoader(dataset, **loader_args)

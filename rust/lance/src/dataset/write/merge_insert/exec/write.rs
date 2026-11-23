@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -13,7 +12,9 @@ use arrow_select;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{
@@ -123,8 +124,6 @@ struct MergeState {
     metrics: MergeInsertMetrics,
     /// Whether the dataset uses stable row ids.
     stable_row_ids: bool,
-    /// Set to track processed row IDs to detect duplicates
-    processed_row_ids: HashSet<u64>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
     processed_insert_keys: InsertedKeyTracker,
     /// The "on" column names for merge operation
@@ -147,7 +146,6 @@ impl MergeState {
             inserted_rows_filter: KeyExistenceFilterBuilder::new(field_ids),
             metrics,
             stable_row_ids,
-            processed_row_ids: HashSet::new(),
             processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
@@ -168,14 +166,14 @@ impl MergeState {
                 // Delete action - only delete, don't write back
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
-                    let row_id = row_id_array.value(row_idx);
 
                     // A source with duplicate keys matches the same target row
                     // more than once; apply the same dedupe policy as updates.
                     // (Target-only deletes from `delete_not_matched_by_source`
                     // also reach here but never duplicate, so they never trip
-                    // `Fail`.)
-                    if !self.processed_row_ids.insert(row_id) {
+                    // `Fail`.) Each target row has one address, so an address
+                    // already in `delete_row_addrs` marks a duplicate.
+                    if !self.delete_row_addrs.insert(row_addr) {
                         match self.source_dedupe_behavior {
                             SourceDedupeBehavior::Fail => {
                                 return Err(create_duplicate_row_error(
@@ -191,7 +189,6 @@ impl MergeState {
                         }
                     }
 
-                    self.delete_row_addrs.insert(row_addr);
                     self.metrics.num_deleted_rows.add(1);
                 }
                 Ok(None) // Don't keep this row
@@ -202,8 +199,9 @@ impl MergeState {
                     let row_addr = row_addr_array.value(row_idx);
                     let row_id = row_id_array.value(row_idx);
 
-                    // Check for duplicate _rowid in the current merge operation
-                    if !self.processed_row_ids.insert(row_id) {
+                    // A target row already in `delete_row_addrs` was matched
+                    // earlier in this merge.
+                    if !self.delete_row_addrs.insert(row_addr) {
                         match self.source_dedupe_behavior {
                             SourceDedupeBehavior::Fail => {
                                 return Err(create_duplicate_row_error(
@@ -218,8 +216,6 @@ impl MergeState {
                             }
                         }
                     }
-
-                    self.delete_row_addrs.insert(row_addr);
 
                     if self.stable_row_ids {
                         self.updating_row_ids.lock().unwrap().capture(&[row_id])?;
@@ -1214,6 +1210,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let _baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let write_time =
+            MetricBuilder::new(&self.metrics).subset_time("merge_write_time", partition);
 
         // Input schema structure based on our logical plan:
         // - target._rowaddr: Address of existing rows to update/delete
@@ -1309,6 +1307,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         };
 
         let result_stream = stream::once(async move {
+            // Time lazy execution, including upstream waits, rather than stream construction.
+            let _write_timer = write_time.timer();
             // Step 2: Write new fragments using the filtered data (inserts + updates)
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
@@ -1905,8 +1905,9 @@ mod tests {
             SourceDedupeBehavior::Fail,
         );
 
-        let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
-        let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
+        // Rows 0 and 1 match the same target row.
+        let row_addr_array = UInt64Array::from(vec![1000, 1000, 3000]);
+        let row_id_array = UInt64Array::from(vec![100, 100, 300]);
 
         let result1 = merge_state.process_row_action(
             Action::UpdateAll,
@@ -1961,8 +1962,9 @@ mod tests {
             SourceDedupeBehavior::FirstSeen,
         );
 
-        let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
-        let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
+        // Rows 0 and 1 match the same target row.
+        let row_addr_array = UInt64Array::from(vec![1000, 1000, 3000]);
+        let row_id_array = UInt64Array::from(vec![100, 100, 300]);
 
         let result1 = merge_state.process_row_action(
             Action::UpdateAll,

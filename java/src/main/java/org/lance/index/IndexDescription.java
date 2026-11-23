@@ -135,7 +135,7 @@ public final class IndexDescription {
   /**
    * JSON representation of index-specific details.
    *
-   * <p>The exact structure depends on the index implementation.
+   * <p>The exact structure depends on the index implementation. System indices return {@code {}}.
    */
   public String getDetailsJson() {
     return detailsJson;

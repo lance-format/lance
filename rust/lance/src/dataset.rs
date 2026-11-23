@@ -50,7 +50,6 @@ use lance_table::io::commit::{
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 use rand::{Rng, seq::index::sample as sample_indices};
@@ -142,7 +141,7 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::cleanup_data_fragments;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
+use crate::dataset::refs::{BranchContents, BranchIdentifier, BranchReservation, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
@@ -179,8 +178,10 @@ pub use take::TakeBuilder;
 pub use update_join_options::{UpdateJoinOptions, UpdateJoinStrategy};
 use uuid::Uuid;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, SourceDedupeBehavior,
-    UncommittedMergeInsert, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertAnalysis, MergeInsertBuilder, MergeInsertJob, MergeInsertJoin,
+    MergeInsertJoinStrategy, MergeInsertWriteMode, MergeInsertWriteStrategy, MergeOperatorSpills,
+    MergeStats, MergeSubplan, SourceDedupeBehavior, UncommittedMergeInsert, WhenMatched,
+    WhenNotMatched, WhenNotMatchedBySource,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;
@@ -688,7 +689,8 @@ impl Dataset {
     /// - Create the branch dataset by shallow cloning.
     ///
     /// These two phases are not atomic. We consider `BranchContents` as the source of truth
-    /// for the branch.
+    /// for the branch. Callers that must check their own state between the phases can run
+    /// them separately with [`Self::reserve_branch`] and [`Self::complete_branch`].
     ///
     /// A concurrent creator that cannot reserve the name returns a conflict without
     /// writing to the branch dataset.
@@ -724,6 +726,42 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        let reservation = self.reserve_branch(branch, version).await?;
+        // The reservation was just written, so skip complete_branch's ref reread.
+        self.clone_reserved_branch(reservation, store_params).await
+    }
+
+    /// Reserve a branch name at an exact source version without creating the branch dataset.
+    ///
+    /// This is the first phase of [`Self::create_branch`]. It applies the same name and
+    /// destination checks, resolves `version` to a fixed source branch and version, and
+    /// atomically creates the branch metadata (`BranchContents`). A concurrent reservation
+    /// of the same name returns a conflict.
+    ///
+    /// Until [`Self::complete_branch`] clones the source, the reserved branch is listed but
+    /// cannot be checked out. To abandon the reservation, delete the branch with
+    /// [`Self::delete_branch`].
+    ///
+    /// A pending reservation does not keep [`Self::cleanup_old_versions`] from removing its
+    /// source version: cleanup finds the versions a branch depends on through the branch's
+    /// manifests, and a reservation has none yet. If cleanup can run before the reservation
+    /// is completed, tag the source version until then, or completion can fail because the
+    /// source manifest was removed.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let reservation = dataset.reserve_branch("experiment", ("main", None)).await?;
+    /// // Check any state that must still hold before the branch is published.
+    /// let experiment = dataset.complete_branch(reservation, None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn reserve_branch(
+        &self,
+        branch: &str,
+        version: impl Into<refs::Ref>,
+    ) -> Result<BranchReservation> {
         refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
@@ -743,22 +781,80 @@ impl Dataset {
                 ),
             });
         }
+
+        // Claim the name before the clone can write into another creator's branch.
+        let contents = self
+            .branches()
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+        Ok(BranchReservation {
+            branch: branch.to_string(),
+            source_branch,
+            source_version: version_number,
+            identifier: contents.identifier,
+        })
+    }
+
+    /// Clone the source version of a reservation from [`Self::reserve_branch`] into its
+    /// branch.
+    ///
+    /// This is the second phase of [`Self::create_branch`]. Because a reservation can be held
+    /// across other work, it first rereads the branch metadata and refuses to clone if the
+    /// reservation was deleted ([`Error::RefNotFound`]) or the name was deleted and reserved
+    /// again ([`Error::RefConflict`]). That check is not atomic with the clone commit.
+    ///
+    /// The clone commits through this dataset's object store and commit handler, so any
+    /// handle of the same dataset can complete the reservation. `store_params` defaults to
+    /// this dataset's store parameters. As with [`Self::create_branch`], a failed or
+    /// interrupted clone keeps the reservation because the clone may have succeeded. Use
+    /// [`Self::force_delete_branch`] to remove the failed creation before retrying.
+    pub async fn complete_branch(
+        &self,
+        reservation: BranchReservation,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let branch = reservation.branch();
+        let contents = self
+            .branches()
+            .get(branch)
+            .await
+            .map_err(|error| match error {
+                Error::RefNotFound { .. } => Error::RefNotFound {
+                    message: format!("branch {branch} was deleted after it was reserved"),
+                },
+                error => error,
+            })?;
+        if contents.identifier != reservation.identifier {
+            return Err(Error::RefConflict {
+                message: format!("branch {branch} was deleted and recreated after it was reserved"),
+            });
+        }
+        self.clone_reserved_branch(reservation, store_params).await
+    }
+
+    async fn clone_reserved_branch(
+        &self,
+        reservation: BranchReservation,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let BranchReservation {
+            branch,
+            source_branch,
+            source_version,
+            ..
+        } = reservation;
+        let branch_location = self.branch_location().find_branch(Some(branch.as_str()))?;
         let source_location = self
             .branch_location()
             .find_branch(source_branch.as_deref())?;
         let clone_op = Operation::Clone {
             is_shallow: true,
-            ref_name: source_branch.clone(),
-            ref_version: version_number,
+            ref_name: source_branch,
+            ref_version: source_version,
             ref_path: source_location.uri,
-            branch_name: Some(branch.to_string()),
+            branch_name: Some(branch),
         };
-        let transaction = Transaction::new(version_number, clone_op, None);
-
-        // Claim the name before the clone can write into another creator's branch.
-        self.branches()
-            .create(branch, version_number, source_branch.as_deref())
-            .await?;
+        let transaction = Transaction::new(source_version, clone_op, None);
 
         CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
@@ -1557,7 +1653,7 @@ impl Dataset {
         } else if let Some(path) = &manifest.transaction_file {
             // Fallback: read external transaction file if present
             let path = self.transactions_dir().join(path.as_str());
-            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let data = self.object_store.read_object(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
             Transaction::try_from(transaction).map(Some)
         } else {
@@ -2118,6 +2214,38 @@ impl Dataset {
         take::take(self, row_indices, projection.into()).await
     }
 
+    /// Take rows with a maximum number of active fragment-reader data reads in the primary base.
+    ///
+    /// Current-format primary-base data and overlay files opened through the
+    /// fragment reader share one scheduler with this request ceiling, and
+    /// fragment-reader fanout is capped at `min(store_parallelism, io_parallelism)`.
+    /// This does not increase fragment-reader fanout above the store default, so
+    /// actual concurrency may be lower. Legacy v1 files, additional-base
+    /// schedulers, and auxiliary metadata or lineage reads (such as deletion
+    /// vectors and spilled row-ID or row-version sequences) keep their existing
+    /// schedulers. It must be greater than zero.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let rows = dataset
+    ///     .take_with_io_parallelism(&[0, 1, 2], dataset.schema().clone(), 64)
+    ///     .await?;
+    /// # let _ = rows;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip_all, fields(num_rows=row_indices.len(), io_parallelism))]
+    pub async fn take_with_io_parallelism(
+        &self,
+        row_indices: &[u64],
+        projection: impl Into<ProjectionRequest>,
+        io_parallelism: u32,
+    ) -> Result<RecordBatch> {
+        take::take_with_io_parallelism(self, row_indices, projection.into(), Some(io_parallelism))
+            .await
+    }
+
     /// Take Rows by the internal ROW ids.
     ///
     /// In Lance format, each row has a unique `u64` id, which is used to identify the row globally.
@@ -2356,6 +2484,8 @@ impl Dataset {
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
+    ///
+    /// `batch_readahead` must be greater than zero; otherwise the stream yields an invalid-input error.
     ///
     /// This is an experimental API. It may change at any time.
     pub fn take_scan(

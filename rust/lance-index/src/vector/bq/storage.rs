@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::cpu::Kernel;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
@@ -51,7 +52,7 @@ use crate::vector::bq::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
 };
 use crate::vector::bq::ex_dot::{
-    EX_DOT_BLOCK_DIMS, ExDotFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
+    EX_DOT_BLOCK_DIMS, ExDotKernelFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
 };
 use crate::vector::bq::pairwise::{RQKernel, RQPairScorer};
@@ -1027,7 +1028,7 @@ pub struct RabitDistCalculator<'a> {
     // the rotated query, zero-padded to a 64-dim multiple when needed; also
     // the source for the FastScan ex LUT on the legacy bypass path
     ex_query: Cow<'a, [f32]>,
-    ex_dot: Option<ExDotFn>,
+    ex_dot: Option<Kernel<ExDotKernelFn>>,
     add_factors: &'a [f32],
     scale_factors: &'a [f32],
     error_factors: Option<&'a [f32]>,
@@ -1119,7 +1120,7 @@ impl<'a> RabitDistCalculator<'a> {
         let ex_dot = self
             .ex_dot
             .expect("raw-query multi-bit RQ requires an ex-dot kernel");
-        ex_dot(
+        ex_dot.call(
             self.ex_query.as_ref(),
             &ex_codes[id * self.ex_code_len..(id + 1) * self.ex_code_len],
         )
@@ -1769,12 +1770,12 @@ impl<'a> RabitDistCalculator<'a> {
             let heap_threshold = (res.len() >= ctx.k)
                 .then(|| max_dist.map(|max_dist| max_dist.0))
                 .flatten();
-            let (pruned_upper_bound, pruned_heap) = prune_masks(
+            let (pruned_upper_bound, pruned_heap) = prune_masks.call(
                 dist16,
                 scale16,
                 add16,
                 error16,
-                terms,
+                &terms,
                 ctx.query_upper_bound,
                 heap_threshold,
             );
@@ -3263,7 +3264,7 @@ mod tests {
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
     use crate::vector::transform::Transformer;
     use crate::vector::v3::subindex::IvfSubIndex;
-    use crate::vector::{CENTROID_DIST_COLUMN, DIST_COL, PART_ID_COLUMN};
+    use crate::vector::{CENTROID_DIST_COLUMN, DIST_COL, PART_ID_COLUMN, RqGraphScoring};
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -5195,12 +5196,12 @@ mod tests {
         if perturbation > 0.0 {
             let threshold = (binary_distance as f64 - margin * 0.5) as f32;
             assert!(bound < threshold);
-            let masks = scaled_prune_mask_kernel()(
+            let masks = scaled_prune_mask_kernel().call(
                 &[binary_ip; PRUNE_LANES],
                 &[calc.scale_factors[0]; PRUNE_LANES],
                 &[calc.add_factors[0]; PRUNE_LANES],
                 &[calc.error_factors.unwrap()[0]; PRUNE_LANES],
-                ScaledLowerBoundTerms {
+                &ScaledLowerBoundTerms {
                     half_sum_q: 0.5 * calc.sum_q,
                     add_factor_scale: calc.add_factor_scale,
                     add_factor_offset: calc.add_factor_offset,
@@ -5717,6 +5718,32 @@ mod tests {
         }
     }
 
+    /// A multi-bit search scores visited nodes with the full multi-bit
+    /// estimator and a reranking search with the 1-bit walk.
+    #[test]
+    fn test_rq_graph_scoring_selects_search_calculator() {
+        let num_rows = 32;
+        let storage = hnsw_partition(5, DistanceType::L2, num_rows as usize);
+        let (query, dist_q_c) = residual_query_array(storage.code_dim());
+        let full = storage.dist_calculator(query.clone(), dist_q_c);
+        let walk = storage.graph_dist_calculator(query.clone(), dist_q_c);
+        let params = |rq_graph_scoring| HnswQueryParams {
+            ef: num_rows as usize,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c,
+            use_acorn: false,
+            rq_graph_scoring,
+        };
+        let multi_bit = params(RqGraphScoring::MultiBit).dist_calculator(&storage, query.clone());
+        let one_bit = params(RqGraphScoring::OneBitRerank).dist_calculator(&storage, query);
+        for id in 0..num_rows {
+            assert_eq!(multi_bit.distance(id), full.distance(id), "row {id}");
+            assert_eq!(one_bit.distance(id), walk.distance(id), "row {id}");
+        }
+        assert!((0..num_rows).any(|id| full.distance(id) != walk.distance(id)));
+    }
+
     #[derive(Clone, Copy)]
     enum RangeSearchPath {
         Graph,
@@ -5725,7 +5752,8 @@ mod tests {
     }
 
     /// HNSW range bounds judge the reranked score, not the walk score, on the
-    /// graph search, the sparse-mask flat scan and the ACORN search. 32 rows
+    /// graph search, the sparse-mask flat scan and the ACORN search, and the
+    /// full multi-bit score when the search never walks. 32 rows
     /// put a one-row mask below HNSW's 10% flat-scan threshold.
     #[rstest]
     #[case::graph_drops_reranked_out(RangeSearchPath::Graph, false)]
@@ -5738,6 +5766,8 @@ mod tests {
         #[case] path: RangeSearchPath,
         #[case] reranked_in_range: bool,
         #[values(1, 5)] num_bits: u8,
+        #[values(RqGraphScoring::MultiBit, RqGraphScoring::OneBitRerank)]
+        rq_graph_scoring: RqGraphScoring,
     ) {
         let num_rows = 32u64;
         let storage = hnsw_partition(num_bits, DistanceType::L2, num_rows as usize);
@@ -5779,6 +5809,7 @@ mod tests {
             upper_bound: upper,
             dist_q_c,
             use_acorn: matches!(path, RangeSearchPath::Acorn),
+            rq_graph_scoring,
         };
         let batch = hnsw
             .search(

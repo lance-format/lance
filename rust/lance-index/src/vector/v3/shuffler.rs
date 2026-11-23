@@ -1244,16 +1244,22 @@ impl TwoFileShuffleReader {
         offsets_reader: &FileReader,
         partition_id: usize,
     ) -> Result<Vec<Range<u64>>> {
-        let max_offset_values = self.num_batches.checked_mul(2).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "num_batches={} overflows on-demand offset count",
-                self.num_batches
-            ))
-        })?;
-        let mut offset_ranges = Vec::with_capacity(max_offset_values);
+        let expected_values = if self.num_partitions == 1 {
+            self.num_batches
+        } else {
+            self.num_batches.checked_mul(2).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "num_batches={} overflows on-demand offset count",
+                    self.num_batches
+                ))
+            })? - usize::from(partition_id == 0)
+        };
+        let mut offset_ranges = Vec::with_capacity(expected_values);
         for batch_idx in 0..self.num_batches {
             let end_index = batch_idx * self.num_partitions + partition_id;
-            if end_index != 0 {
+            // With one partition, each group's end is the next group's start.
+            // Read that shared offset only once to keep the ranges disjoint.
+            if self.num_partitions > 1 && end_index != 0 {
                 let start_index = u64::try_from(end_index - 1).map_err(|_| {
                     Error::invalid_input(format!(
                         "offset index {} cannot be represented as u64",
@@ -1279,7 +1285,6 @@ impl TwoFileShuffleReader {
                 FilterExpression::no_filter(),
             )
             .await?;
-        let expected_values = max_offset_values - usize::from(partition_id == 0);
         let mut offsets = Vec::with_capacity(expected_values);
         while let Some(batch) = offsets_stream.try_next().await? {
             let offset_column = batch
@@ -1307,9 +1312,10 @@ impl TwoFileShuffleReader {
 
         let mut offsets = offsets.into_iter();
         let mut ranges = Vec::with_capacity(self.num_batches);
+        let mut previous_end = 0;
         for batch_idx in 0..self.num_batches {
-            let start = if batch_idx == 0 && partition_id == 0 {
-                0
+            let start = if self.num_partitions == 1 || (batch_idx == 0 && partition_id == 0) {
+                previous_end
             } else {
                 offsets.next().ok_or_else(|| {
                     Error::corrupt_file_named(
@@ -1324,6 +1330,7 @@ impl TwoFileShuffleReader {
                     format!("missing end offset for partition {}", partition_id),
                 )
             })?;
+            previous_end = end;
             // Same as the preloaded path: skip the groups this partition has no
             // rows in rather than passing empty ranges to the reader.
             if start < end {
@@ -2585,6 +2592,55 @@ mod tests {
         assert_eq!(window_values[0], Vec::<i32>::new());
         assert_eq!(window_values[2].len(), 10);
         assert_eq!(window_values[5], Vec::<i32>::new());
+    }
+
+    #[rstest]
+    #[case::forced(
+        OffsetPreloadSource::ForcedOnDemand,
+        DEFAULT_MAX_PRELOADED_OFFSETS_BYTES
+    )]
+    #[case::zero_cap(OffsetPreloadSource::Sidecar, 0)]
+    #[tokio::test]
+    async fn test_on_demand_offsets_single_partition(
+        #[case] offset_source: OffsetPreloadSource,
+        #[case] max_preloaded_offsets_bytes: usize,
+        #[values(1, 3)] num_batches: usize,
+    ) {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let expected_values: Vec<i32> = (1..=num_batches as i32 * 2).map(|v| v * 10).collect();
+        let batches = expected_values
+            .chunks(2)
+            .map(|values| make_batch(&[0, 0], values, None))
+            .collect();
+        let reader = TwoFileShuffler::new(output_dir.clone(), 1)
+            .with_batch_size_bytes(1)
+            .shuffle(batches_to_stream(batches))
+            .await
+            .unwrap();
+
+        let preloaded = collect_partition(reader.as_ref(), 0).await.unwrap();
+        let values: &Int32Array = preloaded["val"].as_primitive();
+        assert_eq!(values.values(), &expected_values);
+        drop(reader);
+
+        let on_demand = TwoFileShuffleReader::try_new_with_preload_limit(
+            Arc::new(ObjectStore::local()),
+            output_dir,
+            1,
+            num_batches as u64,
+            vec![expected_values.len() as u64],
+            0.0,
+            None,
+            max_preloaded_offsets_bytes,
+            offset_source,
+        )
+        .await
+        .unwrap();
+        assert_eq!(on_demand.partition_size(0).unwrap(), expected_values.len());
+        let partition = collect_partition(on_demand.as_ref(), 0).await.unwrap();
+        let values: &Int32Array = partition["val"].as_primitive();
+        assert_eq!(values.values(), &expected_values);
     }
 
     #[tokio::test]
