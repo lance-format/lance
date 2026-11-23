@@ -1533,7 +1533,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
                 inline_tx = if inline_transaction {
-                    Some(pb::Transaction::try_from(transaction)?.into())
+                    Some(lance_table::format::Transaction::try_from(transaction)?)
                 } else {
                     None
                 };
@@ -3270,7 +3270,7 @@ mod tests {
         manifest: Manifest,
         transaction: &Transaction,
     ) -> Arc<dyn CommitHandler> {
-        let transaction = pb::Transaction::try_from(transaction).unwrap().into();
+        let transaction = lance_table::format::Transaction::try_from(transaction).unwrap();
         Arc::new(InjectForeignCommitHandler {
             foreign: Mutex::new(Some((manifest, transaction))),
         })

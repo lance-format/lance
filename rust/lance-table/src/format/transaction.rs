@@ -1,23 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Transaction struct for lance-table format layer.
+//! Protobuf transaction carrier for the manifest write path.
 //!
-//! This struct is introduced to provide a Struct-first API for passing transaction
-//! information within the lance-table crate. It mirrors the protobuf Transaction
-//! message at a semantic level while remaining crate-local, so lance-table does
-//! not depend on higher layers (e.g., lance crate).
+//! [`Transaction`] carries an already-encoded protobuf transaction to
+//! [`crate::io::commit::CommitHandler`] implementations and the
+//! [`crate::io::commit::ManifestWriter`]. A commit path passes it as an
+//! `Option` after deciding whether the manifest should include an inline copy;
+//! `None` leaves the transaction section empty.
 //!
-//! Conversion to protobuf occurs at the write boundary. See the `From<Transaction>`
-//! implementation below.
+//! The protobuf is built and validated before wrapping, so converting back with
+//! `From<Transaction> for pb::Transaction` moves the value at the write boundary.
 
 use crate::format::pb;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transaction {
-    /// Crate-local representation backing: protobuf Transaction.
-    /// Keeping this simple avoids ring dependencies while still enabling
-    /// Struct-first parameter passing in lance-table.
+    /// The encoded transaction carried to the manifest writer.
     pub inner: pb::Transaction,
 }
 
