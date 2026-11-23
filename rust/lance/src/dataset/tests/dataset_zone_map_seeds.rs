@@ -3126,9 +3126,12 @@ fn typed_float(i: i64) -> Option<f64> {
 
 fn typed_column(data_type: &DataType, ids: std::ops::Range<i64>) -> ArrayRef {
     use arrow_array::{
-        BooleanArray, Date32Array, Decimal128Array, DurationMicrosecondArray, Float32Array,
-        Float64Array, Int8Array, LargeBinaryArray, LargeStringArray, Time32SecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, UInt16Array, UInt64Array,
+        BooleanArray, Date32Array, Date64Array, Decimal128Array, DurationMicrosecondArray,
+        DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, Float32Array,
+        Float64Array, Int8Array, Int16Array, LargeBinaryArray, LargeStringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
 
     let values = ids.clone().map(typed_value);
@@ -3182,6 +3185,49 @@ fn typed_column(data_type: &DataType, ids: std::ops::Range<i64>) -> ArrayRef {
                 .with_precision_and_scale(*precision, *scale)
                 .unwrap(),
         ),
+        DataType::Int16 => Arc::new(Int16Array::from_iter(values.map(|v| v.map(|v| v as i16)))),
+        DataType::UInt8 => Arc::new(UInt8Array::from_iter(values.map(|v| v.map(|v| v as u8)))),
+        DataType::UInt32 => Arc::new(UInt32Array::from_iter(values.map(|v| v.map(|v| v as u32)))),
+        // Halves of `typed_value` are exact in Float16; no NaN is generated.
+        DataType::Float16 => arrow::compute::cast(
+            &Float32Array::from_iter(values.map(|v| v.map(|v| v as f32 / 2.0))),
+            data_type,
+        )
+        .unwrap(),
+        DataType::Date64 => Arc::new(Date64Array::from_iter(
+            values.map(|v| v.map(|v| (19_000 + v) * 86_400_000)),
+        )),
+        DataType::Time32(TimeUnit::Millisecond) => Arc::new(Time32MillisecondArray::from_iter(
+            values.map(|v| v.map(|v| (v * 60_000) as i32)),
+        )),
+        DataType::Time64(TimeUnit::Microsecond) => Arc::new(Time64MicrosecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 60_000_000)),
+        )),
+        DataType::Time64(TimeUnit::Nanosecond) => Arc::new(Time64NanosecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 60_000_000_000)),
+        )),
+        DataType::Timestamp(TimeUnit::Second, None) => Arc::new(TimestampSecondArray::from_iter(
+            values.map(|v| v.map(|v| 1_700_000_000 + v)),
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Arc::new(TimestampMicrosecondArray::from_iter(
+                values.map(|v| v.map(|v| 1_700_000_000_000_000 + v * 1_000_000)),
+            ))
+        }
+        DataType::Duration(TimeUnit::Second) => Arc::new(DurationSecondArray::from_iter(values)),
+        DataType::Duration(TimeUnit::Millisecond) => Arc::new(DurationMillisecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 1_000)),
+        )),
+        DataType::Duration(TimeUnit::Nanosecond) => Arc::new(DurationNanosecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 1_000)),
+        )),
+        DataType::Decimal256(_, scale) => arrow::compute::cast(
+            &Decimal128Array::from_iter(values.map(|v| v.map(|v| v as i128 * 10_000)))
+                .with_precision_and_scale(38, *scale)
+                .unwrap(),
+            data_type,
+        )
+        .unwrap(),
         other => panic!("no generator for {other}"),
     }
 }
@@ -3962,6 +4008,20 @@ impl PartialEq for TypedZone {
 #[case::binary(DataType::Binary, &["col >= X'000000000000001E'"])]
 #[case::large_binary(DataType::LargeBinary, &["col >= X'000000000000001E'"])]
 #[case::decimal128(DataType::Decimal128(38, 4), &["col >= 30"])]
+#[case::int16(DataType::Int16, &[])]
+#[case::uint8(DataType::UInt8, &[])]
+#[case::uint32(DataType::UInt32, &[])]
+#[case::float16(DataType::Float16, &[])]
+#[case::date64(DataType::Date64, &[])]
+#[case::time32_ms(DataType::Time32(TimeUnit::Millisecond), &[])]
+#[case::time64_us(DataType::Time64(TimeUnit::Microsecond), &[])]
+#[case::time64_ns(DataType::Time64(TimeUnit::Nanosecond), &[])]
+#[case::timestamp_s(DataType::Timestamp(TimeUnit::Second, None), &[])]
+#[case::timestamp_us(DataType::Timestamp(TimeUnit::Microsecond, None), &[])]
+#[case::duration_s(DataType::Duration(TimeUnit::Second), &[])]
+#[case::duration_ms(DataType::Duration(TimeUnit::Millisecond), &[])]
+#[case::duration_ns(DataType::Duration(TimeUnit::Nanosecond), &[])]
+#[case::decimal256(DataType::Decimal256(50, 4), &[])]
 #[tokio::test]
 async fn test_config_seed_boundary_per_type(
     #[case] data_type: DataType,
