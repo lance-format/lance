@@ -564,9 +564,8 @@ fn python_value_round_trips(
     let values = PyList::new(py, [py_value.clone()])?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("type", dtype)?;
-    let roundtrip = match pyarrow.call_method("array", (values,), Some(&kwargs)) {
-        Ok(array) => array,
-        Err(_) => return Ok(false),
+    let Ok(roundtrip) = pyarrow.call_method("array", (values,), Some(&kwargs)) else {
+        return Ok(false);
     };
     roundtrip.call_method1("equals", (original,))?.extract()
 }
