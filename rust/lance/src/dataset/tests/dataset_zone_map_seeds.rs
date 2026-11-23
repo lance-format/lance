@@ -12,11 +12,13 @@
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
+use arrow_array::types::Float32Type;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, StringViewArray, StructArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, FixedSizeListArray, Int32Array, Int64Array,
+    RecordBatch, RecordBatchIterator, StringArray, StringViewArray, StructArray,
+    TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -41,6 +43,9 @@ use crate::dataset::optimize::CompactionScope;
 use crate::dataset::schema_evolution::{ColumnAlteration, NewColumnTransform};
 use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
+use crate::dataset::write::seeds::{
+    ZONE_WRITE_SEEDS_ENABLED_KEY, ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY,
+};
 use crate::dataset::{
     CommitBuilder, DATA_DIR, InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode,
     UpdateBuilder, WriteDestination, WriteMode, WriteParams,
@@ -1902,6 +1907,7 @@ async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
     manifest.writer_feature_flags &= !FLAG_ZONE_WRITE_SEEDS;
     manifest.version += 1;
     let indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
+    let index_count = indices.len();
     write_manifest_file(
         dataset.object_store.as_ref(),
         dataset.commit_handler.as_ref(),
@@ -1921,7 +1927,7 @@ async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
     let mut reopened = dataset.clone();
     reopened.checkout_latest().await.unwrap();
     assert!(!seed_flags_set(&reopened));
-    assert_eq!(reopened.load_indices().await.unwrap().len(), 1);
+    assert_eq!(reopened.load_indices().await.unwrap().len(), index_count);
     reopened
 }
 
@@ -2559,4 +2565,325 @@ async fn test_binary_copy_translates_remapped_seed_fields() {
         "{plan}"
     );
     assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
+}
+
+// --- Zone write seeds from the dataset config --------------------------------
+//
+// `lance.zone_write_seeds.*` seeds every column that no seeded ZoneMap index
+// covers, so an index created later can be built from the seeds.
+
+const CONFIG_COLUMNS: [&str; 4] = ["id", "val", "name", "ts"];
+/// Columns of [`config_schema`] whose types the config never seeds.
+const UNSEEDED_CONFIG_COLUMNS: [&str; 2] = ["vec", "meta"];
+
+fn config_meta_field() -> Arc<ArrowField> {
+    Arc::new(ArrowField::new("a", DataType::Int32, true))
+}
+
+fn config_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("val", DataType::Int64, true),
+        ArrowField::new("name", DataType::Utf8, true),
+        ArrowField::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        ),
+        ArrowField::new(
+            "meta",
+            DataType::Struct(vec![config_meta_field()].into()),
+            true,
+        ),
+    ]))
+}
+
+fn config_rows(ids: std::ops::Range<i64>) -> RecordBatch {
+    RecordBatch::try_new(
+        config_schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(ids.clone())),
+            Arc::new(Int64Array::from_iter(
+                ids.clone().map(|i| (i % 7 != 3).then_some(i)),
+            )),
+            Arc::new(StringArray::from_iter(
+                ids.clone()
+                    .map(|i| (i % 5 != 2).then(|| format!("n{i:03}"))),
+            )),
+            Arc::new(TimestampMicrosecondArray::from_iter(
+                ids.clone()
+                    .map(|i| Some(1_700_000_000_000_000 + i * 1_000_000)),
+            )),
+            Arc::new(
+                FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                    ids.clone().map(|i| Some(vec![Some(i as f32); 4])),
+                    4,
+                ),
+            ),
+            Arc::new(StructArray::from(vec![(
+                config_meta_field(),
+                Arc::new(Int32Array::from_iter(ids.map(|i| Some(i as i32)))) as ArrayRef,
+            )])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Ten rows in one fragment, written before any config is set.
+async fn dataset_with_config_rows(uri: &str) -> Dataset {
+    Dataset::write(
+        RecordBatchIterator::new([Ok(config_rows(0..10))], config_schema()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+async fn append_config_rows(dataset: &mut Dataset, ids: std::ops::Range<i64>) {
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(config_rows(ids))], config_schema()),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+async fn enable_zone_write_seeds(dataset: &mut Dataset, rows_per_zone: u64) {
+    let rows_per_zone = rows_per_zone.to_string();
+    dataset
+        .update_config([
+            (ZONE_WRITE_SEEDS_ENABLED_KEY, "true"),
+            (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, rows_per_zone.as_str()),
+        ])
+        .await
+        .unwrap();
+}
+
+/// The `rows_per_zone` the seed locator of `column` declares in the data file
+/// serving it, or `None` when that file carries no seed for the column.
+async fn seed_locator_rows_per_zone(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    column: &str,
+) -> Option<u64> {
+    let file = serving_file(fragment, field_id(dataset, column));
+    let reader = open_data_file(dataset, &file.path).await;
+    let value = reader
+        .metadata()
+        .file_schema
+        .metadata
+        .get(&format!("{SEED_META_KEY_PREFIX}{column}"))?
+        .clone();
+    Some(value.split_once(':').unwrap().1.parse().unwrap())
+}
+
+/// The commit that enables the setting publishes the seed flags, so the next
+/// append seeds every column at the configured size; earlier files stay
+/// unseeded.
+#[tokio::test]
+async fn test_config_seeds_columns_without_index() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    assert!(!seed_flags_set(&dataset));
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    assert_seed_flags_set(&dataset);
+
+    append_config_rows(&mut dataset, 10..20).await;
+    let fragments = dataset.fragments().clone();
+    assert_eq!(fragments.len(), 2);
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &fragments[0], column).await,
+            None,
+            "first file, column {column}"
+        );
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &fragments[1], column).await,
+            Some(ROWS_PER_ZONE),
+            "appended file, column {column}"
+        );
+    }
+    for column in UNSEEDED_CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &fragments[1], column).await,
+            None,
+            "appended file, unsupported column {column}"
+        );
+    }
+}
+
+/// A snapshot that enables the setting but does not carry the seed flags
+/// writes no seed; its commit sets the flags and the next write is seeded.
+#[tokio::test]
+async fn test_config_seeds_wait_for_seed_flags() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    let mut legacy = reopen_with_seed_flags_cleared(&dataset).await;
+
+    append_config_rows(&mut legacy, 10..20).await;
+    assert_seed_flags_set(&legacy);
+    append_config_rows(&mut legacy, 20..30).await;
+    let fragments = legacy.fragments().clone();
+    assert_eq!(fragments.len(), 3);
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&legacy, &fragments[1], column).await,
+            None,
+            "append without flags, column {column}"
+        );
+        assert_eq!(
+            seed_locator_rows_per_zone(&legacy, &fragments[2], column).await,
+            Some(ROWS_PER_ZONE),
+            "append with flags, column {column}"
+        );
+    }
+}
+
+/// Without the setting, or with it set to false, appends carry no seeds and
+/// the seed flags stay unset.
+#[rstest::rstest]
+#[case::absent(None)]
+#[case::disabled(Some("false"))]
+#[tokio::test]
+async fn test_config_seeds_off(#[case] enabled: Option<&'static str>) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    if let Some(enabled) = enabled {
+        dataset
+            .update_config([
+                (ZONE_WRITE_SEEDS_ENABLED_KEY, enabled),
+                (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "4"),
+            ])
+            .await
+            .unwrap();
+    }
+    append_config_rows(&mut dataset, 10..20).await;
+    assert!(!seed_flags_set(&dataset));
+    let fragments = dataset.fragments().clone();
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &fragments[1], column).await,
+            None,
+            "column {column}"
+        );
+    }
+}
+
+/// A ZoneMap index created after a seeded append reuses the configured seeds
+/// for that fragment and answers queries like a scan.
+#[tokio::test]
+async fn test_index_built_from_config_seeds() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+    let appended = dataset.fragments()[1].id;
+
+    // Configured seeds record null counts, not positions, so the index
+    // keeps no null bitmap to reuse them.
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": ROWS_PER_ZONE,
+            "use_seeds": true,
+            "store_null_bitmap": false,
+        }));
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![appended]);
+
+    for filter in ["val >= 5 AND val < 15", "val = 12", "val IS NULL"] {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let expected = unindexed.try_into_batch().await.unwrap();
+        assert!(expected.num_rows() > 0, "filter {filter}");
+        assert_eq!(indexed, expected, "filter {filter}");
+    }
+}
+
+/// A column with a seeded ZoneMap index follows that index's zone size even
+/// when the configured size is smaller; a ZoneMap index without seeds does
+/// not take part, so its column gets the configured size like any other.
+#[rstest::rstest]
+#[case::seeded_index(true, 8)]
+#[case::unseeded_index(false, ROWS_PER_ZONE)]
+#[tokio::test]
+async fn test_config_seed_size_with_zone_map_index(
+    #[case] use_seeds: bool,
+    #[case] expected_val_rows_per_zone: u64,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+        .with_params(&serde_json::json!({"rows_per_zone": 8, "use_seeds": use_seeds}));
+    dataset
+        .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+        .await
+        .unwrap();
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+
+    let appended = dataset.fragments()[1].clone();
+    for column in CONFIG_COLUMNS {
+        let expected = if column == "val" {
+            expected_val_rows_per_zone
+        } else {
+            ROWS_PER_ZONE
+        };
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &appended, column).await,
+            Some(expected),
+            "column {column}"
+        );
+    }
+}
+
+/// Binary-copy compaction declares the configured zone size for carried
+/// seeds of columns without a seeded index, as the write path does.
+#[tokio::test]
+async fn test_binary_copy_declares_configured_rows_per_zone() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+    append_config_rows(&mut dataset, 20..30).await;
+    // Drop the unseeded first fragment so every compaction input is seeded.
+    dataset.delete("id < 10").await.unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    let output = dataset.fragments()[0].clone();
+    assert_eq!(output.physical_rows, Some(20));
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &output, column).await,
+            Some(ROWS_PER_ZONE),
+            "column {column}"
+        );
+    }
 }

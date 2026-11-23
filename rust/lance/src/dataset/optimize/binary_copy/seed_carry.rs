@@ -27,6 +27,7 @@ use lance_table::format::DataFile;
 
 use crate::Dataset;
 use crate::Result;
+use crate::dataset::write::seeds::ZoneWriteSeedsConfig;
 use crate::datatypes::Schema;
 
 /// One input column's recognized seed.
@@ -40,14 +41,26 @@ pub enum SourceColumnSeed {
 }
 
 /// The `rows_per_zone` an output column's locator declares: the current
-/// index specification for the column when one exists, else the writer
-/// default. It is write-time configuration; zones are located by length.
-pub fn output_rows_per_zone(index_rows_per_zone: Option<u64>) -> u64 {
-    index_rows_per_zone.unwrap_or(lance_index::scalar::zonemap::ROWS_PER_ZONE_DEFAULT)
+/// seeded index specification for the column when one exists, else
+/// `unindexed_rows_per_zone`. It is write-time configuration; zones are
+/// located by length.
+pub fn output_rows_per_zone(index_rows_per_zone: Option<u64>, unindexed_rows_per_zone: u64) -> u64 {
+    index_rows_per_zone.unwrap_or(unindexed_rows_per_zone)
 }
 
-/// The configured `rows_per_zone` of each column's current usable ZoneMap
-/// index, by field id.
+/// The `rows_per_zone` the write path uses for a column without a seeded
+/// ZoneMap index: the dataset's zone write seed setting when enabled, else
+/// the writer default.
+pub fn unindexed_rows_per_zone(dataset: &Dataset) -> u64 {
+    ZoneWriteSeedsConfig::from_config(dataset.config()).map_or(
+        lance_index::scalar::zonemap::ROWS_PER_ZONE_DEFAULT,
+        |config| config.rows_per_zone,
+    )
+}
+
+/// The seed `rows_per_zone` of each column with a current usable seeded
+/// ZoneMap index, by field id: the smallest among its seeded indices, as
+/// the write path chooses it.
 pub async fn index_rows_per_zone(dataset: &Dataset) -> Result<HashMap<i32, u64>> {
     use crate::index::scalar::fetch_index_details;
     use crate::index::{loading::load_all_indices, segment::index_is_usable};
@@ -74,9 +87,13 @@ pub async fn index_rows_per_zone(dataset: &Dataset) -> Result<HashMap<i32, u64>>
             continue;
         };
         if let Ok(zone_map) = details.to_msg::<ZoneMapIndexDetails>()
+            && zone_map.use_seeds.unwrap_or(false)
             && let Some(configured) = zone_map.rows_per_zone
         {
-            rows_per_zone.insert(field_id, configured);
+            rows_per_zone
+                .entry(field_id)
+                .and_modify(|rows: &mut u64| *rows = (*rows).min(configured))
+                .or_insert(configured);
         }
     }
     Ok(rows_per_zone)
@@ -246,8 +263,8 @@ impl OutputSeedAccumulator {
     /// A column is kept only when every input carries a version 1 seed of one
     /// value type; zones are located by length, so differing collection
     /// granularities concatenate freely and the output locator declares the
-    /// column's current `rows_per_zone` from `index_rows_per_zone` (or the
-    /// writer default). Each column is decided on its own: an input without
+    /// column's current `rows_per_zone` from `index_rows_per_zone` (or
+    /// `unindexed_rows_per_zone`). Each column is decided on its own: an input without
     /// a seed, with a version this build cannot interpret, or with a version
     /// 0 seed drops that column (no conversion or relabeling), and the data
     /// still copies.
@@ -255,6 +272,7 @@ impl OutputSeedAccumulator {
         &mut self,
         current_schema: &Schema,
         index_rows_per_zone: &HashMap<i32, u64>,
+        unindexed_rows_per_zone: u64,
     ) -> Result<Vec<OutputSeed>> {
         let sources = std::mem::take(&mut self.sources);
         let Some(first) = sources.first() else {
@@ -329,7 +347,10 @@ impl OutputSeedAccumulator {
             };
             output.push(OutputSeed {
                 column_name: current_field.name.clone(),
-                rows_per_zone: output_rows_per_zone(index_rows_per_zone.get(field_id).copied()),
+                rows_per_zone: output_rows_per_zone(
+                    index_rows_per_zone.get(field_id).copied(),
+                    unindexed_rows_per_zone,
+                ),
                 bytes,
             });
         }
