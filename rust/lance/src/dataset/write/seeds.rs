@@ -28,12 +28,17 @@
 //! - `lance.zone_write_seeds.rows_per_zone`: rows per seed zone for those
 //!   columns, an integer in `1..=u32::MAX`. Absent, it is
 //!   [`ROWS_PER_ZONE_DEFAULT`].
+//! - `lance.zone_write_seeds.store_null_bitmap`: whether those seeds record
+//!   null positions, so they can serve a ZoneMap index with
+//!   `store_null_bitmap = true` (the index default). Absent or `"true"`,
+//!   they do; `"false"` records none, and the seeds then only serve indexes
+//!   that store no null bitmap.
 //!
-//! Setting either key to an invalid value, or any other key under
+//! Setting any of these keys to an invalid value, or any other key under
 //! `lance.zone_write_seeds.`, is rejected by the commit that sets it.
 //!
 //! A column with a seeded ZoneMap index keeps following that index's
-//! `rows_per_zone`. When a seeded index's requirements cannot be resolved
+//! `rows_per_zone` and null-position policy. When a seeded index's requirements cannot be resolved
 //! for a file (its details or stored null-bitmap policy cannot be read), the
 //! column falls back to the configured seed if the setting is on. Enable the
 //! setting with [`Dataset::update_config`]; the commit that sets it also sets
@@ -52,6 +57,7 @@ use lance_index::scalar::seed::IndexSeedWriter;
 use lance_index::scalar::zonemap::{ROWS_PER_ZONE_DEFAULT, ZoneMapSeedWriter};
 pub use lance_table::feature_flags::{
     ZONE_WRITE_SEEDS_ENABLED_KEY, ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY,
+    ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY,
 };
 use lance_table::format::{IndexMetadata, Manifest};
 
@@ -70,6 +76,8 @@ static SEED_CONFLICT_WARNED: std::sync::Once = std::sync::Once::new();
 pub struct ZoneWriteSeedsConfig {
     /// Rows per seed zone for columns without a seeded ZoneMap index.
     pub rows_per_zone: u64,
+    /// Whether those seeds record null positions.
+    pub store_null_bitmap: bool,
 }
 
 impl ZoneWriteSeedsConfig {
@@ -77,9 +85,9 @@ impl ZoneWriteSeedsConfig {
     ///
     /// Values are validated when they are set
     /// (`validate_zone_write_seeds_config`), so this read is lenient: an
-    /// unparsable `enabled` disables the setting and an invalid
-    /// `rows_per_zone` falls back to [`ROWS_PER_ZONE_DEFAULT`], both with a
-    /// warning. That only matters for a manifest written by a build that did
+    /// unparsable `enabled` disables the setting, an invalid `rows_per_zone`
+    /// falls back to [`ROWS_PER_ZONE_DEFAULT`] and an unparsable
+    /// `store_null_bitmap` records null positions, each with a warning. That only matters for a manifest written by a build that did
     /// not validate them.
     pub fn from_config(config: &HashMap<String, String>) -> Option<Self> {
         let enabled = config.get(ZONE_WRITE_SEEDS_ENABLED_KEY)?;
@@ -108,7 +116,20 @@ impl ZoneWriteSeedsConfig {
                 }
             },
         };
-        Some(Self { rows_per_zone })
+        let store_null_bitmap = match config.get(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY) {
+            None => true,
+            Some(value) => value.parse::<bool>().unwrap_or_else(|err| {
+                log::warn!(
+                    "ignoring {ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY}={value:?} ({err}); zone \
+                     write seeds record null positions"
+                );
+                true
+            }),
+        };
+        Some(Self {
+            rows_per_zone,
+            store_null_bitmap,
+        })
     }
 }
 
@@ -328,7 +349,7 @@ async fn seed_writers_for(
                         && !other_columns.contains(&field.id)
                         && config_seed_supports(field)
                 })
-                .map(|field| (field, config.rows_per_zone))
+                .map(|field| (field, config.rows_per_zone, config.store_null_bitmap))
                 .collect()
         })
         .unwrap_or_default();
@@ -380,13 +401,13 @@ async fn seed_writers_for(
                 .with_null_positions(positions),
         ));
     }
-    // Configured seeds have no index whose null bitmap they could feed. A
-    // column whose seed writer cannot be constructed gets no configured
+    // Configured seeds record null positions unless the config turns them
+    // off. A column whose seed writer cannot be constructed gets no configured
     // seed; errors while observing batches or finishing a seed still fail
     // the write, as for index-requested seeds.
-    for (field, rows_per_zone) in config_columns {
+    for (field, rows_per_zone, positions) in config_columns {
         match ZoneMapSeedWriter::new(&field.name, rows_per_zone, field.data_type()) {
-            Ok(writer) => writers.push(Box::new(writer.with_null_positions(false))),
+            Ok(writer) => writers.push(Box::new(writer.with_null_positions(positions))),
             Err(err) => log::debug!(
                 "column {}: no configured zone write seed ({err})",
                 field.name
@@ -524,30 +545,43 @@ mod tests {
         &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "yes"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "16")],
         None
     )]
-    #[case::default_size(&[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true")], Some(ROWS_PER_ZONE_DEFAULT))]
+    #[case::default_size(&[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true")], Some((ROWS_PER_ZONE_DEFAULT, true)))]
     #[case::explicit_size(
         &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "16")],
-        Some(16)
+        Some((16, true))
     )]
     #[case::zero_size(
         &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "0")],
-        Some(ROWS_PER_ZONE_DEFAULT)
+        Some((ROWS_PER_ZONE_DEFAULT, true))
     )]
     #[case::negative_size(
         &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "-4")],
-        Some(ROWS_PER_ZONE_DEFAULT)
+        Some((ROWS_PER_ZONE_DEFAULT, true))
     )]
     #[case::unparsable_size(
         &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "many")],
-        Some(ROWS_PER_ZONE_DEFAULT)
+        Some((ROWS_PER_ZONE_DEFAULT, true))
     )]
     #[case::too_large_size(
         &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "4294967296")],
-        Some(ROWS_PER_ZONE_DEFAULT)
+        Some((ROWS_PER_ZONE_DEFAULT, true))
     )]
+    #[case::null_bitmap(
+        &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "true")],
+        Some((ROWS_PER_ZONE_DEFAULT, true))
+    )]
+    #[case::no_null_bitmap(
+        &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "false")],
+        Some((ROWS_PER_ZONE_DEFAULT, false))
+    )]
+    #[case::unparsable_null_bitmap(
+        &[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "yes")],
+        Some((ROWS_PER_ZONE_DEFAULT, true))
+    )]
+    #[case::null_bitmap_without_enabled(&[(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "true")], None)]
     fn test_zone_write_seeds_config_from_config(
         #[case] entries: &[(&str, &str)],
-        #[case] expected_rows_per_zone: Option<u64>,
+        #[case] expected: Option<(u64, bool)>,
     ) {
         let config: HashMap<String, String> = entries
             .iter()
@@ -555,7 +589,10 @@ mod tests {
             .collect();
         assert_eq!(
             ZoneWriteSeedsConfig::from_config(&config),
-            expected_rows_per_zone.map(|rows_per_zone| ZoneWriteSeedsConfig { rows_per_zone })
+            expected.map(|(rows_per_zone, store_null_bitmap)| ZoneWriteSeedsConfig {
+                rows_per_zone,
+                store_null_bitmap,
+            })
         );
     }
 

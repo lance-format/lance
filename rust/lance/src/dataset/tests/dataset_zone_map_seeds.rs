@@ -45,6 +45,7 @@ use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::write::seeds::{
     ZONE_WRITE_SEEDS_ENABLED_KEY, ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY,
+    ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY,
 };
 use crate::dataset::{
     CommitBuilder, DATA_DIR, InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode,
@@ -2800,8 +2801,7 @@ async fn test_index_built_from_config_seeds() {
     append_config_rows(&mut dataset, 10..20).await;
     let appended = dataset.fragments()[1].id;
 
-    // Configured seeds record null counts, not positions, so the index
-    // keeps no null bitmap to reuse them.
+    // An index without a null bitmap ignores the positions the seeds carry.
     let params =
         ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
             "rows_per_zone": ROWS_PER_ZONE,
@@ -2835,6 +2835,69 @@ async fn test_index_built_from_config_seeds() {
         assert!(expected.num_rows() > 0, "filter {filter}");
         assert_eq!(indexed, expected, "filter {filter}");
     }
+}
+
+/// Whether a ZoneMap index on `val` built from configured seeds reuses the
+/// appended fragment, depending on the null-position setting of the seeds
+/// (`None` leaves the key absent) and the index's `store_null_bitmap`.
+/// Results of null filters always match a scan.
+#[rstest::rstest]
+#[case::default_seeds_bitmap_index(None, true, true)]
+#[case::default_seeds_no_bitmap_index(None, false, true)]
+#[case::explicit_seeds_bitmap_index(Some("true"), true, true)]
+#[case::no_position_seeds_bitmap_index(Some("false"), true, false)]
+#[tokio::test]
+async fn test_config_seed_null_positions_serve_index(
+    #[case] seeds_store_null_bitmap: Option<&'static str>,
+    #[case] index_store_null_bitmap: bool,
+    #[case] expect_reuse: bool,
+) {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    if let Some(value) = seeds_store_null_bitmap {
+        dataset
+            .update_config([(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, value)])
+            .await
+            .unwrap();
+    }
+    append_config_rows(&mut dataset, 10..20).await;
+    let appended = dataset.fragments()[1].id;
+
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": ROWS_PER_ZONE,
+            "use_seeds": true,
+            "store_null_bitmap": index_store_null_bitmap,
+        }));
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    if expect_reuse {
+        assert_eq!(reports[0].reused_fragments, vec![appended]);
+        assert!(!reports[0].scanned_fragments.contains(&appended));
+    } else {
+        // A seed without null positions is rejected and its fragment scanned.
+        assert!(reports[0].reused_fragments.is_empty());
+        assert!(reports[0].partial_fragments.is_empty());
+        assert!(reports[0].scanned_fragments.contains(&appended));
+    }
+
+    assert_indexed_ids_match_scan(
+        &dataset,
+        &["val IS NULL", "val IS NOT NULL", "val >= 5 AND val < 15"],
+        "null positions",
+    )
+    .await;
 }
 
 /// A column with a seeded ZoneMap index follows that index's zone size even
@@ -2905,6 +2968,7 @@ async fn test_binary_copy_declares_configured_rows_per_zone() {
 #[rstest::rstest]
 #[case::enabled(ZONE_WRITE_SEEDS_ENABLED_KEY, "yes")]
 #[case::rows_per_zone(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "0")]
+#[case::store_null_bitmap(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "yes")]
 #[tokio::test]
 async fn test_config_rejects_invalid_zone_write_seeds_value(
     #[case] key: &'static str,
@@ -3028,8 +3092,7 @@ async fn assert_indexed_ids_match_scan(dataset: &Dataset, filters: &[&str], cont
     }
 }
 
-/// ZoneMap params that build from seeds without a null bitmap, which
-/// configured seeds cannot feed.
+/// ZoneMap params that build from seeds without a null bitmap.
 fn config_seed_index_params(rows_per_zone: u64) -> ScalarIndexParams {
     ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
         "rows_per_zone": rows_per_zone,

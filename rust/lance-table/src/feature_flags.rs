@@ -315,11 +315,16 @@ pub const ZONE_WRITE_SEEDS_CONFIG_PREFIX: &str = "lance.zone_write_seeds.";
 pub const ZONE_WRITE_SEEDS_ENABLED_KEY: &str = "lance.zone_write_seeds.enabled";
 /// Dataset config key for the rows per seed zone of those columns.
 pub const ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY: &str = "lance.zone_write_seeds.rows_per_zone";
+/// Dataset config key that makes those seeds record null positions, so they
+/// can serve a ZoneMap index that stores a null bitmap (`"true"` / `"false"`,
+/// absent means `"true"`).
+pub const ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY: &str = "lance.zone_write_seeds.store_null_bitmap";
 
 /// Validate a change to the zone write seed configuration.
 ///
-/// `lance.zone_write_seeds.enabled` must be `"true"` or `"false"`, and
-/// `lance.zone_write_seeds.rows_per_zone` an integer in `1..=u32::MAX`:
+/// `lance.zone_write_seeds.enabled` and
+/// `lance.zone_write_seeds.store_null_bitmap` must be `"true"` or `"false"`,
+/// and `lance.zone_write_seeds.rows_per_zone` an integer in `1..=u32::MAX`:
 /// per-zone null and NaN counts are 32-bit, as are the row offsets a zone
 /// spans within a fragment. No other key may use the prefix. Call before
 /// publishing a change to these keys.
@@ -329,7 +334,7 @@ pub fn validate_zone_write_seeds_config(manifest: &Manifest) -> Result<()> {
             continue;
         }
         match key.as_str() {
-            ZONE_WRITE_SEEDS_ENABLED_KEY => {
+            ZONE_WRITE_SEEDS_ENABLED_KEY | ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY => {
                 if value != "true" && value != "false" {
                     return Err(Error::invalid_input(format!(
                         "{key} must be \"true\" or \"false\", got {value:?}"
@@ -1072,6 +1077,8 @@ mod tests {
     #[case::size(&[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "8")])]
     #[case::size_without_enabled(&[(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "1")])]
     #[case::largest_size(&[(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "4294967295")])]
+    #[case::null_bitmap(&[(ZONE_WRITE_SEEDS_ENABLED_KEY, "true"), (ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "true")])]
+    #[case::no_null_bitmap(&[(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "false")])]
     #[case::unrelated_key(&[("lance.zone_write_seedsx", "1"), ("other.key", "x")])]
     fn test_zone_write_seeds_config_accepts_valid_values(#[case] entries: &[(&str, &str)]) {
         let mut manifest = empty_manifest();
@@ -1085,6 +1092,8 @@ mod tests {
     #[case::enabled_yes(ZONE_WRITE_SEEDS_ENABLED_KEY, "yes")]
     #[case::enabled_uppercase(ZONE_WRITE_SEEDS_ENABLED_KEY, "TRUE")]
     #[case::enabled_empty(ZONE_WRITE_SEEDS_ENABLED_KEY, "")]
+    #[case::null_bitmap_yes(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "yes")]
+    #[case::null_bitmap_empty(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "")]
     #[case::zero_size(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "0")]
     #[case::negative_size(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "-4")]
     #[case::garbage_size(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "many")]
