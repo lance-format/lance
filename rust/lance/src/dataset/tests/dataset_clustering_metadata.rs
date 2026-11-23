@@ -30,9 +30,10 @@ use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
-use crate::dataset::{ManifestWriteConfig, NewColumnTransform, write_manifest_file};
+use crate::dataset::{NewColumnTransform, write_manifest_file};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
+use lance_table::format::ManifestBuildConfig;
 
 const PROVIDER: &str = "org.example.cluster";
 const BUCKET_KEY: &str = "org.example.cluster.bucket";
@@ -106,18 +107,7 @@ async fn commit_edited_manifest(
         &dataset.base,
         &mut manifest,
         Some(indices),
-        &ManifestWriteConfig {
-            auto_set_feature_flags: true,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
+        &ManifestBuildConfig::default(),
         dataset.manifest_location.naming_scheme,
         None,
         false,

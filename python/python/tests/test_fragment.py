@@ -23,7 +23,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileReader, LanceFileWriter
-from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
+from lance.fragment import DeletionFile, RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 from pyarrow.fs import FileInfo, FileType
 
@@ -694,6 +694,87 @@ def test_deletion_file_with_base_id_serialization():
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+
+
+def test_deletion_file_explicit_path_json_round_trip():
+    explicit_path = f"_deletions/{uuid.uuid4()}.bin"
+    explicit = DeletionFile(
+        read_version=1,
+        id=123,
+        file_type="bitmap",
+        num_deleted_rows=1,
+        path=explicit_path,
+    )
+    assert explicit.stored_path == explicit_path
+    assert explicit.asdict()["path"] == explicit_path
+    assert explicit.path(5) == explicit.path(6) == explicit_path
+    assert (
+        explicit.path(5, "/tmp/ds")
+        == explicit.path(6, "/tmp/ds")
+        == f"tmp/ds/{explicit_path}"
+    )
+
+    fragment = FragmentMetadata(
+        id=5,
+        files=[],
+        physical_rows=10,
+        deletion_file=explicit,
+    )
+    round_tripped = FragmentMetadata.from_json(json.dumps(fragment.to_json()))
+    assert round_tripped == fragment
+    assert round_tripped.deletion_file is not None
+    assert round_tripped.deletion_file.stored_path == explicit_path
+    assert round_tripped.deletion_file.path(5) == explicit_path
+    assert round_tripped.deletion_file.path(99) == explicit_path
+
+    derived = DeletionFile(
+        read_version=1, id=123, file_type="bitmap", num_deleted_rows=1
+    )
+    assert derived.stored_path is None
+    assert derived.asdict()["path"] is None
+    derived_frag = FragmentMetadata(
+        id=5, files=[], physical_rows=10, deletion_file=derived
+    )
+    derived_rt = FragmentMetadata.from_json(json.dumps(derived_frag.to_json()))
+    assert derived_rt == derived_frag
+    assert derived_rt.deletion_file.stored_path is None
+    assert derived_rt.deletion_file.path(5) == "_deletions/5-1-123.bin"
+    assert derived_rt.deletion_file.path(99) == "_deletions/99-1-123.bin"
+
+    inline = DeletionFile(
+        read_version=1,
+        id=123,
+        file_type="bitmap",
+        num_deleted_rows=1,
+        inline=b"\x01\x02",
+    )
+    assert inline.stored_path is None
+    inline_frag = FragmentMetadata(
+        id=5, files=[], physical_rows=10, deletion_file=inline
+    )
+    inline_rt = FragmentMetadata.from_json(json.dumps(inline_frag.to_json()))
+    assert inline_rt == inline_frag
+    assert inline_rt.deletion_file.inline == b"\x01\x02"
+    assert inline_rt.deletion_file.path(5) is None
+
+    with pytest.raises(ValueError, match="both path and inline"):
+        DeletionFile(
+            read_version=1,
+            id=123,
+            file_type="bitmap",
+            num_deleted_rows=1,
+            inline=b"\x01",
+            path=explicit_path,
+        )
+    for bad_path in ("", "/_deletions/a.bin", "other/a.bin", "_deletions/a.arrow"):
+        with pytest.raises(ValueError, match="deletion file path"):
+            DeletionFile(
+                read_version=1,
+                id=123,
+                file_type="bitmap",
+                num_deleted_rows=1,
+                path=bad_path,
+            )
 
 
 def test_fragment_metadata_json_round_trips_clustering_metadata():
@@ -1404,6 +1485,63 @@ def test_fragment_take_with_json_column(tmp_path):
     assert metas[0] == '{"val":1}'
     assert metas[1] == '{"val":4}'
     assert metas[2] == '{"val":7}'
+
+
+@pytest.mark.parametrize("with_deletion", [False, True])
+def test_fragment_take_rejects_offsets_above_u32(tmp_path: Path, with_deletion: bool):
+    # Offsets above u32::MAX used to wrap modulo 2**32 and return a real row.
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path)
+    if with_deletion:
+        dataset.delete("a = 0")
+    frag = dataset.get_fragment(0)
+
+    for offset in [2**32, 2**32 + 3]:
+        with pytest.raises(ValueError, match=str(offset)):
+            frag.take([offset])
+        with pytest.raises(ValueError, match=str(offset)):
+            frag.take([1, offset], columns=["a"])
+
+    # Offsets that fit in u32 but are out of range keep the Rust-side error.
+    with pytest.raises(OSError, match=str(2**32 - 1)):
+        frag.take([2**32 - 1])
+    assert frag.take([2]).to_pydict() == {"a": [3 if with_deletion else 2]}
+
+
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_fragment_take_system_columns(tmp_path: Path, enable_stable_row_ids: bool):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(10)}),
+        tmp_path,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    dataset = lance.write_dataset(
+        pa.table({"a": range(10, 20)}), tmp_path, mode="append"
+    )
+    # A deletion makes fragment offsets, row addresses and row ids differ.
+    dataset.delete("a = 11")
+    frag = dataset.get_fragment(1)
+
+    columns = ["_rowaddr", "a", "_rowid"]
+    actual = frag.take([1, 2], columns=columns)
+    expected = dataset.take([11, 12], columns=columns)
+    assert actual.column_names == columns
+    assert actual == expected
+    assert actual["a"].to_pylist() == [12, 13]
+    assert actual["_rowaddr"].to_pylist() == [(1 << 32) + 2, (1 << 32) + 3]
+    if enable_stable_row_ids:
+        assert actual["_rowid"].to_pylist() == [12, 13]
+    else:
+        assert actual["_rowid"] == actual["_rowaddr"]
+
+    by_row_id = dataset._take_rows(actual["_rowid"].to_pylist(), columns=columns)
+    assert actual == by_row_id
+
+    # System columns alone, out of order and duplicated offsets.
+    for columns in (["_rowid"], ["_rowaddr"], ["_rowid", "_rowaddr"]):
+        actual = frag.take([3, 0, 3], columns=columns)
+        expected = dataset.take([13, 10, 13], columns=columns)
+        assert actual.column_names == columns
+        assert actual == expected
 
 
 def test_fragment_create_with_json_column(tmp_path):

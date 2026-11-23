@@ -82,7 +82,7 @@ impl Transaction {
         // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
         // activates the flag with an `Operation::Merge`, so an action set
         // never carries that watermark.
-        if config.use_stable_row_ids && !current_manifest.uses_stable_row_ids() {
+        if config.use_stable_row_ids() && !current_manifest.uses_stable_row_ids() {
             return Err(Error::not_supported_source(
                 "This dataset was not created with the stable row ids feature.  Please run \
                  `migrate_to_stable_row_ids` before attempting to use stable row ids"
@@ -571,7 +571,7 @@ impl<'a> ApplyState<'a> {
     /// Row lineage the caller read ahead of time for fragments whose lineage
     /// lives in a data file, which applying cannot read itself.
     pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
-        &self.build_config.spilled_row_lineage
+        self.build_config.spilled_row_lineage()
     }
 
     pub(super) fn schema(&self) -> &Schema {
@@ -2007,7 +2007,7 @@ mod tests {
         vec![vec![
             remove_fragment_zero(),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
+                fragment: Ref::Committed(0),
                 deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
@@ -2377,7 +2377,7 @@ mod tests {
         vec![
             mint_fragment(0),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 5,
+                fragment: Ref::Committed(5),
                 deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
@@ -2418,7 +2418,7 @@ mod tests {
     #[rstest]
     #[case::deletion_file(
         Action::SetDeletionFile(SetDeletionFile {
-            fragment: 1,
+            fragment: Ref::Committed(1),
             deletion_file: any_deletion_file(),
             data_change: true,
             base: None,
@@ -2901,7 +2901,7 @@ mod tests {
         write_data(Ref::Local(0), FieldRef::Committed(0)),
     ])]
     #[case::deletion_in_a_committed_fragment(vec![Action::SetDeletionFile(SetDeletionFile {
-        fragment: 0,
+        fragment: Ref::Committed(0),
         deletion_file: any_deletion_file(),
         data_change: true,
         base: None,

@@ -1209,9 +1209,8 @@ impl ScalarQueryParser for TextQueryParser {
         // Infix LIKE is accelerated only by the ngram index (via its regex
         // machinery). A plain-literal `regexp_like(col, 'foo')` is rewritten to
         // `col LIKE '%foo%'` before it reaches the index, so this is the path
-        // that accelerates those. ILIKE is skipped because its case folding does
-        // not match the index's normalization.
-        if !self.supports_regex || like.case_insensitive {
+        // that accelerates those.
+        if !self.supports_regex {
             return None;
         }
         let pattern_str = match pattern {
@@ -1221,7 +1220,10 @@ impl ScalarQueryParser for TextQueryParser {
         // Translate the LIKE pattern into a loose regex used only for candidate
         // generation; the original LIKE stays as the recheck filter, so the
         // regex only needs to be a sound superset.
-        let regex = like_to_regex(pattern_str, like.escape_char)?;
+        let mut regex = like_to_regex(pattern_str, like.escape_char)?;
+        if like.case_insensitive {
+            regex.insert_str(0, "(?i)");
+        }
         if !crate::scalar::ngram::regex_can_use_index(&regex) {
             return None;
         }
@@ -2780,8 +2782,23 @@ fn visit_binary_expr(
         }
         Operator::And => visit_and(expr, index_info, depth),
         Operator::Or => visit_or(expr, index_info, depth),
+        Operator::RegexMatch | Operator::RegexIMatch => Ok(visit_regex_match(expr, index_info)),
         _ => Ok(None),
     }
+}
+
+/// `col ~ 'pat'` is `regexp_like(col, 'pat')`; `~*` adds the `i` flag.
+fn visit_regex_match(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let (column, data_type, query_parser) = maybe_indexed_column(&expr.left, index_info)?;
+    let mut args = vec![expr.left.as_ref().clone(), expr.right.as_ref().clone()];
+    if expr.op == Operator::RegexIMatch {
+        args.push(Expr::Literal(ScalarValue::Utf8(Some("i".into())), None));
+    }
+    let regexp_like = datafusion_functions::regex::regexp_like();
+    query_parser.visit_scalar_function(&column, &data_type, &regexp_like, &args)
 }
 
 fn visit_scalar_fn(

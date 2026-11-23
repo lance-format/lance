@@ -537,6 +537,9 @@ mod aarch64 {
 mod aarch64 {
     pub fn has_neon_f16_support() -> bool {
         // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/aarch64/mod.rs#L533
+        // SAFETY: `getauxval` reads the kernel-provided process auxiliary
+        // vector. `AT_HWCAP` is a valid key, and the call has no pointer or
+        // lifetime preconditions.
         let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
         flags & libc::HWCAP_FPHP != 0
     }
@@ -554,11 +557,17 @@ mod aarch64 {
 mod loongarch64 {
     pub fn has_lsx_support() -> bool {
         // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/loongarch64/mod.rs#L263
+        // SAFETY: `getauxval` reads the kernel-provided process auxiliary
+        // vector. `AT_HWCAP` is a valid key, and the call has no pointer or
+        // lifetime preconditions.
         let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
         flags & libc::HWCAP_LOONGARCH_LSX != 0
     }
     pub fn has_lasx_support() -> bool {
         // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/loongarch64/mod.rs#L264
+        // SAFETY: `getauxval` reads the kernel-provided process auxiliary
+        // vector. `AT_HWCAP` is a valid key, and the call has no pointer or
+        // lifetime preconditions.
         let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
         flags & libc::HWCAP_LOONGARCH_LASX != 0
     }

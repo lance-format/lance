@@ -218,6 +218,32 @@ impl TakeOperation {
     }
 }
 
+/// Output columns and batch ordering for a [`Scanner`] scan plan.
+///
+/// System columns are appended after the projected data columns by
+/// [`LanceScanExec`], so they are not part of the projection schema.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ScanOptions {
+    /// Append the `_rowid` column.
+    pub(super) with_row_id: bool,
+    /// Append the `_rowaddr` column.
+    pub(super) with_row_address: bool,
+    /// Append the `_row_last_updated_at_version` column.
+    pub(super) with_row_last_updated_at_version: bool,
+    /// Append the `_row_created_at_version` column.
+    pub(super) with_row_created_at_version: bool,
+    /// Keep deleted rows with null row identity instead of filtering them out.
+    ///
+    /// Setting this uses the validity of the `_rowid` column as a selection
+    /// vector. Read more in [`crate::io::FileReader`].
+    pub(super) with_make_deletions_null: bool,
+    /// Emit batches in fragment order.
+    ///
+    /// [`Scanner::scan`] resolves this from the scanner's query state; direct
+    /// callers of [`Scanner::scan_fragments`] set it explicitly.
+    pub(super) ordered: bool,
+}
+
 impl Scanner {
     // Helper function for filtered_read
     //
@@ -285,19 +311,23 @@ impl Scanner {
             };
 
             let scan = self.scan_fragments(
-                projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_last_updated_at_version,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_created_at_version,
-                make_deletions_null,
+                ScanOptions {
+                    with_row_id: projection.with_row_id,
+                    with_row_address: self.projection_plan.physical_projection.with_row_addr,
+                    with_row_last_updated_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_last_updated_at_version,
+                    with_row_created_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_created_at_version,
+                    with_make_deletions_null: make_deletions_null,
+                    ordered,
+                },
                 Arc::new(projection.to_bare_schema()),
                 fragments,
                 scan_range,
-                ordered,
             );
 
             if filter_plan.has_refine() && is_prefilter {
@@ -978,20 +1008,24 @@ impl Scanner {
             let optimized_filter = planner.optimize_expr(filter.clone())?;
 
             let new_data_scan = self.scan_fragments(
-                true,
-                self.projection_plan.physical_projection.with_row_addr,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_last_updated_at_version,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_created_at_version,
-                false,
+                ScanOptions {
+                    with_row_id: true,
+                    with_row_address: self.projection_plan.physical_projection.with_row_addr,
+                    with_row_last_updated_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_last_updated_at_version,
+                    with_row_created_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_created_at_version,
+                    with_make_deletions_null: false,
+                    ordered: false,
+                },
                 scan_schema,
                 missing_frags.into(),
                 // No pushdown of limit/offset when doing scalar indexed scan
                 None,
-                false,
             );
             let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
@@ -1040,17 +1074,8 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
-    ///
-    /// Setting `with_make_deletions_null` will use the validity of the _rowid
-    /// column as a selection vector. Read more in [crate::io::FileReader].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_last_updated_at_version: bool,
-        with_row_created_at_version: bool,
-        with_make_deletions_null: bool,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
@@ -1066,30 +1091,22 @@ impl Scanner {
             self.ordered
         };
         self.scan_fragments(
-            with_row_id,
-            with_row_address,
-            with_row_last_updated_at_version,
-            with_row_created_at_version,
-            with_make_deletions_null,
+            ScanOptions {
+                ordered,
+                ..Default::default()
+            },
             projection,
             fragments,
             range,
-            ordered,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_fragments(
         &self,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_last_updated_at_version: bool,
-        with_row_created_at_version: bool,
-        with_make_deletions_null: bool,
+        options: ScanOptions,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
         range: Option<Range<u64>>,
-        ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
         log::trace!("scan_fragments covered {} fragments", fragments.len());
         let config = LanceScanConfig {
@@ -1098,12 +1115,12 @@ impl Scanner {
             fragment_readahead: self.fragment_readahead,
             io_buffer_size: self.get_io_buffer_size(),
             materialization_readahead_bytes: self.materialization_readahead_bytes,
-            with_row_id,
-            with_row_address,
-            with_row_last_updated_at_version,
-            with_row_created_at_version,
-            with_make_deletions_null,
-            ordered_output: ordered,
+            with_row_id: options.with_row_id,
+            with_row_address: options.with_row_address,
+            with_row_last_updated_at_version: options.with_row_last_updated_at_version,
+            with_row_created_at_version: options.with_row_created_at_version,
+            with_make_deletions_null: options.with_make_deletions_null,
+            ordered_output: options.ordered,
             file_reader_options: self.resolved_file_reader_options(),
             parallelism_cap: None,
         };
@@ -1163,10 +1180,7 @@ impl Scanner {
         let fields_to_take = output_projection
             .clone()
             .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if !fields_to_take.has_data_fields()
-            && !fields_to_take.with_row_id
-            && !fields_to_take.with_row_addr
-        {
+        if fields_to_take.is_empty() {
             // No new columns needed
             return Ok(input);
         }

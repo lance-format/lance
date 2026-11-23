@@ -44,7 +44,7 @@ async fn test_bitmap_index_statistics_minimal_io_via_dataset() {
         .unwrap()
         .join(index_meta.uuid.to_string())
         .join(BITMAP_LOOKUP_NAME);
-    let meta = dataset.object_store.inner.head(&lookup_path).await.unwrap();
+    let meta = dataset.object_store.stat(&lookup_path).await.unwrap();
     assert!(
         meta.size >= 1_000_000,
         "bitmap index should be large enough to fail without metadata path, size={} bytes",

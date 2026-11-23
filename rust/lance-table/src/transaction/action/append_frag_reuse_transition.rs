@@ -247,6 +247,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
             inline: None,
         });
         let mut actions = compaction(&[0], 0, false, Some(ordered(survivors(&[0], &[(0, 3)]))));
@@ -269,13 +270,14 @@ mod tests {
 
     fn delete_one_row(fragment: u64) -> Action {
         Action::SetDeletionFile(SetDeletionFile {
-            fragment,
+            fragment: Ref::Committed(fragment),
             deletion_file: DeletionFile {
                 read_version: 1,
                 id: 1,
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(1),
                 base_id: None,
+                path: None,
                 inline: None,
             },
             data_change: true,
@@ -339,13 +341,14 @@ mod tests {
                 t.destinations = vec![Ref::Committed(reserved)];
             }
             actions.push(Action::SetDeletionFile(SetDeletionFile {
-                fragment: reserved,
+                fragment: Ref::Committed(reserved),
                 deletion_file: DeletionFile {
                     read_version: 1,
                     id: 1,
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(1),
                     base_id: None,
+                    path: None,
                     inline: None,
                 },
                 data_change: true,

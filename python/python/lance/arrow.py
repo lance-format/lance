@@ -580,9 +580,21 @@ def cast(
                 "Only support casting fixed size list to fixed size list "
                 f"with the same size, got: {arr.type} to {target_type}"
             )
-        values = cast(arr.values, list_type.value_type)
-        return pa.FixedSizeListArray.from_arrays(
-            values=values, list_size=list_type.list_size
+        # ``arr.values`` ignores the array's offset and length, so slice it.
+        list_size = list_type.list_size
+        values = arr.values.slice(arr.offset * list_size, len(arr) * list_size)
+        values = cast(values, list_type.value_type)
+        if arr.null_count == 0:
+            return pa.FixedSizeListArray.from_arrays(values=values, list_size=list_size)
+        # ``from_arrays(mask=...)`` needs PyArrow 15; build from buffers so the
+        # validity bitmap is kept on every supported PyArrow version.
+        validity = arr.is_valid().buffers()[1]
+        return pa.Array.from_buffers(
+            pa.list_(values.type, list_size),
+            len(arr),
+            [validity],
+            null_count=arr.null_count,
+            children=[values],
         )
 
     # Fallback to normal cast.

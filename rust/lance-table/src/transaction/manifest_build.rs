@@ -243,7 +243,7 @@ impl Transaction {
         // Restore dispatches separately from the prepared build path, and it
         // has no use for a definitions list: ignoring one silently would lose
         // the caller's input.
-        if config.clustering_definitions.is_some() {
+        if config.clustering_definitions().is_some() {
             return Err(Error::invalid_input(
                 "a complete clustering definitions list can only be committed with UpdateConfig",
             ));
@@ -257,7 +257,7 @@ impl Transaction {
         // republish the referenced files as legacy-compatible.
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
-        manifest.set_timestamp(config.timestamp_nanos);
+        manifest.set_timestamp(config.timestamp_nanos().unwrap_or(0));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         validate_flags(&manifest, &indices)?;
@@ -613,7 +613,7 @@ impl Transaction {
             current_manifest,
             &current_indices,
             &frag_reuse,
-            config.migration_next_row_id,
+            config.migration_next_row_id(),
         )?;
         let mut prepared = current_indices.clone();
         if let Some(manifest) = current_manifest {
@@ -782,7 +782,7 @@ impl Transaction {
         // operation that applies a definitions list has to be enforced here
         // rather than in the convenience wrapper: anything else would ignore
         // the caller's list and report success.
-        if config.clustering_definitions.is_some()
+        if config.clustering_definitions().is_some()
             && !matches!(self.operation, Operation::UpdateConfig { .. })
         {
             return Err(Error::invalid_input(
@@ -805,7 +805,7 @@ impl Transaction {
             current_manifest,
             prepared.original(),
             prepared.frag_reuse_update(),
-            config.migration_next_row_id,
+            config.migration_next_row_id(),
         )?;
         let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
         if let Operation::CompositeOperation(composite_operation) = &self.operation {
@@ -826,8 +826,8 @@ impl Transaction {
             );
         }
 
-        if config.use_stable_row_ids
-            && config.migration_next_row_id.is_none()
+        if config.use_stable_row_ids()
+            && config.migration_next_row_id().is_none()
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
@@ -849,7 +849,7 @@ impl Transaction {
             .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
             .map(|idx| idx.name.as_str())
             .collect();
-        if config.migration_next_row_id.is_some() && !blocking_indices.is_empty() {
+        if config.migration_next_row_id().is_some() && !blocking_indices.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Cannot migrate to stable row IDs while indexes exist on the dataset. \
                  Drop the following indexes first, then re-run the migration, and \
@@ -923,7 +923,7 @@ impl Transaction {
 
         // Release builds refuse to publish a stable-row-id dataset with a fragment
         // reuse index, and no index needs it.
-        if config.migration_next_row_id.is_some() {
+        if config.migration_next_row_id().is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
 
@@ -940,7 +940,7 @@ impl Transaction {
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already, or this is
             // a migration activation that explicitly provides the next_row_id.
-            match (current_manifest, config.use_stable_row_ids) {
+            match (current_manifest, config.use_stable_row_ids()) {
                 (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
                 }
@@ -948,7 +948,7 @@ impl Transaction {
                 (_, false) => None,
                 (Some(_), true) => {
                     // Migration activation: use the provided next_row_id.
-                    if let Some(migration_nri) = config.migration_next_row_id {
+                    if let Some(migration_nri) = config.migration_next_row_id() {
                         Some(migration_nri)
                     } else {
                         return Err(Error::not_supported_source(
@@ -1157,7 +1157,7 @@ impl Transaction {
                             &offsets,
                             new_version,
                             prev_version,
-                            &config.spilled_row_lineage,
+                            config.spilled_row_lineage(),
                         )?;
                     }
                 }
@@ -1189,11 +1189,11 @@ impl Transaction {
                         existing_fragments,
                         new_fragments.as_mut_slice(),
                         new_version,
-                        &config.spilled_row_lineage,
+                        config.spilled_row_lineage(),
                     )?;
                 }
 
-                if config.use_stable_row_ids
+                if config.use_stable_row_ids()
                     && update_mode.is_some()
                     && *update_mode == Some(RewriteRows)
                 {
@@ -1762,7 +1762,7 @@ impl Transaction {
                                     &covered_offsets,
                                     new_version,
                                     1,
-                                    &config.spilled_row_lineage,
+                                    config.spilled_row_lineage(),
                                 )?;
                             }
                         }
@@ -1889,7 +1889,7 @@ impl Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => {
-                if let Some(desired) = &config.clustering_definitions {
+                if let Some(desired) = config.clustering_definitions() {
                     // The definitions the writer planned against: the read
                     // snapshot when the commit path supplied one, else the
                     // landing base, which on a first attempt IS the read
@@ -2202,15 +2202,6 @@ impl Transaction {
         Ok(cleaned_fragment_ids)
     }
 
-    fn user_requested_version(config: &ManifestBuildConfig) -> Option<ConcreteFileVersion> {
-        match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
-            (None, Some(true)) => Some(ConcreteFileVersion::V1),
-            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
-            (None, None) => None,
-        }
-    }
-
     /// Build the manifest itself from an already-decided schema and fragment
     /// list, and apply the settings that every operation shares: blob v2
     /// promotion, the tag, feature flags, timestamp, and the fragment and field
@@ -2241,7 +2232,9 @@ impl Transaction {
         changed_fragment_ids: Option<&[u64]>,
         config: &ManifestBuildConfig,
     ) -> Result<Manifest> {
-        let user_requested_version = Self::user_requested_version(config);
+        let user_requested_version = config
+            .storage_format()
+            .map(DataStorageFormat::lance_file_format);
 
         // Blob is one logical column across file versions. Publishing its first
         // 2.2+ file also publishes the logical v2 view, without replacing older files.
@@ -2313,7 +2306,7 @@ impl Transaction {
             )
         };
 
-        if config.activate_non_reusable_field_ids {
+        if config.activate_non_reusable_field_ids() {
             let already_active = current_manifest
                 .map(|manifest| manifest.uses_non_reusable_field_ids())
                 .unwrap_or(false);
@@ -2325,18 +2318,18 @@ impl Transaction {
 
         manifest.tag.clone_from(&self.tag);
 
-        if config.auto_set_feature_flags {
+        if config.auto_set_feature_flags() {
             // Internal operations (e.g. CreateIndex) build with the default config,
             // which has use_stable_row_ids = false. Without inheriting from the previous
             // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
             let inherited = current_manifest
                 .map(|m| m.uses_stable_row_ids())
                 .unwrap_or(false);
-            let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            let use_stable_row_ids = config.use_stable_row_ids() || inherited;
             apply_feature_flags(
                 &mut manifest,
                 use_stable_row_ids,
-                config.disable_transaction_file,
+                config.disable_transaction_file(),
             )?;
         }
 
@@ -2375,7 +2368,7 @@ impl Transaction {
         }
         apply_row_addr_index_feature_flag(&mut manifest, indices);
 
-        manifest.set_timestamp(config.timestamp_nanos);
+        manifest.set_timestamp(config.timestamp_nanos().unwrap_or(0));
 
         manifest.update_max_fragment_id();
         manifest.update_max_field_id();
@@ -2639,10 +2632,7 @@ mod tests {
             },
             None,
         );
-        let config = ManifestBuildConfig {
-            migration_next_row_id: Some(100),
-            ..default_build_config()
-        };
+        let config = default_build_config().with_migration_next_row_id(100);
         let error = transaction
             .build_manifest(Some(&manifest), vec![fri], "txn", &config)
             .unwrap_err();
@@ -4225,9 +4215,9 @@ mod tests {
             },
             None,
         );
-        let mut config = default_build_config();
-        config.auto_set_feature_flags = false;
-        config.activate_non_reusable_field_ids = true;
+        let config = default_build_config()
+            .with_auto_set_feature_flags(false)
+            .with_activate_non_reusable_field_ids(true);
 
         let (activated, _) = transaction
             .build_manifest(Some(&manifest), vec![], "txn", &config)
@@ -4606,6 +4596,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
             inline: None,
         };
         updated2.deletion_file = Some(deletion_file.clone());
@@ -7376,6 +7367,7 @@ mod tests {
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(1),
                     base_id: None,
+                    path: None,
                     inline: None,
                 });
                 Operation::Delete {
@@ -7481,8 +7473,7 @@ mod tests {
             },
             None,
         );
-        let mut config = default_build_config();
-        config.clustering_definitions = Some(vec![]);
+        let config = default_build_config().with_clustering_definitions(vec![]);
         let prepared = transaction
             .prepare_indices(
                 Some(&manifest),
@@ -7662,8 +7653,7 @@ mod tests {
             },
             None,
         );
-        let mut config = default_build_config();
-        config.clustering_definitions = Some(desired);
+        let config = default_build_config().with_clustering_definitions(desired);
         (transaction, config)
     }
 
@@ -7738,8 +7728,8 @@ mod tests {
         };
         let current = sample_manifest();
         assert!(!current.uses_non_reusable_field_ids());
-        let (transaction, mut config) = definitions_update(&current, vec![definition(1)]);
-        config.auto_set_feature_flags = false;
+        let (transaction, config) = definitions_update(&current, vec![definition(1)]);
+        let config = config.with_auto_set_feature_flags(false);
         let (activated, _) = transaction
             .build_manifest(Some(&current), vec![], "txn", &config)
             .unwrap();
@@ -8135,6 +8125,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
             inline: None,
         }
     }

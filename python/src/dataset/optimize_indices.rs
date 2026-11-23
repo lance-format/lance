@@ -15,34 +15,43 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::optimize::unwrap_dataset;
 use super::*;
 
-/// The `OptimizeOptions` of the keyword options of `optimize_indices`, read
-/// as it always has: a key it does not know is ignored.
+/// The `OptimizeOptions` of the keyword options of `optimize_indices`, a
+/// `None` value leaving the option unset. A key it does not know is rejected:
+/// ignoring it would run the default optimize over every index instead.
 pub(crate) fn optimize_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<OptimizeOptions> {
     let mut options = OptimizeOptions::default();
     let Some(kwargs) = kwargs else {
         return Ok(options);
     };
-    if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
-        options.num_indices_to_merge = num_indices_to_merge.extract()?;
-    }
-    if let Some(retrain) = kwargs.get_item("retrain")? {
-        options.retrain = retrain.extract()?;
-    }
-    if let Some(index_names) = kwargs.get_item("index_names")? {
-        options.index_names = Some(
-            index_names
-                .extract::<Vec<String>>()
-                .map_err(|err| PyValueError::new_err(err.to_string()))?,
-        );
-    }
-    if let Some(max_rows_per_task) = kwargs.get_item("max_rows_per_task")? {
-        options.max_rows_per_task = max_rows_per_task.extract()?;
-    }
-    if let Some(max_rows_per_segment) = kwargs.get_item("max_rows_per_segment")? {
-        options.max_rows_per_segment = max_rows_per_segment.extract()?;
-    }
-    if let Some(max_rows_to_consolidate) = kwargs.get_item("max_rows_to_consolidate")? {
-        options.max_rows_to_consolidate = max_rows_to_consolidate.extract()?;
+    for (key, value) in kwargs.iter() {
+        let key: String = key.extract()?;
+        match key.as_str() {
+            "num_indices_to_merge" => {
+                options.num_indices_to_merge = value.extract()?;
+            }
+            "retrain" => {
+                options.retrain = value.extract::<Option<bool>>()?.unwrap_or_default();
+            }
+            "index_names" => {
+                options.index_names = value
+                    .extract::<Option<Vec<String>>>()
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            "max_rows_per_task" => {
+                options.max_rows_per_task = value.extract()?;
+            }
+            "max_rows_per_segment" => {
+                options.max_rows_per_segment = value.extract()?;
+            }
+            "max_rows_to_consolidate" => {
+                options.max_rows_to_consolidate = value.extract()?;
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid optimize_indices option: {key}"
+                )));
+            }
+        }
     }
     Ok(options)
 }

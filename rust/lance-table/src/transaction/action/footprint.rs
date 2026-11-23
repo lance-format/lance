@@ -1280,7 +1280,7 @@ mod tests {
 
     fn set_deletion_file(fragment: u64) -> Action {
         Action::SetDeletionFile(SetDeletionFile {
-            fragment,
+            fragment: Ref::Committed(fragment),
             deletion_file: any_deletion_file(),
             data_change: true,
             base: None,

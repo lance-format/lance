@@ -59,7 +59,6 @@ use lance_table::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_ROW_ADDR_INDICES,
 };
 use lance_testing::datagen::generate_random_array;
-use object_store::ObjectStoreExt;
 use roaring::RoaringBitmap;
 use rstest::rstest;
 use std::{

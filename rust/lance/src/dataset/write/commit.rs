@@ -8,17 +8,17 @@ use std::time::Duration;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::ClusteringDefinition;
+use lance_table::format::{ClusteringDefinition, ManifestBuildConfig};
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::default_commit_retry_timeout;
+use crate::io::commit::{CommitTransactionOptions, default_commit_retry_timeout};
 use crate::{
     Dataset, Error, Result,
     dataset::{
-        ManifestWriteConfig, ReadParams,
+        ReadParams,
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
         refs::Refs,
@@ -40,7 +40,7 @@ pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
     use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
-    storage_format: Option<ConcreteFileVersion>,
+    manifest_config: ManifestBuildConfig,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
@@ -52,16 +52,9 @@ pub struct CommitBuilder<'a> {
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     timeout: Option<Duration>,
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    migration_next_row_id: Option<u64>,
-    /// Whether this commit atomically activates non-reusable field IDs.
-    activate_non_reusable_field_ids: bool,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
     inherited_field_ids: bool,
-    /// The complete desired clustering definitions list for an `UpdateConfig`
-    /// commit; see [`ManifestBuildConfig::clustering_definitions`].
-    clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Whether the caller has opted in to committing a [`CompositeOperation`].
     allow_composite_operations: bool,
 }
@@ -75,7 +68,7 @@ impl<'a> CommitBuilder<'a> {
             dest: dest.into(),
             use_stable_row_ids: None,
             enable_v2_manifest_paths: true,
-            storage_format: None,
+            manifest_config: ManifestBuildConfig::default(),
             commit_handler: None,
             store_params: None,
             object_store: None,
@@ -87,11 +80,8 @@ impl<'a> CommitBuilder<'a> {
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
             inherited_field_ids: false,
-            clustering_definitions: None,
             allow_composite_operations: false,
         }
     }
@@ -120,13 +110,17 @@ impl<'a> CommitBuilder<'a> {
     /// prewritten fragments introduce another exact V2 version, the commit
     /// derives the required mixed-version capability from the final manifest.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
-        self.storage_format = Some(storage_format.resolve());
+        self.manifest_config = self
+            .manifest_config
+            .with_storage_format(DataStorageFormat::new(storage_format.resolve()));
 
         self
     }
 
     pub(crate) fn with_exact_storage_format(mut self, storage_format: ConcreteFileVersion) -> Self {
-        self.storage_format = Some(storage_format);
+        self.manifest_config = self
+            .manifest_config
+            .with_storage_format(DataStorageFormat::new(storage_format));
         self
     }
 
@@ -198,7 +192,9 @@ impl<'a> CommitBuilder<'a> {
     /// be restored (they stay readable). A table already under the contract is
     /// unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
-        self.clustering_definitions = Some(definitions);
+        self.manifest_config = self
+            .manifest_config
+            .with_clustering_definitions(definitions);
         self
     }
 
@@ -325,12 +321,14 @@ impl<'a> CommitBuilder<'a> {
     /// "cannot enable stable row IDs on an existing dataset" check so that the
     /// flag can be activated without creating the dataset from scratch.
     pub(crate) fn with_stable_row_id_migration_activation(mut self, next_row_id: u64) -> Self {
-        self.migration_next_row_id = Some(next_row_id);
+        self.manifest_config = self.manifest_config.with_migration_next_row_id(next_row_id);
         self
     }
 
     pub(crate) fn with_non_reusable_field_id_migration_activation(mut self) -> Self {
-        self.activate_non_reusable_field_ids = true;
+        self.manifest_config = self
+            .manifest_config
+            .with_activate_non_reusable_field_ids(true);
         self
     }
 
@@ -431,7 +429,7 @@ impl<'a> CommitBuilder<'a> {
         // A definitions list is a commit-time input for UpdateConfig alone. Every
         // other operation is refused here, before any path is chosen: the
         // new-dataset paths never reach the manifest builder's own check.
-        if self.clustering_definitions.is_some()
+        if self.manifest_config.clustering_definitions().is_some()
             && !matches!(transaction.operation, Operation::UpdateConfig { .. })
         {
             return Err(Error::invalid_input(
@@ -558,23 +556,17 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_stable_row_ids = if self.migration_next_row_id.is_some() {
+        let manifest_config = if self.manifest_config.migration_next_row_id().is_some() {
             // Migration activation always enables stable row IDs regardless of
-            // the current dataset state.
-            true
-        } else if let Some(ds) = dest.dataset() {
-            ds.manifest.uses_stable_row_ids()
+            // the current dataset state (already implied by `with_migration_next_row_id`).
+            self.manifest_config
         } else {
-            self.use_stable_row_ids.unwrap_or(false)
-        };
-
-        let manifest_config = ManifestWriteConfig {
-            use_stable_row_ids,
-            storage_format: self.storage_format.map(DataStorageFormat::new),
-            migration_next_row_id: self.migration_next_row_id,
-            activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
-            clustering_definitions: self.clustering_definitions.clone(),
-            ..Default::default()
+            let use_stable_row_ids = match dest.dataset() {
+                Some(ds) => ds.manifest.uses_stable_row_ids(),
+                None => self.use_stable_row_ids.unwrap_or(false),
+            };
+            self.manifest_config
+                .with_use_stable_row_ids(use_stable_row_ids)
         };
 
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
@@ -600,12 +592,13 @@ impl<'a> CommitBuilder<'a> {
                     object_store.as_ref(),
                     commit_handler.as_ref(),
                     &transaction,
-                    &manifest_config,
-                    &self.commit_config,
-                    self.retry_timeout,
-                    manifest_naming_scheme,
-                    self.affected_rows.as_ref(),
-                    None,
+                    CommitTransactionOptions::new(
+                        &manifest_config,
+                        &self.commit_config,
+                        manifest_naming_scheme,
+                    )
+                    .with_retry_timeout(self.retry_timeout)
+                    .with_affected_rows(self.affected_rows.as_ref()),
                 )
                 .await?
             }

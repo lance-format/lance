@@ -897,8 +897,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
     let versions_dir = branch_ds.versions_dir();
     let store = branch_ds.object_store(None).await.unwrap();
     let manifests: Vec<_> = store
-        .inner
-        .list(Some(&versions_dir))
+        .list_objects(Some(&versions_dir))
         .try_collect()
         .await
         .unwrap();
@@ -914,8 +913,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
     // Confirm the branch object-store chain is empty (do not open the dataset:
     // with no manifests, Dataset::open would fail).
     let remaining_manifests = store
-        .inner
-        .list(Some(&versions_dir))
+        .list_objects(Some(&versions_dir))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -959,8 +957,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
 
     let staging_wrong = versions_dir.clone().join("staging_wrong");
     store
-        .inner
-        .put(&staging_wrong, source_bytes.clone().into())
+        .put_payload(&staging_wrong, source_bytes.clone().into())
         .await
         .unwrap();
     let err = namespace
@@ -982,8 +979,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
 
     let staging_ok = versions_dir.join("staging_ok");
     store
-        .inner
-        .put(&staging_ok, source_bytes.into())
+        .put_payload(&staging_ok, source_bytes.into())
         .await
         .unwrap();
     let resp = namespace
