@@ -49,7 +49,7 @@ tokio = { version = "1.23", features = [
 async-trait = "0.1"
 jni = "0.21.1"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 bytes = "1.11"
 log = "0.4"
 metrics = "0.24"

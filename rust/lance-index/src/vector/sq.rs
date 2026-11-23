@@ -137,13 +137,28 @@ impl Quantization for ScalarQuantizer {
     type Metadata = ScalarQuantizationMetadata;
     type Storage = ScalarQuantizationStorage;
 
-    fn build(data: &dyn Array, _: DistanceType, params: &Self::BuildParams) -> Result<Self> {
+    fn build(
+        data: &dyn Array,
+        distance_type: DistanceType,
+        params: &Self::BuildParams,
+    ) -> Result<Self> {
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::index(format!(
             "SQ builder: input is not a FixedSizeList: {}",
             data.data_type()
         )))?;
 
-        let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
+        let dimension = fsl.value_length() as usize;
+        if let Some(model) = &params.model {
+            model.validate_for_build(
+                dimension,
+                &fsl.value_type(),
+                distance_type,
+                params.num_bits,
+            )?;
+            return Ok(model.quantizer());
+        }
+
+        let mut quantizer = Self::new(params.num_bits, dimension);
 
         match fsl.value_type() {
             DataType::Float16 => {

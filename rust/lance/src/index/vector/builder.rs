@@ -49,6 +49,7 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
+use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::v3::shuffler::{
@@ -513,6 +514,29 @@ pub struct VectorIndexBuildSummary {
     pub num_vectors_shuffled: usize,
 }
 
+impl<S: IvfSubIndex + 'static> IvfIndexBuilder<S, ScalarQuantizer> {
+    pub(super) fn with_pretrained_sq_model(&mut self) -> Result<&mut Self> {
+        let Some(params) = &self.quantizer_params else {
+            return Ok(self);
+        };
+        let Some(model) = &params.model else {
+            return Ok(self);
+        };
+        let dataset = self
+            .dataset
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("dataset not set before loading the SQ model"))?;
+        let (vector_type, element_type) = utils::get_vector_type(dataset.schema(), &self.column)?;
+        model.validate_for_build(
+            utils::infer_vector_dim(&vector_type)?,
+            &element_type,
+            self.distance_type,
+            params.num_bits,
+        )?;
+        Ok(self.with_quantizer(model.quantizer()))
+    }
+}
+
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -921,16 +945,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             start.elapsed().as_secs_f32()
         );
 
-        // If metric type is cosine, normalize the training data, and after this point,
-        // treat the metric type as L2.
-        let training_data = if self.distance_type == DistanceType::Cosine {
-            lance_linalg::kernels::normalize_fsl_owned(training_data)?
-        } else {
-            training_data
-        };
-
-        // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-        let training_data = utils::filter_finite_training_data(training_data)?;
+        let training_data =
+            utils::prepare_quantizer_training_data(training_data, self.distance_type)?;
 
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {

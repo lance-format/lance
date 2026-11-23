@@ -17,6 +17,7 @@ pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
 pub mod pq;
+pub mod sq;
 pub mod utils;
 
 #[cfg(test)]
@@ -1042,6 +1043,7 @@ pub(crate) async fn build_distributed_vector_index(
                 (),
                 frag_reuse_index,
             )?
+            .with_pretrained_sq_model()?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
             .build()
@@ -1161,6 +1163,7 @@ pub(crate) async fn build_distributed_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_pretrained_sq_model()?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
             .build()
@@ -1501,6 +1504,7 @@ async fn build_vector_index_impl(
                 (),
                 frag_reuse_index,
             )?
+            .with_pretrained_sq_model()?
             .with_optional_fragment_filter(fragment_ids)
             .with_train_only(train_only)
             .with_progress(progress.clone())
@@ -1640,6 +1644,7 @@ async fn build_vector_index_impl(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_pretrained_sq_model()?
             .with_optional_fragment_filter(fragment_ids)
             .with_train_only(train_only)
             .with_progress(progress.clone())
@@ -1992,8 +1997,13 @@ pub(crate) async fn build_empty_vector_index(
     _column: &str,
     _name: &str,
     _uuid: Uuid,
-    _params: &VectorIndexParams,
+    params: &VectorIndexParams,
 ) -> Result<Vec<IndexFile>> {
+    if matches!(params.stages.last(), Some(StageParams::SQ(sq)) if sq.model.is_some()) {
+        return Err(Error::invalid_input(
+            "A shared SQ model requires a data build",
+        ));
+    }
     Ok(Vec::new())
 }
 
@@ -2488,7 +2498,7 @@ fn derive_pq_params(pq_quantizer: &ProductQuantizer) -> PQBuildParams {
 fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
     SQBuildParams {
         num_bits: sq_quantizer.num_bits(),
-        sample_rate: 256, // Default
+        ..Default::default()
     }
 }
 
