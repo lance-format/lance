@@ -6520,6 +6520,76 @@ async fn test_hnsw_partition_load_reads_only_graph_columns() {
     assert_hnsw_columns(&dataset, "after delta merge").await;
 }
 
+/// HNSW may leave storage rows its graph never reached, so a graph shorter
+/// than its partition's storage must still load when no row-ID remapping
+/// dropped any row.
+#[tokio::test]
+async fn test_hnsw_prefix_graph_loads_without_dropped_rows() {
+    use lance_arrow::RecordBatchExt;
+    use lance_index::vector::hnsw::builder::HnswQueryParams;
+
+    let test_dir = TempStrDir::default();
+    let dataset = build_ivf_hnsw_sq(test_dir.as_str(), 1).await;
+    let index = open_ivf_hnsw_sq(&dataset).await;
+    let original = index.as_any().downcast_ref::<IvfHnswSqIndex>().unwrap();
+    let storage = original.load_partition_storage(0, None).await.unwrap();
+    let prefix = storage.len() / 2;
+
+    let mut metadata: HnswMetadata = serde_json::from_str(&original.sub_index_metadata[0]).unwrap();
+    metadata.entry_point = 0;
+    metadata.params.max_level = 1;
+    metadata.level_offsets = vec![0, prefix];
+    let metadata_json = serde_json::to_string(&metadata).unwrap();
+    let graph_batch = original
+        .read_sub_index_batch(0, None, None)
+        .await
+        .unwrap()
+        .slice(0, prefix)
+        .add_metadata(HNSW_METADATA_KEY.to_owned(), metadata_json.clone())
+        .unwrap();
+    let graph = HNSW::load(graph_batch).unwrap();
+    assert_eq!(graph.len(), prefix);
+    let query = Arc::new(Float32Array::from(vec![0.5; DIM])) as ArrayRef;
+    let params = HnswQueryParams {
+        ef: 50,
+        lower_bound: None,
+        upper_bound: None,
+        dist_q_c: 0.0,
+        use_acorn: false,
+    };
+    let (found, _) = graph
+        .search_basic(query, 10, &params, None, &storage)
+        .unwrap();
+    assert!(!found.is_empty(), "the prefix graph should be searchable");
+
+    let mut ivf = original.ivf.clone();
+    ivf.lengths[0] = prefix as u32;
+    let shorter = IvfHnswSqIndex::from_cached_state(
+        original.uri.clone(),
+        original.index_path.clone(),
+        original.uuid,
+        ivf,
+        original.reader.clone(),
+        lance_index::vector::storage::IvfQuantizationStorage::<ScalarQuantizer>::try_new(
+            original.storage.reader().clone(),
+            None,
+        )
+        .await
+        .unwrap(),
+        vec![metadata_json].into(),
+        original.distance_type,
+        LanceCache::no_cache(),
+        original.raw_cache.clone(),
+        original.io_parallelism,
+        original.rq_search_cache.clone(),
+        original.origin_latency,
+    )
+    .unwrap();
+    let entry = shorter.load_partition_entry(0, None).await.unwrap();
+    assert_eq!(entry.index.len(), prefix);
+    assert_eq!(entry.storage.len(), storage.len());
+}
+
 /// The saving is the point of the change, so pin it: reading a real
 /// partition range through the declared projection must move strictly fewer
 /// bytes than the full-schema read the index used to perform.
