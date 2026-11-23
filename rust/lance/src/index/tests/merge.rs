@@ -107,6 +107,54 @@ async fn test_merge_existing_index_segments_preserves_covering_scalar(
     .await;
 }
 
+/// A merge copies stored identifiers as-is, so it must refuse sources that
+/// disagree on whether they hold row ids or row addresses. Off a stable-row-id
+/// table the two numberings coincide numerically, which would let a mixed
+/// merge pass silently even though committing the result would reject the
+/// same mix.
+#[tokio::test]
+async fn test_merge_existing_index_segments_rejects_mixed_row_domains() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_two_int_column_dataset(&test_dir, 20).await;
+    let fragment_ids = all_fragment_ids(&dataset);
+    assert!(fragment_ids.len() >= 2, "need two source segments");
+
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+    let mut segments = Vec::new();
+    for (position, fragment_id) in fragment_ids.into_iter().enumerate() {
+        let segment = dataset
+            .create_index_builder(&["id"], IndexType::Bitmap, &params)
+            .name("mixed_domains".to_string())
+            .fragments(vec![fragment_id])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        segments.push(if position == 0 {
+            // A fresh Bitmap segment is labeled row-id-domain without stable
+            // row ids because the two numberings coincide. Promote this source
+            // to the address-domain label so the pair disagrees.
+            assert!(!segment.results_are_row_addrs());
+            IndexMetadata {
+                index_version: 1,
+                ..segment
+            }
+        } else {
+            segment
+        });
+    }
+
+    let err = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("disagree on whether they store row ids or row addresses"),
+        "unexpected error: {err}"
+    );
+}
+
 /// Segments that disagree on which columns they carry cannot be folded
 /// into one coherent output declaration: there is no single
 /// `covering_fields` that would describe the merged segment truthfully.

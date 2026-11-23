@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
-
 use datafusion::execution::SendableRecordBatchStream;
 use futures::future::try_join_all;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::progress::noop_progress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::minhash_lsh::MinHashLshIndex;
-use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, index_files_to_table};
+use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
-use uuid::Uuid;
 
-use crate::index::append::build_per_segment_filters;
-use crate::index::frag_reuse::{OpenPurpose, StagedRemappingPlans};
-use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
+use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_source};
+use crate::index::frag_reuse::StagedRemappingPlans;
+use crate::{Dataset, Result};
 
 /// Merge one caller-defined group of MinHash LSH segments into a single segment.
 ///
@@ -27,49 +23,20 @@ pub(in crate::index) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    if segments.is_empty() {
-        return Err(Error::index("No segment metadata was provided".to_string()));
-    }
-
-    let field_id = *segments[0].fields.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: segment {} is missing field ids",
-            segments[0].uuid
-        ))
-    })?;
-    let field_path = dataset.schema().field_path(field_id)?;
-    let dataset_version = segments
-        .iter()
-        .map(|segment| segment.dataset_version)
-        .min()
-        .unwrap_or(dataset.manifest.version);
+    let merge = SegmentMerge::new(dataset, "MinHash LSH", &segments)?;
     // The merged segment is always written in the current (row-address)
     // format with each source's identifiers copied as-is, so a pre-migration
     // segment's row ids would be misread as addresses wherever the two differ.
-    if dataset.manifest.uses_stable_row_ids()
-        && let Some(legacy) = segments
-            .iter()
-            .find(|segment| !segment.results_are_row_addrs())
-    {
-        return Err(Error::invalid_input(format!(
-            "MinHash LSH segment {} predates row-address-domain support and cannot be merged \
-             on a dataset with stable row IDs; rebuild the index first (e.g. with \
-             create_index(..., replace: true))",
-            legacy.uuid,
-        )));
-    }
-    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    merge.require_shared_domain(dataset, "MinHash LSH")?;
     // Current segments store addresses. A legacy segment can only reach here
     // without stable row IDs, where its IDs are also physical addresses.
-    let (fragment_bitmap, filters) =
-        build_per_segment_filters(dataset, &segment_refs, staged, true).await?;
+    let (fragment_bitmap, filters) = merge.per_segment_filters(dataset, staged, true).await?;
 
-    let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+    let (new_uuid, new_store) = merge.new_store(dataset)?;
     let created_index = open_and_merge_segments(
         dataset,
-        &field_path,
-        &segment_refs,
+        merge.field_path(),
+        merge.segments(),
         None,
         &new_store,
         &filters,
@@ -77,19 +44,12 @@ pub(in crate::index) async fn merge_segments(
     )
     .await?;
 
-    Ok(IndexMetadata {
-        uuid: new_uuid,
-        dataset_version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(created_index.index_details)),
-        index_version: created_index.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created_index.files)),
-        clustering_id: None,
-        metadata: Default::default(),
-        ..segments[0].clone()
-    })
+    Ok(merge.build_metadata(
+        new_uuid,
+        merge.dataset_version(),
+        fragment_bitmap,
+        created_index,
+    ))
 }
 
 pub(in crate::index) async fn open_and_merge_segments(
@@ -101,33 +61,21 @@ pub(in crate::index) async fn open_and_merge_segments(
     filters: &[Option<OldIndexDataFilter>],
     staged: Option<&StagedRemappingPlans>,
 ) -> Result<CreatedIndex> {
-    let scalar_indices = try_join_all(segments.iter().map(|segment| async move {
-        let scalar_index = super::open_scalar_index_with_plan(
+    let opened = try_join_all(segments.iter().map(|&segment| {
+        open_dyn_source(
             dataset,
             field_path,
             segment,
             staged.and_then(|plans| plans.get(&segment.uuid)),
-            OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
         )
-        .await?;
-        Ok::<_, Error>((segment.uuid, scalar_index))
     }))
     .await?;
-    let mut sources = Vec::with_capacity(scalar_indices.len());
-    for ((segment_uuid, scalar_index), filter) in scalar_indices.iter().zip(filters) {
-        let minhash_index = scalar_index
-            .as_any()
-            .downcast_ref::<MinHashLshIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "expected MinHash LSH segment {}, got {:?}",
-                    segment_uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        sources.push((minhash_index, filter.as_ref()));
-    }
+    let source_indices = downcast_sources::<MinHashLshIndex>(&opened, segments, "MinHash LSH")?;
+    let sources = source_indices
+        .iter()
+        .zip(filters)
+        .map(|(source, filter)| (*source, filter.as_ref()))
+        .collect::<Vec<_>>();
 
     MinHashLshIndex::merge_segments(&sources, new_data, new_store, noop_progress()).await
 }

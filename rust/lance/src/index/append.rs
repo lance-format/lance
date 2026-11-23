@@ -1251,11 +1251,29 @@ async fn merge_scalar_indices<'a>(
                 scan_selection,
             )
             .await?;
-            let per_segment_filters = |filters: Vec<Option<OldIndexDataFilter>>| {
-                filters
-                    .into_iter()
-                    .map(|filter| block_stale_rows(dataset.as_ref(), filter, &stale_rows))
-                    .collect::<Vec<_>>()
+            // The scalar merge primitives below read old rows by address. Only
+            // those types need per-segment filters, so skip the deletion-vector
+            // reads for a BloomFilter zone merge. `old_data_address_domain`
+            // returns true for every type in this group.
+            let merge_filters = if matches!(
+                index_type,
+                IndexType::BTree
+                    | IndexType::Bitmap
+                    | IndexType::NGram
+                    | IndexType::RTree
+                    | IndexType::MinHashLsh
+            ) {
+                let (_, filters) =
+                    build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None, true)
+                        .await?;
+                Some(
+                    filters
+                        .into_iter()
+                        .map(|filter| block_stale_rows(dataset.as_ref(), filter, &stale_rows))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
             };
 
             match index_type {
@@ -1276,101 +1294,61 @@ async fn merge_scalar_indices<'a>(
                     .await?
                 }
                 IndexType::BTree => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
                         new_data_stream,
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
                 }
                 IndexType::Bitmap => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::bitmap::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
                         new_data_stream,
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
                 }
                 IndexType::NGram => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
                 }
                 #[cfg(feature = "geo")]
                 IndexType::RTree => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        address_domain,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::rtree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
                 }
                 IndexType::MinHashLsh => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        address_domain,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     super::scalar::minhash_lsh::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
