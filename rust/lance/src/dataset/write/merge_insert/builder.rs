@@ -147,11 +147,10 @@ impl MergeInsertBuilder {
 
     /// Set the timeout used to limit retries.
     ///
-    /// This is the maximum time to spend on the operation before giving up. At
-    /// least one attempt will be made, regardless of how long it takes to complete.
-    /// Subsequent attempts will be cancelled once this timeout is reached. If
-    /// the timeout has been reached during the first attempt, the operation
-    /// will be cancelled immediately.
+    /// At least one attempt will be made, regardless of how long it takes to
+    /// complete. On subsequent attempts, execution and backoff are cancelled
+    /// once this timeout is reached, and no new commit is started. A commit
+    /// that has already started will finish even if this timeout expires.
     ///
     /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
