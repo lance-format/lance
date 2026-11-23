@@ -673,7 +673,17 @@ def test_lsm_vector_search_planner_inner_product_alias(tmp_path):
         .plan_search(query, k=5, nprobes=2, columns=["id"])
         .to_table()
     )
+    assert dot_result.num_rows > 0
     assert alias_result.equals(dot_result)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Unknown distance_type 'manhattan'. "
+            "Valid values: 'l2', 'cosine', 'dot', 'hamming'"
+        ),
+    ):
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="manhattan")
 
     # The alias is scoped to MemWAL; regular nearest keeps the Rust parser's
     # contract and rejects it.
