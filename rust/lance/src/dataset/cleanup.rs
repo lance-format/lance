@@ -49,8 +49,8 @@ pub mod retention;
 use expiry::Verdict as ExpiryVerdict;
 use expiry::{ThinningAnchor, ThinningCandidate, ThinningSurvivors, VersionExpiry};
 use file_verdict::{FileReference, ListedFile, Verdict as FileVerdict};
-use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
-pub use retention::{CleanupRule, parse_cleanup_policy};
+pub use retention::{CleanupRule, RetentionPolicy, parse_cleanup_policy};
+use retention::{MIN_THINNING_AGE, validate_retention_policy};
 
 use super::mem_wal::util::is_mem_wal_dir_name;
 use super::refs::{REFS_DIR, TagContents, normalize_branch};
@@ -708,13 +708,12 @@ impl<'a> CleanupOperation<'a> {
 
     /// Set age bands for thinning and expiration. Ages must strictly increase;
     /// `RemoveAll` is optional and must be last. Without it, samples never expire
-    /// unless the legacy policy specifies `before_timestamp`. Version filters
-    /// constrain every rule. A policy replaces a previous retention policy.
+    /// unless the dataset-level `CleanupPolicy` sets `before_timestamp`. Version
+    /// filters constrain every rule. A policy replaces a previous retention policy.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance::dataset::cleanup::{CleanupPolicy, CleanupRule};
-    /// # use lance::dataset::cleanup::retention::CleanupPolicy as RetentionPolicy;
+    /// # use lance::dataset::cleanup::{CleanupPolicy, CleanupRule, RetentionPolicy};
     /// # use std::time::Duration;
     /// # async fn example(dataset: &Dataset) -> Result<()> {
     /// dataset.cleanup(CleanupPolicy::default()).with_retention_policy(RetentionPolicy::new(vec![
@@ -2709,6 +2708,11 @@ fn validate_delete_rate_limit(rate: u64) -> Result<()> {
     Ok(())
 }
 
+/// Dataset-level cleanup filters and file-cleanup options.
+///
+/// This selects which manifests cleanup may consider and controls how files are
+/// removed. It is distinct from [`RetentionPolicy`], which describes ordered
+/// version expiry and thinning rules.
 #[derive(Clone, Debug)]
 pub struct CleanupPolicy {
     /// If not none, cleanup all versions before the specified timestamp.
@@ -2739,6 +2743,15 @@ pub struct CleanupPolicy {
 }
 
 impl CleanupPolicy {
+    /// Whether this policy's manifest filters select `manifest`.
+    ///
+    /// This checks only this policy's `before_timestamp`, `before_version` and
+    /// `versions` filters. It does not decide by itself whether cleanup may
+    /// remove a version: cleanup also protects the cleanup read version and later
+    /// versions, tagged versions and branch dependencies, and the optional
+    /// [`RetentionPolicy`] applies its own expiry and thinning rules.
+    ///
+    /// A policy with no filters matches every manifest.
     pub fn should_clean(&self, manifest: &Manifest) -> bool {
         self.before_timestamp
             .is_none_or(|timestamp| manifest.timestamp() < timestamp)

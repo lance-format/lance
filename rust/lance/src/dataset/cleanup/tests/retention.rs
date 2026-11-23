@@ -3,6 +3,24 @@
 
 use super::*;
 
+#[tokio::test]
+#[allow(deprecated)]
+async fn cleanup_policy_alias_feeds_retention_policy_setter() {
+    let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
+    fixture.create_some_data().await.unwrap();
+    let dataset = fixture.open().await.unwrap();
+    let alias: crate::dataset::cleanup::retention::CleanupPolicy =
+        parse_cleanup_policy(r#"{"rules":[{"type":"remove_all","older_than":"14days"}]}"#).unwrap();
+    let operation = dataset
+        .cleanup(CleanupPolicy::default())
+        .with_retention_policy(alias)
+        .unwrap();
+    assert_eq!(
+        operation.retention_policy.as_deref(),
+        Some(RetentionPolicy::default().rules())
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn cleanup_default_policy_is_remove_all_after_two_weeks(
