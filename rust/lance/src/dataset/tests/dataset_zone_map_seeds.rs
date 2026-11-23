@@ -3151,16 +3151,22 @@ const STRING_FILTERS: &[&str] = &["col >= 'v010' AND col < 'v030'", "col = 'v021
 #[case::uint64(DataType::UInt64, INT_FILTERS)]
 #[case::float32(DataType::Float32, FLOAT_FILTERS)]
 #[case::float64(DataType::Float64, FLOAT_FILTERS)]
-#[case::date32(DataType::Date32, &[])]
-#[case::timestamp_ms(DataType::Timestamp(TimeUnit::Millisecond, None), &[])]
+#[case::date32(DataType::Date32, &["col >= DATE '2022-02-07'"])]
+#[case::timestamp_ms(
+    DataType::Timestamp(TimeUnit::Millisecond, None),
+    &["col >= TIMESTAMP '2023-11-14 22:13:50'"]
+)]
 #[case::timestamp_ns_utc(DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), &[])]
 #[case::duration_us(DataType::Duration(TimeUnit::Microsecond), &[])]
-#[case::time32_s(DataType::Time32(TimeUnit::Second), &[])]
+#[case::time32_s(
+    DataType::Time32(TimeUnit::Second),
+    &["col >= arrow_cast(1800, 'Time32(Second)')"]
+)]
 #[case::utf8(DataType::Utf8, STRING_FILTERS)]
 #[case::large_utf8(DataType::LargeUtf8, STRING_FILTERS)]
-#[case::binary(DataType::Binary, &[])]
-#[case::large_binary(DataType::LargeBinary, &[])]
-#[case::decimal128(DataType::Decimal128(38, 4), &[])]
+#[case::binary(DataType::Binary, &["col >= X'000000000000001E'"])]
+#[case::large_binary(DataType::LargeBinary, &["col >= X'000000000000001E'"])]
+#[case::decimal128(DataType::Decimal128(38, 4), &["col >= 30"])]
 #[tokio::test]
 async fn test_config_seed_round_trip_per_type(
     #[case] data_type: DataType,
@@ -3214,11 +3220,15 @@ async fn test_config_seed_round_trip_per_type(
 }
 
 /// Binary-copy compaction of files whose configured seeds were written at
-/// different sizes still carries a seed, and an index built from it answers
+/// different sizes still carries a seed, an index whose zones end at the
+/// input file boundaries is built from it without a scan, and it answers
 /// filters like a scan.
 #[tokio::test]
 async fn test_binary_copy_carries_config_seeds_of_different_sizes() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
     const RESIZED_ROWS_PER_ZONE: u64 = 8;
+    // Each input holds 10 rows, so no carried record crosses a target zone.
+    const INDEX_ROWS_PER_ZONE: u64 = 10;
 
     let dir = TempStrDir::default();
     let mut dataset = dataset_with_config_rows(dir.as_str()).await;
@@ -3252,16 +3262,22 @@ async fn test_binary_copy_carries_config_seeds_of_different_sizes() {
         );
     }
 
-    dataset
-        .create_index(
-            &["val"],
-            IndexType::ZoneMap,
-            None,
-            &config_seed_index_params(RESIZED_ROWS_PER_ZONE),
-            false,
-        )
-        .await
-        .unwrap();
+    let params = config_seed_index_params(INDEX_ROWS_PER_ZONE);
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![output.id]);
+    assert!(reports[0].partial_fragments.is_empty());
+    assert!(reports[0].scanned_fragments.is_empty());
+    assert_eq!(reports[0].scanned_rows, 0);
+
     assert_indexed_ids_match_scan(
         &dataset,
         &["val >= 12 AND val < 22", "val = 25", "val IS NULL"],

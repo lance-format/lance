@@ -268,6 +268,7 @@ impl TryFrom<pb_actions::ConfigUpdate> for ConfigUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::{ZONE_WRITE_SEEDS_ENABLED_KEY, ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY};
     use crate::format::Manifest;
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint,
@@ -604,6 +605,57 @@ mod tests {
             .config
             .insert("lance.auto_cleanup.policy_interval".into(), "10".into());
         assert!(crate::feature_flags::validate_auto_cleanup_config(&manifest).is_err());
+
+        apply(&manifest, vec![set_config(&[("unrelated", Some("1"))])]).unwrap();
+    }
+
+    #[test]
+    fn test_config_update_rejects_an_invalid_zone_write_seeds_value() {
+        let error = apply(
+            &backed_manifest(),
+            vec![set_config(&[(
+                ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY,
+                Some("0"),
+            )])],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Only the settings the whole operation leaves are validated, so a later
+    /// update may repair a value an earlier one set.
+    #[test]
+    fn test_config_update_validates_the_zone_write_seeds_settings_it_leaves() {
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                set_config(&[(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, Some("0"))]),
+                set_config(&[(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, Some("8"))]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            next.config
+                .get(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY)
+                .map(String::as_str),
+            Some("8")
+        );
+    }
+
+    #[test]
+    fn test_zone_write_seeds_settings_invalid_before_the_commit_do_not_block_it() {
+        let mut manifest = backed_manifest();
+        manifest
+            .config
+            .insert(ZONE_WRITE_SEEDS_ENABLED_KEY.into(), "yes".into());
+        assert!(crate::feature_flags::validate_zone_write_seeds_config(&manifest).is_err());
 
         apply(&manifest, vec![set_config(&[("unrelated", Some("1"))])]).unwrap();
     }

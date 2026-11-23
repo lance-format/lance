@@ -4269,6 +4269,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn zone_write_seeds_settings_invalid_before_the_commit_do_not_block_it() {
+        let mut manifest = sample_manifest();
+        manifest.config.insert(
+            crate::feature_flags::ZONE_WRITE_SEEDS_ENABLED_KEY.into(),
+            "yes".into(),
+        );
+        assert!(validate_zone_write_seeds_config(&manifest).is_err());
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateConfig {
+                config_updates: Some(crate::transaction::UpdateMap {
+                    update_entries: vec![crate::transaction::update_map::UpdateMapEntry {
+                        key: "unrelated".into(),
+                        value: Some("1".into()),
+                    }],
+                    replace: false,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+
+        transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+    }
+
     fn covered_index(name: &str, fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
         IndexMetadata {
             fields,

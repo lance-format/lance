@@ -400,8 +400,9 @@ async fn seed_writers_for(
 /// scalar type only. The list is a conservative gate, not a guarantee about
 /// collection cost. Blob and extension-typed columns are excluded because
 /// the written values are not the column's logical values. FixedSizeBinary
-/// is excluded at every width: the statistics accumulator computes no bounds
-/// for it, and a seed without bounds is never reused.
+/// is excluded at every width: zone statistics compute no min/max bounds for
+/// fixed-size binary values, so a seed zone holding non-null values cannot be
+/// validated by an index build.
 fn config_seed_supports(field: &Field) -> bool {
     if field.is_blob() || field.is_blob_v2() || field.extension_name().is_some() {
         return false;
