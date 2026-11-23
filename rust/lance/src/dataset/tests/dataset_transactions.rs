@@ -639,6 +639,7 @@ async fn test_inline_transaction() {
         ds.object_store.as_ref(),
         &ds.base,
         &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
+        None,
     )
     .await
     .unwrap();
