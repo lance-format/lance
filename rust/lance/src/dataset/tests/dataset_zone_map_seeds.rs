@@ -2560,3 +2560,111 @@ async fn test_binary_copy_translates_remapped_seed_fields() {
     );
     assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
 }
+
+/// A seeded FixedSizeBinary column carries bounded seed records, so a
+/// rebuilt zone map reuses them instead of rejecting them as unbounded and
+/// scanning, and the index answers filters like an unindexed scan.
+#[tokio::test]
+async fn test_fixed_size_binary_seed_is_reused() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    const WIDTH: i32 = 16;
+    fn hash(i: i32) -> Option<[u8; WIDTH as usize]> {
+        (i % 5 != 2).then(|| {
+            let mut value = [i as u8; WIDTH as usize];
+            value[0] = (i * 37 % 251) as u8;
+            value
+        })
+    }
+    fn hex_literal(value: [u8; WIDTH as usize]) -> String {
+        let hex: String = value.iter().map(|b| format!("{b:02X}")).collect();
+        format!("X'{hex}'")
+    }
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("h", DataType::FixedSizeBinary(WIDTH), true),
+    ]));
+    let batch = |ids: std::ops::Range<i32>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(ids.clone())),
+                Arc::new(
+                    arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        ids.map(hash),
+                        WIDTH,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap()
+    };
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+        .with_params(&serde_json::json!({"rows_per_zone": ROWS_PER_ZONE, "use_seeds": true}));
+
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch(0..8))], schema.clone()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(&["h"], IndexType::ZoneMap, None, &params, false)
+        .await
+        .unwrap();
+    for start in [8, 16] {
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch(start..start + 8))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let seeded: Vec<u64> = dataset.fragments()[1..].iter().map(|f| f.id).collect();
+    for fragment in dataset.fragments()[1..].iter() {
+        let file = serving_file(fragment, field_id(&dataset, "h"));
+        assert!(seed_in_file(&dataset, &file.path, "h").await.is_some());
+    }
+
+    // The pre-index fragment has no seed and is scanned; both appended
+    // fragments are reused whole, two 4-row records each.
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["h"], IndexType::ZoneMap, None, &params, true)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].reused_fragments, seeded);
+    assert_eq!(reports[0].reused_records, 4);
+    assert_eq!(reports[0].scanned_rows, 8);
+
+    let filters = [
+        format!("h = {}", hex_literal(hash(11).unwrap())),
+        format!("h = {}", hex_literal(hash(3).unwrap())),
+        format!("h > {}", hex_literal([0x80; WIDTH as usize])),
+        "h IS NULL".to_string(),
+    ];
+    for filter in &filters {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let expected = unindexed.try_into_batch().await.unwrap();
+        assert!(expected.num_rows() > 0, "filter {filter}");
+        assert_eq!(indexed, expected, "filter {filter}");
+    }
+}
