@@ -142,7 +142,7 @@ pub(super) async fn open_fts_segment(
     };
     let allowed_rows = async {
         match coverage {
-            Some((coverage, index)) => Ok(Some(coverage.live_rows(index).await?)),
+            Some((coverage, index)) => Ok(Some(coverage.allowed_row_mask(index).await?)),
             None => Ok(None),
         }
     };
