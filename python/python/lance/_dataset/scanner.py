@@ -1334,15 +1334,23 @@ class ScannerBuilder:
         self._strict_batch_size = strict_batch_size
         return self
 
-    def order_by(self, orderings: Optional[list[ColumnOrdering]]) -> ScannerBuilder:
+    def order_by(
+        self, orderings: Optional[list[ColumnOrdering | str]]
+    ) -> ScannerBuilder:
+        if isinstance(orderings, str):
+            raise TypeError(
+                "orderings must be a list of column names or ColumnOrdering."
+            )
         if orderings is not None:
             inner_orderings = []
             for order in orderings:
+                if isinstance(order, str):
+                    order = ColumnOrdering(order)
                 if isinstance(order, ColumnOrdering):
                     inner_orderings.append(order)
                 else:
                     raise TypeError(
-                        f"orderings must be a list of ColumnOrdering. "
+                        f"orderings must be a list of column names or ColumnOrdering. "
                         f"Got {type(order)} instead."
                     )
             orderings = inner_orderings
