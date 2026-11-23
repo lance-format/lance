@@ -523,14 +523,7 @@ async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::R
     };
 
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
-    match dataset
-        .apply_commit(
-            transaction,
-            &crate::dataset::ManifestWriteConfig::default().with_tagged_frag_reuse_trim(),
-            &Default::default(),
-        )
-        .await
-    {
+    match dataset.apply_tagged_frag_reuse_trim(transaction).await {
         Ok(()) => Ok(()),
         Err(error @ Error::RetryableCommitConflict { .. })
             if error.to_string().contains(TAGGED_TRIM_REBASED_TO_NOOP) =>
