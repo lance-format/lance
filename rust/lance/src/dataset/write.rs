@@ -47,7 +47,7 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
-use crate::blob::prepared_to_logical_blob_schema;
+use crate::blob::{BlobWriteSources, prepared_to_logical_blob_schema};
 use crate::dataset::blob::{
     BlobPayloadInventory, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     SidecarRewrite, blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
@@ -193,6 +193,60 @@ impl Dataset {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         file_writer_options: FileWriterOptions,
     ) -> Result<DataFilePart> {
+        let data = data.map(|result| result.map(|batch| (batch, None)));
+        self.write_data_file_part_impl(target, blob_ids, data, file_writer_options)
+            .await
+    }
+
+    /// Encode one part with trusted payload sources accompanying its batches.
+    ///
+    /// Each source map belongs to one batch. Use prepared Blob v2 leaves and
+    /// insert the descriptors returned by [`BlobWriteSources`] at the relevant
+    /// slots. Uploaded keys are relative to the base of `target`. On an ordinary
+    /// table every non-empty payload is spilled to sidecars using the target's
+    /// allocated Blob IDs. A Managed-enabled table can reference the completed
+    /// upload directly. The part and its sidecars use the same lifetime and
+    /// concatenation rules as [`Self::write_data_file_part`].
+    ///
+    /// ```
+    /// # use std::ops::Range;
+    /// # use arrow_array::RecordBatch;
+    /// # use lance::{Dataset, Result, blob::BlobWriteSources, dataset::DataFileTarget};
+    /// # use lance_file::writer::FileWriterOptions;
+    /// # async fn example(dataset: &Dataset, target: &DataFileTarget, ids: Option<Range<u32>>,
+    /// #   batch: RecordBatch, sources: BlobWriteSources) -> Result<()> {
+    /// let part = dataset.write_data_file_part_with_blob_sources(
+    ///     target, ids, futures::stream::iter([Ok((batch, sources))]),
+    ///     FileWriterOptions::default(),
+    /// ).await?;
+    /// # let _ = part;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_data_file_part_with_blob_sources(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<(RecordBatch, BlobWriteSources)>> + Send,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<DataFilePart> {
+        if !versions::writes_blob_v2(target.version) {
+            return Err(Error::not_supported(
+                "Part writes with Blob sources require Lance file version 2.2 or later",
+            ));
+        }
+        let data = data.map(|result| result.map(|(batch, sources)| (batch, Some(sources))));
+        self.write_data_file_part_impl(target, blob_ids, data, file_writer_options)
+            .await
+    }
+
+    async fn write_data_file_part_impl(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<(RecordBatch, Option<BlobWriteSources>)>> + Send,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<DataFilePart> {
         self.validate_data_file_target(target)?;
         validate_blob_v2_write_schema(target.schema.as_ref())?;
         let managed = managed_blobs_enabled(target.schema.as_ref())?;
@@ -234,9 +288,9 @@ impl Dataset {
         } else {
             None
         };
+        let root = self.blob_base_path(target.base_id)?;
         if managed && let Some(writer) = preprocessor.take() {
-            let root = self.blob_base_path(target.base_id)?;
-            preprocessor = Some(writer.with_managed_base(target.base_id, root));
+            preprocessor = Some(writer.with_managed_base(target.base_id, root.clone()));
         }
 
         let file_name = format!("{}.part", generate_random_filename());
@@ -258,7 +312,9 @@ impl Dataset {
         let mut data = Box::pin(data);
         let write_result = async {
             while let Some(batch) = data.next().await {
-                writer.write_batch(&batch?).await?;
+                let (batch, sources) = batch?;
+                let sources = sources.as_ref().map(|sources| (&root, sources));
+                writer.write_batch_with_sources(&batch, sources).await?;
             }
             writer.finish_file().await
         }
@@ -2145,6 +2201,22 @@ fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+
+    #[doc(hidden)]
+    async fn write_with_blob_sources(
+        &mut self,
+        batch: &RecordBatch,
+        _root: &Path,
+        sources: &BlobWriteSources,
+    ) -> Result<()> {
+        if !sources.is_empty() {
+            return Err(Error::not_supported(
+                "This writer does not accept Blob sources",
+            ));
+        }
+        self.write(std::slice::from_ref(batch)).await
+    }
+
     /// Mark the next batch as ending the current file page.
     fn prepare_for_flush(&mut self) {}
     /// Get the file path and base ID for the data file being written.
@@ -2290,9 +2362,20 @@ impl V2WriterAdapter {
     }
 
     pub(in crate::dataset) async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_batch_with_sources(batch, None).await
+    }
+
+    async fn write_batch_with_sources(
+        &mut self,
+        batch: &RecordBatch,
+        sources: Option<(&Path, &BlobWriteSources)>,
+    ) -> Result<()> {
         let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch.clone())?;
         let batch = match self.preprocessor.as_mut() {
-            Some(pre) => pre.preprocess_batch(&batch).await?,
+            Some(pre) => pre.preprocess_batch_with_sources(&batch, sources).await?,
+            None if sources.is_some_and(|(_, sources)| !sources.is_empty()) => {
+                return Err(Error::invalid_input("Blob sources require a Blob v2 field"));
+            }
             None => batch,
         };
         self.writer.write_batch(&batch).await
@@ -2339,6 +2422,17 @@ impl GenericWriter for V2WriterAdapter {
         }
         Ok(())
     }
+
+    async fn write_with_blob_sources(
+        &mut self,
+        batch: &RecordBatch,
+        root: &Path,
+        sources: &BlobWriteSources,
+    ) -> Result<()> {
+        self.write_batch_with_sources(batch, Some((root, sources)))
+            .await
+    }
+
     fn prepare_for_flush(&mut self) {
         self.writer.prepare_for_flush();
     }
