@@ -4,6 +4,9 @@
 import json
 import multiprocessing
 import pickle
+import subprocess
+import sys
+import textwrap
 import uuid
 from pathlib import Path
 from unittest import mock
@@ -26,6 +29,124 @@ from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import DeletionFile, RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 from pyarrow.fs import FileInfo, FileType
+
+
+def test_fragment_storage_stats(tmp_path: Path):
+    table = pa.table({"x": list(range(20)), "y": ["a"] * 20})
+    dataset = write_dataset(
+        table,
+        tmp_path / "stats",
+        max_rows_per_file=10,
+        data_storage_version="2.1",
+    )
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 2
+
+    totals: dict[int, int] = {}
+    for fragment in fragments:
+        pairs = fragment.storage_stats()
+        assert pairs == sorted(pairs)
+        assert pairs
+        for field_id, nbytes in pairs:
+            assert nbytes > 0
+            totals[field_id] = totals.get(field_id, 0) + nbytes
+
+    data_stats = dataset.stats.data_stats()
+    assert {field.id: field.bytes_on_disk for field in data_stats.fields} == totals
+
+
+def test_fragment_storage_stats_refreshes_expired_namespace_credentials(tmp_path: Path):
+    """Expired Python namespace credentials must not deadlock fragment stats.
+
+    Dataset statistics already release the GIL around this metadata read.
+    Fragment stats have to do the same: credential refresh calls back into
+    Python, and waiting while the GIL is held stops both sides.
+    """
+    script = textwrap.dedent(
+        """
+        import sys
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from pathlib import Path
+
+        import lance
+        import pyarrow as pa
+        from lance.namespace import LanceNamespace
+
+
+        class Namespace(LanceNamespace):
+            def namespace_id(self):
+                return "fragment-stats-gil"
+
+            def describe_table(self, request):
+                print("REFRESH_REACHED", flush=True)
+                raise RuntimeError("REFRESH_REACHED")
+
+
+        class MissingManifest(BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_error(404)
+
+            def log_message(self, *args):
+                pass
+
+
+        tmp_path = Path(sys.argv[1])
+        local = lance.write_dataset(
+            pa.table({"x": [1, 2]}),
+            tmp_path / "local",
+            data_storage_version="2.1",
+        )
+        server = HTTPServer(("127.0.0.1", 0), MissingManifest)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            options = {
+                "aws_access_key_id": "test",
+                "aws_secret_access_key": "test",
+                "aws_region": "us-east-1",
+                "aws_endpoint": f"http://127.0.0.1:{server.server_port}",
+                "allow_http": "true",
+                # Valid for the open. refresh_offset 0 keeps that open from
+                # refreshing; the sleep below is what makes the stats read the
+                # one that has to call describe_table.
+                "expires_at_millis": str(int(time.time() * 1000) + 1000),
+                "refresh_offset_millis": "0",
+                "client_max_retries": "0",
+            }
+            dataset = lance.LanceDataset(
+                "s3://bucket/ds",
+                version=local.version,
+                serialized_manifest=local._ds.serialized_manifest(),
+                storage_options=options,
+                namespace_client=Namespace(),
+                table_id=["ds"],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+        time.sleep(1.2)
+        try:
+            dataset.get_fragments()[0].storage_stats()
+        except Exception as error:
+            if "REFRESH_REACHED" not in str(error):
+                raise SystemExit(f"unexpected error: {error}") from error
+        else:
+            raise SystemExit("expected refresh error")
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "REFRESH_REACHED" in completed.stdout
 
 
 def test_write_fragment(tmp_path: Path):

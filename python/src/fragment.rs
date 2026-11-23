@@ -244,6 +244,18 @@ impl FileFragment {
         })
     }
 
+    /// On-disk bytes for each field, as ``(field_id, bytes)`` sorted by field id.
+    ///
+    /// A field stored in more than one data file is reported once, with the
+    /// sizes added together.
+    fn storage_stats(&self) -> PyResult<Vec<(u32, u64)>> {
+        // Release the GIL before waiting. A Python namespace refreshes expired
+        // credentials on a worker via `Python::attach`; holding the GIL here
+        // deadlocks that refresh and the call never returns.
+        rt().block_on(None, self.fragment.storage_stats())?
+            .infer_error()
+    }
+
     #[pyo3(signature=(columns=None, with_row_address=None))]
     fn open_session(
         self_: PyRef<'_, Self>,
