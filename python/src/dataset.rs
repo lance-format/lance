@@ -2843,8 +2843,22 @@ impl Dataset {
         self.ds.count_fragments()
     }
 
-    fn fragment_ids(&self) -> crate::bitmap::PyBitmap {
-        crate::bitmap::PyBitmap(self.ds.fragment_bitmap().clone())
+    #[pyo3(signature = (filter=None))]
+    fn fragment_ids(&self, filter: Option<&Bound<'_, PyAny>>) -> PyResult<crate::bitmap::PyBitmap> {
+        let Some(filter) = filter else {
+            return Ok(crate::bitmap::PyBitmap(self.ds.fragment_bitmap().clone()));
+        };
+        let filter = if let Ok(sql) = filter.cast::<PyString>() {
+            ExprFilter::Sql(sql.to_str()?.to_owned())
+        } else if let Ok(bytes) = filter.cast::<PyBytes>() {
+            ExprFilter::Substrait(bytes.as_bytes().to_vec())
+        } else {
+            return Err(PyTypeError::new_err("filter must be a string or bytes"));
+        };
+        let candidates = rt()
+            .block_on(None, self.ds.candidate_fragment_ids(filter))?
+            .infer_error()?;
+        Ok(crate::bitmap::PyBitmap::new(candidates))
     }
 
     fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
@@ -2871,14 +2885,23 @@ impl Dataset {
         batch.to_pyarrow(py)
     }
 
-    fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
-        let core_fragments = self_.ds.get_fragments();
-
-        let fragments: Vec<FileFragment> = core_fragments
-            .iter()
-            .map(|f| FileFragment::new(f.clone()))
-            .collect::<Vec<_>>();
-        Ok(fragments)
+    #[pyo3(signature = (filter=None))]
+    fn get_fragments(&self, filter: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<FileFragment>> {
+        let candidates = filter
+            .map(|filter| self.fragment_ids(Some(filter)))
+            .transpose()?;
+        Ok(self
+            .ds
+            .iter_fragments()
+            .filter(|fragment| {
+                candidates
+                    .as_ref()
+                    .is_none_or(|ids| ids.0.contains(fragment.id as u32))
+            })
+            .map(|fragment| {
+                FileFragment::new(LanceFileFragment::new(self.ds.clone(), fragment.clone()))
+            })
+            .collect())
     }
 
     fn get_fragment(self_: PyRef<'_, Self>, fragment_id: usize) -> PyResult<Option<FileFragment>> {

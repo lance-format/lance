@@ -1525,23 +1525,41 @@ class LanceDataset(pa.dataset.Dataset):
         # Use the new path-based Rust function directly
         self._ds.update_field_metadata_by_path(field_updates, replace=replace)
 
-    def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
-        """Get all fragments from the dataset.
+    def get_fragments(
+        self, filter: Optional[Union[str, Expression]] = None
+    ) -> List[LanceFragment]:
+        """Get candidate fragments in manifest order.
 
-        Note: filter is not supported yet.
+        If supplied, a SQL predicate or PyArrow expression can rule out
+        fragments using scalar index metadata. Apply the same filter when
+        reading the returned fragments. With no filter, return all fragments.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"x": [0, 1, 2, 3]}), "memory://", max_rows_per_file=2
+        ... )
+        >>> dataset.create_scalar_index("x", "ZONEMAP")
+        >>> fragments = dataset.get_fragments(filter="x >= 2")
+        >>> scan = dataset.scanner(fragments=fragments, filter="x >= 2")
+        >>> scan.to_table()["x"].to_pylist()
+        [2, 3]
         """
-        if filter is not None:
-            raise ValueError("get_fragments() does not support filter yet")
         return [
             LanceFragment(self, fragment_id=None, fragment=f)
-            for f in self._ds.get_fragments()
+            for f in self._ds.get_fragments(self._encode_fragment_filter(filter))
         ]
 
-    def fragment_ids(self) -> Bitmap:
-        """Get the ids of all fragments in the currently checked out version.
+    def fragment_ids(self, filter: Optional[Union[str, Expression]] = None) -> Bitmap:
+        """Get candidate fragment IDs in the currently checked out version.
 
-        Unlike :meth:`get_fragments`, this does not create an object for every
-        fragment.
+        If supplied, a SQL predicate or PyArrow expression can rule out
+        fragments using scalar index metadata. Fragments with incomplete index
+        coverage or inconclusive statistics are retained. Apply the original
+        filter at the same dataset version when reading or updating candidates.
+        With no filter, return all fragment IDs.
 
         Examples
         --------
@@ -1553,8 +1571,20 @@ class LanceDataset(pa.dataset.Dataset):
         ... )
         >>> list(dataset.fragment_ids())
         [0, 1]
+        >>> dataset.create_scalar_index("x", "ZONEMAP")
+        >>> list(dataset.fragment_ids(filter=pa.compute.field("x") >= 2))
+        [1]
         """
-        return self._ds.fragment_ids()
+        return self._ds.fragment_ids(self._encode_fragment_filter(filter))
+
+    def _encode_fragment_filter(
+        self, filter: Optional[Union[str, Expression]]
+    ) -> Optional[Union[str, bytes]]:
+        if isinstance(filter, pa.compute.Expression):
+            return _serialize_expression(filter, self._ds.schema)
+        if filter is not None and not isinstance(filter, str):
+            raise TypeError("filter must be a SQL string or a PyArrow expression")
+        return filter
 
     def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""

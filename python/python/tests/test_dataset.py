@@ -2083,6 +2083,84 @@ def test_fragment_ids(tmp_path: Path):
     assert list(dataset.fragment_ids() - indexed) == [5]
 
 
+@pytest.mark.parametrize("filter_format", ["sql", "pyarrow"])
+def test_fragment_pruning(tmp_path: Path, filter_format: str):
+    dataset = lance.write_dataset(
+        pa.table({"price": [0, 1, 10, 11, 20, 21]}),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    predicate = (
+        "price >= 11" if filter_format == "sql" else pa.compute.field("price") >= 11
+    )
+    assert list(dataset.fragment_ids(filter=predicate)) == [0, 1, 2]
+    dataset.create_scalar_index("price", "ZONEMAP")
+
+    ids = dataset.fragment_ids(filter=predicate)
+    fragments = dataset.get_fragments(filter=predicate)
+    assert list(ids) == [1, 2]
+    assert [fragment.fragment_id for fragment in fragments] == [1, 2]
+    assert dataset.scanner(fragments=fragments, filter=predicate).to_table() == (
+        dataset.to_table(filter=predicate, use_scalar_index=False)
+    )
+    assert list(dataset.fragment_ids()) == [0, 1, 2]
+    assert [fragment.fragment_id for fragment in dataset.get_fragments()] == [0, 1, 2]
+    assert list(dataset.fragment_ids(filter="price > 100")) == []
+    assert dataset.get_fragments(filter="price > 100") == []
+
+    dataset = lance.write_dataset(pa.table({"price": [100]}), tmp_path, mode="append")
+    assert list(dataset.fragment_ids(filter=predicate)) == [1, 2, 3]
+    assert [fragment.fragment_id for fragment in dataset.get_fragments(predicate)] == [
+        1,
+        2,
+        3,
+    ]
+
+
+def test_fragment_pruning_invalid_filter(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"price": [0, 1]}), tmp_path)
+    for get_candidates in (dataset.fragment_ids, dataset.get_fragments):
+        with pytest.raises(TypeError, match="SQL string or a PyArrow expression"):
+            get_candidates(filter=1)
+        with pytest.raises(ValueError, match="does not return a boolean"):
+            get_candidates(filter="price")
+
+
+@pytest.mark.parametrize(
+    ("use_zonemap", "expected_fragments", "expected_prices"),
+    [
+        pytest.param(False, [0, 2], [0, 21], id="rowaddr_in"),
+        pytest.param(True, [1, 2], [10, 21], id="rowaddr_or_zonemap"),
+    ],
+)
+def test_fragment_pruning_row_address(
+    tmp_path: Path,
+    use_zonemap: bool,
+    expected_fragments: list[int],
+    expected_prices: list[int],
+):
+    dataset = lance.write_dataset(
+        pa.table({"price": [0, 1, 10, 11, 20, 21]}),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    addresses = dataset.to_table(with_row_address=True)["_rowaddr"].to_pylist()
+    if use_zonemap:
+        dataset.create_scalar_index("price", "ZONEMAP")
+        predicate = f"_rowaddr = {addresses[2]} OR price > 20"
+    else:
+        predicate = f"_rowaddr IN ({addresses[0]}, {addresses[5]})"
+
+    assert list(dataset.fragment_ids(filter=predicate)) == expected_fragments
+    fragments = dataset.get_fragments(filter=predicate)
+    assert [fragment.fragment_id for fragment in fragments] == expected_fragments
+    result = dataset.scanner(fragments=fragments, filter=predicate).to_table()
+    assert result.sort_by("price") == dataset.to_table(
+        filter=predicate, use_scalar_index=False
+    ).sort_by("price")
+    assert sorted(result["price"].to_pylist()) == expected_prices
+
+
 def test_pickle_fragment(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

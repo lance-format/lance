@@ -9,8 +9,9 @@ use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion_expr::{Expr, ExprSchemable, Volatility};
-use lance_core::{Error, Result};
+use datafusion_expr::{Expr, ExprSchemable, Operator, Volatility};
+use lance_core::utils::address::RowAddress;
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_datafusion::planner::Planner;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -18,12 +19,13 @@ use lance_index::scalar::expression::{ScalarIndexExpr, ScalarIndexSearch, create
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::staleness::{overlaid_fragments, overlay_affects_index};
 use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 
 use super::Dataset;
-use super::scanner::ExprFilter;
+use super::scanner::{ExprFilter, TakeOperation};
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::resolve_query_segment_coverages;
-use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::loading::{DatasetIndexInternalExt, ScalarIndexInfo};
 use crate::index::scalar::IndexDetails;
 
 impl Dataset {
@@ -33,6 +35,8 @@ impl Dataset {
     /// This reads index and dataset metadata without scanning data files. It
     /// retains fragments that lack usable index coverage or cannot be ruled out.
     /// Apply the original filter to the candidates using the same snapshot.
+    /// Equality and IN predicates on `_rowaddr` can also prune using physical
+    /// fragment IDs without accessing an index.
     /// Predicates with query-scoped or volatile functions and segments that
     /// require row-level address translation are handled conservatively.
     ///
@@ -78,7 +82,10 @@ impl Dataset {
             return Ok(all_fragments.clone());
         };
         let expr = Planner::new(schema).optimize_expr(expr)?;
+        self.evaluate_fragment_filter(&expr, &OnceCell::new()).await
+    }
 
+    async fn fragment_pruning_index_info(&self) -> Result<(Vec<IndexMetadata>, ScalarIndexInfo)> {
         let indices = self.load_indices().await?;
         let pruning_indices: Vec<_> = indices
             .iter()
@@ -95,10 +102,64 @@ impl Dataset {
         let index_info = self
             .scalar_index_info_for_segments_ignoring(&pruning_indices, &HashSet::new())
             .await?;
-        let Some(query) = create_filter_plan(expr, &index_info, true)?.index_query else {
+        Ok((pruning_indices, index_info))
+    }
+
+    #[async_recursion]
+    async fn evaluate_fragment_filter(
+        &self,
+        expr: &Expr,
+        indices: &OnceCell<(Vec<IndexMetadata>, ScalarIndexInfo)>,
+    ) -> Result<RoaringBitmap> {
+        let all_fragments = self.fragment_bitmap.as_ref();
+        let columns = expr.column_refs();
+        if columns.iter().any(|column| column.name == ROW_ADDR) {
+            // Keep address and scalar predicates in the same boolean tree so a
+            // mixed OR can use the candidates from both sides.
+            if let Expr::BinaryExpr(binary) = expr {
+                match binary.op {
+                    Operator::And => {
+                        let left = self.evaluate_fragment_filter(&binary.left, indices).await?;
+                        if left.is_empty() {
+                            return Ok(left);
+                        }
+                        return Ok(left
+                            & self
+                                .evaluate_fragment_filter(&binary.right, indices)
+                                .await?);
+                    }
+                    Operator::Or => {
+                        let left = self.evaluate_fragment_filter(&binary.left, indices).await?;
+                        if &left == all_fragments {
+                            return Ok(left);
+                        }
+                        return Ok(left
+                            | self
+                                .evaluate_fragment_filter(&binary.right, indices)
+                                .await?);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((TakeOperation::RowAddrs(addresses), None)) =
+                TakeOperation::try_from_expr(expr)
+            {
+                return Ok(addresses
+                    .into_iter()
+                    .map(|address| RowAddress::from(address).fragment_id())
+                    .filter(|id| all_fragments.contains(*id))
+                    .collect());
+            }
+            return Ok(all_fragments.clone());
+        }
+
+        let (pruning_indices, index_info) = indices
+            .get_or_try_init(|| self.fragment_pruning_index_info())
+            .await?;
+        let Some(query) = create_filter_plan(expr.clone(), index_info, true)?.index_query else {
             return Ok(all_fragments.clone());
         };
-        self.evaluate_fragment_query(&query, &pruning_indices).await
+        self.evaluate_fragment_query(&query, pruning_indices).await
     }
 
     #[async_recursion]
@@ -206,8 +267,6 @@ mod tests {
         ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, TimestampMillisecondArray,
         UInt64Array, record_batch,
     };
-    use lance_core::ROW_ADDR;
-    use lance_core::utils::address::RowAddress;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use rstest::rstest;
@@ -384,7 +443,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fragment_pruning_accepts_scanner_system_columns() {
+    async fn test_fragment_pruning_by_row_address_without_index() {
+        let dataset = write_dataset(true).await;
+        let middle = u64::from(RowAddress::new_from_parts(1, 0));
+        let last = u64::from(RowAddress::new_from_parts(2, 1));
+        assert_candidates(&dataset, &format!("_rowaddr = {middle}"), &[1]).await;
+        assert_candidates(
+            &dataset,
+            &format!("_rowaddr IN ({last}, 0, {last})"),
+            &[0, 2],
+        )
+        .await;
+
+        dataset.object_store.io_stats_incremental();
+        let absent = u64::from(RowAddress::first_row(99));
+        let candidates = dataset
+            .candidate_fragment_ids(ExprFilter::Sql(format!("_rowaddr = {absent}")))
+            .await
+            .unwrap();
+        assert!(candidates.is_empty());
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .is_empty()
+        );
+    }
+
+    #[rstest]
+    #[case::and("price >= 10 AND _rowaddr = {address}", &[1])]
+    #[case::and_disjoint("price < 10 AND _rowaddr = {address}", &[])]
+    #[case::or("_rowaddr = {address} OR price > 20", &[1, 2])]
+    #[case::or_with_in("_rowaddr IN ({address}, {address} + 1) OR price > 20", &[1, 2])]
+    #[case::or_unindexed("_rowaddr = {address} OR user_id = 1", &[0, 1, 2])]
+    #[tokio::test]
+    async fn test_fragment_pruning_combines_row_address_and_zonemap(
+        #[case] predicate: &str,
+        #[case] expected: &[u32],
+    ) {
         let mut dataset = write_dataset(false).await;
         build_segments(
             &mut dataset,
@@ -396,8 +493,8 @@ mod tests {
         let address = u64::from(RowAddress::new_from_parts(1, 0));
         assert_candidates(
             &dataset,
-            &format!("price >= 10 AND _rowaddr = {address}"),
-            &[1, 2],
+            &predicate.replace("{address}", &address.to_string()),
+            expected,
         )
         .await;
     }
