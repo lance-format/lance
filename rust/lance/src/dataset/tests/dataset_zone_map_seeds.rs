@@ -3909,7 +3909,7 @@ async fn test_config_seed_boundary_real_sizes(
 
 /// One stored or expected zone of the ZoneMap index on `col`; `min` and `max`
 /// are one-element arrays of the column's type.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct TypedZone {
     fragment_id: u64,
     zone_start: u64,
@@ -3918,6 +3918,18 @@ struct TypedZone {
     nan_count: u32,
     min: ArrayRef,
     max: ArrayRef,
+}
+
+impl PartialEq for TypedZone {
+    fn eq(&self, other: &Self) -> bool {
+        self.fragment_id == other.fragment_id
+            && self.zone_start == other.zone_start
+            && self.zone_length == other.zone_length
+            && self.null_count == other.null_count
+            && self.nan_count == other.nan_count
+            && self.min.as_ref() == other.min.as_ref()
+            && self.max.as_ref() == other.max.as_ref()
+    }
 }
 
 /// The boundary shape where reused and scanned seed records mix (seed zones
