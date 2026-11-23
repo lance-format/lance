@@ -10759,6 +10759,40 @@ def test_branches(tmp_path: Path):
     assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
 
 
+@pytest.mark.parametrize(
+    "source, reference, target",
+    [
+        pytest.param("main", ("dev", 2), "dev", id="checkout-branch"),
+        pytest.param("dev", ("main", 2), "main", id="checkout-main"),
+        pytest.param("main", "dev_tip", "dev", id="checkout-tag"),
+        pytest.param(None, "dev_tip", "dev", id="open-tag"),
+        pytest.param("dev", ("dev", 2), "dev", id="same-branch"),
+        pytest.param("main", ("main", 2), "main", id="same-main"),
+    ],
+)
+def test_branch_snapshot_location(tmp_path: Path, source, reference, target):
+    uri = tmp_path / "dataset"
+    main = lance.write_dataset(pa.table({"id": [0]}), uri)
+    dev = main.create_branch("dev")
+    dev = lance.write_dataset(pa.table({"id": [1]}), dev, mode="append")
+    main = lance.write_dataset(pa.table({"id": [2]}), main, mode="append")
+    assert dev.version == main.version == 2
+    dev.tags.create("dev_tip", dev.version)
+    datasets = {"main": main, "dev": dev}
+
+    if source is None:
+        snapshot = lance.dataset(uri, version=reference)
+    else:
+        snapshot = datasets[source].checkout_version(reference)
+
+    expected = datasets[target]
+    table = expected.to_table()
+    assert snapshot.to_table() == table
+    assert lance.dataset(snapshot.uri, version=snapshot.version).to_table() == table
+    assert snapshot.uri == expected.uri
+    assert pickle.loads(pickle.dumps(snapshot)).to_table() == table
+
+
 def test_default_scan_options_nearest(tmp_path: Path) -> None:
     dim = 4
     num_rows = 10

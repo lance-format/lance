@@ -167,7 +167,6 @@ class LanceDataset(pa.dataset.Dataset):
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
-        self._uri = uri
         self._storage_options = storage_options
         self._base_store_params = base_store_params
 
@@ -206,6 +205,7 @@ class LanceDataset(pa.dataset.Dataset):
             namespace_client_managed_versioning=namespace_client_managed_versioning,
             base_store_params=base_store_params,
         )
+        self._uri = self._ds.uri
         self._default_scan_options = default_scan_options
         self._read_params = read_params
 
@@ -2831,6 +2831,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds = copy.copy(self)
         if version != ds.version:
             ds._ds = self._ds.checkout_version(version)
+            ds._uri = ds._ds.uri
         return ds
 
     def restore(self):
