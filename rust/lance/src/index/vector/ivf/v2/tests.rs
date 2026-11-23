@@ -6556,6 +6556,7 @@ async fn test_hnsw_prefix_graph_loads_without_dropped_rows() {
         upper_bound: None,
         dist_q_c: 0.0,
         use_acorn: false,
+        rq_graph_scoring: Default::default(),
     };
     let (found, _) = graph
         .search_basic(query, 10, &params, None, &storage)
