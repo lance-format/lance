@@ -65,8 +65,8 @@ pub struct DirectoryNamespaceBuilder {
     /// avoiding extra object store calls.
     dir_listing_to_manifest_migration_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
-    /// Retained for the public builder API and `Debug` output. DirectoryNamespace
-    /// does not consume per-request context, so `build` drops it.
+    /// Transferred to DirectoryNamespace, which retains it for its lifetime even
+    /// though it does not consume per-request context.
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     commit_retries: Option<u32>,
     /// When true, returns input storage options in describe_table/declare_table responses
@@ -510,9 +510,10 @@ impl DirectoryNamespaceBuilder {
 
     /// Set a dynamic context provider for per-request context.
     ///
-    /// DirectoryNamespace does not consume per-request context, so the provider
-    /// is retained on the builder for API compatibility but is not called.
-    /// RestNamespace converts the context into HTTP headers.
+    /// The provider can be used to generate additional context for operations.
+    /// DirectoryNamespace retains the provider for the lifetime of the built
+    /// namespace but does not call it (unlike RestNamespace where it is converted
+    /// to HTTP headers).
     ///
     /// # Arguments
     ///
@@ -651,6 +652,7 @@ impl DirectoryNamespaceBuilder {
             commit_retries: self.commit_retries,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
             credential_vendor,
+            _context_provider: self.context_provider,
             vend_input_storage_options: self.vend_input_storage_options,
             vend_input_storage_options_refresh_interval_millis: self
                 .vend_input_storage_options_refresh_interval_millis,

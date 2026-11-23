@@ -32,6 +32,7 @@ use tokio::sync::OnceCell;
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 
+use crate::context::DynamicContextProvider;
 use crate::credentials::CredentialVendor;
 
 /// Thread-safe metrics tracker for namespace operations.
@@ -243,6 +244,10 @@ pub struct DirectoryNamespace {
     /// Credential vendor created once during initialization.
     /// Used to vend temporary credentials for table access.
     credential_vendor: Option<Arc<dyn CredentialVendor>>,
+    /// Retained for the lifetime of the namespace. DirectoryNamespace does not
+    /// call the provider, but dropping it earlier would release resources owned
+    /// by it, such as a Python object or Java global reference.
+    _context_provider: Option<Arc<dyn DynamicContextProvider>>,
     /// When true, returns input storage options in responses when no credential vendor is configured.
     vend_input_storage_options: bool,
     /// Refresh interval in milliseconds for vended input storage options.

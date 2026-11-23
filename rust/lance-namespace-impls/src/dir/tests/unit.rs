@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::context::{DynamicContextProvider, OperationInfo};
 
 /// The builder's three flags have supported combinations that must resolve to
 /// the same discovery behavior they had before the internal mode existed.
@@ -37,6 +38,42 @@ fn test_table_discovery_mode_resolution(
     assert_eq!(mode.has_directory_listing(), has_directory_listing);
     assert_eq!(mode.uses_manifest_for_root(), uses_manifest_for_root);
     assert_eq!(mode.merges_manifest_listing(), merges_manifest_listing);
+}
+
+#[tokio::test]
+async fn test_context_provider_retained_for_namespace_lifetime() {
+    #[derive(Debug)]
+    struct Provider;
+
+    impl DynamicContextProvider for Provider {
+        fn provide_context(
+            &self,
+            _info: &OperationInfo,
+        ) -> std::collections::HashMap<String, String> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    let temp_dir = TempStdDir::default();
+    let provider = Arc::new(Provider);
+    let provider_ref = Arc::downgrade(&provider);
+    let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+        .context_provider(provider.clone())
+        .build()
+        .await
+        .unwrap();
+
+    drop(provider);
+    assert!(
+        provider_ref.upgrade().is_some(),
+        "the namespace must keep the context provider alive after build"
+    );
+
+    drop(namespace);
+    assert!(
+        provider_ref.upgrade().is_none(),
+        "dropping the namespace must release the context provider"
+    );
 }
 
 fn build_rq_num_bits(index_type: &str, num_bits: Option<i32>) -> Result<u8> {
