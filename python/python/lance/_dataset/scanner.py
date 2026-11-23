@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import operator
+import sys
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -1627,7 +1628,14 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         Table
         """
-        return self.to_table()[:num_rows]
+        if num_rows is None:
+            return self.to_table()
+        stop = operator.index(num_rows)
+        if stop < 0:
+            return self.to_table()[:stop]
+        if stop >= sys.maxsize:
+            return self.to_table()
+        return self._scanner.to_pyarrow(stop).read_all()
 
     def count_rows(self) -> int:
         """Count rows matching the scanner filter.

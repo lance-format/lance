@@ -37,7 +37,7 @@ pub use lance_datafusion_exec::exec::{
     ExecutionMetricValue, ExecutionOutcome, ExecutionStatsCallback, ExecutionSummaryCounts,
     HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, OperatorMetrics, RecordBatchExec,
     StrictBatchSizeExec, collect_execution_metrics, collect_operator_metrics,
-    execute_plan_with_diagnostics,
+    execute_plan_with_diagnostics, into_single_partition,
 };
 use lance_datafusion_exec::exec::{
     execute_plan_with_context, new_runtime_env, new_session_config, track_execution_memory,

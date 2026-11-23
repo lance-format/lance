@@ -1871,6 +1871,17 @@ async fn test_scan_order_survives_parallelism(
         batch["foo"].as_primitive::<Int32Type>().values(),
         expected.as_slice()
     );
+    let prefix: Vec<_> = scan
+        .try_into_stream_with_output_limit(Some(2))
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        concat_batches(&batch.schema(), &prefix).unwrap(),
+        batch.slice(0, 2)
+    );
 }
 
 #[tokio::test]
@@ -1887,6 +1898,23 @@ async fn test_unordered_scan_keeps_parallelism() {
     let mut values = batch["foo"].as_primitive::<Int32Type>().values().to_vec();
     values.sort_unstable();
     assert_eq!(values, (0..12_288).map(|idx| idx * 2).collect::<Vec<_>>());
+
+    let prefix: Vec<_> = scan
+        .try_into_stream_with_output_limit(Some(2))
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let prefix = concat_batches(&batch.schema(), &prefix).unwrap();
+    assert_eq!(prefix.num_rows(), 2);
+    assert!(
+        prefix["foo"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .all(|v| values.binary_search(v).is_ok())
+    );
 }
 
 #[rstest]

@@ -925,6 +925,30 @@ pub fn execute_plan(
     execute_plan_with_context(plan, options, task_context)
 }
 
+/// Merge the output partitions of an optimized plan, preserving its declared ordering.
+///
+/// An ordered scan can still have several partitions after optimization. A plain
+/// coalesce would interleave their rows in scheduling order.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use datafusion_physical_plan::ExecutionPlan;
+/// # use lance_datafusion_exec::exec::into_single_partition;
+/// # fn example(plan: Arc<dyn ExecutionPlan>) {
+/// let output = into_single_partition(plan);
+/// assert_eq!(output.properties().partitioning.partition_count(), 1);
+/// # }
+/// ```
+pub fn into_single_partition(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    if plan.properties().partitioning.partition_count() == 1 {
+        plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
+    } else {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    }
+}
+
 /// Executes a plan under `task_context`, reporting its metrics through `options`
 /// once the stream finishes. The report has the peak memory reservation of the
 /// execution when [`track_execution_memory`] prepared `task_context`.
@@ -942,23 +966,7 @@ pub fn execute_plan_with_context(
         );
     }
 
-    // Coalesce to a single partition if the optimizer left more than one.
-    // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
-    // declares UnspecifiedDistribution, leaving multi-partition plans here.
-    //
-    // If the plan carries an output ordering (e.g. a top-k `SortExec` whose
-    // result was later repartitioned to parallelize downstream operators),
-    // a plain `CoalescePartitionsExec` would scramble that order because it
-    // merges partitions in scheduling-dependent order. Use an order-preserving
-    // merge in that case instead, mirroring what `EnforceDistribution` itself
-    // does when it needs to merge an ordered, multi-partition plan.
-    let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
-        plan
-    } else if let Some(ordering) = plan.output_ordering() {
-        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
-    } else {
-        Arc::new(CoalescePartitionsExec::new(plan))
-    };
+    let plan = into_single_partition(plan);
 
     let memory_pool = Arc::clone(task_context.memory_pool());
     let stream = plan.execute(0, task_context)?;
