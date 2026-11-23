@@ -8,8 +8,8 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, NewColumnTransform, ReadParams, TRANSACTIONS_DIR, UpdateBuilder,
-    write_manifest_file,
+    ColumnAlteration, MergeInsertBuilder, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
+    UpdateBuilder, WhenMatched, write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
@@ -1594,6 +1594,105 @@ impl CommitHandler for GateNextCommitHandler {
             )
             .await
     }
+}
+
+async fn stage_one_row_update(dir: &str) -> (Dataset, Transaction) {
+    let dataset = InsertBuilder::new(dir)
+        .execute(vec![
+            record_batch!(("id", Int32, [0, 1, 2, 3]), ("value", Int32, [0, 0, 0, 0])).unwrap(),
+        ])
+        .await
+        .unwrap();
+    let staged = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .try_build()
+        .unwrap()
+        .execute_uncommitted_batches(vec![
+            record_batch!(("id", Int32, [1]), ("value", Int32, [10])).unwrap(),
+        ])
+        .await
+        .unwrap();
+    (dataset, staged.transaction)
+}
+
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_retry_after_publication_race() {
+    let dir = TempStrDir::default();
+    let (mut dataset, staged) = stage_one_row_update(&dir).await;
+    let read = Arc::new(dataset.clone());
+    dataset.delete("id = 0").await.unwrap();
+
+    let handler = Arc::new(GateNextCommitHandler {
+        inner: Arc::new(ConditionalPutCommitHandler),
+        gate_next: AtomicBool::new(true),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let commit = CommitBuilder::new(read)
+        .with_commit_handler(handler.clone())
+        .execute(staged);
+    tokio::pin!(commit);
+    tokio::select! {
+        _ = handler.entered.notified() => {}
+        result = &mut commit => panic!("expected staged disjoint rows to commit after retry: {result:?}"),
+    }
+    dataset.delete("id = 2").await.unwrap();
+    handler.release.notify_one();
+    let committed = commit
+        .await
+        .expect("expected staged disjoint rows to commit after retry");
+    assert_eq!(committed.version().version, 4);
+    let rows = committed.scan().try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<Int32Type>();
+    let values = rows["value"].as_primitive::<Int32Type>();
+    let mut rows: Vec<_> = ids
+        .values()
+        .iter()
+        .zip(values.values())
+        .map(|(&id, &value)| (id, value))
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(rows, [(1, 10), (3, 0)]);
+}
+
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_after_intermediate_undelete() {
+    let dir = TempStrDir::default();
+    let (mut dataset, staged) = stage_one_row_update(&dir).await;
+    let read = Arc::new(dataset.clone());
+    let original = read.fragments()[0].clone();
+    dataset.delete("id = 1").await.unwrap();
+    // Restore the original deletion mask, then change a different row. Looking
+    // at the endpoints alone would miss the change to row 1.
+    let restore_rows = Transaction::new(
+        dataset.version().version,
+        Operation::Delete {
+            updated_fragments: vec![original],
+            deleted_fragment_ids: vec![],
+            predicate: String::new(),
+        },
+        None,
+    );
+    dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(restore_rows)
+        .await
+        .unwrap();
+    dataset.delete("id = 2").await.unwrap();
+    let result = CommitBuilder::new(read).execute(staged).await;
+    assert!(
+        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+        "{result:?}"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, 4);
+    assert_eq!(
+        dataset
+            .count_rows(Some("id = 1 AND value = 0".into()))
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 /// Once the restore has checked its predecessor, a commit that wins the next

@@ -390,7 +390,7 @@ impl<'a> TransactionRebase<'a> {
                         if !self.modified_fragment_ids.contains(&group.fragment_id) {
                             continue;
                         }
-                        let Some(affected_rows) = self.affected_rows else {
+                        let Some(UpdateRows::Supplied(affected_rows)) = &self.affected_rows else {
                             return Err(
                                 self.retryable_conflict_err(other_transaction, other_version)
                             );
@@ -477,12 +477,22 @@ impl<'a> TransactionRebase<'a> {
                             }
 
                             // Mark any modified fragments as needing a rewrite.
-                            *needs_rewrite |= updated.deletion_file != fragment.deletion_file;
+                            *needs_rewrite |= updated.deletion_file != fragment.deletion_file
+                                || matches!(self.affected_rows, Some(UpdateRows::Deferred));
+                        } else if matches!(self.affected_rows, Some(UpdateRows::Deferred))
+                            && self.modified_fragment_ids.contains(&updated.id)
+                        {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
                         }
                     }
 
                     for removed_fragment_id in removed_fragment_ids {
-                        if self.initial_fragments.contains_key(removed_fragment_id) {
+                        if self.initial_fragments.contains_key(removed_fragment_id)
+                            || (matches!(self.affected_rows, Some(UpdateRows::Deferred))
+                                && self.modified_fragment_ids.contains(removed_fragment_id))
+                        {
                             return Err(
                                 self.retryable_conflict_err(other_transaction, other_version)
                             );

@@ -2014,6 +2014,9 @@ pub(crate) async fn commit_transaction(
                 read_version_dataset.schema(),
                 dataset.schema(),
             )?;
+            if !other_transactions.is_empty() {
+                rebase.defer_staged_update_rows();
+            }
             // A retry's window starts after its previous attempt, so it would
             // miss the moves recorded there; not tracking only costs coverage.
             if checked_since == read_version && missing.is_empty() {
@@ -2044,6 +2047,9 @@ pub(crate) async fn commit_transaction(
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
+            rebase
+                .recover_staged_update_rows(&dataset, &other_transactions)
+                .await?;
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
             tagged_rewrite = assembly;

@@ -46,7 +46,7 @@ pub struct TransactionRebase<'a> {
     initial_fragments: HashMap<u64, (Fragment, bool)>,
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
-    affected_rows: Option<&'a RowAddrTreeMap>,
+    affected_rows: Option<UpdateRows<'a>>,
     /// Boxed: the commit loop holds the rebase across awaits.
     frag_reuse_base: Option<Box<FragReuseBase>>,
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
@@ -265,6 +265,15 @@ fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
 mod check;
 mod finish;
 mod init;
+mod staged_update;
+
+#[derive(Debug)]
+enum UpdateRows<'a> {
+    Supplied(&'a RowAddrTreeMap),
+    Deferred,
+    // Only the named Update/Delete overlaps in the current retry window were inspected.
+    DeletionOverlaps(RowAddrTreeMap),
+}
 
 impl<'a> TransactionRebase<'a> {
     #[track_caller]

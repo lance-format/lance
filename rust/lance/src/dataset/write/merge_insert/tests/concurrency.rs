@@ -4,6 +4,92 @@
 use super::*;
 use lance_datagen::ArrayGeneratorExt;
 
+#[rstest::rstest]
+#[case::disjoint_update(1, false)]
+#[case::disjoint_delete(1, true)]
+#[case::same_row_update(2, false)]
+#[case::same_row_delete(2, true)]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts(
+    #[case] other_id: u32,
+    #[case] delete: bool,
+    #[values(false, true)] stable_ids: bool,
+) {
+    let batch = |ids: Vec<u32>, value: u32| {
+        let values = vec![value; ids.len()];
+        record_batch!(("id", UInt32, ids), ("value", UInt32, values)).unwrap()
+    };
+    let mut dataset = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 5,
+            enable_stable_row_ids: stable_ids,
+            ..Default::default()
+        })
+        .execute(vec![batch((0..10).collect(), 0)])
+        .await
+        .unwrap();
+    dataset.delete("id = 0").await.unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let read = Arc::new(dataset.clone());
+    let stage = |id, value| {
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![batch(vec![id], value)])
+    };
+    let staged = stage(2, 20).await.unwrap().transaction;
+    if delete {
+        dataset.delete(&format!("id = {other_id}")).await.unwrap();
+    } else {
+        dataset = CommitBuilder::new(read.clone())
+            .execute(stage(other_id, 10).await.unwrap().transaction)
+            .await
+            .unwrap();
+    }
+    dataset.delete("id = 3").await.unwrap();
+    let version = dataset.manifest().version;
+    let result = CommitBuilder::new(read).execute(staged).await;
+    if other_id == 2 {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest().version, version);
+    } else {
+        dataset = result.expect("expected staged disjoint rows to commit");
+        assert_eq!(dataset.manifest().version, version + 1);
+    }
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<UInt32Type>();
+    let values = rows["value"].as_primitive::<UInt32Type>();
+    let mut actual: Vec<_> = ids
+        .values()
+        .iter()
+        .copied()
+        .zip(values.values().iter().copied())
+        .collect();
+    actual.sort_unstable();
+    let expected: Vec<_> = (1..10)
+        .filter(|&id| id != 3 && !(delete && id == other_id))
+        .map(|id| {
+            (
+                id,
+                if id == other_id {
+                    10
+                } else if id == 2 {
+                    20
+                } else {
+                    0
+                },
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
 // For some reason, Windows isn't able to handle the timeout test. Possibly
 // a performance bug in their timer implementation?
 #[cfg(not(windows))]

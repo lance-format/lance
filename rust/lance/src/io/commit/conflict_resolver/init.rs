@@ -11,6 +11,7 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        let affected_rows = affected_rows.map(UpdateRows::Supplied);
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }

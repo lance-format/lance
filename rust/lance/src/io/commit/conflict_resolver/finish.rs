@@ -64,7 +64,14 @@ impl<'a> TransactionRebase<'a> {
             .iter()
             .any(|(_, (_, needs_rewrite))| *needs_rewrite)
         {
-            if let Some(affected_rows) = self.affected_rows {
+            if let Some(rows) = &self.affected_rows {
+                let affected_rows = match rows {
+                    UpdateRows::Supplied(rows) => *rows,
+                    UpdateRows::DeletionOverlaps(rows) => rows,
+                    UpdateRows::Deferred => {
+                        return Err(Error::internal("staged update offsets were not resolved"));
+                    }
+                };
                 // Then we do the rebase
 
                 // 1. Load the deletion files that need a rewrite.
@@ -786,7 +793,7 @@ impl<'a> TransactionRebase<'a> {
 
 /// Read a fragment's deletion vector as a bitmap of physical offsets, or an
 /// empty bitmap when the fragment has no deletion file.
-async fn read_fragment_deletion_bitmap(
+pub(super) async fn read_fragment_deletion_bitmap(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<RoaringBitmap> {
