@@ -455,7 +455,9 @@ async fn released_state(kind: Kind) -> Released {
 
 /// The row addresses each committed segment of [`BTREE`] answers through the
 /// query path (fragment reuse translation and coverage applied), per segment.
-async fn segment_answers(dataset: &Dataset) -> Vec<(Uuid, std::result::Result<Vec<u64>, String>)> {
+pub(super) async fn segment_answers(
+    dataset: &Dataset,
+) -> Vec<(Uuid, std::result::Result<Vec<u64>, String>)> {
     let mut answers = Vec::new();
     for segment in raw_segments(dataset, BTREE).await {
         let opened = crate::index::scalar_logical::open_scalar_index_segments(
@@ -730,7 +732,7 @@ async fn fts_hits(dataset: &Dataset, terms: &str) -> (Vec<(i32, f32)>, String) {
 }
 
 /// The sorted `i` of every live row whose text holds a word of `terms`.
-async fn scanned_matches(dataset: &Dataset, terms: &str) -> Vec<i32> {
+pub(super) async fn scanned_matches(dataset: &Dataset, terms: &str) -> Vec<i32> {
     let words: Vec<&str> = terms.split_whitespace().collect();
     let batch = dataset
         .scan()

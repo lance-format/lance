@@ -2876,8 +2876,8 @@ mod tests {
             assert_eq!(stored_index(&dataset, "vector_idx").await.uuid, legacy.uuid);
         }
 
-        /// A merged segment keeps its sources' provenance while its pages hold
-        /// the addresses the translating loader produced. Remapping it across
+        /// A merged segment commits its live coverage and its pages hold the
+        /// addresses the translating loader produced. Remapping it across
         /// a later rewrite must admit those intermediate addresses into the
         /// hops: stable partition, index merge with new data, compaction of
         /// the partition's destinations, remap. The remapped file holds the
@@ -2905,8 +2905,8 @@ mod tests {
             assert_eq!(appended.len(), 2);
             assert_eq!(
                 merged.fragment_bitmap.as_ref().unwrap(),
-                &RoaringBitmap::from_iter([0u32, 1].into_iter().chain(appended.iter().copied())),
-                "the merge keeps the sources' provenance"
+                &RoaringBitmap::from_iter([10u32, 11].into_iter().chain(appended.iter().copied())),
+                "the merge commits its live coverage"
             );
             assert_eq!(
                 segment_fragments_for(&dataset, 3).await,
