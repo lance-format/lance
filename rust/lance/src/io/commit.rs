@@ -88,6 +88,8 @@ mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
 pub mod namespace_manifest;
+#[cfg(all(feature = "dynamodb", test))]
+mod s3_ddb_profile_test;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
 
@@ -1411,6 +1413,7 @@ pub(crate) async fn do_commit_detached_transaction(
             let checked = crate::index::vector::ivf::validate_committed_vector_segments(
                 dataset,
                 &transaction.operation,
+                &manifest,
                 &indices,
             )
             .await;
@@ -2075,6 +2078,7 @@ pub(crate) async fn commit_transaction(
             let checked = crate::index::vector::ivf::validate_committed_vector_segments(
                 &dataset,
                 &attempt_transaction.operation,
+                &manifest,
                 &indices,
             )
             .await;

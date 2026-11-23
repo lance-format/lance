@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
 
 use super::super::query::Tokens;
@@ -42,7 +42,7 @@ pub struct FlatFieldStats {
 impl FlatFieldStats {
     /// An empty accumulator sized for `num_columns` columns and `num_terms`
     /// deduplicated query terms.
-    pub(in crate::scalar::inverted) fn zeros(num_columns: usize, num_terms: usize) -> Self {
+    pub fn zeros(num_columns: usize, num_terms: usize) -> Self {
         Self {
             doc_counts: vec![0; num_columns],
             total_tokens: vec![0; num_columns],
@@ -86,7 +86,7 @@ impl FlatFieldStats {
 
     /// Add another accumulator's totals. Every field is an integer count, so
     /// merging per-batch folds is exact and order-independent.
-    pub(in crate::scalar::inverted) fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: Self) {
         for (total, part) in self.doc_counts.iter_mut().zip(other.doc_counts) {
             *total += part;
         }
@@ -141,6 +141,74 @@ impl<'a> CombinedCorpusStats<'a> {
     }
 }
 
+/// Blend pre-aggregated per-column corpus totals into a [`CombinedFieldsBM25Scorer`].
+///
+/// This applies the exact Lucene `CombinedFieldQuery` blend:
+/// `docCount' = max_f docCount_f`, `docFreq'(t) = max_f docFreq_f(t)`,
+/// `sumTotalTermFreq' = Σ_f w_f · sumTotalTermFreq_f` (in `f64`), and
+/// `avgdl' = (sumTotalTermFreq' / docCount') as f32`.
+///
+/// Distributed coordinators aggregate raw per-column totals across segments and
+/// flat shards before calling this function so their blended scorer matches
+/// single-node [`build_combined_bm25_scorer`] bit-for-bit.
+pub fn build_combined_bm25_scorer_from_totals(
+    weights: &[f32],
+    doc_counts: &[usize],
+    total_tokens: &[u64],
+    terms: &[String],
+    doc_freqs: &[Vec<usize>],
+) -> Result<CombinedFieldsBM25Scorer> {
+    let num_columns = weights.len();
+    if doc_counts.len() != num_columns
+        || total_tokens.len() != num_columns
+        || doc_freqs.len() != num_columns
+    {
+        return Err(Error::invalid_input(format!(
+            "combined_fields column totals length mismatch: weights={num_columns}, doc_counts={}, total_tokens={}, doc_freqs={}",
+            doc_counts.len(),
+            total_tokens.len(),
+            doc_freqs.len(),
+        )));
+    }
+    if let Some((slot, freqs)) = doc_freqs
+        .iter()
+        .enumerate()
+        .find(|(_, freqs)| freqs.len() != terms.len())
+    {
+        return Err(Error::invalid_input(format!(
+            "combined_fields column {slot} doc_freqs length {} does not match {} terms",
+            freqs.len(),
+            terms.len(),
+        )));
+    }
+
+    let mut doc_count = 0usize;
+    let mut sum_total_term_freq = 0f64;
+    let mut doc_freq: HashMap<String, usize> = terms.iter().map(|t| (t.clone(), 0)).collect();
+
+    for column_slot in 0..num_columns {
+        doc_count = doc_count.max(doc_counts[column_slot]);
+        sum_total_term_freq += weights[column_slot] as f64 * total_tokens[column_slot] as f64;
+        for (term, &df) in terms.iter().zip(&doc_freqs[column_slot]) {
+            let entry = doc_freq
+                .get_mut(term)
+                .expect("doc_freq initialized for every term");
+            *entry = (*entry).max(df);
+        }
+    }
+
+    let avg_doc_length = if doc_count > 0 {
+        (sum_total_term_freq / doc_count as f64) as f32
+    } else {
+        0.0
+    };
+    Ok(CombinedFieldsBM25Scorer::new(
+        doc_count,
+        avg_doc_length,
+        doc_freq,
+    ))
+}
+
 /// Fold the target columns' segment statistics into a single [`CombinedFieldsBM25Scorer`].
 ///
 /// Generalizes [`build_global_bm25_scorer`](super::super::build_global_bm25_scorer)
@@ -171,9 +239,10 @@ pub async fn build_combined_bm25_scorer(
         debug_assert_eq!(flat.doc_counts.len(), columns.len());
         debug_assert!(flat.doc_freqs.iter().all(|df| df.len() == terms.len()));
     }
-    let mut doc_count = 0usize;
-    let mut sum_total_term_freq = 0f64;
-    let mut doc_freq: HashMap<String, usize> = terms.iter().map(|t| (t.clone(), 0)).collect();
+    let mut weights = Vec::with_capacity(columns.len());
+    let mut doc_counts = Vec::with_capacity(columns.len());
+    let mut total_tokens_per_col = Vec::with_capacity(columns.len());
+    let mut doc_freqs_per_col = Vec::with_capacity(columns.len());
 
     for (column_slot, column) in columns.iter().enumerate() {
         let mut column_num_docs = 0usize;
@@ -204,26 +273,19 @@ pub async fn build_combined_bm25_scorer(
             }
         }
 
-        doc_count = doc_count.max(column_num_docs);
-        sum_total_term_freq += column.weight as f64 * column_total_tokens as f64;
-        for (term, df) in terms.iter().zip(column_doc_freq) {
-            let entry = doc_freq
-                .get_mut(term)
-                .expect("doc_freq initialized for every term");
-            *entry = (*entry).max(df);
-        }
+        weights.push(column.weight);
+        doc_counts.push(column_num_docs);
+        total_tokens_per_col.push(column_total_tokens);
+        doc_freqs_per_col.push(column_doc_freq);
     }
 
-    let avg_doc_length = if doc_count > 0 {
-        (sum_total_term_freq / doc_count as f64) as f32
-    } else {
-        0.0
-    };
-    Ok(CombinedFieldsBM25Scorer::new(
-        doc_count,
-        avg_doc_length,
-        doc_freq,
-    ))
+    build_combined_bm25_scorer_from_totals(
+        &weights,
+        &doc_counts,
+        &total_tokens_per_col,
+        &terms,
+        &doc_freqs_per_col,
+    )
 }
 
 #[cfg(test)]

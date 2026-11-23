@@ -211,6 +211,32 @@ fn ngram_to_token(ngram: &str, ngram_length: usize) -> u32 {
     token
 }
 
+/// The inverse of [`ngram_to_token`].
+fn token_to_ngram(token: u32, ngram_length: usize) -> String {
+    (0..ngram_length as u32)
+        .rev()
+        .map(|idx| {
+            let pos = (token / (ALPHA_SPAN as u32).pow(idx) % ALPHA_SPAN as u32) as u8 - 1;
+            (if pos < 10 {
+                b'0' + pos
+            } else {
+                b'a' + pos - 10
+            }) as char
+        })
+        .collect()
+}
+
+/// The trigram condition a regex is answered with, as a plan shows it.
+pub(crate) fn regex_trigrams(pattern: &str) -> String {
+    const MAX_LEN: usize = 256;
+    let mut trigrams = ngram_regex::regex_to_trigram_query(pattern).to_string();
+    if trigrams.len() > MAX_LEN {
+        trigrams.truncate(MAX_LEN);
+        trigrams.push_str("...");
+    }
+    trigrams
+}
+
 /// Basic stats about an ngram index
 #[derive(Serialize)]
 struct NGramStatistics {

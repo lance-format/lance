@@ -40,6 +40,7 @@ use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::details::{
     target_partition_size_from_details, vector_index_details_default,
 };
+use crate::index::vector::ivf::compatibility::{VectorQueryContract, vector_segment_contract};
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
@@ -4199,8 +4200,6 @@ async fn test_vector_segment_contract_read_from_file_metadata(
     #[case] params: VectorIndexParams,
     #[case] index_type: IndexType,
 ) {
-    use crate::index::vector::ivf::{VectorQueryContract, vector_segment_contract};
-
     let mut dataset = write_small_vector_dataset("memory://").await;
     let segment = dataset
         .create_index_builder(&["vector"], IndexType::Vector, &params)

@@ -111,25 +111,19 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
     }
 }
 
-/// Sized cache key for `IvfIndexState`.
-///
-/// Used for v0.3+ indices that support serialization. This key has a codec,
-/// so custom cache backends can serialize the state to disk/Redis/etc.
-/// Legacy indices use `LegacyVectorIndexCacheKey` instead (in-memory only).
-///
-/// Note: legacy entries hold live readers bound to the object store that
-/// opened them, so they are only valid for credential setups that refresh
-/// internally (e.g. a credentials provider). Deployments that pass fresh
-/// static credentials per dataset open should use v0.3+ index formats.
+/// Portable state is tied to the physical files, not their current row remapping.
+/// Dataset scoping is supplied by `DSIndexCache`; store and path distinguish
+/// external index locations and fresh bindings to a different physical store.
 #[derive(Debug, Clone)]
 pub(crate) struct IvfIndexStateCacheKey<'a> {
     uuid: &'a Uuid,
-    fri_uuid: Option<&'a Uuid>,
+    store: &'a str,
+    path: &'a str,
 }
 
 impl<'a> IvfIndexStateCacheKey<'a> {
-    fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
-        Self { uuid, fri_uuid }
+    pub(crate) fn new(uuid: &'a Uuid, store: &'a str, path: &'a str) -> Self {
+        Self { uuid, store, path }
     }
 }
 
@@ -141,19 +135,24 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
     }
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(fri_uuid) = self.fri_uuid {
-            format!("{}-{}", self.uuid, fri_uuid).into()
-        } else {
-            self.uuid.to_string().into()
-        }
+        format!(
+            "{}:{}:{}:{}",
+            self.uuid,
+            self.store.len(),
+            self.store,
+            self.path
+        )
+        .into()
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.ivf-state-key", 1)
+        CacheKeySchema::new("lance.index.ivf-state-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        write_index_identity(builder, self.uuid, self.fri_uuid);
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+        builder.write_str(self.store);
+        builder.write_str(self.path);
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
@@ -1084,16 +1083,9 @@ impl Dataset {
         // key is a plugin detail), so there is no cheap scalar check here.
         let frag_reuse_uuid = v0_frag_reuse_cache_id(self).await;
 
-        // Check sized cache for IvfIndexState (v2+ indices).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if self.index_cache.get_with_key(&state_key).await.is_some() {
-            // Reconstruct via open_vector_index which will hit the same sized key.
-            let index = self
-                .open_vector_index_with_purpose(column, uuid, metrics, purpose)
-                .await?;
-            return Ok(index.as_index());
-        }
-
+        // Portable state is looked up after resolving the segment's physical
+        // location and current remapping below. A UUID-only probe cannot check
+        // either, and must not bypass the current segment's visibility rules.
         // Fallback: in-memory cache for legacy indices.
         let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(cached) = self.index_cache.get_with_key(&vector_cache_key).await {
@@ -1136,7 +1128,7 @@ impl Dataset {
 
         if is_vector_index {
             let index = self
-                .open_vector_index_with_purpose(column, uuid, metrics, purpose)
+                .open_vector_index_from_metadata_with_purpose(column, &index_meta, metrics, purpose)
                 .await?;
             Ok(index.as_index())
         } else {
@@ -1206,6 +1198,10 @@ impl Dataset {
         let uuid = &index_meta.uuid;
         let object_store = self.object_store_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;
+        let index_file = index_dir
+            .clone()
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME);
         // Hold the shared allocation before cache accesses can evict it.
         // The handle is dropped if this index does not use resident columns.
         // Physical file keys also let shallow clones share immutable columns.
@@ -1230,17 +1226,16 @@ impl Dataset {
         let resolved =
             frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
                 .await?;
-        // The index state (paths, model, quantizer metadata) and a legacy
-        // whole-index entry embed no translated rows: they live in the plain
-        // per-index namespace and stay warm across appends and unrelated
-        // rewrites. Partitions decoded through a translating remapper live in
-        // the translated namespace of `query_cache`.
+        // Portable file state is independent of this mapping. Legacy live
+        // indices and decoded partitions still use the resolved translation
+        // identity, including the current v0 history or tagged fingerprint.
         let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
         let remapping = resolved.map(|(_, remapping)| remapping);
 
         // Check sized cache first (v2+ indices with serializable state).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let state_key =
+            IvfIndexStateCacheKey::new(uuid, &object_store.store_prefix, index_file.as_ref());
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
@@ -1273,10 +1268,6 @@ impl Dataset {
         } else {
             self.open_frag_reuse_index(metrics).await?
         };
-        let index_file = index_dir
-            .clone()
-            .join(uuid.to_string())
-            .join(INDEX_FILE_NAME);
         let file_sizes = index_meta.file_size_map();
         let reader: Arc<dyn Reader> = vector::open_index_file(
             object_store.as_ref(),

@@ -69,10 +69,18 @@ impl ExternalBaseResolver {
         let uri_path = ObjectStore::extract_path_from_uri(self.store_registry.clone(), uri)?;
 
         let mut best_match: Option<(usize, ResolvedExternalBase)> = None;
+        let provider = self
+            .store_registry
+            .get_provider(url.scheme())
+            .ok_or_else(|| Error::invalid_input(format!("Unknown scheme: {}", url.scheme())))?;
         for candidate in &self.candidates {
-            let uri_store_prefix = self
-                .store_registry
-                .calculate_object_store_prefix(uri, candidate.store_params.storage_options())?;
+            let Some(uri_store_prefix) = provider.calculate_object_store_prefix_for_match(
+                &url,
+                candidate.store_params.storage_options(),
+            )?
+            else {
+                continue;
+            };
             if candidate.store_prefix != uri_store_prefix {
                 continue;
             }

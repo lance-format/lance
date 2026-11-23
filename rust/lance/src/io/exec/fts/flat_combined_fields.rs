@@ -32,6 +32,7 @@ use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsSearchParams};
 use lance_index::scalar::inverted::{
     CombinedFieldsBM25Scorer, DocumentGranularity, FTS_SCHEMA, flat_combined_fields_search_stream,
+    flat_combined_fields_search_with_scorer_stream,
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use tracing::instrument;
@@ -118,6 +119,10 @@ pub struct FlatCombinedFieldsExec {
     /// Picks the emitted rows. The planner reads `unindexed_input` unfiltered, so
     /// that the filter does not change the corpus statistics.
     emit_prefilter: PreFilterSource,
+    /// When set, `execute()` skips opening index segments and skips folding
+    /// corpus statistics, streaming batches scored directly against this
+    /// precomputed blended scorer (distributed corpus-global stats).
+    base_scorer: Option<Arc<CombinedFieldsBM25Scorer>>,
     /// Publishes the blended scorer to an indexed sibling; see
     /// [`Self::with_shared_scorer`].
     shared_scorer: Option<Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>>,
@@ -231,10 +236,28 @@ impl FlatCombinedFieldsExec {
             resolved_fields,
             stats_scope,
             emit_prefilter,
+            base_scorer: None,
             shared_scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Override the blended BM25F scorer used by `execute()`.
+    ///
+    /// When set, `execute()` validates the shared tokenizer via cached segment
+    /// parameters without opening index postings or doc sets, and stream-scores
+    /// each input batch against `scorer` without buffering the whole unindexed
+    /// corpus. Mirrors [`super::CombinedFieldsQueryExec::with_base_scorer`].
+    pub fn with_base_scorer(mut self, scorer: Arc<CombinedFieldsBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    /// Scorer override, or `None` to compute corpus statistics from the scan
+    /// and committed indexes.
+    pub fn base_scorer(&self) -> Option<&Arc<CombinedFieldsBM25Scorer>> {
+        self.base_scorer.as_ref()
     }
 
     /// Publish the blended scorer this scan builds to an indexed sibling.
@@ -357,6 +380,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
             resolved_fields: self.resolved_fields.clone(),
             stats_scope: self.stats_scope.clone(),
             emit_prefilter,
+            base_scorer: self.base_scorer.clone(),
             shared_scorer: self.shared_scorer.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -381,6 +405,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
             FlatStatsScope::WholeCorpus => Vec::new(),
         };
         let emit_prefilter = self.emit_prefilter.clone();
+        let preset_base_scorer = self.base_scorer.clone();
         let scanned_fragments = self.scanned_fragments.clone();
         let prefilter_context = context.clone();
         let stats_mask_ds = self.dataset.clone();
@@ -406,6 +431,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
         let stream = stream::once(async move {
             let shared_scorer_producer = shared_scorer_producer;
             let result = async {
+                let empty_selection = roaring::RoaringBitmap::new();
                 let CombinedFieldsScan {
                     columns,
                     tokens,
@@ -414,6 +440,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                 } = open_combined_fields_scan(
                     &ds,
                     &query,
+                    preset_base_scorer.as_ref().map(|_| &empty_selection),
                     CombinedFieldsIndexRequirement::AtLeastOneColumn,
                     &stale_rows_per_column,
                     &tokenized_query,
@@ -426,6 +453,40 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                     .column_names()
                     .map(|column| input_schema.index_of(column))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
+
+                let emit_mask = {
+                    let pre_filter = build_prefilter_restricted_to_fragments(
+                        prefilter_context,
+                        partition,
+                        &emit_prefilter,
+                        stats_mask_ds.clone(),
+                        scanned_fragments.clone(),
+                        // The external row-address mask is applied by the
+                        // planner's `RowAddrMaskFilterExec` wrap around this
+                        // node, so it stays out of the corpus statistics.
+                        PreFilterMasks::default(),
+                        &metrics_set,
+                    )?;
+                    pre_filter.wait_for_ready().await?;
+                    pre_filter.mask()
+                };
+
+                if let Some(scorer) = preset_base_scorer {
+                    let weights: Vec<f32> = columns.iter().map(|column| column.weight).collect();
+                    let scored_stream = flat_combined_fields_search_with_scorer_stream(
+                        input,
+                        weights,
+                        doc_col_indices,
+                        Some(emit_mask),
+                        &tokens,
+                        tokenizer,
+                        query.operator(),
+                        scorer.clone(),
+                        target_batch_size,
+                        Some(elapsed_compute),
+                    );
+                    return Ok::<_, DataFusionError>((scored_stream, scorer));
+                }
 
                 // One mask per target column over the rows it may fold. Built through
                 // `create_restricted_deletion_mask` so the fragment restriction lands in
@@ -460,25 +521,8 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                         stats_masks
                     }
                     FlatStatsScope::WholeCorpus => {
-                        vec![fragment_mask(scanned_fragments.clone()).await?; columns.len()]
+                        vec![fragment_mask(scanned_fragments).await?; columns.len()]
                     }
-                };
-
-                let emit_mask = {
-                    let pre_filter = build_prefilter_restricted_to_fragments(
-                        prefilter_context,
-                        partition,
-                        &emit_prefilter,
-                        stats_mask_ds.clone(),
-                        scanned_fragments,
-                        // The external row-address mask is applied by the
-                        // planner's `RowAddrMaskFilterExec` wrap around this
-                        // node, so it stays out of the corpus statistics.
-                        PreFilterMasks::default(),
-                        &metrics_set,
-                    )?;
-                    pre_filter.wait_for_ready().await?;
-                    pre_filter.mask()
                 };
 
                 flat_combined_fields_search_stream(

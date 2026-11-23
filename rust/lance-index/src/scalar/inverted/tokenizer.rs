@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{env, path::PathBuf};
@@ -233,6 +234,15 @@ pub struct InvertedIndexParams {
         deserialize_with = "deserialize_format_version"
     )]
     pub(crate) format_version: Option<InvertedListFormatVersion>,
+}
+
+impl DeepSizeOf for InvertedIndexParams {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // All remaining fields are inline scalars or enums.
+        self.lance_tokenizer.deep_size_of_children(context)
+            + self.base_tokenizer.deep_size_of_children(context)
+            + self.custom_stop_words.deep_size_of_children(context)
+    }
 }
 
 // Unknown fields must remain ignored because these params are persisted across Lance versions.
@@ -741,7 +751,13 @@ impl InvertedIndexParams {
     /// (`with_position`, `block_size`, worker/memory/format settings) are ignored:
     /// two columns can differ there yet still be safe to combine in a
     /// `combined_fields` (BM25F) query. Used by cross-field FTS validation.
-    pub(crate) fn same_tokenization(&self, other: &Self) -> bool {
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    /// let params = InvertedIndexParams::default();
+    /// assert!(params.same_tokenization(&params.clone().with_position(false)));
+    /// ```
+    pub fn same_tokenization(&self, other: &Self) -> bool {
         // Destructure exhaustively so that adding a new field forces an explicit
         // decision here about whether it affects tokenization.
         let Self {

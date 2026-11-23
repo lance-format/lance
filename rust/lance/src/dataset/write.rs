@@ -693,9 +693,9 @@ pub struct WriteParams {
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 
     /// New base paths to register in the manifest during dataset creation.
-    /// Each BasePath must have a properly assigned ID (non-zero).
+    /// An id of 0 requests an unused id; explicit non-zero ids must not
+    /// collide with existing bases or each other.
     /// Only used in CREATE/OVERWRITE modes for manifest registration.
-    /// IDs should be assigned by the caller before passing to WriteParams.
     pub initial_bases: Option<Vec<BasePath>>,
 
     /// Target base IDs for writing data files.
@@ -823,7 +823,8 @@ impl WriteParams {
     /// Set the initial_bases for this WriteParams.
     ///
     /// This specifies new base paths to register in the manifest during dataset creation.
-    /// Each BasePath must have a properly assigned ID (non-zero) before calling this method.
+    /// An id of 0 requests an unused id; explicit non-zero ids must not collide
+    /// with existing bases or each other.
     /// Only used in CREATE/OVERWRITE modes for manifest registration.
     pub fn with_initial_bases(self, bases: Vec<BasePath>) -> Self {
         Self {
@@ -1396,6 +1397,86 @@ pub(crate) async fn cleanup_data_fragments(
     }
 }
 
+/// Assign IDs to initial bases whose ID is zero.
+///
+/// Zero is both the automatic-assignment marker for `initial_bases` and the
+/// ID that selects primary storage in `target_bases`, so a registered base
+/// must never take it. Explicit IDs are reserved before any automatic ID is
+/// chosen, which keeps the result independent of the order the caller lists
+/// the bases in. Existing manifest bindings are reserved for the same reason.
+///
+/// Automatic IDs start after the highest existing ID, or at 1 when there are
+/// no existing bases, so previously valid requests keep the IDs they received.
+/// That range skips explicit IDs; once it is exhausted, allocation falls back
+/// to the lowest free ID.
+fn assign_initial_base_ids(
+    initial_bases: &mut [BasePath],
+    existing_base_paths: Option<&HashMap<u32, BasePath>>,
+) -> Result<()> {
+    let mut used_ids: BTreeSet<u32> = existing_base_paths
+        .map(|bases| bases.keys().copied().collect())
+        .unwrap_or_default();
+    used_ids.insert(PRIMARY_BASE_ID);
+
+    let mut explicit_ids = BTreeSet::new();
+    for base_path in initial_bases.iter() {
+        if base_path.id == PRIMARY_BASE_ID {
+            continue;
+        }
+        if let Some(existing) = existing_base_paths.and_then(|bases| bases.get(&base_path.id)) {
+            return Err(Error::invalid_input(format!(
+                "Cannot register base ID {} for '{}': it is already bound to '{}'",
+                base_path.id, base_path.path, existing.path
+            )));
+        }
+        if !explicit_ids.insert(base_path.id) {
+            return Err(Error::invalid_input(format!(
+                "Duplicate explicit base ID {} in initial_bases. Base IDs must be unique.",
+                base_path.id
+            )));
+        }
+    }
+
+    used_ids.extend(explicit_ids);
+    let mut next_above_max = existing_base_paths
+        .and_then(|bases| bases.keys().max().copied())
+        .map_or(Some(1), |max_id| max_id.checked_add(1));
+    for base_path in initial_bases.iter_mut() {
+        if base_path.id != PRIMARY_BASE_ID {
+            continue;
+        }
+        let id = match next_above_max.and_then(|start| first_unused_at_or_above(start, &used_ids)) {
+            Some(id) => {
+                next_above_max = id.checked_add(1);
+                id
+            }
+            None => {
+                // No ID above the highest existing one remains, so the free
+                // IDs can only be below that range.
+                next_above_max = None;
+                BasePath::unused_id(used_ids.iter().copied())?
+            }
+        };
+        base_path.id = id;
+        used_ids.insert(id);
+    }
+    Ok(())
+}
+
+/// Find the first ID at or above `start` that is not in `used_ids`.
+///
+/// Returns `None` when every ID from `start` through `u32::MAX` is used.
+fn first_unused_at_or_above(start: u32, used_ids: &BTreeSet<u32>) -> Option<u32> {
+    let mut candidate = start;
+    for &used_id in used_ids.range(start..) {
+        if used_id != candidate {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
+    Some(candidate)
+}
+
 pub async fn validate_and_resolve_target_bases(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
@@ -1423,13 +1504,8 @@ pub async fn validate_and_resolve_target_bases(
     // Step 2: Assign IDs to initial_bases and add them to all_bases
     let mut all_bases: HashMap<u32, BasePath> = existing_base_paths.cloned().unwrap_or_default();
     if let Some(initial_bases) = &mut params.initial_bases {
-        let mut next_id = all_bases.keys().max().map(|&id| id + 1).unwrap_or(1);
-
-        for base_path in initial_bases.iter_mut() {
-            if base_path.id == 0 {
-                base_path.id = next_id;
-                next_id += 1;
-            }
+        assign_initial_base_ids(initial_bases, existing_base_paths)?;
+        for base_path in initial_bases.iter() {
             all_bases.insert(base_path.id, base_path.clone());
         }
     }
@@ -1536,17 +1612,11 @@ pub(crate) async fn validate_and_resolve_target_bases_with_primary(
             .map(|bases| bases.keys().copied().collect())
             .unwrap_or_default();
         // CREATE mode registers initial_bases in the same write; assign their
-        // ids here (the delegate keeps non-zero ids as-is) so they join the
-        // rotation.
+        // ids here (reserving explicit ids before automatic ones) so they join
+        // the rotation.
         if let Some(initial_bases) = &mut params.initial_bases {
-            let mut next_id = ids.iter().max().map(|id| id + 1).unwrap_or(1);
-            for base_path in initial_bases.iter_mut() {
-                if base_path.id == 0 {
-                    base_path.id = next_id;
-                    next_id += 1;
-                }
-                ids.push(base_path.id);
-            }
+            assign_initial_base_ids(initial_bases, existing_base_paths)?;
+            ids.extend(initial_bases.iter().map(|base_path| base_path.id));
         }
         ids.sort_unstable();
         ids.dedup();
@@ -4063,6 +4133,185 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::auto_before_explicit("auto_before_explicit", &[0, 1])]
+    #[case::explicit_before_auto("explicit_before_auto", &[1, 0])]
+    #[tokio::test]
+    async fn test_initial_base_ids_reserve_explicit_ids(
+        #[case] case_name: &str,
+        #[case] initial_ids: &[u32],
+    ) {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = format!("shared-memory://initial_base_ids_{case_name}");
+        let primary_uri = format!("{test_uri}/primary");
+        let auto_uri = format!("{test_uri}/auto");
+        let explicit_uri = format!("{test_uri}/explicit");
+
+        let initial_bases = initial_ids
+            .iter()
+            .map(|id| {
+                if *id == 0 {
+                    BasePath::new(0, auto_uri.clone(), Some("auto".to_string()), true)
+                } else {
+                    BasePath::new(
+                        *id,
+                        explicit_uri.clone(),
+                        Some("explicit".to_string()),
+                        true,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen.batch(2),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 1,
+                initial_bases: Some(initial_bases),
+                target_base_names_or_paths: Some(vec!["auto".to_string(), "explicit".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The automatic base must not take the explicit ID or primary ID 0,
+        // whichever order the caller listed them in.
+        let base_paths = &dataset.manifest.base_paths;
+        assert_eq!(base_paths.len(), 2, "both initial bases must survive");
+        assert!(!base_paths.contains_key(&PRIMARY_BASE_ID));
+        assert_eq!(base_paths[&1].path, explicit_uri);
+        assert_eq!(base_paths[&1].name.as_deref(), Some("explicit"));
+        assert_eq!(base_paths[&2].path, auto_uri);
+        assert_eq!(base_paths[&2].name.as_deref(), Some("auto"));
+
+        // Target resolution follows the assigned ids, and the round-robin
+        // order follows the requested target order.
+        let file_bases = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| fragment.metadata.files.iter().map(|file| file.base_id))
+            .collect::<Vec<_>>();
+        assert_eq!(file_bases, vec![Some(2), Some(1)]);
+
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_initial_base_ids_reject_duplicate_explicit_ids() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = "shared-memory://duplicate_initial_base_ids";
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let error = Dataset::write(
+            data_gen.batch(1),
+            &format!("{test_uri}/primary"),
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath::new(
+                        1,
+                        format!("{test_uri}/base1"),
+                        Some("base1".to_string()),
+                        true,
+                    ),
+                    BasePath::new(
+                        1,
+                        format!("{test_uri}/base2"),
+                        Some("base2".to_string()),
+                        true,
+                    ),
+                ]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("duplicate explicit base IDs must be rejected");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("Duplicate explicit base ID 1"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initial_base_ids_reject_existing_conflicts_and_reserve_existing_ids() {
+        let existing = HashMap::from([(
+            1,
+            BasePath::new(
+                1,
+                "memory://existing".to_string(),
+                Some("existing".to_string()),
+                true,
+            ),
+        )]);
+        let mut params = WriteParams {
+            mode: WriteMode::Create,
+            initial_bases: Some(vec![BasePath::new(
+                1,
+                "memory://conflict".to_string(),
+                Some("conflict".to_string()),
+                true,
+            )]),
+            ..Default::default()
+        };
+
+        let result = validate_and_resolve_target_bases(&mut params, Some(&existing)).await;
+        let Err(error) = result else {
+            panic!("an explicit ID that already exists must be rejected");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("already bound to 'memory://existing'"),
+            "{error}"
+        );
+
+        // Automatic assignment must skip primary ID 0 and existing IDs.
+        params.initial_bases = Some(vec![BasePath::new(
+            0,
+            "memory://auto".to_string(),
+            Some("auto".to_string()),
+            true,
+        )]);
+        let result = validate_and_resolve_target_bases(&mut params, Some(&existing))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(params.initial_bases.as_ref().unwrap()[0].id, 2);
+
+        // Using the highest u32 id must not overflow automatic allocation, and
+        // it must not consume a lower unused id.
+        let high_existing = HashMap::from([(
+            u32::MAX,
+            BasePath::new(
+                u32::MAX,
+                "memory://high".to_string(),
+                Some("high".to_string()),
+                true,
+            ),
+        )]);
+        params.initial_bases = Some(vec![BasePath::new(
+            0,
+            "memory://auto".to_string(),
+            Some("auto".to_string()),
+            true,
+        )]);
+        let result = validate_and_resolve_target_bases(&mut params, Some(&high_existing))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(params.initial_bases.as_ref().unwrap()[0].id, 1);
+    }
+
     #[tokio::test]
     async fn test_multi_base_write_read_with_base_scoped_storage_options() {
         use crate::dataset::builder::DatasetBuilder;
@@ -5913,17 +6162,19 @@ mod tests {
                     mode: WriteMode::Create,
                     max_rows_per_file: 3,
                     initial_bases: Some(vec![
-                        BasePath {
-                            id: 0,
-                            name: Some("base1".to_string()),
-                            is_dataset_root: true,
-                            path: format!("{}/base1", create_root),
-                        },
+                        // Listed before the explicit ID 1: the automatic base
+                        // must not take that reserved ID.
                         BasePath {
                             id: 0,
                             name: Some("base2".to_string()),
                             is_dataset_root: false,
                             path: format!("{}/base2", create_root),
+                        },
+                        BasePath {
+                            id: 1,
+                            name: Some("base1".to_string()),
+                            is_dataset_root: true,
+                            path: format!("{}/base1", create_root),
                         },
                     ]),
                     ..Default::default()
@@ -5934,6 +6185,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dataset.manifest.base_paths.len(), 2);
+        assert_eq!(
+            dataset.manifest.base_paths[&1].name.as_deref(),
+            Some("base1")
+        );
+        assert_eq!(
+            dataset.manifest.base_paths[&2].name.as_deref(),
+            Some("base2")
+        );
         let file_bases: Vec<_> = dataset
             .get_fragments()
             .iter()
