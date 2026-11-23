@@ -3,6 +3,7 @@
 
 //! Python dataset delta bindings.
 
+use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
@@ -51,6 +52,20 @@ impl DatasetDelta {
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
         reader.into_pyarrow(py)
     }
+
+    /// Get inserted and updated rows between begin_version (exclusive) and end_version (inclusive).
+    ///
+    /// Requires stable row ids on the dataset.
+    fn get_upserted_rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_upserted_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        reader.into_pyarrow(py)
+    }
+
     /// Get the row ids deleted between begin_version (exclusive) and end_version (inclusive) as a stream reader.
     ///
     /// Requires stable row ids on the dataset.
@@ -102,6 +117,20 @@ impl DatasetDeltaBuilder {
     fn with_end_version(&self, end_version: u64) -> Self {
         Self {
             builder: self.builder.clone().with_end_version(end_version),
+        }
+    }
+
+    #[pyo3(signature = (timestamp))]
+    fn with_begin_date(&self, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            builder: self.builder.clone().with_begin_date(timestamp),
+        }
+    }
+
+    #[pyo3(signature = (timestamp))]
+    fn with_end_date(&self, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            builder: self.builder.clone().with_end_date(timestamp),
         }
     }
 

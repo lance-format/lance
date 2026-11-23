@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
@@ -46,6 +47,15 @@ class DatasetDelta:
         """
         return self._delta.get_updated_rows()
 
+    def get_upserted_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for inserted and updated rows.
+
+        Requires stable row ids. The batches include ``_rowid``,
+        ``_row_created_at_version``, and ``_row_last_updated_at_version``.
+        """
+        return self._delta.get_upserted_rows()
+
     def get_deleted_row_ids(self) -> pa.RecordBatchReader:
         """
         Return a streaming RecordBatchReader of the row ids deleted in the range.
@@ -76,5 +86,21 @@ class _DatasetDeltaBuilder:
         self._builder = self._builder.with_end_version(version)
         return self
 
+    def with_begin_date(self, timestamp: datetime) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_begin_date(_as_utc(timestamp))
+        return self
+
+    def with_end_date(self, timestamp: datetime) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_end_date(_as_utc(timestamp))
+        return self
+
     def build(self) -> DatasetDelta:
         return DatasetDelta(self._builder.build())
+
+
+def _as_utc(timestamp: datetime) -> datetime:
+    # versions() reports a naive local wall time. Callers who pass that value
+    # unchanged would shift the window, so naive inputs are UTC by contract.
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)

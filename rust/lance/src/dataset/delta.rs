@@ -3274,4 +3274,24 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(keys, (0..10).collect::<Vec<_>>());
     }
+
+    #[tokio::test]
+    async fn test_open_ended_date_delta_reads_other_writers_rows() {
+        MockClock::set_system_time(std::time::Duration::from_secs(10));
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        let original = write_dataset_temp(&dir, 0, 1, 1, "v1", true, false).await;
+        assert_eq!(original.version().version, 1);
+
+        MockClock::set_system_time(std::time::Duration::from_secs(20));
+        let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(15, 0).unwrap();
+        let writer = write_dataset_temp(&dir, 100, 1, 1, "v2", true, true).await;
+        assert_eq!(writer.version().version, 2);
+        assert_eq!(original.version().version, 1);
+
+        let delta = original.delta().with_begin_date(begin_ts).build().unwrap();
+        assert_eq!(delta.list_transactions().await.unwrap().len(), 1);
+        let batch = collect_stream(delta.get_upserted_rows().await.unwrap()).await;
+        let keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(keys, vec![100]);
+    }
 }
