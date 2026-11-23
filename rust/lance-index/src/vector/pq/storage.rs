@@ -1215,6 +1215,11 @@ impl DistCalculator for PQDistCalculator {
             return;
         }
         let code_len = self.num_sub_vectors / 2;
+        if k >= 100 && self.num_bits == 4 {
+            self.distance_all_with_scratch(k, dists, quantized_dists, quantized_table, candidates);
+            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+            return;
+        }
         let table = (self.num_bits == 4
             && matches!(self.distance_type, DistanceType::L2 | DistanceType::Dot)
             // When every row fits in the heap, every row is scored anyway.

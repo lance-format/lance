@@ -1,0 +1,39 @@
+name: T188 BBC collector characterization
+on:
+  push:
+    branches: [codex/t188-bbc-large-k-ann-20261123]
+permissions:
+  contents: read
+jobs:
+  characterize:
+    runs-on: ubuntu-24.04-8x
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98
+        with:
+          components: rustfmt, clippy
+      - name: Configure pinned mbx shim
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fLsS https://github.com/jdx/mr-boxington/releases/download/v1.29.1/mbx-x86_64-unknown-linux-gnu.tar.gz -o /tmp/mbx.tar.gz
+          echo 'ca95f28c77711845c0455839792ca3f3070bdf007979ab75bf7e10c03b07fe3f  /tmp/mbx.tar.gz' | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/mbx.tar.gz -C "$HOME/.local/bin" mbx
+          "$HOME/.local/bin/mbx" setup --yes
+          echo "$HOME/.local/share/mbx/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Verify source and Cargo environment
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(command -v cargo)" = "$HOME/.local/share/mbx/bin/cargo"
+          cargo --version
+          rustc --version
+      - name: Test score, range and boundary contracts
+        run: cargo test --locked --profile ci -p lance-index --lib research_bbc_scores_match_exhaustive_selection
+      - name: Compare dense RQ to scalar with identical inputs
+        if: success() || failure()
+        run: cargo test --locked --profile ci -p lance-index --lib test_raw_query_multi_bit_topk_dense_matches_sparse

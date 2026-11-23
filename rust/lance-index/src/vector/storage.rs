@@ -247,6 +247,79 @@ pub trait DistCalculator {
     }
 }
 
+// Experimental per-partition range. Outliers saturate into end buckets.
+pub(crate) fn research_bucket_scale(n: usize, score: impl Fn(usize) -> f32) -> Option<(f32, f32)> {
+    let stride = (n / 128).max(1);
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for id in (0..n).step_by(stride) {
+        let d = score(id);
+        if d.is_finite() {
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+    }
+    let scale = 64.0 / (hi - lo);
+    (scale.is_finite() && scale > 0.0).then_some((lo, scale))
+}
+
+#[inline]
+pub(crate) fn research_bucket(d: f32, (lo, scale): (f32, f32)) -> usize {
+    (((d - lo) * scale) as usize).min(63)
+}
+
+fn research_bucket_collect(
+    k: usize,
+    lower: OrderedFloat,
+    upper: OrderedFloat,
+    row_id: &impl Fn(u32) -> u64,
+    res: &mut BinaryHeap<OrderedNode<u64>>,
+    dists: &[f32],
+    scale: (f32, f32),
+) {
+    let initial_limit = res
+        .peek()
+        .filter(|_| res.len() == k)
+        .map(|node| node.dist.0);
+    let mut buckets: [Vec<OrderedNode<u64>>; 64] = std::array::from_fn(|_| Vec::new());
+    for node in res.drain() {
+        buckets[research_bucket(node.dist.0, scale)].push(node);
+    }
+    let mut cutoff = 63;
+    for (chunk_id, chunk) in dists.chunks(256).enumerate() {
+        for (offset, &value) in chunk.iter().enumerate() {
+            if initial_limit.is_some_and(|top| value >= top) {
+                continue;
+            }
+            let bucket = research_bucket(value, scale);
+            let dist = OrderedFloat(value);
+            if bucket <= cutoff && dist >= lower && dist < upper {
+                let id = row_id((256 * chunk_id + offset) as u32);
+                buckets[bucket].push(OrderedNode::new(id, dist));
+            }
+        }
+        let mut count = 0;
+        for (i, bucket) in buckets[..=cutoff].iter().enumerate() {
+            count += bucket.len();
+            if count >= k {
+                cutoff = i;
+                break;
+            }
+        }
+    }
+    let mut result = Vec::with_capacity(k);
+    for mut bucket in buckets.into_iter().take(cutoff + 1) {
+        let remaining = k - result.len();
+        if bucket.len() > remaining {
+            bucket.select_nth_unstable_by(remaining, |a, b| {
+                a.dist.cmp(&b.dist).then(a.id.cmp(&b.id))
+            });
+            bucket.truncate(remaining);
+        }
+        result.append(&mut bucket);
+    }
+    *res = BinaryHeap::from(result);
+}
+
 /// Push rows `0..dists.len()` whose distance lies in `[lower_bound,
 /// upper_bound)` into the top-`k` heap `res`.
 pub(crate) fn accumulate_distances_into_heap(
@@ -261,6 +334,14 @@ pub(crate) fn accumulate_distances_into_heap(
     let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
     let mut max_dist = res.peek().map(|node| node.dist);
 
+    if k >= 100
+        && dists.len() >= 128
+        && dists.len() > k.saturating_sub(res.len())
+        && let Some(scale) = research_bucket_scale(dists.len(), |id| dists[id])
+    {
+        research_bucket_collect(k, lower_bound, upper_bound, &row_id, res, dists, scale);
+        return;
+    }
     for (id, dist) in dists.iter().copied().enumerate() {
         // Nearly every row of a full heap loses to its worst entry; one plain
         // float compare settles those before the total-order compares below.
@@ -3198,6 +3279,76 @@ mod tests {
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
     use lance_core::deepsize::DeepSizeOf;
     use std::sync::Arc;
+
+    #[test]
+    fn research_bbc_scores_match_exhaustive_selection() {
+        use super::{BinaryHeap, OrderedFloat, accumulate_distances_into_heap};
+
+        let patterns = [
+            vec![],
+            vec![2.0; 87],
+            vec![2.0; 513],
+            (0..513).map(|i| (i % 17) as f32).collect(),
+            (0..513)
+                .map(|i| {
+                    if i % 64 == 0 {
+                        f32::NAN
+                    } else {
+                        (512 - i) as f32
+                    }
+                })
+                .collect(),
+            (0..513)
+                .map(|i| {
+                    [
+                        f32::NEG_INFINITY,
+                        f32::MIN,
+                        -1.0,
+                        0.0,
+                        1.0,
+                        f32::MAX,
+                        f32::INFINITY,
+                    ][i % 7]
+                })
+                .collect(),
+        ];
+        for dists in &patterns {
+            for (lo, hi) in [(None, None), (Some(1.0), Some(8.0)), (Some(4.0), Some(4.0))] {
+                let mut heap = BinaryHeap::new();
+                let k = 100;
+                for (i, chunk) in dists.chunks(256).enumerate() {
+                    accumulate_distances_into_heap(
+                        k,
+                        lo,
+                        hi,
+                        |row| (i * 256) as u64 + u64::from(row),
+                        &mut heap,
+                        chunk,
+                    );
+                }
+                let mut expected: Vec<_> = dists
+                    .iter()
+                    .copied()
+                    .map(OrderedFloat)
+                    .filter(|d| {
+                        *d >= OrderedFloat(lo.unwrap_or(f32::MIN))
+                            && *d < OrderedFloat(hi.unwrap_or(f32::MAX))
+                    })
+                    .collect();
+                expected.sort_unstable();
+                expected.truncate(k);
+                let actual: Vec<_> = heap
+                    .into_sorted_vec()
+                    .into_iter()
+                    .map(|n| {
+                        assert_eq!(n.dist.0.to_bits(), dists[n.id as usize].to_bits());
+                        n.dist
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_prewarm_materialization_uses_cpu_pool() {

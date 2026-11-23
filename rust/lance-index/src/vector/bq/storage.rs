@@ -1744,6 +1744,47 @@ impl<'a> RabitDistCalculator<'a> {
         let lower_bound_of = |id: usize, binary_ip: f32| {
             self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error
         };
+        if k >= 100
+            && ctx.n > k.saturating_sub(res.len())
+            && let Some(scale) = crate::vector::storage::research_bucket_scale(ctx.n, |i| {
+                lower_bound_of(i, dists[i])
+            })
+        {
+            let mut bins: [Vec<(u32, f32)>; 64] = std::array::from_fn(|_| Vec::new());
+            let mut max_dist = res.peek().map(|node| node.dist);
+            let initial = max_dist.filter(|_| res.len() >= k);
+            let mut counters = RabitPruneCounters {
+                candidates: ctx.n,
+                ..Default::default()
+            };
+            for (i, &ip) in dists.iter().enumerate() {
+                let bound = lower_bound_of(i, ip);
+                if bound >= ctx.query_upper_bound {
+                    counters.pruned_upper_bound += 1;
+                } else if initial.is_some_and(|top| bound >= top.0) {
+                    counters.pruned_heap += 1;
+                } else {
+                    bins[crate::vector::storage::research_bucket(bound, scale)]
+                        .push((i as u32, bound));
+                }
+            }
+            for bin in bins {
+                for (id, bound) in bin {
+                    self.accumulate_raw_query_multi_bit_row(
+                        &ctx,
+                        id as usize,
+                        row_id(id),
+                        dists[id as usize],
+                        bound,
+                        res,
+                        &mut max_dist,
+                        &mut counters,
+                    );
+                }
+            }
+            record_rabit_prune_stats(&counters);
+            return;
+        }
         let terms = ScaledLowerBoundTerms {
             half_sum_q: 0.5 * self.sum_q,
             add_factor_scale: self.add_factor_scale,
@@ -4805,7 +4846,7 @@ mod tests {
             );
 
             let max_dist = exact_dists.iter().fold(0.0f32, |acc, dist| acc.max(*dist));
-            for k in [1usize, 10, n + 7] {
+            for k in [1usize, 10, 100, 500, n + 7] {
                 for bounds in [(None, None), (Some(max_dist * 0.25), Some(max_dist * 0.7))] {
                     let (lower_bound, upper_bound) = bounds;
                     let mut dense_heap = BinaryHeap::new();
