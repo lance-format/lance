@@ -21,7 +21,7 @@ use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt32Array, cast::AsArray};
 use arrow_data::ArrayData;
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use lance::Result;
 use lance::datatypes::Schema;
 use lance_arrow::FixedSizeListArrayExt;
@@ -43,9 +43,13 @@ use pyo3::{
     types::PyIterator,
 };
 
-/// Parse a Python-facing distance metric with the shared Rust parser.
-pub(crate) fn parse_distance_type(distance_type: &str) -> PyResult<DistanceType> {
-    DistanceType::try_from(distance_type).map_err(|e| PyValueError::new_err(e.to_string()))
+/// Parse a user-supplied distance metric with the shared Rust parser.
+///
+/// Callers map the parser error into their own Python exception wording.
+pub(crate) fn parse_distance_type(
+    distance_type: &str,
+) -> std::result::Result<DistanceType, ArrowError> {
+    DistanceType::try_from(distance_type)
 }
 
 /// A wrapper around a JSON string that converts to a Python object
@@ -109,7 +113,8 @@ impl KMeans {
         max_iters: u32,
         centroids_arr: Option<&Bound<PyAny>>,
     ) -> PyResult<Self> {
-        let metric_type = parse_distance_type(metric_type)?;
+        let metric_type = parse_distance_type(metric_type)
+            .map_err(|e| PyValueError::new_err(format!("Invalid metric_type: {}", e)))?;
         let trained_kmeans = if let Some(arr) = centroids_arr {
             let data = ArrayData::from_pyarrow_bound(arr)?;
             if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
@@ -261,7 +266,8 @@ impl Hnsw {
         let vectors = concat(&array_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
         std::mem::drop(data);
 
-        let dt = parse_distance_type(distance_type)?;
+        let dt =
+            parse_distance_type(distance_type).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         let hnsw = rt()
             .runtime

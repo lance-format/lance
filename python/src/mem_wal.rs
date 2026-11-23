@@ -895,7 +895,20 @@ impl PyLsmVectorSearchPlanner {
         // See the point-lookup planner: a rename moves a name and keeps the id.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
 
-        let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
+        let distance_type = distance_type.as_deref().unwrap_or("l2");
+        // MemWAL callers historically used `inner_product` for dot. Keep that
+        // alias here instead of broadening the shared DistanceType parser.
+        let normalized_distance_type = if distance_type.eq_ignore_ascii_case("inner_product") {
+            "dot"
+        } else {
+            distance_type
+        };
+        let dist_type = parse_distance_type(normalized_distance_type).map_err(|_| {
+            PyValueError::new_err(format!(
+                "Unknown distance_type '{}'. Valid values: 'l2', 'cosine', 'dot', 'hamming'",
+                distance_type
+            ))
+        })?;
 
         let vector_dim = get_vector_dim(&ds, &vector_column)?;
         let filter = filter
