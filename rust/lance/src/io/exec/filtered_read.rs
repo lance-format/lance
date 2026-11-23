@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3302,23 +3303,30 @@ impl RowStreamRead {
                         self.dataset.find_fragment(u64::from(fragment_id))?,
                     ),
                 };
-                let requested = match requested {
-                    RowAddrSelection::Full => None,
-                    RowAddrSelection::Partial(bitmap) => Some(bitmap_to_ranges(bitmap)),
-                };
                 let dataset = self.dataset.clone();
                 let descriptor = descriptor.clone();
                 Some(async move {
                     let fragment =
                         FilteredReadStream::load_fragment(dataset, descriptor, false, false)
                             .await?;
-                    let requested =
-                        requested.unwrap_or_else(|| vec![0..fragment.num_physical_rows]);
-                    let valid = FilteredReadStream::full_frag_range(
-                        fragment.num_physical_rows,
-                        &fragment.deletion_vector,
-                    );
-                    let matched = FilteredReadStream::intersect_ranges(&valid, &requested);
+                    let matched = match requested {
+                        RowAddrSelection::Full => {
+                            let valid = FilteredReadStream::full_frag_range(
+                                fragment.num_physical_rows,
+                                &fragment.deletion_vector,
+                            );
+                            let physical_range = 0..fragment.num_physical_rows;
+                            FilteredReadStream::intersect_ranges(
+                                &valid,
+                                std::slice::from_ref(&physical_range),
+                            )
+                        }
+                        RowAddrSelection::Partial(bitmap) => Self::partial_fragment_ranges(
+                            bitmap,
+                            fragment.num_physical_rows,
+                            fragment.deletion_vector.as_deref(),
+                        ),
+                    };
                     Ok::<_, Error>((position, fragment_id, fragment.fragment, matched))
                 })
             })
@@ -3345,6 +3353,123 @@ impl RowStreamRead {
             },
             fragments,
         ))
+    }
+
+    fn partial_fragment_ranges(
+        requested: &RoaringBitmap,
+        num_physical_rows: u64,
+        deletion_vector: Option<&DeletionVector>,
+    ) -> Vec<Range<u64>> {
+        let mut requested = Cow::Borrowed(requested);
+        if let Ok(end) = u32::try_from(num_physical_rows)
+            && requested.max().is_some_and(|offset| offset >= end)
+        {
+            requested.to_mut().remove_range(end..);
+        }
+
+        // Bitmap subtraction pays off for many nearby offsets. Probing avoids
+        // allocating a bitmap for small requests and walking deletion containers
+        // for scattered requests.
+        let count = requested.len();
+        let has_high_container_occupancy =
+            || count >= 32 * u64::from(requested.statistics().n_containers);
+        let is_dense = count >= 128
+            && requested
+                .min()
+                .zip(requested.max())
+                .is_some_and(|(start, end)| {
+                    count >= (u64::from(end) - u64::from(start) + 1).div_ceil(4)
+                });
+        match deletion_vector {
+            None | Some(DeletionVector::NoDeletions) => bitmap_to_ranges(&requested),
+            Some(DeletionVector::Bitmap(deleted)) if is_dense => {
+                bitmap_to_ranges(&(requested.as_ref() - deleted))
+            }
+            // A distant offset can span many empty containers. Use the
+            // occupancy of the request containers to amortize copying, since
+            // array containers can also hold long consecutive runs.
+            Some(DeletionVector::Bitmap(deleted))
+                if count >= 128 && has_high_container_occupancy() =>
+            {
+                let mut surviving = requested.into_owned();
+                surviving -= deleted;
+                if surviving.statistics().n_bitset_containers > 0 {
+                    bitmap_to_ranges(&surviving)
+                } else {
+                    Self::requested_ranges_minus_sorted_offsets(&surviving, std::iter::empty())
+                }
+            }
+            Some(DeletionVector::Set(deleted)) if is_dense && deleted.len() as u64 <= count => {
+                let mut surviving = requested.into_owned();
+                for offset in deleted {
+                    surviving.remove(*offset);
+                }
+                bitmap_to_ranges(&surviving)
+            }
+            // Sorting a small set once lets us apply deletions to whole runs.
+            // Well-occupied containers can amortize sorting a larger set.
+            Some(deleted @ DeletionVector::Set(offsets))
+                if count >= 128
+                    && (offsets.len() as u64 <= count / 8
+                        || (offsets.len() as u64 <= count && has_high_container_occupancy())) =>
+            {
+                Self::requested_ranges_minus_sorted_offsets(&requested, deleted.to_sorted_iter())
+            }
+            Some(deleted) => {
+                let mut ranges: Vec<Range<u64>> = Vec::new();
+                for offset in requested.iter().filter(|offset| !deleted.contains(*offset)) {
+                    let start = u64::from(offset);
+                    if let Some(last) = ranges.last_mut().filter(|range| range.end == start) {
+                        last.end += 1;
+                    } else {
+                        ranges.push(start..start + 1);
+                    }
+                }
+                ranges
+            }
+        }
+    }
+
+    fn requested_ranges_minus_sorted_offsets(
+        requested: &RoaringBitmap,
+        sorted_deletions: impl Iterator<Item = u32>,
+    ) -> Vec<Range<u64>> {
+        let mut deleted = sorted_deletions.map(u64::from).peekable();
+        let mut offsets = requested.iter();
+        let mut next = offsets.next();
+        let mut ranges = Vec::new();
+        while let Some(first) = next {
+            let mut start = u64::from(first);
+            let mut end = start + 1;
+            next = offsets.next();
+            // Walk short runs with the cheaper scalar iterator. Use the range
+            // iterator once there are enough adjacent offsets to amortize it.
+            while end < start + 8 && next.is_some_and(|offset| u64::from(offset) == end) {
+                end += 1;
+                next = offsets.next();
+            }
+            if next.is_some_and(|offset| u64::from(offset) == end) {
+                end += 1;
+                let mut rest = offsets.clone();
+                if let Some(tail) = rest.next_range()
+                    && u64::from(*tail.start()) == end
+                {
+                    end = u64::from(*tail.end()) + 1;
+                    offsets = rest;
+                }
+                next = offsets.next();
+            }
+            while let Some(deletion) = deleted.next_if(|&offset| offset < end) {
+                if start < deletion {
+                    ranges.push(start..deletion);
+                }
+                start = start.max(deletion + 1);
+            }
+            if start < end {
+                ranges.push(start..end);
+            }
+        }
+        ranges
     }
 
     /// Build a batch's read ranges by resolving stable row ids through the
@@ -6001,6 +6126,162 @@ mod tests {
         assert_eq!(ranges, expected);
     }
 
+    #[rstest]
+    #[case::single_outlier(8192, 1, 0, 1)]
+    #[case::mixed(8160, 1, 0, 32)]
+    #[case::cluster_after_outliers(8160, 1, 64, 0)]
+    #[case::cluster_between_outliers(8160, 1, 64, 64)]
+    #[case::two_clusters(8064, 2, 64, 64)]
+    #[case::four_clusters(8064, 4, 64, 64)]
+    #[case::ten_clusters(8064, 10, 64, 64)]
+    #[case::sixty_four_clusters(8064, 64, 64, 64)]
+    fn test_partial_fragment_ranges_with_distant_offset_and_few_deletions(
+        #[case] clustered_rows: u32,
+        #[case] run_count: u32,
+        #[case] leading: u32,
+        #[case] trailing: u32,
+    ) {
+        const PHYSICAL_ROWS: u32 = 10_000_000;
+        let runs = (0..run_count).map(|index| {
+            let start = (index + 1) * 100_000;
+            let run_len =
+                clustered_rows / run_count + u32::from(index < clustered_rows % run_count);
+            start..start + run_len
+        });
+        let before = (0..leading).map(|index| index * 2);
+        let after = (0..trailing).map(|index| 9_000_000 + index * 2);
+        let mut requested: RoaringBitmap = before
+            .clone()
+            .chain(runs.clone().flatten())
+            .chain(after.clone())
+            .collect();
+        requested.insert(PHYSICAL_ROWS);
+        let first = runs.clone().next().unwrap();
+        let deleted_offset = first.start + (first.end - first.start) / 2;
+        let deleted = DeletionVector::Set(HashSet::from([deleted_offset]));
+
+        let ranges = RowStreamRead::partial_fragment_ranges(
+            &requested,
+            u64::from(PHYSICAL_ROWS),
+            Some(&deleted),
+        );
+
+        let expected = before
+            .map(|offset| offset..offset + 1)
+            .chain([first.start..deleted_offset, deleted_offset + 1..first.end])
+            .chain(runs.skip(1))
+            .chain(after.map(|offset| offset..offset + 1))
+            .map(|range| u64::from(range.start)..u64::from(range.end))
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, expected);
+    }
+
+    #[test]
+    fn test_partial_fragment_ranges_split_short_and_long_runs() {
+        let requested: RoaringBitmap = [1, 2, 5, 7, 8, 10]
+            .into_iter()
+            .chain(100..500)
+            .chain([u32::MAX - 1, u32::MAX])
+            .collect();
+        let deleted = DeletionVector::Set(HashSet::from([0, 2, 4, 7, 10, 100, 499, u32::MAX]));
+
+        let ranges = RowStreamRead::partial_fragment_ranges(
+            &requested,
+            u64::from(u32::MAX) + 1,
+            Some(&deleted),
+        );
+
+        assert_eq!(
+            ranges,
+            vec![
+                1..2,
+                5..6,
+                8..9,
+                101..499,
+                u64::from(u32::MAX - 1)..u64::from(u32::MAX),
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::short_run(8191, false)]
+    #[case::long_run(65_536, false)]
+    #[case::scattered_survivors(8191, true)]
+    fn test_partial_fragment_ranges_with_bitmap_deletions_and_distant_offset(
+        #[case] run_len: u32,
+        #[case] delete_alternating: bool,
+    ) {
+        const DISTANT: u32 = 900_000_001;
+        const PHYSICAL_ROWS: u32 = 1_000_000_000;
+        let requested: RoaringBitmap = (0..run_len).chain([DISTANT, PHYSICAL_ROWS]).collect();
+        let mut bitmap: RoaringBitmap = if delete_alternating {
+            (0..run_len).step_by(2).collect()
+        } else {
+            RoaringBitmap::from_iter([run_len / 2])
+        };
+        bitmap.extend((0..(6000 - bitmap.len()) as u32).map(|index| 100_000 + index * 166_000));
+        assert_eq!(bitmap.len(), 6000);
+        let expected: RoaringBitmap = requested
+            .iter()
+            .filter(|&offset| offset < PHYSICAL_ROWS && !bitmap.contains(offset))
+            .collect();
+
+        let ranges = RowStreamRead::partial_fragment_ranges(
+            &requested,
+            u64::from(PHYSICAL_ROWS),
+            Some(&DeletionVector::Bitmap(bitmap)),
+        );
+
+        assert_eq!(ranges, bitmap_to_ranges(&expected));
+    }
+
+    #[rstest]
+    #[case::outside_request((100_000..102_048).collect())]
+    #[case::alternating_in_request((0..4096).step_by(2).collect())]
+    fn test_partial_fragment_ranges_with_large_deletion_set_and_distant_offset(
+        #[case] offsets: HashSet<u32>,
+    ) {
+        let requested: RoaringBitmap = (0..8191).chain([500_000]).collect();
+        assert_eq!(offsets.len(), 2048);
+        let expected: RoaringBitmap = requested
+            .iter()
+            .filter(|offset| !offsets.contains(offset))
+            .collect();
+        let ranges = RowStreamRead::partial_fragment_ranges(
+            &requested,
+            1_000_000,
+            Some(&DeletionVector::Set(offsets)),
+        );
+
+        assert_eq!(ranges, bitmap_to_ranges(&expected));
+    }
+
+    #[test]
+    fn test_partial_fragment_ranges_with_bitmap_deletions_and_array_runs() {
+        let runs = (0..16u32).map(|index| {
+            let start = index * (1 << 20);
+            start..start + 4096
+        });
+        let requested: RoaringBitmap = runs.flatten().collect();
+        let layout = requested.statistics();
+        assert_eq!(requested.len(), 65_536);
+        assert_eq!(layout.n_containers, 16);
+        assert_eq!(layout.n_array_containers, 16);
+
+        let deleted: RoaringBitmap = (2048..8048).collect();
+        let expected: RoaringBitmap = requested
+            .iter()
+            .filter(|&offset| !deleted.contains(offset))
+            .collect();
+        let ranges = RowStreamRead::partial_fragment_ranges(
+            &requested,
+            1 << 24,
+            Some(&DeletionVector::Bitmap(deleted)),
+        );
+
+        assert_eq!(ranges, bitmap_to_ranges(&expected));
+    }
+
     #[test]
     fn test_trim_ranges_by_offset() {
         // Test case 1: No skip, take all
@@ -7879,6 +8160,134 @@ mod tests {
                     .as_primitive::<Float32Type>()
                     .values(),
                 &[0.9, 0.7]
+            );
+        }
+
+        #[rstest]
+        #[case::sparse(false, true)]
+        #[case::dense(true, true)]
+        #[case::stale_offsets(false, false)]
+        #[tokio::test]
+        async fn take_physical_selection_with_deletions(
+            #[case] is_dense: bool,
+            #[case] has_allowlist: bool,
+        ) {
+            const ROWS_PER_FRAGMENT: u32 = 11_000;
+            let batch = arrow_array::record_batch!((
+                "i",
+                Int32,
+                (0..3 * ROWS_PER_FRAGMENT as i32).collect::<Vec<_>>()
+            ))
+            .unwrap();
+            let schema = batch.schema();
+            let reader = RecordBatchIterator::new([Ok(batch)], schema);
+            let params = WriteParams {
+                max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                ..Default::default()
+            };
+            let mut dataset = Dataset::write(reader, "memory://", Some(params))
+                .await
+                .unwrap();
+            dataset
+                .delete("i = 2 OR (i >= 22000 AND i % 2 = 0)")
+                .await
+                .unwrap();
+            let dataset = Arc::new(dataset);
+            let fragments = dataset.get_fragments();
+            for (fragment, is_bitmap) in [(&fragments[0], false), (&fragments[2], true)] {
+                let deleted = fragment.get_deletion_vector().await.unwrap().unwrap();
+                assert!(matches!(
+                    (deleted.as_ref(), is_bitmap),
+                    (DeletionVector::Set(_), false) | (DeletionVector::Bitmap(_), true)
+                ));
+            }
+
+            let addr = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
+            let addresses = [
+                Some(addr(2, 3)),
+                Some(addr(0, 3)),
+                Some(addr(0, 2)), // deleted from a set
+                None,
+                Some(addr(1, 1)),                 // outside fragment scope
+                Some(addr(0, 8)),                 // outside the allowlist
+                Some(addr(2, ROWS_PER_FRAGMENT)), // stale offset in a live fragment
+                Some(addr(9, 0)),                 // stale fragment
+                Some(addr(0, 3)),                 // duplicate
+            ];
+            let end = if is_dense { ROWS_PER_FRAGMENT } else { 7 };
+            let offsets = (0..end).rev();
+            let set_offsets = 100..if is_dense { 356 } else { 100 };
+            let keys: Vec<_> = addresses
+                .into_iter()
+                .chain(offsets.clone().map(|offset| Some(addr(2, offset))))
+                .chain(set_offsets.clone().map(|offset| Some(addr(0, offset))))
+                .collect();
+            let scores = (0..keys.len() as u32).collect::<Vec<_>>();
+            let input =
+                arrow_array::record_batch!((ROW_ADDR, UInt64, keys), ("score", UInt32, scores))
+                    .unwrap();
+            let projection = dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap();
+            let scope = vec![
+                dataset.fragments()[2].clone(),
+                dataset.fragments()[0].clone(),
+            ];
+            let mut options = FilteredReadOptions::new(projection)
+                .with_batch_size(2 * ROWS_PER_FRAGMENT)
+                .with_fragments(Arc::new(scope));
+            if has_allowlist {
+                let mut allowed = RowAddrTreeMap::from_iter([addr(1, 1)]);
+                allowed.insert_range(addr(0, 2)..addr(0, 6));
+                allowed.insert_range(addr(0, 100)..addr(0, 356));
+                allowed.insert_range(addr(2, 1)..addr(2, ROWS_PER_FRAGMENT));
+                options = options.with_physical_row_addr_prefilter(Arc::new(allowed));
+            }
+            let plan =
+                FilteredReadExec::try_new(dataset, options, Some(rows_input(vec![input]))).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let mut expected_prefix = vec![(22_003, 0), (3, 1)];
+            if !has_allowlist {
+                expected_prefix.push((8, 5));
+            }
+            expected_prefix.push((3, 8));
+            let expected_i = expected_prefix
+                .iter()
+                .map(|&(value, _)| value)
+                .chain(
+                    offsets
+                        .clone()
+                        .filter(|offset| offset % 2 == 1)
+                        .map(|offset| 22_000 + offset as i32),
+                )
+                .chain(set_offsets.clone().map(|offset| offset as i32))
+                .collect::<Vec<_>>();
+            let expected_scores = expected_prefix
+                .iter()
+                .map(|&(_, score)| score)
+                .chain(
+                    offsets
+                        .enumerate()
+                        .filter(|(_, offset)| offset % 2 == 1)
+                        .map(|(index, _)| (addresses.len() + index) as u32),
+                )
+                .chain(
+                    (addresses.len() as u32 + end)
+                        ..(addresses.len() as u32 + end + set_offsets.len() as u32),
+                )
+                .collect::<Vec<_>>();
+            assert_eq!(
+                result["i"]
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values(),
+                &expected_i
+            );
+            assert_eq!(
+                result["score"]
+                    .as_primitive::<arrow_array::types::UInt32Type>()
+                    .values(),
+                &expected_scores
             );
         }
 
