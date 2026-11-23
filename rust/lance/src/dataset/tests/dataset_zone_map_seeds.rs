@@ -3406,12 +3406,11 @@ async fn append_boundary_fragment(
         .unwrap();
 }
 
+/// `(id, val)` pairs, sorted by `id`.
+type BoundaryRows = Vec<(i64, Option<i64>)>;
+
 /// Sorted `(id, val)` pairs a filter returns.
-async fn boundary_query(
-    dataset: &Dataset,
-    filter: &str,
-    use_index: bool,
-) -> Vec<(i64, Option<i64>)> {
+async fn boundary_query(dataset: &Dataset, filter: &str, use_index: bool) -> BoundaryRows {
     use arrow::array::AsArray;
     use arrow::datatypes::Int64Type;
 
@@ -3422,7 +3421,7 @@ async fn boundary_query(
         .project(&["id", "val"])
         .unwrap();
     let batch = scan.try_into_batch().await.unwrap();
-    let mut rows: Vec<(i64, Option<i64>)> = batch["id"]
+    let mut rows: BoundaryRows = batch["id"]
         .as_primitive::<Int64Type>()
         .values()
         .iter()
@@ -3518,30 +3517,35 @@ async fn test_config_seed_boundary_matrix(
     let reused = sorted(&report.reused_fragments);
     let partial = sorted(&report.partial_fragments);
     let scanned = sorted(&report.scanned_fragments);
+    // A partly reused fragment is listed as both partial and scanned.
     assert_eq!(
-        reused.len() + partial.len() + scanned.len(),
+        reused.len() + scanned.len(),
         fragments.len(),
         "{context}: {report:?}"
     );
+    assert!(
+        reused.iter().all(|id| !scanned.contains(id)),
+        "{context}: {report:?}"
+    );
+    assert!(
+        partial.iter().all(|id| scanned.contains(id)),
+        "{context}: {report:?}"
+    );
 
-    // Whether the fully scanned creating fragment counts towards
-    // `scanned_rows` is not pinned here, so each expectation also accepts the
-    // seeded total plus its BOUNDARY_CREATE_ROWS (11) rows.
-    let index_multiple_of_seed = index_rows_per_zone % seed_rows_per_zone == 0;
+    // `scanned_rows` includes the creating fragment's BOUNDARY_CREATE_ROWS (11)
+    // rows.
+    let index_multiple_of_seed = index_rows_per_zone.is_multiple_of(seed_rows_per_zone);
     if index_multiple_of_seed {
         // Every seed record lies inside one index zone: no appended fragment
         // is scanned.
         assert_eq!(reused, appended, "{context}: {report:?}");
         assert!(partial.is_empty(), "{context}: {report:?}");
         assert_eq!(scanned, vec![creating], "{context}: {report:?}");
-        assert!(
-            matches!(report.scanned_rows, 0 | 11),
-            "{context}: {report:?}"
-        );
+        assert_eq!(report.scanned_rows, 11, "{context}: {report:?}");
     } else if seed_rows_per_zone < index_rows_per_zone {
-        // 8-row records over 20-row index zones in a 64-row fragment: the
-        // records [16,24), [40,48) and [56,64) cross an index zone boundary
-        // and are scanned, the other five are reused.
+        // 8-row records over index zones [0,20), [20,40), [40,60), [60,64)
+        // in a 64-row fragment: the records [16,24) and [56,64) cross an
+        // index zone boundary and are scanned, the other six are reused.
         assert_eq!(
             (seed_rows_per_zone, index_rows_per_zone, rows_per_fragment),
             (8, 20, 64),
@@ -3549,20 +3553,20 @@ async fn test_config_seed_boundary_matrix(
         );
         assert!(reused.is_empty(), "{context}: {report:?}");
         assert_eq!(partial, appended, "{context}: {report:?}");
-        assert_eq!(scanned, vec![creating], "{context}: {report:?}");
-        // Five reused and 24 scanned rows per appended fragment, three
-        // appended fragments.
-        assert_eq!(report.reused_records, 15, "{context}: {report:?}");
-        assert!(
-            matches!(report.scanned_rows, 72 | 83),
-            "{context}: {report:?}"
-        );
+        let mut all_fragments = appended.clone();
+        all_fragments.push(creating);
+        all_fragments.sort_unstable();
+        assert_eq!(scanned, all_fragments, "{context}: {report:?}");
+        // Six reused records and 16 scanned rows per appended fragment, plus
+        // the creating fragment's 11 rows.
+        assert_eq!(report.reused_records, 18, "{context}: {report:?}");
+        assert_eq!(report.scanned_rows, 59, "{context}: {report:?}");
     } else {
         // TODO(expectation): every 32-row seed record spans several 8-row
         // index zones; whether such fragments are reported partial or
         // scanned is not established by the existing tests.
         assert!(
-            !scanned.is_empty() || !partial.is_empty(),
+            scanned.contains(&creating),
             "{context}: the creating fragment is never reused: {report:?}"
         );
     }
@@ -3573,9 +3577,8 @@ async fn test_config_seed_boundary_matrix(
     let zone_boundary = first_appended + (index_rows_per_zone as i64).min(rows_per_fragment);
     let fragment_boundary = first_appended + rows_per_fragment;
     let total_rows = BOUNDARY_CREATE_ROWS + BOUNDARY_APPENDED_FRAGMENTS * rows_per_fragment;
-    let generated: Vec<(i64, Option<i64>)> =
-        (0..total_rows).map(|p| (p, boundary_value(p))).collect();
-    let oracle = |keep: &dyn Fn(Option<i64>) -> bool| -> Vec<(i64, Option<i64>)> {
+    let generated: BoundaryRows = (0..total_rows).map(|p| (p, boundary_value(p))).collect();
+    let oracle = |keep: &dyn Fn(Option<i64>) -> bool| -> BoundaryRows {
         generated
             .iter()
             .filter(|(_, v)| keep(*v))
@@ -3584,7 +3587,7 @@ async fn test_config_seed_boundary_matrix(
     };
 
     let zone_value = zone_boundary * 3;
-    let mut cases: Vec<(String, Vec<(i64, Option<i64>)>)> = vec![
+    let mut cases: Vec<(String, BoundaryRows)> = vec![
         (
             format!("val < {zone_value}"),
             oracle(&|v: Option<i64>| v.is_some_and(|v| v < zone_value)),
