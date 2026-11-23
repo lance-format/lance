@@ -320,25 +320,11 @@ impl RawInvertedIndexParams {
                 base_tokenizer
             )));
         }
-        if analyzer == "text"
-            && matches!(
-                (
-                    self.split_identifiers,
-                    self.split_on_numerics,
-                    self.preserve_original,
-                    self.index_operators,
-                ),
-                (Some(true), _, _, _)
-                    | (_, Some(true), _, _)
-                    | (_, _, Some(true), _)
-                    | (_, _, _, Some(true))
-            )
-        {
-            return Err(Error::invalid_input(
-                "code analyzer flags require analyzer='code'".to_string(),
-            ));
-        }
 
+        // Selecting the profile only chooses defaults here. The four
+        // code-only options are applied below and validated together by
+        // `InvertedIndexParams::validate`, after `analyzer` has been resolved
+        // into the persisted `base_tokenizer`.
         let mut params = match analyzer {
             "code" => InvertedIndexParams::code(),
             "text" => InvertedIndexParams::default(),
@@ -1171,14 +1157,20 @@ impl InvertedIndexParams {
         }
     }
 
+    fn has_code_analyzer_options(&self) -> bool {
+        self.split_identifiers
+            || self.split_on_numerics
+            || self.preserve_original
+            || self.index_operators
+    }
+
     fn validate(&self) -> Result<()> {
         validate_block_size(self.block_size)?;
-        if self.base_tokenizer != "code"
-            && (self.split_identifiers
-                || self.split_on_numerics
-                || self.preserve_original
-                || self.index_operators)
-        {
+        // These four options change the code tokenizer's emitted stream, so no
+        // other analyzer can consume them. This validates the normalized
+        // `base_tokenizer` for both JSON and builder callers; the input-only
+        // `analyzer` profile has already been resolved by this point.
+        if self.base_tokenizer != "code" && self.has_code_analyzer_options() {
             return Err(Error::invalid_input(
                 "code analyzer flags require base_tokenizer='code'".to_string(),
             ));
@@ -1488,6 +1480,26 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("requires base_tokenizer='code'"));
+    }
+
+    #[rstest]
+    #[case::split_identifiers("split_identifiers")]
+    #[case::split_on_numerics("split_on_numerics")]
+    #[case::preserve_original("preserve_original")]
+    #[case::index_operators("index_operators")]
+    fn test_code_analyzer_options_require_code_base_tokenizer(#[case] option: &str) {
+        let mut value = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(option.to_string(), true.into());
+
+        let err = serde_json::from_value::<InvertedIndexParams>(value).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("code analyzer flags require base_tokenizer='code'"),
+            "unexpected error for {option}: {err}"
+        );
     }
 
     #[test]
