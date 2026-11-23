@@ -64,7 +64,8 @@ use crate::io::exec::{
 use crate::session::index_caches::QuantizedRefinementOptions;
 use crate::{Error, Result};
 
-use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, ScanOptions, Scanner};
+use super::source::ScanOptions;
+use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
 /// cosine on SQ, PQ, and RQ as L2 over normalized vectors, twice `1 - cos`;

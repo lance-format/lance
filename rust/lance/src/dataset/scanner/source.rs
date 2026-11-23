@@ -223,22 +223,25 @@ impl TakeOperation {
 /// System columns are appended after the projected data columns by
 /// [`LanceScanExec`], so they are not part of the projection schema.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ScanOptions {
+pub(super) struct ScanOptions {
     /// Append the `_rowid` column.
-    pub with_row_id: bool,
+    pub(super) with_row_id: bool,
     /// Append the `_rowaddr` column.
-    pub with_row_address: bool,
+    pub(super) with_row_address: bool,
     /// Append the `_row_last_updated_at_version` column.
-    pub with_row_last_updated_at_version: bool,
+    pub(super) with_row_last_updated_at_version: bool,
     /// Append the `_row_created_at_version` column.
-    pub with_row_created_at_version: bool,
+    pub(super) with_row_created_at_version: bool,
     /// Keep deleted rows with null row identity instead of filtering them out.
-    pub with_make_deletions_null: bool,
+    ///
+    /// Setting this uses the validity of the `_rowid` column as a selection
+    /// vector. Read more in [`crate::io::FileReader`].
+    pub(super) with_make_deletions_null: bool,
     /// Emit batches in fragment order.
     ///
     /// [`Scanner::scan`] resolves this from the scanner's query state; direct
     /// callers of [`Scanner::scan_fragments`] set it explicitly.
-    pub ordered: bool,
+    pub(super) ordered: bool,
 }
 
 impl Scanner {
@@ -1071,12 +1074,8 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
-    ///
-    /// Setting `with_make_deletions_null` in `options` will use the validity of the _rowid
-    /// column as a selection vector. Read more in [crate::io::FileReader].
     pub(crate) fn scan(
         &self,
-        options: ScanOptions,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
@@ -1092,7 +1091,10 @@ impl Scanner {
             self.ordered
         };
         self.scan_fragments(
-            ScanOptions { ordered, ..options },
+            ScanOptions {
+                ordered,
+                ..Default::default()
+            },
             projection,
             fragments,
             range,
