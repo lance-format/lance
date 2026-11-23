@@ -646,6 +646,60 @@ def test_lsm_vector_search_filter_binding(tmp_path):
         )
 
 
+def test_lsm_vector_search_planner_inner_product_alias(tmp_path):
+    ds = lance.write_dataset(
+        _vector_search_table(range(64)),
+        str(tmp_path / "vec"),
+        schema=_vector_search_schema(),
+    )
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        name="vector_idx",
+        num_partitions=2,
+        num_sub_vectors=2,
+        metric="dot",
+    )
+    ds.initialize_mem_wal(maintained_indexes=["vector_idx"])
+
+    query = pa.array([6.0, 6.1, 6.2, 6.3], type=pa.float32())
+    dot_result = (
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="dot")
+        .plan_search(query, k=5, nprobes=2, columns=["id"])
+        .to_table()
+    )
+    alias_result = (
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="INNER_PRODUCT")
+        .plan_search(query, k=5, nprobes=2, columns=["id"])
+        .to_table()
+    )
+    assert dot_result.num_rows > 0
+    assert alias_result.equals(dot_result)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Unknown distance_type 'manhattan'. "
+            "Valid values: 'l2', 'cosine', 'dot', 'hamming'"
+        ),
+    ):
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="manhattan")
+
+    # The alias is scoped to MemWAL; regular nearest keeps the Rust parser's
+    # contract and rejects it.
+    with pytest.raises(
+        ValueError, match="Metric type 'inner_product' is not supported"
+    ):
+        ds.scanner(
+            nearest={
+                "column": "vector",
+                "q": query.to_pylist(),
+                "k": 5,
+                "metric": "INNER_PRODUCT",
+            }
+        )
+
+
 VECTOR_DIM = 32
 ROWS_PER_BATCH = 50
 NUM_WRITE_ROUNDS = 3
