@@ -22,8 +22,7 @@ jobs:
           --retry 5 --retry-all-errors --retry-delay 10 \
           --output typos.tar.gz \
           https://github.com/crate-ci/typos/releases/download/v1.26.0/typos-v1.26.0-x86_64-unknown-linux-musl.tar.gz
-        mkdir -p "$HOME/bin"
-        tar -xzf typos.tar.gz -C "$HOME/bin" ./typos
+        tar -xzf typos.tar.gz ./typos
         rm typos.tar.gz
 
     - name: Check spelling of the entire repository
