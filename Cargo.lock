@@ -3141,9 +3141,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -3230,7 +3230,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -4544,7 +4544,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4656,7 +4656,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4706,7 +4706,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrayref",
  "bitpacking",
@@ -4718,7 +4718,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4762,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4799,7 +4799,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion-exec"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4827,7 +4827,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4847,7 +4847,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4856,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4925,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4965,7 +4965,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5006,7 +5006,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "approx",
  "arc-swap",
@@ -5090,7 +5090,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5113,7 +5113,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5168,7 +5168,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -5189,7 +5189,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "approx",
  "argminmax",
@@ -5211,7 +5211,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5225,7 +5225,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5241,7 +5241,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -5303,11 +5303,11 @@ dependencies = [
 
 [[package]]
 name = "lance-protos"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 
 [[package]]
 name = "lance-select"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5324,7 +5324,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5372,7 +5372,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5394,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5408,7 +5408,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "15.0.0-beta.26"
+version = "15.0.0-beta.28"
 dependencies = [
  "arrow-array",
  "chrono",
@@ -9993,9 +9993,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
