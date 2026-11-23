@@ -62,6 +62,7 @@ impl CpuFeatures {
     pub const AVX512VPOPCNTDQ: Self = Self(1 << 23);
     pub const AVX512VBMI: Self = Self(1 << 24);
     pub const AVX512BF16: Self = Self(1 << 25);
+    pub const DOTPROD: Self = Self(1 << 26);
 
     /// The set with no features, which every host supports.
     pub const fn empty() -> Self {
@@ -237,6 +238,7 @@ const FEATURE_TABLE: &[FeatureInfo] = {
         x86(F::AVX512BF16, "avx512bf16", F::AVX512BW),
         other(F::NEON, "neon", F::empty()),
         other(F::FP16, "fp16", F::NEON),
+        other(F::DOTPROD, "dotprod", F::NEON),
         other(F::LSX, "lsx", F::empty()),
         other(F::LASX, "lasx", F::LSX),
     ]
@@ -287,6 +289,7 @@ const BASELINE: CpuFeatures = {
         (cfg!(target_feature = "avx512bf16"), CpuFeatures::AVX512BF16),
         (cfg!(target_feature = "neon"), CpuFeatures::NEON),
         (cfg!(target_feature = "fp16"), CpuFeatures::FP16),
+        (cfg!(target_feature = "dotprod"), CpuFeatures::DOTPROD),
         (cfg!(target_feature = "lsx"), CpuFeatures::LSX),
         (cfg!(target_feature = "lasx"), CpuFeatures::LASX),
     ];
@@ -366,11 +369,15 @@ fn detect_host_features() -> CpuFeatures {
     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
     let has_fp16 = aarch64::has_neon_f16_support();
 
-    if has_fp16 {
+    let mut features = if has_fp16 {
         CpuFeatures::NEON.union(CpuFeatures::FP16)
     } else {
         CpuFeatures::NEON
+    };
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        features = features.union(CpuFeatures::DOTPROD);
     }
+    features
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -646,6 +653,7 @@ mod tests {
     #[case::avx512vbmi("avx512vbmi", CpuFeatures::AVX512BW.union(CpuFeatures::AVX2))]
     #[case::avx512bf16("avx512bf16", CpuFeatures::AVX512BW.union(CpuFeatures::FMA))]
     #[case::fp16("fp16", CpuFeatures::NEON)]
+    #[case::dotprod("dotprod", CpuFeatures::NEON)]
     #[case::lasx("lasx", CpuFeatures::LSX)]
     fn target_feature_mask_includes_implied_features(
         #[case] name: &str,

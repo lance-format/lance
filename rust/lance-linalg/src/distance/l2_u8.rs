@@ -12,10 +12,11 @@
 //!   1. scalar     — portable reference, also used for tails
 //!   2. avx2       — VPSADBW-style abs diff + VPMADDWD squaring, 32 elements/iter
 //!   3. avx512vnni — same approach with VPDPWSSD accumulation, 64 elements/iter
+//!   4. dotprod    — NEON byte abs diff and dot product, 16 elements/iter
 //!
 //! ## Algorithm
 //!
-//! Each SIMD backend computes |a - b| per element using saturating
+//! The x86 backends compute |a - b| per element using saturating
 //! subtraction: `max(a,b) - min(a,b) = (a ⊖ b) | (b ⊖ a)` where ⊖
 //! is unsigned saturating subtraction. The absolute differences are then
 //! zero-extended to i16 and squared via VPMADDWD (which also pairwise-
@@ -33,7 +34,11 @@ lance_core::dispatch! {
         {
             &[x86::L2_U8_AVX512_VNNI, x86::L2_U8_AVX2, L2_U8_SCALAR]
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[arm::L2_U8_DOTPROD, L2_U8_SCALAR]
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             &[L2_U8_SCALAR]
         }
@@ -168,6 +173,32 @@ mod x86 {
                 i += 1;
             }
             result
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use std::arch::aarch64::*;
+
+    use super::{L2U8Kernel, l2_u8_scalar};
+
+    lance_core::target_kernel! {
+        #[target_features("dotprod")]
+        #[candidate(pub(super) L2_U8_DOTPROD: L2U8Kernel)]
+        pub(super) fn l2_u8_dotprod(a: &[u8], b: &[u8]) -> u32 {
+            let len = a.len().min(b.len());
+            let mut sum = vdupq_n_u32(0);
+            let mut left = a[..len].chunks_exact(16);
+            let mut right = b[..len].chunks_exact(16);
+            for (left, right) in left.by_ref().zip(right.by_ref()) {
+                // SAFETY: Each chunk contains 16 bytes and NEON loads can be unaligned.
+                let diff = vabdq_u8(unsafe { vld1q_u8(left.as_ptr()) }, unsafe {
+                    vld1q_u8(right.as_ptr())
+                });
+                sum = vdotq_u32(sum, diff, diff);
+            }
+            vaddvq_u32(sum).wrapping_add(l2_u8_scalar(left.remainder(), right.remainder()))
         }
     }
 }
