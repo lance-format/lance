@@ -2710,12 +2710,24 @@ async fn test_config_seeds_columns_without_index() {
         );
     }
     for column in UNSEEDED_CONFIG_COLUMNS {
-        assert_eq!(
-            seed_locator_rows_per_zone(&dataset, &fragments[1], column).await,
-            None,
+        assert!(
+            !fragment_has_seed_locator(&dataset, &fragments[1], column).await,
             "appended file, unsupported column {column}"
         );
     }
+}
+
+/// Whether any data file of `fragment` carries a seed locator for `column`.
+/// Nested columns may have no file that stores the parent field itself.
+async fn fragment_has_seed_locator(dataset: &Dataset, fragment: &Fragment, column: &str) -> bool {
+    let key = format!("{SEED_META_KEY_PREFIX}{column}");
+    for file in &fragment.files {
+        let reader = open_data_file(dataset, &file.path).await;
+        if reader.metadata().file_schema.metadata.contains_key(&key) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A snapshot that enables the setting but does not carry the seed flags
@@ -3051,10 +3063,9 @@ fn typed_float(i: i64) -> Option<f64> {
 
 fn typed_column(data_type: &DataType, ids: std::ops::Range<i64>) -> ArrayRef {
     use arrow_array::{
-        BooleanArray, Date32Array, Decimal128Array, DurationMicrosecondArray, FixedSizeBinaryArray,
-        Float32Array, Float64Array, Int8Array, LargeBinaryArray, LargeStringArray,
-        Time32SecondArray, TimestampMillisecondArray, TimestampNanosecondArray, UInt16Array,
-        UInt64Array,
+        BooleanArray, Date32Array, Decimal128Array, DurationMicrosecondArray, Float32Array,
+        Float64Array, Int8Array, LargeBinaryArray, LargeStringArray, Time32SecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, UInt16Array, UInt64Array,
     };
 
     let values = ids.clone().map(typed_value);
@@ -3103,13 +3114,6 @@ fn typed_column(data_type: &DataType, ids: std::ops::Range<i64>) -> ArrayRef {
         DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter(
             values.map(|v| v.map(|v| v.to_be_bytes().to_vec())),
         )),
-        DataType::FixedSizeBinary(4) => Arc::new(
-            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                values.map(|v| v.map(|v| (v as u32).to_be_bytes())),
-                4,
-            )
-            .unwrap(),
-        ),
         DataType::Decimal128(precision, scale) => Arc::new(
             Decimal128Array::from_iter(values.map(|v| v.map(|v| v as i128 * 10_000)))
                 .with_precision_and_scale(*precision, *scale)
@@ -3156,7 +3160,6 @@ const STRING_FILTERS: &[&str] = &["col >= 'v010' AND col < 'v030'", "col = 'v021
 #[case::large_utf8(DataType::LargeUtf8, STRING_FILTERS)]
 #[case::binary(DataType::Binary, &[])]
 #[case::large_binary(DataType::LargeBinary, &[])]
-#[case::fixed_size_binary(DataType::FixedSizeBinary(4), &[])]
 #[case::decimal128(DataType::Decimal128(38, 4), &[])]
 #[tokio::test]
 async fn test_config_seed_round_trip_per_type(

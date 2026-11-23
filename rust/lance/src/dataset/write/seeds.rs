@@ -399,7 +399,9 @@ async fn seed_writers_for(
 /// Whether the dataset config seeds `field`: flat columns of a candidate
 /// scalar type only. The list is a conservative gate, not a guarantee about
 /// collection cost. Blob and extension-typed columns are excluded because
-/// the written values are not the column's logical values.
+/// the written values are not the column's logical values. FixedSizeBinary
+/// is excluded at every width: the statistics accumulator computes no bounds
+/// for it, and a seed without bounds is never reused.
 fn config_seed_supports(field: &Field) -> bool {
     if field.is_blob() || field.is_blob_v2() || field.extension_name().is_some() {
         return false;
@@ -428,7 +430,6 @@ fn config_seed_supports(field: &Field) -> bool {
             | DataType::LargeUtf8
             | DataType::Binary
             | DataType::LargeBinary
-            | DataType::FixedSizeBinary(_)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
     )
@@ -571,7 +572,8 @@ mod tests {
     #[case::duration(DataType::Duration(arrow_schema::TimeUnit::Second), true)]
     #[case::utf8(DataType::Utf8, true)]
     #[case::large_binary(DataType::LargeBinary, true)]
-    #[case::fixed_size_binary(DataType::FixedSizeBinary(16), true)]
+    #[case::fixed_size_binary_narrow(DataType::FixedSizeBinary(4), false)]
+    #[case::fixed_size_binary_wide(DataType::FixedSizeBinary(16), false)]
     #[case::decimal128(DataType::Decimal128(10, 2), true)]
     #[case::utf8_view(DataType::Utf8View, false)]
     #[case::null(DataType::Null, false)]
