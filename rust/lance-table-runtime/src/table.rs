@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_core::{
     Error, Result,
+    cache::LanceCache,
     datatypes::{Projectable, Schema},
 };
 use lance_file::reader::FileReaderOptions;
@@ -71,6 +72,7 @@ pub struct TableState {
     pub base: Path,
     pub manifest_location: ManifestLocation,
     pub(crate) session: Arc<TableSession>,
+    pub(crate) index_cache: LanceCache,
     // Keep the incarnation opened by this handle; the name may later be reused.
     pub branch_identifier: Arc<BranchIdentifier>,
     pub fragment_bitmap: Arc<RoaringBitmap>,
@@ -101,12 +103,14 @@ impl TableState {
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Self {
+        let index_cache = session.index_cache().with_key_prefix(&uri);
         Self {
             object_store,
             base,
             uri,
             manifest_location,
             session,
+            index_cache,
             commit_handler,
             branch_identifier,
             fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
@@ -120,6 +124,7 @@ impl TableState {
 
     /// Replace the session associated with the runtime bindings.
     pub fn set_session(&mut self, session: Arc<TableSession>) {
+        self.index_cache = session.index_cache().with_key_prefix(&self.uri);
         self.session = session;
     }
 
@@ -764,6 +769,17 @@ impl Table {
     #[doc(hidden)]
     pub fn into_parts(self) -> (TableState, Arc<Manifest>, Refs) {
         (self.state, self.manifest, self.refs)
+    }
+
+    /// Update this handle to the newly published snapshot.
+    pub(crate) fn set_manifest(&mut self, manifest: Arc<Manifest>, location: ManifestLocation) {
+        self.state
+            .set_manifest(&mut self.manifest, manifest, location);
+    }
+
+    #[doc(hidden)]
+    pub fn index_cache(&self) -> &LanceCache {
+        &self.state.index_cache
     }
 
     pub(crate) fn view(&self) -> TableView<'_> {
