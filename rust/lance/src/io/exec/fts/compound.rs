@@ -63,9 +63,9 @@ use super::query_tokens::{
     tokenize_cross_column_compound_query, tokenizer_for_match_query,
 };
 use super::segments::{
-    finalize_row_ids_and_scores, fts_row_addr_to_row_id, fts_segments_are_address_domain,
-    open_fts_segments, search_prepared_segments, segments_the_prefilter_may_match,
-    widen_limit_for_tie_rerank,
+    cutoff_tie_unresolved, finalize_row_ids_and_scores, fts_row_addr_to_row_id,
+    fts_segments_are_address_domain, open_fts_segments, search_prepared_segments,
+    segments_the_prefilter_may_match, widen_limit_for_tie_rerank,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -841,12 +841,32 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     &indices,
                     &query,
                     &params,
-                    prefilter,
+                    prefilter.clone(),
                     metrics.clone(),
-                    committed_scorer,
+                    committed_scorer.clone(),
                 )
                 .await
                 .map_err(DataFusionError::from)?;
+                // A tie larger than the widened cap cannot be ordered from what
+                // came back; complete it exactly instead of cutting it at an
+                // arbitrary address.
+                let (row_ids, scores) =
+                    if cutoff_tie_unresolved(&scores, requested_limit, params.limit) {
+                        let mut exact_params = params.clone();
+                        exact_params.limit = None;
+                        compound_search_with_base_scorer(
+                            &indices,
+                            &query,
+                            &exact_params,
+                            prefilter,
+                            metrics.clone(),
+                            committed_scorer,
+                        )
+                        .await
+                        .map_err(DataFusionError::from)?
+                    } else {
+                        (row_ids, scores)
+                    };
                 DataFusionResult::Ok(finalize_row_ids_and_scores(
                     row_ids,
                     scores,
@@ -1178,18 +1198,23 @@ impl ExecutionPlan for CompoundQueryExec {
             let address_domain = fts_segments_are_address_domain(&dataset_for_scope, &segments)?;
             let row_addr_to_row_id =
                 fts_row_addr_to_row_id(&dataset_for_scope, address_domain).await?;
-            // Hold a tie group at the cutoff whole so it survives to be ordered by
-            // row id after translation; see `finalize_row_ids_and_scores`.
+            // Candidates have to be ordered by row id after translation (see
+            // `finalize_row_ids_and_scores`), which needs any tie at the cutoff
+            // held whole. The siblings widen the limit and complete an
+            // over-large tie by re-running the search; this one cannot, because
+            // the branch structure below consumes its prefilter and candidate
+            // set, so it searches exhaustively and lets `finalize` apply the
+            // limit. Teaching the collectors to keep ties at the k-th score in
+            // one pass would remove both this and the siblings' second search.
             let requested_limit = params.limit;
-            let params =
-                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
-                    widened if widened != requested_limit => {
-                        let mut widened_params = params.clone();
-                        widened_params.limit = widened;
-                        widened_params
-                    }
-                    _ => params.clone(),
-                };
+            let params = match (requested_limit, row_addr_to_row_id.is_some()) {
+                (Some(_), true) => {
+                    let mut exact_params = params.clone();
+                    exact_params.limit = None;
+                    exact_params
+                }
+                _ => params.clone(),
+            };
             if let Some(first_index) = indices.first() {
                 let snapshot = tokenize_compound_query(&query, first_index.as_ref())?;
                 tokenized_query.get_or_init(|| snapshot);
@@ -1931,10 +1956,25 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 &search_columns,
                 &query,
                 &params,
-                prefilter,
+                prefilter.clone(),
                 metrics.clone(),
             )
             .await?;
+            let (row_ids, scores) = if cutoff_tie_unresolved(&scores, requested_limit, params.limit)
+            {
+                let mut exact_params = params.clone();
+                exact_params.limit = None;
+                cross_column_compound_search(
+                    &search_columns,
+                    &query,
+                    &exact_params,
+                    prefilter,
+                    metrics.clone(),
+                )
+                .await?
+            } else {
+                (row_ids, scores)
+            };
             let (row_ids, scores) = finalize_row_ids_and_scores(
                 row_ids,
                 scores,

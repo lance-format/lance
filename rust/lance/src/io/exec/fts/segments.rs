@@ -245,6 +245,37 @@ pub(super) fn widen_limit_for_tie_rerank(limit: Option<usize>, translating: bool
     }
 }
 
+/// Whether a bounded search may have cut a tie group that straddles the top-k
+/// cutoff, so its result cannot be re-ranked into the right order.
+///
+/// True only when the search actually filled the widened cap *and* the score
+/// at the requested cutoff still equals the last score retained: then rows
+/// beyond the cap may tie the cutoff too, and which of them belong in the
+/// top-k cannot be decided from what came back. The caller completes the tie
+/// by re-running the search exactly, the same escape hatch the WAND tie
+/// certificate takes when its own completion budget is exhausted --
+/// [`FTS_TIE_RERANK_BUDGET`] alone silently truncates a larger tie, and equal
+/// scores across many short documents are an ordinary FTS case, not a corner
+/// one.
+pub(super) fn cutoff_tie_unresolved(
+    scores: &[f32],
+    requested_limit: Option<usize>,
+    searched_limit: Option<usize>,
+) -> bool {
+    let (Some(requested), Some(searched)) = (requested_limit, searched_limit) else {
+        return false;
+    };
+    if requested == 0 || scores.len() < searched || scores.len() <= requested {
+        // Nothing was cut: the search ran out of matches before its cap, or
+        // everything it found survives the requested limit anyway.
+        return false;
+    }
+    scores
+        .get(requested - 1)
+        .zip(scores.last())
+        .is_some_and(|(cutoff, last)| cutoff == last)
+}
+
 /// Translate a final `(row_ids, scores)` pair out of the index's stored domain
 /// and put it back into the order a caller sees, dropping unresolvable rows
 /// and keeping the two vectors aligned.

@@ -44,8 +44,9 @@ use tracing::instrument;
 use super::corpus::SharedFtsScorer;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
 use super::segments::{
-    combined_columns_the_prefilter_may_match, finalize_row_ids_and_scores, fts_row_addr_to_row_id,
-    fts_segments_are_address_domain, open_fts_segments, widen_limit_for_tie_rerank,
+    combined_columns_the_prefilter_may_match, cutoff_tie_unresolved, finalize_row_ids_and_scores,
+    fts_row_addr_to_row_id, fts_segments_are_address_domain, open_fts_segments,
+    widen_limit_for_tie_rerank,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -717,10 +718,30 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 &search_params,
                 query.operator(),
                 scorer.as_ref(),
-                pre_filter,
+                pre_filter.clone(),
                 metrics.as_ref(),
             )
             .await?;
+            // A tie larger than the widened cap cannot be ordered from what
+            // came back, so complete it exactly rather than truncating it at an
+            // arbitrary address.
+            let (doc_ids, scores) =
+                if cutoff_tie_unresolved(&scores, params.limit, search_params.limit) {
+                    let mut exact_params = params.clone();
+                    exact_params.limit = None;
+                    combined_fields_search(
+                        &columns,
+                        &tokens,
+                        &exact_params,
+                        query.operator(),
+                        scorer.as_ref(),
+                        pre_filter,
+                        metrics.as_ref(),
+                    )
+                    .await?
+                } else {
+                    (doc_ids, scores)
+                };
             let (doc_ids, scores) = finalize_row_ids_and_scores(
                 doc_ids,
                 scores,

@@ -2868,6 +2868,82 @@ async fn test_fts_mixed_domain_within_one_index_is_rejected_at_commit() {
     );
 }
 
+/// The same pagination guarantee for a tie larger than the re-rank budget.
+/// Equal scores across many short documents are an ordinary FTS case, so a
+/// fixed margin is not enough on its own: 131 identical rows exceed it, and
+/// truncating them at an arbitrary address made the one-row pages return
+/// `[1, 2, 2]`. The cutoff tie has to be completed exactly instead.
+#[rstest]
+#[case::within_budget(8)]
+#[case::exceeds_budget(131)]
+#[tokio::test]
+async fn test_fts_combined_fields_tied_pagination_completes_large_ties(#[case] rows: i32) {
+    let dir = TempStrDir::default();
+    let ds = write_fts_dataset(
+        &dir,
+        combined_fields_batch(
+            (0..rows).collect(),
+            vec!["alpha"; rows as usize],
+            vec!["beta"; rows as usize],
+        ),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    // Moves row id 0's address behind every other row's, while its row id
+    // still sorts first.
+    let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
+        .update_where("id = 0")
+        .unwrap()
+        .set("title", "'alpha'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    let mut ds = updated.new_dataset.as_ref().clone();
+    create_inverted_indices(&mut ds, &["title", "body"], &combined_fields_test_params()).await;
+    let ds = append_fts_dataset(
+        &dir,
+        combined_fields_batch(vec![rows], vec!["alpha"], vec!["beta"]),
+        None,
+    )
+    .await;
+
+    let mut pages = Vec::new();
+    for offset in 0..3 {
+        let batch = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(combined_query(
+                "alpha beta",
+                Operator::And,
+            )))
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        pages.extend(
+            batch["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    assert_eq!(
+        pages,
+        vec![0, 1, 2],
+        "one-row pages over a {rows}-row tie must walk every row once, in row-id order"
+    );
+}
+
 /// Top-k selection ranks ties by the identifier the index stores, which is now
 /// a row address, while the plan above sorts by `_rowid`. An update moves a
 /// row's address without moving its row id, so the two orders disagree and
