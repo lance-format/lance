@@ -1628,6 +1628,9 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         Table
         """
+        if type(self) is not LanceScanner:
+            # Subclasses can customize the table or reader used by head.
+            return self.to_table()[:num_rows]
         if num_rows is None:
             return self.to_table()
         stop = operator.index(num_rows)

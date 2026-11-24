@@ -1753,6 +1753,31 @@ def test_scanner_head_preserves_scan(tmp_path, stop):
     assert scanner.to_table() == expected
 
 
+def test_scanner_head_uses_subclass_reader(tmp_path):
+    data = pa.table({"id": [0, 1, 2]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    class SkipFirst(lance.LanceScanner):
+        def to_reader(self):
+            return super().to_reader().read_all().slice(1).to_reader()
+
+    scanner = SkipFirst(ds.scanner()._scanner, ds)
+    assert scanner.head(1) == data.slice(1, 1)
+
+
+def test_scanner_head_uses_subclass_table():
+    data = pa.table({"id": [1, 2]})
+
+    class TableScanner(lance.LanceScanner):
+        def __init__(self):
+            self.table = data
+
+        def to_table(self):
+            return self.table
+
+    assert TableScanner().head(1) == data.slice(0, 1)
+
+
 def test_relative_paths(tmp_path: Path):
     # relative paths get coerced to the full absolute path
     current_dir = os.getcwd()
