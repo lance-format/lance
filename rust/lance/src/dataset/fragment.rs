@@ -73,6 +73,7 @@ use super::write::seeds::SeedCollector;
 
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
+use crate::blob::{BlobWriteSources, logical_to_prepared_blob_schema};
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::writer::{OverlayWriter, WriteOverlayError};
 use crate::dataset::overlay::{
@@ -2990,8 +2991,65 @@ impl FileFragment {
             .manifest
             .data_storage_format
             .lance_file_format();
-        self.write_column_with_version_and_options(data, schema, write_version, file_writer_options)
-            .await
+        let data = data.map(|result| result.map(|batch| (batch, None)));
+        self.write_column_with_version_and_options(
+            data,
+            schema,
+            write_version,
+            file_writer_options,
+            false,
+        )
+        .await
+    }
+
+    /// Stage replacement columns using prepared Blob v2 leaves and trusted
+    /// payload sources associated with each batch.
+    ///
+    /// See [`Self::write_columns`] for the schema, row alignment and commit
+    /// contract. Each batch can supply [`BlobWriteSources`] for payloads
+    /// uploaded into primary dataset storage or resolved from a prior write.
+    /// Only the dataset schema's Managed opt-in determines whether the
+    /// writer can adopt a completed upload. Requires file version 2.2 or newer.
+    ///
+    /// ```
+    /// # use arrow_array::RecordBatch;
+    /// # use lance::{Result, blob::BlobWriteSources, dataset::fragment::FileFragment};
+    /// # use lance_core::datatypes::Schema;
+    /// # use lance_file::writer::FileWriterOptions;
+    /// # async fn example(fragment: &FileFragment, batch: RecordBatch, schema: &Schema,
+    /// #   sources: BlobWriteSources) -> Result<()> {
+    /// let replacement = fragment.write_columns_with_blob_sources(
+    ///     futures::stream::iter([Ok((batch, sources))]), schema, FileWriterOptions::default(),
+    /// ).await?;
+    /// # let _ = replacement;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_columns_with_blob_sources(
+        &self,
+        data: impl Stream<Item = Result<(RecordBatch, BlobWriteSources)>> + Send,
+        schema: &Schema,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<super::transaction::DataReplacementGroup> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        if !versions::writes_blob_v2(write_version) {
+            return Err(Error::not_supported(
+                "Column writes with Blob sources require Lance file version 2.2 or later",
+            ));
+        }
+        let data = data.map(|result| result.map(|(batch, sources)| (batch, Some(sources))));
+        self.write_column_with_version_and_options(
+            data,
+            schema,
+            write_version,
+            file_writer_options,
+            true,
+        )
+        .await
     }
 
     /// Write replacement column data using an exact V2 data file version.
@@ -3020,21 +3078,24 @@ impl FileFragment {
         schema: &Schema,
         write_version: ConcreteFileVersion,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        let data = data.map(|result| result.map(|batch| (batch, None)));
         self.write_column_with_version_and_options(
             data,
             schema,
             write_version,
             FileWriterOptions::default(),
+            false,
         )
         .await
     }
 
     async fn write_column_with_version_and_options(
         &self,
-        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        data: impl Stream<Item = Result<(RecordBatch, Option<BlobWriteSources>)>> + Send,
         schema: &Schema,
         write_version: ConcreteFileVersion,
         file_writer_options: FileWriterOptions,
+        has_blob_sources: bool,
     ) -> Result<super::transaction::DataReplacementGroup> {
         versions::validate_write_version(
             self.dataset
@@ -3045,8 +3106,20 @@ impl FileFragment {
         )?;
         let expected_rows = self.physical_rows().await? as u64;
 
-        let writer_schema = self.resolve_writer_schema(schema)?;
+        let mut writer_schema = self.resolve_writer_schema(schema)?;
+        if has_blob_sources {
+            writer_schema
+                .metadata
+                .clone_from(&self.dataset.schema().metadata);
+        }
         let batch_schema = ArrowSchema::from(&writer_schema);
+        let (batch_schema, expected_schema) = if has_blob_sources {
+            let prepared = logical_to_prepared_blob_schema(&batch_schema)?;
+            let expected_schema = Cow::Owned(LanceSchema::try_from(&prepared)?);
+            (prepared, expected_schema)
+        } else {
+            (batch_schema, Cow::Borrowed(&writer_schema))
+        };
         let projection_schema = ArrowSchema::new(
             batch_schema
                 .fields()
@@ -3087,7 +3160,7 @@ impl FileFragment {
             write_version,
             self.dataset.as_ref(),
             &writer_schema,
-            has_blob_v2,
+            has_blob_v2 && !has_blob_sources,
             file_writer_options,
         )
         .await?;
@@ -3103,7 +3176,7 @@ impl FileFragment {
         let mut data = std::pin::pin!(data);
         let staged: Result<_> = async {
             while let Some(batch_result) = data.next().await {
-                let batch = batch_result?;
+                let (batch, sources) = batch_result?;
                 // Struct encoders consume children positionally, so a batch
                 // ordered differently from the manifest lands under the wrong
                 // field ids. Projection fixes that by name, but it downcasts by
@@ -3116,7 +3189,7 @@ impl FileFragment {
                 LanceSchema::try_from(batch.schema_ref().as_ref())
                     .and_then(|staged| {
                         staged.check_compatible(
-                            &writer_schema,
+                            expected_schema.as_ref(),
                             &SchemaCompareOptions {
                                 compare_nullability: NullabilityComparison::Ignore,
                                 ignore_field_order: true,
@@ -3128,7 +3201,13 @@ impl FileFragment {
                 let batch = batch
                     .project_by_schema(&projection_schema)
                     .map_err(|err| self.schema_mismatch(err))?;
-                writer.write(std::slice::from_ref(&batch)).await?;
+                if let Some(sources) = sources.as_ref() {
+                    writer
+                        .write_with_blob_sources(&batch, &self.dataset.base, sources)
+                        .await?;
+                } else {
+                    writer.write(std::slice::from_ref(&batch)).await?;
+                }
                 seeds.observe(&batch)?;
             }
             seeds.flush(writer.as_mut()).await?;
