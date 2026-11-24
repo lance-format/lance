@@ -4913,7 +4913,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "criterion",
- "datafusion-common",
  "futures",
  "lance-arrow",
  "lance-core",

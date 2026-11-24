@@ -4355,7 +4355,6 @@ dependencies = [
  "async-trait",
  "byteorder",
  "bytes",
- "datafusion-common",
  "futures",
  "lance-arrow",
  "lance-core",
