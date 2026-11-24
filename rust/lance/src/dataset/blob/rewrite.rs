@@ -218,7 +218,8 @@ async fn descriptor_to_logical_blob_array(
             .iter()
             .map(|index| row_addrs[*index])
             .collect::<Vec<_>>();
-        collect_blob_v2_descriptor_files(dataset, blob_field_id, descriptions, &data_row_addrs)
+        let table = dataset.table_view().to_table();
+        collect_blob_v2_descriptor_files(&table, blob_field_id, descriptions, &data_row_addrs)
             .await?
     };
 

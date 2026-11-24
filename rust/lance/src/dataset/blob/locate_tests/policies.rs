@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::super::*;
+use super::*;
 use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::blob::external::{ExternalBaseCandidate, ExternalBaseResolver};
-use crate::dataset::blob::read::{
-    BlobEntry, ReadBlobsExecution, execute_blob_entries_with_execution,
-};
 use crate::dataset::blob::test_util::create_multi_base_blob_v2_fixture;
 use crate::dataset::{DatasetBuilder, ReadParams, WriteParams};
-use crate::session::Session;
+use crate::session::{Session, UnregisteredExternalBlobPolicy};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use async_trait::async_trait;
@@ -21,6 +18,9 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
+use lance_table_runtime::blob::execution::{
+    BlobEntry, ReadBlobsExecution, execute_blob_entries_with_execution,
+};
 use object_store::list::PaginatedListStore;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -487,7 +487,8 @@ async fn test_unregistered_external_blob_policy(#[case] size: u64, #[case] prefe
         .await
         .unwrap();
     let field_id = dataset.schema().field("blob").unwrap().id as u32;
-    let mut locator = BlobLocator::new(&dataset, field_id);
+    let table = dataset.table_view().to_table();
+    let mut locator = BlobLocator::new(&table, field_id);
     for uri in [
         "probe://bucket/secret",
         "file:///etc/passwd",
@@ -560,7 +561,8 @@ async fn test_unregistered_external_blob_allowed_by_default(#[case] is_wrapped: 
         .await
         .unwrap();
     let field_id = dataset.schema().field("blob").unwrap().id as u32;
-    let file = BlobLocator::new(&dataset, field_id)
+    let table = dataset.table_view().to_table();
+    let file = BlobLocator::new(&table, field_id)
         .locate(
             &StoredBlob::External {
                 base_id: 0,
@@ -611,7 +613,8 @@ async fn test_external_preserves_runtime_base_store(#[values(false, true)] is_wr
         .await
         .unwrap();
     let field_id = dataset.schema().field("blob").unwrap().id as u32;
-    let file = BlobLocator::new(&dataset, field_id)
+    let table = dataset.table_view().to_table();
+    let file = BlobLocator::new(&table, field_id)
         .locate(
             &StoredBlob::External {
                 base_id: 2,
@@ -624,7 +627,7 @@ async fn test_external_preserves_runtime_base_store(#[values(false, true)] is_wr
         .await
         .unwrap();
     if !is_wrapped {
-        assert!(Arc::ptr_eq(&file.source.object_store, &store));
+        assert!(Arc::ptr_eq(file.object_store(), &store));
     }
     assert_eq!(file.read().await.unwrap().as_ref(), b"old");
     store.put(&root.join("payload"), b"new").await.unwrap();
@@ -741,7 +744,8 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         position: 0,
         size: 3,
     };
-    let mut locator = BlobLocator::new(&dataset, field_id);
+    let table = dataset.table_view().to_table();
+    let mut locator = BlobLocator::new(&table, field_id);
     let managed_file = locator.locate(&managed, 0).await.unwrap();
     assert_eq!(managed_file.read().await.unwrap().as_ref(), b"old");
     assert!(provider.tracker.incremental_stats().read_iops > 0);
@@ -758,7 +762,10 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
             .unwrap();
     }
     let external_file = locator.locate(&external, 0).await.unwrap();
-    assert!(!Arc::ptr_eq(&managed_file.source, &external_file.source));
+    assert!(!Arc::ptr_eq(
+        managed_file.object_store(),
+        external_file.object_store()
+    ));
     observer.incremental_stats();
     assert_eq!(external_file.read().await.unwrap().as_ref(), b"old");
     assert!(observer.incremental_stats().read_iops > 0);
@@ -769,7 +776,7 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         .put(&payload_path, next_payload.into())
         .await
         .unwrap();
-    let mut next_locator = BlobLocator::new(&dataset, field_id);
+    let mut next_locator = BlobLocator::new(&table, field_id);
     if prefetch {
         next_locator
             .prefetch_external_sizes(&descriptions)
@@ -799,6 +806,8 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
     assert_eq!(provider.params.lock().unwrap().len(), expected_bindings);
     // A scan shares this execution across batches, but creates a new locator per batch.
     let execution = Arc::new(ReadBlobsExecution::new(None));
+    let external_store = external_file.object_store();
+    let managed_store = managed_file.object_store();
     for batch in 0..4 {
         let payload: &[u8] = if batch % 2 == 0 { b"new" } else { b"now" };
         provider
@@ -806,7 +815,7 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
             .put(&payload_path, payload.into())
             .await
             .unwrap();
-        let mut locator = BlobLocator::new(&dataset, field_id);
+        let mut locator = BlobLocator::new(&table, field_id);
         let mut entries: Vec<BlobEntry> = Vec::new();
         for (selection_index, (position, size)) in [(0, 2), (1, 2), (0, 2)].into_iter().enumerate()
         {
@@ -822,9 +831,7 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
                 )
                 .await
                 .unwrap();
-            if let Some(first) = entries.first() {
-                assert!(Arc::ptr_eq(&first.file.source, &file.source));
-            }
+            assert!(Arc::ptr_eq(file.object_store(), external_store));
             entries.push(BlobEntry {
                 selection_index,
                 file,
@@ -845,6 +852,7 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         assert_eq!(stats.requests[0].range, Some(0..3));
 
         let managed_file = locator.locate(&managed, 0).await.unwrap();
+        assert!(Arc::ptr_eq(managed_file.object_store(), managed_store));
         let blobs = execute_blob_entries_with_execution(
             vec![BlobEntry {
                 selection_index: 0,
@@ -858,7 +866,6 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         .unwrap();
         assert_eq!(blobs[0].data.as_ref(), b"old");
         assert_eq!(provider.tracker.incremental_stats().read_iops, 0);
-        assert_eq!(execution.num_schedulers(), 2);
         assert_eq!(provider.params.lock().unwrap().len(), expected_bindings);
     }
     assert!(observer.stats().read_iops > 0);

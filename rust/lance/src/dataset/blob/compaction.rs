@@ -66,7 +66,8 @@ impl SidecarRewrite {
                 "Blob descriptor and source row counts differ",
             ));
         }
-        let mut locator = BlobLocator::new(dataset, field_id);
+        let table = dataset.table_view().to_table();
+        let mut locator = BlobLocator::new(&table, field_id);
         let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
             field.name(),
             field.is_nullable(),
@@ -84,18 +85,18 @@ impl SidecarRewrite {
                     let id = self.register(
                         base_id,
                         Source {
-                            store: file.source.object_store.clone(),
-                            path: file.source.path.clone(),
+                            store: file.object_store().clone(),
+                            path: file.data_path().clone(),
                         },
                     )?;
                     if matches!(blob, StoredBlob::Dedicated { .. }) {
-                        builder.push_dedicated(id, file.size)?;
+                        builder.push_dedicated(id, file.size())?;
                     } else {
                         builder.push_packed(
                             id,
                             BlobRange {
-                                offset: file.position,
-                                size: file.size,
+                                offset: file.position(),
+                                size: file.size(),
                             },
                         )?;
                     }
@@ -124,15 +125,15 @@ impl SidecarRewrite {
                     let id = self.register(
                         base,
                         Source {
-                            store: file.source.object_store.clone(),
-                            path: file.source.path.clone(),
+                            store: file.object_store().clone(),
+                            path: file.data_path().clone(),
                         },
                     )?;
                     builder.push_packed(
                         id,
                         BlobRange {
-                            offset: file.position,
-                            size: file.size,
+                            offset: file.position(),
+                            size: file.size(),
                         },
                     )?;
                 }

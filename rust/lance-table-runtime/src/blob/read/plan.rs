@@ -7,16 +7,16 @@ use std::{
     sync::Arc,
 };
 
-use crate::dataset::blob::file::{BlobFile, BlobSource, BlobSourceKey};
-use crate::dataset::blob::read::BlobReadRange;
+use crate::blob::file::{BlobFile, BlobSource, BlobSourceKey};
+use crate::blob::read::BlobReadRange;
 use lance_core::{Error, Result};
 
 /// One logical blob selected for planned reading.
 #[derive(Debug)]
-pub(in crate::dataset::blob) struct BlobEntry {
-    pub(in crate::dataset::blob) selection_index: usize,
-    pub(in crate::dataset::blob) file: BlobFile,
-    pub(in crate::dataset::blob) requested_range: Option<BlobReadRange>,
+pub struct BlobEntry {
+    pub selection_index: usize,
+    pub file: BlobFile,
+    pub requested_range: Option<BlobReadRange>,
 }
 
 /// One resolved logical selection. Its position in the containing vector is
@@ -335,11 +335,9 @@ pub(super) fn plan_disjoint_blob_reads(
 mod tests {
     use super::*;
 
-    use crate::dataset::blob::file::{BlobFile, BlobSource};
-    use crate::dataset::blob::read::{
-        BlobReadRange, ReadBlobsExecution, execute_blob_read_batches_stream,
-    };
-    use crate::dataset::blob::test_util::{
+    use crate::blob::file::{BlobFile, BlobSource};
+    use crate::blob::read::{BlobReadRange, ReadBlobsExecution, execute_blob_read_batches_stream};
+    use crate::blob::test_util::{
         RecordingRangeObjectStore, recording_range_store,
         recording_range_store_with_url_and_block_size,
     };

@@ -135,6 +135,21 @@ impl TableState {
 }
 
 impl TableView<'_> {
+    #[doc(hidden)]
+    pub fn blob_base_path(&self, base_id: Option<u32>) -> Result<Path> {
+        match base_id {
+            Some(id) => self
+                .manifest
+                .base_paths
+                .get(&id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
+                })?
+                .extract_path(self.state.session.store_registry()),
+            None => Ok(self.state.base.clone()),
+        }
+    }
+
     async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
