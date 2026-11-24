@@ -5020,6 +5020,123 @@ mod tests {
         }
     }
 
+    /// The same stray-legacy-segment gap for FTS, which reaches the rebuild
+    /// decision through the separate Inverted dispatch path rather than the
+    /// `update_criteria.requires_old_data` one the types above use.
+    ///
+    /// `select_segments_to_merge` picks nothing in append mode, so without
+    /// `legacy_domain_mismatch` folding every remaining row-id-domain segment
+    /// into the rebuild, optimize would try to leave the legacy segment beside
+    /// a freshly built address-domain delta -- an index whose two segments
+    /// disagree about what their stored identifiers mean.
+    #[tokio::test]
+    async fn test_optimize_append_rebuilds_stray_legacy_fts_segment_with_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let batch = |start: i32, end: i32| {
+            let ids = Int32Array::from_iter_values(start..end);
+            let bodies =
+                StringArray::from_iter_values((start..end).map(|i| format!("common song{i}")));
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("body", DataType::Utf8, false),
+                ])),
+                vec![Arc::new(ids), Arc::new(bodies)],
+            )
+            .unwrap()
+        };
+
+        let initial = batch(0, 8);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 8,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = InvertedIndexParams::default().num_workers(1);
+        let segment = crate::index::create::CreateIndexBuilder::new(
+            &mut dataset,
+            &["body"],
+            IndexType::Inverted,
+            &params,
+        )
+        .name("body_idx".into())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        assert!(
+            segment.results_are_row_addrs(),
+            "a segment built by the current code is always address-domain"
+        );
+
+        // Relabel below `INVERTED_ROW_ADDR_DOMAIN_VERSION` so the index reads
+        // as a pre-migration one. Its postings are still addresses, which is
+        // fine here: the rebuild this test asserts discards the segment's data
+        // and rescans, so only the label is ever consulted.
+        let legacy_segment = IndexMetadata {
+            index_version: 3,
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("body_idx", "body", vec![legacy_segment])
+            .await
+            .unwrap();
+        let legacy = dataset.load_indices_by_name("body_idx").await.unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(!legacy[0].results_are_row_addrs());
+
+        // A second fragment, left unindexed, then append-mode optimize: the
+        // case that selects zero old segments to merge.
+        let appended = batch(8, 16);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 8,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let committed = dataset.load_indices_by_name("body_idx").await.unwrap();
+        assert_eq!(
+            committed.len(),
+            1,
+            "the legacy segment must be rebuilt with the new data, not left \
+             beside it: {committed:?}"
+        );
+        assert!(
+            committed[0].results_are_row_addrs(),
+            "the rebuilt segment must be address-domain"
+        );
+
+        // Every row must still be findable, from both the original fragment
+        // and the appended one.
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new("common".to_owned()))
+            .unwrap();
+        assert_eq!(scan.count_rows().await.unwrap(), 16);
+        for term in ["song0", "song7", "song8", "song15"] {
+            let mut scan = dataset.scan();
+            scan.full_text_search(FullTextSearchQuery::new(term.to_owned()))
+                .unwrap();
+            assert_eq!(scan.count_rows().await.unwrap(), 1, "missing {term}");
+        }
+    }
+
     /// A trailing merge window must also rebuild legacy segments outside it.
     /// Use a real pre-migration index: committing a mixture of row domains is
     /// rejected before optimization can run.

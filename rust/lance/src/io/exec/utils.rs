@@ -2978,3 +2978,132 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod row_addr_domain_tests {
+    use super::*;
+    use crate::dataset::{UpdateBuilder, WriteParams};
+    use arrow_array::{RecordBatchIterator, record_batch};
+    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_select::RowSetOps;
+
+    /// Four rows over two fragments under stable row ids, so a row id and its
+    /// row address are two different numbers for every row past the first
+    /// fragment.
+    async fn two_fragment_dataset(uri: &str) -> Dataset {
+        let batch = record_batch!(("id", Int32, [0, 1, 2, 3])).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn treemap(rows: impl IntoIterator<Item = u64>) -> RowAddrTreeMap {
+        let mut map = RowAddrTreeMap::new();
+        for row in rows {
+            map.insert(row);
+        }
+        map
+    }
+
+    fn addr(fragment: u32, offset: u32) -> u64 {
+        u64::from(RowAddress::new_from_parts(fragment, offset))
+    }
+
+    /// Row ids 0..4 lie in fragments 0 and 1, so the second fragment's ids and
+    /// addresses disagree. Translating has to move exactly those.
+    #[tokio::test]
+    async fn translates_row_ids_in_every_fragment() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+
+        let translated = translate_treemap_to_row_addr_domain(&dataset, &treemap(0..4))
+            .await
+            .unwrap();
+        let expected = treemap([addr(0, 0), addr(0, 1), addr(1, 0), addr(1, 1)]);
+        assert_eq!(translated, expected);
+
+        // The ids of the second fragment really do differ from their
+        // addresses, or this test would pass without translating anything.
+        assert_ne!(treemap(0..4), expected);
+    }
+
+    /// Both mask shapes carry the same translation: an allow-list and a
+    /// block-list of the same rows must name the same addresses.
+    #[tokio::test]
+    async fn translates_allow_lists_and_block_lists_alike() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+        let rows = treemap([2, 3]);
+        let expected = treemap([addr(1, 0), addr(1, 1)]);
+
+        let allow = row_id_mask_to_row_addr_domain(
+            &dataset,
+            Arc::new(RowAddrMask::from_allowed(rows.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(allow.allow_list(), Some(&expected));
+        assert!(allow.block_list().is_none());
+
+        let block =
+            row_id_mask_to_row_addr_domain(&dataset, Arc::new(RowAddrMask::from_block(rows)))
+                .await
+                .unwrap();
+        assert_eq!(block.block_list(), Some(&expected));
+        assert!(block.allow_list().is_none());
+    }
+
+    /// An update rewrites a row into a new fragment while it keeps its row id.
+    /// The translation has to follow it there -- taking the id for an address
+    /// would name whatever now sits at the old location.
+    #[tokio::test]
+    async fn follows_a_row_moved_by_an_update() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+        let before = translate_treemap_to_row_addr_domain(&dataset, &treemap([0]))
+            .await
+            .unwrap();
+        assert_eq!(before, treemap([addr(0, 0)]));
+
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 0")
+            .unwrap()
+            .set("id", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // Row id 0 survives the update; its address does not.
+        let after = translate_treemap_to_row_addr_domain(&dataset, &treemap([0]))
+            .await
+            .unwrap();
+        assert_ne!(after, before, "the row moved, so its address must change");
+        assert_eq!(after.len(), Some(1));
+    }
+
+    /// A row id that no longer resolves contributes no address rather than
+    /// leaking through untranslated.
+    #[tokio::test]
+    async fn drops_row_ids_that_no_longer_resolve() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+        let translated = translate_treemap_to_row_addr_domain(&dataset, &treemap([0, 9_999]))
+            .await
+            .unwrap();
+        assert_eq!(translated, treemap([addr(0, 0)]));
+    }
+}
