@@ -39,8 +39,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    ClusteringDefinition, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
-    MAGIC, Manifest, ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
+    DataFile, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, ManifestBuildConfig,
+    RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -146,11 +146,11 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
-    commit_detached_transaction, commit_new_dataset, commit_transaction,
-    default_commit_retry_timeout, detect_overlapping_fragments, fix_schema,
+    CommitTransactionOptions, commit_detached_transaction, commit_new_dataset, commit_transaction,
+    detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
-use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
+use crate::utils::temporal::{timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
     BlobFile, BlobRangeRequest, BlobReadRange, BlobV2BatchRewritePlan, ReadBlob, ReadBlobRange,
@@ -2112,14 +2112,34 @@ impl Dataset {
     pub(crate) async fn apply_commit(
         &mut self,
         transaction: Transaction,
-        write_config: &ManifestWriteConfig,
+        build_config: &ManifestBuildConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
-        self.apply_commit_with_expected_latest_version(
+        self.apply_commit_with_options(
             transaction,
-            write_config,
-            commit_config,
-            None,
+            CommitTransactionOptions::new(
+                build_config,
+                commit_config,
+                self.manifest_location.naming_scheme,
+            ),
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_tagged_frag_reuse_trim(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<()> {
+        let build_config = ManifestBuildConfig::default();
+        let commit_config = CommitConfig::default();
+        self.apply_commit_with_options(
+            transaction,
+            CommitTransactionOptions::new(
+                &build_config,
+                &commit_config,
+                self.manifest_location.naming_scheme,
+            )
+            .with_tagged_frag_reuse_trim(),
         )
         .await
     }
@@ -2127,9 +2147,25 @@ impl Dataset {
     async fn apply_commit_with_expected_latest_version(
         &mut self,
         transaction: Transaction,
-        write_config: &ManifestWriteConfig,
+        build_config: &ManifestBuildConfig,
         commit_config: &CommitConfig,
         expected_latest_version: Option<u64>,
+    ) -> Result<()> {
+        let mut options = CommitTransactionOptions::new(
+            build_config,
+            commit_config,
+            self.manifest_location.naming_scheme,
+        );
+        if let Some(version) = expected_latest_version {
+            options = options.with_expected_latest_version(version);
+        }
+        self.apply_commit_with_options(transaction, options).await
+    }
+
+    async fn apply_commit_with_options(
+        &mut self,
+        transaction: Transaction,
+        options: CommitTransactionOptions<'_>,
     ) -> Result<()> {
         // Keep the retry and rebase state machine out of every caller's future.
         let (manifest, manifest_location) = Box::pin(commit_transaction(
@@ -2137,12 +2173,7 @@ impl Dataset {
             self.object_store.as_ref(),
             self.commit_handler.as_ref(),
             &transaction,
-            write_config,
-            commit_config,
-            default_commit_retry_timeout(),
-            self.manifest_location.naming_scheme,
-            None,
-            expected_latest_version,
+            options,
         ))
         .await?;
 
@@ -2212,6 +2243,38 @@ impl Dataset {
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
         take::take(self, row_indices, projection.into()).await
+    }
+
+    /// Take rows with a maximum number of active fragment-reader data reads in the primary base.
+    ///
+    /// Current-format primary-base data and overlay files opened through the
+    /// fragment reader share one scheduler with this request ceiling, and
+    /// fragment-reader fanout is capped at `min(store_parallelism, io_parallelism)`.
+    /// This does not increase fragment-reader fanout above the store default, so
+    /// actual concurrency may be lower. Legacy v1 files, additional-base
+    /// schedulers, and auxiliary metadata or lineage reads (such as deletion
+    /// vectors and spilled row-ID or row-version sequences) keep their existing
+    /// schedulers. It must be greater than zero.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let rows = dataset
+    ///     .take_with_io_parallelism(&[0, 1, 2], dataset.schema().clone(), 64)
+    ///     .await?;
+    /// # let _ = rows;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip_all, fields(num_rows=row_indices.len(), io_parallelism))]
+    pub async fn take_with_io_parallelism(
+        &self,
+        row_indices: &[u64],
+        projection: impl Into<ProjectionRequest>,
+        io_parallelism: u32,
+    ) -> Result<RecordBatch> {
+        take::take_with_io_parallelism(self, row_indices, projection.into(), Some(io_parallelism))
+            .await
     }
 
     /// Take Rows by the internal ROW ids.
@@ -4549,7 +4612,18 @@ pub(crate) struct NewTransactionResult<'a> {
     pub new_transactions: BoxStream<'a, Result<(u64, Arc<Transaction>)>>,
 }
 
-pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'_> {
+#[derive(Clone, Copy)]
+pub(crate) enum TransactionReadSource {
+    SessionCache,
+    /// Read the transaction from its manifest or the file it references.
+    /// A version-only cache entry may belong to a previous table at the URI.
+    Storage,
+}
+
+pub(crate) fn load_new_transactions(
+    dataset: &Dataset,
+    source: TransactionReadSource,
+) -> NewTransactionResult<'_> {
     // Resolve every manifest with version > our current version (the latest plus
     // the ones in between). On non-lexically-ordered stores this uses the version
     // hint to avoid an O(n) listing.
@@ -4570,13 +4644,26 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let manifest = Dataset::get_manifest(
-                    dataset.object_store.as_ref(),
-                    &location,
-                    &dataset.uri,
-                    dataset.session.as_ref(),
-                )
-                .await?;
+                let manifest = match source {
+                    TransactionReadSource::SessionCache => {
+                        Dataset::get_manifest(
+                            dataset.object_store.as_ref(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?
+                    }
+                    TransactionReadSource::Storage => Arc::new(
+                        Dataset::load_manifest(
+                            dataset.object_store.as_ref(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?,
+                    ),
+                };
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.
@@ -4589,30 +4676,40 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .try_buffer_unordered(stage_parallelism);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
-            let manifest_copy = manifest.clone();
-            let tx_key = TransactionKey {
-                version: manifest.version,
+            let version = manifest.version;
+            let missing_transaction = || {
+                Error::internal(format!(
+                    "Dataset version {version} does not have a transaction file"
+                ))
             };
+            if let TransactionReadSource::Storage = source {
+                let transaction = dataset
+                    .read_transaction_from_storage(&manifest, &location)
+                    .await?
+                    .ok_or_else(missing_transaction)?;
+                return Ok((version, Arc::new(transaction)));
+            }
+
+            let tx_key = TransactionKey { version };
             let transaction =
                 if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
                     cached
                 } else {
                     let mut dataset_version = dataset.clone();
-                    dataset_version.set_manifest(manifest_copy.clone(), location);
-                    let loaded =
-                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::internal(format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ))
-                        })?);
+                    dataset_version.set_manifest(manifest, location);
+                    let loaded = Arc::new(
+                        dataset_version
+                            .read_transaction()
+                            .await?
+                            .ok_or_else(missing_transaction)?,
+                    );
                     dataset
                         .metadata_cache
                         .insert_with_key(&tx_key, loaded.clone())
                         .await;
                     loaded
                 };
-            Ok((manifest.version, transaction))
+            Ok((version, transaction))
         })
         .try_buffer_unordered(stage_parallelism);
 
@@ -5078,106 +5175,6 @@ impl DatasetTakeRows for Dataset {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,              // default true
-    timestamp: Option<SystemTime>,             // default None
-    use_stable_row_ids: bool,                  // default false
-    use_legacy_format: Option<bool>,           // default None
-    storage_format: Option<DataStorageFormat>, // default None
-    disable_transaction_file: bool,            // default false
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
-    /// sets `manifest.next_row_id` to the provided value before activating the flag.
-    migration_next_row_id: Option<u64>, // default None
-    /// Whether this commit activates non-reusable field IDs.
-    activate_non_reusable_field_ids: bool,
-    /// This commit is a tagged fragment-reuse-index trim derived by
-    /// `cleanup_frag_reuse_index` against the current manifest entry; see
-    /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
-    tagged_frag_reuse_trim: bool, // default false
-    /// The writer's complete desired clustering definitions list for an
-    /// `UpdateConfig` commit; see `ManifestBuildConfig::clustering_definitions`.
-    clustering_definitions: Option<Vec<ClusteringDefinition>>, // default None
-}
-
-impl Default for ManifestWriteConfig {
-    fn default() -> Self {
-        Self {
-            auto_set_feature_flags: true,
-            timestamp: None,
-            use_stable_row_ids: false,
-            disable_transaction_file: false,
-            use_legacy_format: None,
-            storage_format: None,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        }
-    }
-}
-
-impl ManifestWriteConfig {
-    pub fn disable_transaction_file(&self) -> bool {
-        self.disable_transaction_file
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
-        self.disable_transaction_file = true;
-        self
-    }
-
-    /// Mark this commit as a tagged fragment-reuse-index trim derived by the
-    /// maintenance path; required for `build_manifest` to accept the shape.
-    pub(crate) fn with_tagged_frag_reuse_trim(mut self) -> Self {
-        self.tagged_frag_reuse_trim = true;
-        self
-    }
-
-    /// Whether this commit is the tagged fragment reuse trim the maintenance
-    /// path derived against the current entry (`FragReuseUpdate::Trim`).
-    pub(crate) fn tagged_frag_reuse_trim(&self) -> bool {
-        self.tagged_frag_reuse_trim
-    }
-
-    /// Resolve into the config `Transaction::build_manifest` consumes.
-    ///
-    /// The timestamp is resolved here rather than during the build so it goes
-    /// through this crate's mockable `SystemTime`.
-    pub(crate) fn has_clustering_definitions(&self) -> bool {
-        self.clustering_definitions.is_some()
-    }
-
-    /// Whether the definitions list names an id the read manifest does not
-    /// hold, i.e. the commit allocates. One pass over each list; the
-    /// allocation itself is validated by the manifest build.
-    pub(crate) fn allocates_clustering_definitions(&self, read: &Manifest) -> bool {
-        self.clustering_definitions.as_ref().is_some_and(|desired| {
-            let current: HashSet<u32> = read.clustering.iter().map(|c| c.id).collect();
-            desired
-                .iter()
-                .any(|definition| !current.contains(&definition.id))
-        })
-    }
-
-    pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
-        ManifestBuildConfig {
-            auto_set_feature_flags: self.auto_set_feature_flags,
-            timestamp_nanos: timestamp_to_nanos(self.timestamp),
-            use_stable_row_ids: self.use_stable_row_ids,
-            use_legacy_format: self.use_legacy_format,
-            storage_format: self.storage_format.clone(),
-            disable_transaction_file: self.disable_transaction_file,
-            migration_next_row_id: self.migration_next_row_id,
-            activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
-            clustering_definitions: self.clustering_definitions.clone(),
-            spilled_row_lineage: Default::default(),
-        }
-    }
-}
-
 /// Decode an inline transaction section for opportunistic caching.
 ///
 /// Returns `None` instead of failing when the transaction cannot be decoded:
@@ -5211,7 +5208,7 @@ pub(crate) async fn write_manifest_file(
     base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
-    config: &ManifestWriteConfig,
+    config: &ManifestBuildConfig,
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
     may_change_schema: bool,
@@ -5251,15 +5248,15 @@ pub(crate) async fn write_manifest_file(
         blob::validate_blob_threshold_metadata(&manifest.schema)
             .map_err(CommitError::OtherError)?;
     }
-    if config.auto_set_feature_flags {
+    if config.auto_set_feature_flags() {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
-        // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
-        let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
+        // when config.use_stable_row_ids() is false (the ManifestBuildConfig default).
+        let use_stable_row_ids = config.use_stable_row_ids() || manifest.uses_stable_row_ids();
         apply_feature_flags(
             manifest,
             use_stable_row_ids,
-            config.disable_transaction_file,
+            config.disable_transaction_file(),
         )?;
         crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag(
             manifest,
@@ -5286,7 +5283,11 @@ pub(crate) async fn write_manifest_file(
     validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     versions::finalize_manifest_storage_version(manifest)?;
 
-    manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+    manifest.set_timestamp(
+        config
+            .timestamp_nanos()
+            .unwrap_or_else(|| timestamp_to_nanos(None)),
+    );
 
     manifest.update_max_fragment_id();
 

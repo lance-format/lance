@@ -120,13 +120,12 @@ mock_instant.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
 lance-index = { workspace = true, features = ["test-oracle"] }
-lance-arrow-scalar = { workspace = true }
-lance-arrow-stats = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 tracing-mock.workspace = true
 env_logger.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
+sha2.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 serial_test = { workspace = true }
@@ -295,6 +294,10 @@ harness = false
 
 [[bench]]
 name = "frag_reuse"
+harness = false
+
+[[bench]]
+name = "hnsw_auto_remap"
 harness = false
 
 [[bench]]

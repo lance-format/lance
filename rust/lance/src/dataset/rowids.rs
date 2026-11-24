@@ -13,8 +13,12 @@ use crate::session::caches::{RowIdSequenceKey, RowVersionSequenceKey};
 use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
-use lance_select::{RowAddrSelection, RowAddrTreeMap};
+use lance_select::{
+    NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
+};
 use lance_table::{
     format::{
         Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
@@ -23,9 +27,11 @@ use lance_table::{
     },
     rowids::{
         FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids,
+        segment::U64Segment,
         version::{LoadedRowLineage, SpilledRowLineage},
     },
 };
+use std::borrow::Cow;
 use std::sync::Arc;
 
 pub(crate) use spill::place_carried_row_lineage;
@@ -254,6 +260,200 @@ pub(crate) async fn get_row_id_index_with(
     Ok(Some(index))
 }
 
+/// A dense fragment maps an ID to a physical offset by subtraction. Cache only
+/// its endpoints and manifest slot. Prefix maxima let a point lookup skip
+/// disjoint ranges and still find old and new copies after an update.
+#[derive(DeepSizeOf)]
+struct InlineRowIdRange {
+    start: u64,
+    end: u64,
+    prefix_end: u64,
+    slot: usize,
+}
+
+struct InlineRowIdRangesKey<'a> {
+    version: u64,
+    e_tag: &'a str,
+}
+
+impl CacheKey for InlineRowIdRangesKey<'_> {
+    type ValueType = Option<Vec<InlineRowIdRange>>;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("inline_row_id_ranges/{}/{}", self.version, self.e_tag).into()
+    }
+
+    fn type_name() -> &'static str {
+        "InlineRowIdRanges"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.inline-row-id-ranges", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_str(self.e_tag);
+    }
+}
+
+fn inline_row_id_ranges(dataset: &Dataset) -> Result<Option<Vec<InlineRowIdRange>>> {
+    let mut ranges = Vec::new();
+    for (slot, fragment) in dataset.iter_fragments().enumerate() {
+        let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+            return Ok(None);
+        };
+        // A protobuf sequence with one Range (two u64 varints) fits in 32
+        // bytes. Avoid decoding an arbitrarily large inline array to reject it.
+        if data.len() > 32 {
+            return Ok(None);
+        }
+        let sequence = read_row_ids(data)?;
+        let [U64Segment::Range(range)] = sequence.segments() else {
+            return Ok(None);
+        };
+        // Leave legacy or unrepresentable physical addresses to the existing index.
+        if u32::try_from(fragment.id).is_err()
+            || range.end.saturating_sub(range.start) > u64::from(u32::MAX) + 1
+            || slot > 0 && dataset.manifest.fragments[slot - 1].id >= fragment.id
+        {
+            return Ok(None);
+        }
+        if range.is_empty() {
+            continue;
+        }
+        ranges.push(InlineRowIdRange {
+            start: range.start,
+            end: range.end,
+            prefix_end: 0,
+            slot,
+        });
+    }
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut prefix_end = 0;
+    for range in &mut ranges {
+        prefix_end = prefix_end.max(range.end);
+        range.prefix_end = prefix_end;
+    }
+    Ok(Some(ranges))
+}
+
+/// Resolve one stable ID using only a dense inline snapshot and its candidate
+/// deletion files. The outer None means the snapshot needs the general index;
+/// the inner None means the ID is missing or deleted.
+async fn lookup_inline_row_id(
+    dataset: &Dataset,
+    row_id: u64,
+    with_deletions: bool,
+) -> Result<Option<Option<RowAddress>>> {
+    let ranges = if let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() {
+        let key = InlineRowIdRangesKey {
+            version: dataset.manifest.version,
+            e_tag,
+        };
+        dataset
+            .index_cache
+            .get_or_insert_with_key(key, || async { inline_row_id_ranges(dataset) })
+            .await?
+    } else {
+        // As with RowIdIndex, an unversioned cache identity cannot be shared
+        // across a drop and recreate at the same URI.
+        Arc::new(inline_row_id_ranges(dataset)?)
+    };
+    let Some(ranges) = ranges.as_ref() else {
+        return Ok(None);
+    };
+    let lower = ranges.partition_point(|range| range.prefix_end <= row_id);
+    let upper = ranges.partition_point(|range| range.start <= row_id);
+    let mut lookups = Vec::new();
+    for idx in lower..upper {
+        let range = &ranges[idx];
+        if range.end <= row_id {
+            continue;
+        }
+        let fragment = &dataset.manifest.fragments[range.slot];
+        let address = RowAddress::new_from_parts(fragment.id as u32, (row_id - range.start) as u32);
+        // The general ignore-deletions index also applies tombstones to a
+        // fragment whose span overlaps another, even for its unique IDs.
+        let overlaps = idx > 0 && ranges[idx - 1].prefix_end > range.start
+            || ranges
+                .get(idx + 1)
+                .is_some_and(|next| next.start < range.end);
+        lookups.push(async move {
+            if (with_deletions || overlaps)
+                && let Some(file) = &fragment.deletion_file
+                && read_dataset_deletion_file(dataset, fragment.id, file)
+                    .await?
+                    .contains(address.row_offset())
+            {
+                return Ok(None);
+            }
+            Ok::<_, Error>(Some(address))
+        });
+    }
+    let mut live = None;
+    let mut candidates =
+        futures::stream::iter(lookups).buffer_unordered(dataset.object_store.io_parallelism());
+    while let Some(candidate) = candidates.try_next().await? {
+        if let Some(address) = candidate
+            && live.replace(address).is_some()
+        {
+            return Err(Error::internal(format!(
+                "row id index corrupt: stable row id {row_id} is live in multiple fragments"
+            )));
+        }
+    }
+    Ok(Some(live))
+}
+
+pub(super) async fn resolve_take_row_ids(
+    dataset: &Dataset,
+    row_ids: &[u64],
+    with_deletions: bool,
+) -> Result<Option<Vec<Option<RowAddress>>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
+    }
+    if let [id] = row_ids {
+        if let Some(e_tag) = dataset.manifest_location.e_tag.as_deref()
+            && let Some(index) = dataset
+                .index_cache
+                .get_with_key(&RowIdIndexKey {
+                    version: dataset.manifest.version,
+                    with_deletions,
+                    e_tag: Some(e_tag),
+                })
+                .await
+        {
+            return Ok(Some(vec![index.get(*id)?]));
+        }
+        if let Some(address) = lookup_inline_row_id(dataset, *id, with_deletions).await? {
+            return Ok(Some(vec![address]));
+        }
+    }
+    resolve_row_ids(dataset, row_ids, with_deletions).await
+}
+
+/// The [`RowIdIndex`] a row-id -> row-address translation needs, or `None` when
+/// the dataset has no stable row ids and an id already *is* an address, so there
+/// is nothing to translate.
+///
+/// [`get_row_id_index`] returns `None` for exactly that one case, so a stable-row-id
+/// dataset without an index is a broken invariant rather than a case for the caller
+/// to guess at — guessing is how a block-list mask ends up inverted into "allow
+/// nothing". Every caller that brings a row-id-domain value into the address domain
+/// goes through here.
+pub(crate) async fn row_id_index_for_translation(
+    dataset: &Dataset,
+) -> Result<Option<Arc<RowIdIndex>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
+    }
+    get_row_id_index(dataset).await?.map(Some).ok_or_else(|| {
+        Error::internal("dataset uses stable row ids but has no row id index to translate with")
+    })
+}
+
 /// Map a set of physical row addresses to their stable row ids
 ///
 /// A fragment's [`RowIdSequence`] holds one id per physical row in offset order;
@@ -315,6 +515,85 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
     Ok(row_ids)
 }
 
+/// Translate stable row ids into their current physical row addresses, via
+/// the dataset's [`RowIdIndex`] (an id -> address lookup, batched and
+/// amortized O(log n) — cheap, unlike the reverse direction above, which
+/// needs a per-fragment [`RowIdSequence`] scan). This is the opposite
+/// direction from [`translate_addr_treemap_to_row_ids`], used to bring a
+/// row-id-domain scalar-index result into row-address domain (see
+/// `ScalarIndexLoader::row_id_result_to_row_addrs`).
+///
+/// An id with no live address (deleted, or superseded by compaction) is
+/// silently dropped, mirroring the "no live counterpart -> not part of the
+/// answer" contract of [`translate_addr_treemap_to_row_ids`]. `ids` must not
+/// contain a `RowAddrSelection::Full` marker — that is an address-domain-only
+/// shortcut ("this whole physical fragment matches") that no row-id-domain
+/// index ever produces, since a row-id-domain index has no notion of
+/// physical fragment layout to begin with.
+pub(crate) fn translate_row_id_treemap_to_row_addrs(
+    row_id_index: &RowIdIndex,
+    ids: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let Some(id_iter) = ids.row_addrs() else {
+        return Err(Error::internal(
+            "a row-id-domain mask used a 'whole fragment' marker; no row-id-domain index \
+             produces one",
+        ));
+    };
+    let ids: Vec<u64> = id_iter.map(u64::from).collect();
+    let addrs = row_id_index.get_many(&ids)?;
+    Ok(RowAddrTreeMap::from_iter(
+        addrs.into_iter().flatten().map(u64::from),
+    ))
+}
+
+fn translate_row_id_set_to_row_addrs(
+    row_id_index: &RowIdIndex,
+    set: NullableRowAddrSet,
+) -> Result<NullableRowAddrSet> {
+    let (selected, nulls) = set.into_parts();
+    Ok(NullableRowAddrSet::new(
+        translate_row_id_treemap_to_row_addrs(row_id_index, &selected)?,
+        translate_row_id_treemap_to_row_addrs(row_id_index, &nulls)?,
+    ))
+}
+
+/// Translate a row-id-domain [`NullableRowAddrMask`] into the row-address
+/// domain. Unlike the address -> row-id direction, both `AllowList` and
+/// `BlockList` are supported here: either way, only the ids actually listed
+/// in the mask need a lookup, never the full id universe (see
+/// [`translate_row_id_treemap_to_row_addrs`]).
+pub(crate) fn translate_row_id_mask_to_row_addrs(
+    row_id_index: &RowIdIndex,
+    mask: NullableRowAddrMask,
+) -> Result<NullableRowAddrMask> {
+    match mask {
+        NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
+            translate_row_id_set_to_row_addrs(row_id_index, set)?,
+        )),
+        NullableRowAddrMask::BlockList(set) => Ok(NullableRowAddrMask::BlockList(
+            translate_row_id_set_to_row_addrs(row_id_index, set)?,
+        )),
+    }
+}
+
+/// Plain-[`RowAddrMask`] (post-`drop_nulls`) sibling of
+/// [`translate_row_id_mask_to_row_addrs`], for finalizing an
+/// [`lance_select::IndexExprResult`] to row-address domain.
+pub(crate) fn translate_row_id_plain_mask_to_row_addrs(
+    row_id_index: &RowIdIndex,
+    mask: RowAddrMask,
+) -> Result<RowAddrMask> {
+    match mask {
+        RowAddrMask::AllowList(set) => Ok(RowAddrMask::AllowList(
+            translate_row_id_treemap_to_row_addrs(row_id_index, &set)?,
+        )),
+        RowAddrMask::BlockList(set) => Ok(RowAddrMask::BlockList(
+            translate_row_id_treemap_to_row_addrs(row_id_index, &set)?,
+        )),
+    }
+}
+
 /// Resolve row addresses to row ids, positionally: `addr = (fragment << 32) | offset`
 /// looks up `offset` in the fragment's [`RowIdSequence`]. The inverse companion of
 /// [`get_row_id_index`].
@@ -327,7 +606,34 @@ pub async fn row_addrs_to_row_ids(
     dataset: &Dataset,
     addrs: impl IntoIterator<Item = Option<u64>>,
 ) -> Result<Vec<Option<u64>>> {
-    row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Include).await
+    let addrs: Vec<Option<u64>> = addrs.into_iter().collect();
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(addrs);
+    }
+
+    let mut positions_by_fragment: std::collections::HashMap<u32, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (position, addr) in addrs.iter().enumerate() {
+        if let Some(addr) = addr {
+            positions_by_fragment
+                .entry(RowAddress::from(*addr).fragment_id())
+                .or_default()
+                .push(position);
+        }
+    }
+
+    let mut ids: Vec<Option<u64>> = vec![None; addrs.len()];
+    for (fragment_id, positions) in positions_by_fragment {
+        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            continue;
+        };
+        let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+        for position in positions {
+            let offset = RowAddress::from(addrs[position].expect("grouped from Some")).row_offset();
+            ids[position] = sequence.get(offset as usize);
+        }
+    }
+    Ok(ids)
 }
 
 /// Resolve row ids to their current row addresses, in input order.
@@ -362,24 +668,11 @@ pub async fn row_ids_to_row_addrs(dataset: &Dataset, row_ids: &[u64]) -> Result<
         .collect())
 }
 
-/// Resolve physical row addresses to stable row ids only for live physical slots.
-///
-/// When stable row ids are enabled, missing fragments, out-of-range offsets,
-/// deleted physical slots, and `None` inputs yield `None`. This prevents a
-/// deleted slot's stable id from selecting a replacement row written by an
-/// update. Without stable row ids, the input is returned unchanged.
-pub(crate) async fn live_row_addrs_to_row_ids(
-    dataset: &Dataset,
-    addrs: impl IntoIterator<Item = Option<u64>>,
-) -> Result<Vec<Option<u64>>> {
-    row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Exclude).await
-}
-
 /// Builds a synchronous lookup, for the rows of `fragment_ids`, that a caller
-/// can use like [`live_row_addrs_to_row_ids`] one address at a time (e.g.
-/// inside a scoring loop) instead of as a batch. This function itself is
-/// still async: it awaits loading every fragment's row id sequence and
-/// deletion vector up front, so the returned closure never has to.
+/// can use one address at a time (e.g. inside a scoring loop) instead of as a
+/// batch. This function itself is still async: it awaits loading every
+/// fragment's row id sequence and deletion vector up front, so the returned
+/// closure never has to.
 ///
 /// The returned lookup yields `None` for an address in a fragment outside
 /// `fragment_ids` or no longer in the dataset, past the end of its fragment,
@@ -424,57 +717,6 @@ pub(crate) async fn live_row_addr_to_row_id_lookup(
         }
         sequence.get(offset as usize)
     })
-}
-
-#[derive(Clone, Copy)]
-enum DeletedRowBehavior {
-    Include,
-    Exclude,
-}
-
-async fn row_addrs_to_row_ids_impl(
-    dataset: &Dataset,
-    addrs: impl IntoIterator<Item = Option<u64>>,
-    deleted_row_behavior: DeletedRowBehavior,
-) -> Result<Vec<Option<u64>>> {
-    let addrs: Vec<Option<u64>> = addrs.into_iter().collect();
-    if !dataset.manifest.uses_stable_row_ids() {
-        return Ok(addrs);
-    }
-
-    let mut positions_by_fragment: std::collections::HashMap<u32, Vec<usize>> =
-        std::collections::HashMap::new();
-    for (position, addr) in addrs.iter().enumerate() {
-        if let Some(addr) = addr {
-            positions_by_fragment
-                .entry(RowAddress::from(*addr).fragment_id())
-                .or_default()
-                .push(position);
-        }
-    }
-
-    let mut ids: Vec<Option<u64>> = vec![None; addrs.len()];
-    for (fragment_id, positions) in positions_by_fragment {
-        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
-            continue;
-        };
-        let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
-        let deletion_vector = match deleted_row_behavior {
-            DeletedRowBehavior::Include => None,
-            DeletedRowBehavior::Exclude => fragment.get_deletion_vector().await?,
-        };
-        for position in positions {
-            let offset = RowAddress::from(addrs[position].expect("grouped from Some")).row_offset();
-            if deletion_vector
-                .as_ref()
-                .is_some_and(|deletions| deletions.contains(offset))
-            {
-                continue;
-            }
-            ids[position] = sequence.get(offset as usize);
-        }
-    }
-    Ok(ids)
 }
 
 /// Build the index from freshly decoded sequences. The index then owns their
@@ -625,7 +867,6 @@ mod test {
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
-    use lance_table::rowids::segment::U64Segment;
     use std::collections::HashMap;
     use std::collections::HashSet;
 

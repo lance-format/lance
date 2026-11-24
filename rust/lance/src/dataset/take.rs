@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
+use std::ops::Range;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::rowids::resolve_row_ids;
+use crate::dataset::rowids::resolve_take_row_ids;
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
@@ -24,6 +28,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
@@ -109,6 +114,20 @@ pub async fn take(
     offsets: &[u64],
     projection: ProjectionRequest,
 ) -> Result<RecordBatch> {
+    take_with_io_parallelism(dataset, offsets, projection, None).await
+}
+
+pub async fn take_with_io_parallelism(
+    dataset: &Dataset,
+    offsets: &[u64],
+    projection: ProjectionRequest,
+    io_parallelism: Option<u32>,
+) -> Result<RecordBatch> {
+    if io_parallelism == Some(0) {
+        return Err(Error::invalid_input(
+            "take io_parallelism must be greater than 0, got 0",
+        ));
+    }
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
     if offsets.is_empty() {
         return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
@@ -120,11 +139,14 @@ pub async fn take(
     let fragments = dataset.get_fragments();
     let addrs = row_offsets_to_row_addresses(&fragments, offsets).await?;
 
-    let builder = TakeBuilder::try_new_from_addresses(
+    let mut builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
         addrs,
         Arc::new(projection),
     )?;
+    if let Some(io_parallelism) = io_parallelism {
+        builder = builder.with_io_parallelism(io_parallelism);
+    }
 
     take_rows(builder).await
 }
@@ -134,6 +156,7 @@ pub async fn take(
 async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
+    io_parallelism: Option<NonZeroU32>,
 ) -> Result<RecordBatch> {
     // If we need row addresses in output, add to projection's output expressions
     let projection = if builder.with_row_address {
@@ -196,6 +219,24 @@ async fn do_take_rows(
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
+    let store_parallelism = builder.dataset.object_store.io_parallelism();
+    let fragment_concurrency = match io_parallelism {
+        Some(io_parallelism) => store_parallelism.min(io_parallelism.get() as usize),
+        None => store_parallelism,
+    };
+    let read_config = match io_parallelism {
+        Some(io_parallelism) => {
+            let config = SchedulerConfig::new(SchedulerConfig::max_bandwidth_bytes(
+                io_parallelism.get() as usize,
+            ));
+            read_config.with_scan_scheduler(ScanScheduler::new_with_io_parallelism(
+                builder.dataset.object_store.clone(),
+                config,
+                io_parallelism,
+            ))
+        }
+        None => read_config,
+    };
     let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
@@ -258,7 +299,7 @@ async fn do_take_rows(
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-            .buffered(builder.dataset.object_store.io_parallelism())
+            .buffered(fragment_concurrency)
             .try_collect()
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
@@ -296,7 +337,7 @@ async fn do_take_rows(
                     read_config.clone().with_row_address(true),
                 )
             })
-            .buffered(builder.dataset.object_store.io_parallelism())
+            .buffered(fragment_concurrency)
             .try_collect::<Vec<_>>()
             .await?;
         let one_batch = if batches.len() > 1 {
@@ -374,13 +415,21 @@ async fn do_take_rows(
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
+    let io_parallelism = builder
+        .io_parallelism
+        .map(|io_parallelism| {
+            NonZeroU32::new(io_parallelism).ok_or_else(|| {
+                Error::invalid_input("TakeBuilder io_parallelism must be greater than 0, got 0")
+            })
+        })
+        .transpose()?;
     if builder.is_empty() {
         return builder.empty_batch();
     }
 
     let projection = builder.projection.clone();
 
-    do_take_rows(builder, projection).await
+    do_take_rows(builder, projection, io_parallelism).await
 }
 
 fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
@@ -468,6 +517,7 @@ pub struct TakeBuilder {
     with_row_address: bool,
     missing_row_policy: MissingRowPolicy,
     ignore_deletions: bool,
+    io_parallelism: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -492,6 +542,7 @@ impl TakeBuilder {
             with_row_address: false,
             missing_row_policy: MissingRowPolicy::default(),
             ignore_deletions: false,
+            io_parallelism: None,
         })
     }
 
@@ -509,6 +560,7 @@ impl TakeBuilder {
             with_row_address: false,
             missing_row_policy: MissingRowPolicy::default(),
             ignore_deletions: false,
+            io_parallelism: None,
         })
     }
 
@@ -530,6 +582,35 @@ impl TakeBuilder {
     /// live, for example row ids from an index built after the last deletion.
     pub fn with_ignore_deletions(mut self, ignore_deletions: bool) -> Self {
         self.ignore_deletions = ignore_deletions;
+        self
+    }
+
+    /// Sets the maximum active fragment-reader data reads in the primary base for this take.
+    ///
+    /// Current-format primary-base data and overlay files opened through the
+    /// fragment reader share one scheduler with this request ceiling, and
+    /// fragment-reader fanout is capped at `min(store_parallelism, io_parallelism)`.
+    /// This does not increase fragment-reader fanout above the store default, so
+    /// actual concurrency may be lower. Legacy v1 files, additional-base
+    /// schedulers, and auxiliary metadata or lineage reads (such as deletion
+    /// vectors and spilled row-ID or row-version sequences) keep their existing
+    /// schedulers. Must be greater than zero.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let batch = dataset
+    ///     .take_builder(&[0, 1, 2], dataset.schema().clone())?
+    ///     .with_io_parallelism(64)
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = batch;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_io_parallelism(mut self, io_parallelism: u32) -> Self {
+        self.io_parallelism = Some(io_parallelism);
         self
     }
 
@@ -569,7 +650,7 @@ impl TakeBuilder {
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
             let addrs = if let Some(resolved) =
-                resolve_row_ids(&self.dataset, row_ids, !self.ignore_deletions).await?
+                resolve_take_row_ids(&self.dataset, row_ids, !self.ignore_deletions).await?
             {
                 if self.missing_row_policy == MissingRowPolicy::Error
                     && let Some(first_missing_index) =
@@ -644,13 +725,18 @@ mod test {
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
     use lance_core::utils::deletion::DeletionVector;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use lance_io::stream::RecordBatchStream;
     use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use crate::dataset::{
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
@@ -2013,6 +2099,325 @@ mod test {
         assert_eq!(RecordBatch::new_empty(data.schema()), values);
     }
 
+    #[tokio::test]
+    async fn test_take_rows_with_io_parallelism() {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Arc::new(
+            Dataset::write(batches, "memory://", Some(write_params))
+                .await
+                .unwrap(),
+        );
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        // Rows from four fragments, out of order.
+        let indices = [5_u64 << 32, (4_u64 << 32) + 39, 39, (2_u64 << 32) + 20];
+
+        // One request at a time across all fragments still returns every row.
+        let expected = dataset
+            .take_rows(&indices, projection.clone())
+            .await
+            .unwrap();
+        let values = dataset
+            .take_builder(&indices, projection.clone())
+            .unwrap()
+            .with_io_parallelism(1)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(expected, values);
+
+        // The public logical-offset API takes the same path and also handles an
+        // empty selection without constructing a scheduler.
+        let logical_indices = [399, 0, 199, 40];
+        let expected = dataset
+            .take(&logical_indices, projection.clone())
+            .await
+            .unwrap();
+        let values = dataset
+            .take_with_io_parallelism(&logical_indices, projection.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(expected, values);
+        // Large caps (including u32::MAX) must work without over-allocating.
+        let values = dataset
+            .take_with_io_parallelism(&logical_indices, projection.clone(), u32::MAX)
+            .await
+            .unwrap();
+        assert_eq!(expected, values);
+
+        // Sorted multi-fragment selections take the ordered path.
+        let sorted_logical_indices = [0, 40, 199, 399];
+        let sorted_expected = dataset
+            .take(&sorted_logical_indices, projection.clone())
+            .await
+            .unwrap();
+        let sorted_values = dataset
+            .take_with_io_parallelism(&sorted_logical_indices, projection.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(sorted_expected, sorted_values);
+
+        let empty = dataset
+            .take_with_io_parallelism(&[], projection.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(empty, dataset.take(&[], projection.clone()).await.unwrap());
+
+        let error = dataset
+            .take_with_io_parallelism(&indices, projection.clone(), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("io_parallelism"), "{error}");
+
+        let error = dataset
+            .take_builder(&indices, projection.clone())
+            .unwrap()
+            .with_io_parallelism(0)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("io_parallelism"), "{error}");
+
+        let error = dataset
+            .take_builder(&[], projection)
+            .unwrap()
+            .with_io_parallelism(0)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("io_parallelism"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_take_rows_enforces_io_parallelism_across_fragments() {
+        let data = test_batch(0..400);
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            batches,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 40,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let peak_reads = Arc::new(AtomicUsize::new(0));
+
+        // Increment immediately before the artificial delay and decrement after
+        // it. The interval therefore exposes how many data-file GETs the take's
+        // scheduler allowed to proceed concurrently.
+        let mut completed_policy = ProxyObjectStorePolicy::new();
+        let completed_active = active_reads.clone();
+        completed_policy.set_before_policy(
+            "complete_take_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    completed_active.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let delayed = Arc::new(ThrottledStore::new(
+            Arc::new(ProxyObjectStore::new(
+                dataset.object_store.inner.clone(),
+                Arc::new(Mutex::new(completed_policy)),
+            )),
+            ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(10),
+                ..Default::default()
+            },
+        ));
+        let mut started_policy = ProxyObjectStorePolicy::new();
+        let started_active = active_reads.clone();
+        let started_peak = peak_reads.clone();
+        started_policy.set_before_policy(
+            "start_take_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    let active = started_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    started_peak.fetch_max(active, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        Arc::make_mut(&mut dataset.object_store).inner = Arc::new(ProxyObjectStore::new(
+            delayed,
+            Arc::new(Mutex::new(started_policy)),
+        ));
+
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        // Logical offsets touch all ten fragments in reverse order.
+        let indices = (0_u64..10)
+            .rev()
+            .map(|fragment| fragment * 40)
+            .collect::<Vec<_>>();
+        let fragment_fanout = dataset.object_store.io_parallelism().min(indices.len());
+        let uncapped = dataset.take(&indices, projection.clone()).await.unwrap();
+        let uncapped_peak = peak_reads.load(Ordering::SeqCst);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        if fragment_fanout > 2 {
+            assert!(
+                uncapped_peak > 2,
+                "uncapped take must exceed the tested cap, observed {uncapped_peak}"
+            );
+        } else {
+            assert_eq!(uncapped_peak, fragment_fanout);
+        }
+
+        peak_reads.store(0, Ordering::SeqCst);
+        let capped = dataset
+            .take_with_io_parallelism(&indices, projection.clone(), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(capped, uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), fragment_fanout.min(2));
+
+        // Sorted multi-fragment takes must enforce the same cap.
+        let sorted_indices = (0_u64..10)
+            .map(|fragment| fragment * 40)
+            .collect::<Vec<_>>();
+        let sorted_uncapped = dataset
+            .take(&sorted_indices, projection.clone())
+            .await
+            .unwrap();
+        peak_reads.store(0, Ordering::SeqCst);
+        let sorted_capped = dataset
+            .take_with_io_parallelism(&sorted_indices, projection, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(sorted_capped, sorted_uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), fragment_fanout.min(2));
+    }
+
+    #[tokio::test]
+    async fn test_take_rows_enforces_io_parallelism_across_data_files_in_fragment() {
+        let data = test_batch(0..40);
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            batches,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 40,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add three extra column files to the same fragment so a single-fragment
+        // take opens and reads four data files concurrently.
+        for col_name in ["c1", "c2", "c3"] {
+            let extra_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, false),
+                ArrowField::new(col_name, DataType::Int32, false),
+            ]));
+            let extra_batch = RecordBatch::try_new(
+                extra_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..40)),
+                    Arc::new(Int32Array::from_iter_values(100..140)),
+                ],
+            )
+            .unwrap();
+            dataset
+                .merge(
+                    RecordBatchIterator::new([Ok(extra_batch)], extra_schema),
+                    "i",
+                    "i",
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 4);
+
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let peak_reads = Arc::new(AtomicUsize::new(0));
+
+        let mut completed_policy = ProxyObjectStorePolicy::new();
+        let completed_active = active_reads.clone();
+        completed_policy.set_before_policy(
+            "complete_single_frag_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    completed_active.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let delayed = Arc::new(ThrottledStore::new(
+            Arc::new(ProxyObjectStore::new(
+                dataset.object_store.inner.clone(),
+                Arc::new(Mutex::new(completed_policy)),
+            )),
+            ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(20),
+                ..Default::default()
+            },
+        ));
+        let mut started_policy = ProxyObjectStorePolicy::new();
+        let started_active = active_reads.clone();
+        let started_peak = peak_reads.clone();
+        started_policy.set_before_policy(
+            "start_single_frag_data_read",
+            Arc::new(move |method, path| {
+                if method == "get_opts" && path.as_ref().contains("data/") {
+                    let active = started_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    started_peak.fetch_max(active, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        Arc::make_mut(&mut dataset.object_store).inner = Arc::new(ProxyObjectStore::new(
+            delayed,
+            Arc::new(Mutex::new(started_policy)),
+        ));
+
+        let projection = dataset.schema().clone();
+        let indices = [20_u64, 0];
+        let uncapped = dataset.take(&indices, projection.clone()).await.unwrap();
+        let uncapped_peak = peak_reads.load(Ordering::SeqCst);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert!(
+            uncapped_peak > 2,
+            "uncapped multi-file single-fragment take must exceed cap 2, observed {uncapped_peak}"
+        );
+
+        peak_reads.store(0, Ordering::SeqCst);
+        let capped_two = dataset
+            .take_with_io_parallelism(&indices, projection.clone(), 2)
+            .await
+            .unwrap();
+        assert_eq!(capped_two, uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), 2);
+
+        peak_reads.store(0, Ordering::SeqCst);
+        let capped_one = dataset
+            .take_with_io_parallelism(&indices, projection, 1)
+            .await
+            .unwrap();
+        assert_eq!(capped_one, uncapped);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(peak_reads.load(Ordering::SeqCst), 1);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn take_scan_dataset(
@@ -2155,6 +2560,160 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn test_stable_point_take_reads_candidate_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = test_batch(0..32);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let original_version = dataset.manifest.version;
+        dataset.delete("i % 4 = 0").await.unwrap();
+        let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+        let values = |batch: RecordBatch| {
+            batch["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .to_vec()
+        };
+        let deletion_reads = || {
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .into_iter()
+                .map(|request| request.path)
+                .filter(|path| path.parts().any(|part| part.as_ref() == "_deletions"))
+                .collect::<Vec<_>>()
+        };
+        let last = &dataset.manifest.fragments[7];
+        let expected_path =
+            deletion_file_path(&dataset.base, last.id, last.deletion_file.as_ref().unwrap());
+        dataset.object_store.io_stats_incremental();
+        let take = |ids: &[u64]| dataset.take_builder(ids, dataset.schema().clone()).unwrap();
+        assert_eq!(values(take(&[31]).execute().await.unwrap()), [31]);
+        assert_eq!(deletion_reads(), [expected_path]);
+        assert_eq!(values(take(&[31]).execute().await.unwrap()), [31]);
+        assert!(deletion_reads().is_empty());
+        for missing in [28, u64::MAX] {
+            assert!(values(take(&[missing]).execute().await.unwrap()).is_empty());
+            let error = take(&[missing])
+                .with_missing_row_policy(MissingRowPolicy::Error)
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("first missing row ID {missing}"))
+            );
+        }
+        assert!(deletion_reads().is_empty());
+        assert_eq!(
+            values(
+                take(&[28])
+                    .with_ignore_deletions(true)
+                    .execute()
+                    .await
+                    .unwrap()
+            ),
+            [28]
+        );
+        assert_eq!(
+            values(take(&[31, 28, 2, 31]).execute().await.unwrap()),
+            [31, 2, 31]
+        );
+
+        let original = dataset.checkout_version(original_version).await.unwrap();
+        assert_eq!(
+            values(
+                original
+                    .take_rows(&[28], original.schema().clone())
+                    .await
+                    .unwrap()
+            ),
+            [28]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stable_point_take_checks_each_candidate_copy() {
+        use lance_table::format::RowIdMeta;
+        use lance_table::rowids::{RowIdSequence, write_row_ids};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = test_batch(0..16);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("i % 4 = 0").await.unwrap();
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        // Snapshot without a shared cache identity. Fragment 0 covers 0..4
+        // and fragment 1 now covers 2..6. Both have offset 0 tombstoned.
+        dataset.manifest_location.e_tag = None;
+        let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
+        fragments[1].row_id_meta = Some(RowIdMeta::Inline(
+            write_row_ids(&RowIdSequence::from(2..6)).into(),
+        ));
+        let mut expected_paths: Vec<_> = fragments[..2]
+            .iter()
+            .map(|f| deletion_file_path(&dataset.base, f.id, f.deletion_file.as_ref().unwrap()))
+            .collect();
+        expected_paths.sort();
+        let dataset = Arc::new(dataset);
+        dataset.object_store.io_stats_incremental();
+        let take = |id, ignore| {
+            dataset
+                .take_builder(&[id], dataset.schema().clone())
+                .unwrap()
+                .with_ignore_deletions(ignore)
+        };
+        let batch = take(2, true).execute().await.unwrap();
+        assert_eq!(
+            batch["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(0),
+            2
+        );
+        let mut paths: Vec<_> = dataset
+            .object_store
+            .io_stats_incremental()
+            .requests
+            .into_iter()
+            .map(|request| request.path)
+            .filter(|path| path.parts().any(|part| part.as_ref() == "_deletions"))
+            .collect();
+        paths.sort();
+        assert_eq!(paths, expected_paths);
+        assert_eq!(take(0, true).execute().await.unwrap().num_rows(), 0);
+        for ignore in [false, true] {
+            let err = take(3, ignore).execute().await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("stable row id 3 is live in multiple fragments"),
+                "{err}"
+            );
+        }
+    }
+
     /// An update keeps the old copy of a row under a deletion vector and writes
     /// its id again in a new fragment. Ignoring deletions must still resolve
     /// the id to the live copy, which takes that fragment's deletion vector.
@@ -2191,6 +2750,17 @@ mod test {
                 .unwrap();
         }
         let dataset = Arc::new(dataset);
+
+        for ignore_deletions in [false, true] {
+            let point = dataset
+                .take_builder(&[1], dataset.schema().clone())
+                .unwrap()
+                .with_ignore_deletions(ignore_deletions)
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(point["s"].as_string::<i32>().value(0), "updated");
+        }
 
         let checked = dataset
             .take_rows(&[1, 2], dataset.schema().clone())

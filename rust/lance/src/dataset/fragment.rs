@@ -73,10 +73,11 @@ use super::write::seeds::SeedCollector;
 
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
+use crate::blob::{BlobWriteSources, logical_to_prepared_blob_schema};
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::writer::{OverlayWriter, WriteOverlayError};
 use crate::dataset::overlay::{
-    OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
+    OverlayReadPlanner, OverlayReadSelection, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
 use crate::dataset::{Dataset, UpdateJoinOptions};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -2990,8 +2991,65 @@ impl FileFragment {
             .manifest
             .data_storage_format
             .lance_file_format();
-        self.write_column_with_version_and_options(data, schema, write_version, file_writer_options)
-            .await
+        let data = data.map(|result| result.map(|batch| (batch, None)));
+        self.write_column_with_version_and_options(
+            data,
+            schema,
+            write_version,
+            file_writer_options,
+            false,
+        )
+        .await
+    }
+
+    /// Stage replacement columns using prepared Blob v2 leaves and trusted
+    /// payload sources associated with each batch.
+    ///
+    /// See [`Self::write_columns`] for the schema, row alignment and commit
+    /// contract. Each batch can supply [`BlobWriteSources`] for payloads
+    /// uploaded into primary dataset storage or resolved from a prior write.
+    /// Only the dataset schema's Managed opt-in determines whether the
+    /// writer can adopt a completed upload. Requires file version 2.2 or newer.
+    ///
+    /// ```
+    /// # use arrow_array::RecordBatch;
+    /// # use lance::{Result, blob::BlobWriteSources, dataset::fragment::FileFragment};
+    /// # use lance_core::datatypes::Schema;
+    /// # use lance_file::writer::FileWriterOptions;
+    /// # async fn example(fragment: &FileFragment, batch: RecordBatch, schema: &Schema,
+    /// #   sources: BlobWriteSources) -> Result<()> {
+    /// let replacement = fragment.write_columns_with_blob_sources(
+    ///     futures::stream::iter([Ok((batch, sources))]), schema, FileWriterOptions::default(),
+    /// ).await?;
+    /// # let _ = replacement;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_columns_with_blob_sources(
+        &self,
+        data: impl Stream<Item = Result<(RecordBatch, BlobWriteSources)>> + Send,
+        schema: &Schema,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<super::transaction::DataReplacementGroup> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        if !versions::writes_blob_v2(write_version) {
+            return Err(Error::not_supported(
+                "Column writes with Blob sources require Lance file version 2.2 or later",
+            ));
+        }
+        let data = data.map(|result| result.map(|(batch, sources)| (batch, Some(sources))));
+        self.write_column_with_version_and_options(
+            data,
+            schema,
+            write_version,
+            file_writer_options,
+            true,
+        )
+        .await
     }
 
     /// Write replacement column data using an exact V2 data file version.
@@ -3020,21 +3078,24 @@ impl FileFragment {
         schema: &Schema,
         write_version: ConcreteFileVersion,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        let data = data.map(|result| result.map(|batch| (batch, None)));
         self.write_column_with_version_and_options(
             data,
             schema,
             write_version,
             FileWriterOptions::default(),
+            false,
         )
         .await
     }
 
     async fn write_column_with_version_and_options(
         &self,
-        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        data: impl Stream<Item = Result<(RecordBatch, Option<BlobWriteSources>)>> + Send,
         schema: &Schema,
         write_version: ConcreteFileVersion,
         file_writer_options: FileWriterOptions,
+        has_blob_sources: bool,
     ) -> Result<super::transaction::DataReplacementGroup> {
         versions::validate_write_version(
             self.dataset
@@ -3045,8 +3106,20 @@ impl FileFragment {
         )?;
         let expected_rows = self.physical_rows().await? as u64;
 
-        let writer_schema = self.resolve_writer_schema(schema)?;
+        let mut writer_schema = self.resolve_writer_schema(schema)?;
+        if has_blob_sources {
+            writer_schema
+                .metadata
+                .clone_from(&self.dataset.schema().metadata);
+        }
         let batch_schema = ArrowSchema::from(&writer_schema);
+        let (batch_schema, expected_schema) = if has_blob_sources {
+            let prepared = logical_to_prepared_blob_schema(&batch_schema)?;
+            let expected_schema = Cow::Owned(LanceSchema::try_from(&prepared)?);
+            (prepared, expected_schema)
+        } else {
+            (batch_schema, Cow::Borrowed(&writer_schema))
+        };
         let projection_schema = ArrowSchema::new(
             batch_schema
                 .fields()
@@ -3087,7 +3160,7 @@ impl FileFragment {
             write_version,
             self.dataset.as_ref(),
             &writer_schema,
-            has_blob_v2,
+            has_blob_v2 && !has_blob_sources,
             file_writer_options,
         )
         .await?;
@@ -3103,7 +3176,7 @@ impl FileFragment {
         let mut data = std::pin::pin!(data);
         let staged: Result<_> = async {
             while let Some(batch_result) = data.next().await {
-                let batch = batch_result?;
+                let (batch, sources) = batch_result?;
                 // Struct encoders consume children positionally, so a batch
                 // ordered differently from the manifest lands under the wrong
                 // field ids. Projection fixes that by name, but it downcasts by
@@ -3116,7 +3189,7 @@ impl FileFragment {
                 LanceSchema::try_from(batch.schema_ref().as_ref())
                     .and_then(|staged| {
                         staged.check_compatible(
-                            &writer_schema,
+                            expected_schema.as_ref(),
                             &SchemaCompareOptions {
                                 compare_nullability: NullabilityComparison::Ignore,
                                 ignore_field_order: true,
@@ -3128,7 +3201,13 @@ impl FileFragment {
                 let batch = batch
                     .project_by_schema(&projection_schema)
                     .map_err(|err| self.schema_mismatch(err))?;
-                writer.write(std::slice::from_ref(&batch)).await?;
+                if let Some(sources) = sources.as_ref() {
+                    writer
+                        .write_with_blob_sources(&batch, &self.dataset.base, sources)
+                        .await?;
+                } else {
+                    writer.write(std::slice::from_ref(&batch)).await?;
+                }
                 seeds.observe(&batch)?;
             }
             seeds.flush(writer.as_mut()).await?;
@@ -4012,22 +4091,12 @@ impl FragmentReader {
         let Some(overlay) = &self.overlay else {
             return Ok(merged);
         };
-        // The offset_in_frag of every row this read will return, materialized once.
-        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
-        // it lets us both prune overlays to the read and slice each batch's offsets
-        // below without reading any data. Only paid when the fragment has overlays.
-        //
-        // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
-        // yield a coverage bitmap directly (for pruning) and to slice per batch (for
-        // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
-        // wholesale — a larger refactor tracked separately.
-        let offsets_in_frag: Arc<Vec<u32>> =
-            Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
+        let selection = Arc::new(OverlayReadSelection::new(params, total_num_rows)?);
 
         // Open only the overlay readers this read touches (pruned by row selection).
         let plans = resolve_overlays(
             &overlay.planner,
-            &offsets_in_frag,
+            &selection,
             &overlay.fragment,
             &overlay.read_config,
         )
@@ -4038,21 +4107,22 @@ impl FragmentReader {
         let plans = Arc::new(plans);
 
         // Batches arrive in physical read order, so a running total of the rows seen
-        // so far gives each batch its starting offset_in_batch into `offsets_in_frag`.
+        // so far identifies its selection slice. Materialize only the batch's
+        // offsets when its future is polled, not while scheduling the whole read.
         let mut rows_seen = 0usize;
         let stream = merged
             .map(move |task| {
                 let num_rows = task.num_rows;
                 let start = rows_seen;
                 rows_seen += num_rows as usize;
-                let offsets_in_frag = offsets_in_frag.clone();
+                let selection = selection.clone();
                 let plans = plans.clone();
                 let inner = task.task;
                 ReadBatchTask {
                     num_rows,
                     task: async move {
-                        let batch_offsets = &offsets_in_frag[start..start + num_rows as usize];
-                        merge_overlay_batch(inner, batch_offsets, &plans).await
+                        let batch_selection = selection.batch(start, num_rows as usize)?;
+                        merge_overlay_batch(inner, &batch_selection, &plans).await
                     }
                     .boxed(),
                 }
@@ -4588,6 +4658,7 @@ mod tests {
         };
         use arrow_buffer::NullBuffer;
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use futures::{StreamExt, TryStreamExt};
         use lance_core::datatypes::Schema;
         use lance_file::version::LanceFileVersion;
         use lance_file::writer::FileWriterOptions;
@@ -4598,6 +4669,7 @@ mod tests {
         use roaring::RoaringBitmap;
         use rstest::rstest;
 
+        use crate::dataset::fragment::FragReadConfig;
         use crate::dataset::transaction::{DataOverlayGroup, Operation};
         use crate::dataset::{Dataset, WriteDestination, WriteParams};
 
@@ -5498,12 +5570,19 @@ mod tests {
         /// scan test uses single-batch fragments, so this is the only guard for the
         /// cross-batch (`start > 0`) path.
         #[rstest]
+        #[case::full(None)]
+        #[case::ranges(Some(vec![1..6, 8..10]))]
         #[tokio::test]
         async fn test_scan_multi_batch_overlay_slicing(
-            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+            #[values(
+                LanceFileVersion::V2_0,
+                LanceFileVersion::V2_1,
+                LanceFileVersion::V2_2,
+                LanceFileVersion::V2_3
+            )]
+            version: LanceFileVersion,
+            #[case] ranges: Option<Vec<std::ops::Range<u64>>>,
         ) {
-            use futures::TryStreamExt;
-
             // One fragment of 10 rows so the read can be chunked below.
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("id", DataType::Int32, true),
@@ -5543,15 +5622,37 @@ mod tests {
             .await;
 
             let frag = dataset.get_fragment(0).unwrap();
-            let mut scanner = frag.scan();
-            scanner.batch_size(4).project(&["val"]).unwrap();
-            let batches: Vec<RecordBatch> = scanner
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
+            let expected_rows: Vec<i32> = ranges.as_ref().map_or_else(
+                || (0..10).collect(),
+                |ranges| {
+                    ranges
+                        .iter()
+                        .flat_map(|r| r.clone().map(|i| i as i32))
+                        .collect()
+                },
+            );
+            let batches: Vec<RecordBatch> = if let Some(ranges) = ranges {
+                frag.open(&full_schema(&dataset), FragReadConfig::default())
+                    .await
+                    .unwrap()
+                    .read_ranges(ranges.into(), 4)
+                    .await
+                    .unwrap()
+                    .buffered(2)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            } else {
+                let mut scanner = frag.scan();
+                scanner.batch_size(4).project(&["val"]).unwrap();
+                scanner
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap()
+            };
             // Guard the guard: the read must actually span multiple batches, else
             // this would not exercise the cross-batch slice at all.
             assert!(
@@ -5562,7 +5663,8 @@ mod tests {
 
             let merged =
                 arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
-            let expected: Vec<i32> = (0..10)
+            let expected: Vec<i32> = expected_rows
+                .into_iter()
                 .map(|i| match i {
                     1 => 111,
                     5 => 555,
@@ -8938,7 +9040,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn indexed_scan_still_maps_stable_ids() {
+        async fn indexed_scan_skips_stable_id_mapping_for_a_fresh_index() {
+            // A freshly built scalar index is address-domain, even on a
+            // stable-row-id dataset, so the scalar-index scan path consumes
+            // its result directly — no per-fragment row-id-sequence read is
+            // needed to map it back to physical offsets.
             let (_dir, mut dataset) = fixture(true).await;
             dataset
                 .create_index(
@@ -8966,9 +9072,10 @@ mod tests {
             );
             let stats = dataset.object_store.io_stats_incremental();
             for fragment in dataset.get_fragments() {
-                assert!(
-                    lineage_reads(&stats, &fragment) > 0,
-                    "index results need stable-to-physical mapping: {stats:?}"
+                assert_eq!(
+                    lineage_reads(&stats, &fragment),
+                    0,
+                    "address-domain index results need no stable-to-physical mapping: {stats:?}"
                 );
             }
         }

@@ -1098,7 +1098,7 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
         let index = indices.iter().find(|index| index.name == name).unwrap();
         let metrics = lance_index::metrics::LocalMetricsCollector::default();
         if column == "vector" {
-            // The generic open's probe misses on a per-segment key.
+            // The generic open must also reuse portable state after a remap.
             dataset
                 .open_generic_index(column, &index.uuid, &metrics)
                 .await
@@ -1198,8 +1198,8 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
     for (column, name) in segments {
         assert_eq!(
             index_loads(&dataset, column, name).await,
-            1,
-            "{name} reloads"
+            usize::from(column != "vector"),
+            "portable vector state survives; scalar decoded content still reloads: {name}"
         );
         assert_eq!(
             index_loads(&dataset, column, name).await,
@@ -4726,6 +4726,16 @@ async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
         )
         .await
         .unwrap();
+    let uuid = dataset
+        .load_index_by_name("vector_idx")
+        .await
+        .unwrap()
+        .unwrap()
+        .uuid;
+    assert_eq!(
+        dataset.vector_index_types("vector", &[uuid]).await.unwrap(),
+        [IndexType::IvfPq]
+    );
     let original = dataset
         .scan()
         .filter("i = 6")
@@ -4746,6 +4756,10 @@ async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
+    assert!(matches!(
+        dataset.vector_index_types("vector", &[uuid]).await,
+        Err(Error::IndexNotFound { .. })
+    ));
     // Excluded from the query listing: no coverage the reader can honor.
     assert!(
         !dataset

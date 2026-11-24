@@ -39,7 +39,10 @@ use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
-use crate::dataset::rowids::live_row_addrs_to_row_ids;
+use crate::dataset::rowids::{
+    row_id_index_for_translation, translate_row_id_plain_mask_to_row_addrs,
+    translate_row_id_treemap_to_row_addrs,
+};
 use crate::dataset::{row_offsets_to_row_addresses, versions};
 use crate::datatypes::Schema;
 use crate::index::visibility::IndexVisibility;
@@ -218,6 +221,32 @@ impl TakeOperation {
     }
 }
 
+/// Output columns and batch ordering for a [`Scanner`] scan plan.
+///
+/// System columns are appended after the projected data columns by
+/// [`LanceScanExec`], so they are not part of the projection schema.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ScanOptions {
+    /// Append the `_rowid` column.
+    pub(super) with_row_id: bool,
+    /// Append the `_rowaddr` column.
+    pub(super) with_row_address: bool,
+    /// Append the `_row_last_updated_at_version` column.
+    pub(super) with_row_last_updated_at_version: bool,
+    /// Append the `_row_created_at_version` column.
+    pub(super) with_row_created_at_version: bool,
+    /// Keep deleted rows with null row identity instead of filtering them out.
+    ///
+    /// Setting this uses the validity of the `_rowid` column as a selection
+    /// vector. Read more in [`crate::io::FileReader`].
+    pub(super) with_make_deletions_null: bool,
+    /// Emit batches in fragment order.
+    ///
+    /// [`Scanner::scan`] resolves this from the scanner's query state; direct
+    /// callers of [`Scanner::scan_fragments`] set it explicitly.
+    pub(super) ordered: bool,
+}
+
 impl Scanner {
     // Helper function for filtered_read
     //
@@ -285,19 +314,23 @@ impl Scanner {
             };
 
             let scan = self.scan_fragments(
-                projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_last_updated_at_version,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_created_at_version,
-                make_deletions_null,
+                ScanOptions {
+                    with_row_id: projection.with_row_id,
+                    with_row_address: self.projection_plan.physical_projection.with_row_addr,
+                    with_row_last_updated_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_last_updated_at_version,
+                    with_row_created_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_created_at_version,
+                    with_make_deletions_null: make_deletions_null,
+                    ordered,
+                },
                 Arc::new(projection.to_bare_schema()),
                 fragments,
                 scan_range,
-                ordered,
             );
 
             if filter_plan.has_refine() && is_prefilter {
@@ -456,44 +489,47 @@ impl Scanner {
             overlay_stale_rows = self
                 .overlay_stale_index_rows(index_query, &candidate_frags)
                 .await?;
-            if let Some(block) = overlay_stale_rows.block_mask().await? {
+            // This feeds `FilteredReadExec`'s `EvaluatedIndex::without_rows`, which
+            // ANDs it with a `ScalarIndexExec`-produced `IndexExprResult` — always
+            // address-domain on the wire — so the block must be address-domain too.
+            if let Some(block) = overlay_stale_rows.block_mask_by_address() {
                 read_options = read_options.with_overlay_block(block);
             }
         }
 
         let result_format = self.index_expr_result_format();
-        let index_input = match self.external_row_mask.as_deref() {
-            Some(mask) if use_external_mask => Some(self.mask_as_take_input(mask.clone())?),
-            _ => {
-                if let Some(index_query) = filter_plan.index_query.clone() {
-                    let target_fragments = read_options
-                        .fragments
-                        .as_ref()
-                        .unwrap_or_else(|| self.dataset.fragments())
-                        .iter()
-                        .map(|fragment| fragment.id as u32)
-                        .collect::<RoaringBitmap>();
-                    let fragment_scope = ScalarIndexExec::fragments_covered_by_index_query(
-                        &index_query,
-                        self.dataset.as_ref(),
-                    )
-                    .await?
-                        & target_fragments;
-                    let mut exec =
-                        ScalarIndexExec::new(self.dataset.clone(), index_query, result_format)
-                            .with_fragment_scope(fragment_scope);
-                    if let Some(segment_uuids) = self
-                        .scalar_index_selection
-                        .as_ref()
-                        .and_then(|selection| selection.segment_uuids.clone())
-                    {
-                        exec = exec.with_segment_uuids(segment_uuids);
-                    }
-                    Some(Arc::new(exec) as Arc<dyn ExecutionPlan>)
-                } else {
-                    None
-                }
+        let index_input = if use_external_mask && self.external_row_mask.is_some() {
+            let mask = self
+                .external_row_mask_as_row_addrs()
+                .await?
+                .expect("checked is_some above");
+            Some(self.mask_as_take_input(mask).await?)
+        } else if let Some(index_query) = filter_plan.index_query.clone() {
+            let target_fragments = read_options
+                .fragments
+                .as_ref()
+                .unwrap_or_else(|| self.dataset.fragments())
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<RoaringBitmap>();
+            let fragment_scope = ScalarIndexExec::fragments_covered_by_index_query(
+                &index_query,
+                self.dataset.as_ref(),
+            )
+            .await?
+                & target_fragments;
+            let mut exec = ScalarIndexExec::new(self.dataset.clone(), index_query, result_format)
+                .with_fragment_scope(fragment_scope);
+            if let Some(segment_uuids) = self
+                .scalar_index_selection
+                .as_ref()
+                .and_then(|selection| selection.segment_uuids.clone())
+            {
+                exec = exec.with_segment_uuids(segment_uuids);
             }
+            Some(Arc::new(exec) as Arc<dyn ExecutionPlan>)
+        } else {
+            None
         };
 
         let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
@@ -606,8 +642,45 @@ impl Scanner {
         .boxed()
     }
 
-    fn row_ids_as_take_input(&self, row_ids: RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
-        self.mask_as_take_input(RowAddrMask::from_allowed(row_ids))
+    // Convert genuine stable row ids into a take input, via the dataset's
+    // row-id index (a batched, amortized id -> address lookup) — the ids
+    // themselves are not a valid `FilteredReadExec` index input, since that
+    // node consumes row-address domain exclusively (see `mask_as_take_input`).
+    async fn row_ids_as_take_input(
+        &self,
+        row_ids: RowAddrTreeMap,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // No stable row ids: the id is the address, nothing to convert.
+        let addrs = match row_id_index_for_translation(&self.dataset).await? {
+            Some(row_id_index) => {
+                translate_row_id_treemap_to_row_addrs(row_id_index.as_ref(), &row_ids)?
+            }
+            None => row_ids,
+        };
+        self.mask_as_take_input(RowAddrMask::from_allowed(addrs))
+            .await
+    }
+
+    // `self.external_row_mask` (set by `with_row_id_prefilter`) is `_rowid`-domain —
+    // genuinely row-id domain for a stable-row-id dataset — but every take input is
+    // address-domain (see `mask_as_take_input`), so this converts it once. Callers
+    // that need the external mask itself as their `mask` argument (the plain-scan
+    // shortcut below) must go through this too, not read the field directly, or
+    // `mask_as_take_input`'s self-intersection mixes a converted copy against an
+    // unconverted one.
+    async fn external_row_mask_as_row_addrs(&self) -> Result<Option<RowAddrMask>> {
+        let Some(external) = self.external_row_mask.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            match row_id_index_for_translation(&self.dataset).await? {
+                Some(row_id_index) => translate_row_id_plain_mask_to_row_addrs(
+                    row_id_index.as_ref(),
+                    external.clone(),
+                )?,
+                None => external.clone(),
+            },
+        ))
     }
 
     // Wrap a row-address mask as a replayable literal index input for FilteredReadExec, so a
@@ -618,10 +691,11 @@ impl Scanner {
     // both scan and ANN. Intersecting the caller's mask once at this boundary is
     // what keeps the invariant on all of them; applying it per branch is how
     // branches get missed. Idempotent, so the branch that passes the external
-    // mask itself is unaffected.
-    fn mask_as_take_input(&self, mask: RowAddrMask) -> Result<Arc<dyn ExecutionPlan>> {
-        let mask = match self.external_row_mask.as_deref() {
-            Some(external) => mask.intersect(external.clone()),
+    // mask itself is unaffected — as long as it passes it as address domain (via
+    // `external_row_mask_as_row_addrs`), matching what this intersects it against.
+    async fn mask_as_take_input(&self, mask: RowAddrMask) -> Result<Arc<dyn ExecutionPlan>> {
+        let mask = match self.external_row_mask_as_row_addrs().await? {
+            Some(external) => mask.intersect(external),
             None => mask,
         };
         let index_result = IndexExprResult::exact(mask);
@@ -633,10 +707,13 @@ impl Scanner {
         Ok(Arc::new(RecordBatchExec::new(batch)))
     }
 
+    // Row addresses need no conversion: `FilteredReadExec`'s index input is
+    // address-domain natively (see `mask_as_take_input`).
     async fn row_addrs_as_take_input(&self, row_addrs: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_ids =
-            live_row_addrs_to_row_ids(&self.dataset, row_addrs.into_iter().map(Some)).await?;
-        self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
+        self.mask_as_take_input(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            row_addrs,
+        )))
+        .await
     }
 
     // The columns the source read must produce. If we have an aggregate, we only need the
@@ -671,6 +748,7 @@ impl Scanner {
         let input = match take_op {
             TakeOperation::RowIds(ids) => {
                 self.row_ids_as_take_input(RowAddrTreeMap::from_iter(ids))
+                    .await
             }
             TakeOperation::RowAddrs(addrs) => self.row_addrs_as_take_input(addrs).await,
             TakeOperation::RowOffsets(offsets) => {
@@ -821,14 +899,16 @@ impl Scanner {
         IndexVisibility::from_segments(self.dataset.clone(), segments, fragments)
     }
 
-    /// Read a result-domain ID selection against current values and the same
-    /// fragment and physical-row restrictions as the indexed branch.
-    pub(super) fn row_ids_take(
+    /// Read a result-domain row-address selection against current values and
+    /// the same fragment and physical-row restrictions as the indexed branch.
+    pub(super) async fn row_addrs_take(
         &self,
         rows: RowAddrTreeMap,
         projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let index_input = self.row_ids_as_take_input(rows)?;
+        let index_input = self
+            .mask_as_take_input(RowAddrMask::from_allowed(rows))
+            .await?;
         let mut read_options = FilteredReadOptions::new(projection);
         if let Some(fragments) = self.fragments.as_ref() {
             read_options = read_options.with_fragments(Arc::new(fragments.clone()));
@@ -978,20 +1058,24 @@ impl Scanner {
             let optimized_filter = planner.optimize_expr(filter.clone())?;
 
             let new_data_scan = self.scan_fragments(
-                true,
-                self.projection_plan.physical_projection.with_row_addr,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_last_updated_at_version,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_created_at_version,
-                false,
+                ScanOptions {
+                    with_row_id: true,
+                    with_row_address: self.projection_plan.physical_projection.with_row_addr,
+                    with_row_last_updated_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_last_updated_at_version,
+                    with_row_created_at_version: self
+                        .projection_plan
+                        .physical_projection
+                        .with_row_created_at_version,
+                    with_make_deletions_null: false,
+                    ordered: false,
+                },
                 scan_schema,
                 missing_frags.into(),
                 // No pushdown of limit/offset when doing scalar indexed scan
                 None,
-                false,
             );
             let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
@@ -1010,8 +1094,9 @@ impl Scanner {
             let filter = filter_plan.full_expr.as_ref().expect_ok()?;
             let take_projection = fallback_projection.expect_ok()?;
 
-            let stale_node =
-                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_projection)?;
+            let stale_node = self
+                .row_addrs_take(stale_rows.physical_selection(), take_projection)
+                .await?;
 
             let planner = Planner::new(stale_node.schema());
             let optimized_filter = planner.optimize_expr(filter.clone())?;
@@ -1040,17 +1125,8 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
-    ///
-    /// Setting `with_make_deletions_null` will use the validity of the _rowid
-    /// column as a selection vector. Read more in [crate::io::FileReader].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_last_updated_at_version: bool,
-        with_row_created_at_version: bool,
-        with_make_deletions_null: bool,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
@@ -1066,30 +1142,22 @@ impl Scanner {
             self.ordered
         };
         self.scan_fragments(
-            with_row_id,
-            with_row_address,
-            with_row_last_updated_at_version,
-            with_row_created_at_version,
-            with_make_deletions_null,
+            ScanOptions {
+                ordered,
+                ..Default::default()
+            },
             projection,
             fragments,
             range,
-            ordered,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_fragments(
         &self,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_last_updated_at_version: bool,
-        with_row_created_at_version: bool,
-        with_make_deletions_null: bool,
+        options: ScanOptions,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
         range: Option<Range<u64>>,
-        ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
         log::trace!("scan_fragments covered {} fragments", fragments.len());
         let config = LanceScanConfig {
@@ -1098,12 +1166,12 @@ impl Scanner {
             fragment_readahead: self.fragment_readahead,
             io_buffer_size: self.get_io_buffer_size(),
             materialization_readahead_bytes: self.materialization_readahead_bytes,
-            with_row_id,
-            with_row_address,
-            with_row_last_updated_at_version,
-            with_row_created_at_version,
-            with_make_deletions_null,
-            ordered_output: ordered,
+            with_row_id: options.with_row_id,
+            with_row_address: options.with_row_address,
+            with_row_last_updated_at_version: options.with_row_last_updated_at_version,
+            with_row_created_at_version: options.with_row_created_at_version,
+            with_make_deletions_null: options.with_make_deletions_null,
+            ordered_output: options.ordered,
             file_reader_options: self.resolved_file_reader_options(),
             parallelism_cap: None,
         };

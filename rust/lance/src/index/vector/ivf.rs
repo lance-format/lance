@@ -146,6 +146,7 @@ mod compatibility;
 mod coreset_algo;
 pub mod io;
 mod partition_serde;
+mod shape;
 mod streaming_hamming;
 pub mod v2;
 

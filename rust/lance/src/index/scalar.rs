@@ -15,6 +15,7 @@ pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
 pub(crate) mod rtree;
+pub(crate) mod segment_merge;
 pub(crate) mod zonemap;
 
 use super::frag_reuse::ResolvedRemapping;

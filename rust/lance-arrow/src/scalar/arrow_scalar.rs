@@ -8,9 +8,6 @@
 //! provides a correct total ordering for all Arrow types (including proper NaN
 //! handling for floats and null ordering).
 
-mod convert;
-pub mod serde;
-
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -42,7 +39,7 @@ type Result<T> = std::result::Result<T, ArrowError>;
 /// # Examples
 ///
 /// ```
-/// use lance_arrow_scalar::ArrowScalar;
+/// use lance_arrow::scalar::ArrowScalar;
 ///
 /// let a = ArrowScalar::from(1i32);
 /// let b = ArrowScalar::from(2i32);
@@ -115,7 +112,7 @@ impl ArrowScalar {
     /// Returns `true` if this scalar is a non-null floating-point NaN.
     ///
     /// ```
-    /// use lance_arrow_scalar::ArrowScalar;
+    /// use lance_arrow::scalar::ArrowScalar;
     ///
     /// assert!(ArrowScalar::from(f32::NAN).is_nan());
     /// assert!(!ArrowScalar::from(1.0f32).is_nan());

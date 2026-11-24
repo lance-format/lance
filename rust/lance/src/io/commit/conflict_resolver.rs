@@ -38,6 +38,37 @@ use std::{
     sync::Arc,
 };
 
+/// A caller-selected transaction property that identifies a logical append.
+#[derive(Clone, Copy)]
+pub(crate) struct AppendIdempotencyKey<'a> {
+    pub property: &'a str,
+    pub value: &'a str,
+}
+
+impl AppendIdempotencyKey<'_> {
+    pub(crate) fn matches_properties(&self, properties: &HashMap<String, String>) -> bool {
+        properties
+            .get(self.property)
+            .is_some_and(|value| value == self.value)
+    }
+
+    /// Search the commit window before checking ordinary rebase conflicts. A
+    /// known match settles the outcome even if another version is missing.
+    pub(crate) fn committed_version(
+        &self,
+        transactions: &[(u64, Arc<Transaction>)],
+    ) -> Option<u64> {
+        transactions.iter().find_map(|(version, transaction)| {
+            (matches!(transaction.operation, Operation::Append { .. })
+                && transaction
+                    .transaction_properties
+                    .as_deref()
+                    .is_some_and(|properties| self.matches_properties(properties)))
+            .then_some(*version)
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct TransactionRebase<'a> {
     transaction: Transaction,

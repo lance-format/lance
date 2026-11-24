@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{env, path::PathBuf};
@@ -235,6 +236,15 @@ pub struct InvertedIndexParams {
     pub(crate) format_version: Option<InvertedListFormatVersion>,
 }
 
+impl DeepSizeOf for InvertedIndexParams {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // All remaining fields are inline scalars or enums.
+        self.lance_tokenizer.deep_size_of_children(context)
+            + self.base_tokenizer.deep_size_of_children(context)
+            + self.custom_stop_words.deep_size_of_children(context)
+    }
+}
+
 // Unknown fields must remain ignored because these params are persisted across Lance versions.
 #[derive(Debug, Deserialize)]
 struct RawInvertedIndexParams {
@@ -310,25 +320,11 @@ impl RawInvertedIndexParams {
                 base_tokenizer
             )));
         }
-        if analyzer == "text"
-            && matches!(
-                (
-                    self.split_identifiers,
-                    self.split_on_numerics,
-                    self.preserve_original,
-                    self.index_operators,
-                ),
-                (Some(true), _, _, _)
-                    | (_, Some(true), _, _)
-                    | (_, _, Some(true), _)
-                    | (_, _, _, Some(true))
-            )
-        {
-            return Err(Error::invalid_input(
-                "code analyzer flags require analyzer='code'".to_string(),
-            ));
-        }
 
+        // Selecting the profile only chooses defaults here. The four
+        // code-only options are applied below and validated together after
+        // `analyzer` has been resolved into the persisted `base_tokenizer`;
+        // the input profile is kept only to make its diagnostic actionable.
         let mut params = match analyzer {
             "code" => InvertedIndexParams::code(),
             "text" => InvertedIndexParams::default(),
@@ -395,7 +391,7 @@ impl RawInvertedIndexParams {
         params.memory_limit_mb = self.memory_limit_mb;
         params.num_workers = self.num_workers;
         params.format_version = self.format_version;
-        params.validate()?;
+        params.validate(self.analyzer.as_deref())?;
         Ok(params)
     }
 }
@@ -498,7 +494,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             .posting_format_version
             .map(|version| resolve_fts_format_version(Some(&version.to_string())))
             .transpose()?;
-        params.validate()?;
+        params.validate(None)?;
         Ok(params)
     }
 }
@@ -741,7 +737,13 @@ impl InvertedIndexParams {
     /// (`with_position`, `block_size`, worker/memory/format settings) are ignored:
     /// two columns can differ there yet still be safe to combine in a
     /// `combined_fields` (BM25F) query. Used by cross-field FTS validation.
-    pub(crate) fn same_tokenization(&self, other: &Self) -> bool {
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    /// let params = InvertedIndexParams::default();
+    /// assert!(params.same_tokenization(&params.clone().with_position(false)));
+    /// ```
+    pub fn same_tokenization(&self, other: &Self) -> bool {
         // Destructure exhaustively so that adding a new field forces an explicit
         // decision here about whether it affects tokenization.
         let Self {
@@ -1105,7 +1107,7 @@ impl InvertedIndexParams {
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
-        self.validate()?;
+        self.validate(None)?;
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
@@ -1155,17 +1157,30 @@ impl InvertedIndexParams {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    fn has_code_analyzer_options(&self) -> bool {
+        self.split_identifiers
+            || self.split_on_numerics
+            || self.preserve_original
+            || self.index_operators
+    }
+
+    /// Validate normalized params. `explicit_analyzer` is the input-only JSON
+    /// profile when one was supplied, so the code-option diagnostic can name a
+    /// field the caller can actually change without creating a profile conflict.
+    fn validate(&self, explicit_analyzer: Option<&str>) -> Result<()> {
         validate_block_size(self.block_size)?;
-        if self.base_tokenizer != "code"
-            && (self.split_identifiers
-                || self.split_on_numerics
-                || self.preserve_original
-                || self.index_operators)
-        {
-            return Err(Error::invalid_input(
-                "code analyzer flags require base_tokenizer='code'".to_string(),
-            ));
+        // These four options change the code tokenizer's emitted stream, so no
+        // other analyzer can consume them. This is the one validation rule for
+        // JSON and builder callers, applied after `analyzer` has been resolved
+        // into the persisted `base_tokenizer`.
+        if self.base_tokenizer != "code" && self.has_code_analyzer_options() {
+            let required = match explicit_analyzer {
+                Some("text") => "analyzer='code'",
+                _ => "base_tokenizer='code'",
+            };
+            return Err(Error::invalid_input(format!(
+                "code analyzer flags require {required}"
+            )));
         }
         Ok(())
     }
@@ -1472,6 +1487,40 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("requires base_tokenizer='code'"));
+    }
+
+    #[rstest]
+    #[case::split_identifiers("split_identifiers")]
+    #[case::split_on_numerics("split_on_numerics")]
+    #[case::preserve_original("preserve_original")]
+    #[case::index_operators("index_operators")]
+    fn test_code_analyzer_options_require_code_base_tokenizer(#[case] option: &str) {
+        let mut value = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(option.to_string(), true.into());
+
+        let err = serde_json::from_value::<InvertedIndexParams>(value).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("code analyzer flags require base_tokenizer='code'"),
+            "unexpected error for {option}: {err}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_text_analyzer_reports_the_analyzer_option() {
+        let err = serde_json::from_value::<InvertedIndexParams>(json!({
+            "analyzer": "text",
+            "split_identifiers": true
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("code analyzer flags require analyzer='code'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -2116,3 +2116,217 @@ async fn test_phrase_query_reads_legacy_per_doc_positions() {
 
     assert_eq!(row_ids, vec![100]);
 }
+
+#[rstest::rstest]
+#[case::and(Operator::And)]
+#[case::or(Operator::Or)]
+#[tokio::test]
+async fn test_exact_single_term_phrase_uses_frequencies_without_positions(
+    #[case] operator: Operator,
+    #[values(0, 17)] query_position: u32,
+) {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default().with_position(true);
+    let format = params.resolved_format_version();
+    let mut partition =
+        InnerBuilder::new_with_format_version(0, true, TokenSetFormat::default(), format);
+    partition.tokens.get_or_add("hit");
+    let mut posting =
+        PostingListBuilder::new_with_posting_tail_codec(true, format.posting_tail_codec());
+    posting.add(0, PositionRecorder::Position(vec![3, 7, 9].into()));
+    posting.add(1, PositionRecorder::Position(vec![4].into()));
+    partition.posting_lists.push(posting);
+    partition.docs.append(100, 10);
+    partition.docs.append(200, 6);
+    partition.docs.append(300, 6);
+    partition.write(store.as_ref()).await.unwrap();
+    write_test_metadata(&store, vec![0], params).await;
+
+    let index = InvertedIndex::load(store, None, &LanceCache::with_capacity(1 << 20))
+        .await
+        .unwrap();
+    let tokens = Arc::new(Tokens::with_positions(
+        vec!["hit".to_owned()],
+        vec![query_position],
+        DocType::Text,
+    ));
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let phrase = index
+        .bm25_search(
+            tokens.clone(),
+            Arc::new(params.clone().with_phrase_slop(Some(0))),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        index.partitions[0]
+            .inverted_list
+            .index_cache
+            .get_with_key(&PositionKey { token_id: 0 })
+            .await
+            .is_none(),
+        "a singleton exact phrase must not read or cache its position stream"
+    );
+    let matched = index
+        .bm25_search(
+            tokens,
+            Arc::new(params),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(phrase, matched);
+    let mut rows = phrase.0;
+    rows.sort_unstable();
+    assert_eq!(rows, vec![100, 200]);
+}
+
+#[tokio::test]
+async fn test_exact_single_term_phrase_still_requires_positional_index() {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let index = write_single_partition_index(
+        store,
+        InvertedIndexParams::default().with_position(false),
+        TokenSetFormat::default(),
+        "hit",
+        100,
+    )
+    .await
+    .unwrap();
+    let error = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["hit".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_phrase_slop(Some(0))),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("position is not found"),
+        "{error}"
+    );
+}
+
+async fn rewrite_miniblock_position_encoding(
+    store: &Arc<LanceIndexStore>,
+    partition_ids: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    // Use the existing mini-block positions encoding emitted by final mergers.
+    for partition_id in partition_ids {
+        let path = posting_file_path(partition_id);
+        let reader = store.open_index_file(&path).await?;
+        let metadata = reader.schema().metadata.clone();
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        let schema = batch.schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == COMPRESSED_POSITION_COL {
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert(
+                        lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.into(),
+                        lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.into(),
+                    );
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+        drop(reader);
+        let mut writer = store.new_index_file(&path, schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish_with_metadata(metadata).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_whole_positions_match_committed_arrow_streams() -> Result<()> {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        Arc::new(ObjectStore::local()),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    for partition_id in 0..2 {
+        let documents = (0..385)
+            .map(|row| {
+                let (left, right) = if row % 3 == 0 {
+                    ("alpha", "alpha")
+                } else if row % 3 == 1 {
+                    ("alpha", "beta")
+                } else {
+                    ("beta", "alpha")
+                };
+                (left, right, partition_id * 385 + row)
+            })
+            .collect::<Vec<_>>();
+        write_pair_partition_with_position(&store, partition_id, &documents, true).await;
+    }
+    rewrite_miniblock_position_encoding(&store, 0..2).await?;
+    let (index, _) = load_prewarmed_index(
+        store.clone(),
+        vec![0, 1],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    for partition in &index.partitions {
+        let inverted = &partition.inverted_list;
+        let PositionsLayout::SharedStream(codec) = inverted.positions_layout else {
+            panic!("fixture must use current shared position streams");
+        };
+        let reader = inverted.reader.get().await?;
+        for token_id in 0..inverted.len() as u32 {
+            let batch = reader
+                .read_range(
+                    token_id as usize..token_id as usize + 1,
+                    Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
+                )
+                .await?;
+            let offsets = batch[POSITION_BLOCK_OFFSET_COL].as_list::<i32>().value(0);
+            let expected = SharedPositionStream::from_arrow(
+                codec,
+                offsets.as_primitive::<UInt32Type>().values().to_vec(),
+                batch[COMPRESSED_POSITION_COL].as_binary::<i64>().clone(),
+            );
+            // Compare the entire encoded stream, not only rows selected by a
+            // query. This includes repeated positions and the partial tail.
+            assert!(expected.block_count() > 1);
+            for _ in 0..2 {
+                let actual = whole_positions::try_read(reader.as_ref(), token_id, codec)
+                    .await?
+                    .expect("mini-block fixture must support direct reads");
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    actual.size(),
+                    actual.bytes().len() + std::mem::size_of_val(actual.block_offsets()),
+                );
+            }
+        }
+    }
+    Ok(())
+}

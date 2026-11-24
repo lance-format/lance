@@ -8,17 +8,19 @@ use std::time::Duration;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::ClusteringDefinition;
+use lance_table::format::{ClusteringDefinition, ManifestBuildConfig};
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::default_commit_retry_timeout;
+use crate::io::commit::{
+    CommitTransactionOptions, conflict_resolver::AppendIdempotencyKey, default_commit_retry_timeout,
+};
 use crate::{
     Dataset, Error, Result,
     dataset::{
-        ManifestWriteConfig, ReadParams,
+        ReadParams,
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
         refs::Refs,
@@ -40,7 +42,7 @@ pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
     use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
-    storage_format: Option<ConcreteFileVersion>,
+    manifest_config: ManifestBuildConfig,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
@@ -51,17 +53,11 @@ pub struct CommitBuilder<'a> {
     retry_timeout: Duration,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    append_idempotency_property: Option<String>,
     timeout: Option<Duration>,
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    migration_next_row_id: Option<u64>,
-    /// Whether this commit atomically activates non-reusable field IDs.
-    activate_non_reusable_field_ids: bool,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
     inherited_field_ids: bool,
-    /// The complete desired clustering definitions list for an `UpdateConfig`
-    /// commit; see [`ManifestBuildConfig::clustering_definitions`].
-    clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Whether the caller has opted in to committing a [`CompositeOperation`].
     allow_composite_operations: bool,
 }
@@ -75,7 +71,7 @@ impl<'a> CommitBuilder<'a> {
             dest: dest.into(),
             use_stable_row_ids: None,
             enable_v2_manifest_paths: true,
-            storage_format: None,
+            manifest_config: ManifestBuildConfig::default(),
             commit_handler: None,
             store_params: None,
             object_store: None,
@@ -86,12 +82,10 @@ impl<'a> CommitBuilder<'a> {
             retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
+            append_idempotency_property: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
             inherited_field_ids: false,
-            clustering_definitions: None,
             allow_composite_operations: false,
         }
     }
@@ -120,13 +114,17 @@ impl<'a> CommitBuilder<'a> {
     /// prewritten fragments introduce another exact V2 version, the commit
     /// derives the required mixed-version capability from the final manifest.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
-        self.storage_format = Some(storage_format.resolve());
+        self.manifest_config = self
+            .manifest_config
+            .with_storage_format(DataStorageFormat::new(storage_format.resolve()));
 
         self
     }
 
     pub(crate) fn with_exact_storage_format(mut self, storage_format: ConcreteFileVersion) -> Self {
-        self.storage_format = Some(storage_format);
+        self.manifest_config = self
+            .manifest_config
+            .with_storage_format(DataStorageFormat::new(storage_format));
         self
     }
 
@@ -198,7 +196,9 @@ impl<'a> CommitBuilder<'a> {
     /// be restored (they stay readable). A table already under the contract is
     /// unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
-        self.clustering_definitions = Some(definitions);
+        self.manifest_config = self
+            .manifest_config
+            .with_clustering_definitions(definitions);
         self
     }
 
@@ -318,6 +318,33 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Deduplicate an [`Operation::Append`] by a property in
+    /// [`Transaction::transaction_properties`]. The property value must be nonempty.
+    ///
+    /// Use the same property name, value and original `read_version` on every
+    /// submission of a logical append. If an append with the same property value
+    /// has already committed on this branch after `read_version`, the call returns
+    /// an error with [`Error::append_already_committed_version`] and publishes no
+    /// version. The first append wins even when the staged fragments differ. It
+    /// may also reference the same staged files. Use distinct values for distinct
+    /// appends, and retain the base version and intervening history for as long
+    /// as the append can be retried. If there is a gap and no known match, the
+    /// commit fails.
+    ///
+    /// A committed append is matched by its stored property, including appends
+    /// written before this option was introduced. Every writer submitting the
+    /// logical append concurrently must use the option. This is for individual,
+    /// non-detached appends to an existing dataset.
+    ///
+    /// ```
+    /// # use lance::dataset::CommitBuilder;
+    /// let builder = CommitBuilder::new("memory://").with_append_idempotency_property("job_id");
+    /// ```
+    pub fn with_append_idempotency_property(mut self, property: impl Into<String>) -> Self {
+        self.append_idempotency_property = Some(property.into());
+        self
+    }
+
     /// Configure this commit as the second step of a stable row ID migration.
     ///
     /// Sets `use_stable_row_ids = true` and supplies the `next_row_id` that was
@@ -325,12 +352,14 @@ impl<'a> CommitBuilder<'a> {
     /// "cannot enable stable row IDs on an existing dataset" check so that the
     /// flag can be activated without creating the dataset from scratch.
     pub(crate) fn with_stable_row_id_migration_activation(mut self, next_row_id: u64) -> Self {
-        self.migration_next_row_id = Some(next_row_id);
+        self.manifest_config = self.manifest_config.with_migration_next_row_id(next_row_id);
         self
     }
 
     pub(crate) fn with_non_reusable_field_id_migration_activation(mut self) -> Self {
-        self.activate_non_reusable_field_ids = true;
+        self.manifest_config = self
+            .manifest_config
+            .with_activate_non_reusable_field_ids(true);
         self
     }
 
@@ -428,10 +457,37 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        let append_idempotency_key = if let Some(property) =
+            self.append_idempotency_property.as_deref()
+        {
+            if self.detached
+                || transaction.read_version == 0
+                || is_detached_version(transaction.read_version)
+                || !matches!(transaction.operation, Operation::Append { .. })
+            {
+                return Err(Error::invalid_input(
+                    "append idempotency requires a non-detached Append based on an existing version",
+                ));
+            }
+            let value = transaction
+                .transaction_properties
+                .as_deref()
+                .and_then(|properties| properties.get(property))
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "append idempotency requires a nonempty transaction property {property:?}"
+                    ))
+                })?;
+            Some(AppendIdempotencyKey { property, value })
+        } else {
+            None
+        };
+
         // A definitions list is a commit-time input for UpdateConfig alone. Every
         // other operation is refused here, before any path is chosen: the
         // new-dataset paths never reach the manifest builder's own check.
-        if self.clustering_definitions.is_some()
+        if self.manifest_config.clustering_definitions().is_some()
             && !matches!(transaction.operation, Operation::UpdateConfig { .. })
         {
             return Err(Error::invalid_input(
@@ -558,23 +614,17 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_stable_row_ids = if self.migration_next_row_id.is_some() {
+        let manifest_config = if self.manifest_config.migration_next_row_id().is_some() {
             // Migration activation always enables stable row IDs regardless of
-            // the current dataset state.
-            true
-        } else if let Some(ds) = dest.dataset() {
-            ds.manifest.uses_stable_row_ids()
+            // the current dataset state (already implied by `with_migration_next_row_id`).
+            self.manifest_config
         } else {
-            self.use_stable_row_ids.unwrap_or(false)
-        };
-
-        let manifest_config = ManifestWriteConfig {
-            use_stable_row_ids,
-            storage_format: self.storage_format.map(DataStorageFormat::new),
-            migration_next_row_id: self.migration_next_row_id,
-            activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
-            clustering_definitions: self.clustering_definitions.clone(),
-            ..Default::default()
+            let use_stable_row_ids = match dest.dataset() {
+                Some(ds) => ds.manifest.uses_stable_row_ids(),
+                None => self.use_stable_row_ids.unwrap_or(false),
+            };
+            self.manifest_config
+                .with_use_stable_row_ids(use_stable_row_ids)
         };
 
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
@@ -600,12 +650,14 @@ impl<'a> CommitBuilder<'a> {
                     object_store.as_ref(),
                     commit_handler.as_ref(),
                     &transaction,
-                    &manifest_config,
-                    &self.commit_config,
-                    self.retry_timeout,
-                    manifest_naming_scheme,
-                    self.affected_rows.as_ref(),
-                    None,
+                    CommitTransactionOptions::new(
+                        &manifest_config,
+                        &self.commit_config,
+                        manifest_naming_scheme,
+                    )
+                    .with_retry_timeout(self.retry_timeout)
+                    .with_affected_rows(self.affected_rows.as_ref())
+                    .with_append_idempotency_key(append_idempotency_key),
                 )
                 .await?
             }
@@ -709,6 +761,11 @@ impl<'a> CommitBuilder<'a> {
     ///   will be supported in the future.
     /// </div>
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
+        if self.append_idempotency_property.is_some() {
+            return Err(Error::invalid_input(
+                "append idempotency requires an individual Append transaction",
+            ));
+        }
         if transactions.is_empty() {
             return Err(Error::invalid_input_source(
                 "No transactions to commit".into(),
