@@ -1285,6 +1285,63 @@ fn make_seeded_vector_batch(num_rows: usize) -> (RecordBatch, SchemaRef) {
 }
 
 #[rstest]
+#[tokio::test]
+async fn refined_ivf_flat_keeps_nearest_live_rows(#[values(false, true)] stable_row_ids: bool) {
+    const K: usize = 5;
+    let (batch, schema) = make_seeded_vector_batch(240);
+    let query = batch["vector"].as_fixed_size_list().value(0);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            max_rows_per_file: 40,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(4, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // The same physical index outlives both partial and whole-fragment deletes.
+    for deleted_prefix in [1, 12, 72, 204] {
+        dataset
+            .delete(&format!("id < {deleted_prefix}"))
+            .await
+            .unwrap();
+        let expected = ground_truth(&dataset, "vector", query.as_ref(), K, DistanceType::L2).await;
+        let indexed = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .nprobes(4)
+            .refine(3)
+            .fast_search()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let actual: HashSet<u64> = indexed[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(indexed.num_rows(), K);
+        assert_eq!(actual, expected, "deleted prefix {deleted_prefix}");
+    }
+}
+
+#[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
 #[case::pq8(Some(8))]
