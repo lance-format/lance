@@ -22,13 +22,12 @@ use lance_table::format::Fragment;
 
 use super::Dataset;
 use super::fragment::FileFragment;
-use super::optimize::CompactionOptions;
 use super::scanner::{PlannedFilteredScan, Scanner};
 use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
-use super::write::{GenericWriter, WriteParams};
+use super::write::GenericWriter;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
@@ -58,65 +57,6 @@ pub fn create_scan_stream(
         | ConcreteFileVersion::V2_3 => LanceStream::try_new_v2(
             dataset, fragments, offsets, projection, config, metrics, partition,
         ),
-    }
-}
-
-fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
-    for fragment in fragments {
-        for data_file in fragment.referenced_lance_files() {
-            if data_file.file_version()? != expected {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
-pub async fn can_use_binary_copy(
-    version: ConcreteFileVersion,
-    dataset: &Dataset,
-    options: &CompactionOptions,
-    fragments: &[Fragment],
-) -> Result<bool> {
-    match version {
-        ConcreteFileVersion::V1 => Ok(false),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => {
-            if !binary_copy_files_match(fragments, version)? {
-                return Ok(false);
-            }
-            super::optimize::execution::can_use_binary_copy_current(dataset, options, fragments)
-                .await
-        }
-    }
-}
-
-pub async fn rewrite_files_binary_copy(
-    version: ConcreteFileVersion,
-    dataset: &Dataset,
-    fragments: &[Fragment],
-    params: &WriteParams,
-    read_batch_bytes: Option<usize>,
-) -> Result<Vec<Fragment>> {
-    match version {
-        ConcreteFileVersion::V1 => Err(Error::not_supported(
-            "binary-copy compaction is not supported for Lance file version 1".to_string(),
-        )),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => {
-            super::optimize::binary_copy::rewrite_files_binary_copy(
-                version,
-                dataset,
-                fragments,
-                params,
-                read_batch_bytes,
-            )
-            .await
-        }
     }
 }
 

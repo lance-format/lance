@@ -3,6 +3,8 @@
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
+use std::collections::HashMap;
+
 use lance_core::{Result, datatypes::Schema};
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::index_seed::IndexSeedWriter;
@@ -25,6 +27,12 @@ pub trait WriteSeedHook: Send + Sync {
         version: ConcreteFileVersion,
         schema: &Schema,
     ) -> Result<Vec<Box<dyn IndexSeedWriter>>>;
+
+    /// Current ZoneMap zone sizes by top-level field ID for carrying seeds
+    /// through binary copy. Unspecified fields use the format default.
+    async fn index_rows_per_zone(&self, _table: &Table) -> Result<HashMap<i32, u64>> {
+        Ok(HashMap::new())
+    }
 }
 
 /// Collects write seeds for the columns of one data file.

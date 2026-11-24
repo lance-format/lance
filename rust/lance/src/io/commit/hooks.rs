@@ -41,7 +41,7 @@ impl LanceCommitHook {
         }
     }
 
-    fn dataset(&self, table: &Table) -> Dataset {
+    pub(crate) fn dataset(&self, table: &Table) -> Dataset {
         Dataset::from_committed_table(table.clone(), self.session.clone())
     }
 }

@@ -4,7 +4,9 @@
 use lance_core::{Error, Result};
 use lance_table::feature_flags::FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
 use lance_table::format::{IndexMetadata, Manifest};
-use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
+use lance_table::system_index::frag_reuse::{
+    FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry, metadata::uses_tagged_fri,
+};
 
 /// An empty fragment reuse index counts.
 pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexMetadata]) -> bool {
@@ -64,4 +66,33 @@ pub fn validate_stable_row_id_fri_shape(
         )));
     }
     Ok(true)
+}
+
+/// Check the format and build constraints before recording a compaction
+/// on a stable-row-ID table. User index compatibility is checked separately.
+pub fn validate_stable_row_id_recording_format(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+    is_supported: bool,
+) -> Result<()> {
+    if !is_supported {
+        return Err(Error::not_supported(
+            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
+             recording their row-address moves in a fragment reuse index is not supported by \
+             this build of Lance",
+        ));
+    }
+    // The tagged-history flag is sticky, so it can outlive a trim and a
+    // migration to stable row ids.
+    let frag_reuse_entry = indices
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
+    if uses_tagged_fri(manifest, frag_reuse_entry) {
+        return Err(Error::not_supported(
+            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
+             manifest requires a tagged fragment reuse history, which stable row IDs do not \
+             support",
+        ));
+    }
+    Ok(())
 }

@@ -54,6 +54,37 @@ impl WriteSeedHook for LanceWriteSeedHook {
         };
         seed_writers_for(&dataset, &indices, schema, zone_map_seed_version).await
     }
+
+    async fn index_rows_per_zone(&self, table: &Table) -> Result<HashMap<i32, u64>> {
+        let dataset = Dataset::from_committed_table(table.clone(), self.session.clone());
+        let mut rows_per_zone = HashMap::new();
+        for index in load_all_indices(&dataset)
+            .await?
+            .iter()
+            .filter(|index| index_is_usable(index))
+        {
+            let Some(field_id) = index.keyed_field() else {
+                continue;
+            };
+            let Some(field) = dataset
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.id == field_id)
+            else {
+                continue;
+            };
+            let Ok(details) = fetch_index_details(&dataset, &field.name, index).await else {
+                continue;
+            };
+            if let Ok(zone_map) = details.to_msg::<pbold::ZoneMapIndexDetails>()
+                && let Some(configured) = zone_map.rows_per_zone
+            {
+                rows_per_zone.insert(field_id, configured);
+            }
+        }
+        Ok(rows_per_zone)
+    }
 }
 
 pub async fn collect_write_seeds(

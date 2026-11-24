@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Dataset;
-use crate::Result;
-use crate::dataset::DATA_DIR;
-use crate::dataset::WriteParams;
-use crate::dataset::fragment::write::generate_random_filename;
-use crate::datatypes::Schema;
-use lance_core::Error;
+use crate::fragment::generate_random_filename;
+use crate::{Table, WriteParams, WriteSeedHook};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::decoder::{ColumnInfo, PageInfo as DecPageInfo};
 use lance_file::reader::FileReader as LFReader;
 use lance_file::version::ConcreteFileVersion;
@@ -25,20 +21,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 async fn init_writer_if_necessary(
-    dataset: &Dataset,
+    dataset: &Table,
     version: ConcreteFileVersion,
     current_writer: &mut Option<FileWriter>,
     current_filename: &mut Option<String>,
 ) -> Result<bool> {
     if current_writer.is_none() {
         let filename = format!("{}.lance", generate_random_filename());
-        let path = dataset
-            .table_state
-            .base
-            .clone()
-            .join(DATA_DIR)
-            .join(filename.as_str());
-        let object_writer = dataset.table_state.object_store.create(&path).await?;
+        let path = dataset.data_dir().join(filename.as_str());
+        let object_writer = dataset.state.object_store.create(&path).await?;
         *current_writer = Some(file_versions::create_lazy_writer(
             version,
             object_writer,
@@ -140,10 +131,11 @@ async fn finalize_current_output_file(
 /// - `read_batch_bytes_opt`: optional I/O batch size when coalescing page reads.
 pub async fn rewrite_files_binary_copy(
     version: ConcreteFileVersion,
-    dataset: &Dataset,
+    dataset: &Table,
     fragments: &[Fragment],
     params: &WriteParams,
     read_batch_bytes_opt: Option<usize>,
+    seed_hook: Option<&dyn WriteSeedHook>,
 ) -> Result<Vec<Fragment>> {
     if fragments.is_empty() || fragments.iter().any(|fragment| fragment.files.is_empty()) {
         return Err(Error::invalid_input(
@@ -183,7 +175,10 @@ pub async fn rewrite_files_binary_copy(
     // Seeds of the inputs feeding the current output file, in copy order.
     let mut seed_acc = OutputSeedAccumulator::default();
     let carry_v1_seeds = lance_table::feature_flags::write_v1_zone_write_seeds(&dataset.manifest);
-    let index_rows_per_zone = seed_carry::index_rows_per_zone(dataset).await?;
+    let index_rows_per_zone = match seed_hook {
+        Some(hook) => hook.index_rows_per_zone(dataset).await?,
+        None => Default::default(),
+    };
 
     // Visit each fragment and all of its data files (a fragment may contain multiple files)
     for frag in fragments.iter() {
@@ -191,7 +186,7 @@ pub async fn rewrite_files_binary_copy(
             let object_store = if let Some(base_id) = df.base_id {
                 dataset.object_store(Some(base_id)).await?
             } else {
-                dataset.table_state.object_store.clone()
+                dataset.state.object_store.clone()
             };
             let full_path = dataset.data_file_dir(df)?.clone().join(df.path.as_str());
             let scan_scheduler = ScanScheduler::new(

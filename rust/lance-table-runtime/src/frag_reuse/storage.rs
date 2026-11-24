@@ -12,8 +12,8 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 };
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::system_index::frag_reuse::{
-    FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails,
-    PreloadedFragReuseHistory,
+    FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails,
+    FragReuseVersion, PreloadedFragReuseHistory,
 };
 use object_store::path::Path;
 use prost::Message;
@@ -24,6 +24,47 @@ use uuid::Uuid;
 use crate::Table;
 use crate::caches::FragReuseDetailsKey;
 use crate::commit::load_all_indices;
+
+/// `dataset_version` stamps both the new reuse version and the entry, which must agree.
+pub async fn build_new_frag_reuse_index(
+    dataset: &Table,
+    frag_reuse_groups: Vec<FragReuseGroup>,
+    new_fragment_bitmap: RoaringBitmap,
+    dataset_version: u64,
+) -> lance_core::Result<IndexMetadata> {
+    let new_version = FragReuseVersion {
+        // `finish_rewrite` restamps it if the rewrite publishes on a later version.
+        dataset_version,
+        groups: frag_reuse_groups,
+    };
+
+    let indices = dataset.load_index_metadata().await?;
+    let index_meta = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+
+    let (new_index_details, fragment_bitmap) = match index_meta {
+        None => (
+            FragReuseIndexDetails {
+                versions: Vec::from([new_version]),
+            },
+            new_fragment_bitmap,
+        ),
+        Some(index_meta) => {
+            let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
+            // Every version's new fragments, as a rebuild in `finish_rewrite` or a cleanup
+            // publishes, so the entry is the same whether or not its commit is restamped.
+            let fragment_bitmap = current_details.new_frag_bitmap() | new_fragment_bitmap;
+            let mut versions = current_details.versions.clone();
+            versions.push(new_version);
+            (FragReuseIndexDetails { versions }, fragment_bitmap)
+        }
+    };
+
+    let mut entry =
+        build_frag_reuse_index_metadata(dataset, index_meta, new_index_details, fragment_bitmap)
+            .await?;
+    entry.dataset_version = dataset_version;
+    Ok(entry)
+}
 
 /// Load fragment reuse index details from index metadata
 pub async fn load_frag_reuse_index_details(

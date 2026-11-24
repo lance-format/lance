@@ -16,32 +16,24 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::writer::FileWriterOptions;
-use lance_index::is_system_index;
-use lance_index::metrics::NoOpMetricsCollector;
+use lance_table::feature_flags::frag_reuse_with_stable_row_ids_enabled;
 use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{
     Fragment, IndexMetadata, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
     ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
 };
+use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_table::system_index::is_system_index;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::RewriteResult;
-use super::remapping::IndexRemapperOptions;
-use super::repack;
-use crate::Dataset;
-use crate::dataset::fragment::FileFragment;
-use crate::dataset::index::{
-    load_indices_for_remapping, vector_segment_merge_groups_for_compaction,
-};
-use crate::dataset::{WriteParams, versions};
-use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
-use crate::index::vector::details::needs_vector_details_inference;
-use crate::index::{
-    loading::{DatasetIndexInternalExt, load_all_indices},
-    segment::{index_is_usable, segment_has_vector_details},
-};
+use super::{CompactionHooks, CompactionIndexSegment, RewriteResult, repack};
+use crate::commit::index::{index_usability, open_v0_frag_reuse_index};
+use crate::commit::load_all_indices;
+use crate::frag_reuse::validate_stable_row_id_recording_format;
+use crate::fragment::validate_write_version;
+use crate::{FileFragment, Table, WriteParams};
 
 /// Default small-file threshold as a percentage of the maximum file size.
 const DEFAULT_MIN_FILE_SIZE_PERCENT: u128 = 95;
@@ -139,7 +131,7 @@ impl TryFrom<&str> for IndexRemapMode {
     }
 }
 
-/// Options to be passed to [`crate::dataset::optimize::compact_files`].
+/// Options to be passed to [`crate::optimize::compact_files`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionOptions {
     /// Target number of rows per file. Defaults to 1 million.
@@ -154,7 +146,7 @@ pub struct CompactionOptions {
     pub max_rows_per_group: usize,
     /// Max number of bytes per output data file.
     ///
-    /// Defaults to [`crate::dataset::WriteParams::max_bytes_per_file`].
+    /// Defaults to [`crate::WriteParams::max_bytes_per_file`].
     /// See [`Self::min_bytes_per_file`] for small-file selection.
     pub max_bytes_per_file: Option<usize>,
     /// Files at or above this size are excluded from small-file compaction.
@@ -163,7 +155,7 @@ pub struct CompactionOptions {
     /// Files needing cleanup may still be compacted.
     ///
     /// ```
-    /// use lance::dataset::optimize::CompactionOptions;
+    /// use lance_table_runtime::optimize::CompactionOptions;
     /// let options = CompactionOptions {
     ///     min_bytes_per_file: Some(512 * 1024 * 1024),
     ///     ..Default::default()
@@ -185,11 +177,11 @@ pub struct CompactionOptions {
     pub num_threads: Option<usize>,
     /// The batch size to use when scanning the input fragments.  If not
     /// specified then the default (see
-    /// [`crate::dataset::Scanner::batch_size`]) will be used.
+    /// `LANCE_DEFAULT_BATCH_SIZE`) will be used.
     pub batch_size: Option<usize>,
     /// The number of bytes to allow to queue up in the I/O buffer when scanning
     /// the input fragments.  If not specified then the default (see
-    /// [`crate::dataset::Scanner::io_buffer_size`]) will be used.
+    /// `LANCE_DEFAULT_IO_BUFFER_SIZE`) will be used.
     ///
     /// Increasing this can avoid a deadlock that occurs when a single batch of
     /// data is larger than the I/O buffer size.
@@ -307,7 +299,7 @@ pub struct CompactionOptions {
     /// with [`CompactionScope::RepackColumns`], which also refuses
     /// `ForceBinaryCopy`.
     ///
-    /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
+    /// [`FragmentColumnLayoutStats::live_file_count`]: crate::optimize::FragmentColumnLayoutStats::live_file_count
     #[serde(default)]
     pub max_data_files_per_fragment: Option<usize>,
     /// Which kinds of task this run plans. Defaults to [`CompactionScope::All`].
@@ -320,7 +312,7 @@ pub struct CompactionOptions {
     /// Targets cannot cross the V1/V2 boundary.
     ///
     /// ```
-    /// # use lance::dataset::optimize::CompactionOptions;
+    /// # use lance_table_runtime::optimize::CompactionOptions;
     /// # use lance_file::version::LanceFileVersion;
     /// let options = CompactionOptions {
     ///     data_storage_version: Some(LanceFileVersion::V2_2),
@@ -677,7 +669,7 @@ impl CompactionOptions {
         self
     }
 
-    pub(super) fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
+    pub(super) fn write_version(&self, dataset: &Table) -> ConcreteFileVersion {
         self.data_storage_version
             .map(LanceFileVersion::resolve)
             .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
@@ -767,7 +759,7 @@ impl SourceBudgetSummary {
     /// Whether a source budget left eligible work out of this plan.
     ///
     /// ```
-    /// use lance::dataset::optimize::SourceBudgetSummary;
+    /// use lance_table_runtime::optimize::SourceBudgetSummary;
     /// assert!(!SourceBudgetSummary::default().budget_exhausted());
     /// ```
     pub fn budget_exhausted(&self) -> bool {
@@ -777,7 +769,7 @@ impl SourceBudgetSummary {
     /// Whether eligible work exists but the first task cannot fit the budgets.
     ///
     /// ```
-    /// use lance::dataset::optimize::SourceBudgetSummary;
+    /// use lance_table_runtime::optimize::SourceBudgetSummary;
     /// assert!(!SourceBudgetSummary::default().is_blocked());
     /// ```
     pub fn is_blocked(&self) -> bool {
@@ -916,10 +908,6 @@ impl CompactionPlan {
     fn extend_tasks(&mut self, tasks: impl IntoIterator<Item = TaskData>) {
         self.tasks.extend(tasks);
     }
-
-    pub(super) fn tasks(&self) -> &[TaskData] {
-        &self.tasks
-    }
 }
 
 /// Trait for implementing custom compaction planning strategies.
@@ -936,7 +924,7 @@ pub trait CompactionPlanner: Send + Sync {
     /// # Arguments
     ///
     /// * `dataset` - Reference to the dataset to be compacted
-    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
+    async fn plan(&self, dataset: &Table) -> Result<CompactionPlan>;
 }
 
 /// Formulate a plan to compact the files in a dataset
@@ -949,7 +937,7 @@ pub trait CompactionPlanner: Send + Sync {
 /// compacted.
 ///
 /// Fragments no rewrite task takes are then checked for a column repack
-/// against [`Dataset::column_layout_stats`], one task per fragment.
+/// against [`Table::column_layout_stats`], one task per fragment.
 #[derive(Debug, Clone, Default)]
 pub struct DefaultCompactionPlanner {
     options: CompactionOptions,
@@ -968,19 +956,10 @@ impl DefaultCompactionPlanner {
         })
     }
 
-    /// Select the publication contract used by this plan. Without an explicit
-    /// remapper, planning preserves physical index boundaries. Distributed callers
-    /// using [`crate::dataset::index::DatasetIndexRemapperOptions`] at commit may opt into atomic merges.
-    ///
-    /// ```
-    /// use lance::dataset::index::DatasetIndexRemapperOptions;
-    /// use lance::dataset::optimize::{CompactionOptions, DefaultCompactionPlanner};
-    /// let planner = DefaultCompactionPlanner::new(CompactionOptions::default())?
-    ///     .with_index_remapper(&DatasetIndexRemapperOptions::default());
-    /// # Ok::<(), lance::Error>(())
-    /// ```
-    pub fn with_index_remapper(mut self, remapper: &dyn IndexRemapperOptions) -> Self {
-        self.can_replace_vector_segments = remapper.supports_vector_segment_replacement();
+    /// Allow a planning hook to group compatible segments when the selected
+    /// compaction remapper can atomically replace them.
+    pub fn with_vector_segment_replacement(mut self, supported: bool) -> Self {
+        self.can_replace_vector_segments = supported;
         self
     }
 }
@@ -988,7 +967,8 @@ impl DefaultCompactionPlanner {
 impl DefaultCompactionPlanner {
     /// Why one fragment is a compaction candidate, if it is: the same rule for
     /// ordinary planning and for caller-chosen groups.
-    pub(super) fn candidacy_of(
+    #[doc(hidden)]
+    pub fn candidacy_of(
         &self,
         fragment: &Fragment,
         metrics: &FragmentMetrics,
@@ -1081,7 +1061,7 @@ impl DefaultCompactionPlanner {
     /// and `max_data_files_per_fragment` are not consulted.
     pub async fn plan_groups(
         &self,
-        dataset: &Dataset,
+        dataset: &Table,
         groups: Vec<CompactionGroup>,
     ) -> Result<CompactionPlan> {
         Ok(self.plan_groups_with_budget(dataset, groups).await?.plan)
@@ -1096,9 +1076,10 @@ impl DefaultCompactionPlanner {
     /// the selected prefix.
     ///
     /// ```
-    /// # use lance::{Dataset, Result};
-    /// # use lance::dataset::optimize::{CompactionGroup, CompactionOptions, DefaultCompactionPlanner};
-    /// # async fn plan(dataset: &Dataset, groups: Vec<CompactionGroup>) -> Result<()> {
+    /// # use lance_core::Result;
+    /// # use lance_table_runtime::Table;
+    /// # use lance_table_runtime::optimize::{CompactionGroup, CompactionOptions, DefaultCompactionPlanner};
+    /// # async fn plan(dataset: &Table, groups: Vec<CompactionGroup>) -> Result<()> {
     /// let result = DefaultCompactionPlanner::new(CompactionOptions {
     ///     max_source_rows: Some(5_000_000), ..Default::default()
     /// })?.plan_groups_with_budget(dataset, groups).await?;
@@ -1108,23 +1089,31 @@ impl DefaultCompactionPlanner {
     /// ```
     pub async fn plan_groups_with_budget(
         &self,
-        dataset: &Dataset,
+        dataset: &Table,
         groups: Vec<CompactionGroup>,
     ) -> Result<CompactionPlanningResult> {
+        self.plan_groups_with_budget_and_hooks(dataset, groups, &CompactionHooks::default())
+            .await
+    }
+
+    /// Plan explicit groups using the caller's index bindings.
+    pub async fn plan_groups_with_budget_and_hooks(
+        &self,
+        dataset: &Table,
+        groups: Vec<CompactionGroup>,
+        hooks: &CompactionHooks<'_>,
+    ) -> Result<CompactionPlanningResult> {
         let write_version = self.options.write_version(dataset);
-        versions::validate_write_version(
+        validate_write_version(
             dataset.manifest.data_storage_format.lance_file_format(),
             write_version,
         )?;
         if self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
-            ensure_frag_reuse_recording_allowed(
-                &dataset.manifest,
-                &load_all_indices(dataset).await?,
-            )?;
+            ensure_frag_reuse_recording_allowed(dataset, hooks).await?;
         }
         let eager_remap_capable =
             if !self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
-                Some(has_eager_remappable_index(dataset).await?)
+                Some(needs_row_addrs(dataset, hooks).await?)
             } else {
                 None
             };
@@ -1186,12 +1175,11 @@ impl DefaultCompactionPlanner {
         // that coverage into its exclusions: the index is left addressing the
         // rows it already addresses, and the other members of the same group
         // and of every other group still plan. Group boundaries are untouched.
-        let unreadable_coverage =
-            if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
-                unremappable_index_coverage(dataset).await?
-            } else {
-                Vec::new()
-            };
+        let unreadable_coverage = if !self.options.defer_index_remap {
+            unremappable_index_coverage(dataset, hooks, false).await?
+        } else {
+            Vec::new()
+        };
         let held_back =
             unreadable_coverage
                 .iter()
@@ -1279,7 +1267,7 @@ impl DefaultCompactionPlanner {
                         .await
                         .map(|metrics| (group_index, Some((fragment.into(), metrics))))
                 })
-                .buffered(dataset.table_state.object_store.as_ref().io_parallelism())
+                .buffered(dataset.state.object_store.as_ref().io_parallelism())
                 .try_collect()
                 .await?;
         measured.reverse();
@@ -1348,8 +1336,13 @@ impl DefaultCompactionPlanner {
                     .collect::<RoaringBitmap>()
             })
             .collect::<Vec<_>>();
-        let index_fragmaps =
-            load_index_fragmaps(dataset, can_merge_vector_segments, &candidate_windows).await?;
+        let index_fragmaps = load_index_fragmaps(
+            dataset,
+            can_merge_vector_segments,
+            &candidate_windows,
+            hooks,
+        )
+        .await?;
         let indices_containing_frag = |frag_id: u32| {
             index_fragmaps
                 .iter()
@@ -1513,7 +1506,7 @@ impl DefaultCompactionPlanner {
 
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
-    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+    async fn plan(&self, dataset: &Table) -> Result<CompactionPlan> {
         Ok(self.plan_with_budget(dataset).await?.plan)
     }
 }
@@ -1526,9 +1519,10 @@ impl DefaultCompactionPlanner {
     /// adjusting; a task's row count is a minimum for the row limit only.
     ///
     /// ```
-    /// # use lance::{Dataset, Result};
-    /// # use lance::dataset::optimize::{CompactionOptions, DefaultCompactionPlanner, SourceBudgetLimit};
-    /// # async fn plan(dataset: &Dataset) -> Result<()> {
+    /// # use lance_core::Result;
+    /// # use lance_table_runtime::Table;
+    /// # use lance_table_runtime::optimize::{CompactionOptions, DefaultCompactionPlanner, SourceBudgetLimit};
+    /// # async fn plan(dataset: &Table) -> Result<()> {
     /// let result = DefaultCompactionPlanner::new(CompactionOptions {
     ///     max_source_rows: Some(5_000_000), ..Default::default()
     /// })?.plan_with_budget(dataset).await?;
@@ -1540,16 +1534,26 @@ impl DefaultCompactionPlanner {
     /// }
     /// # Ok(()) }
     /// ```
-    pub async fn plan_with_budget(&self, dataset: &Dataset) -> Result<CompactionPlanningResult> {
+    pub async fn plan_with_budget(&self, dataset: &Table) -> Result<CompactionPlanningResult> {
+        self.plan_with_budget_and_hooks(dataset, &CompactionHooks::default())
+            .await
+    }
+
+    /// Plan against the table using the caller's index bindings.
+    pub async fn plan_with_budget_and_hooks(
+        &self,
+        dataset: &Table,
+        hooks: &CompactionHooks<'_>,
+    ) -> Result<CompactionPlanningResult> {
         let write_version = self.options.write_version(dataset);
-        versions::validate_write_version(
+        validate_write_version(
             dataset.manifest.data_storage_format.lance_file_format(),
             write_version,
         )?;
         let mut all_tasks = if self.options.scope == CompactionScope::RepackColumns {
             Vec::new()
         } else {
-            self.plan_rewrites(dataset).await?
+            self.plan_rewrites(dataset, hooks).await?
         };
         if self.options.scope != CompactionScope::RewriteFragments {
             let rewritten: HashSet<u64> = all_tasks
@@ -1569,17 +1573,14 @@ impl DefaultCompactionPlanner {
             .any(|task| task.kind == CompactionTaskKind::RewriteFragments);
         let moves_rows_with_stable_row_ids = moves_rows && dataset.manifest.uses_stable_row_ids();
         if self.options.defer_index_remap && moves_rows_with_stable_row_ids {
-            ensure_frag_reuse_recording_allowed(
-                &dataset.manifest,
-                &load_all_indices(dataset).await?,
-            )?;
+            ensure_frag_reuse_recording_allowed(dataset, hooks).await?;
         }
         // Computed at most once here, rather than reloaded by every task in
         // `rewrite_files` and the planner above: see the doc comment on
         // `CompactionOptions::has_eager_remappable_index`.
         let eager_remap_capable =
             if !self.options.defer_index_remap && moves_rows_with_stable_row_ids {
-                Some(has_eager_remappable_index(dataset).await?)
+                Some(needs_row_addrs(dataset, hooks).await?)
             } else {
                 None
             };
@@ -1604,7 +1605,11 @@ impl DefaultCompactionPlanner {
     }
 
     /// The tasks that rewrite fragments, each with its live row count.
-    async fn plan_rewrites(&self, dataset: &Dataset) -> Result<Vec<(TaskData, usize)>> {
+    async fn plan_rewrites(
+        &self,
+        dataset: &Table,
+        hooks: &CompactionHooks<'_>,
+    ) -> Result<Vec<(TaskData, usize)>> {
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
         let fragments = dataset.get_fragments();
@@ -1613,19 +1618,11 @@ impl DefaultCompactionPlanner {
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
             "fragments in manifest are not sorted"
         );
-        // Without stable row ids a rewrite moves every row address, so the
-        // indices over the rewritten fragments have to be remapped in the same
-        // commit, and an index this build cannot open cannot be remapped. With
-        // stable row ids this never applies: every index's coverage is fixed
-        // up from manifest metadata alone (follow the data, or drop the
-        // rewritten fragments), which needs no reader for the index at all.
-        // An unremappable index's fragments join the caller's own exclusions
-        // and are left uncompacted - taking the same path, which terminates
-        // the current bin rather than letting the candidates on either side
-        // of the gap be planned together.
+        // Leave unremappable index coverage in place. The exclusions end the
+        // current bin so candidates on either side cannot be planned together.
         let mut excluded_fragment_ids = self.excluded_fragment_ids.clone();
-        if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
-            let unremappable = unremappable_index_coverage(dataset)
+        if !self.options.defer_index_remap {
+            let unremappable = unremappable_index_coverage(dataset, hooks, false)
                 .await?
                 .into_iter()
                 .fold(RoaringBitmap::new(), |mut covered, (_, fragments)| {
@@ -1657,7 +1654,7 @@ impl DefaultCompactionPlanner {
                         .map(|metrics| Some((fragment.into(), metrics)))
                 }
             })
-            .buffered(dataset.table_state.object_store.as_ref().io_parallelism());
+            .buffered(dataset.state.object_store.as_ref().io_parallelism());
 
         let schema_field_ids = dataset
             .schema()
@@ -1742,8 +1739,13 @@ impl DefaultCompactionPlanner {
         let can_merge_vector_segments = self.can_replace_vector_segments
             && !self.options.defer_index_remap
             && !dataset.manifest.uses_stable_row_ids();
-        let index_fragmaps =
-            load_index_fragmaps(dataset, can_merge_vector_segments, &candidate_windows).await?;
+        let index_fragmaps = load_index_fragmaps(
+            dataset,
+            can_merge_vector_segments,
+            &candidate_windows,
+            hooks,
+        )
+        .await?;
         let indices_containing_frag = |frag_id: u32| {
             index_fragmaps
                 .iter()
@@ -1835,11 +1837,11 @@ impl DefaultCompactionPlanner {
     /// The tasks that repack the columns of a fragment not in `rewritten`,
     /// each with its live row count. A fragment is considered when it holds
     /// columns in more than `max_data_files_per_fragment` files, as
-    /// [`Dataset::column_layout_stats`] counts them, and
+    /// [`Table::column_layout_stats`] counts them, and
     /// `repack::plan_fragment_repack` decides what to merge.
     fn plan_repacks(
         &self,
-        dataset: &Dataset,
+        dataset: &Table,
         rewritten: &HashSet<u64>,
     ) -> Result<Vec<(TaskData, usize)>> {
         let Some(max_files) = self.options.max_data_files_per_fragment else {
@@ -1884,7 +1886,8 @@ impl DefaultCompactionPlanner {
 
 /// Information about a fragment used to decide its fate in compaction
 #[derive(Debug)]
-pub(super) struct FragmentMetrics {
+#[doc(hidden)]
+pub struct FragmentMetrics {
     /// The number of original rows in the fragment
     pub physical_rows: usize,
     /// The number of rows that have been deleted
@@ -1908,12 +1911,14 @@ impl FragmentMetrics {
 }
 
 /// The number of held-back fragment ids a log line names before summarizing.
-pub(super) const HELD_BACK_SAMPLE_LIMIT: usize = 8;
+#[doc(hidden)]
+pub const HELD_BACK_SAMPLE_LIMIT: usize = 8;
 
 /// Render held-back fragment ids for a log line: the first
 /// [`HELD_BACK_SAMPLE_LIMIT`] in ascending order, then how many are left, so
 /// that coverage of an arbitrarily wide index cannot produce an unbounded line.
-pub(super) fn describe_held(ids: &BTreeSet<u64>) -> String {
+#[doc(hidden)]
+pub fn describe_held(ids: &BTreeSet<u64>) -> String {
     let sample = ids
         .iter()
         .take(HELD_BACK_SAMPLE_LIMIT)
@@ -1940,10 +1945,8 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
 /// Read the main-file size when it reliably indicates whether merging can help.
 /// Multi-file, deleted, overlaid, and obsolete-column layouts return unknown.
 /// Blob sidecars are excluded because the byte cap applies to the main file.
-pub(super) fn fragment_file_bytes(
-    fragment: &Fragment,
-    schema_field_ids: &HashSet<i32>,
-) -> Option<u64> {
+#[doc(hidden)]
+pub fn fragment_file_bytes(fragment: &Fragment, schema_field_ids: &HashSet<i32>) -> Option<u64> {
     if fragment.files.len() != 1
         || fragment.deletion_file.is_some()
         || !fragment.overlays.is_empty()
@@ -1973,7 +1976,8 @@ pub(super) fn fragment_file_bytes(
 /// binary copy and update write, holds no dead user column and never matches;
 /// nor does any file compaction writes, so compacting a fragment that matches
 /// cannot leave one that matches again.
-pub(super) fn pins_dead_user_columns_for_lineage(
+#[doc(hidden)]
+pub fn pins_dead_user_columns_for_lineage(
     fragment: &Fragment,
     schema_field_ids: &HashSet<i32>,
 ) -> bool {
@@ -2009,7 +2013,8 @@ pub(super) fn pins_dead_user_columns_for_lineage(
 /// tasks use the same cumulative checks as hard mode.
 ///
 /// Each task is paired with the number of live rows in its source fragments.
-pub(super) fn limit_tasks_to_source_budget(
+#[doc(hidden)]
+pub fn limit_tasks_to_source_budget(
     options: &CompactionOptions,
     schema: &lance_core::datatypes::Schema,
     all_tasks: Vec<(TaskData, usize)>,
@@ -2165,7 +2170,8 @@ fn task_source_bytes(
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum CompactionCandidacy {
+#[doc(hidden)]
+pub enum CompactionCandidacy {
     /// Compact the fragment if it has neighbors that are also candidates
     CompactWithNeighbors,
     /// Compact the fragment regardless.
@@ -2173,7 +2179,8 @@ pub(super) enum CompactionCandidacy {
 }
 
 /// Internal struct used for planning compaction.
-pub(super) struct CandidateBin {
+#[doc(hidden)]
+pub struct CandidateBin {
     pub fragments: Vec<Fragment>,
     /// Where these fragments sit in the sequence this run binned, not in the
     /// manifest: the whole-dataset planner counts the fragments it considered,
@@ -2188,7 +2195,7 @@ pub(super) struct CandidateBin {
 
 impl CandidateBin {
     /// Return true if compacting these fragments wouldn't do anything.
-    pub(super) fn is_noop(&self) -> bool {
+    pub fn is_noop(&self) -> bool {
         if self.fragments.is_empty() {
             return true;
         }
@@ -2201,7 +2208,7 @@ impl CandidateBin {
     }
 
     /// Split into one or more bins with at least `min_num_rows` in them.
-    pub(super) fn split_for_size(self, min_num_rows: usize) -> Vec<Self> {
+    pub fn split_for_size(self, min_num_rows: usize) -> Vec<Self> {
         let total_rows = self.row_counts.iter().sum::<usize>();
         let mut remaining_rows = total_rows;
         let mut current_rows = 0;
@@ -2257,84 +2264,42 @@ impl CandidateBin {
     }
 }
 
-pub(super) async fn load_index_fragmaps(
-    dataset: &Dataset,
+async fn load_index_fragmaps(
+    dataset: &Table,
     can_merge_vector_segments: bool,
     candidate_windows: &[RoaringBitmap],
+    hooks: &CompactionHooks<'_>,
 ) -> Result<Vec<RoaringBitmap>> {
-    // Coverage, not usability: these bitmaps decide the rewrite groups. Under
-    // stable row ids `Transaction::recalculate_fragment_bitmap` then rejects any
-    // group that splits an index's coverage, and it walks every index the new
-    // manifest carries - including the ones this build cannot read. Binning from
-    // the filtered view fails that check outright on a dataset holding an index
-    // written by a newer Lance.
-    let indices = load_all_indices(dataset).await?;
-    let mut index_fragmaps = Vec::with_capacity(indices.len());
-    let mut segments_by_name = HashMap::<&str, Vec<_>>::new();
-    for index in indices.iter().filter(|idx| !is_system_index(idx)) {
-        segments_by_name
-            .entry(index.name.as_str())
-            .or_default()
-            .push(index);
+    // A rewrite group must respect the coverage of every user segment,
+    // including opaque indices a query could not use.
+    let indices = load_all_indices(dataset, hooks.commit_index.as_deref()).await?;
+    let mut segments = Vec::with_capacity(indices.len());
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
+        segments.push(CompactionIndexSegment {
+            index,
+            coverage: index_fragment_coverage(dataset, index).await?,
+        });
     }
 
-    // Apply all manifest-known boundaries before loading any stored models.
-    // Eligible segments can potentially share coverage; scalar, opaque and
-    // unsupported vector layouts retain their individual boundaries.
-    let mut potential_boundaries = Vec::new();
-    if can_merge_vector_segments {
-        for segments in segments_by_name.values() {
-            let mut eligible_coverage = RoaringBitmap::new();
-            for segment in segments {
-                let coverage = index_fragment_coverage(dataset, segment).await?;
-                if crate::dataset::index::is_merge_candidate(segment) {
-                    eligible_coverage |= coverage;
-                } else {
-                    potential_boundaries.push(coverage);
-                }
+    let mut merge_group_by_id = HashMap::new();
+    let mut index_fragmaps = Vec::with_capacity(segments.len());
+    if can_merge_vector_segments && let Some(hook) = hooks.index {
+        let merge_groups = hook
+            .merge_index_segments(dataset, &segments, candidate_windows)
+            .await;
+        for group in merge_groups {
+            for id in group {
+                merge_group_by_id.insert(id, index_fragmaps.len());
             }
-            if !eligible_coverage.is_empty() {
-                potential_boundaries.push(eligible_coverage);
-            }
+            index_fragmaps.push(RoaringBitmap::new());
         }
     }
-    let candidate_windows = crate::dataset::index::constrain_candidate_windows(
-        candidate_windows,
-        &potential_boundaries,
-    );
 
-    let mut visited_names = HashSet::new();
-    // System indices (fragment-reuse, mem-wal) don't define data coverage and
-    // aren't remapped per rewrite group, so they must not constrain compaction
-    // bins -- otherwise deferred compaction's fragment-reuse index repeatedly
-    // splits the small-fragment run and they never coalesce.
-    for index in indices.iter().filter(|idx| !is_system_index(idx)) {
-        if !visited_names.insert(index.name.as_str()) {
-            continue;
-        }
-
-        let segments = &segments_by_name[index.name.as_str()];
-        let merge_groups = if can_merge_vector_segments {
-            let (relevant, other): (Vec<_>, Vec<_>) =
-                segments.iter().copied().partition(|segment| {
-                    segment.fragment_bitmap.as_ref().is_some_and(|coverage| {
-                        candidate_windows.iter().any(|window| {
-                            !coverage.is_disjoint(window) && !window.is_subset(coverage)
-                        })
-                    })
-                });
-            let mut groups = vector_segment_merge_groups_for_compaction(dataset, &relevant).await;
-            groups.extend(other.into_iter().map(|segment| vec![segment]));
-            groups
+    for segment in segments {
+        if let Some(group) = merge_group_by_id.get(&segment.index.uuid) {
+            index_fragmaps[*group] |= segment.coverage;
         } else {
-            segments.iter().map(|segment| vec![*segment]).collect()
-        };
-        for merge_group in merge_groups {
-            let mut group_fragment_bitmap = RoaringBitmap::new();
-            for segment in merge_group {
-                group_fragment_bitmap |= index_fragment_coverage(dataset, segment).await?;
-            }
-            index_fragmaps.push(group_fragment_bitmap);
+            index_fragmaps.push(segment.coverage);
         }
     }
     Ok(index_fragmaps)
@@ -2343,62 +2308,46 @@ pub(super) async fn load_index_fragmaps(
 /// The fragments an index segment covers, reconstructing the coverage of a
 /// legacy segment that predates the bitmap from the dataset it was written
 /// against.
-async fn index_fragment_coverage(
-    dataset: &Dataset,
-    index: &IndexMetadata,
-) -> Result<RoaringBitmap> {
+async fn index_fragment_coverage(dataset: &Table, index: &IndexMetadata) -> Result<RoaringBitmap> {
     if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
         return Ok(fragment_bitmap.clone());
     }
 
     let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-    // max_fragment_id is inclusive (the highest id); +1 for an exclusive
-    // upper bound so the last fragment is covered (None => empty range).
-    let frags = 0..dataset_at_index
-        .manifest
-        .max_fragment_id
-        .map_or(0, |m| m + 1);
-    let mut coverage = RoaringBitmap::from_sorted_iter(frags).unwrap();
-    // Reconstructed in the id space of the version the index was written
-    // against, which a later compaction has already moved on from.
-    // `load_all_indices` puts a stored bitmap into the current space by running
-    // it through the fragment-reuse index and leaves a `None` one alone, so a
-    // reconstruction has to take that step itself. Skipping it names the
-    // fragments a deferred compaction moved these rows out of, which is a set
-    // no rewrite can intersect - the guards below then wave through the rewrite
-    // of the fragment the rows actually live in.
-    if let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? {
-        frag_reuse_index.remap_fragment_bitmap(&mut coverage)?;
+    let mut coverage = RoaringBitmap::new();
+    if let Some(max) = dataset_at_index.manifest.max_fragment_id {
+        coverage.insert_range(0..=max);
+    }
+    // Stored bitmaps are already translated by load_all_indices. The legacy
+    // fallback reconstructs an old bitmap, so project it through v0 history.
+    if let Some(history) = legacy_frag_reuse_index(dataset).await? {
+        history.remap_fragment_bitmap(&mut coverage)?;
     }
     Ok(coverage)
 }
 
-/// Each index this build has no reader for, by name, and the fragments it covers.
-///
-/// A rewrite moves every row address in the fragments it touches, and putting an
-/// index back in step means opening it. A build that cannot open one cannot
-/// remap it, so compacting the fragments it covers would leave it addressing
-/// rows that are gone -- worse than the erase this whole path exists to prevent.
-/// They are held out of the plan instead, and the rest of the table still
-/// compacts.
-///
-/// Only the non-stable-row-id eager remap path needs this: there, a rewrite
-/// group fixes up an index's coverage by remapping it or not at all, so an
-/// index this build cannot open is left stranded on deleted fragment ids. On
-/// a stable-row-id table every index's coverage is instead fixed up from
-/// manifest metadata alone (follow the data, or drop the rewritten
-/// fragments), which needs no reader for the index at all, so this check
-/// does not apply there; callers only run it for non-stable-row-id tables.
-async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
+/// Find coverage whose indices require an engine to follow moved rows.
+async fn unremappable_index_coverage(
+    dataset: &Table,
+    hooks: &CompactionHooks<'_>,
+    no_remapper_factory: bool,
+) -> Result<Vec<(String, RoaringBitmap)>> {
+    // Lance preserves or withdraws stable-row-ID coverage using manifest
+    // metadata. A standalone caller without an index binding holds those
+    // fragments back, since it cannot determine whether coverage can follow.
+    if dataset.manifest.uses_stable_row_ids() && hooks.index.is_some() && !no_remapper_factory {
+        return Ok(Vec::new());
+    }
+    let is_usable = index_usability(hooks.commit_index.as_deref());
+    let indices = load_all_indices(dataset, hooks.commit_index.as_deref()).await?;
     let mut coverage = Vec::new();
-    for index in load_all_indices(dataset).await?.iter() {
-        if index_is_usable(index) {
-            continue;
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
+        if hooks.index.is_none() || no_remapper_factory || !is_usable(index) {
+            coverage.push((
+                index.name.clone(),
+                index_fragment_coverage(dataset, index).await?,
+            ));
         }
-        coverage.push((
-            index.name.clone(),
-            index_fragment_coverage(dataset, index).await?,
-        ));
     }
     Ok(coverage)
 }
@@ -2408,13 +2357,13 @@ async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, R
 /// [`DefaultCompactionPlanner`] keeps those fragments out of the plan, but
 /// nothing forces a caller through it: `compact_files_with_planner` takes any
 /// planner, [`CompactionPlan`] is public and serializable, and a distributed
-/// driver hands [`crate::dataset::optimize::commit_compaction`] results planned elsewhere. Committing such
+/// driver hands [`crate::optimize::commit_compaction`] results planned elsewhere. Committing such
 /// a plan strands the index on fragment ids the rewrite deleted, so the commit
-/// boundary refuses it rather than the planner alone. Only relevant without
-/// stable row ids; see [`unremappable_index_coverage`].
+/// boundary checks coverage again.
 pub(super) async fn reject_unremappable_rewrite(
-    dataset: &Dataset,
+    dataset: &Table,
     completed_tasks: &[RewriteResult],
+    hooks: &CompactionHooks<'_>,
 ) -> Result<()> {
     let rewritten = completed_tasks
         .iter()
@@ -2422,7 +2371,9 @@ pub(super) async fn reject_unremappable_rewrite(
         .filter_map(|fragment| u32::try_from(fragment.id).ok())
         .collect::<RoaringBitmap>();
 
-    for (name, covered) in unremappable_index_coverage(dataset).await? {
+    for (name, covered) in
+        unremappable_index_coverage(dataset, hooks, hooks.remapper.is_none()).await?
+    {
         let blocked = covered & &rewritten;
         if !blocked.is_empty() {
             return Err(Error::invalid_input(format!(
@@ -2440,28 +2391,58 @@ pub(super) async fn reject_unremappable_rewrite(
 }
 
 pub async fn plan_compaction(
-    dataset: &Dataset,
+    dataset: &Table,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
     let planner = DefaultCompactionPlanner::new(options.clone())?;
     planner.plan(dataset).await
 }
 
-/// Whether any non-system index on `dataset` both stores row addresses and
-/// its type supports being eagerly remapped onto them
-/// (`IndexMetadata::supports_eager_remap`). Metadata-only, no index opened:
-/// an index whose type can never remap (ZoneMap, BloomFilter, FM) does not
-/// count, since an eager remap would do nothing for it but materialize and
-/// then discard an old-to-new move for every rewritten row -- on a large
-/// compaction, table-scale memory the rewrite files have already been
-/// written to produce.
-pub(super) async fn has_eager_remappable_index(dataset: &Dataset) -> Result<bool> {
-    let Some(indices) = load_indices_for_remapping(dataset).await? else {
-        return Ok(false);
-    };
-    Ok(indices
+/// Ask the host whether an eager remap would consume row addresses.
+pub(super) async fn needs_row_addrs(dataset: &Table, hooks: &CompactionHooks<'_>) -> Result<bool> {
+    match hooks.index {
+        Some(hook) => hook.needs_row_addrs(dataset).await,
+        None => Ok(false),
+    }
+}
+
+pub(super) async fn ensure_frag_reuse_recording_allowed(
+    dataset: &Table,
+    hooks: &CompactionHooks<'_>,
+) -> Result<()> {
+    let indices = load_all_indices(dataset, hooks.commit_index.as_deref()).await?;
+    validate_stable_row_id_recording_format(
+        &dataset.manifest,
+        &indices,
+        frag_reuse_with_stable_row_ids_enabled(),
+    )?;
+    if let Some(hook) = hooks.index {
+        hook.validate_stable_row_id_recording(&indices)?;
+    } else if indices.iter().any(|index| !is_system_index(index)) {
+        return Err(Error::not_supported(
+            "Cannot verify user indices on a stable-row-id table with fragment reuse",
+        ));
+    }
+    Ok(())
+}
+
+async fn legacy_frag_reuse_index(
+    dataset: &Table,
+) -> Result<Option<Arc<lance_table::system_index::frag_reuse::CompactFragReuseIndex>>> {
+    let indices = dataset.load_index_metadata().await?;
+    let Some(entry) = indices
         .iter()
-        .any(|index| !is_system_index(index) && index.supports_eager_remap()))
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(None);
+    };
+    match entry.index_version {
+        0 => Ok(Some(open_v0_frag_reuse_index(dataset, entry).await?)),
+        1 => Ok(None),
+        version => Err(Error::not_supported(format!(
+            "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+        ))),
+    }
 }
 
 /// Refuse an eager index remap while the table's fragment reuse index is not
@@ -2477,8 +2458,8 @@ pub(super) async fn has_eager_remappable_index(dataset: &Dataset) -> Result<bool
 /// every row the FRI still had to translate. Explicitly remapping the indices
 /// and cleaning up the FRI first, or compacting with `defer_index_remap` set
 /// instead, keeps the index's pages in step with its coverage.
-pub(super) async fn reject_eager_remap_over_undrained_fri(dataset: &Dataset) -> Result<()> {
-    if let Some(fri) = dataset.frag_reuse_index().await?
+pub(super) async fn reject_eager_remap_over_undrained_fri(dataset: &Table) -> Result<()> {
+    if let Some(fri) = legacy_frag_reuse_index(dataset).await?
         && !fri.is_empty()
     {
         return Err(Error::not_supported(
@@ -2492,17 +2473,18 @@ pub(super) async fn reject_eager_remap_over_undrained_fri(dataset: &Dataset) -> 
 }
 
 pub(super) async fn validate_fragment_groups_preserve_index_boundaries<'a>(
-    dataset: &Dataset,
+    dataset: &Table,
     groups: impl Iterator<Item = &'a [Fragment]>,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<()> {
-    let indices = load_all_indices(dataset).await?;
+    let indices = load_all_indices(dataset, hooks.commit_index.as_deref()).await?;
     let mut physical_index_boundaries = Vec::new();
-    // Scalar indexes heal partial coverage through the fragment-reuse path.
-    // Only vector segments require all-or-nothing physical replacement here.
+    // Hosts can identify segments for which a partial rewrite is safe.
     for index in indices.iter().filter(|index| {
         !is_system_index(index)
-            && (segment_has_vector_details(index)
-                || needs_vector_details_inference(index, dataset.schema()))
+            && hooks
+                .index
+                .is_none_or(|hook| hook.requires_whole_segment(dataset, index))
     }) {
         physical_index_boundaries.push((
             index.name.clone(),
@@ -2534,7 +2516,7 @@ pub(super) async fn validate_fragment_groups_preserve_index_boundaries<'a>(
                      {segment_id} (covered fragments {covered_fragment_ids:?}), but the selected \
                      remapper/publication path cannot atomically replace vector segments. \
                      Use a boundary-preserving DefaultCompactionPlanner plan, or select the \
-                     built-in DatasetIndexRemapperOptions with eager address remapping"
+                     a remapper with atomic segment replacement and eager address remapping"
                 )));
             }
         }

@@ -25,9 +25,7 @@ use lance_table::format::index_seed::{
     merge_seeds_for_binary_copy, parse_seed_for_binary_copy,
 };
 
-use crate::Dataset;
-use crate::Result;
-use crate::datatypes::Schema;
+use lance_core::{Result, datatypes::Schema};
 
 /// One input column's recognized seed.
 pub enum SourceColumnSeed {
@@ -44,42 +42,6 @@ pub enum SourceColumnSeed {
 /// default. It is write-time configuration; zones are located by length.
 pub fn output_rows_per_zone(index_rows_per_zone: Option<u64>) -> u64 {
     index_rows_per_zone.unwrap_or(ROWS_PER_ZONE_DEFAULT)
-}
-
-/// The configured `rows_per_zone` of each column's current usable ZoneMap
-/// index, by field id.
-pub async fn index_rows_per_zone(dataset: &Dataset) -> Result<HashMap<i32, u64>> {
-    use crate::index::scalar::fetch_index_details;
-    use crate::index::{loading::load_all_indices, segment::index_is_usable};
-    use lance_index::pbold::ZoneMapIndexDetails;
-
-    let mut rows_per_zone = HashMap::new();
-    for index in load_all_indices(dataset)
-        .await?
-        .iter()
-        .filter(|index| index_is_usable(index))
-    {
-        let Some(field_id) = index.keyed_field() else {
-            continue;
-        };
-        let Some(field) = dataset
-            .schema()
-            .fields
-            .iter()
-            .find(|field| field.id == field_id)
-        else {
-            continue;
-        };
-        let Ok(details) = fetch_index_details(dataset, &field.name, index).await else {
-            continue;
-        };
-        if let Ok(zone_map) = details.to_msg::<ZoneMapIndexDetails>()
-            && let Some(configured) = zone_map.rows_per_zone
-        {
-            rows_per_zone.insert(field_id, configured);
-        }
-    }
-    Ok(rows_per_zone)
 }
 
 /// The validated seeds of one input file, keyed by field id. An input with no
