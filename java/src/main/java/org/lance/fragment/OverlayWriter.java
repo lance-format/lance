@@ -26,7 +26,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 
 import java.io.IOException;
-import java.util.List;
 import java.util.Optional;
 
 /**
@@ -56,8 +55,8 @@ public final class OverlayWriter implements AutoCloseable {
    * null value replaces the previous cell with null. Omit a row or column from the batch to leave
    * its cells untouched.
    *
-   * <p>All batch vectors must share a root allocator. The batch can use its own root allocator,
-   * independent of the dataset.
+   * <p>All batch vectors with an allocator must share a root allocator. The batch can use its own
+   * root allocator, independent of the dataset.
    *
    * <p>If {@code writeBatch} throws, some values from the failed batch may already be staged. Call
    * {@link #abort()} or {@link #close()} to discard the staged overlay. Do not call {@link
@@ -70,13 +69,27 @@ public final class OverlayWriter implements AutoCloseable {
   public synchronized void writeBatch(VectorSchemaRoot batch, DictionaryProvider dictionaryProvider)
       throws IOException {
     checkOpen();
-    List<FieldVector> vectors = batch.getFieldVectors();
-    if (vectors.isEmpty()) {
+    // Check before Arrow export can retain buffers from earlier vectors.
+    BufferAllocator allocator = null;
+    for (FieldVector vector : batch.getFieldVectors()) {
+      BufferAllocator vectorAllocator = vector.getAllocator();
+      if (vectorAllocator == null) {
+        continue; // Null vectors have no buffers to retain.
+      }
+      BufferAllocator root = vectorAllocator.getRoot();
+      if (allocator == null) {
+        allocator = root;
+      } else if (root != allocator) {
+        throw new IllegalArgumentException(
+            "Overlay batch vectors must share the same root allocator. Column '"
+                + vector.getName()
+                + "' uses a different root");
+      }
+    }
+    if (allocator == null) {
       throw new IllegalArgumentException("Overlay batch must contain a '_rowaddr' column");
     }
-    // Arrow retains the batch buffers during export. Allocate temporary buffers at their root
-    // to avoid charging the export to a child allocator.
-    BufferAllocator allocator = vectors.get(0).getAllocator().getRoot();
+    // Allocate temporary buffers at the root to avoid charging the export to a child allocator.
     try (ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
       try {

@@ -746,6 +746,33 @@ public class FragmentTest {
   }
 
   @Test
+  void testWriteOverlayRejectsMixedAllocatorRoots(@TempDir Path tempDir) throws IOException {
+    String datasetPath = tempDir.resolve("mixed_overlay_allocator_roots").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        RootAllocator valueAllocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 1)) {
+        Fragment fragment = dataset.getFragments().get(0);
+        try (OverlayWriter writer = fragment.writeOverlay(List.of("id"));
+            VectorSchemaRoot batch =
+                VectorSchemaRoot.of(
+                    new UInt8Vector(MetadataColumns.ROWADDR, allocator),
+                    new IntVector("id", valueAllocator))) {
+          batch.allocateNew();
+          ((UInt8Vector) batch.getVector(MetadataColumns.ROWADDR))
+              .setSafe(0, (long) fragment.getId() << 32);
+          ((IntVector) batch.getVector("id")).setSafe(0, 42);
+          batch.setRowCount(1);
+
+          assertThrows(IllegalArgumentException.class, () -> writer.writeBatch(batch));
+        }
+      }
+    }
+  }
+
+  @Test
   void testOverlayWriterLifecycle(@TempDir Path tempDir) throws IOException {
     Path datasetDir = tempDir.resolve("overlay_writer_lifecycle");
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
