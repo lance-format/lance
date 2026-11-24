@@ -955,7 +955,7 @@ impl FlatMatchQueryExec {
     }
 
     /// Re-cut this scorer at `limit`, keeping its input, candidate filter and
-    /// scorers. See [`MatchQueryExec::with_limit`].
+    /// scorers. See [`super::MatchQueryExec::with_limit`].
     pub fn with_limit(&self, limit: usize) -> Self {
         let mut params = self.params.clone();
         params.limit = Some(limit);

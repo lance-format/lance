@@ -919,7 +919,9 @@ mod tests {
             Arc::new(CoalescePartitionsExec::new(union)),
             shared,
         ));
-        assert_eq!(execute_results(owner.as_ref()).await.unwrap().len(), 2);
+        // The flat leg emits every match and leaves the cut to the consumer, so
+        // only the indexed leg's limit shows: one indexed row plus four residual.
+        assert_eq!(execute_results(owner.as_ref()).await.unwrap().len(), 5);
 
         let widened = owner
             .transform_up(|plan| {
@@ -938,7 +940,7 @@ mod tests {
             })
             .unwrap()
             .data;
-        // Both indexed rows match `alpha beta`; all four residual rows match.
+        // Both indexed rows match `alpha beta` once the indexed leg widens.
         assert_eq!(execute_results(widened.as_ref()).await.unwrap().len(), 6);
     }
 
