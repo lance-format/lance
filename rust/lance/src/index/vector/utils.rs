@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
 use arrow_array::new_empty_array;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -18,6 +19,7 @@ use log::{info, warn};
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use tokio::sync::Mutex;
 
@@ -35,6 +37,9 @@ const TRAINING_SAMPLE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// in memory on a 96-vCPU host, taking a row costs as long as scanning 63 KiB
 /// of 1,024-dim and 44 KiB of 128-dim `f32` vectors; this stays below both.
 const DENSE_SAMPLE_SCAN_BYTES_PER_ROW: usize = 32 * 1024;
+
+/// Rows of a training sample one parallel task checks for non-finite values.
+const FINITE_CHECK_ROWS: usize = 8192;
 
 /// Whether to read `sample_rows` of `num_rows` rows `byte_width` wide with one
 /// scan rather than `take`.
@@ -510,6 +515,18 @@ pub(crate) async fn sample_unseen_training_data(
 pub fn filter_finite_training_data(
     training_data: FixedSizeListArray,
 ) -> Result<FixedSizeListArray> {
+    // A sample can hold many GB and is almost always all finite, so confirm
+    // that in parallel before building the per-row mask.
+    let num_rows = training_data.len();
+    let all_finite = (0..num_rows.div_ceil(FINITE_CHECK_ROWS))
+        .into_par_iter()
+        .all(|chunk| {
+            let start = chunk * FINITE_CHECK_ROWS;
+            all_vectors_finite(&training_data.slice(start, FINITE_CHECK_ROWS.min(num_rows - start)))
+        });
+    if all_finite {
+        return Ok(training_data);
+    }
     let finite_mask = lance_index::vector::utils::is_finite(&training_data);
     if finite_mask.true_count() == training_data.len() {
         Ok(training_data)
@@ -517,6 +534,32 @@ pub fn filter_finite_training_data(
         let filtered = arrow::compute::filter(&training_data, &finite_mask)?;
         Ok(filtered.as_fixed_size_list().clone())
     }
+}
+
+/// Whether every vector and value is non-null and every float value is finite:
+/// [`lance_index::vector::utils::is_finite`] for all rows, without a per-row array.
+fn all_vectors_finite(vectors: &FixedSizeListArray) -> bool {
+    fn all_finite<T: Copy>(values: &[T], is_finite: impl Fn(T) -> bool) -> bool {
+        // No early exit, so the check vectorizes.
+        values
+            .iter()
+            .fold(true, |all, &value| all & is_finite(value))
+    }
+    let values = vectors.values();
+    vectors.null_count() == 0
+        && values.null_count() == 0
+        && match values.data_type() {
+            DataType::Float16 => all_finite(values.as_primitive::<Float16Type>().values(), |v| {
+                v.is_finite()
+            }),
+            DataType::Float32 => all_finite(values.as_primitive::<Float32Type>().values(), |v| {
+                v.is_finite()
+            }),
+            DataType::Float64 => all_finite(values.as_primitive::<Float64Type>().values(), |v| {
+                v.is_finite()
+            }),
+            _ => true,
+        }
 }
 
 #[derive(Debug)]
@@ -2109,6 +2152,45 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         let vals = filtered.values().as_primitive::<Float32Type>();
         assert_eq!(vals.values(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// Rows past the first parallel check chunk are filtered too, whether a
+    /// value is not finite, a value is null, or the whole vector is null.
+    #[rstest::rstest]
+    #[case::all_finite(None)]
+    #[case::nan(Some(f32::NAN))]
+    #[case::infinite(Some(f32::INFINITY))]
+    fn test_filter_finite_training_data_across_chunks(#[case] bad_value: Option<f32>) {
+        let num_rows = 2 * FINITE_CHECK_ROWS + 5;
+        let bad_value_row = num_rows - 1;
+        let null_value_row = FINITE_CHECK_ROWS + 3;
+        let null_vector_row = FINITE_CHECK_ROWS + 4;
+        let values = Float32Array::from_iter((0..num_rows * 2).map(|i| match (i / 2, bad_value) {
+            (row, Some(value)) if row == bad_value_row => Some(value),
+            (row, Some(_)) if row == null_value_row && i % 2 == 0 => None,
+            _ => Some(i as f32),
+        }));
+        let vector_validity = NullBuffer::from_iter(
+            (0..num_rows).map(|row| bad_value.is_none() || row != null_vector_row),
+        );
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let training_data =
+            FixedSizeListArray::try_new(field, 2, Arc::new(values), Some(vector_validity)).unwrap();
+
+        let filtered = filter_finite_training_data(training_data.clone()).unwrap();
+        let removed = [null_value_row, null_vector_row, bad_value_row];
+        let expected_rows: Vec<usize> = (0..num_rows)
+            .filter(|row| bad_value.is_none() || !removed.contains(row))
+            .collect();
+        assert_eq!(filtered.len(), expected_rows.len());
+        let expected_values: Vec<f32> = expected_rows
+            .iter()
+            .flat_map(|&row| [(2 * row) as f32, (2 * row + 1) as f32])
+            .collect();
+        assert_eq!(
+            filtered.values().as_primitive::<Float32Type>().values(),
+            &expected_values[..]
+        );
     }
 
     #[tokio::test]
