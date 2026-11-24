@@ -49,7 +49,7 @@ loaded, is file corruption.
 
 | Column                 | Type                    | Nullable | Description                                                      |
 |------------------------|-------------------------|----------|------------------------------------------------------------------|
-| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded document IDs and frequencies). A document ID is a dense, partition-local `u32` assigned when the document is appended, not a row id or row address; it is resolved to the document's row through `docs.lance._rowid`. |
+| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded document IDs and frequencies). A document ID is a dense, partition-local `u32` assigned when the document is appended, not a row id or row address; it is resolved to the document's row through `docs.lance`'s identity column (`_rowaddr` or `_rowid`, see above). |
 | `_max_score`           | Float32                 | false    | Maximum score for the token (for query optimization)             |
 | `_length`              | UInt32                  | false    | Number of documents containing the token                         |
 | `_compressed_position` | List<List<LargeBinary>> | true     | Optional compressed position lists for phrase queries            |
