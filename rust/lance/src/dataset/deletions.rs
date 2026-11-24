@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_table::format::{DeletionFileType, Fragment};
+use lance_table::format::{DeletionFile, DeletionFileType, Fragment};
 use lance_table::transaction::{Operation, Transaction};
+use rand::Rng;
 use roaring::RoaringBitmap;
 
 use super::write::CommitBuilder;
@@ -117,10 +118,15 @@ impl Dataset {
         }
         let mut encoded = Vec::with_capacity(encoded_size);
         bitmap.serialize_into(&mut encoded)?;
-        deletion_file.file_type = DeletionFileType::Bitmap;
-        deletion_file.num_deleted_rows = Some(bitmap.len() as usize);
-        deletion_file.base_id = None;
-        deletion_file.inline = Some(encoded.into());
+        *deletion_file = DeletionFile {
+            read_version: self.manifest.version,
+            id: rand::rng().random::<u64>(),
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(bitmap.len() as usize),
+            base_id: None,
+            path: None,
+            inline: Some(encoded.into()),
+        };
         Ok(Some(fragment))
     }
 }
@@ -138,8 +144,9 @@ mod tests {
     use crate::dataset::WriteParams;
     use crate::index::DatasetIndexExt;
 
-    async fn dataset_with_deletions(
-        inline_max_bytes: Option<&str>,
+    async fn write_i32_dataset(
+        values: std::ops::Range<i32>,
+        params: Option<WriteParams>,
     ) -> (tempfile::TempDir, Dataset) {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "i",
@@ -148,18 +155,25 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..40))],
+            vec![Arc::new(Int32Array::from_iter_values(values))],
         )
         .unwrap();
         let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        // On disk, so the dataset can be reopened with empty caches.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let dataset = Dataset::write(reader, &uri, params).await.unwrap();
+        (dir, dataset)
+    }
+
+    async fn dataset_with_deletions(
+        inline_max_bytes: Option<&str>,
+    ) -> (tempfile::TempDir, Dataset) {
         let params = WriteParams {
             max_rows_per_file: 10,
             ..Default::default()
         };
-        // On disk, so the dataset can be reopened with empty caches.
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap().to_string();
-        let mut dataset = Dataset::write(reader, &uri, Some(params)).await.unwrap();
+        let (dir, mut dataset) = write_i32_dataset(0..40, Some(params)).await;
         if let Some(max_bytes) = inline_max_bytes {
             dataset
                 .update_config([(
@@ -337,5 +351,118 @@ mod tests {
         assert_eq!(values.len(), 36);
         assert!(!values.iter().any(|v| [3, 17, 18, 39].contains(v)));
         assert_eq!(deletion_file_requests(&reopened), 0);
+    }
+
+    async fn commit_explicit_deletion_files(
+        dataset: Dataset,
+        read_version: u64,
+        id: u64,
+        prefix: &str,
+        offsets: &[u32],
+    ) -> Dataset {
+        use lance_table::io::deletion::deletion_file_path;
+
+        let mut updated_fragments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            let mut metadata = fragment.metadata().clone();
+            let file = DeletionFile {
+                read_version,
+                id,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(offsets.len()),
+                base_id: None,
+                path: Some(format!("{prefix}-{}.bin", metadata.id)),
+                inline: None,
+            };
+            let mut encoded = Vec::new();
+            RoaringBitmap::from_iter(offsets.iter().copied())
+                .serialize_into(&mut encoded)
+                .unwrap();
+            let stored = deletion_file_path(&dataset.base, metadata.id, &file);
+            dataset.object_store.put(&stored, &encoded).await.unwrap();
+            metadata.deletion_file = Some(file);
+            updated_fragments.push(metadata);
+        }
+        let version = dataset.manifest.version;
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                version,
+                Operation::Delete {
+                    updated_fragments,
+                    deleted_fragment_ids: vec![],
+                    predicate: "explicit paths".to_string(),
+                },
+                None,
+            ))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_inline_deletions_drops_an_explicit_path() {
+        let (_dir, mut dataset) = write_i32_dataset(0..10, None).await;
+        let version = dataset.manifest.version;
+        dataset = commit_explicit_deletion_files(
+            dataset,
+            version,
+            1,
+            "_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b",
+            &[3],
+        )
+        .await;
+        dataset
+            .update_config([(
+                INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY.to_string(),
+                "4096".to_string(),
+            )])
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.inline_deletions().await.unwrap(), 1);
+        let file = dataset.manifest.fragments[0]
+            .deletion_file
+            .as_ref()
+            .unwrap();
+        assert!(file.path.is_none());
+        assert!(file.is_inline());
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_INLINE_DELETIONS,
+            0
+        );
+
+        let reopened = Dataset::open(&dataset.uri).await.unwrap();
+        let values = live_values(&reopened).await;
+        assert_eq!(values.len(), 9);
+        assert!(!values.contains(&3));
+    }
+
+    #[tokio::test]
+    async fn test_repeated_explicit_to_inline_preserves_deletions() {
+        let (_dir, mut dataset) = write_i32_dataset(
+            0..20,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await;
+        dataset
+            .update_config([(
+                INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY.to_string(),
+                "4096".to_string(),
+            )])
+            .await
+            .unwrap();
+
+        for (prefix, offsets) in [
+            ("_deletions/first", vec![3_u32]),
+            ("_deletions/second", vec![3_u32, 4]),
+        ] {
+            dataset = commit_explicit_deletion_files(dataset, 1, 1, prefix, &offsets).await;
+            let expected = 20 - 2 * offsets.len();
+            assert_eq!(live_values(&dataset).await.len(), expected);
+            assert_eq!(dataset.inline_deletions().await.unwrap(), 2);
+            assert_eq!(live_values(&dataset).await.len(), expected, "{prefix}");
+        }
     }
 }

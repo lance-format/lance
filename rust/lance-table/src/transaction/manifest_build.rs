@@ -190,19 +190,40 @@ pub(super) fn apply_range_segments(
 }
 
 impl Transaction {
+    fn set_fragment_id(fragment: &mut Fragment, new_id: u64) -> Result<()> {
+        if new_id != fragment.id
+            && let Some(deletion_file) = &fragment.deletion_file
+            && deletion_file.uses_derived_path()
+        {
+            return Err(Error::invalid_input(format!(
+                "Cannot assign fragment id {new_id} to fragment {} with derived deletion file {}; \
+                 set DeletionFile.path or inline the deletion vector",
+                fragment.id,
+                crate::io::deletion::relative_deletion_file_path(fragment.id, deletion_file),
+            )));
+        }
+        fragment.id = new_id;
+        Ok(())
+    }
+
+    fn assign_fragment_id(fragment: &mut Fragment, next_fragment_id: &mut u64) -> Result<()> {
+        if fragment.id == 0 {
+            Self::set_fragment_id(fragment, *next_fragment_id)?;
+            *next_fragment_id += 1;
+        }
+        Ok(())
+    }
+
     pub(super) fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
-    ) -> impl Iterator<Item = Fragment> + 'a
+    ) -> impl Iterator<Item = Result<Fragment>> + 'a
     where
         T: IntoIterator<Item = Fragment> + 'a,
     {
         new_fragments.into_iter().map(move |mut f| {
-            if f.id == 0 {
-                f.id = *fragment_id;
-                *fragment_id += 1;
-            }
-            f
+            Self::assign_fragment_id(&mut f, fragment_id)?;
+            Ok(f)
         })
     }
 
@@ -988,7 +1009,7 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -1167,7 +1188,7 @@ impl Transaction {
 
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                 // New fragments were staged against the same pre-Project schema.
                 for fragment in &mut new_fragments {
                     let spilled = fragment.spilled_row_lineage_field_ids();
@@ -1272,7 +1293,7 @@ impl Transaction {
                 // id safe here.
                 let mut new_fragments = fragments.clone();
                 for fragment in new_fragments.iter_mut() {
-                    fragment.id = fragment_id;
+                    Self::set_fragment_id(fragment, fragment_id)?;
                     fragment_id += 1;
                 }
                 if let Some(next_row_id) = &mut next_row_id {
@@ -1541,10 +1562,7 @@ impl Transaction {
                             fragment.id
                         )));
                     }
-                    if fragment.id == 0 {
-                        fragment.id = fragment_id;
-                        fragment_id += 1;
-                    }
+                    Self::assign_fragment_id(fragment, &mut fragment_id)?;
                 }
 
                 if let Some(next_row_id) = &mut next_row_id {
@@ -4047,6 +4065,106 @@ mod tests {
             vec![1, 1],
             "append must cost one visit per appended fragment, regardless of table size"
         );
+    }
+
+    #[test]
+    fn test_assign_fragment_id_deletion_path() {
+        use crate::feature_flags::FLAG_DELETION_FILE_PATHS;
+
+        let explicit = DeletionFile {
+            read_version: 1,
+            id: 10,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.arrow".to_string()),
+            inline: None,
+        };
+        let build = |deletion_file: &DeletionFile, existing: std::ops::Range<u64>| {
+            let mut fragment = Fragment::new(0).with_physical_rows(10);
+            fragment.deletion_file = Some(deletion_file.clone());
+            Transaction::new(
+                1,
+                Operation::Append {
+                    fragments: vec![fragment],
+                },
+                None,
+            )
+            .build_manifest(
+                Some(&sample_manifest_with_fragments(existing)),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+        };
+
+        let mut assigned_ids = Vec::new();
+        for existing in [0..42, 0..43] {
+            let (new_manifest, _) = build(&explicit, existing).unwrap();
+            let fragment = new_manifest.fragments.last().unwrap();
+            assigned_ids.push(fragment.id);
+            assert_eq!(fragment.deletion_file.as_ref(), Some(&explicit));
+            assert_ne!(
+                new_manifest.reader_feature_flags & FLAG_DELETION_FILE_PATHS,
+                0
+            );
+            assert_ne!(
+                new_manifest.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+                0
+            );
+        }
+        assert_eq!(assigned_ids, vec![42, 43]);
+
+        let inline = DeletionFile {
+            file_type: DeletionFileType::Bitmap,
+            path: None,
+            inline: Some(bytes::Bytes::from_static(&[1, 2, 3])),
+            ..explicit
+        };
+        let (new_manifest, _) = build(&inline, 0..42).unwrap();
+        let fragment = new_manifest.fragments.last().unwrap();
+        assert_eq!(fragment.id, 42);
+        assert_eq!(fragment.deletion_file.as_ref(), Some(&inline));
+
+        let build_merge = |deletion_file: &DeletionFile, existing: std::ops::Range<u64>| {
+            let current = sample_manifest_with_fragments(existing.clone());
+            let mut fragments: Vec<Fragment> = existing.map(Fragment::new).collect();
+            let mut fragment = Fragment::new(0).with_physical_rows(10);
+            fragment.deletion_file = Some(deletion_file.clone());
+            fragments.push(fragment);
+            Transaction::new(
+                current.version,
+                Operation::Merge {
+                    fragments,
+                    schema: current.schema.clone(),
+                    preserves_nullability: false,
+                },
+                None,
+            )
+            .build_manifest(Some(&current), vec![], "txn", &default_build_config())
+        };
+
+        let derived = DeletionFile {
+            path: None,
+            ..explicit.clone()
+        };
+        let err = build(&derived, 0..42).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("fragment id 42"), "{err}");
+
+        let err = build_merge(&derived, 0..42).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("fragment id 42"), "{err}");
+
+        let (merged_manifest, _) = build_merge(&explicit, 0..42).unwrap();
+        let fragment = merged_manifest.fragments.last().unwrap();
+        assert_eq!(fragment.id, 42);
+        assert_eq!(fragment.deletion_file.as_ref(), Some(&explicit));
+
+        let (new_manifest, _) = build(&derived, 0..0).unwrap();
+        let fragment = new_manifest.fragments.last().unwrap();
+        assert_eq!(fragment.id, 0);
+        assert_eq!(fragment.deletion_file.as_ref(), Some(&derived));
     }
 
     #[rstest]
