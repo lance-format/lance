@@ -289,7 +289,7 @@ impl BranchDatasetFixture {
     // Update counters by listing authoritative branch directories instead of reading the latest manifest.
     async fn refresh(&mut self) -> Result<()> {
         use futures::TryStreamExt;
-        let branch_path = self.dataset.base.clone();
+        let branch_path = self.dataset.table_state.base.clone();
 
         // Count files in a directory, filtering by optional extension(s).
         async fn count_dir(os: &ObjectStore, dir: &Path, exts: Option<&[&str]>) -> Result<usize> {
@@ -312,7 +312,7 @@ impl BranchDatasetFixture {
 
         let manifest_dir = branch_path.clone().join("_versions");
         self.counts.num_manifest_files = count_dir(
-            &self.dataset.object_store,
+            &self.dataset.table_state.object_store,
             &manifest_dir,
             Some(&["manifest"]),
         )
@@ -321,20 +321,25 @@ impl BranchDatasetFixture {
 
         // Transactions: count files under _transactions (extension .txn)
         let txn_dir = branch_path.clone().join("_transactions");
-        self.counts.num_tx_files = count_dir(&self.dataset.object_store, &txn_dir, Some(&["txn"]))
-            .await
-            .unwrap_or(0);
+        self.counts.num_tx_files = count_dir(
+            &self.dataset.table_state.object_store,
+            &txn_dir,
+            Some(&["txn"]),
+        )
+        .await
+        .unwrap_or(0);
 
         // Indices: count files under _indices
         let idx_dir = branch_path.clone().join(crate::dataset::INDICES_DIR);
-        self.counts.num_index_files = count_dir(&self.dataset.object_store, &idx_dir, None)
-            .await
-            .unwrap_or(0);
+        self.counts.num_index_files =
+            count_dir(&self.dataset.table_state.object_store, &idx_dir, None)
+                .await
+                .unwrap_or(0);
 
         // Deletions: count files under _deletions (extensions .arrow / .bin)
         let del_dir = branch_path.clone().join("_deletions");
         self.counts.num_delete_files = count_dir(
-            &self.dataset.object_store,
+            &self.dataset.table_state.object_store,
             &del_dir,
             Some(&["arrow", "bin"]),
         )
@@ -343,10 +348,13 @@ impl BranchDatasetFixture {
 
         // Data files: count .lance files under data/
         let data_dir = branch_path.clone().join(crate::dataset::DATA_DIR);
-        self.counts.num_data_files =
-            count_dir(&self.dataset.object_store, &data_dir, Some(&["lance"]))
-                .await
-                .unwrap_or(0);
+        self.counts.num_data_files = count_dir(
+            &self.dataset.table_state.object_store,
+            &data_dir,
+            Some(&["lance"]),
+        )
+        .await
+        .unwrap_or(0);
 
         Ok(())
     }
@@ -436,7 +444,7 @@ impl BranchDatasetFixture {
 // ===================== Tests =====================
 #[tokio::test]
 async fn cleanup_lineage_branch1() {
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup.branch1.write_data().await.unwrap();
     setup.branch1.run_cleanup().await.unwrap();
@@ -501,7 +509,7 @@ async fn cleanup_lineage_branch1() {
 
 #[tokio::test]
 async fn cleanup_lineage_branch3() {
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup.branch3.write_data().await.unwrap();
     setup.branch3.run_cleanup().await.unwrap();
@@ -557,7 +565,7 @@ async fn cleanup_lineage_branch3() {
 #[tokio::test]
 async fn cleanup_lineage_branch4() {
     // Setup shared lineage and per-branch auto-clean config
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup.branch4.write_data().await.unwrap();
     setup.branch4.run_cleanup().await.unwrap();
@@ -618,7 +626,7 @@ async fn cleanup_lineage_branch4() {
 #[tokio::test]
 async fn cleanup_lineage_main() {
     // Setup shared lineage and per-branch auto-clean config
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup.main.write_data().await.unwrap();
     setup.main.run_cleanup().await.unwrap();
@@ -774,7 +782,7 @@ async fn cleanup_lineage_main() {
 #[tokio::test]
 async fn auto_clean_referenced_branches_from_branch2() {
     // Setup shared lineage and per-branch auto-clean config
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup.branch3.write_data().await.unwrap();
     setup.enable_auto_cleanup().await.unwrap();
@@ -837,7 +845,7 @@ async fn auto_clean_referenced_branches_from_branch2() {
 
 #[tokio::test]
 async fn auto_clean_referenced_branches_from_main() {
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup.enable_auto_cleanup().await.unwrap();
     setup.main.write_data().await.unwrap();
@@ -1004,7 +1012,7 @@ async fn auto_clean_referenced_branches_from_main() {
 
 #[tokio::test]
 async fn explain_cleanup_with_referenced_branches_matches_cleanup() {
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup.enable_auto_cleanup().await.unwrap();
     setup.main.write_data().await.unwrap();
@@ -1072,7 +1080,7 @@ async fn explain_cleanup_with_referenced_branches_matches_cleanup() {
 
 #[tokio::test]
 async fn auto_clean_referenced_branches_with_tags() {
-    let mut setup = build_lineage_datasets().await.unwrap();
+    let mut setup = Box::pin(build_lineage_datasets()).await.unwrap();
 
     setup
         .branch3

@@ -87,7 +87,11 @@ impl MergeInsertBuilder {
         })
     }
 
-    /// Specify what should happen when a target row matches a row in the source
+    /// Specify what should happen when a target row matches a row in the source.
+    ///
+    /// Updates may omit target fields, but any supplied list must include all
+    /// of its item fields. Partial list item schemas are rejected because their
+    /// offsets and validity cannot safely be updated independently.
     pub fn when_matched(&mut self, behavior: WhenMatched) -> &mut Self {
         self.params.when_matched = behavior;
         self

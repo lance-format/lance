@@ -152,7 +152,7 @@ impl FragmentReuseIndex {
 /// Whether this build can translate `index`'s stored addresses in batches:
 /// `Some(true)` when its type has a batch remapper, `Some(false)` when it
 /// does not, `None` when its details are missing or cannot be interpreted.
-pub(super) async fn segment_supports_batch_remapping(
+pub(crate) async fn segment_supports_batch_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> Result<Option<bool>> {
@@ -213,7 +213,7 @@ impl FragmentReuseIndex {
         }
         Ok(Arc::new(Self {
             ledger,
-            live_fragments: dataset.fragment_bitmap.clone(),
+            live_fragments: dataset.table_state.fragment_bitmap.clone(),
             readers,
         }))
     }
@@ -704,8 +704,13 @@ pub mod tests {
         }
         let id = Uuid::new_v4();
         let store = LanceIndexStore::with_format_version(
-            dataset.object_store.clone(),
-            dataset.base.clone().join("_fri").join(id.to_string()),
+            dataset.table_state.object_store.clone(),
+            dataset
+                .table_state
+                .base
+                .clone()
+                .join("_fri")
+                .join(id.to_string()),
             Arc::new(LanceCache::with_capacity(1024 * 1024)),
             lance_file::version::ConcreteFileVersion::V2_1,
         );
@@ -759,7 +764,12 @@ pub mod tests {
                 .indices_dir()
                 .join(uuid.to_string())
                 .join("details.binpb");
-            let mut writer = dataset.object_store.create(&path).await.unwrap();
+            let mut writer = dataset
+                .table_state
+                .object_store
+                .create(&path)
+                .await
+                .unwrap();
             writer.write_all(&content).await.unwrap();
             writer.shutdown().await.unwrap();
             field(
@@ -797,7 +807,7 @@ pub mod tests {
         manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
         manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
         Arc::make_mut(&mut dataset.manifest).fragments = destinations.into();
-        dataset.fragment_bitmap = Arc::new(
+        dataset.table_state.fragment_bitmap = Arc::new(
             dataset
                 .manifest
                 .fragments
@@ -808,8 +818,8 @@ pub mod tests {
         dataset.index_cache.clear().await;
         let key = IndexMetadataKey {
             version: dataset.manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
-            e_tag: dataset.manifest_location.e_tag.as_deref(),
+            store_identity: &dataset.table_state.object_store.store_prefix,
+            e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
         };
         dataset
             .index_cache
@@ -827,13 +837,13 @@ pub mod tests {
         manifest.transaction_file = None;
         manifest.transaction_section = None;
         let location = crate::dataset::write_manifest_file(
-            &dataset.object_store,
-            dataset.commit_handler.as_ref(),
-            &dataset.base,
+            &dataset.table_state.object_store,
+            dataset.table_state.commit_handler.as_ref(),
+            &dataset.table_state.base,
             &mut manifest,
             Some(indices),
-            &crate::dataset::ManifestWriteConfig::default(),
-            dataset.manifest_location.naming_scheme,
+            &lance_table::format::ManifestBuildConfig::default(),
+            dataset.table_state.manifest_location.naming_scheme,
             None,
             false,
         )
@@ -969,8 +979,8 @@ pub mod tests {
         for mut target in [legacy, tagged] {
             let fragments = target.manifest.fragments.clone();
             let expected_indices = lance_table::io::manifest::read_manifest_indexes(
-                &target.object_store,
-                &target.manifest_location,
+                &target.table_state.object_store,
+                &target.table_state.manifest_location,
                 &target.manifest,
             )
             .await
@@ -980,8 +990,8 @@ pub mod tests {
             assert_eq!(target.manifest.version, latest);
             assert_eq!(target.manifest.fragments, fragments);
             let restored_indices = lance_table::io::manifest::read_manifest_indexes(
-                &target.object_store,
-                &target.manifest_location,
+                &target.table_state.object_store,
+                &target.table_state.manifest_location,
                 &target.manifest,
             )
             .await
@@ -1035,13 +1045,13 @@ pub mod tests {
         manifest.reader_feature_flags &= !flag;
         manifest.writer_feature_flags &= !flag;
         let error = crate::dataset::write_manifest_file(
-            &dataset.object_store,
-            dataset.commit_handler.as_ref(),
-            &dataset.base,
+            &dataset.table_state.object_store,
+            dataset.table_state.commit_handler.as_ref(),
+            &dataset.table_state.base,
             &mut manifest,
             Some(indices),
             &Default::default(),
-            dataset.manifest_location.naming_scheme,
+            dataset.table_state.manifest_location.naming_scheme,
             None,
             false,
         )
@@ -1113,6 +1123,7 @@ pub mod tests {
             .unwrap();
         assert!(result[0].is_some_and(|a| {
             dataset
+                .table_state
                 .fragment_bitmap
                 .contains(RowAddress::from(a).fragment_id())
         }));
@@ -1227,13 +1238,14 @@ pub mod tests {
         assert!(Arc::ptr_eq(&first.readers[0], &current.readers[0]));
         assert!(Arc::ptr_eq(
             &first.live_fragments,
-            &previous.fragment_bitmap
+            &previous.table_state.fragment_bitmap
         ));
         assert!(Arc::ptr_eq(
             &current.live_fragments,
-            &dataset.fragment_bitmap
+            &dataset.table_state.fragment_bitmap
         ));
-        let added = (&*dataset.fragment_bitmap - &*previous.fragment_bitmap)
+        let added = (&*dataset.table_state.fragment_bitmap
+            - &*previous.table_state.fragment_bitmap)
             .min()
             .unwrap();
         let added = u64::from(RowAddress::new_from_parts(added, 0));
@@ -1339,7 +1351,8 @@ pub mod tests {
         let fri = install(&mut dataset, content, destinations, false).await;
         let first = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
         let mut rebound = dataset.clone();
-        rebound.object_store = Arc::new(dataset.object_store.as_ref().clone());
+        rebound.table_state.object_store =
+            Arc::new(dataset.table_state.object_store.as_ref().clone());
         let second = FragmentReuseIndex::open(&rebound, &fri).await.unwrap();
         assert!(Arc::ptr_eq(&first.ledger, &second.ledger));
         assert!(!Arc::ptr_eq(&first.readers[0], &second.readers[0]));
@@ -1988,7 +2001,12 @@ pub mod tests {
             .join(uuid.to_string())
             .join("details.binpb");
         let details = if external {
-            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
+            let mut writer = dataset
+                .table_state
+                .object_store
+                .create(&details_path)
+                .await
+                .unwrap();
             writer.write_all(&content).await.unwrap();
             writer.shutdown().await.unwrap();
             field(
@@ -2092,8 +2110,8 @@ pub mod tests {
         assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
 
         let indices = lance_table::io::manifest::read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -2101,6 +2119,7 @@ pub mod tests {
         assert_eq!(indices.iter().find(|index| index.uuid == uuid), Some(&fri));
         if external {
             let bytes = dataset
+                .table_state
                 .object_store
                 .open(&details_path)
                 .await

@@ -590,7 +590,8 @@ mod tests {
                 ]))),
                 ..Default::default()
             };
-            config.spilled_row_lineage = Arc::new(SpilledRowLineage::from([(0, loaded)]));
+            config =
+                config.with_spilled_row_lineage(Arc::new(SpilledRowLineage::from([(0, loaded)])));
         }
         let transaction = Transaction::new(
             manifest.version,

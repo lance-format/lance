@@ -39,7 +39,7 @@ use lance_arrow::{
 use lance_core::{
     datatypes::{
         BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
-        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+        BlobV2Layout, Field as LanceField, Schema as LanceSchema, stamp_field_id,
     },
     utils::blob::blob_path,
 };
@@ -51,8 +51,8 @@ use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 pub use crate::dataset::blob::{
-    BlobFile, BlobReadRange, ReadBlobFile, ReadBlobFilesBuilder, ReadBlobFilesStream,
-    read_blob_file_ranges, read_blob_files,
+    BlobFile, BlobReadRange, BlobWriteSources, ReadBlobFile, ReadBlobFilesBuilder,
+    ReadBlobFilesStream, read_blob_file_ranges, read_blob_files,
 };
 
 use crate::dataset::BLOBS_DIR;
@@ -154,10 +154,7 @@ pub(crate) fn prepared_blob_field_with_metadata(
 /// under the table's ids.
 pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Result<Field> {
     let source = LanceField::try_from(source)?;
-    Ok(crate::dataset::mem_wal::stamp_field_id(
-        &prepared,
-        std::slice::from_ref(&source),
-    ))
+    Ok(stamp_field_id(&prepared, std::slice::from_ref(&source)))
 }
 
 pub(crate) fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
@@ -717,6 +714,35 @@ impl BlobDescriptorArrayBuilder {
         Self::new_with_metadata(column, true, metadata)
     }
 
+    /// Create a prepared builder using an existing logical Blob v2 field.
+    ///
+    /// This preserves its name, nullability and metadata, including when the
+    /// field is a child of a struct or list.
+    ///
+    /// ```
+    /// use lance::{BlobDescriptorArrayBuilder, blob_field};
+    /// # fn example() -> lance::Result<()> {
+    /// let field = blob_field("item", false);
+    /// let mut builder = BlobDescriptorArrayBuilder::for_field(&field)?;
+    /// builder.push_inline(b"example".as_slice())?;
+    /// let prepared = builder.finish()?;
+    /// assert!(!prepared.field().is_nullable());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn for_field(field: &Field) -> Result<Self> {
+        if !field.is_blob_v2() {
+            return Err(Error::invalid_input(format!(
+                "Field '{}' is not a Blob v2 field",
+                field.name()
+            )));
+        }
+        Ok(Self {
+            field: logical_to_prepared_blob_field(field)?,
+            values: Vec::new(),
+        })
+    }
+
     pub(crate) fn new_with_metadata(
         column: impl Into<String>,
         nullable: bool,
@@ -1030,10 +1056,20 @@ impl BlobObjectWriter {
         &mut self,
         reader: &dyn Reader,
         range: Range<usize>,
+        max_request_size: usize,
     ) -> Result<BlobRange> {
         let (value, next_offset) = blob_range(self.offset, range.len() as u64)?;
         let mut writer = self.take_writer()?;
-        writer.copy_range_from_reader(reader, range).await?;
+        for start in (range.start..range.end).step_by(max_request_size) {
+            let end = start.saturating_add(max_request_size).min(range.end);
+            let copied = writer.copy_range_from_reader(reader, start..end).await?;
+            if copied != end - start {
+                return Err(Error::io(format!(
+                    "Blob source '{}' returned {copied} bytes for range {start}..{end}",
+                    reader.path()
+                )));
+            }
+        }
         self.writer = Some(writer);
         self.offset = next_offset;
         Ok(value)
@@ -1350,8 +1386,11 @@ impl DedicatedBlobWriter {
         &mut self,
         reader: &dyn Reader,
         range: Range<usize>,
+        max_request_size: usize,
     ) -> Result<()> {
-        self.upload.write_blob_from_reader(reader, range).await?;
+        self.upload
+            .write_blob_from_reader(reader, range, max_request_size)
+            .await?;
         Ok(())
     }
 

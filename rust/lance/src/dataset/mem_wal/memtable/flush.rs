@@ -532,11 +532,11 @@ impl MemTableFlusher {
         if !deleted.is_empty() {
             let dv = DeletionVector::from(deleted.clone());
             let deletion_file = write_deletion_file(
-                &dataset.base,
+                &dataset.table_state.base,
                 0, // 1 fragment per SSTable
                 dataset.version().version,
                 &dv,
-                dataset.object_store.as_ref(),
+                dataset.table_state.object_store.as_ref(),
                 dataset.inline_deletions_max_bytes()?,
             )
             .await?;

@@ -9,13 +9,16 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
 use arrow::array::{FixedSizeListArray, Float32Array};
+use arrow::datatypes::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JClass, JFloatArray, JObject, JString};
 use jni::sys::jfloatArray;
 use lance::index::NoopIndexBuildProgress;
 use lance::index::vector::utils::get_vector_dim;
 use lance_index::vector::ivf::builder::IvfBuildParams as RustIvfBuildParams;
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::builder::PQBuildParams as RustPQBuildParams;
+use lance_index::vector::quantizer::QuantizerBuildParams;
 use lance_linalg::distance::MetricType;
 
 /// Flatten a FixedSizeList<Float32> into a contiguous Vec<f32>.
@@ -152,7 +155,9 @@ pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainPqCo
     column_jstr: JString<'local>,        // java.lang.String
     pq_params_obj: JObject<'local>,      // org.lance.index.vector.PQBuildParams
     distance_type_jstr: JString<'local>, // org.lance.index.DistanceType#toString()
+    centroids: JFloatArray<'local>,      // nullable float[]
 ) -> jfloatArray {
+    let centroids = (!centroids.is_null()).then_some(centroids);
     ok_or_throw_with_return!(
         env,
         inner_train_pq_codebook(
@@ -161,6 +166,7 @@ pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainPqCo
             column_jstr,
             pq_params_obj,
             distance_type_jstr,
+            centroids,
         )
         .map(|arr| arr.into_raw()),
         JFloatArray::default().into_raw()
@@ -173,10 +179,19 @@ fn inner_train_pq_codebook<'local>(
     column_jstr: JString<'local>,
     pq_params_obj: JObject<'local>,
     distance_type_jstr: JString<'local>,
+    centroids: Option<JFloatArray<'local>>,
 ) -> Result<JFloatArray<'local>> {
     let column: String = env.get_string(&column_jstr)?.into();
     let pq_params = build_pq_params_from_java(env, &pq_params_obj)?;
     let metric_type = parse_distance_type(env, &distance_type_jstr)?;
+    let centroid_values = centroids
+        .map(|centroids| -> Result<_> {
+            let length = env.get_array_length(&centroids)? as usize;
+            let mut values = vec![0.0; length];
+            env.get_float_array_region(&centroids, 0, &mut values)?;
+            Ok(values)
+        })
+        .transpose()?;
 
     let flattened: Vec<f32> = {
         let dataset_guard =
@@ -184,6 +199,12 @@ fn inner_train_pq_codebook<'local>(
         let dataset = &dataset_guard.inner;
 
         let dim = get_vector_dim(dataset.schema(), &column)?;
+        let ivf_model = centroid_values
+            .map(|values| ivf_model_from_centroids(values, dim))
+            .transpose()?;
+        let residual_model = ivf_model
+            .as_ref()
+            .filter(|_| RustPQBuildParams::use_residual(metric_type));
 
         let pq = block_on(lance::index::vector::pq::build_pq_model(
             dataset,
@@ -191,7 +212,7 @@ fn inner_train_pq_codebook<'local>(
             dim,
             metric_type,
             &pq_params,
-            None,
+            residual_model,
         ))?;
 
         flatten_fixed_size_list_to_f32(&pq.codebook)?
@@ -200,4 +221,15 @@ fn inner_train_pq_codebook<'local>(
     let jarray = env.new_float_array(flattened.len() as i32)?;
     env.set_float_array_region(&jarray, 0, &flattened)?;
     Ok(jarray)
+}
+
+fn ivf_model_from_centroids(values: Vec<f32>, dim: usize) -> Result<IvfModel> {
+    let centroids = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, false)),
+        dim as i32,
+        Arc::new(Float32Array::from(values)),
+        None,
+    )
+    .map_err(|error| Error::input_error(format!("Invalid IVF centroids: {error}")))?;
+    Ok(IvfModel::new(centroids, None))
 }

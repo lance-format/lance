@@ -4,7 +4,7 @@
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use chrono::TimeDelta;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::SendableRecordBatchStream as DataFusionRecordBatchStream;
 use futures::{Stream, StreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
@@ -16,7 +16,7 @@ use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_datafusion::utils::StreamingWriteSource;
+use lance_datafusion::utils::{StreamingWriteSource, from_datafusion_stream};
 use lance_file::concat::{
     FileConcatOptions, FileConcatReason, FileConcatResult, FileConcatTarget,
     concat_data_file_parts as concat_parts,
@@ -27,15 +27,16 @@ use lance_file::versions::v1::writer::{
 };
 use lance_file::writer::{self as current_writer, FileWriteSummary};
 use lance_file::{versions as file_versions, writer::FileWriterOptions};
-use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
-};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::stream::SendableRecordBatchStream;
 use lance_io::traits::Writer;
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{BasePath, DataFile, Fragment};
-use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
+use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
+use lance_table_runtime::base::log_unregistered_base_scoped_options;
+use lance_table_runtime::commit::resolve_commit_handler;
 use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -47,7 +48,7 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
-use crate::blob::prepared_to_logical_blob_schema;
+use crate::blob::{BlobWriteSources, prepared_to_logical_blob_schema};
 use crate::dataset::blob::{
     BlobPayloadInventory, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     SidecarRewrite, blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
@@ -193,6 +194,60 @@ impl Dataset {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         file_writer_options: FileWriterOptions,
     ) -> Result<DataFilePart> {
+        let data = data.map(|result| result.map(|batch| (batch, None)));
+        self.write_data_file_part_impl(target, blob_ids, data, file_writer_options)
+            .await
+    }
+
+    /// Encode one part with trusted payload sources accompanying its batches.
+    ///
+    /// Each source map belongs to one batch. Use prepared Blob v2 leaves and
+    /// insert the descriptors returned by [`BlobWriteSources`] at the relevant
+    /// slots. Uploaded keys are relative to the base of `target`. On an ordinary
+    /// table every non-empty payload is spilled to sidecars using the target's
+    /// allocated Blob IDs. A Managed-enabled table can reference the completed
+    /// upload directly. The part and its sidecars use the same lifetime and
+    /// concatenation rules as [`Self::write_data_file_part`].
+    ///
+    /// ```
+    /// # use std::ops::Range;
+    /// # use arrow_array::RecordBatch;
+    /// # use lance::{Dataset, Result, blob::BlobWriteSources, dataset::DataFileTarget};
+    /// # use lance_file::writer::FileWriterOptions;
+    /// # async fn example(dataset: &Dataset, target: &DataFileTarget, ids: Option<Range<u32>>,
+    /// #   batch: RecordBatch, sources: BlobWriteSources) -> Result<()> {
+    /// let part = dataset.write_data_file_part_with_blob_sources(
+    ///     target, ids, futures::stream::iter([Ok((batch, sources))]),
+    ///     FileWriterOptions::default(),
+    /// ).await?;
+    /// # let _ = part;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_data_file_part_with_blob_sources(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<(RecordBatch, BlobWriteSources)>> + Send,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<DataFilePart> {
+        if !versions::writes_blob_v2(target.version) {
+            return Err(Error::not_supported(
+                "Part writes with Blob sources require Lance file version 2.2 or later",
+            ));
+        }
+        let data = data.map(|result| result.map(|(batch, sources)| (batch, Some(sources))));
+        self.write_data_file_part_impl(target, blob_ids, data, file_writer_options)
+            .await
+    }
+
+    async fn write_data_file_part_impl(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<(RecordBatch, Option<BlobWriteSources>)>> + Send,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<DataFilePart> {
         self.validate_data_file_target(target)?;
         validate_blob_v2_write_schema(target.schema.as_ref())?;
         let managed = managed_blobs_enabled(target.schema.as_ref())?;
@@ -234,9 +289,9 @@ impl Dataset {
         } else {
             None
         };
+        let root = self.blob_base_path(target.base_id)?;
         if managed && let Some(writer) = preprocessor.take() {
-            let root = self.blob_base_path(target.base_id)?;
-            preprocessor = Some(writer.with_managed_base(target.base_id, root));
+            preprocessor = Some(writer.with_managed_base(target.base_id, root.clone()));
         }
 
         let file_name = format!("{}.part", generate_random_filename());
@@ -258,7 +313,9 @@ impl Dataset {
         let mut data = Box::pin(data);
         let write_result = async {
             while let Some(batch) = data.next().await {
-                writer.write_batch(&batch?).await?;
+                let (batch, sources) = batch?;
+                let sources = sources.as_ref().map(|sources| (&root, sources));
+                writer.write_batch_with_sources(&batch, sources).await?;
             }
             writer.finish_file().await
         }
@@ -400,7 +457,7 @@ impl WriteDestination<'_> {
 
     pub fn uri(&self) -> String {
         match self {
-            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
+            WriteDestination::Dataset(dataset) => dataset.table_state.uri.clone(),
             WriteDestination::Uri(uri) => uri.to_string(),
         }
     }
@@ -1733,37 +1790,6 @@ fn append_external_base_candidate(
     }
 }
 
-/// Log base-scoped storage options (`base_<id>.<key>`) whose id does not
-/// match any registered base path. Unregistered entries are ignored during
-/// resolution. The open path logs at debug, since options may legitimately be
-/// vended for bases the loaded version does not register; the write path logs
-/// at warn, since ids are already assigned there and an unmatched id is much
-/// more likely a mistake.
-pub(crate) fn log_unregistered_base_scoped_options(
-    store_params: Option<&ObjectStoreParams>,
-    base_paths: &HashMap<u32, BasePath>,
-    level: log::Level,
-) {
-    if !log::log_enabled!(level) {
-        return;
-    }
-    let Some(options) = store_params.and_then(|params| params.storage_options()) else {
-        return;
-    };
-    let unregistered = options
-        .keys()
-        .filter_map(|key| parse_base_scoped_key(key).map(|(id, _)| id))
-        .filter(|id| !base_paths.contains_key(id))
-        .collect::<BTreeSet<_>>();
-    if !unregistered.is_empty() {
-        log::log!(
-            level,
-            "Ignoring base-scoped storage options for unregistered base path ids: {:?}",
-            unregistered
-        );
-    }
-}
-
 fn write_store_params_for_base(params: &WriteParams, base_path: &BasePath) -> ObjectStoreParams {
     // Exact per-URI bindings are used as-is. Otherwise the write-level default
     // params are resolved for the base scope: `base_<id>.<key>` storage
@@ -1885,9 +1911,7 @@ pub(super) async fn blob_v2_external_base_resolver(
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
 ///
-/// This is a private variant that takes a `SendableRecordBatchStream` instead
-/// of a reader. We don't expose the stream at our interface because it is a
-/// DataFusion type.
+/// Accepts a DataFusion stream and an already resolved write schema.
 ///
 /// The caller must resolve `storage_version` once for the operation. Operations
 /// that also select a commit format must reuse the same value when committing.
@@ -1899,7 +1923,7 @@ pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: Schema,
-    data: SendableRecordBatchStream,
+    data: DataFusionRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
@@ -1909,7 +1933,7 @@ pub async fn write_fragments_internal(
         object_store,
         base_dir,
         schema,
-        data,
+        from_datafusion_stream(data),
         params,
         target_bases_info,
         None,
@@ -2001,15 +2025,7 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
-/// Give a new table its field IDs. `inherited` IDs are an existing table's,
-/// such as a MemWAL generation's, and may exceed the new-table limit.
-pub(crate) fn assign_new_table_field_ids(schema: &mut Schema, inherited: bool) -> Result<()> {
-    if inherited {
-        schema.try_keep_field_ids()
-    } else {
-        schema.try_assign_new_table_field_ids()
-    }
-}
+pub(crate) use lance_table_runtime::commit::assign_new_table_field_ids;
 
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
@@ -2145,6 +2161,22 @@ fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+
+    #[doc(hidden)]
+    async fn write_with_blob_sources(
+        &mut self,
+        batch: &RecordBatch,
+        _root: &Path,
+        sources: &BlobWriteSources,
+    ) -> Result<()> {
+        if !sources.is_empty() {
+            return Err(Error::not_supported(
+                "This writer does not accept Blob sources",
+            ));
+        }
+        self.write(std::slice::from_ref(batch)).await
+    }
+
     /// Mark the next batch as ending the current file page.
     fn prepare_for_flush(&mut self) {}
     /// Get the file path and base ID for the data file being written.
@@ -2290,9 +2322,20 @@ impl V2WriterAdapter {
     }
 
     pub(in crate::dataset) async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_batch_with_sources(batch, None).await
+    }
+
+    async fn write_batch_with_sources(
+        &mut self,
+        batch: &RecordBatch,
+        sources: Option<(&Path, &BlobWriteSources)>,
+    ) -> Result<()> {
         let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch.clone())?;
         let batch = match self.preprocessor.as_mut() {
-            Some(pre) => pre.preprocess_batch(&batch).await?,
+            Some(pre) => pre.preprocess_batch_with_sources(&batch, sources).await?,
+            None if sources.is_some_and(|(_, sources)| !sources.is_empty()) => {
+                return Err(Error::invalid_input("Blob sources require a Blob v2 field"));
+            }
             None => batch,
         };
         self.writer.write_batch(&batch).await
@@ -2339,6 +2382,17 @@ impl GenericWriter for V2WriterAdapter {
         }
         Ok(())
     }
+
+    async fn write_with_blob_sources(
+        &mut self,
+        batch: &RecordBatch,
+        root: &Path,
+        sources: &BlobWriteSources,
+    ) -> Result<()> {
+        self.write_batch_with_sources(batch, Some((root, sources)))
+            .await
+    }
+
     fn prepare_for_flush(&mut self) {
         self.writer.prepare_for_flush();
     }
@@ -2771,37 +2825,6 @@ where
 }
 
 // Given input options resolve what the commit handler should be.
-async fn resolve_commit_handler(
-    uri: &str,
-    commit_handler: Option<Arc<dyn CommitHandler>>,
-    store_options: &Option<ObjectStoreParams>,
-) -> Result<Arc<dyn CommitHandler>> {
-    match commit_handler {
-        None => {
-            #[allow(deprecated)]
-            if store_options
-                .as_ref()
-                .map(|opts| opts.object_store.is_some())
-                .unwrap_or_default()
-            {
-                return Err(Error::invalid_input(
-                    "when creating a dataset with a custom object store the commit_handler must also be specified",
-                ));
-            }
-            commit_handler_from_url(uri, store_options).await
-        }
-        Some(commit_handler) => {
-            if uri.starts_with("s3+ddb") {
-                Err(Error::invalid_input(
-                    "`s3+ddb://` scheme and custom commit handler are mutually exclusive",
-                ))
-            } else {
-                Ok(commit_handler)
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2830,6 +2853,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::StorageOptionsAccessor;
+    use lance_io::stream::RecordBatchStreamAdapter as LanceRecordBatchStreamAdapter;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
     use parquet_variant_compute::{
@@ -3116,11 +3140,13 @@ mod tests {
             .map(|&batch_rows| {
                 let batch = data.slice(offset, batch_rows);
                 offset += batch_rows;
-                Ok::<_, DataFusionError>(batch)
+                Ok(batch)
             })
             .collect::<Vec<_>>();
-        let stream =
-            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let stream = LanceRecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(batches),
+        );
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
@@ -3173,10 +3199,12 @@ mod tests {
         let batches = input_batch_sizes.map(|batch_rows| {
             let batch = data.slice(offset, batch_rows);
             offset += batch_rows;
-            Ok::<_, DataFusionError>(batch)
+            Ok(batch)
         });
-        let stream =
-            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let stream = LanceRecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(batches),
+        );
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
@@ -4091,7 +4119,7 @@ mod tests {
         for fragment in fragments {
             assert!(
                 fragment
-                    .metadata
+                    .metadata()
                     .files
                     .iter()
                     .any(|file| file.base_id == Some(1))
@@ -4195,7 +4223,7 @@ mod tests {
         let file_bases = dataset
             .get_fragments()
             .iter()
-            .flat_map(|fragment| fragment.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|fragment| fragment.metadata().files.iter().map(|file| file.base_id))
             .collect::<Vec<_>>();
         assert_eq!(file_bases, vec![Some(2), Some(1)]);
 
@@ -4361,7 +4389,7 @@ mod tests {
         for fragment in dataset.get_fragments() {
             assert!(
                 fragment
-                    .metadata
+                    .metadata()
                     .files
                     .iter()
                     .all(|file| file.base_id == Some(1))
@@ -4468,11 +4496,12 @@ mod tests {
 
         // Verify data was written to base2 (ID 2)
         let fragments = dataset.get_fragments();
-        assert!(
-            fragments
+        assert!(fragments.iter().all(|f| {
+            f.metadata()
+                .files
                 .iter()
-                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
-        );
+                .all(|file| file.base_id == Some(2))
+        }));
 
         let reopened = Dataset::open(&primary_uri).await.unwrap();
         assert_eq!(scan_sorted_ids(&reopened).await, (0..2).collect::<Vec<_>>());
@@ -4589,12 +4618,18 @@ mod tests {
 
         // Verify data is distributed across both bases
         let fragments = dataset.get_fragments();
-        let has_base1_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
-        let has_base2_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+        let has_base1_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(1))
+        });
+        let has_base2_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(2))
+        });
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
@@ -4714,12 +4749,18 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert!(!fragments.is_empty());
 
-        let has_base1_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
-        let has_base2_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+        let has_base1_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(1))
+        });
+        let has_base2_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(2))
+        });
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
@@ -4831,11 +4872,12 @@ mod tests {
 
         // Verify data was written to base1
         let fragments = dataset.get_fragments();
-        assert!(
-            fragments
+        assert!(fragments.iter().all(|f| {
+            f.metadata()
+                .files
                 .iter()
-                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(1)))
-        );
+                .all(|file| file.base_id == Some(1))
+        }));
 
         // Now append using the path URI instead of name
         let mut data_gen2 =
@@ -4859,12 +4901,18 @@ mod tests {
 
         // Verify data is now in both bases
         let fragments = dataset.get_fragments();
-        let has_base1_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
-        let has_base2_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+        let has_base1_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(1))
+        });
+        let has_base2_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(2))
+        });
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
@@ -4872,7 +4920,12 @@ mod tests {
         // Verify base2 has exactly 1 fragment (from the append)
         let base2_fragments: Vec<_> = fragments
             .iter()
-            .filter(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
+            .filter(|f| {
+                f.metadata()
+                    .files
+                    .iter()
+                    .all(|file| file.base_id == Some(2))
+            })
             .collect();
         assert_eq!(base2_fragments.len(), 1, "Should have 1 fragment in base2");
     }
@@ -5303,11 +5356,13 @@ mod tests {
         .unwrap();
 
         // Build a stream: one good batch, then an error.
-        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
-            Err(DataFusionError::External("injected failure".into())),
+            Err(Error::External {
+                source: "injected failure".into(),
+            }),
         ];
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5365,12 +5420,14 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
         .unwrap();
-        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
             Ok(good_batch.slice(0, 1)),
-            Err(DataFusionError::External("injected failure".into())),
+            Err(Error::External {
+                source: "injected failure".into(),
+            }),
         ];
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5472,7 +5529,7 @@ mod tests {
 
     async fn write_id_batches(
         test_uri: &str,
-        items: Vec<std::result::Result<RecordBatch, DataFusionError>>,
+        items: Vec<Result<RecordBatch>>,
         params: WriteParams,
     ) -> Result<Vec<Fragment>> {
         let arrow_schema = id_batch(0).schema();
@@ -5481,7 +5538,7 @@ mod tests {
             ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema,
             futures::stream::iter(items),
         ));
@@ -5801,14 +5858,16 @@ mod tests {
 
         // 3 rows per file: the first batch fills and completes a file in the
         // target base, then the stream fails or the hook fails on the last file.
-        let mut items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let mut items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
             Ok(good_batch.slice(0, second_batch_rows)),
         ];
         if fail_complete_at.is_none() {
-            items.push(Err(DataFusionError::External("injected failure".into())));
+            items.push(Err(Error::External {
+                source: "injected failure".into(),
+            }));
         }
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5923,7 +5982,7 @@ mod tests {
         let file_bases: Vec<_> = dataset
             .get_fragments()
             .iter()
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1)]);
 
@@ -5946,7 +6005,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(2)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
 
@@ -5969,7 +6028,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(5)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(2)]);
 
@@ -6040,7 +6099,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(1)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
 
@@ -6065,7 +6124,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(4)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![Some(1), Some(2)]);
 
@@ -6122,7 +6181,7 @@ mod tests {
         .unwrap();
         assert!(
             plain.get_fragments().iter().all(|f| f
-                .metadata
+                .metadata()
                 .files
                 .iter()
                 .all(|file| file.base_id.is_none()))
@@ -6196,7 +6255,7 @@ mod tests {
         let file_bases: Vec<_> = dataset
             .get_fragments()
             .iter()
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
         let reopened = Dataset::open(&create_uri).await.unwrap();
@@ -6235,14 +6294,15 @@ mod tests {
             .unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
         for fragment in fragments {
-            let data_file = fragment.metadata.files.first().unwrap();
+            let data_file = fragment.metadata().files.first().unwrap();
             let path = dataset
+                .table_state
                 .base
                 .clone()
                 .join(super::DATA_DIR)
@@ -6255,7 +6315,10 @@ mod tests {
                 file_scheduler,
                 None,
                 Default::default(),
-                &dataset.metadata_cache.file_metadata_cache(&path),
+                &dataset
+                    .table_state
+                    .metadata_cache
+                    .file_metadata_cache(&path),
                 FileReaderOptions::default(),
             )
             .await
@@ -6317,10 +6380,11 @@ mod tests {
         let data_file = new_fragment.files.first().unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let path = dataset
+            .table_state
             .base
             .clone()
             .join(super::DATA_DIR)
@@ -6333,7 +6397,10 @@ mod tests {
             file_scheduler,
             None,
             Default::default(),
-            &dataset.metadata_cache.file_metadata_cache(&path),
+            &dataset
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(&path),
             FileReaderOptions::default(),
         )
         .await

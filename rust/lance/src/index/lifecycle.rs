@@ -212,7 +212,8 @@ pub(super) async fn build_index_metadata_from_segments(
                 .await?;
         }
         let index_dir = dataset.indices_dir().join(uuid.to_string());
-        let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        let mut files =
+            list_index_files_with_sizes(&dataset.table_state.object_store, &index_dir).await?;
         if is_inverted_index {
             retain_committed_inverted_files(&mut files);
         }
@@ -232,7 +233,7 @@ pub(super) async fn build_index_metadata_from_segments(
             metadata,
         })
     }))
-    .buffered(dataset.object_store.io_parallelism())
+    .buffered(dataset.table_state.object_store.io_parallelism())
     .try_collect::<Vec<_>>()
     .await?;
 
@@ -632,12 +633,12 @@ impl DatasetIndexExt for Dataset {
         // this cache, which is shared by every dataset opened at the URI.
         // `None` is not proof that two observations share an incarnation (see
         // `ManifestLocation::e_tag`), so derive privately and never publish.
-        let Some(e_tag) = self.manifest_location.e_tag.as_deref() else {
+        let Some(e_tag) = self.table_state.manifest_location.e_tag.as_deref() else {
             return Ok(derive().await?.indices);
         };
         let derived_key = QueryIndexListingKey(DerivedIndexListingKey {
             version: self.manifest.version,
-            store_identity: &self.object_store.store_prefix,
+            store_identity: &self.table_state.object_store.store_prefix,
             e_tag: Some(e_tag),
         });
         let (listing, was_cached) = self
@@ -868,7 +869,7 @@ impl DatasetIndexExt for Dataset {
             .into_iter()
             .map(IntoIndexSegment::into_index_segment)
             .collect::<Result<Vec<_>>>()?;
-        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
+        let dataset_fragments = self.table_state.fragment_bitmap.as_ref().clone();
         if segments.first().is_some_and(|segment| {
             segment
                 .index_details()
@@ -1152,7 +1153,7 @@ impl DatasetIndexExt for Dataset {
                     )?
                 {
                     let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                        bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
+                        bitmap.intersection_len(self.table_state.fragment_bitmap.as_ref()) > 0
                     });
                     let is_fts_index = if let Some(details) = &idx.index_details {
                         IndexDetails(details.clone()).supports_fts()
