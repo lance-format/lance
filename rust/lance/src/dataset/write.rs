@@ -4,7 +4,7 @@
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use chrono::TimeDelta;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::SendableRecordBatchStream as DataFusionRecordBatchStream;
 use futures::{Stream, StreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
@@ -16,7 +16,7 @@ use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_datafusion::utils::StreamingWriteSource;
+use lance_datafusion::utils::{StreamingWriteSource, from_datafusion_stream};
 use lance_file::concat::{
     FileConcatOptions, FileConcatReason, FileConcatResult, FileConcatTarget,
     concat_data_file_parts as concat_parts,
@@ -30,6 +30,7 @@ use lance_file::{versions as file_versions, writer::FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
+use lance_io::stream::SendableRecordBatchStream;
 use lance_io::traits::Writer;
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{BasePath, DataFile, Fragment};
@@ -1941,9 +1942,7 @@ pub(super) async fn blob_v2_external_base_resolver(
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
 ///
-/// This is a private variant that takes a `SendableRecordBatchStream` instead
-/// of a reader. We don't expose the stream at our interface because it is a
-/// DataFusion type.
+/// Accepts a DataFusion stream and an already resolved write schema.
 ///
 /// The caller must resolve `storage_version` once for the operation. Operations
 /// that also select a commit format must reuse the same value when committing.
@@ -1955,7 +1954,7 @@ pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: Schema,
-    data: SendableRecordBatchStream,
+    data: DataFusionRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
@@ -1965,7 +1964,7 @@ pub async fn write_fragments_internal(
         object_store,
         base_dir,
         schema,
-        data,
+        from_datafusion_stream(data),
         params,
         target_bases_info,
         None,
@@ -2924,6 +2923,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::StorageOptionsAccessor;
+    use lance_io::stream::RecordBatchStreamAdapter as LanceRecordBatchStreamAdapter;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
     use parquet_variant_compute::{
@@ -3210,11 +3210,13 @@ mod tests {
             .map(|&batch_rows| {
                 let batch = data.slice(offset, batch_rows);
                 offset += batch_rows;
-                Ok::<_, DataFusionError>(batch)
+                Ok(batch)
             })
             .collect::<Vec<_>>();
-        let stream =
-            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let stream = LanceRecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(batches),
+        );
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
@@ -3267,10 +3269,12 @@ mod tests {
         let batches = input_batch_sizes.map(|batch_rows| {
             let batch = data.slice(offset, batch_rows);
             offset += batch_rows;
-            Ok::<_, DataFusionError>(batch)
+            Ok(batch)
         });
-        let stream =
-            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let stream = LanceRecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(batches),
+        );
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
@@ -5397,11 +5401,13 @@ mod tests {
         .unwrap();
 
         // Build a stream: one good batch, then an error.
-        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
-            Err(DataFusionError::External("injected failure".into())),
+            Err(Error::External {
+                source: "injected failure".into(),
+            }),
         ];
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5459,12 +5465,14 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
         .unwrap();
-        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
             Ok(good_batch.slice(0, 1)),
-            Err(DataFusionError::External("injected failure".into())),
+            Err(Error::External {
+                source: "injected failure".into(),
+            }),
         ];
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5566,7 +5574,7 @@ mod tests {
 
     async fn write_id_batches(
         test_uri: &str,
-        items: Vec<std::result::Result<RecordBatch, DataFusionError>>,
+        items: Vec<Result<RecordBatch>>,
         params: WriteParams,
     ) -> Result<Vec<Fragment>> {
         let arrow_schema = id_batch(0).schema();
@@ -5575,7 +5583,7 @@ mod tests {
             ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema,
             futures::stream::iter(items),
         ));
@@ -5895,14 +5903,16 @@ mod tests {
 
         // 3 rows per file: the first batch fills and completes a file in the
         // target base, then the stream fails or the hook fails on the last file.
-        let mut items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let mut items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
             Ok(good_batch.slice(0, second_batch_rows)),
         ];
         if fail_complete_at.is_none() {
-            items.push(Err(DataFusionError::External("injected failure".into())));
+            items.push(Err(Error::External {
+                source: "injected failure".into(),
+            }));
         }
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));

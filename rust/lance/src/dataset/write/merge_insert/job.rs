@@ -77,7 +77,7 @@ use lance_datafusion::{
         new_session_context_with_memory_tracking, provider_to_stream,
     },
     spill::{materialize_stream, spilling_table_provider_with_job_disk_manager},
-    utils::StreamingWriteSource,
+    utils::{StreamingWriteSource, from_datafusion_stream},
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexCriteria;
@@ -1716,7 +1716,7 @@ impl MergeInsertJob {
                         self.dataset.object_store.clone(),
                         &self.dataset.base,
                         self.dataset.schema().clone(),
-                        stream,
+                        from_datafusion_stream(stream),
                         self.write_params.as_ref().clone(),
                         target_bases_info,
                         None,
