@@ -14,6 +14,7 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::versions as file_versions;
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_table::format::index_seed::SEED_META_KEY_PREFIX;
 use lance_table::format::{DataFile, Fragment};
 use prost::Message;
 use prost_types::Any;
@@ -480,11 +481,7 @@ async fn flush_footer(
     for seed in seeds {
         let buf_index = writer.add_global_buffer(seed.bytes).await?;
         writer.add_schema_metadata(
-            format!(
-                "{}{}",
-                lance_index::scalar::seed::SEED_META_KEY_PREFIX,
-                seed.column_name
-            ),
+            format!("{SEED_META_KEY_PREFIX}{}", seed.column_name),
             format!("{}:{}", buf_index, seed.rows_per_zone),
         );
     }

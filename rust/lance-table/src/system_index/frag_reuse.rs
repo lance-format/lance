@@ -6,6 +6,8 @@ pub mod ledger;
 pub mod lineage;
 pub mod metadata;
 pub mod retention;
+pub mod row_map;
+pub mod stable_partition;
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
