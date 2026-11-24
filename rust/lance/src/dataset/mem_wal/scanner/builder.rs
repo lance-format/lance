@@ -15,7 +15,6 @@ use arrow_schema::{DataType, SchemaRef};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::limit::GlobalLimitExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
@@ -27,7 +26,7 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::{FreshTierWatermark, ShardSnapshot};
-use super::planner::{LsmScanPlanner, lex_ordering};
+use super::planner::{LsmScanPlanner, sort_top_k};
 use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use super::sstable_cache::{DatasetCache, SsTableWarmer};
@@ -796,9 +795,12 @@ impl LsmScanner {
             && let Some(keys) =
                 extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
         {
-            let mut planner =
-                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema)?
-                    .with_identity_schema(Arc::clone(&self.identity_schema));
+            let mut planner = LsmPointLookupPlanner::new(
+                collector,
+                self.pk_columns.clone(),
+                base_schema.clone(),
+            )?
+            .with_identity_schema(Arc::clone(&self.identity_schema));
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());
             }
@@ -815,10 +817,7 @@ impl LsmScanner {
             // `pk IN (..)` can return many rows, so an ordering still has to be
             // applied — and above the lookup, before the limit trims it.
             if let Some(ordering) = ordering {
-                plan = Arc::new(
-                    SortExec::new(lex_ordering(ordering, plan.schema().as_ref())?, plan)
-                        .with_fetch(self.limit),
-                );
+                plan = sort_top_k(plan, ordering, &base_schema, self.limit, 0)?;
             }
             return Ok(match self.limit {
                 Some(n) => Arc::new(GlobalLimitExec::new(plan, 0, Some(n))),

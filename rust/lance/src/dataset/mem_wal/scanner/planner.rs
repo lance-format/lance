@@ -34,25 +34,36 @@ use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
-/// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
-/// dropped from a WAL-arm scan. Used only for sources whose schema carries the
-/// column (active / SSTables written since deletes existed).
-/// Build the physical sort ordering for `ordering` against `schema`.
+/// Sort `plan` by `ordering`, keeping the top `offset + limit` rows.
 ///
-/// Every key must be a top-level column the plan actually emits: the sort runs
-/// above the source projection, so a key outside it has no values to sort by.
-/// Nested paths are rejected rather than silently resolved against a struct.
-pub(super) fn lex_ordering(ordering: &[ColumnOrdering], schema: &Schema) -> Result<LexOrdering> {
+/// Each key must be a top-level column `plan` emits with its full table type:
+/// a struct whose projection pruned or reordered its children would compare
+/// as a different key. A `LIMIT 0` validates the keys but skips the sort.
+pub(super) fn sort_top_k(
+    plan: Arc<dyn ExecutionPlan>,
+    ordering: &[ColumnOrdering],
+    table_schema: &Schema,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
     let exprs = ordering
         .iter()
         .map(|c| {
-            let index = schema.index_of(&c.column_name).map_err(|_| {
+            let (index, field) = schema.column_with_name(&c.column_name).ok_or_else(|| {
                 Error::invalid_input(format!(
                     "order_by column '{}' is not in the scan projection; \
                      project it to sort by it",
                     c.column_name
                 ))
             })?;
+            let table_field = table_schema.field_with_name(&c.column_name)?;
+            if field.data_type() != table_field.data_type() {
+                return Err(Error::invalid_input(format!(
+                    "order_by column '{}' must be projected whole to sort by it",
+                    c.column_name
+                )));
+            }
             Ok(PhysicalSortExpr {
                 expr: Arc::new(Column::new(&c.column_name, index)),
                 options: SortOptions {
@@ -62,10 +73,19 @@ pub(super) fn lex_ordering(ordering: &[ColumnOrdering], schema: &Schema) -> Resu
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    LexOrdering::new(exprs)
-        .ok_or_else(|| Error::invalid_input("order_by requires at least one column".to_string()))
+    let ordering = LexOrdering::new(exprs)
+        .ok_or_else(|| Error::invalid_input("order_by requires at least one column".to_string()))?;
+    // DataFusion's top-k asserts `k > 0`; the limit above returns the empty result.
+    if limit == Some(0) {
+        return Ok(plan);
+    }
+    let fetch = limit.map(|l| l.saturating_add(offset));
+    Ok(Arc::new(SortExec::new(ordering, plan).with_fetch(fetch)))
 }
 
+/// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
+/// dropped from a WAL-arm scan. Used only for sources whose schema carries the
+/// column (active / SSTables written since deletes existed).
 fn fold_not_tombstone(filter: Option<&Expr>) -> Expr {
     let live = !col(TOMBSTONE);
     match filter {
@@ -377,11 +397,13 @@ impl LsmScanPlanner {
         // top `offset + limit` *live* rows — capping a source before the block
         // list is what leaves the ranked arms under-filled.
         if let Some(ordering) = ordering {
-            let fetch = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
-            plan = Arc::new(
-                SortExec::new(lex_ordering(ordering, plan.schema().as_ref())?, plan)
-                    .with_fetch(fetch),
-            );
+            plan = sort_top_k(
+                plan,
+                ordering,
+                &self.base_schema,
+                limit,
+                offset.unwrap_or(0),
+            )?;
         }
         if limit.is_some() || offset.unwrap_or(0) > 0 {
             plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), limit));
@@ -1354,6 +1376,112 @@ mod integration_tests {
             .unwrap();
 
         assert_eq!(scan_ids(scanner).await, vec![2, 1]);
+    }
+
+    /// Base rows `id=1, meta={a:1, b:9}` and `id=2, meta={a:2, b:0}`.
+    async fn struct_key_base(uri: &str) -> Arc<Dataset> {
+        use arrow_array::StructArray;
+        let mut id_metadata = HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let meta_fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_metadata),
+            Field::new("meta", DataType::Struct(meta_fields.clone().into()), false),
+        ]));
+        let meta = StructArray::new(
+            meta_fields.into(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![9, 0])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(meta)],
+        )
+        .unwrap();
+        Arc::new(create_dataset(uri, vec![batch]).await)
+    }
+
+    /// Sorting a struct key whose projection prunes its children would compare
+    /// the pruned struct, ranking by `meta.b` instead of `meta`. Both the scan
+    /// and the point-lookup entry points must reject it.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_rejects_pruned_struct_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = struct_key_base(&format!("{}/base", temp.path().to_str().unwrap())).await;
+        let ordered = |filter: Option<&str>, projection: &[&str]| {
+            let mut scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+                .project(projection)
+                .unwrap()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_last(
+                    "meta".to_string(),
+                )]))
+                .unwrap()
+                .limit(Some(1), None)
+                .unwrap();
+            if let Some(filter) = filter {
+                scanner = scanner.filter(filter).unwrap();
+            }
+            scanner
+        };
+
+        for filter in [None, Some("id IN (1, 2)")] {
+            assert_eq!(
+                scan_ids(ordered(filter, &["id", "meta"])).await,
+                vec![1],
+                "full struct key ranks by meta.a first ({filter:?})"
+            );
+            let err = ordered(filter, &["id", "meta.b"])
+                .try_into_batch()
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("meta"),
+                "pruned struct key must be rejected ({filter:?}): {err}"
+            );
+        }
+    }
+
+    /// An ordered `LIMIT 0` returns no rows with the projected schema, on both
+    /// the scan and the point-lookup entry points.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_limit_zero() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[1, 2, 3], "b")]).await,
+        );
+
+        for filter in [None, Some("id IN (1, 2)")] {
+            let ordered = |limit| {
+                let mut scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+                    .project(&["name"])
+                    .unwrap()
+                    .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                        "name".to_string(),
+                    )]))
+                    .unwrap()
+                    .limit(Some(limit), None)
+                    .unwrap();
+                if let Some(filter) = filter {
+                    scanner = scanner.filter(filter).unwrap();
+                }
+                scanner
+            };
+            let expected = ordered(1).try_into_batch().await.unwrap().schema();
+            let batch = ordered(0).try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), 0, "{filter:?}");
+            assert_eq!(batch.schema(), expected, "{filter:?}");
+        }
     }
 
     #[tokio::test]
