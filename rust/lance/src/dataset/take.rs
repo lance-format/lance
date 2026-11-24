@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::rowids::get_row_id_index_with;
+use crate::dataset::rowids::{get_row_id_index_with, row_ids_to_row_addrs};
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
@@ -649,10 +649,22 @@ impl TakeBuilder {
                 .row_ids
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
-            let addrs = if let Some(row_id_index) =
-                get_row_id_index_with(&self.dataset, !self.ignore_deletions).await?
-            {
-                let resolved = row_id_index.get_many(row_ids)?;
+            let addrs = if self.dataset.manifest.uses_stable_row_ids() {
+                let resolved = if self.ignore_deletions {
+                    // Scalar index maintenance can remove deleted entries. The
+                    // explicit raw take mode must still resolve those stored rows.
+                    get_row_id_index_with(&self.dataset, false)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::internal("Stable row ID take did not produce a row ID index")
+                        })?
+                        .get_many(row_ids)?
+                        .into_iter()
+                        .map(|address| address.map(u64::from))
+                        .collect()
+                } else {
+                    row_ids_to_row_addrs(&self.dataset, row_ids).await?
+                };
                 if self.missing_row_policy == MissingRowPolicy::Error
                     && let Some(first_missing_index) =
                         resolved.iter().position(|address| address.is_none())
@@ -665,10 +677,7 @@ impl TakeBuilder {
                         row_ids[first_missing_index]
                     )));
                 }
-                resolved
-                    .into_iter()
-                    .filter_map(|opt| opt.map(|address| address.into()))
-                    .collect::<Vec<_>>()
+                resolved.into_iter().flatten().collect::<Vec<_>>()
             } else {
                 row_ids.clone()
             };
