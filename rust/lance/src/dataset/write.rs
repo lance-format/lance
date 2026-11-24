@@ -4157,7 +4157,7 @@ mod tests {
         for fragment in fragments {
             assert!(
                 fragment
-                    .metadata
+                    .metadata()
                     .files
                     .iter()
                     .any(|file| file.base_id == Some(1))
@@ -4261,7 +4261,7 @@ mod tests {
         let file_bases = dataset
             .get_fragments()
             .iter()
-            .flat_map(|fragment| fragment.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|fragment| fragment.metadata().files.iter().map(|file| file.base_id))
             .collect::<Vec<_>>();
         assert_eq!(file_bases, vec![Some(2), Some(1)]);
 
@@ -4427,7 +4427,7 @@ mod tests {
         for fragment in dataset.get_fragments() {
             assert!(
                 fragment
-                    .metadata
+                    .metadata()
                     .files
                     .iter()
                     .all(|file| file.base_id == Some(1))
@@ -4534,11 +4534,12 @@ mod tests {
 
         // Verify data was written to base2 (ID 2)
         let fragments = dataset.get_fragments();
-        assert!(
-            fragments
+        assert!(fragments.iter().all(|f| {
+            f.metadata()
+                .files
                 .iter()
-                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
-        );
+                .all(|file| file.base_id == Some(2))
+        }));
 
         let reopened = Dataset::open(&primary_uri).await.unwrap();
         assert_eq!(scan_sorted_ids(&reopened).await, (0..2).collect::<Vec<_>>());
@@ -4655,12 +4656,18 @@ mod tests {
 
         // Verify data is distributed across both bases
         let fragments = dataset.get_fragments();
-        let has_base1_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
-        let has_base2_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+        let has_base1_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(1))
+        });
+        let has_base2_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(2))
+        });
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
@@ -4780,12 +4787,18 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert!(!fragments.is_empty());
 
-        let has_base1_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
-        let has_base2_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+        let has_base1_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(1))
+        });
+        let has_base2_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(2))
+        });
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
@@ -4897,11 +4910,12 @@ mod tests {
 
         // Verify data was written to base1
         let fragments = dataset.get_fragments();
-        assert!(
-            fragments
+        assert!(fragments.iter().all(|f| {
+            f.metadata()
+                .files
                 .iter()
-                .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(1)))
-        );
+                .all(|file| file.base_id == Some(1))
+        }));
 
         // Now append using the path URI instead of name
         let mut data_gen2 =
@@ -4925,12 +4939,18 @@ mod tests {
 
         // Verify data is now in both bases
         let fragments = dataset.get_fragments();
-        let has_base1_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
-        let has_base2_data = fragments
-            .iter()
-            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+        let has_base1_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(1))
+        });
+        let has_base2_data = fragments.iter().any(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(2))
+        });
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
@@ -4938,7 +4958,12 @@ mod tests {
         // Verify base2 has exactly 1 fragment (from the append)
         let base2_fragments: Vec<_> = fragments
             .iter()
-            .filter(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
+            .filter(|f| {
+                f.metadata()
+                    .files
+                    .iter()
+                    .all(|file| file.base_id == Some(2))
+            })
             .collect();
         assert_eq!(base2_fragments.len(), 1, "Should have 1 fragment in base2");
     }
@@ -5995,7 +6020,7 @@ mod tests {
         let file_bases: Vec<_> = dataset
             .get_fragments()
             .iter()
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1)]);
 
@@ -6018,7 +6043,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(2)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
 
@@ -6041,7 +6066,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(5)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(2)]);
 
@@ -6112,7 +6137,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(1)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
 
@@ -6137,7 +6162,7 @@ mod tests {
             .get_fragments()
             .iter()
             .skip(4)
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![Some(1), Some(2)]);
 
@@ -6194,7 +6219,7 @@ mod tests {
         .unwrap();
         assert!(
             plain.get_fragments().iter().all(|f| f
-                .metadata
+                .metadata()
                 .files
                 .iter()
                 .all(|file| file.base_id.is_none()))
@@ -6268,7 +6293,7 @@ mod tests {
         let file_bases: Vec<_> = dataset
             .get_fragments()
             .iter()
-            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
         let reopened = Dataset::open(&create_uri).await.unwrap();
@@ -6313,7 +6338,7 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
         for fragment in fragments {
-            let data_file = fragment.metadata.files.first().unwrap();
+            let data_file = fragment.metadata().files.first().unwrap();
             let path = dataset
                 .table_state
                 .base

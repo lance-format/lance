@@ -35,7 +35,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
+    DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     storage_contract::finalize_manifest_storage_version,
 };
 use lance_table::io::commit::{
@@ -541,7 +541,7 @@ impl Dataset {
         }
     }
 
-    fn table_view(&self) -> TableView<'_> {
+    pub(crate) fn table_view(&self) -> TableView<'_> {
         TableView::new(&self.table_state, &self.manifest, &self.refs)
     }
 
@@ -1593,32 +1593,7 @@ impl Dataset {
     }
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {
-        // Sum the counts already in the manifest. A fragment goes through
-        // `FileFragment::count_rows` (which may open its files) only when a
-        // count is missing, the manifest predates `writer_version` (see
-        // `FileFragment::physical_rows`), or it has no data files (an error).
-        // Those are checked before `num_rows`, since an untrusted physical row
-        // count can be smaller than the deletion count.
-        let trust_metadata = self.manifest.writer_version.is_some();
-        let dataset = Arc::new(self.clone());
-        let mut num_rows = 0;
-        let mut need_io = Vec::new();
-        for fragment in self.manifest.fragments.iter() {
-            if trust_metadata
-                && !fragment.files.is_empty()
-                && let Some(rows) = fragment.num_rows()
-            {
-                num_rows += rows;
-            } else {
-                need_io.push(FileFragment::new(dataset.clone(), fragment.clone()));
-            }
-        }
-        let cnts = stream::iter(need_io)
-            .map(|f| async move { f.count_rows(None).await })
-            .buffer_unordered(16)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(num_rows + cnts.iter().sum::<usize>())
+        self.table_view().to_table().count_rows().await
     }
 
     /// Take rows by indices.
@@ -2574,13 +2549,6 @@ impl Dataset {
         self.object_store(data_file.base_id).await
     }
 
-    pub(crate) async fn object_store_for_deletion(
-        &self,
-        deletion_file: &DeletionFile,
-    ) -> Result<Arc<ObjectStore>> {
-        self.object_store(deletion_file.base_id).await
-    }
-
     pub(crate) async fn object_store_for_index(
         &self,
         index: &IndexMetadata,
@@ -2594,10 +2562,6 @@ impl Dataset {
     pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
         let table = self.table_view().with_manifest_view(manifest);
         Self::from_table_with_index_cache(table, self.session.clone(), self.index_cache.clone())
-    }
-
-    pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
-        self.table_view().dataset_dir_for_deletion(deletion_file)
     }
 
     /// Get the indices directory for a specific index, considering its base_id
@@ -2761,10 +2725,11 @@ impl Dataset {
     /// Get fragments.
     pub fn get_fragments(&self) -> Vec<FileFragment> {
         let dataset = Arc::new(self.clone());
-        self.manifest
-            .fragments
-            .iter()
-            .map(|f| FileFragment::new(dataset.clone(), f.clone()))
+        let table = Arc::new(self.table_view().to_table());
+        self.iter_fragments()
+            .map(|fragment| {
+                FileFragment::from_table(dataset.clone(), table.clone(), fragment.clone())
+            })
             .collect()
     }
 
@@ -2873,6 +2838,7 @@ impl Dataset {
     /// independently via the fragment bitmap.
     pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
         let dataset = Arc::new(self.clone());
+        let table = Arc::new(self.table_view().to_table());
         ordered_ids
             .iter()
             .map(|id| {
@@ -2886,7 +2852,7 @@ impl Dataset {
                     "fragment_bitmap rank({id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
                     fragment.id
                 );
-                Some(FileFragment::new(dataset.clone(), fragment.clone()))
+                Some(FileFragment::from_table(dataset.clone(), table.clone(), fragment.clone()))
             })
             .collect()
     }
@@ -3956,7 +3922,7 @@ impl Dataset {
         let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
             .then(|f| {
                 let joiner = joiner.clone();
-                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
+                async move { f.merge(left_on, &joiner).await.map(Fragment::from) }
             })
             .try_collect::<Vec<_>>()
             .await?;

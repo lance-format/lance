@@ -443,7 +443,7 @@ async fn managed_append_preserves_primary_base_root_semantics(
         dataset
             .get_fragments()
             .iter()
-            .all(|fragment| fragment.metadata.files[0].base_id.is_none())
+            .all(|fragment| fragment.metadata().files[0].base_id.is_none())
     );
 }
 
@@ -1015,7 +1015,7 @@ async fn managed_clone_preserves_existing_retention_contract(
     if deep && !registered {
         assert_eq!(source.manifest.fragments, cloned.manifest.fragments);
         for fragment in source.get_fragments() {
-            for file in &fragment.metadata.files {
+            for file in &fragment.metadata().files {
                 let relative = format!("data/{}", file.path);
                 assert_eq!(
                     std::fs::read(std::path::Path::new(source_dir.as_ref()).join(&relative))
