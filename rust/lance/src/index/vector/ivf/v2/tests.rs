@@ -12,7 +12,7 @@ use std::{
 };
 
 use all_asserts::{assert_ge, assert_lt};
-use arrow::datatypes::{Float64Type, UInt8Type, UInt32Type, UInt64Type};
+use arrow::datatypes::{Float64Type, Int32Type, UInt8Type, UInt32Type, UInt64Type};
 use arrow::{array::AsArray, datatypes::Float32Type};
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array, ListArray,
@@ -7674,6 +7674,74 @@ async fn test_pq_storage_backwards_compat() {
 
     let pq_meta: ProductQuantizationMetadata = get_pq_metadata(&dataset, scheduler.clone()).await;
     assert!(pq_meta.buffer_index().is_some());
+}
+
+/// IVF_HNSW_PQ indices from releases before 0.25, whose PQ storage metadata
+/// names the bit width `num_bits`, has no `transposed` before 0.19.2 and no
+/// `codebook_tensor` before 0.12. 0.11.1 and 0.16.1 wrote the legacy v1 file
+/// (0,2), 0.16.1 with an L2 and a Dot index on one column; 0.18.2 and 0.24.1
+/// wrote the v3 index layout in a Lance 2.0 file (0,3). The 0.24.1 index has
+/// empty details that are filled in from this metadata, so without it the
+/// search silently scans. See `datagen.py` next to each fixture.
+#[rstest]
+#[case::v0_11_1_l2("v0.11.1/legacy_ivf_hnsw_pq", DistanceType::L2, "l2_idx")]
+#[case::v0_16_1_l2("v0.16.1/legacy_ivf_hnsw_pq", DistanceType::L2, "l2_idx")]
+#[case::v0_16_1_dot("v0.16.1/legacy_ivf_hnsw_pq", DistanceType::Dot, "dot_idx")]
+#[case::v0_18_2_l2("v0.18.2/ivf_hnsw_pq", DistanceType::L2, "vector_idx")]
+#[case::v0_24_1_l2("v0.24.1/ivf_hnsw_pq", DistanceType::L2, "vector_idx")]
+#[tokio::test]
+async fn test_pre_0_25_ivf_hnsw_pq_search(
+    #[case] fixture: &str,
+    #[case] metric: DistanceType,
+    #[case] index_name: &str,
+) {
+    const K: usize = 10;
+    let test_dir = copy_test_data_to_tmp(fixture).unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let rows = dataset
+        .scan()
+        .project(&["vector"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let vectors = rows["vector"].as_fixed_size_list();
+
+    let mut found = 0;
+    let mut expected = 0;
+    for row in (0..rows.num_rows()).step_by(32) {
+        let query = vectors.value(row);
+        let search = |use_index: bool| {
+            let dataset = dataset.clone();
+            let query = query.clone();
+            async move {
+                let mut scanner = dataset.scan();
+                scanner
+                    .project(&["i"])
+                    .unwrap()
+                    .nearest("vector", query.as_ref(), K)
+                    .unwrap()
+                    .distance_metric(metric)
+                    .use_index(use_index);
+                let plan = scanner.explain_plan(false).await.unwrap();
+                let ids = scanner.try_into_batch().await.unwrap()["i"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec();
+                (plan, ids)
+            }
+        };
+        let (plan, ids) = search(true).await;
+        assert!(
+            plan.contains(&format!("ANNSubIndex: name={index_name},")),
+            "{plan}"
+        );
+        let (_, exact) = search(false).await;
+        found += ids.iter().filter(|id| exact.contains(id)).count();
+        expected += exact.len();
+    }
+    let recall = found as f32 / expected as f32;
+    assert!(recall >= 0.5, "recall {recall} over {expected} neighbors");
 }
 
 #[tokio::test]

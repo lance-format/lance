@@ -65,6 +65,8 @@ pub const PQ_METADATA_KEY: &str = "lance:pq";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
     pub codebook_position: usize,
+    /// Releases before 0.25 wrote this key as `num_bits`.
+    #[serde(alias = "num_bits")]
     pub nbits: u32,
     pub num_sub_vectors: usize,
     pub dimension: usize,
@@ -72,10 +74,14 @@ pub struct ProductQuantizationMetadata {
     #[serde(skip)]
     pub codebook: Option<FixedSizeListArray>,
 
-    // empty for v1 format
-    // used for v3 format
-    // deprecated in later version
+    /// The codebook as an encoded `pb::Tensor`. v3 writers from 0.12 and v1
+    /// writers from 0.14 filled it until 0.30; releases before 0.12 did not
+    /// write the key, and later ones leave it empty.
+    #[serde(default)]
     pub codebook_tensor: Vec<u8>,
+    /// Releases before 0.19.2 did not write this key; their codes are not
+    /// transposed.
+    #[serde(default)]
     pub transposed: bool,
 }
 
@@ -153,7 +159,9 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
             .map_err(|_| Error::index(format!("Failed to parse PQ metadata: {}", metadata)))?;
 
         debug_assert!(metadata.codebook.is_none());
-        debug_assert!(metadata.codebook_tensor.is_empty());
+        // Writers from 0.14 until 0.30 also copied the codebook into
+        // `codebook_tensor`; the protobuf at `codebook_position` holds the same
+        // tensor.
 
         let codebook_tensor: pb::Tensor =
             read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
