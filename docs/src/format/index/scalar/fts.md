@@ -20,7 +20,7 @@ The FTS index consists of multiple files storing the token dictionary, document 
 
 An FTS index may contain multiple partitions. Each partition has its own set of token, document, and posting list files, prefixed with the partition ID (e.g. `part_0_tokens.lance`, `part_0_docs.lance`, `part_0_invert.lance`). The `metadata.lance` file lists all partition IDs in the index. At query time, every partition must be searched and the results combined to produce the final ranked output. Fewer partitions generally means better query performance, since each partition requires its own token dictionary lookup and posting list scan. The number of partitions is controlled by the training configuration -- specifically `LANCE_FTS_TARGET_SIZE` determines how large each merged partition can grow (see [Training Process](#training-process) for details).
 
-From format version 4 (`INVERTED_ROW_ADDR_DOMAIN_VERSION`) onward, `docs.lance._rowid` holds the document's physical row address (`fragment_id << 32 | offset`). In versions 1 through 3 it holds the dataset's row id. Readers must interpret `_rowid` according to the segment's `index_version`. Writers may label a segment with version 1 through 3 only on a dataset without stable row ids, where row ids and row addresses are equal. A reader that supports version 4 must also support every capability of version 3. The posting-list format is recorded separately and must not be inferred from `index_version`.
+From format version 4 (`INVERTED_ROW_ADDR_DOMAIN_VERSION`) onward, each document's identity is stored in `docs.lance._rowaddr` and holds the document's physical row address (`fragment_id << 32 | offset`). In versions 1 through 3 it is stored in `docs.lance._rowid` and holds the dataset's row id. The column name therefore tracks `index_version`: a reader must select the column for the segment's version, and a reader that looks for the wrong one finds no such column rather than silently reading one domain's values as the other's. Writers may label a segment with version 1 through 3 only on a dataset without stable row ids, where row ids and row addresses are equal, and must then name the column `_rowid` so that a reader supporting only those versions can still read it. A reader that supports version 4 must also support every capability of version 3. The posting-list format is recorded separately and must not be inferred from `index_version`.
 
 ### Token Dictionary File Schema
 
@@ -33,7 +33,7 @@ From format version 4 (`INVERTED_ROW_ADDR_DOMAIN_VERSION`) onward, `docs.lance._
 
 | Column        | Type   | Nullable | Description                      |
 |---------------|--------|----------|----------------------------------|
-| `_rowid`      | UInt64 | false    | Document row ID (format version <= 3) or row address (format version >= 4); see above |
+| `_rowid` / `_rowaddr` | UInt64 | false | Document row ID, named `_rowid` (format version <= 3), or row address, named `_rowaddr` (format version >= 4); see above |
 | `_num_tokens` | UInt32 | false    | Number of tokens in the document |
 
 Partitioned `docs.lance` files may include the optional schema metadata key

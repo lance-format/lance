@@ -38,6 +38,19 @@ pub const VALUE_COLUMN_NAME: &str = "value";
 pub trait TrainingRequest: std::any::Any + Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     fn criteria(&self) -> &TrainingCriteria;
+
+    /// Tell the request whether the dataset it will train over uses stable
+    /// row ids.
+    ///
+    /// Every builtin type now trains on physical row addresses regardless, so
+    /// most plugins ignore this. It matters only where the *stored layout*
+    /// differs between the two cases -- an FTS segment names its document
+    /// identity column `_rowaddr` when it keeps its row-address-domain
+    /// version, and `_rowid` when it will be relabelled to a legacy version
+    /// for older readers, which only happens without stable row ids.
+    ///
+    /// Called before training; the default does nothing.
+    fn set_stable_row_ids(&mut self, _stable_row_ids: bool) {}
 }
 
 /// A default training request impl for indexes that don't need any parameters

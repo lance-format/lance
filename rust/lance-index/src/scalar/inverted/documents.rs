@@ -20,7 +20,7 @@ use lance_core::cache::{CacheKey, CacheLoadOrigin, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -33,6 +33,48 @@ use super::index::{
     DocSet, NUM_TOKEN_COL, count_row_id_runs, dequantize_doc_length, doc_index_storage_column,
     document_coordinate_rank, quantize_doc_length,
 };
+
+/// [`docs_identity_column`] for an opened docs file, whose schema is a Lance
+/// schema rather than an Arrow one.
+pub fn docs_identity_column_of(
+    reader: &dyn lance_index_core::scalar::IndexReader,
+) -> Result<&'static str> {
+    if reader.schema().field(ROW_ADDR).is_some() {
+        Ok(ROW_ADDR)
+    } else if reader.schema().field(ROW_ID).is_some() {
+        Ok(ROW_ID)
+    } else {
+        Err(Error::invalid_input(format!(
+            "docs file has neither a {ROW_ADDR} nor a {ROW_ID} column; it cannot identify its \
+             documents"
+        )))
+    }
+}
+
+/// The column holding each document's identity in a `docs.lance` file.
+///
+/// From [`INVERTED_ROW_ADDR_DOMAIN_VERSION`](super::INVERTED_ROW_ADDR_DOMAIN_VERSION)
+/// a segment stores physical row addresses and names the column [`ROW_ADDR`];
+/// a segment persisted before it stores row ids in [`ROW_ID`].
+///
+/// Resolved from the file's own schema rather than from the index version, so
+/// one reader serves both without threading the version to every read site.
+/// The names are what makes the two distinguishable at all: the values are
+/// `u64` either way, so a file whose column disagrees with its declared
+/// version fails here on a missing column instead of silently reinterpreting
+/// addresses as ids.
+pub fn docs_identity_column(schema: &arrow_schema::Schema) -> Result<&'static str> {
+    if schema.column_with_name(ROW_ADDR).is_some() {
+        Ok(ROW_ADDR)
+    } else if schema.column_with_name(ROW_ID).is_some() {
+        Ok(ROW_ID)
+    } else {
+        Err(Error::invalid_input(format!(
+            "docs file has neither a {ROW_ADDR} nor a {ROW_ID} column; it cannot identify its \
+             documents"
+        )))
+    }
+}
 
 /// Schema metadata key persisted in every modern `docs.lance` partition.
 pub(super) const TOTAL_TOKENS_KEY: &str = "total_tokens";
@@ -1693,8 +1735,9 @@ impl PartitionDocuments {
                 },
                 || async move {
                     let reader = store.open_index_file(&path).await?;
-                    let batch = reader.read_range(0..num_docs, Some(&[ROW_ID])).await?;
-                    let row_ids = required_u64_column(&batch, ROW_ID, &path)?;
+                    let identity = docs_identity_column_of(reader.as_ref())?;
+                    let batch = reader.read_range(0..num_docs, Some(&[identity])).await?;
+                    let row_ids = required_u64_column(&batch, identity, &path)?;
                     if row_ids.null_count() != 0 {
                         return Err(corrupt_docs(
                             &path,
@@ -1988,12 +2031,12 @@ impl PartitionDocuments {
                     index..index + 1
                 })
                 .collect::<Vec<_>>();
-            let batch = self
-                .reader()
-                .await?
-                .read_ranges(&ranges, Some(&[ROW_ID, NUM_TOKEN_COL]))
+            let reader = self.reader().await?;
+            let identity = docs_identity_column_of(reader.as_ref())?;
+            let batch = reader
+                .read_ranges(&ranges, Some(&[identity, NUM_TOKEN_COL]))
                 .await?;
-            let row_ids = required_u64_column(&batch, ROW_ID, &self.path)?;
+            let row_ids = required_u64_column(&batch, identity, &self.path)?;
             let lengths = required_u32_column(&batch, NUM_TOKEN_COL, &self.path)?;
             if row_ids.null_count() != 0
                 || lengths.null_count() != 0
@@ -2231,12 +2274,13 @@ impl PartitionDocuments {
             .get_or_try_init(|| async {
                 if self.lengths.get().is_none() && self.projection.get().is_none() {
                     let reader = self.reader().await?;
+                    let identity = docs_identity_column_of(reader.as_ref())?;
                     let batch = reader
-                        .read_range(0..self.num_docs, Some(&[ROW_ID, NUM_TOKEN_COL]))
+                        .read_range(0..self.num_docs, Some(&[identity, NUM_TOKEN_COL]))
                         .await?;
                     let lengths = self.lengths_from_batch(&batch)?;
                     let row_ids =
-                        Arc::new(required_u64_column(&batch, ROW_ID, &self.path)?.clone());
+                        Arc::new(required_u64_column(&batch, identity, &self.path)?.clone());
                     if row_ids.null_count() != 0 {
                         return Err(corrupt_docs(
                             &self.path,

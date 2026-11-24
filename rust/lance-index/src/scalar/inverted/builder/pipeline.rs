@@ -113,6 +113,7 @@ pub(super) async fn build(
         worker_memory_limit_bytes: config.run_memory_limit_bytes,
         block_size: builder.params.block_size,
         coordinate_rank: document_coordinate_rank(&stream.schema()),
+        identity_column: builder.identity_column(),
     };
     let ids = builder.partition_id_allocator();
     let tokenized = Arc::new(AtomicU64::new(0));

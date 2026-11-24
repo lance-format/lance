@@ -222,6 +222,11 @@ pub struct InvertedIndexBuilder {
     src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
     deleted_fragments: RoaringBitmap,
+    /// The column documents' identities are written under. Defaults to the
+    /// legacy `ROW_ID`; a build committed as
+    /// `INVERTED_ROW_ADDR_DOMAIN_VERSION` sets `ROW_ADDR` via
+    /// [`Self::with_identity_column`].
+    identity_column: &'static str,
 }
 
 impl InvertedIndexBuilder {
@@ -267,7 +272,21 @@ impl InvertedIndexBuilder {
             posting_tail_codec: format_version.posting_tail_codec(),
             progress: noop_progress(),
             deleted_fragments,
+            identity_column: ROW_ID,
         }
+    }
+
+    /// Write documents' identities under `identity_column`. Must agree with
+    /// the `index_version` the finished segment is committed with: from
+    /// `INVERTED_ROW_ADDR_DOMAIN_VERSION` that is [`ROW_ADDR`], and a build
+    /// relabelled down to a legacy version keeps [`ROW_ID`].
+    pub fn with_identity_column(mut self, identity_column: &'static str) -> Self {
+        self.identity_column = identity_column;
+        self
+    }
+
+    pub(crate) fn identity_column(&self) -> &'static str {
+        self.identity_column
     }
 
     pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
@@ -536,6 +555,7 @@ impl InvertedIndexBuilder {
             worker_memory_limit_bytes,
             block_size: self.params.block_size,
             coordinate_rank: document_coordinate_rank(&stream.schema()),
+            identity_column: self.identity_column,
         };
         let id_alloc = self.partition_id_allocator();
         let tokenized_count = Arc::new(AtomicU64::new(0));
@@ -1134,6 +1154,11 @@ pub struct InnerBuilder {
     pub(super) tokens: TokenDictionary,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
+    /// The column the documents' identities are written under. Defaults to
+    /// the legacy [`ROW_ID`]; a build that will be labelled
+    /// [`INVERTED_ROW_ADDR_DOMAIN_VERSION`](super::INVERTED_ROW_ADDR_DOMAIN_VERSION)
+    /// sets [`ROW_ADDR`] through [`Self::with_identity_column`].
+    identity_column: &'static str,
 }
 
 impl InnerBuilder {
@@ -1197,7 +1222,16 @@ impl InnerBuilder {
             tokens: TokenDictionary::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
+            identity_column: ROW_ID,
         }
+    }
+
+    /// Write the documents' identities under `identity_column` (see
+    /// [`DocSet::to_batch`]). Must agree with the `index_version` the finished
+    /// segment is committed with.
+    pub fn with_identity_column(mut self, identity_column: &'static str) -> Self {
+        self.identity_column = identity_column;
+        self
     }
 
     pub fn new_with_posting_tail_codec(
@@ -1348,7 +1382,19 @@ impl InnerBuilder {
             tokens,
             posting_lists,
             docs,
+            identity_column,
         } = other;
+
+        // A merged partition writes one schema, so the name is taken from
+        // whichever side actually came from a persisted segment: a freshly
+        // built partition still carries the default until the build is told
+        // which to use, and consolidation merges those into partitions loaded
+        // from files. `write_docs` uses the accumulating builder's name, so
+        // adopting a non-default incoming one keeps a rewrite on the name its
+        // source was read under.
+        if identity_column != ROW_ID {
+            self.identity_column = identity_column;
+        }
 
         if self.with_position != with_position {
             return Err(Error::index(format!(
@@ -1609,7 +1655,7 @@ impl InnerBuilder {
         path: &str,
     ) -> Result<IndexFile> {
         log::info!("writing docs of partition {}", self.id);
-        let batch = docs.to_batch()?;
+        let batch = docs.to_batch(self.identity_column)?;
         let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
         writer
@@ -1649,6 +1695,7 @@ impl PartitionWriteTarget {
 }
 
 struct IndexWorker {
+    identity_column: &'static str,
     tokenizer: Box<dyn LanceTokenizer>,
     dest_store: Arc<dyn IndexStore>,
     id_alloc: Arc<AtomicU64>,
@@ -1692,6 +1739,7 @@ struct IndexWorkerConfig {
     worker_memory_limit_bytes: u64,
     block_size: usize,
     coordinate_rank: usize,
+    identity_column: &'static str,
 }
 
 impl IndexWorker {
@@ -1748,10 +1796,12 @@ impl IndexWorker {
             config.token_set_format,
             config.format_version,
             config.block_size,
-        );
+        )
+        .with_identity_column(config.identity_column);
         builder.docs = DocSet::with_coordinate_rank(config.coordinate_rank);
 
         Ok(Self {
+            identity_column: config.identity_column,
             tokenizer,
             dest_store,
             builder,
@@ -2159,7 +2209,8 @@ impl IndexWorker {
             self.token_set_format,
             format_version,
             block_size,
-        );
+        )
+        .with_identity_column(self.identity_column);
         replacement.docs = DocSet::with_coordinate_rank(self.coordinate_rank);
         let builder = std::mem::replace(&mut self.builder, replacement);
         if let Some(sender) = &self.run_sender {
@@ -4770,6 +4821,7 @@ mod tests {
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: params.block_size,
                 coordinate_rank: 0,
+                identity_column: ROW_ID,
             },
         )
         .await?;
@@ -4795,6 +4847,7 @@ mod tests {
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: params.block_size,
                 coordinate_rank: 0,
+                identity_column: ROW_ID,
             },
         )
         .await?;
@@ -5196,6 +5249,7 @@ mod tests {
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
+                identity_column: ROW_ID,
             },
         )
         .await?;
@@ -5540,6 +5594,7 @@ mod tests {
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
+                identity_column: ROW_ID,
             },
         )
         .await?;
@@ -5573,6 +5628,7 @@ mod tests {
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
+                identity_column: ROW_ID,
             },
         )
         .await?;
@@ -5613,6 +5669,7 @@ mod tests {
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
+                identity_column: ROW_ID,
             },
         )
         .await?;

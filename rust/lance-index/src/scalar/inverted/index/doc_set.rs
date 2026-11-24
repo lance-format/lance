@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::inverted::documents::docs_identity_column;
 
 #[derive(Debug, Clone, DeepSizeOf, Copy)]
 pub enum DocInfo {
@@ -240,6 +241,10 @@ pub struct DocSet {
     // Memoized answer to `row_ids_strictly_ascending`. Filled on first query use;
     // build-time appends happen before any query touches it.
     row_ids_ascending: Arc<std::sync::OnceLock<bool>>,
+    /// The column this set's identities were read from, carried so a builder
+    /// derived from it rewrites them under the same name. A set built from
+    /// scratch keeps the legacy default until the build is told otherwise.
+    pub(super) identity_column: &'static str,
 }
 
 impl DeepSizeOf for DocSet {
@@ -448,12 +453,18 @@ impl DocSet {
         block_max_scores
     }
 
-    pub fn to_batch(&self) -> Result<RecordBatch> {
+    /// `identity_column` names the column the documents' identities are
+    /// written under: [`ROW_ADDR`] from
+    /// [`INVERTED_ROW_ADDR_DOMAIN_VERSION`](crate::scalar::inverted::INVERTED_ROW_ADDR_DOMAIN_VERSION)
+    /// onward, [`ROW_ID`] for a segment written to be read as a legacy one.
+    /// The name has to match the version the segment will be labelled with --
+    /// see `docs_identity_column`.
+    pub fn to_batch(&self, identity_column: &str) -> Result<RecordBatch> {
         let row_id_col = UInt64Array::from_iter_values(self.row_ids.iter().cloned());
         let num_tokens_col = UInt32Array::from_iter_values(self.num_tokens.iter().cloned());
 
         let mut fields = vec![
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+            arrow_schema::Field::new(identity_column, DataType::UInt64, false),
             arrow_schema::Field::new(NUM_TOKEN_COL, DataType::UInt32, false),
         ];
         let mut columns = vec![
@@ -482,7 +493,8 @@ impl DocSet {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let identity = docs_identity_column(batch.schema_ref())?;
+        let row_id_col = batch[identity].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
         let mut doc_indices = Vec::new();
         for rank in 0.. {
@@ -492,13 +504,15 @@ impl DocSet {
             };
             doc_indices.push(column.as_primitive::<datatypes::UInt32Type>());
         }
-        Self::from_columns_with_doc_indices(
+        let mut docs = Self::from_columns_with_doc_indices(
             row_id_col,
             num_tokens_col,
             &doc_indices,
             is_legacy,
             frag_reuse_index,
-        )
+        )?;
+        docs.identity_column = identity;
+        Ok(docs)
     }
 
     /// Additive sibling of [`Self::load`] for mappings that require
@@ -510,9 +524,10 @@ impl DocSet {
     ) -> Result<Self> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        let identity = docs_identity_column(batch.schema_ref())?;
         let (batch, frag_reuse_index) = match remapping {
             Some(remapping) => {
-                let row_id_idx = batch.schema().index_of(ROW_ID)?;
+                let row_id_idx = batch.schema().index_of(identity)?;
                 let (batch, remapper) =
                     remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
                         .await?;
@@ -520,7 +535,7 @@ impl DocSet {
             }
             None => (batch, None),
         };
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let row_id_col = batch[identity].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
         let mut doc_indices = Vec::new();
         for rank in 0.. {
@@ -565,6 +580,7 @@ impl DocSet {
             scoring_quantized: false,
             norms: Arc::new(std::sync::OnceLock::new()),
             row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
+            identity_column: ROW_ID,
         }
     }
 
@@ -630,6 +646,7 @@ impl DocSet {
                 scoring_quantized: false,
                 norms: Arc::new(std::sync::OnceLock::new()),
                 row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
+                identity_column: ROW_ID,
             });
         }
 
@@ -675,6 +692,7 @@ impl DocSet {
                 scoring_quantized: false,
                 norms: Arc::new(std::sync::OnceLock::new()),
                 row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
+                identity_column: ROW_ID,
             });
         }
 
@@ -698,6 +716,7 @@ impl DocSet {
             scoring_quantized: false,
             norms: Arc::new(std::sync::OnceLock::new()),
             row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
+            identity_column: ROW_ID,
         })
     }
 

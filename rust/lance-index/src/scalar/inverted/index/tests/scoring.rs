@@ -144,7 +144,7 @@ async fn write_test_partition_with_optional_impacts_and_positions(
     token_writer.write_record_batch(token_batch).await.unwrap();
     token_writer.finish().await.unwrap();
 
-    let doc_batch = docs.to_batch().unwrap();
+    let doc_batch = docs.to_batch(lance_core::ROW_ID).unwrap();
     let mut doc_writer = store
         .new_index_file(&doc_file_path(partition_id), doc_batch.schema())
         .await

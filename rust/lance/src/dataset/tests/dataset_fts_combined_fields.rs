@@ -3099,3 +3099,147 @@ async fn test_fts_large_tie_pagination_across_query_shapes(
     }
     assert_eq!(pages, vec![0, 1, 2]);
 }
+
+/// The identity column in `docs.lance` has to be named for the domain the
+/// segment is committed with: `_rowaddr` when it keeps
+/// `INVERTED_ROW_ADDR_DOMAIN_VERSION`, `_rowid` when `build_scalar_index`
+/// relabels it down for older readers. The reader resolves whichever name is
+/// present, so only an assertion on the written file catches a build path that
+/// was never told which to write.
+#[rstest]
+#[case::stable_row_ids(true, "_rowaddr")]
+#[case::without_stable_row_ids(false, "_rowid")]
+#[tokio::test]
+async fn test_fts_docs_identity_column_matches_index_version(
+    #[case] stable_row_ids: bool,
+    #[case] expected_column: &str,
+) {
+    use crate::dataset::index::LanceIndexStoreExt;
+    use lance_index::scalar::IndexStore;
+    use lance_index::scalar::lance_format::LanceIndexStore;
+
+    let dir = TempStrDir::default();
+    let mut ds = write_fts_dataset(
+        &dir,
+        combined_fields_batch(vec![0, 1, 2, 3], vec!["alpha"; 4], vec!["beta"; 4]),
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await;
+    create_inverted_indices(&mut ds, &["title"], &combined_fields_test_params()).await;
+
+    let meta = ds.load_index_by_name("title_idx").await.unwrap().unwrap();
+    // With stable row ids the segment keeps the row-address-domain version;
+    // without them `build_scalar_index` relabels it down to whichever legacy
+    // version its posting format implies.
+    assert_eq!(
+        meta.results_are_row_addrs(),
+        stable_row_ids,
+        "index_version {} does not match the expected domain",
+        meta.index_version
+    );
+
+    // Read the committed docs file's schema straight off disk.
+    let store = LanceIndexStore::from_dataset_for_existing(&ds, &meta)
+        .await
+        .unwrap();
+    let mut docs = None;
+    let mut tried = Vec::new();
+    for id in 0..4u64 {
+        for candidate in [format!("part_{id}_docs.lance"), "docs.lance".to_string()] {
+            match store.open_index_file(&candidate).await {
+                Ok(reader) => {
+                    docs = Some(reader);
+                    break;
+                }
+                Err(err) => tried.push(format!("{candidate}: {err}")),
+            }
+        }
+        if docs.is_some() {
+            break;
+        }
+    }
+    let docs = docs.unwrap_or_else(|| panic!("no docs file; tried:\n{}", tried.join("\n")));
+    let columns = docs
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        columns.iter().any(|name| name == expected_column),
+        "docs.lance for index_version {} must name its identity column \
+         {expected_column}, got {columns:?}",
+        meta.index_version
+    );
+    let unexpected = if expected_column == "_rowaddr" {
+        "_rowid"
+    } else {
+        "_rowaddr"
+    };
+    assert!(
+        !columns.iter().any(|name| name == unexpected),
+        "docs.lance must not also carry {unexpected}: {columns:?}"
+    );
+
+    // Optimizing rewrites the segment but keeps its version, so the column has
+    // to survive a merge too.
+    ds.append(
+        RecordBatchIterator::new(
+            vec![Ok(combined_fields_batch(
+                vec![4, 5],
+                vec!["alpha"; 2],
+                vec!["beta"; 2],
+            ))],
+            combined_fields_batch(vec![4], vec!["alpha"], vec!["beta"]).schema(),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    ds.optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let merged = ds.load_index_by_name("title_idx").await.unwrap().unwrap();
+    let merged_store = LanceIndexStore::from_dataset_for_existing(&ds, &merged)
+        .await
+        .unwrap();
+    let mut merged_docs = None;
+    for id in 0..6u64 {
+        if let Ok(reader) = merged_store
+            .open_index_file(&format!("part_{id}_docs.lance"))
+            .await
+        {
+            merged_docs = Some(reader);
+            break;
+        }
+    }
+    let merged_columns = merged_docs
+        .expect("merged index must have a docs file")
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        merged_columns.iter().any(|name| name == expected_column)
+            && !merged_columns.iter().any(|name| name == unexpected),
+        "a merge must keep the identity column name, got {merged_columns:?} \
+         (merged index_version {}, addr-domain {})",
+        merged.index_version,
+        merged.results_are_row_addrs()
+    );
+
+    // And the index still answers, read back through the resolved name.
+    let ids = fts_result_ids(
+        &ds,
+        MatchQuery::new("alpha".into())
+            .with_column(Some("title".into()))
+            .into(),
+    )
+    .await;
+    assert_eq!(unique_ids(ids), HashSet::from([0, 1, 2, 3, 4, 5]));
+}

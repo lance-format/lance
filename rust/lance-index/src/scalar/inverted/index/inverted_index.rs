@@ -5,6 +5,7 @@ use super::*;
 use crate::scalar::RowAddrTranslatorRef;
 use crate::scalar::inverted::documents::DocumentRemapping;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_index_core::remapping::RowAddrTranslator;
 
 #[derive(Debug, Default)]
@@ -84,6 +85,19 @@ impl InvertedIndex {
         }
     }
 
+    /// The column this index's documents' identities are stored under, which
+    /// tracks [`Self::index_version`] exactly: both switch on
+    /// `results_are_row_addresses`. A segment rewritten from this one -- a
+    /// merge or a remap -- keeps this index's version, so it has to keep this
+    /// name too.
+    pub(super) fn identity_column(&self) -> &'static str {
+        if self.results_are_row_addresses {
+            ROW_ADDR
+        } else {
+            ROW_ID
+        }
+    }
+
     fn posting_tail_codec(&self) -> PostingTailCodec {
         self.partitions
             .first()
@@ -99,7 +113,16 @@ impl InvertedIndex {
         self.to_builder_with_offset(None)
     }
 
+    /// Every builder derived from an opened index inherits that index's
+    /// identity column (see [`Self::identity_column`]): a rewrite keeps the
+    /// source's `index_version`, so it must keep the matching column name, and
+    /// setting it here means no rewrite path can omit it.
     fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
+        self.to_builder_with_offset_inner(fragment_mask)
+            .with_identity_column(self.identity_column())
+    }
+
+    fn to_builder_with_offset_inner(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
             InvertedIndexBuilder::from_existing_index(
@@ -254,6 +277,7 @@ impl InvertedIndex {
                 .with_progress(progress)
                 .with_token_set_format(first.token_set_format)
                 .with_format_version(first.format_version())
+                .with_identity_column(first.identity_column())
                 .update_from_segments(new_data, dest_store, segments, old_data_filters)
                 .await?
         };

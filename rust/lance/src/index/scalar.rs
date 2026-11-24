@@ -564,8 +564,13 @@ pub(super) async fn build_scalar_index(
             format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
         )
     })?;
-    let training_request =
+    let mut training_request =
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+    // Only the plugin knows whether its stored layout depends on this, and the
+    // default is a no-op. FTS uses it to name its document identity column for
+    // the `index_version` the segment will actually be committed with -- see
+    // the relabeling below.
+    training_request.set_stable_row_ids(dataset.manifest.uses_stable_row_ids());
 
     // A zone map trained from the table reuses the write seeds its fragments
     // already carry and scans only the fragments without one. A caller that

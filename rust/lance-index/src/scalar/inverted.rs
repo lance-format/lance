@@ -48,7 +48,7 @@ pub use cross_column::cross_column_compound_search;
 use datafusion_execution::SendableRecordBatchStream;
 use documents::DocumentRemapping;
 pub use index::*;
-use lance_core::{Result, cache::LanceCache};
+use lance_core::{ROW_ADDR, ROW_ID, Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
 pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
 pub use tokenizer::*;
@@ -492,12 +492,40 @@ use super::IndexStore;
 pub struct InvertedIndexPlugin;
 
 impl InvertedIndexPlugin {
+    /// Train a segment that writes its document identities under the legacy
+    /// [`ROW_ID`] column. Callers that know the segment will keep
+    /// [`INVERTED_ROW_ADDR_DOMAIN_VERSION`] should use
+    /// [`Self::train_inverted_index_in_domain`] with [`ROW_ADDR`] instead.
     pub async fn train_inverted_index(
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         params: InvertedIndexParams,
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        Self::train_inverted_index_in_domain(
+            data,
+            index_store,
+            params,
+            fragment_ids,
+            progress,
+            ROW_ID,
+        )
+        .await
+    }
+
+    /// Like [`Self::train_inverted_index`], naming the document identity
+    /// column explicitly. The name must match the `index_version` the
+    /// finished segment is committed with: [`ROW_ADDR`] for
+    /// [`INVERTED_ROW_ADDR_DOMAIN_VERSION`], [`ROW_ID`] for a segment
+    /// relabelled to a legacy version.
+    pub async fn train_inverted_index_in_domain(
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        params: InvertedIndexParams,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+        identity_column: &'static str,
     ) -> Result<CreatedIndex> {
         let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
             if !frag_ids.is_empty() {
@@ -514,7 +542,8 @@ impl InvertedIndexPlugin {
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
-                .with_progress(progress);
+                .with_progress(progress)
+                .with_identity_column(identity_column);
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -576,18 +605,35 @@ impl InvertedIndexPlugin {
 struct InvertedIndexTrainingRequest {
     parameters: InvertedIndexParams,
     criteria: TrainingCriteria,
+    /// The column the trained segment writes document identities under. The
+    /// caller sets [`ROW_ADDR`] when the segment will keep
+    /// [`INVERTED_ROW_ADDR_DOMAIN_VERSION`]; it stays [`ROW_ID`] when the
+    /// segment will be relabelled to a legacy version, where an old reader
+    /// expects that name and the two domains coincide anyway.
+    identity_column: &'static str,
 }
 
 impl InvertedIndexTrainingRequest {
     pub fn new(parameters: InvertedIndexParams) -> Self {
         Self {
             parameters,
+            identity_column: ROW_ID,
             criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         }
     }
 }
 
 impl TrainingRequest for InvertedIndexTrainingRequest {
+    fn set_stable_row_ids(&mut self, stable_row_ids: bool) {
+        // Without stable row ids `build_scalar_index` relabels the finished
+        // segment to a pre-`INVERTED_ROW_ADDR_DOMAIN_VERSION` version so an
+        // older reader still understands it -- and that reader looks for
+        // `ROW_ID`. The two domains coincide there, so the legacy name is
+        // truthful. With stable row ids the segment keeps version 4 and names
+        // the column for what it actually holds.
+        self.identity_column = if stable_row_ids { ROW_ADDR } else { ROW_ID };
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -645,12 +691,13 @@ impl BasicTrainer for InvertedIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        Self::train_inverted_index(
+        Self::train_inverted_index_in_domain(
             data,
             index_store,
             request.parameters.clone(),
             fragment_ids,
             progress,
+            request.identity_column,
         )
         .await
     }

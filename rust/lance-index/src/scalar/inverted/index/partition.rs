@@ -1665,6 +1665,10 @@ impl InvertedPartition {
         );
         builder.tokens = TokenDictionary::try_from_token_set(Arc::unwrap_or_clone(self.tokens))?;
         builder.docs = self.docs.load_build_docset().await?;
+        // Rewrites keep the source segment's `index_version`, so they must keep
+        // the identity column it was read under.
+        let identity_column = builder.docs.identity_column;
+        builder = builder.with_identity_column(identity_column);
 
         builder
             .posting_lists
