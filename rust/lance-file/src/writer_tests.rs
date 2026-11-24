@@ -1,6 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+/// A failed page must not drop another encoder's still-owned work. The
+/// second future stands in for an already-dispatched encoder join handle.
+pub async fn assert_page_encoder_failure_drains<F, Fut>(write: F)
+where
+    F: FnOnce(futures::stream::FuturesOrdered<lance_encoding::encoder::EncodeTask>) -> Fut,
+    Fut: std::future::Future<Output = lance_core::Result<()>>,
+{
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let failed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = futures::stream::FuturesOrdered::new();
+    let start_wait = started.clone();
+    let first_failed = failed.clone();
+    tasks.push_back(Box::pin(async move {
+        start_wait.notified().await;
+        first_failed.notify_one();
+        Err(lance_core::Error::execution("first page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let finish = finished.clone();
+    let continue_work = release.clone();
+    tasks.push_back(Box::pin(async move {
+        started.notify_one();
+        continue_work.notified().await;
+        finish.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(lance_core::Error::execution("later page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let operation = write(tasks);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => panic!("writer returned before the remaining encoder drained: {result:?}"),
+        _ = failed.notified() => {},
+    }
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(matches!(
+        futures::poll!(&mut operation),
+        std::task::Poll::Pending
+    ));
+    release.notify_one();
+    let error = operation.await.unwrap_err();
+    assert!(matches!(error, lance_core::Error::Execution { .. }));
+    assert!(error.to_string().contains("first page encoder failed"));
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1279,6 +1325,183 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    fn packed_metadata() -> HashMap<String, String> {
+        HashMap::from([(PACKED_STRUCT_META_KEY.to_owned(), "true".to_owned())])
+    }
+
+    /// A packed `{a: Int32, <name>: child}` struct of three rows.
+    fn packed_struct_with_child(name: &str, child: ArrayRef) -> StructArray {
+        let fields = ArrowFields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new(name, child.data_type().clone(), true),
+        ]);
+        StructArray::new(
+            fields,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), child],
+            None,
+        )
+    }
+
+    fn int32_lists() -> ListArray {
+        ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![]),
+            Some(vec![Some(2), Some(3)]),
+        ])
+    }
+
+    async fn write_single_column(
+        fs: &FsFixture,
+        field: ArrowField,
+        column: ArrayRef,
+        version: ConcreteFileVersion,
+    ) -> lance_core::Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await?,
+            LanceSchema::try_from(schema.as_ref())?,
+            version,
+            FileWriterOptions::default(),
+        )?;
+        writer.write_batch(&batch).await?;
+        writer.finish().await?;
+        Ok(())
+    }
+
+    /// Packed structs are encoded as one primitive column, so a list-like
+    /// child, even inside a nested struct, is rejected with an error naming the
+    /// child instead of panicking while the column is converted to a data block.
+    #[rstest]
+    #[case::list("l", "List", false)]
+    #[case::large_list("l", "LargeList", false)]
+    #[case::map("m", "Map", false)]
+    #[case::nested_struct("inner.l", "List", false)]
+    #[case::packed_struct_in_list("l", "List", true)]
+    #[tokio::test]
+    async fn test_writer_rejects_packed_struct_with_list_child(
+        #[case] child_path: &str,
+        #[case] child_type: &str,
+        #[case] in_list: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        use arrow_array::LargeListArray;
+        use arrow_array::builder::MapBuilder;
+
+        let child: ArrayRef = match (child_path, child_type) {
+            (_, "LargeList") => Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(1)]), Some(vec![]), Some(vec![Some(2)])],
+            )),
+            (_, "Map") => {
+                let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+                for i in 0..3 {
+                    builder.keys().append_value(i);
+                    builder.values().append_value(i * 10);
+                    builder.append(true).unwrap();
+                }
+                Arc::new(builder.finish())
+            }
+            ("inner.l", _) => {
+                let lists: ArrayRef = Arc::new(int32_lists());
+                Arc::new(StructArray::new(
+                    ArrowFields::from(vec![
+                        ArrowField::new("b", DataType::Int32, true),
+                        ArrowField::new("l", lists.data_type().clone(), true),
+                    ]),
+                    vec![Arc::new(Int32Array::from(vec![4, 5, 6])), lists],
+                    None,
+                ))
+            }
+            _ => Arc::new(int32_lists()),
+        };
+        let top_name = child_path.split('.').next().unwrap();
+        let packed = packed_struct_with_child(top_name, child);
+        let packed_name = if in_list { "item" } else { "s" };
+        let packed_field = ArrowField::new(packed_name, packed.data_type().clone(), true)
+            .with_metadata(packed_metadata());
+        let (field, column): (ArrowField, ArrayRef) = if in_list {
+            let list = ListArray::new(
+                Arc::new(packed_field),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 3])),
+                Arc::new(packed),
+                None,
+            );
+            (
+                ArrowField::new("s", list.data_type().clone(), true),
+                Arc::new(list),
+            )
+        } else {
+            (packed_field, Arc::new(packed))
+        };
+
+        let fs = FsFixture::default();
+        let error = write_single_column(&fs, field, column, version)
+            .await
+            .expect_err("a packed struct with a list-like child was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Packed struct field '{packed_name}'")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("child '{child_path}' of type {child_type}(")),
+            "{message}"
+        );
+    }
+
+    /// Packed structs whose children are values still round-trip: fixed-width
+    /// children on every version and variable-width children from 2.2 on.
+    #[rstest]
+    #[case::fixed_v2_0(ConcreteFileVersion::V2_0, false)]
+    #[case::fixed_v2_1(ConcreteFileVersion::V2_1, false)]
+    #[case::fixed_v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::fixed_v2_3(ConcreteFileVersion::V2_3, false)]
+    #[case::variable_v2_2(ConcreteFileVersion::V2_2, true)]
+    #[case::variable_v2_3(ConcreteFileVersion::V2_3, true)]
+    #[tokio::test]
+    async fn test_packed_struct_with_value_children_round_trips(
+        #[case] version: ConcreteFileVersion,
+        #[case] variable: bool,
+    ) {
+        let child: ArrayRef = if variable {
+            Arc::new(StringArray::from(vec!["x", "", "yz"]))
+        } else {
+            Arc::new(arrow_array::Float64Array::from(vec![0.5, 1.5, 2.5]))
+        };
+        let packed = packed_struct_with_child("c", child);
+        let field =
+            ArrowField::new("s", packed.data_type().clone(), true).with_metadata(packed_metadata());
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let expected = RecordBatch::try_new(schema.clone(), vec![Arc::new(packed)]).unwrap();
+
+        let fs = FsFixture::default();
+        crate::testing::write_lance_file(
+            arrow_array::RecordBatchIterator::new(vec![Ok(expected.clone())], schema.clone()),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let output = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let actual = arrow_select::concat::concat_batches(&schema, &output).unwrap();
+        assert_eq!(actual.column(0), expected.column(0));
     }
 
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {

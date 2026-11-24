@@ -470,21 +470,20 @@ impl<'a> CreateIndexBuilder<'a> {
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
-                let mut params = if let Some(provided_params) =
-                    self.params.as_any().downcast_ref::<ScalarIndexParams>()
+                let mut params = if let Some(params_json) = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .and_then(|provided_params| provided_params.params.as_deref())
                 {
-                    if let Some(params_json) = &provided_params.params {
-                        // Parse and apply the custom parameters
-                        if let Ok(json_value) =
-                            serde_json::from_str::<serde_json::Value>(params_json)
-                        {
-                            base_params.with_params(&json_value)
-                        } else {
-                            base_params
-                        }
-                    } else {
-                        base_params
-                    }
+                    let json_value = serde_json::from_str::<serde_json::Value>(params_json)
+                        .map_err(|e| {
+                            Error::invalid_input(format!(
+                                "Invalid JSON params for {} index: {e}",
+                                self.index_type
+                            ))
+                        })?;
+                    base_params.with_params(&json_value)
                 } else {
                     base_params
                 };
@@ -699,7 +698,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 // Capture file sizes after vector index creation
                 let index_dir = self.dataset.indices_dir().join(index_id.to_string());
                 let files =
-                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                    list_index_files_with_sizes(&self.dataset.table_state.object_store, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
@@ -727,7 +726,7 @@ impl<'a> CreateIndexBuilder<'a> {
             fragment_bitmap: if train {
                 match &self.fragments {
                     Some(fragment_ids) => Some(fragment_ids.iter().collect()),
-                    None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
+                    None => Some(self.dataset.table_state.fragment_bitmap.as_ref().clone()),
                 }
             } else {
                 // Empty bitmap for untrained indices
@@ -887,7 +886,13 @@ impl<'a> CreateIndexBuilder<'a> {
             )));
         }
 
-        let all_fragment_ids: Vec<u32> = self.dataset.fragment_bitmap.as_ref().iter().collect();
+        let all_fragment_ids: Vec<u32> = self
+            .dataset
+            .table_state
+            .fragment_bitmap
+            .as_ref()
+            .iter()
+            .collect();
         if !train || all_fragment_ids.is_empty() {
             let segment_uuid = Uuid::new_v4();
             let created_index = build_scalar_index(
@@ -1070,8 +1075,15 @@ fn index_matches_type(
     if index_type == IndexType::Scalar
         && let Some(scalar_params) = params.as_any().downcast_ref::<ScalarIndexParams>()
     {
-        return scalar_params.index_type.to_lowercase()
-            == plugin_name_from_details_url(&d.type_url);
+        // "fts" is accepted as an alias of "inverted", the plugin name derived
+        // from the committed index's details type.
+        let requested = scalar_params.index_type.to_lowercase();
+        let requested = if requested == "fts" {
+            "inverted".to_string()
+        } else {
+            requested
+        };
+        return requested == plugin_name_from_details_url(&d.type_url);
     }
 
     index_type.matches_details(d)
@@ -1114,7 +1126,7 @@ async fn should_train_index(
         return Ok(false);
     }
 
-    if dataset.fragment_bitmap.is_empty() {
+    if dataset.table_state.fragment_bitmap.is_empty() {
         return Ok(false);
     }
 
@@ -1144,7 +1156,7 @@ fn vector_params_have_precomputed_ivf(params: &VectorIndexParams) -> bool {
 fn effective_vector_fragments(dataset: &Dataset, fragments: Option<&[u32]>) -> Option<Vec<u32>> {
     let fragments = Dataset::normalize_fragment_ids(fragments?);
     let fragment_bitmap: roaring::RoaringBitmap = fragments.iter().copied().collect();
-    (fragment_bitmap != *dataset.fragment_bitmap).then_some(fragments)
+    (fragment_bitmap != *dataset.table_state.fragment_bitmap).then_some(fragments)
 }
 
 /// Validate that a user-supplied `index_uuid` is permitted for this build.
@@ -1272,6 +1284,30 @@ mod tests {
         assert_eq!(resolved["base_tokenizer"], "ngram");
         assert_eq!(resolved["stem"], expected_word_filters);
         assert_eq!(resolved["remove_stop_words"], expected_word_filters);
+    }
+
+    /// The Java binding passes the params string through unchanged, so a typo
+    /// there must fail the build instead of training with default parameters.
+    #[tokio::test]
+    async fn test_malformed_scalar_params_json_is_rejected() {
+        let mut dataset = gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams {
+            index_type: "bloomfilter".to_string(),
+            // Truncated JSON: parses as no valid JSON value.
+            params: Some(r#"{"fpp": 0.00"#.to_string()),
+        };
+        let err = dataset
+            .create_index(&["i"], IndexType::BloomFilter, None, &params, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("EOF while parsing"), "{err}");
+        assert!(dataset.load_indices().await.unwrap().is_empty());
     }
 
     #[test]
@@ -1442,6 +1478,51 @@ mod tests {
                 .contains("already exists, please specify a different name or use replace=True"),
             "{err2}"
         );
+    }
+
+    /// An "fts" build on a column that already has an inverted index must find
+    /// that index instead of committing a second one as "<column>_idx_2".
+    #[rstest]
+    #[case::fts_after_fts("fts", "fts")]
+    #[case::fts_after_inverted("inverted", "fts")]
+    #[tokio::test]
+    async fn test_fts_alias_repeated_build_collides_with_existing_inverted_index(
+        #[case] first: &str,
+        #[case] second: &str,
+    ) {
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(batches, "memory://", None).await.unwrap();
+
+        let params = ScalarIndexParams::new(first.to_string());
+        CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Scalar, &params)
+            .execute()
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::new(second.to_string());
+        let err = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Scalar, &params)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Index { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("already exists, please specify a different name or use replace=True"),
+            "{err}"
+        );
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+
+        CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Scalar, &params)
+            .replace(true)
+            .execute()
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "text_idx");
     }
 
     /// The same guard shape, duplicated in `execute_multi_segment_fmindex`
@@ -2222,7 +2303,7 @@ mod tests {
         expected: &[(&str, StageIo)],
     ) {
         let progress = Arc::new(IoRecordingProgress {
-            store: dataset.object_store.clone(),
+            store: dataset.table_state.object_store.clone(),
             events: Default::default(),
         });
         let mut builder = CreateIndexBuilder::new(&mut dataset, &[column], index_type, params)
@@ -2523,7 +2604,7 @@ mod tests {
     /// shard files. Locks the "every segment has exactly one lookup" invariant.
     async fn assert_canonical_btree_segment(dataset: &Dataset, uuid: &Uuid) {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir)
+        let files = list_index_files_with_sizes(&dataset.table_state.object_store, &index_dir)
             .await
             .unwrap();
         let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -2712,6 +2793,7 @@ mod tests {
             .join(live_index.uuid.to_string())
             .join(BITMAP_LOOKUP_NAME);
         let artifact_before = dataset
+            .table_state
             .object_store
             .read_one_all(&artifact_path)
             .await
@@ -2742,6 +2824,7 @@ mod tests {
         }
         assert_eq!(dataset.version().version, version_before);
         let artifact_after = dataset
+            .table_state
             .object_store
             .read_one_all(&artifact_path)
             .await
@@ -3109,7 +3192,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             logical.calculate_included_frags().await.unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
 
         let mut trimmed = staged.clone();
@@ -3159,7 +3242,7 @@ mod tests {
         assert_eq!(merged.dataset_version, expected_dataset_version);
         assert_eq!(
             merged.fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
         assert!(
             merged
@@ -3264,6 +3347,7 @@ mod tests {
                 .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
+                    .table_state
                     .object_store
                     .as_ref()
                     .exists(&segment_index)
@@ -3342,7 +3426,7 @@ mod tests {
 
         assert_eq!(
             segment.fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
     }
 
@@ -4008,6 +4092,7 @@ mod tests {
             .join("staging")
             .join("orphan.lance");
         dataset
+            .table_state
             .object_store
             .put(&stale_staging_path, b"stale")
             .await
@@ -4026,6 +4111,7 @@ mod tests {
                 .join(lance_index::scalar::inverted::METADATA_FILE);
             assert!(
                 dataset
+                    .table_state
                     .object_store
                     .as_ref()
                     .exists(&metadata_path)
@@ -4135,7 +4221,7 @@ mod tests {
         .unwrap();
 
         let staged_coverage = staged.fragment_bitmap.clone().unwrap();
-        let live = dataset.fragment_bitmap.as_ref();
+        let live = dataset.table_state.fragment_bitmap.as_ref();
         assert!(
             !staged_coverage.is_subset(live) && !staged_coverage.is_disjoint(live),
             "precondition: the staged coverage must be partly retired, staged {staged_coverage:?} live {live:?}"
@@ -4166,7 +4252,7 @@ mod tests {
             .expect("a merged segment records its coverage");
         assert_eq!(
             coverage,
-            &(&staged_coverage & dataset.fragment_bitmap.as_ref()),
+            &(&staged_coverage & dataset.table_state.fragment_bitmap.as_ref()),
             "with no applicable mapping the claim is exactly the staged fragments still live"
         );
         assert!(
@@ -4285,7 +4371,7 @@ mod tests {
             .as_ref()
             .expect("a merged segment records its coverage");
         assert!(
-            coverage.is_disjoint(dataset.fragment_bitmap.as_ref()),
+            coverage.is_disjoint(dataset.table_state.fragment_bitmap.as_ref()),
             "a merge with no applicable mapping must not claim live fragments, got {coverage:?}"
         );
         assert!(
@@ -4620,6 +4706,7 @@ mod tests {
             );
             assert!(
                 row_addrs.iter().all(|row_addr| dataset
+                    .table_state
                     .fragment_bitmap
                     .contains(RowAddress::from(u64::from(*row_addr)).fragment_id())),
                 "{index_type:?} merge returned retired row addresses (compacted: {compact})"
@@ -5172,7 +5259,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !dataset.fragment_bitmap.contains(0),
+            !dataset.table_state.fragment_bitmap.contains(0),
             "compaction should retire fragment 0"
         );
 
@@ -5324,7 +5411,7 @@ mod tests {
                 "vector",
                 vec![IndexSegment::new(
                     uuid,
-                    dataset.fragment_bitmap.as_ref().clone(),
+                    dataset.table_state.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
                     Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
@@ -5340,7 +5427,7 @@ mod tests {
         assert_eq!(indices[0].uuid, uuid);
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
         assert_eq!(indices[0].dataset_version, source_dataset_version);
 
@@ -5350,7 +5437,7 @@ mod tests {
                 "vector",
                 vec![IndexSegment::new(
                     Uuid::new_v4(),
-                    dataset.fragment_bitmap.as_ref().clone(),
+                    dataset.table_state.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
                     Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),

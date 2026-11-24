@@ -9,6 +9,7 @@ use lance_core::Error;
 use object_store::{GetResult, ObjectMeta, Result};
 
 use super::GetRequest;
+use crate::object_store::hf_throttle::is_huggingface_rate_limited;
 use crate::traits::ByteStream;
 
 // One budget bounds the entire download, including requests to reopen a failed body.
@@ -21,7 +22,11 @@ async fn request_with_retry(request: &GetRequest, retries: &mut usize) -> Result
         {
             Ok(result) => return Ok(result),
             Err(error) => {
-                if *retries == 0 || !matches!(error, object_store::Error::Generic { .. }) {
+                // OpenDAL already owns retries for handled Hugging Face rate limits.
+                if *retries == 0
+                    || !matches!(error, object_store::Error::Generic { .. })
+                    || is_huggingface_rate_limited(&error)
+                {
                     return Err(error);
                 }
                 *retries -= 1;

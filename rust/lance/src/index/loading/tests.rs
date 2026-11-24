@@ -7,11 +7,14 @@ use crate::index::tests::support::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::utils::test::serializing_cache::SerializingCacheBackend;
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use all_asserts::assert_ge;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, Int32Type, UInt64Type};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
+use lance_core::cache::CacheNamespace;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
@@ -21,6 +24,8 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 use lance_linalg::distance::DistanceType;
 use rstest::rstest;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::index::vector::IndexFileVersion;
 use crate::index::vector::VectorIndexParams;
@@ -28,6 +33,55 @@ use crate::index::vector::ivf::v2::tests::{
     NUM_ROWS, PartitionBypassCacheBackend, append_dataset, generate_test_dataset, ground_truth,
     ivf_partition_cache_keys,
 };
+
+#[tokio::test]
+async fn test_cold_ivf_initialization_trace() {
+    let data = copy_test_data_to_tmp("v0.30.0_pre_created_at/index_without_created_at").unwrap();
+    let dataset = Dataset::open(&data.path_str()).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    // This older manifest may require type inference while listing indices.
+    dataset.session().index_cache.clear().await;
+    let trace = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("off,lance::io_events=info")
+        .with_span_events(FmtSpan::CLOSE)
+        .with_writer(trace.reopen().unwrap())
+        .finish();
+
+    async {
+        for _ in 0..2 {
+            dataset
+                .open_vector_index_from_metadata("vec", &indices[0], &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        }
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let output = std::fs::read_to_string(trace.path()).unwrap();
+    let mut opens = output
+        .lines()
+        .filter(|line| line.contains("ivf_index_initialize") && line.contains("close"));
+    let cold = opens
+        .next()
+        .expect("cold open should record initialization");
+    for field in [
+        "index_reader_us",
+        "model_read_us",
+        "model_decode_us",
+        "quantizer_open_us",
+        "resident_open_us",
+        "query_state_us",
+        "scheduler_requests",
+        "scheduler_bytes",
+    ] {
+        assert!(cold.contains(&format!("{field}=")), "{cold}");
+    }
+    assert!(opens.next().is_none(), "warm open repeated initialization");
+    assert!(output.lines().any(|line| line.contains("prepare_us=")));
+}
 
 #[tokio::test]
 async fn test_open_logical_vector_index_single_segment_quality_apis() {
@@ -525,7 +579,13 @@ async fn test_vector_cache_uses_current_object_store(#[case] index_version: Inde
         .unwrap();
 
     let frag_reuse_uuid = dataset_a.frag_reuse_index_uuid().await;
-    let state_cache_key = IvfIndexStateCacheKey::new(&index_meta.uuid, frag_reuse_uuid.as_ref());
+    let index_path = dataset_a
+        .indice_files_dir(&index_meta)
+        .unwrap()
+        .join(index_meta.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let state_cache_key =
+        IvfIndexStateCacheKey::new(&index_meta.uuid, &store_a.store_prefix, index_path.as_ref());
     let cached_state = if matches!(index_version, IndexFileVersion::V3) {
         Some(
             dataset_a
@@ -1110,4 +1170,147 @@ mod multi_column_planner {
             Some("a = Int32(1) AND b > Int32(5)")
         );
     }
+}
+
+#[test]
+fn portable_state_key_preserves_physical_and_dataset_isolation() {
+    let uuid = Uuid::from_u128(1);
+    let other_uuid = Uuid::from_u128(2);
+    let digest = |dataset: &str, key: &IvfIndexStateCacheKey<'_>| {
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root().child(dataset),
+            IvfIndexStateCacheKey::stable_type_id(),
+            IvfIndexStateCacheKey::schema(),
+        );
+        key.write_key(&mut builder);
+        builder.finish()
+    };
+    let key = IvfIndexStateCacheKey::new(&uuid, "s3$bucket", "ds/_indices/1/index.idx");
+    let original = digest("dataset", &key);
+    assert_ne!(original, digest("clone", &key));
+    for candidate in [
+        IvfIndexStateCacheKey::new(&other_uuid, key.store, key.path),
+        IvfIndexStateCacheKey::new(&uuid, "s3$other-bucket", key.path),
+        IvfIndexStateCacheKey::new(&uuid, key.store, "elsewhere/_indices/1/index.idx"),
+    ] {
+        assert_ne!(original, digest("dataset", &candidate));
+    }
+    // A v1 key does not describe the physical store. Neither a plain nor a
+    // remapped v1 entry can be safely reinterpreted as the new identity.
+    for fri in [None, Some(&other_uuid)] {
+        let mut old = KeyBuilder::new(
+            CacheNamespace::root().child("dataset"),
+            "IvfIndexState",
+            CacheKeySchema::new("lance.index.ivf-state-key", 1),
+        );
+        write_index_identity(&mut old, &uuid, fri);
+        assert_ne!(original, old.finish());
+        let legacy = LegacyVectorIndexCacheKey::new(&uuid, fri);
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root().child("dataset"),
+            LegacyVectorIndexCacheKey::stable_type_id(),
+            LegacyVectorIndexCacheKey::schema(),
+        );
+        legacy.write_key(&mut builder);
+        assert_ne!(original, builder.finish());
+    }
+    assert_eq!(LegacyVectorIndexCacheKey::schema().version(), 1);
+}
+
+/// An old-key entry may be from another store binding at the same dataset URI.
+/// Keep its bytes untouched, but never promote it into the physical-file key.
+#[tokio::test]
+async fn portable_state_schema_change_does_not_promote_unqualified_state() {
+    #[derive(Debug)]
+    struct OldStateKey<'a>(&'a Uuid);
+    impl CacheKey for OldStateKey<'_> {
+        type ValueType = IvfStateEntryBox;
+        fn key(&self) -> std::borrow::Cow<'_, str> {
+            self.0.to_string().into()
+        }
+        fn type_name() -> &'static str {
+            "IvfIndexState"
+        }
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("lance.index.ivf-state-key", 1)
+        }
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            write_index_identity(builder, self.0, None);
+        }
+        fn codec() -> Option<lance_core::cache::CacheCodec> {
+            IvfIndexStateCacheKey::codec()
+        }
+    }
+    let mut dataset = gen_batch()
+        .col("vector", array::rand_vec::<Float32Type>(4.into()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    let meta = dataset
+        .load_indices_by_name("vector_idx")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let store = dataset.object_store_for_index(&meta).await.unwrap();
+    let path = dataset
+        .indice_files_dir(&meta)
+        .unwrap()
+        .join(meta.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let key = IvfIndexStateCacheKey::new(&meta.uuid, &store.store_prefix, path.as_ref());
+    dataset
+        .open_vector_index("vector", &meta.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let state = dataset.index_cache.get_with_key(&key).await.unwrap();
+    let backend = Arc::new(SerializingCacheBackend::new());
+    dataset.index_cache = crate::session::Session::with_index_cache_backend(
+        backend.clone(),
+        1024 * 1024,
+        Arc::default(),
+    )
+    .index_cache
+    .for_dataset(dataset.uri())
+    .into();
+    let old_key = OldStateKey(&meta.uuid);
+    dataset.index_cache.insert_with_key(&old_key, state).await;
+    assert!(dataset.index_cache.get_with_key(&key).await.is_none());
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    dataset
+        .open_vector_index("vector", &meta.uuid, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(dataset.index_cache.get_with_key(&key).await.is_some());
+    assert!(
+        dataset.index_cache.get_with_key(&old_key).await.is_some(),
+        "old bytes were not reinterpreted or removed"
+    );
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    dataset
+        .open_vector_index("vector", &meta.uuid, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
 }

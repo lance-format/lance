@@ -93,7 +93,7 @@ pub mod data_fragment {
     /// first row is row 1, the second row is row 42, and the third row is row 3.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum RowIdSequence {
-        /// Current Lance writers store row ids inline regardless of encoded size.
+        /// Serialized row IDs stored directly in the fragment metadata.
         #[prost(bytes, tag = "5")]
         InlineRowIds(::prost::bytes::Bytes),
         /// The row ids are a hidden column of one of this fragment's `files`: the
@@ -108,7 +108,7 @@ pub mod data_fragment {
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum LastUpdatedAtVersionSequence {
-        /// Current Lance writers store last-updated versions inline regardless of encoded size.
+        /// Serialized last-updated versions stored directly in the fragment metadata.
         #[prost(bytes, tag = "7")]
         InlineLastUpdatedAtVersions(::prost::alloc::vec::Vec<u8>),
         /// The versions are a hidden column of one of this fragment's `files`: the
@@ -119,7 +119,7 @@ pub mod data_fragment {
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum CreatedAtVersionSequence {
-        /// Current Lance writers store created-at versions inline regardless of encoded size.
+        /// Serialized created-at versions stored directly in the fragment metadata.
         #[prost(bytes, tag = "9")]
         InlineCreatedAtVersions(::prost::alloc::vec::Vec<u8>),
         /// The versions are a hidden column of one of this fragment's `files`: the
@@ -350,7 +350,8 @@ impl ::prost::Name for FieldCoverage {
 }
 /// Deletion File
 ///
-/// The path of the deletion file is constructed as:
+/// The path of the deletion file is `{root}/{path}` when `path` is set, where
+/// `path` is a normalized relative path under `_deletions/`, or constructed as:
 ///    {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
 /// where {extension} depends on DeletionFileType.
 ///
@@ -371,6 +372,13 @@ pub struct DeletionFile {
     /// The number of rows that are marked as deleted.
     #[prost(uint64, tag = "4")]
     pub num_deleted_rows: u64,
+    /// Normalized relative path under `_deletions/` from the dataset root selected
+    /// by `base_id`, ending in `.arrow` or `.bin` to match `file_type`. Cannot be
+    /// set together with `inline`. Requires `FLAG_DELETION_FILE_PATHS` (1 << 21)
+    /// in both reader and writer feature flags while present, and the writer flag
+    /// remains set on subsequent versions.
+    #[prost(string, optional, tag = "5")]
+    pub path: ::core::option::Option<::prost::alloc::string::String>,
     /// The deletion vector itself, stored in the manifest instead of in a file.
     /// Always the BITMAP encoding (a serialized Roaring bitmap of deleted row
     /// offsets), whatever `file_type` says. A reader that reads one request per
@@ -392,7 +400,7 @@ pub mod deletion_file {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum DeletionFileType {
-        /// A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
+        /// A single UInt32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
         /// one column. Has a .arrow extension.
         ArrowArray = 0,
         /// A Roaring Bitmap of deleted row offsets. Has a .bin extension.
@@ -1171,13 +1179,17 @@ pub struct IndexMetadata {
     /// form the trailing suffix of this list in emission order.
     #[prost(int32, repeated, tag = "2")]
     pub fields: ::prost::alloc::vec::Vec<i32>,
-    /// Index name. Must be unique within one dataset version.
+    /// Logical index name shared by all segments of the index.
     #[prost(string, tag = "3")]
     pub name: ::prost::alloc::string::String,
     /// The version of the dataset this index was built from.
     #[prost(uint64, tag = "4")]
     pub dataset_version: u64,
     /// A bitmap of the included fragment ids.
+    ///
+    /// Stores committed dataset fragment IDs, not local IDs stored inside index
+    /// files. When `local_fragment_aliases` is used, a commit or rebase updates
+    /// this bitmap and the aliases together without rewriting the index files.
     ///
     /// This may by used to determine how much of the dataset is covered by the
     /// index. This information can be retrieved from the dataset by looking at
@@ -1203,7 +1215,7 @@ pub struct IndexMetadata {
     ///    URL ignoring case.
     #[prost(message, optional, tag = "6")]
     pub index_details: ::core::option::Option<::prost_types::Any>,
-    /// The minimum lance version that this index is compatible with.
+    /// Index format version for this segment. If unset, use version 0.
     #[prost(int32, optional, tag = "7")]
     pub index_version: ::core::option::Option<i32>,
     /// Timestamp when the index was created (UTC timestamp in milliseconds since epoch)
@@ -1212,8 +1224,7 @@ pub struct IndexMetadata {
     /// this field was added, this will be None/null.
     #[prost(uint64, optional, tag = "8")]
     pub created_at: ::core::option::Option<u64>,
-    /// The base path index of the data file. Used when the file is imported or referred from another dataset.
-    /// Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+    /// Base path ID for the index files. If unset, use the dataset base path.
     #[prost(uint32, optional, tag = "9")]
     pub base_id: ::core::option::Option<u32>,
     /// List of files and their sizes for this index segment.
@@ -1261,6 +1272,25 @@ pub struct IndexMetadata {
     #[prost(map = "string, string", tag = "13")]
     pub metadata:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Sparse map from fragment IDs stored in this segment's files to committed
+    /// fragment IDs. An empty map means no mapping. Unmapped IDs keep their
+    /// value. Each stored ID is translated once.
+    ///
+    /// Applies to every fragment ID referenced by the segment's files, such as the
+    /// fragment half of a physical row address or a zone's fragment ID. A row
+    /// address keeps its row offset. Stable logical row IDs and user column values
+    /// are not translated.
+    ///
+    /// Keys and values must be less than 2^32 - 1. u32::MAX (2^32 - 1) is
+    /// reserved for RowAddress::TOMBSTONE_FRAG. Two referenced fragment IDs must
+    /// not resolve to the same final fragment ID.
+    ///
+    /// Requires flag 1 << 20 (FLAG_LOCAL_FRAGMENT_ALIASES) in both reader and
+    /// writer feature flags while nonempty. Both bits are cleared when no
+    /// retained segment has a nonempty map. Reserved until readers and index
+    /// maintenance support aliases.
+    #[prost(map = "uint32, uint32", tag = "14")]
+    pub local_fragment_aliases: ::std::collections::HashMap<u32, u32>,
 }
 impl ::prost::Name for IndexMetadata {
     const NAME: &'static str = "IndexMetadata";
@@ -2079,8 +2109,7 @@ pub mod transaction {
     }
     /// Nested message and enum types in `Rewrite`.
     pub mod rewrite {
-        /// During a rewrite an index may be rewritten.  We only serialize the UUID
-        /// since a rewrite should not change the other index parameters.
+        /// Identifies the replaced index segment and records its replacement metadata.
         #[derive(Clone, PartialEq, ::prost::Message)]
         pub struct RewrittenIndex {
             /// The id of the index that will be replaced
@@ -2242,15 +2271,8 @@ pub mod transaction {
     /// An operation that clones a dataset.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Clone {
-        /// - true:  Performs a metadata-only clone (copies manifest without data files).
-        ///           The cloned dataset references original data through `base_paths`,
-        ///           suitable for experimental scenarios or rapid metadata migration.
-        /// - false: Performs a full deep clone using the underlying object storage's native
-        ///           copy API (e.g., S3 CopyObject, GCS rewrite). This leverages server-side
-        ///           bulk copy operations to bypass download/upload bottlenecks, achieving
-        ///           near-linear speedup for large datasets (typically 3-10x faster than
-        ///           manual file transfers). The operation maintains atomicity and data
-        ///           integrity guarantees provided by the storage backend.
+        /// True for a shallow clone that references source files through `base_paths`.
+        /// False for a deep clone that copies source files.
         #[prost(bool, tag = "1")]
         pub is_shallow: bool,
         /// the reference name in the source dataset
@@ -2293,17 +2315,16 @@ pub mod transaction {
             "/lance.table.Transaction.UInt32List".into()
         }
     }
-    /// An operation that updates rows but does not add or remove rows.
+    /// Updates rows or applies merge-insert changes, including inserts and deletes.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Update {
-        /// The fragments that have been removed. These are fragments where all rows
-        /// have been updated and moved to a new fragment.
+        /// Fragments removed after all their rows were deleted or moved.
         #[prost(uint64, repeated, tag = "1")]
         pub removed_fragment_ids: ::prost::alloc::vec::Vec<u64>,
         /// The fragments that have been updated.
         #[prost(message, repeated, tag = "2")]
         pub updated_fragments: ::prost::alloc::vec::Vec<super::DataFragment>,
-        /// The new fragments where updated rows have been moved to.
+        /// New fragments containing inserted or rewritten rows.
         #[prost(message, repeated, tag = "3")]
         pub new_fragments: ::prost::alloc::vec::Vec<super::DataFragment>,
         /// The ids of the fields that have been modified.
@@ -2712,10 +2733,9 @@ pub mod u64_segment {
         /// A bitmap of the values in the range. The bitmap is a sequence of bytes,
         /// where each byte represents 8 values. The first byte represents values
         /// start to start + 7, the second byte represents values start + 8 to
-        /// start + 15, and so on. The most significant bit of each byte represents
-        /// the first value in the range, and the least significant bit represents
-        /// the last value in the range. If the bit is set, the value is in the
-        /// range; if it is not set, the value is not in the range.
+        /// start + 15, and so on. Within each byte, the least significant bit
+        /// represents the first of its eight values. A set bit means the value
+        /// is present.
         #[prost(bytes = "vec", tag = "3")]
         pub bitmap: ::prost::alloc::vec::Vec<u8>,
     }

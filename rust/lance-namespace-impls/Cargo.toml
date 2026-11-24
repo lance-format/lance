@@ -14,7 +14,7 @@ rust-version.workspace = true
 [features]
 default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
 rest = ["dep:arc-swap", "dep:reqwest", "dep:serde"]
-rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
+rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde", "tokio/net", "tokio/rt"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp", "lance/gcp"]
 dir-aws = ["lance-io/aws", "lance/aws"]
@@ -23,7 +23,7 @@ dir-oss = ["lance-io/oss", "lance/oss"]
 dir-huggingface = ["lance-io/huggingface", "lance/huggingface"]
 dir-goosefs = ["lance-io/goosefs", "lance/goosefs"]
 # Credential vending features
-credential-vendor-aws = ["dep:aws-sdk-sts", "dep:aws-config", "dep:sha2", "dep:base64"]
+credential-vendor-aws = ["dep:aws-sdk-sts", "dep:aws-config", "dep:sha2", "dep:base64", "tokio/fs", "tokio/rt"]
 credential-vendor-gcp = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:base64", "dep:ring", "dep:rustls-pki-types"]
 credential-vendor-azure = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:base64", "dep:chrono", "dep:hmac", "dep:quick-xml"]
 
@@ -65,7 +65,7 @@ serde = { workspace = true, optional = true }
 # Common dependencies
 async-trait.workspace = true
 bytes.workspace = true
-tokio = { workspace = true, features = ["sync", "full"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 serde_json = { workspace = true }
 futures.workspace = true
 log.workspace = true
@@ -74,7 +74,7 @@ roaring.workspace = true
 uuid.workspace = true
 
 # Shared credential vending dependencies
-sha2 = { version = "0.10", optional = true }
+sha2 = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
 
 # AWS credential vending dependencies (optional, enabled by "credential-vendor-aws" feature)
@@ -91,6 +91,7 @@ hmac = { version = "0.12", optional = true }
 quick-xml = { version = "0.40", optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile.workspace = true
 wiremock.workspace = true
 rstest.workspace = true

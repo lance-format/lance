@@ -20,7 +20,7 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    DatasetRuntimeConfig, ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    DatasetRuntimeConfig, ReadParams, deep_clone_copy_parallelism,
     parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
     write_manifest_file,
 };
@@ -28,7 +28,7 @@ use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
-use lance_table::format::DataStorageFormat;
+use lance_table::format::{DataStorageFormat, ManifestBuildConfig};
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -60,7 +60,6 @@ use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::{BasePath, Fragment, pb};
 use lance_table::io::deletion::DELETIONS_DIR;
-use object_store::ObjectStoreExt;
 use prost::Message;
 
 use crate::index::DatasetIndexExt;
@@ -251,8 +250,8 @@ async fn test_with_object_store_clone_preserves_shared_state_and_overrides_store
     let wrapped_dataset = dataset.with_object_store(wrapped_store, Some(store_params));
     assert!(Arc::ptr_eq(&dataset.session(), &wrapped_dataset.session()));
     assert!(!Arc::ptr_eq(
-        &dataset.object_store.as_ref().inner,
-        &wrapped_dataset.object_store.as_ref().inner
+        &dataset.table_state.object_store.as_ref().inner,
+        &wrapped_dataset.table_state.object_store.as_ref().inner
     ));
 }
 
@@ -363,11 +362,7 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let _ = existing_tracker.incremental_stats();
     let _ = request_tracker.incremental_stats();
 
-    base_store
-        .inner
-        .get_range(&base_location, 0..1)
-        .await
-        .unwrap();
+    base_store.read_range(&base_location, 0..1).await.unwrap();
 
     assert!(existing_tracker.incremental_stats().read_iops > 0);
     assert!(request_tracker.incremental_stats().read_iops > 0);
@@ -425,7 +420,7 @@ async fn test_store_params_for_base_resolves_base_scoped_options() {
         .join("data")
         .join("probe.lance");
     base_store.put(&probe, b"hello").await.unwrap();
-    let read = base_store.inner.get_range(&probe, 0..5).await.unwrap();
+    let read = base_store.read_range(&probe, 0..5).await.unwrap();
     assert_eq!(read.as_ref(), b"hello");
 }
 
@@ -573,6 +568,7 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array) as ArrayRef]).unwrap();
 
         let object_writer = dataset
+            .table_state
             .object_store
             .create(&dataset.data_dir().join(file_name))
             .await
@@ -694,6 +690,7 @@ async fn test_create_data_file_checks_column_types(
     let values = column_of(file_schema.field(0).data_type(), &[20, 21, 22]);
     let file_batch = RecordBatch::try_new(file_schema.clone(), vec![values]).unwrap();
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&dataset.data_dir().join("x.lance"))
         .await
@@ -887,10 +884,10 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let fragment = cloned
         .get_fragments()
         .into_iter()
-        .find(|fragment| fragment.metadata.deletion_file.is_some())
+        .find(|fragment| fragment.metadata().deletion_file.is_some())
         .unwrap();
     assert_eq!(
-        fragment.metadata.deletion_file.as_ref().unwrap().base_id,
+        fragment.metadata().deletion_file.as_ref().unwrap().base_id,
         Some(base.id)
     );
 
@@ -1060,7 +1057,7 @@ async fn test_cold_prefiltered_vector_search_reads_each_deletion_file_once() {
     let deletion_files = dataset
         .get_fragments()
         .iter()
-        .filter(|fragment| fragment.metadata.deletion_file.is_some())
+        .filter(|fragment| fragment.metadata().deletion_file.is_some())
         .count();
     assert_eq!(deletion_files, 8);
 
@@ -1245,7 +1242,7 @@ async fn test_base_files_share_one_scheduler_per_scan() {
     // exactly one scheduler. Reverting the open_current_file_reader change
     // (a fresh scheduler per file) leaves the cache empty and fails this.
     assert_eq!(
-        cache.len(),
+        cache.num_cached_bases(),
         1,
         "all files of one base must share a single scheduler"
     );
@@ -1278,7 +1275,7 @@ async fn test_base_object_store_cache_invalidation(#[case] has_source_bindings: 
     let store = cloned.object_store(Some(base_id)).await.unwrap();
 
     let rebound = cloned.with_object_store(
-        cloned.object_store.clone(),
+        cloned.table_state.object_store.clone(),
         Some(ObjectStoreParams {
             block_size: Some(32 * 1024),
             ..Default::default()
@@ -1614,7 +1611,11 @@ async fn test_load_manifest_iops() {
     .await
     .unwrap();
 
-    let _ = _original_ds.object_store.as_ref().io_stats_incremental(); //reset
+    let _ = _original_ds
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); //reset
 
     let _dataset = DatasetBuilder::from_uri("memory://test")
         .with_session(session)
@@ -1626,7 +1627,11 @@ async fn test_load_manifest_iops() {
     // in the metadata cache. Opening therefore issues a single IOP:
     // 1. List _versions directory to resolve the latest manifest location.
     // The manifest body is served from the cache instead of being read from storage.
-    let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = _dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 1);
 }
 
@@ -1657,7 +1662,9 @@ async fn test_checkout_removed_version_not_served_from_cache() {
 
     let version = dataset.manifest().version;
     let location = dataset.manifest_location().clone();
-    let cache = session.metadata_cache.for_dataset(&dataset.uri);
+    let cache = session
+        .metadata_cache()
+        .for_dataset(&dataset.table_state.uri);
 
     assert!(
         cache
@@ -1672,11 +1679,21 @@ async fn test_checkout_removed_version_not_served_from_cache() {
     dataset.checkout_version(version).await.unwrap();
 
     // Remove the version from storage, as cleanup (or a manual delete) would.
-    dataset.object_store.delete(&location.path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .delete(&location.path)
+        .await
+        .unwrap();
 
     let resolved = dataset
+        .table_state
         .commit_handler
-        .resolve_version_location(&dataset.base, version, &dataset.object_store.inner)
+        .resolve_version_location(
+            &dataset.table_state.base,
+            version,
+            &dataset.table_state.object_store.inner,
+        )
         .await
         .unwrap();
     assert!(
@@ -1745,13 +1762,10 @@ async fn test_write_params(
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
         // No group / batch concept in v2
         if data_storage_version == LanceFileVersion::Legacy {
-            let reader = crate::dataset::versions::open_v1_fragment_reader(
-                fragment,
-                dataset.schema(),
-                &FragReadConfig::default(),
-            )
-            .await
-            .unwrap();
+            let reader = fragment
+                .open_v1_fragment_reader(dataset.schema(), &FragReadConfig::default())
+                .await
+                .unwrap();
             assert_eq!(reader.num_batches(), 10);
             for i in 0..reader.num_batches() as u32 {
                 assert_eq!(reader.num_rows_in_batch(i).unwrap(), 10);
@@ -1802,10 +1816,14 @@ async fn test_write_manifest(
 
     // New datasets retain legacy field-ID allocation until explicitly migrated.
     let manifest = read_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset
+            .table_state
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .resolve_latest_location(
+                &dataset.table_state.base,
+                dataset.table_state.object_store.as_ref(),
+            )
             .await
             .unwrap()
             .path,
@@ -1831,10 +1849,14 @@ async fn test_write_manifest(
 
     // Check it set the flag
     let mut manifest = read_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset
+            .table_state
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .resolve_latest_location(
+                &dataset.table_state.base,
+                dataset.table_state.object_store.as_ref(),
+            )
             .await
             .unwrap()
             .path,
@@ -1856,24 +1878,13 @@ async fn test_write_manifest(
     manifest.reader_feature_flags |= FLAG_UNKNOWN;
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -1932,16 +1943,13 @@ async fn test_clone_rejects_unknown_writer_requirements() {
     unknown_writer.version += 1;
     unknown_writer.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut unknown_writer,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         true,
     )
@@ -1967,9 +1975,9 @@ async fn open_rejects_mixed_file_versions_without_capability() {
     create_file(&uri, WriteMode::Create, LanceFileVersion::V2_0).await;
     let dataset = Dataset::open(uri.to_str().unwrap()).await.unwrap();
     let mut manifest = read_manifest(
-        dataset.object_store.as_ref(),
-        &dataset.manifest_location.path,
-        dataset.manifest_location.size,
+        dataset.table_state.object_store.as_ref(),
+        &dataset.table_state.manifest_location.path,
+        dataset.table_state.manifest_location.size,
     )
     .await
     .unwrap();
@@ -1979,14 +1987,15 @@ async fn open_rejects_mixed_file_versions_without_capability() {
     manifest.version += 1;
 
     dataset
+        .table_state
         .commit_handler
         .commit(
             &mut manifest,
             None,
-            &dataset.base,
-            dataset.object_store.as_ref(),
+            &dataset.table_state.base,
+            dataset.table_state.object_store.as_ref(),
             write_manifest_file_to_path,
-            dataset.manifest_location.naming_scheme,
+            dataset.table_state.manifest_location.naming_scheme,
             None,
         )
         .await
@@ -2021,6 +2030,7 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
 
     let file_name = "mixed-v2_1.lance";
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&dataset.data_dir().join(file_name))
         .await
@@ -2052,16 +2062,13 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         false,
     )
@@ -2141,6 +2148,7 @@ async fn same_fragment_mixed_v2_files_validate_and_scan() {
     let mut data_files = Vec::with_capacity(columns.len());
     for (file_name, version, batch) in columns {
         let object_writer = dataset
+            .table_state
             .object_store
             .create(&dataset.data_dir().join(file_name))
             .await
@@ -2162,16 +2170,13 @@ async fn same_fragment_mixed_v2_files_validate_and_scan() {
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         false,
     )
@@ -2200,22 +2205,19 @@ async fn test_restore_rejects_unknown_target_flags() {
         .into_reader_rows(RowCount::from(1), BatchCount::from(1));
     let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
 
-    let write_config = ManifestWriteConfig {
-        auto_set_feature_flags: false,
-        ..Default::default()
-    };
+    let write_config = ManifestBuildConfig::default().with_auto_set_feature_flags(false);
     let mut unknown_manifest = dataset.manifest.as_ref().clone();
     unknown_manifest.version = 2;
     unknown_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
     unknown_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut unknown_manifest,
         None,
         &write_config,
-        dataset.manifest_location.naming_scheme,
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2226,13 +2228,13 @@ async fn test_restore_rejects_unknown_target_flags() {
     let mut supported_manifest = dataset.manifest.as_ref().clone();
     supported_manifest.version = 3;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut supported_manifest,
         None,
         &write_config,
-        dataset.manifest_location.naming_scheme,
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2269,16 +2271,13 @@ async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
     unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
     unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
     let location = write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2291,6 +2290,7 @@ async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
     assert_eq!(dataset.version().version, original_version);
     assert!(
         dataset
+            .table_state
             .metadata_cache
             .get_with_key(&ManifestKey {
                 version: location.version,
@@ -2376,10 +2376,14 @@ async fn test_rle_v2_v23_write_and_append() {
     .unwrap();
 
     let manifest = read_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset
+            .table_state
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .resolve_latest_location(
+                &dataset.table_state.base,
+                dataset.table_state.object_store.as_ref(),
+            )
             .await
             .unwrap()
             .path,
@@ -2671,10 +2675,10 @@ async fn test_deep_clone(
     assert!(cloned_dataset.manifest().base_paths.is_empty());
 
     // Validate internal file counts are equal between source and cloned datasets
-    let store = branch.object_store.as_ref();
-    let src_root = dataset.base.clone();
-    let branch_root = branch.base.clone();
-    let dst_root = cloned_dataset.base.clone();
+    let store = branch.table_state.object_store.as_ref();
+    let src_root = dataset.table_state.base.clone();
+    let branch_root = branch.table_state.base.clone();
+    let dst_root = cloned_dataset.table_state.base.clone();
 
     let src_data = count_files(store, &src_root, "data").await;
     let dst_data = count_files(store, &dst_root, "data").await;
@@ -2727,8 +2731,8 @@ async fn test_deep_clone(
         )
         .await
         .unwrap();
-    let store = branch.object_store.as_ref();
-    let dst_root = cloned_dataset.base.clone();
+    let store = branch.table_state.object_store.as_ref();
+    let dst_root = cloned_dataset.table_state.base.clone();
 
     // Validate target dataset rows
     let batches = cloned_dataset
@@ -2806,8 +2810,12 @@ async fn test_deep_clone_copies_blob_v2_sidecars() {
         )
         .await
         .unwrap();
-    let source_index_file_count =
-        count_files(source.object_store.as_ref(), &source.base, "_indices").await;
+    let source_index_file_count = count_files(
+        source.table_state.object_store.as_ref(),
+        &source.table_state.base,
+        "_indices",
+    )
+    .await;
 
     let cloned = Arc::new(
         source
@@ -2819,7 +2827,12 @@ async fn test_deep_clone_copies_blob_v2_sidecars() {
     assert_eq!(cloned_indices.len(), 1);
     assert_eq!(cloned_indices[0].name, "id_idx");
     assert_eq!(
-        count_files(cloned.object_store.as_ref(), &cloned.base, "_indices").await,
+        count_files(
+            cloned.table_state.object_store.as_ref(),
+            &cloned.table_state.base,
+            "_indices"
+        )
+        .await,
         source_index_file_count
     );
 
@@ -2849,16 +2862,13 @@ async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
     unsupported_manifest.version += 1;
     unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
     write_manifest_file(
-        source.object_store.as_ref(),
-        source.commit_handler.as_ref(),
-        &source.base,
+        source.table_state.object_store.as_ref(),
+        source.table_state.commit_handler.as_ref(),
+        &source.table_state.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        source.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        source.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2897,16 +2907,13 @@ async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
     unsupported_manifest.version += 1;
     unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
     write_manifest_file(
-        source.object_store.as_ref(),
-        source.commit_handler.as_ref(),
-        &source.base,
+        source.table_state.object_store.as_ref(),
+        source.table_state.commit_handler.as_ref(),
+        &source.table_state.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        source.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        source.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -3000,7 +3007,7 @@ async fn test_deep_clone_cross_store(
     )
     .await
     .unwrap();
-    assert_ne!(dataset.object_store.store_prefix, "");
+    assert_ne!(dataset.table_state.object_store.store_prefix, "");
 
     // Create a scalar index so the index files and the manifest index section are also
     // copied across stores (the index section is read through the source store at commit).
@@ -3024,8 +3031,8 @@ async fn test_deep_clone_cross_store(
 
     // The clone targets a local store, distinct from the in-memory source.
     assert_ne!(
-        cloned_dataset.object_store.store_prefix,
-        dataset.object_store.store_prefix
+        cloned_dataset.table_state.object_store.store_prefix,
+        dataset.table_state.object_store.store_prefix
     );
     assert!(cloned_dataset.manifest().base_paths.is_empty());
 
@@ -3060,6 +3067,8 @@ async fn test_shallow_clone_cross_store(
     #[case] source_has_target: bool,
     #[case] target_has_target: bool,
 ) {
+    use object_store::ObjectStoreExt;
+
     let source_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
     let target_store: Arc<dyn object_store::ObjectStore> =
@@ -3156,12 +3165,17 @@ async fn test_shallow_clone_cross_store(
     assert_eq!(cloned.uri(), target_uri);
     assert_eq!(cloned.version().version, 1);
     target_store
-        .head(&cloned.manifest_location.path)
+        .head(&cloned.table_state.manifest_location.path)
         .await
         .unwrap();
     assert!(cloned.read_transaction().await.unwrap().is_some());
     assert_eq!(
-        count_files(&cloned.object_store, &cloned.base, "data").await,
+        count_files(
+            &cloned.table_state.object_store,
+            &cloned.table_state.base,
+            "data"
+        )
+        .await,
         0
     );
     let base_id = first_base_id(&cloned);
@@ -3175,6 +3189,7 @@ async fn test_shallow_clone_cross_store(
         .unwrap();
     assert!(
         inherited
+            .table_state
             .manifest_location
             .path
             .as_ref()
@@ -3525,7 +3540,7 @@ async fn test_reconfigure_installs_accessor_in_opened_primary_store() {
         configured.storage_options_accessor().unwrap().accessor_id(),
         "shallow-clone-rotating-credentials"
     );
-    assert_eq!(configured.object_store.block_size(), 1024);
+    assert_eq!(configured.table_state.object_store.block_size(), 1024);
 
     // A real metadata read through the primary backend must refresh credentials.
     let versions = configured.versions().await.unwrap();
@@ -3544,7 +3559,10 @@ async fn test_reconfigure_installs_accessor_in_opened_primary_store() {
 
     // The primary backend itself was replaced, not only the handle's params.
     assert!(
-        !Arc::ptr_eq(&cloned.object_store, &configured.object_store),
+        !Arc::ptr_eq(
+            &cloned.table_state.object_store,
+            &configured.table_state.object_store
+        ),
         "reconfigure must replace the primary backend when the accessor changes"
     );
 
@@ -5130,7 +5148,7 @@ fn install_fragments(dataset: &mut Dataset, fragments: Vec<Fragment>) {
     let mut manifest = dataset.manifest.as_ref().clone();
     manifest.fragments = Arc::new(fragments);
     dataset.manifest = Arc::new(manifest);
-    dataset.fragment_bitmap = Arc::new(
+    dataset.table_state.fragment_bitmap = Arc::new(
         dataset
             .manifest
             .fragments
@@ -5236,11 +5254,11 @@ async fn test_open_damaged_latest_manifest_reports_path(
     assert_eq!(dataset.version().version, 2);
     assert_eq!(dataset.get_fragments().len(), 3);
 
-    let manifest_path = dataset.manifest_location.path.clone();
+    let manifest_path = dataset.table_state.manifest_location.path.clone();
     let local_path = lance_io::local::to_local_path(&manifest_path);
     let manifest = std::fs::read(&local_path).unwrap();
     // Past one block the manifest takes another request than the block with the footer.
-    let block_size = dataset.object_store.block_size();
+    let block_size = dataset.table_state.object_store.block_size();
     assert_eq!(manifest.len() > block_size, column_name_len > block_size);
     std::fs::write(&local_path, damage(&manifest)).unwrap();
 
@@ -5488,24 +5506,13 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
     manifest.version += 1;
 
     let err = write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -5576,17 +5583,18 @@ async fn forge_legacy_nullable_primary_key(uri: &str, with_mem_wal: bool) -> Dat
     // make building the fixture depend on the very validation these tests
     // exercise, so a regression would show up as a fixture that cannot be
     // built rather than as the behaviour under test changing.
-    manifest.set_timestamp(crate::dataset::timestamp_to_nanos(None));
+    manifest.set_timestamp(crate::utils::temporal::timestamp_to_nanos(None));
     manifest.update_max_fragment_id();
     dataset
+        .table_state
         .commit_handler
         .commit(
             &mut manifest,
             (!indices.is_empty()).then_some(indices),
-            &dataset.base,
-            dataset.object_store.as_ref(),
+            &dataset.table_state.base,
+            dataset.table_state.object_store.as_ref(),
             lance_table::io::commit::write_manifest_file_to_path,
-            dataset.manifest_location.naming_scheme,
+            dataset.table_state.manifest_location.naming_scheme,
             None,
         )
         .await

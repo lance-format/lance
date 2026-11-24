@@ -88,8 +88,7 @@ pub(super) async fn blob_sidecars(store: &ObjectStore, data_dir: &Path) -> Vec<P
     use futures::TryStreamExt;
 
     let mut paths = store
-        .inner
-        .list(Some(data_dir))
+        .list_objects(Some(data_dir))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()

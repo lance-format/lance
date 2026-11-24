@@ -6,7 +6,7 @@ use arrow_array::builder::{
 };
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow_schema::DataType;
-use datafusion_common::{DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
 use lance_arrow::json::{json_path_exists, select_json_path, select_json_path_values};
 use std::sync::Arc;
@@ -49,18 +49,23 @@ impl JsonbType {
 mod common {
     use super::*;
 
-    /// Convert ColumnarValue arguments to ArrayRef vector
-    ///
-    /// Note: This implementation currently broadcasts scalars to arrays.
-    /// Future optimization: handle scalars directly without broadcasting
-    /// to improve performance for scalar inputs.
-    pub fn columnar_to_arrays(args: &[ColumnarValue]) -> Vec<ArrayRef> {
-        args.iter()
-            .map(|arg| match arg {
-                ColumnarValue::Array(arr) => arr.clone(),
-                ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-            })
-            .collect()
+    /// Broadcast arguments for array evaluation, preserving scalar results for scalar-only calls.
+    pub(super) fn invoke_columnar(
+        args: &[ColumnarValue],
+        implementation: fn(&[ArrayRef]) -> Result<ArrayRef>,
+    ) -> Result<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(args)?;
+        let result = implementation(&arrays)?;
+        if args
+            .iter()
+            .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+        {
+            Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                &result, 0,
+            )?))
+        } else {
+            Ok(ColumnarValue::Array(result))
+        }
     }
 
     /// Create DataFusionError for execution failures (simplified error wrapping)
@@ -303,16 +308,12 @@ pub fn json_extract_with_type_udf() -> ScalarUDF {
 
 /// Implementation of json_extract function with ColumnarValue
 fn json_extract_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_extract_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_extract_impl)
 }
 
 /// Implementation of json_extract_with_type function with ColumnarValue
 fn json_extract_with_type_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_extract_with_type_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_extract_with_type_impl)
 }
 
 /// Implementation of json_extract function
@@ -476,9 +477,7 @@ pub fn json_exists_udf() -> ScalarUDF {
 
 /// Implementation of json_exists function with ColumnarValue
 fn json_exists_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_exists_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_exists_impl)
 }
 
 /// Implementation of json_exists function
@@ -538,9 +537,7 @@ pub fn json_get_udf() -> ScalarUDF {
 
 /// Implementation of json_get function with ColumnarValue
 fn json_get_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_get_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_get_impl)
 }
 
 /// Implementation of json_get function
@@ -591,9 +588,7 @@ pub fn json_get_string_udf() -> ScalarUDF {
 
 /// Implementation of json_get_string function with ColumnarValue
 fn json_get_string_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_get_string_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_get_string_impl)
 }
 
 /// Implementation of json_get_string function
@@ -647,9 +642,7 @@ pub fn json_get_int_udf() -> ScalarUDF {
 
 /// Implementation of json_get_int function with ColumnarValue
 fn json_get_int_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_get_int_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_get_int_impl)
 }
 
 /// Implementation of json_get_int function
@@ -703,9 +696,7 @@ pub fn json_get_float_udf() -> ScalarUDF {
 
 /// Implementation of json_get_float function with ColumnarValue
 fn json_get_float_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_get_float_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_get_float_impl)
 }
 
 /// Implementation of json_get_float function
@@ -759,9 +750,7 @@ pub fn json_get_bool_udf() -> ScalarUDF {
 
 /// Implementation of json_get_bool function with ColumnarValue
 fn json_get_bool_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_get_bool_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_get_bool_impl)
 }
 
 /// Implementation of json_get_bool function
@@ -816,9 +805,7 @@ pub fn json_array_contains_udf() -> ScalarUDF {
 
 /// Implementation of json_array_contains function with ColumnarValue
 fn json_array_contains_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_array_contains_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_array_contains_impl)
 }
 
 /// Implementation of json_array_contains function
@@ -917,9 +904,7 @@ pub fn json_array_length_udf() -> ScalarUDF {
 
 /// Implementation of json_array_length function with ColumnarValue
 fn json_array_length_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays = common::columnar_to_arrays(args);
-    let result = json_array_length_impl(&arrays)?;
-    Ok(ColumnarValue::Array(result))
+    common::invoke_columnar(args, json_array_length_impl)
 }
 
 /// Implementation of json_array_length function
@@ -980,6 +965,40 @@ fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::changing_keys(vec!["a", "b", "c"], vec![1, 2, 3])]
+    #[case::empty_column(vec![], vec![])]
+    fn scalar_document_column_keys(#[case] keys: Vec<&str>, #[case] expected: Vec<i64>) {
+        let doc = lance_arrow::json::encode_json(r#"{"a":1,"b":2,"c":3}"#).unwrap();
+        let result = super::json_get_int_columnar_impl(&[
+            ColumnarValue::Scalar(datafusion_common::ScalarValue::LargeBinary(Some(doc))),
+            ColumnarValue::Array(Arc::new(StringArray::from(keys))),
+        ])
+        .unwrap();
+        let ColumnarValue::Array(result) = result else {
+            panic!("expected array")
+        };
+        assert_eq!(
+            result.as_any().downcast_ref::<Int64Array>().unwrap(),
+            &Int64Array::from(expected)
+        );
+    }
+    #[test]
+    fn all_scalar_and_null_json_arguments() {
+        let doc = lance_arrow::json::encode_json(r#"{"a":1}"#).unwrap();
+        for (document, expected) in [(Some(doc), Some(1)), (None, None)] {
+            let result = json_get_int_columnar_impl(&[
+                ColumnarValue::Scalar(datafusion_common::ScalarValue::LargeBinary(document)),
+                ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some("a".into()))),
+            ])
+            .unwrap();
+            let ColumnarValue::Scalar(datafusion_common::ScalarValue::Int64(actual)) = result
+            else {
+                panic!("expected scalar integer")
+            };
+            assert_eq!(actual, expected);
+        }
+    }
     use super::*;
     use arrow_array::builder::LargeBinaryBuilder;
     use arrow_array::{BooleanArray, Float64Array, Int64Array};

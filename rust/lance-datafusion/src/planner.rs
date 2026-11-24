@@ -330,6 +330,33 @@ impl ContextProvider for LanceContextProvider {
     }
 }
 
+/// Element type of a SQL array literal such as `[0, 0.5, NULL]`.
+///
+/// Untyped `NULL` elements do not take part in the choice, and integer
+/// elements mixed with floating point elements widen to `Float64`, so the
+/// order of the elements does not change the result. Otherwise the first
+/// non-null element decides and the others are coerced to it.
+fn array_literal_element_type(values: &[ScalarValue]) -> ArrowDataType {
+    let mut types = values
+        .iter()
+        .map(ScalarValue::data_type)
+        .filter(|data_type| !data_type.is_null());
+    let Some(first) = types.next() else {
+        return ArrowDataType::Null;
+    };
+    let mut has_float = first.is_floating();
+    let mut all_numeric = first.is_numeric();
+    for data_type in types {
+        has_float |= data_type.is_floating();
+        all_numeric &= data_type.is_numeric();
+    }
+    if has_float && all_numeric && !first.is_floating() {
+        ArrowDataType::Float64
+    } else {
+        first
+    }
+}
+
 pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
@@ -431,6 +458,10 @@ impl Planner {
             BinaryOperator::Or => Operator::Or,
             BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
             BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
+            BinaryOperator::PGRegexMatch => Operator::RegexMatch,
+            BinaryOperator::PGRegexIMatch => Operator::RegexIMatch,
+            BinaryOperator::PGRegexNotMatch => Operator::RegexNotMatch,
+            BinaryOperator::PGRegexNotIMatch => Operator::RegexNotIMatch,
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Operator {op} is not supported"
@@ -904,25 +935,36 @@ impl Planner {
                     }
                 }
 
-                let field = if !values.is_empty() {
-                    let data_type = values[0].data_type();
-
-                    for value in &mut values {
-                        if value.data_type() != data_type {
-                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::invalid_input(format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type())))?;
-                        }
-                    }
-                    Field::new("item", data_type, true)
-                } else {
-                    Field::new("item", ArrowDataType::Null, true)
-                };
-
+                let data_type = array_literal_element_type(&values);
                 let values = values
                     .into_iter()
-                    .map(|v| v.to_array().map_err(Error::from))
+                    .map(|value| {
+                        if value.data_type() == data_type {
+                            Ok(value)
+                        } else if value.is_null() {
+                            ScalarValue::try_from(&data_type).map_err(Error::from)
+                        } else {
+                            safe_coerce_scalar(&value, &data_type).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "Array expressions must have a consistent datatype. Expected: {}, got: {}",
+                                    data_type,
+                                    value.data_type()
+                                ))
+                            })
+                        }
+                    })
                     .collect::<Result<Vec<_>>>()?;
-                let array_refs = values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
-                let values = concat(&array_refs)?;
+                let values = if values.is_empty() {
+                    arrow_array::new_empty_array(&data_type)
+                } else {
+                    let values = values
+                        .iter()
+                        .map(|v| v.to_array().map_err(Error::from))
+                        .collect::<Result<Vec<_>>>()?;
+                    let array_refs = values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
+                    concat(&array_refs)?
+                };
+                let field = Field::new("item", data_type, true);
                 let values = ListArray::try_new(
                     field.into(),
                     OffsetBuffer::from_lengths([values.len()]),
@@ -1419,7 +1461,7 @@ mod tests {
 
     use super::*;
 
-    use arrow::datatypes::Float64Type;
+    use arrow::datatypes::{Float64Type, Int64Type};
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
         StructArray, Time32SecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -2846,6 +2888,62 @@ mod tests {
     }
 
     #[test]
+    fn test_array_literal_element_types() {
+        let float64 = |values: Vec<Option<f64>>| {
+            ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(values)])
+        };
+        let int64 = |values: Vec<Option<i64>>| {
+            ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(values)])
+        };
+        let empty = ListArray::new(
+            Arc::new(Field::new("item", DataType::Null, true)),
+            OffsetBuffer::from_lengths([0]),
+            arrow_array::new_empty_array(&DataType::Null),
+            None,
+        );
+        let cases = [
+            (
+                "[0, 0.5, 1]",
+                float64(vec![Some(0.0), Some(0.5), Some(1.0)]),
+            ),
+            ("[-1, 0.5]", float64(vec![Some(-1.0), Some(0.5)])),
+            ("[NULL, 1]", int64(vec![None, Some(1)])),
+            ("[1, NULL]", int64(vec![Some(1), None])),
+            ("[1, NULL, 0.5]", float64(vec![Some(1.0), None, Some(0.5)])),
+            ("[1, 2, 3]", int64(vec![Some(1), Some(2), Some(3)])),
+            ("[]", empty),
+        ];
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let planner = Planner::new(schema);
+        let mismatches = cases
+            .into_iter()
+            .filter_map(|(sql, expected)| {
+                let expected = Expr::Literal(ScalarValue::List(Arc::new(expected)), None);
+                match planner.parse_expr(sql) {
+                    Ok(actual) if actual == expected => None,
+                    Ok(actual) => Some(format!("{sql}: planned {actual:?}")),
+                    Err(err) => Some(format!("{sql}: {err}")),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[test]
+    fn test_array_literal_rejects_incompatible_elements() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let planner = Planner::new(schema);
+
+        let err = planner.parse_expr("[1, 'a']").unwrap_err();
+
+        assert!(
+            err.to_string().contains("consistent datatype"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_sql_like() {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
 
@@ -3687,6 +3785,35 @@ mod tests {
         let expr = planner.parse_filter(filter).unwrap();
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
         let result = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            result.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::matches("name ~ 'e[12]'", [Some(false), Some(true), Some(false), None])]
+    #[case::imatches("name ~* 'e[12]'", [Some(false), Some(true), Some(true), None])]
+    #[case::not_matches("name !~ 'e[12]'", [Some(true), Some(false), Some(true), None])]
+    #[case::not_imatches("name !~* 'e[12]'", [Some(true), Some(false), Some(false), None])]
+    #[case::negated("NOT name ~ 'e[12]'", [Some(true), Some(false), Some(true), None])]
+    fn test_regex_operators(#[case] filter: &str, #[case] expected: [Option<bool>; 4]) {
+        let batch = arrow_array::record_batch!((
+            "name",
+            Utf8,
+            [Some("name0"), Some("name1"), Some("NAME2"), None]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap();
 
         assert_eq!(
             result.into_array(batch.num_rows()).unwrap().as_ref(),

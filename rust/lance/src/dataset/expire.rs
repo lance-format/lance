@@ -226,8 +226,13 @@ pub async fn plan_expire_versions(
     let protected = ProtectedVersions::resolve(dataset).await?;
 
     let locations: Vec<ManifestLocation> = dataset
+        .table_state
         .commit_handler
-        .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+        .list_manifest_locations(
+            &dataset.table_state.base,
+            &dataset.table_state.object_store,
+            false,
+        )
         .try_collect()
         .await?;
 
@@ -380,7 +385,7 @@ pub async fn expire_versions(
         source.boxed()
     };
 
-    let store = &dataset.object_store;
+    let store = &dataset.table_state.object_store;
     paced
         .map(|location| async move {
             let location = location?;
@@ -393,7 +398,7 @@ pub async fn expire_versions(
             };
             Ok::<_, Error>((location, outcome))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_for_each(|(location, outcome)| {
             let mut stats = stats.lock().unwrap();
             match outcome {
@@ -434,8 +439,9 @@ pub async fn expire_versions(
             continue;
         }
         dataset
+            .table_state
             .commit_handler
-            .forget_version(&dataset.base, *version, identity)
+            .forget_version(&dataset.table_state.base, *version, identity)
             .await?;
     }
 
@@ -489,8 +495,13 @@ mod tests {
 
     async fn version_count(dataset: &Dataset) -> usize {
         dataset
+            .table_state
             .commit_handler
-            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .list_manifest_locations(
+                &dataset.table_state.base,
+                &dataset.table_state.object_store,
+                false,
+            )
             .try_collect::<Vec<_>>()
             .await
             .unwrap()
@@ -544,7 +555,12 @@ mod tests {
         let uri = TempStrDir::default();
         let mut dataset = dataset_with_versions(&uri, 4).await;
         let before = version_count(&dataset).await;
-        lance_table::io::commit::write_version_hint(&dataset.object_store, &dataset.base, 3).await;
+        lance_table::io::commit::write_version_hint(
+            &dataset.table_state.object_store,
+            &dataset.table_state.base,
+            3,
+        )
+        .await;
 
         let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
         policy.lock().unwrap().set_before_policy(
@@ -557,8 +573,8 @@ mod tests {
                 }
             }),
         );
-        let original = dataset.object_store.inner.clone();
-        let object_store = Arc::make_mut(&mut dataset.object_store);
+        let original = dataset.table_state.object_store.inner.clone();
+        let object_store = Arc::make_mut(&mut dataset.table_state.object_store);
         object_store.inner = Arc::new(ProxyObjectStore::new(original, policy));
 
         let error = expire_versions(
@@ -647,8 +663,13 @@ mod tests {
         // Versions 1, 3, 4 go; 2 is tagged and 5 is latest.
         assert_eq!(stats.versions_removed, 3);
         let surviving = dataset
+            .table_state
             .commit_handler
-            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .list_manifest_locations(
+                &dataset.table_state.base,
+                &dataset.table_state.object_store,
+                false,
+            )
             .map_ok(|l| l.version)
             .try_collect::<HashSet<_>>()
             .await
@@ -703,8 +724,8 @@ mod tests {
                 }
             }),
         );
-        let original = dataset.object_store.inner.clone();
-        let object_store = Arc::make_mut(&mut dataset.object_store);
+        let original = dataset.table_state.object_store.inner.clone();
+        let object_store = Arc::make_mut(&mut dataset.table_state.object_store);
         object_store.inner = Arc::new(ProxyObjectStore::new(original, policy));
 
         let stats = expire_versions(
@@ -726,8 +747,9 @@ mod tests {
 
     async fn count_data_files(dataset: &Dataset) -> usize {
         dataset
+            .table_state
             .object_store
-            .read_dir_all(&dataset.base.clone().join("data"), None)
+            .read_dir_all(&dataset.table_state.base.clone().join("data"), None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap()
@@ -760,7 +782,12 @@ mod tests {
 
         // Pin the hint below the latest so the guard has something to protect that the
         // ordinary "never remove the latest" rule would not already cover.
-        lance_table::io::commit::write_version_hint(&dataset.object_store, &dataset.base, 3).await;
+        lance_table::io::commit::write_version_hint(
+            &dataset.table_state.object_store,
+            &dataset.table_state.base,
+            3,
+        )
+        .await;
 
         let plan = explain_expire_versions(
             &dataset,
@@ -813,7 +840,10 @@ mod tests {
         let main_before = version_count(&dataset).await;
 
         let branch = dataset.create_branch("feature", 4u64, None).await.unwrap();
-        assert_ne!(branch.base, dataset.base, "a branch has its own path");
+        assert_ne!(
+            branch.table_state.base, dataset.table_state.base,
+            "a branch has its own path"
+        );
 
         let stats = expire_versions(
             &branch,
