@@ -13,7 +13,7 @@ use std::{
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array};
-use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
@@ -39,7 +39,7 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
-use lance_arrow::{DataTypeExt, RecordBatchExt};
+use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Schema as LanceSchema, format_field_path_minimal};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
@@ -1889,42 +1889,9 @@ fn null_check_only_columns(filter: &Expr) -> HashSet<String> {
 /// leaves under fewer list levels. `None` when `field` is a leaf, is stored as
 /// one physical column (blob, packed struct, map), or has no such leaf.
 fn validity_leaf(field: &Field) -> Option<String> {
-    validity_leaf_path(field).map(|path| format_field_path_minimal(&path))
-}
-
-/// [`validity_leaf`] as path components.
-pub(crate) fn validity_leaf_path(field: &Field) -> Option<Vec<&str>> {
-    fn fixed_width(data_type: &DataType) -> Option<usize> {
-        match data_type {
-            DataType::Boolean => Some(1),
-            other => other.byte_width_opt(),
-        }
-    }
-    fn is_atomic(field: &Field) -> bool {
-        field.is_blob()
-            || field.is_packed_struct()
-            || matches!(field.data_type(), DataType::Map(..))
-    }
-    fn walk(field: &Field, list_depth: usize) -> Option<((usize, usize), Vec<&str>)> {
-        if is_atomic(field) {
-            return None;
-        }
-        if let Some(width) = fixed_width(&field.data_type()) {
-            return Some(((list_depth, width), vec![]));
-        }
-        let child_depth = list_depth + usize::from(!field.data_type().is_struct());
-        field
-            .children
-            .iter()
-            .filter_map(|child| {
-                let (score, mut path) = walk(child, child_depth)?;
-                path.insert(0, child.name.as_str());
-                Some((score, path))
-            })
-            .min_by_key(|(score, _)| *score)
-    }
-    let (_, path) = walk(field, 0)?;
-    (!path.is_empty()).then_some(path)
+    field
+        .validity_leaf_path()
+        .map(|path| format_field_path_minimal(&path))
 }
 
 /// Top-level names of the projected fields, listing a partially projected
@@ -4189,6 +4156,7 @@ mod tests {
     use arrow_array::{
         Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray,
     };
+    use arrow_schema::DataType;
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::address::RowAddress;
@@ -7085,6 +7053,7 @@ mod tests {
 
     mod row_stream {
         use super::*;
+        use arrow_array::types::Int32Type;
         use arrow_array::{Float32Array, LargeBinaryArray, StringArray, UInt64Array};
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use datafusion::datasource::memory::MemorySourceConfig;
@@ -7096,6 +7065,9 @@ mod tests {
         use rstest::rstest;
 
         use crate::blob::{BlobArrayBuilder, blob_field};
+        use crate::dataset::fragment::tests::demand_row_ids::{
+            fixture as row_id_fixture, lineage_reads,
+        };
         use crate::dataset::{Dataset, WriteParams};
         use crate::utils::test::NoContextTestFixture;
         use lance_core::datatypes::BlobHandling;
@@ -7212,6 +7184,56 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
+        }
+
+        #[rstest]
+        #[case::row_ids(true)]
+        #[case::row_addresses(false)]
+        #[tokio::test]
+        async fn row_stream_loads_only_for_id_mapping(#[case] stable_ids: bool) {
+            let (_dir, dataset) = row_id_fixture(true).await;
+            let dataset = Arc::new(dataset);
+            let fragments = dataset.get_fragments();
+            let keys = [Some(14_u64), None, Some(2), Some(13), Some(2)].map(|id| {
+                id.map(|id| {
+                    if stable_ids {
+                        id
+                    } else {
+                        RowAddress::new_from_parts(
+                            fragments[id as usize / 12].id() as u32,
+                            id as u32 % 12,
+                        )
+                        .into()
+                    }
+                })
+            });
+            let key_column = if stable_ids { ROW_ID } else { ROW_ADDR };
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                key_column,
+                DataType::UInt64,
+                true,
+            )]));
+            let input =
+                RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(keys.to_vec()))])
+                    .unwrap();
+            let input = rows_input(vec![input]);
+            let options = FilteredReadOptions::basic_full_read(&dataset);
+            let plan = FilteredReadExec::try_new(dataset.clone(), options, Some(input)).unwrap();
+            dataset.object_store.io_stats_incremental();
+            let batches = run(&plan).await;
+            let batch = concat_batches(&plan.schema(), &batches).unwrap();
+            assert_eq!(
+                batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+                [14, 2, 2]
+            );
+            let stats = dataset.object_store.io_stats_incremental();
+            for fragment in fragments {
+                assert_eq!(
+                    lineage_reads(&stats, &fragment) > 0,
+                    stable_ids,
+                    "{stats:?}"
+                );
+            }
         }
 
         #[rstest]

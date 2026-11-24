@@ -694,6 +694,57 @@ impl Field {
         }
     }
 
+    /// Return a child path that can carry this field's validity in a projection.
+    ///
+    /// Prefer the narrowest fixed-width leaf among those under the fewest list
+    /// levels. Return `None` for a leaf, a field stored as one physical column
+    /// (blob, packed struct, or map), or a field without a fixed-width leaf.
+    ///
+    /// ```
+    /// # use arrow_schema::{DataType, Field as ArrowField};
+    /// # use lance_core::datatypes::Field;
+    /// let field = Field::try_from(ArrowField::new_struct(
+    ///     "outer",
+    ///     vec![ArrowField::new("child", DataType::Int32, true)],
+    ///     true,
+    /// ))?;
+    /// assert_eq!(field.validity_leaf_path(), Some(vec!["child"]));
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn validity_leaf_path(&self) -> Option<Vec<&str>> {
+        fn fixed_width(data_type: &DataType) -> Option<usize> {
+            match data_type {
+                DataType::Boolean => Some(1),
+                other => other.byte_width_opt(),
+            }
+        }
+        fn is_atomic(field: &Field) -> bool {
+            field.is_blob()
+                || field.is_packed_struct()
+                || matches!(field.data_type(), DataType::Map(..))
+        }
+        fn walk(field: &Field, list_depth: usize) -> Option<((usize, usize), Vec<&str>)> {
+            if is_atomic(field) {
+                return None;
+            }
+            if let Some(width) = fixed_width(&field.data_type()) {
+                return Some(((list_depth, width), vec![]));
+            }
+            let child_depth = list_depth + usize::from(!field.data_type().is_struct());
+            field
+                .children
+                .iter()
+                .filter_map(|child| {
+                    let (score, mut path) = walk(child, child_depth)?;
+                    path.insert(0, child.name.as_str());
+                    Some((score, path))
+                })
+                .min_by_key(|(score, _)| *score)
+        }
+        let (_, path) = walk(self, 0)?;
+        (!path.is_empty()).then_some(path)
+    }
+
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),

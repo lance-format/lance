@@ -52,7 +52,6 @@ use file_verdict::{FileReference, ListedFile, Verdict as FileVerdict};
 pub use retention::{CleanupRule, RetentionPolicy, parse_cleanup_policy};
 use retention::{MIN_THINNING_AGE, validate_retention_policy};
 
-use super::mem_wal::util::is_mem_wal_dir_name;
 use super::refs::{REFS_DIR, TagContents, normalize_branch};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
@@ -80,6 +79,7 @@ use lance_table::{
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
+    system_index::mem_wal::is_mem_wal_dir_name,
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;

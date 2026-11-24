@@ -3,7 +3,7 @@
 
 //! Exercise registration from a downstream crate, without changing the builtin registry.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use arrow_array::{RecordBatchIterator, record_batch};
 use arrow_schema::{DataType, Field};
@@ -12,8 +12,9 @@ use datafusion::execution::SendableRecordBatchStream;
 use lance::{
     Dataset,
     dataset::{
-        UpdateBuilder, WriteParams,
+        CommitBuilder, UpdateBuilder, WriteParams,
         optimize::{CompactionOptions, compact_files},
+        transaction::{Operation, Transaction},
     },
     index::{DatasetIndexExt, DatasetIndexInternalExt, register_scalar_index_plugin},
 };
@@ -23,6 +24,7 @@ use lance_index::{
     IndexType,
     metrics::NoOpMetricsCollector,
     progress::IndexBuildProgress,
+    registry::IndexPluginRegistry,
     scalar::{
         CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams,
         expression::{SargableQueryParser, ScalarQueryParser},
@@ -48,7 +50,9 @@ impl Name for ExampleIndexDetails {
 }
 
 #[derive(Debug, Default)]
-struct ExampleIndexPlugin;
+struct ExampleIndexPlugin {
+    max_version: OnceLock<u32>,
+}
 
 const ROWS_PER_ZONE: u64 = 2;
 
@@ -102,7 +106,15 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
     /// The example delegates its storage to ZoneMap, so it supports exactly
     /// the file versions that plugin writes and reads.
     fn version(&self) -> u32 {
-        ZoneMapIndexPlugin.version()
+        *self
+            .max_version
+            .get()
+            .expect("version requires an attached registry")
+    }
+
+    fn attach_registry(&self, registry: Arc<IndexPluginRegistry>) {
+        let delegate = registry.get_plugin_by_name("zonemap").unwrap();
+        self.max_version.set(delegate.version()).unwrap();
     }
 
     fn new_query_parser(
@@ -325,11 +337,13 @@ async fn legacy_external_plugin_can_remap_false_stays_on_fallback() {
 #[tokio::test]
 async fn register_create_open_and_cache_external_index() {
     LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let uri = directory.path().to_str().unwrap();
     let batch = record_batch!(("value", Int64, [1, 2, 3, 4])).unwrap();
     let schema = batch.schema();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(batch)], schema),
-        "memory://",
+        uri,
         Some(WriteParams {
             max_rows_per_file: 2,
             ..Default::default()
@@ -370,6 +384,24 @@ async fn register_create_open_and_cache_external_index() {
         register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap_err();
     assert!(matches!(err, Error::InvalidInput { .. }));
     assert!(err.to_string().contains("before the first plugin registry"));
+
+    let mut future_metadata = metadata.clone();
+    future_metadata.index_version += 1;
+    let transaction = Transaction::new(
+        dataset.version().version,
+        Operation::CreateIndex {
+            new_indices: vec![future_metadata],
+            removed_indices: vec![metadata.clone()],
+        },
+        None,
+    );
+    let committed = CommitBuilder::new(Arc::new(dataset))
+        .execute(transaction)
+        .await
+        .unwrap();
+    let reopened = Dataset::open(uri).await.unwrap();
+    assert_eq!(reopened.version().version, committed.version().version);
+    assert!(reopened.load_indices().await.unwrap().is_empty());
 }
 
 #[rstest]

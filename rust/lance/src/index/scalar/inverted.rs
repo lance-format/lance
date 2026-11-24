@@ -36,7 +36,7 @@ use crate::{
     Dataset, Error, Result,
     dataset::index::LanceIndexStoreExt,
     index::{DatasetIndexExt, scalar::fetch_index_details},
-    session::caches::InvertedIndexParamsKey,
+    session::index_caches::InvertedIndexParamsKey,
 };
 
 #[derive(Debug, Clone)]
