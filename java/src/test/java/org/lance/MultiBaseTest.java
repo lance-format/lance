@@ -220,7 +220,7 @@ public class MultiBaseTest {
 
   @Test
   public void testAddBases() throws Exception {
-    Dataset created =
+    try (Dataset created =
         Dataset.write()
             .allocator(allocator)
             .reader(makeReader(0, 100))
@@ -229,22 +229,27 @@ public class MultiBaseTest {
             .initialBases(Arrays.asList(new BasePath(0, Optional.of("base1"), base1, false)))
             .targetBases(Arrays.asList("base1"))
             .maxRowsPerFile(100)
-            .execute();
-    assertEquals(1, created.getBasePaths().size());
-    long versionBefore = created.version();
+            .execute()) {
+      assertEquals(1, created.getBasePaths().size());
+      long versionBefore = created.version();
+      Map<String, String> properties = Map.of("source", "archive");
+      created.addBases(
+          Arrays.asList(new BasePath(0, Optional.of("base2"), base2, false)), properties);
 
-    created.addBases(Arrays.asList(new BasePath(0, Optional.of("base2"), base2, false)));
-
-    assertEquals(versionBefore + 1, created.version());
-    assertEquals(
-        Arrays.asList("base1", "base2"),
-        created.getBasePaths().stream()
-            .map(base -> base.getName().orElseThrow(AssertionError::new))
-            .sorted()
-            .collect(Collectors.toList()));
+      assertEquals(versionBefore + 1, created.version());
+      try (Transaction written = created.readTransaction().orElseThrow()) {
+        assertEquals(properties, written.transactionProperties().orElseThrow());
+      }
+      assertEquals(
+          Arrays.asList("base1", "base2"),
+          created.getBasePaths().stream()
+              .map(base -> base.getName().orElseThrow(AssertionError::new))
+              .sorted()
+              .collect(Collectors.toList()));
+    }
 
     // The added base is usable by later writes.
-    Dataset appended =
+    try (Dataset appended =
         Dataset.write()
             .allocator(allocator)
             .reader(makeReader(100, 50))
@@ -252,14 +257,15 @@ public class MultiBaseTest {
             .mode(WriteParams.WriteMode.APPEND)
             .targetBases(Arrays.asList("base2"))
             .maxRowsPerFile(50)
-            .execute();
-    assertEquals(150, appended.countRows());
-    assertTrue(hasLanceFile(base2));
-
-    assertThrows(
-        IllegalArgumentException.class,
-        () ->
-            appended.addBases(Arrays.asList(new BasePath(0, Optional.of("base1"), base2, false))));
+            .execute()) {
+      assertEquals(150, appended.countRows());
+      assertTrue(hasLanceFile(base2));
+      assertThrows(
+          IllegalArgumentException.class,
+          () ->
+              appended.addBases(
+                  Arrays.asList(new BasePath(0, Optional.of("base1"), base2, false))));
+    }
   }
 
   @Test

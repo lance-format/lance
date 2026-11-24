@@ -254,15 +254,12 @@ fn inner_deep_clone<'local>(
     let target_path_str = target_path.extract(env)?;
     let reference = transform_jref_to_ref(jref, env)?;
     let storage_opts = transform_jstorage_options(storage_options, env)?;
-    let new_ds = {
-        let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(
-            dataset_guard
-                .inner
-                .deep_clone(target_path_str.as_str(), reference, storage_opts),
-        )?
-    };
+    let mut dataset = clone_dataset(env, &java_dataset)?;
+    let new_ds = block_on(
+        dataset
+            .inner
+            .deep_clone(&target_path_str, reference, storage_opts),
+    )?;
 
     BlockingDataset { inner: new_ds }.into_java(env)
 }

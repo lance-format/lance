@@ -38,6 +38,7 @@ import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceField;
 import org.lance.schema.SqlExpressions;
 
+import com.sun.net.httpserver.HttpServer;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
@@ -67,6 +68,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -85,6 +87,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -2338,21 +2346,98 @@ public class DatasetTest {
   }
 
   @Test
-  void testDeepClone(@TempDir Path tempDir) throws Exception {
+  void testDeepCloneAllowsSourceReads(@TempDir Path tempDir) throws Exception {
+    HttpServer target = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    CountDownLatch requestStarted = new CountDownLatch(1);
+    CountDownLatch releaseRequest = new CountDownLatch(1);
+    target.createContext(
+        "/",
+        exchange -> {
+          requestStarted.countDown();
+          try {
+            releaseRequest.await();
+            exchange.sendResponseHeaders(403, -1);
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+          } finally {
+            exchange.close();
+          }
+        });
+    target.start();
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset source =
+            new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("src").toString())
+                .createEmptyDataset()) {
+      Map<String, String> options =
+          Map.of(
+              "aws_endpoint", "http://127.0.0.1:" + target.getAddress().getPort(),
+              "allow_http", "true",
+              "aws_region", "us-east-1",
+              "client_max_retries", "0",
+              "aws_access_key_id", "test",
+              "aws_secret_access_key", "test");
+      Future<Dataset> clone =
+          executor.submit(() -> source.deepClone("s3://bucket/clone", Ref.ofMain(), options));
+      try {
+        assertTrue(requestStarted.await(10, TimeUnit.SECONDS), "clone did not reach destination");
+        Future<Long> rows = executor.submit(() -> source.countRows());
+        assertEquals(0L, rows.get(5, TimeUnit.SECONDS).longValue());
+      } finally {
+        releaseRequest.countDown();
+      }
+      ExecutionException failure =
+          assertThrows(ExecutionException.class, () -> clone.get(10, TimeUnit.SECONDS));
+      assertTrue(failure.getCause().getMessage().contains("403"), failure::toString);
+    } finally {
+      releaseRequest.countDown();
+      executor.shutdownNow();
+      target.stop(0);
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testDeepClone(boolean callerOwnsResources, @TempDir Path tempDir) throws Exception {
     String srcPath = tempDir.resolve("deep_clone_src").toString();
     String dstPath = tempDir.resolve("deep_clone_dst").toString();
 
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Session session = Session.builder().build()) {
       TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
       try (Dataset empty = suite.createEmptyDataset()) {
         assertEquals(1, empty.version());
       }
 
-      try (Dataset src = suite.write(1, 5)) {
+      suite.write(1, 5).close();
+      OpenDatasetBuilder open = Dataset.open().uri(srcPath);
+      if (callerOwnsResources) {
+        open.allocator(allocator).session(session);
+      }
+      try (Dataset src = open.build()) {
+        BufferAllocator cloneAllocator;
+        Session cloneSession;
         try (Dataset clone = src.deepClone(dstPath, Ref.ofMain(src.version()))) {
           assertEquals(dstPath, clone.uri());
-          assertEquals(src.getSchema().getFields(), clone.getSchema().getFields());
+          cloneSession = clone.session();
+          assertNotNull(cloneSession);
+          cloneAllocator = clone.allocator();
+          try (Dataset checkout = clone.checkoutVersion(clone.version())) {
+            assertTrue(cloneSession.isSameAs(checkout.session()));
+          }
+          if (callerOwnsResources) {
+            assertSame(allocator, cloneAllocator);
+          }
+          src.close();
+          assertEquals(suite.getSchema().getFields(), clone.getSchema().getFields());
           assertEquals(5, clone.countRows());
+        }
+        assertTrue(cloneSession.isClosed());
+        if (callerOwnsResources) {
+          allocator.assertOpen();
+          assertFalse(session.isClosed());
+        } else {
+          assertThrows(IllegalStateException.class, cloneAllocator::assertOpen);
         }
 
         // A deep clone owns its data files, unlike a shallow clone that references the source.

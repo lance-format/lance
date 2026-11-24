@@ -740,7 +740,7 @@ public class Dataset implements Closeable {
    * writes through {@link WriteParams.Builder#withTargetBases(List)}. See {@link #getBasePaths()}
    * for the registered bases.
    *
-   * @param newBases the base paths to add; each needs a name and path that are not already used
+   * @param newBases the base paths to register
    * @throws IllegalArgumentException if {@code newBases} is null or the dataset is closed
    */
   public void addBases(List<BasePath> newBases) {
@@ -750,7 +750,7 @@ public class Dataset implements Closeable {
   /**
    * Register additional base paths on this dataset.
    *
-   * @param newBases the base paths to add; each needs a name and path that are not already used
+   * @param newBases the base paths to register
    * @param transactionProperties optional key-value pairs recorded on the transaction, may be null
    * @throws IllegalArgumentException if {@code newBases} is null or the dataset is closed
    * @see #addBases(List)
@@ -1278,6 +1278,17 @@ public class Dataset implements Closeable {
   private void initializeSession() {
     session = Session.fromHandle(nativeGetSessionHandle());
     ownsSession = true;
+  }
+
+  private Dataset initializeIndependentDataset(Dataset result) {
+    if (allocatorOwners != null || allocator == null) {
+      result.allocator = new RootAllocator(Long.MAX_VALUE);
+      result.allocatorOwners = new AtomicInteger(1);
+    } else {
+      result.shareAllocator(this);
+    }
+    result.initializeSession();
+    return result;
   }
 
   /**
@@ -2539,15 +2550,7 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(branch != null, "Branch cannot be null");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset created = nativeCreateBranch(branch, ref, storageOptions);
-      if (allocatorOwners != null || allocator == null) {
-        created.allocator = new RootAllocator(Long.MAX_VALUE);
-        created.allocatorOwners = new AtomicInteger(1);
-      } else {
-        created.shareAllocator(this);
-      }
-      created.initializeSession();
-      return created;
+      return initializeIndependentDataset(nativeCreateBranch(branch, ref, storageOptions));
     }
   }
 
@@ -2996,7 +2999,9 @@ public class Dataset implements Closeable {
    * Deep clone the specified version into a new dataset at the target path.
    *
    * <p>Unlike {@link #shallowClone(String, Ref, Map)}, this copies the data files, so the new
-   * dataset does not depend on the source. The target can live in a different object store.
+   * dataset does not depend on the source. The target can live in a different object store. Other
+   * reads on this handle can continue during the copy. The returned handle can be used after the
+   * source is closed.
    *
    * @param targetPath the URI to clone the dataset into
    * @param ref the referred version of the current dataset
@@ -3009,13 +3014,8 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(ref != null, "ref can not be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeDeepClone(targetPath, ref, Optional.ofNullable(storageOptions));
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeIndependentDataset(
+          nativeDeepClone(targetPath, ref, Optional.ofNullable(storageOptions)));
     }
   }
 
