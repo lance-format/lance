@@ -514,25 +514,69 @@ fn fits_l2_prepared(num_values: usize, dimension: usize) -> bool {
 
 /// The nearest centroid of every `f32` vector of `data` under L2 and the
 /// squared distance to it, with the tiled GEMM of e-means assignment.
+///
+/// The GEMM scores `||x||^2 - 2 x.c + ||c||^2`, which rounds away the gaps
+/// between nearby centroids when the norms dwarf them, as when a partition
+/// split clusters rows far from the origin and close together. L2 distance
+/// does not change when vectors and centroids move by the same offset, so both
+/// are centered on the centroids' mean first, one task's rows at a time.
 fn gemm_membership_and_dist(
     centroids: &[f32],
     data: &[f32],
     dimension: usize,
 ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
-    let norms = f32::prepare_centroids(centroids, dimension);
+    let center = centroid_mean(centroids, dimension);
+    let centered = |vectors: &[f32]| -> Vec<f32> {
+        vectors
+            .chunks_exact(dimension)
+            .flat_map(|vector| vector.iter().zip(&center).map(|(v, c)| v - c))
+            .collect()
+    };
+    let centroids = centered(centroids);
+    let norms = f32::prepare_centroids(&centroids, dimension);
     let num_rows = data.len() / dimension;
     let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<f32>()))
         .min(num_rows.div_ceil(MEMBERSHIP_MIN_TASKS))
         .max(MEMBERSHIP_MIN_TASK_ROWS);
-    let rows: Vec<usize> = (0..num_rows).collect();
-    rows.par_chunks(chunk_rows)
-        .flat_map_iter(|rows| {
+    data[..num_rows * dimension]
+        .par_chunks(chunk_rows * dimension)
+        .flat_map_iter(|vectors| {
             let _busy = profile::work(Work::Assign);
+            let vectors = centered(vectors);
+            let rows: Vec<usize> = (0..vectors.len() / dimension).collect();
             let mut assignments = Vec::with_capacity(rows.len());
-            f32::assign_rows(data, dimension, centroids, &norms, rows, &mut assignments);
+            f32::assign_rows(
+                &vectors,
+                dimension,
+                &centroids,
+                &norms,
+                &rows,
+                &mut assignments,
+            );
             assignments.into_iter().map(Option::unzip)
         })
         .unzip()
+}
+
+/// The mean of `centroids`, or the origin if it is not finite, so that one
+/// non-finite centroid cannot leave every vector unassigned.
+fn centroid_mean(centroids: &[f32], dimension: usize) -> Vec<f32> {
+    let mut sum = vec![0.0f64; dimension];
+    for centroid in centroids.chunks_exact(dimension) {
+        for (total, &value) in sum.iter_mut().zip(centroid) {
+            *total += value as f64;
+        }
+    }
+    let num_centroids = (centroids.len() / dimension).max(1) as f64;
+    let mean: Vec<f32> = sum
+        .iter()
+        .map(|total| (total / num_centroids) as f32)
+        .collect();
+    if mean.iter().all(|value| value.is_finite()) {
+        mean
+    } else {
+        vec![0.0; dimension]
+    }
 }
 
 /// [`KMeansAlgo::membership_of_rows`] for `f32` vectors under L2: every task
@@ -2833,6 +2877,70 @@ mod tests {
                 "row {row}: distance {distance} vs {best}"
             );
         }
+    }
+
+    /// Rows and centroids clustered tightly far from the origin, as a partition
+    /// split trains on, are assigned as pairwise L2 assigns them: at an offset
+    /// of 50 the GEMM expansion would otherwise round away gaps this small.
+    #[test]
+    fn test_flat_l2_gemm_assignment_far_from_origin() {
+        let (num_rows, k, dimension) = (1_000, 5, 32);
+        let mut rng = SmallRng::seed_from_u64(9);
+        let mut clustered = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    (if i % dimension == 0 { 50.0 } else { 0.0 }) + rng.random_range(-0.01..0.01)
+                })
+                .collect()
+        };
+        let data = clustered(num_rows * dimension);
+        let centroids = clustered(k * dimension);
+
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &centroids,
+            &data,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+
+        for (row, vector) in data.chunks_exact(dimension).enumerate() {
+            let pairwise: Vec<f32> = centroids
+                .chunks_exact(dimension)
+                .map(|centroid| l2::l2(vector, centroid))
+                .collect();
+            let best = pairwise[argmin(pairwise.iter().copied()).unwrap() as usize];
+            let chosen = membership[row].unwrap() as usize;
+            let tolerance = 1e-3 * best;
+            assert!(
+                pairwise[chosen] - best <= tolerance,
+                "row {row}: centroid {chosen} at {} is not the nearest at {best}",
+                pairwise[chosen]
+            );
+            assert!((distances[row].unwrap() - best).abs() <= tolerance);
+        }
+    }
+
+    /// With no centroids, flat L2 assignment of vectors too wide for
+    /// `L2Prepared`, as a partition split can request, leaves every row
+    /// unassigned instead of panicking in the GEMM path.
+    #[test]
+    fn test_flat_l2_assignment_without_centroids() {
+        let dimension = 32;
+        let data = vec![1.0f32; 3 * dimension];
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &[],
+            &data,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+        assert_eq!(membership, vec![None; 3]);
+        assert_eq!(distances, vec![None; 3]);
     }
 
     /// The GEMM membership of hierarchical nodes picks the child the gathered

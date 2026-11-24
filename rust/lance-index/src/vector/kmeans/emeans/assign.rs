@@ -122,10 +122,11 @@ struct GemmTiles {
 }
 
 impl GemmTiles {
-    /// `None` when the dimension is too large for even a one-by-one tile.
+    /// `None` when there are no rows or centroids, or the dimension is too
+    /// large for even a one-by-one tile.
     fn new(num_rows: usize, k: usize, dimension: usize) -> Option<Self> {
         let vectors_per_tile = GEMM_TILE_MAX_ELEMENTS / dimension;
-        if vectors_per_tile < 2 || num_rows == 0 {
+        if vectors_per_tile < 2 || num_rows == 0 || k == 0 {
             return None;
         }
         // A small table, such as a 16-centroid node of hierarchical training,
@@ -291,6 +292,7 @@ mod tests {
             assert!(tiles.centroids >= 1 && tiles.centroids <= k);
         }
         assert!(GemmTiles::new(10, 4, 1 << 15).is_none());
+        assert!(GemmTiles::new(10, 0, 8).is_none());
         // A hierarchy node keeps its 16 centroids in one block even at
         // dimension 1,024, where a tile holds 31 vectors in all.
         let tiles = GemmTiles::new(4096, 16, 1024).unwrap();
