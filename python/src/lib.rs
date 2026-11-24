@@ -164,7 +164,16 @@ pub fn rt() -> &'static BackgroundExecutor {
     if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
         install_atfork();
     }
-    let new_ptr = Box::into_raw(Box::new(create_background_executor()));
+    let new_ptr =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(create_background_executor)) {
+            Ok(executor) => Box::into_raw(Box::new(executor)),
+            Err(payload) => {
+                // Nothing was installed. Clear the flag so a later call retries instead of
+                // spinning forever on `EXECUTOR_INSTALLED` with no executor ever arriving.
+                EXECUTOR_INSTALLED.store(false, Ordering::SeqCst);
+                std::panic::resume_unwind(payload);
+            }
+        };
     BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
     // SAFETY: the executor is leaked and all of its operations take `&self`.
     unsafe { &*new_ptr }

@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
+import subprocess
 import sys
+import textwrap
 import traceback
 from pathlib import Path
 
@@ -69,3 +71,39 @@ def test_table_roundtrip(tmp_path: Path):
     # where it does hold at least keeps the Linux path honest.
     if sys.platform != "darwin":
         assert exitcode == 0, "reading the dataset failed in the forked child"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Test not applicable on Windows")
+def test_executor_creation_can_be_retried_after_failure():
+    # The executor is process-global and the failing call has to be its first user,
+    # so the scenario runs in a fresh interpreter.
+    script = textwrap.dedent(
+        """
+        import os
+        import resource
+
+        import lance
+        import pyarrow as pa
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (96, 96))
+        # Leave no room for the threads the executor needs.
+        held = []
+        try:
+            while True:
+                held.append(os.open(os.devnull, os.O_RDONLY))
+        except OSError:
+            pass
+        table = pa.table({"id": [1]})
+        try:
+            lance.write_dataset(table, "memory://retry")
+        except BaseException:
+            pass
+        else:
+            raise AssertionError("write_dataset succeeded without file descriptors")
+        for fd in held:
+            os.close(fd)
+
+        assert lance.write_dataset(table, "memory://retry").count_rows() == 1
+        """
+    )
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=15)
