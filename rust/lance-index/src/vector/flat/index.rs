@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     metrics::{IndexTimer, IndexTiming, MetricsCollector},
-    prefilter::{PreFilter, sample_blocked_share},
+    prefilter::PreFilter,
     vector::{
         ApproxMode, DIST_COL, PartitionSearchCandidate, PartitionSearchResult, Query,
         graph::{OrderedFloat, OrderedNode},
@@ -473,51 +473,44 @@ impl IvfSubIndex for FlatIndex {
                 &mut scratch.u8,
                 &mut scratch.u32,
             );
-        } else {
+        } else if prefilter.deletions_only() {
+            // A full heap rejects most distances before they need a mask lookup.
+            // Keep dense scoring even when many rows are deleted.
             let mask = prefilter.mask();
-            // Dense scoring avoids materializing every selected offset for a
-            // light mask. When most rows are blocked, the selected-row kernels
-            // can skip their distances. Sampling affects only that cost choice.
-            const DELETION_SAMPLES: usize = 64;
-            let dense = prefilter.deletions_only()
-                && (storage.len() <= DELETION_SAMPLES
-                    || sample_blocked_share(&mask, storage.len(), DELETION_SAMPLES, |id| {
-                        storage.row_id(id)
-                    }) < 0.5);
-            if dense {
-                dist_calc.accumulate_topk_with_mask(
-                    k,
-                    params.lower_bound,
-                    params.upper_bound,
-                    |id| storage.row_id(id),
-                    Some(&mask),
-                    res,
-                    &mut scratch.distances,
-                    &mut scratch.u16,
-                    &mut scratch.u8,
-                    &mut scratch.u32,
-                );
-            } else {
-                // The selection and the calculator's candidate buffer share the
-                // u32 scratch: take it for the selection and keep the larger of
-                // the two afterwards.
-                mask.selected_offsets_into(row_ids, &mut scratch.u32);
-                let selected = std::mem::take(&mut scratch.u32);
-                dist_calc.accumulate_filtered_topk_with_scratch(
-                    k,
-                    params.lower_bound,
-                    params.upper_bound,
-                    selected.iter().map(|&id| (id, storage.row_id(id))),
-                    |_| true,
-                    res,
-                    &mut scratch.distances,
-                    &mut scratch.u16,
-                    &mut scratch.u8,
-                    &mut scratch.u32,
-                );
-                if selected.capacity() > scratch.u32.capacity() {
-                    scratch.u32 = selected;
-                }
+            dist_calc.accumulate_topk_with_mask(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                |id| storage.row_id(id),
+                Some(&mask),
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+        } else {
+            // The selection and the calculator's candidate buffer share the
+            // u32 scratch: take it for the selection and keep the larger of
+            // the two afterwards.
+            prefilter
+                .mask()
+                .selected_offsets_into(row_ids, &mut scratch.u32);
+            let selected = std::mem::take(&mut scratch.u32);
+            dist_calc.accumulate_filtered_topk_with_scratch(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                selected.iter().map(|&id| (id, storage.row_id(id))),
+                |_| true,
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+            if selected.capacity() > scratch.u32.capacity() {
+                scratch.u32 = selected;
             }
         }
         drop(distance_timer);
