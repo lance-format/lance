@@ -7172,17 +7172,31 @@ def test_custom_commit_lock(tmp_path: Path):
     commit_module = importlib.import_module("lance.commit")
 
     @contextlib.contextmanager
-    def commit_lock(_version: int):
+    def conflicting_lock(_version: int):
         raise commit_module.CommitConflictError()
 
-    with pytest.raises(Exception, match="CommitConflictError"):
+    # Creating a dataset treats a conflict as another writer having created it first.
+    with pytest.raises(OSError, match="Dataset already exists"):
         lance.write_dataset(
-            pa.table({"a": range(100)}), tmp_path / "test3", commit_lock=commit_lock
+            pa.table({"a": range(100)}),
+            tmp_path / "test3",
+            commit_lock=conflicting_lock,
         )
 
-    dataset = lance.dataset(tmp_path / "test1", commit_lock=commit_lock)
-    with pytest.raises(Exception, match="CommitConflictError"):
-        dataset.delete("a < 10")
+    # On an existing dataset a conflict is retried, and the lock is called again.
+    lock_calls = []
+
+    @contextlib.contextmanager
+    def contended_lock(version: int):
+        lock_calls.append(version)
+        if len(lock_calls) == 1:
+            raise commit_module.CommitConflictError()
+        yield
+
+    dataset = lance.dataset(tmp_path / "test1", commit_lock=contended_lock)
+    dataset.delete("a < 10")
+    assert len(lock_calls) == 2
+    assert dataset.count_rows() == 90
 
 
 @pytest.mark.parametrize("manager_type", ["class", "generator"])
@@ -11135,3 +11149,27 @@ class TestLanceScannerTake:
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner(filter="id >= 4")
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
+
+
+def test_commit_lock_conflict_error_keeps_type(tmp_path: Path):
+    # A CommitConflictError raised by a custom lock must surface as that type, with its
+    # retryable flag, instead of being flattened into a generic internal OSError.
+    commit_module = importlib.import_module("lance.commit")
+
+    @contextlib.contextmanager
+    def conflicting_lock(_version: int):
+        raise commit_module.CommitConflictError("taken by another writer")
+
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "data")
+    fragment = dataset.get_fragments()[0]
+
+    with pytest.raises(commit_module.CommitConflictError) as exc_info:
+        lance.LanceDataset.commit(
+            str(tmp_path / "data"),
+            lance.LanceOperation.Append([fragment.metadata]),
+            read_version=dataset.version,
+            commit_lock=conflicting_lock,
+            max_retries=0,
+        )
+    assert exc_info.value.retryable is True
+    assert dataset.version == 1

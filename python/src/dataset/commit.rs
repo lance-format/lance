@@ -30,8 +30,10 @@ static PY_CONFLICT_ERROR: LazyLock<PyResult<Py<PyAny>>> = LazyLock::new(|| {
 });
 
 fn handle_error(py_err: PyErr, py: Python) -> CommitError {
+    // The cached object is the class itself. `get_type()` would return its metaclass,
+    // which no exception instance passes, and the conflict arm would never be taken.
     let conflict_err_type = match &*PY_CONFLICT_ERROR {
-        Ok(err) => err.bind(py).get_type(),
+        Ok(err) => err.bind(py).clone(),
         Err(import_error) => {
             return CommitError::OtherError(Error::internal(format!(
                 "Error importing from pylance {}",
