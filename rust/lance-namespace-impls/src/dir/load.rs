@@ -179,8 +179,8 @@ impl DirectoryNamespace {
 
         let dataset = match branch {
             Some(name) => {
-                self.open_directory_branch(&table_uri, name, version)
-                    .await?
+                // Keep branch store resolution out of the future used by shallow location lookups.
+                Box::pin(self.open_directory_branch(&table_uri, name, version)).await?
             }
             None => {
                 let dataset = self
