@@ -241,6 +241,10 @@ impl OutputSeedAccumulator {
         self.sources.push(source);
     }
 
+    pub fn clear(&mut self) {
+        self.sources.clear();
+    }
+
     /// Merge the accumulated inputs' seeds and reset for the next output.
     ///
     /// A column is kept only when every input carries a version 1 seed of one

@@ -25,8 +25,10 @@
 
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::{
-    FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, inherit_sticky_feature_flags,
-    managed_blobs_enabled, validate_auto_cleanup_config,
+    FLAG_MANAGED_BLOBS, FLAG_ZONE_WRITE_SEEDS, ZONE_WRITE_SEEDS_VERSION_KEY,
+    apply_index_object_metadata_flag, inherit_sticky_feature_flags, managed_blobs_enabled,
+    validate_auto_cleanup_config, validate_zone_write_seeds_version_config,
+    zone_write_seeds_v1_enabled,
 };
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
@@ -426,11 +428,20 @@ impl<'a> ApplyState<'a> {
         {
             validate_auto_cleanup_config(&manifest)?;
         }
+        if current_manifest.config.get(ZONE_WRITE_SEEDS_VERSION_KEY)
+            != manifest.config.get(ZONE_WRITE_SEEDS_VERSION_KEY)
+        {
+            validate_zone_write_seeds_version_config(&manifest)?;
+        }
         // Both read the final schema and config, so they come after those land.
         apply_range_segments(&mut manifest, Some(current_manifest))?;
         if managed_blobs_enabled(&manifest.schema)? {
             manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
+        }
+        if zone_write_seeds_v1_enabled(&manifest) {
+            manifest.reader_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+            manifest.writer_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
         }
 
         // The assembly derives the marks from what the manifest still holds,

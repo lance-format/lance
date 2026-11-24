@@ -930,15 +930,21 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
     def create(self):
         """Create dataset with ZONEMAP and BLOOMFILTER indices.
 
-        The zonemap column contains nulls at rows 0 and 500 so that IS NULL
-        queries can be verified across version boundaries.
+        The zonemap columns contain nulls at rows 0 and 500 so that IS NULL
+        queries can be verified across version boundaries. The string column
+        defaults to `use_seeds=True` on Lance >= 10, exercising write-seed
+        compatibility across versions.
         """
         shutil.rmtree(self.path, ignore_errors=True)
         zonemap_values = [None if i in (0, 500) else i for i in range(1000)]
+        zonemap_str_values = [
+            None if i in (0, 500) else f"v{i:04d}" for i in range(1000)
+        ]
         data = pa.table(
             {
                 "idx": pa.array(range(1000)),
                 "zonemap": pa.array(zonemap_values, type=pa.int64()),
+                "zonemap_str": pa.array(zonemap_str_values, type=pa.string()),
                 "bloomfilter": pa.array(range(1000)),
             }
         )
@@ -949,6 +955,7 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
             data_storage_version=safe_data_storage_version(self.compat_version),
         )
         dataset.create_scalar_index("zonemap", "ZONEMAP")
+        dataset.create_scalar_index("zonemap_str", "ZONEMAP")
         dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
 
     def check_read(self):
@@ -957,6 +964,11 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
 
         # Test ZONEMAP equality
         table = ds.to_table(filter="zonemap == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        # Test string ZONEMAP equality
+        table = ds.to_table(filter="zonemap_str == 'v0007'")
         assert table.num_rows == 1
         assert table.column("idx").to_pylist() == [7]
 
@@ -971,6 +983,12 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
             # Before write, there are 2 NULLs
             assert table.num_rows == 2
 
+        table = ds.to_table(filter="zonemap_str IS NULL")
+        if 1000 in table.column("idx").to_pylist():
+            assert table.num_rows == 3
+        else:
+            assert table.num_rows == 2
+
         # Test BLOOMFILTER
         table = ds.to_table(filter="bloomfilter == 7")
         assert table.num_rows == 1
@@ -983,6 +1001,7 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
             {
                 "idx": pa.array([1000]),
                 "zonemap": pa.array([None], type=pa.int64()),
+                "zonemap_str": pa.array([None], type=pa.string()),
                 "bloomfilter": pa.array([1000]),
             }
         )
@@ -994,6 +1013,8 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         # files are compacted.  The newly inserted null must be found
         # regardless of which version handles the seed-based index update.
         table = ds.to_table(filter="zonemap IS NULL")
+        assert table.num_rows >= 1
+        table = ds.to_table(filter="zonemap_str IS NULL")
         assert table.num_rows >= 1
 
     def skip_downgrade(self, version: str) -> bool:

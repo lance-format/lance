@@ -120,6 +120,17 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// Their min/max exclude NaNs, which are counted separately by sign. Set in
 /// both reader and writer feature flags and preserve across commits.
 pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
+
+/// Dataset config key that opts a table into version 1 zone write seeds
+/// ([`FLAG_ZONE_WRITE_SEEDS`]).
+///
+/// Valid values are `"0"` and `"1"`. When absent or `"0"`, writers continue to
+/// emit version 0 zone write seeds without setting [`FLAG_ZONE_WRITE_SEEDS`],
+/// keeping the table readable and writable by Lance `< 15`. Committing `"1"`
+/// atomically activates [`FLAG_ZONE_WRITE_SEEDS`] in both feature flag words;
+/// once activated, the capability is sticky and later writes emit version 1
+/// seeds unless this key explicitly pins the table back to `"0"`.
+pub const ZONE_WRITE_SEEDS_VERSION_KEY: &str = "lance.zone_write_seeds.version";
 /// Writer-only protection for clustering definitions, ID allocation, references,
 /// and generic fragment/index segment metadata maintenance.
 /// Set whenever a manifest carries any of them; a writer that does not preserve
@@ -306,6 +317,57 @@ pub fn validate_auto_cleanup_config(manifest: &Manifest) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Validate a change to [`ZONE_WRITE_SEEDS_VERSION_KEY`].
+///
+/// Accepts absent, `"0"`, or `"1"`. Call before publishing a commit that
+/// modifies this key, not when carrying inherited configuration across an
+/// unrelated commit.
+///
+/// ```
+/// # use lance_table::{feature_flags::validate_zone_write_seeds_version_config, format::Manifest};
+/// # fn check(manifest: &Manifest) -> lance_core::Result<()> {
+/// validate_zone_write_seeds_version_config(manifest)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_zone_write_seeds_version_config(manifest: &Manifest) -> Result<()> {
+    if let Some(value) = manifest.config.get(ZONE_WRITE_SEEDS_VERSION_KEY) {
+        match value.as_str() {
+            "0" | "1" => {}
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "{ZONE_WRITE_SEEDS_VERSION_KEY} must be \"0\" or \"1\", got {value:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the manifest's config explicitly opts into version 1 zone write
+/// seeds (`lance.zone_write_seeds.version = "1"`).
+pub fn zone_write_seeds_v1_enabled(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .get(ZONE_WRITE_SEEDS_VERSION_KEY)
+        .is_some_and(|value| value == "1")
+}
+
+/// Whether writers targeting `manifest` should emit version 1 zone write seeds
+/// rather than version 0.
+///
+/// Version 1 seeds require [`FLAG_ZONE_WRITE_SEEDS`] to already be active on
+/// the snapshot. Once activated, writers emit version 1 unless
+/// [`ZONE_WRITE_SEEDS_VERSION_KEY`] explicitly pins the table back to `"0"`.
+pub fn write_v1_zone_write_seeds(manifest: &Manifest) -> bool {
+    manifest.has_zone_write_seeds()
+        && manifest
+            .config
+            .get(ZONE_WRITE_SEEDS_VERSION_KEY)
+            .map(String::as_str)
+            != Some("0")
 }
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
@@ -1026,6 +1088,64 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("zone write seed"));
         }
+    }
+
+    #[rstest::rstest]
+    #[case::absent(None, true)]
+    #[case::v0(Some("0"), true)]
+    #[case::v1(Some("1"), true)]
+    #[case::v2(Some("2"), false)]
+    #[case::bool_true(Some("true"), false)]
+    #[case::empty(Some(""), false)]
+    fn test_validate_zone_write_seeds_version_config(
+        #[case] value: Option<&str>,
+        #[case] valid: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        if let Some(value) = value {
+            manifest
+                .config
+                .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), value.to_string());
+        }
+        let result = validate_zone_write_seeds_version_config(&manifest);
+        assert_eq!(result.is_ok(), valid, "{value:?}: {result:?}");
+        if !valid {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains(ZONE_WRITE_SEEDS_VERSION_KEY),
+                "{error}"
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::unflagged_absent(false, None, false)]
+    #[case::unflagged_v0(false, Some("0"), false)]
+    #[case::unflagged_v1_without_flag(false, Some("1"), false)]
+    #[case::flagged_absent(true, None, true)]
+    #[case::flagged_v1(true, Some("1"), true)]
+    #[case::flagged_pinned_v0(true, Some("0"), false)]
+    fn test_write_v1_zone_write_seeds_policy(
+        #[case] flagged: bool,
+        #[case] config_value: Option<&str>,
+        #[case] expected_v1: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        if flagged {
+            manifest.reader_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+            manifest.writer_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+        }
+        if let Some(value) = config_value {
+            manifest
+                .config
+                .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), value.to_string());
+        }
+        assert_eq!(write_v1_zone_write_seeds(&manifest), expected_v1);
+        assert_eq!(
+            zone_write_seeds_v1_enabled(&manifest),
+            config_value == Some("1")
+        );
     }
 
     #[test]

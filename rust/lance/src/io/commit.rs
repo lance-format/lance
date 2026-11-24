@@ -1427,14 +1427,14 @@ pub(crate) async fn do_commit_detached_transaction(
                     FragReuseUpdate::None,
                 )
                 .await?;
-                let (mut manifest, mut indices) = transaction.build_manifest_prepared(
+                let (manifest, mut indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
                     &attempt_build_config,
                     None,
                 )?;
-                finish_built_manifest(dataset, transaction, &mut manifest, &mut indices).await?;
+                finish_built_manifest(dataset, transaction, &mut indices).await?;
                 (manifest, indices)
             }
         };
@@ -1700,19 +1700,17 @@ async fn composite_frag_reuse_update(
 }
 
 /// The IO a freshly built manifest still needs: an action-based history that
-/// outgrew the inline limit moves to an external file, and the seed feature
-/// flags follow the final index list. One await point, rather than one per
-/// step, keeps the commit loop's future under the `large_futures` limit.
+/// outgrew the inline limit moves to an external file. Keeping this behind one
+/// await point keeps the commit loop's future under the `large_futures` limit.
 async fn finish_built_manifest(
     dataset: &Dataset,
     transaction: &Transaction,
-    manifest: &mut Manifest,
     indices: &mut [IndexMetadata],
 ) -> Result<()> {
     if matches!(transaction.operation, Operation::CompositeOperation(_)) {
         crate::index::frag_reuse::spill_frag_reuse_history(dataset, indices).await?;
     }
-    crate::dataset::write::seeds::apply_seed_feature_flags(manifest, indices, dataset).await
+    Ok(())
 }
 
 /// Step one of a commit attempt (`Transaction::prepare_indices`): the index
@@ -2191,15 +2189,14 @@ pub(crate) async fn commit_transaction(
                     frag_reuse,
                 )
                 .await?;
-                let (mut manifest, mut indices) = attempt_transaction.build_manifest_prepared(
+                let (manifest, mut indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &attempt_build_config,
                     read_version_state,
                 )?;
-                finish_built_manifest(&dataset, &attempt_transaction, &mut manifest, &mut indices)
-                    .await?;
+                finish_built_manifest(&dataset, &attempt_transaction, &mut indices).await?;
                 (manifest, indices)
             }
         };

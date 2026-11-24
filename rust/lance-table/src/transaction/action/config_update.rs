@@ -268,6 +268,7 @@ impl TryFrom<pb_actions::ConfigUpdate> for ConfigUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::{FLAG_ZONE_WRITE_SEEDS, ZONE_WRITE_SEEDS_VERSION_KEY};
     use crate::format::Manifest;
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint,
@@ -606,6 +607,48 @@ mod tests {
         assert!(crate::feature_flags::validate_auto_cleanup_config(&manifest).is_err());
 
         apply(&manifest, vec![set_config(&[("unrelated", Some("1"))])]).unwrap();
+    }
+
+    #[test]
+    fn test_config_update_validates_and_activates_zone_write_seeds_version() {
+        let error = apply(
+            &backed_manifest(),
+            vec![set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("2"))])],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(ZONE_WRITE_SEEDS_VERSION_KEY),
+            "{error}"
+        );
+
+        let v0 = apply(
+            &backed_manifest(),
+            vec![set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("0"))])],
+        )
+        .unwrap();
+        assert!(!v0.has_zone_write_seeds());
+
+        let v1 = apply(
+            &backed_manifest(),
+            vec![
+                set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("bad"))]),
+                set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))]),
+            ],
+        )
+        .unwrap();
+        assert_ne!(v1.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+        assert_ne!(v1.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+
+        let mut inherited_invalid = backed_manifest();
+        inherited_invalid
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.into(), "future".into());
+        apply(
+            &inherited_invalid,
+            vec![set_config(&[("unrelated", Some("1"))])],
+        )
+        .unwrap();
     }
 
     #[test]
