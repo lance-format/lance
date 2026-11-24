@@ -12,9 +12,14 @@
 
 use std::collections::HashSet;
 
+use lance_index::registry::{
+    plugin_name_from_details_url, scalar_index_details_are_known, scalar_index_version,
+};
 use lance_index::scalar::btree::BTREE_LOOKUP_NAME;
-use lance_index::{INDEX_FILE_NAME, is_system_index};
+use lance_index::{INDEX_FILE_NAME, IndexType, pb::VectorIndexDetails};
 use lance_table::format::{IndexFile, IndexMetadata};
+use lance_table::system_index::is_system_index;
+use prost::Name;
 use roaring::RoaringBitmap;
 
 use crate::index::scalar::IndexDetails;
@@ -125,14 +130,21 @@ pub(crate) fn validate_segment_index_details(
 
 /// Whether optimize can fold several segments of this kind into one without
 /// rescanning the table: the kinds the single-process optimize merges rather
-/// than rebuilds, vector, BTree, Bitmap and NGram (`merge_scalar_indices`) and
-/// Inverted (`InvertedIndex::merge_segments`).
+/// than rebuilds, vector, BTree, Bitmap, BloomFilter, NGram, MinHash LSH and RTree
+/// (`merge_scalar_indices`), Inverted (`InvertedIndex::merge_segments`), and
+/// LabelList (`merge_label_list_indices`). LabelList's pure merge is supported
+/// even though its ordinary append path cannot merge several old segments with
+/// a new stream.
 pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
     segment_has_vector_details(segment)
         || segment_has_btree_details(segment)
         || segment_has_bitmap_details(segment)
+        || segment_has_bloomfilter_details(segment)
         || segment_has_ngram_details(segment)
+        || segment_has_minhashlsh_details(segment)
+        || (cfg!(feature = "geo") && segment_has_rtree_details(segment))
         || segment_has_inverted_details(segment)
+        || segment_has_label_list_details(segment)
 }
 
 /// Detect vector segments while preserving the legacy pre-details fallback.
@@ -160,7 +172,28 @@ pub(crate) fn index_type_is_known(index: &IndexMetadata) -> bool {
         || index
             .index_details
             .as_ref()
-            .is_none_or(|details| IndexDetails(details.clone()).has_reader())
+            .is_none_or(|details| index_details_have_reader(&details.type_url))
+}
+
+/// Whether this build has a reader for the complete declared type name.
+pub(crate) fn index_details_have_reader(type_url: &str) -> bool {
+    let Some((_, details_type_name)) = type_url.rsplit_once('/') else {
+        return false;
+    };
+    if details_type_name.eq_ignore_ascii_case(&VectorIndexDetails::full_name())
+        // MemWAL flush used this exact pre-`pb` package name.
+        || details_type_name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
+    {
+        return true;
+    }
+    if scalar_index_details_are_known(type_url) {
+        return true;
+    }
+    #[cfg(feature = "geo")]
+    if details_type_name.eq_ignore_ascii_case(&lance_index::pb::RTreeIndexDetails::full_name()) {
+        return true;
+    }
+    false
 }
 
 /// Detect FTS / inverted segments from manifest details.
@@ -253,20 +286,94 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
     let max_supported_version = index
         .index_details
         .as_ref()
-        .map(|details| {
-            IndexDetails(details.clone())
-                .index_version()
-                .unwrap_or(i32::MAX as u32)
-        })
+        .map(|details| details_index_version(&details.type_url).unwrap_or(i32::MAX as u32))
         .unwrap_or_default();
     (index.index_version > max_supported_version as i32).then_some(max_supported_version)
+}
+
+fn details_index_version(type_url: &str) -> Option<u32> {
+    // The details do not include the vector subtype, so use the highest
+    // supported version of any vector index.
+    if type_url.ends_with(VectorIndexDetails::NAME) {
+        return Some(IndexType::max_vector_version());
+    }
+    let plugin_name = plugin_name_from_details_url(type_url);
+    let version = scalar_index_version(&plugin_name);
+    #[cfg(feature = "geo")]
+    if plugin_name == "rtree" {
+        return Some(lance_geo::rtree::RTREE_ROW_ADDR_DOMAIN_VERSION);
+    }
+    version
+}
+
+pub(crate) fn index_has_supported_field_dependencies(index: &IndexMetadata) -> bool {
+    is_system_index(index)
+        || index
+            .fields
+            .iter()
+            .chain(&index.covering_fields)
+            .all(|field_id| *field_id >= 0)
 }
 
 /// Whether this build may expose an index through the usable-index view.
 ///
 /// System indices have dedicated readers rather than scalar plugins. Ordinary
 /// indices need both a reader for their exact declared type and a supported
-/// format version.
+/// format version. Their field dependencies must belong to the user schema:
+/// reserved negative IDs require dedicated support, not schema lookups.
 pub(crate) fn index_is_usable(index: &IndexMetadata) -> bool {
-    index_type_is_known(index) && unsupported_index_version(index).is_none()
+    index_type_is_known(index)
+        && unsupported_index_version(index).is_none()
+        && index_has_supported_field_dependencies(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::scalar::SCALAR_INDEX_PLUGIN_REGISTRY;
+    use lance_index::pb::RTreeIndexDetails;
+
+    #[test]
+    fn test_index_details_reader_matches_complete_type_name_case_insensitively() {
+        for type_url in [
+            "/lance.index.pb.VectorIndexDetails",
+            "type.googleapis.com/LANCE.INDEX.PB.VECTORINDEXDETAILS",
+            "type.googleapis.com/lance.index.VectorIndexDetails",
+            "type.googleapis.com/LANCE.TABLE.BTREEINDEXDETAILS",
+            "type.googleapis.com/lance.index.pb.BTreeIndexDetails",
+        ] {
+            assert!(
+                index_details_have_reader(type_url),
+                "expected a reader for {type_url}"
+            );
+        }
+
+        for type_url in [
+            "type.googleapis.com/example.MyVectorIndexDetails",
+            "type.googleapis.com/example.BTreeIndexDetails",
+            "VectorIndexDetails",
+        ] {
+            assert!(
+                !index_details_have_reader(type_url),
+                "unexpected reader for {type_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rtree_manifest_metadata_matches_registry() {
+        let details = prost_types::Any::from_msg(&RTreeIndexDetails::default()).unwrap();
+        let registry = &*SCALAR_INDEX_PLUGIN_REGISTRY;
+        assert_eq!(
+            index_details_have_reader(&details.type_url),
+            cfg!(feature = "geo")
+        );
+        assert_eq!(
+            details_index_version(&details.type_url),
+            registry
+                .get_plugin_by_details(&details)
+                .ok()
+                .map(|plugin| plugin.version()),
+        );
+    }
 }

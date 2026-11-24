@@ -13,10 +13,12 @@ use std::sync::Arc;
 
 use super::binary_copy;
 use super::planning::{
-    CompactionMode, CompactionOptions, CompactionPlan, TaskData, has_eager_remappable_index,
+    CompactionMode, CompactionOptions, CompactionPlan, CompactionTaskKind, TaskData,
+    has_eager_remappable_index,
 };
+use super::repack;
 use crate::Dataset;
-use crate::dataset::blob::BlobV2BatchRewritePlan;
+use crate::dataset::blob::{BlobV2BatchRewritePlan, SidecarRewrite};
 use crate::dataset::index::load_indices_for_remapping;
 use crate::dataset::rowids::{
     RowLineage, RowLineagePlan, RowLineageSpill, RowVersionKind, inline_row_lineage_max_bytes,
@@ -25,21 +27,18 @@ use crate::dataset::rowids::{
 use crate::dataset::utils::{CapturedRowIds, make_rowid_capture_stream};
 use crate::dataset::versions;
 use crate::dataset::{
-    WriteMode, WriteParams, cleanup_data_fragments,
-    write::write_fragments_internal_with_file_row_counts,
+    WriteMode, WriteParams, cleanup_data_fragments, write::write_fragments_internal_impl,
 };
 use crate::io::commit::migrate_fragments;
 use crate::io::deletion::read_dataset_deletion_file;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{BlobHandling, Field as LanceField};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::writer::FileWriterOptions;
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{Fragment, RowDatasetVersionSequence};
 use lance_table::rowids::RowIdSequence;
@@ -55,8 +54,9 @@ pub struct CompactionMetrics {
     pub fragments_added: usize,
     /// The number of files that have been removed, including deletion files.
     pub files_removed: usize,
-    /// The number of files that have been added, which is always equal to the
-    /// number of fragments.
+    /// The number of files that have been added: each new fragment's data
+    /// files and deletion file for a fragment rewrite, and each new data file
+    /// for a column repack.
     pub files_added: usize,
 }
 
@@ -188,7 +188,7 @@ pub async fn can_use_binary_copy_current(
             // check file global buffer
             let object_store = match data_file.base_id {
                 Some(base_id) => dataset.object_store(Some(base_id)).await?,
-                None => dataset.object_store.clone(),
+                None => dataset.table_state.object_store.clone(),
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
@@ -300,16 +300,14 @@ async fn prepare_reader(
     }
     if capture_row_ids {
         scanner.with_row_id();
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    }
+    let data = Box::pin(scanner.try_into_stream().await?);
+    if capture_row_ids {
         let (data_no_row_ids, rx) =
             make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
         Ok((data_no_row_ids, Some(rx), has_blob_v2_columns))
     } else {
-        Ok((
-            SendableRecordBatchStream::from(scanner.try_into_stream().await?),
-            None,
-            has_blob_v2_columns,
-        ))
+        Ok((data, None, has_blob_v2_columns))
     }
 }
 
@@ -323,7 +321,10 @@ pub struct CompactionTask {
 }
 
 impl CompactionTask {
-    /// Run the compaction task and return the result.
+    /// Run the compaction task and return the result. A
+    /// [`CompactionTaskKind::RewriteFragments`] task rewrites its fragments
+    /// into new ones; a [`CompactionTaskKind::RepackColumns`] task writes new
+    /// data files for its fragment.
     ///
     /// This result should be later passed to
     /// [`crate::dataset::optimize::commit_compaction`] to commit
@@ -338,7 +339,14 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        rewrite_files(dataset, self.task.clone(), &self.options).await
+        match &self.task.kind {
+            CompactionTaskKind::RewriteFragments => {
+                rewrite_files(dataset, self.task.clone(), &self.options).await
+            }
+            CompactionTaskKind::RepackColumns { files } => {
+                repack::execute_repack(&dataset, &self.task, files, &self.options).await
+            }
+        }
     }
 }
 
@@ -391,6 +399,19 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// The new data files of a [`CompactionTaskKind::RepackColumns`] task.
+    /// `new_fragments` and `original_fragments` are then empty.
+    #[serde(default)]
+    pub repacked_files: Option<RepackedFiles>,
+}
+
+/// The data files a column repack wrote for one fragment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepackedFiles {
+    /// The fragment the files belong to.
+    pub fragment_id: u64,
+    /// The new files.
+    pub files: Vec<lance_table::format::DataFile>,
 }
 
 /// The old row addresses of `fragments`' live (non-deleted) rows, reconstructed
@@ -513,6 +534,7 @@ pub(super) async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            repacked_files: None,
         });
     }
 
@@ -578,6 +600,7 @@ pub(super) async fn rewrite_files(
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
 
+    let mut sidecars = None;
     if !can_binary_copy {
         let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
@@ -604,27 +627,27 @@ pub(super) async fn rewrite_files(
 
         if has_blob_v2_columns {
             let dataset_arc = Arc::new(dataset.as_ref().clone());
-            let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new(
+            let supports_prepared = matches!(
+                write_version,
+                ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+            );
+            let mut rewrite_plan = BlobV2BatchRewritePlan::try_new(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
-                managed_blobs_enabled(dataset.schema())?
-                    && matches!(
-                        write_version,
-                        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                    ),
-            )?);
+                supports_prepared,
+            )?;
+            if supports_prepared && !managed_blobs_enabled(dataset.schema())? {
+                let context = Arc::new(SidecarRewrite::default());
+                rewrite_plan = rewrite_plan.with_sidecar_rewrite(context.clone());
+                sidecars = Some(context);
+            }
+            let rewrite_plan = Arc::new(rewrite_plan);
             let transformed_schema = rewrite_plan.output_schema().clone();
-            let transformed = reader_with_progress.then(move |batch_result| {
+            let transformed = reader_with_progress.and_then(move |batch| {
                 let dataset = dataset_arc.clone();
                 let rewrite_plan = rewrite_plan.clone();
-                async move {
-                    let batch = batch_result?;
-                    rewrite_plan
-                        .transform_batch(&dataset, batch)
-                        .await
-                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
-                }
+                async move { rewrite_plan.transform_batch(&dataset, batch).await }
             });
             reader = Some(Box::pin(RecordBatchStreamAdapter::new(
                 transformed_schema,
@@ -685,11 +708,6 @@ pub(super) async fn rewrite_files(
     };
     let max_rows_per_file = file_row_counts.first().copied().unwrap_or(1);
 
-    let file_writer_options = FileWriterOptions {
-        data_cache_bytes: options.data_cache_bytes,
-        ..Default::default()
-    };
-
     let mut params = WriteParams {
         max_rows_per_file,
         max_rows_per_group: options.max_rows_per_group,
@@ -699,7 +717,7 @@ pub(super) async fn rewrite_files(
         // the writer would reject such blobs.
         allow_external_blob_outside_bases: true,
         data_storage_version: Some(write_version.to_selector()),
-        file_writer_options: Some(file_writer_options),
+        file_writer_options: Some(options.file_writer_options()),
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
@@ -787,16 +805,21 @@ pub(super) async fn rewrite_files(
             }
             None => None,
         };
-        let (frags, _) = write_fragments_internal_with_file_row_counts(
+        let (frags, _) = write_fragments_internal_impl(
             write_version,
             Some(dataset.as_ref()),
-            dataset.object_store.clone(),
-            &dataset.base,
+            dataset.table_state.object_store.clone(),
+            &dataset.table_state.base,
             write_schema,
             stream,
             params,
             None,
             Some(file_row_counts),
+            None,
+            false,
+            false,
+            None,
+            sidecars.clone(),
         )
         .await?;
         new_fragments = frags;
@@ -842,8 +865,13 @@ pub(super) async fn rewrite_files(
     let row_addrs = match row_addrs_result {
         Ok(v) => v,
         Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
-                .await;
+            cleanup_data_fragments(
+                &dataset.table_state.object_store,
+                &dataset.table_state.base,
+                None,
+                &new_fragments,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -873,6 +901,7 @@ pub(super) async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        repacked_files: None,
     })
 }
 
@@ -1214,10 +1243,8 @@ pub(super) fn append_row_lineage_columns(
         let batch = batch?;
         let rows = batch.num_rows();
         if offset + rows > total_rows {
-            return Err(datafusion::error::DataFusionError::External(Box::new(
-                Error::internal(format!(
-                    "compaction read more rows than its row lineage covers ({total_rows})"
-                )),
+            return Err(Error::internal(format!(
+                "compaction read more rows than its row lineage covers ({total_rows})"
             )));
         }
         let mut arrays = batch.columns().to_vec();
@@ -1229,8 +1256,7 @@ pub(super) fn append_row_lineage_columns(
             arrays.push(Arc::new(arrow_array::UInt64Array::from(batch_values)) as ArrayRef);
         }
         offset += rows;
-        RecordBatch::try_new(batch_schema.clone(), arrays)
-            .map_err(datafusion::error::DataFusionError::from)
+        Ok(RecordBatch::try_new(batch_schema.clone(), arrays)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, batches))
 }

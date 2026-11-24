@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Transaction struct for lance-table format layer.
+//! Protobuf transaction carrier for the manifest write path.
 //!
-//! This struct is introduced to provide a Struct-first API for passing transaction
-//! information within the lance-table crate. It mirrors the protobuf Transaction
-//! message at a semantic level while remaining crate-local, so lance-table does
-//! not depend on higher layers (e.g., lance crate).
+//! [`Transaction`] holds a [`pb::Transaction`] message in memory so commit
+//! handlers and the [`crate::io::commit::ManifestWriter`] can pass it without
+//! depending on the higher-level transaction builder. A commit path passes it
+//! as an `Option` after deciding whether the manifest should include an inline
+//! copy; `None` leaves the transaction section empty.
 //!
-//! Conversion to protobuf occurs at the write boundary. See the `From<Transaction>`
-//! implementation below.
+//! The manifest writer serializes the message into wire bytes with
+//! `write_protobuf`. Callers can also construct the wrapper directly through
+//! [`Transaction::inner`] or `From<pb::Transaction>`, so the wrapper itself does
+//! not establish how the message was built or that it was validated.
 
 use crate::format::pb;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transaction {
-    /// Crate-local representation backing: protobuf Transaction.
-    /// Keeping this simple avoids ring dependencies while still enabling
-    /// Struct-first parameter passing in lance-table.
+    /// The protobuf message carried to the manifest writer.
     pub inner: pb::Transaction,
 }
 
@@ -68,7 +69,8 @@ pub fn operation_may_change_schema(transaction: &pb::Transaction) -> bool {
     }
 }
 
-/// Write-boundary conversion: serialize using protobuf at the last step.
+/// Write-boundary conversion: move the protobuf message out without another
+/// conversion.
 impl From<Transaction> for pb::Transaction {
     fn from(tx: Transaction) -> Self {
         tx.inner
@@ -84,6 +86,7 @@ impl From<pb::Transaction> for Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::pb_actions;
     use prost::Message;
 
     /// The classification that must never depend on payload size. A MemWAL
@@ -125,7 +128,7 @@ mod tests {
     #[test]
     fn field_metadata_updates_change_schema() {
         let mut update = pb::transaction::UpdateConfig {
-            config_updates: Some(pb::transaction::UpdateMap::default()),
+            config_updates: Some(pb_actions::UpdateMap::default()),
             ..Default::default()
         };
         let config_only = pb::Transaction {
@@ -136,7 +139,7 @@ mod tests {
 
         update
             .field_metadata_updates
-            .insert(0, pb::transaction::UpdateMap::default());
+            .insert(0, pb_actions::UpdateMap::default());
         let field_update = pb::Transaction {
             operation: Some(pb::transaction::Operation::UpdateConfig(update)),
             ..Default::default()

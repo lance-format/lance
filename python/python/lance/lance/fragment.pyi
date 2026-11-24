@@ -29,6 +29,8 @@ class DeletionFile:
     num_deleted_rows: int
     file_type: Literal["array", "bitmap"]
     base_id: Optional[int]
+    stored_path: Optional[str]
+    inline: Optional[bytes]
 
     def __init__(
         self,
@@ -37,18 +39,21 @@ class DeletionFile:
         file_type: Literal["array", "bitmap"],
         num_deleted_rows: int,
         base_id: Optional[int] = None,
+        inline: Optional[bytes] = None,
+        path: Optional[str] = None,
     ): ...
     def asdict(self) -> dict:
         """Get a dictionary representation of the deletion file."""
         ...
-    def path(self, fragment_id: int, base_uri: Optional[str] = None) -> str:
+    def path(self, fragment_id: int, base_uri: Optional[str] = None) -> Optional[str]:
         """
         Get the path to the deletion file.
 
         Parameters
         ----------
         fragment_id : int
-            The fragment id.
+            The id of the fragment that owns the file. Ignored when the file
+            has an explicit path.
         base_uri : str, optional
             The base URI to use for the path. If not provided, a relative path
             is returned.

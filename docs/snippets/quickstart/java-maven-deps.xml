@@ -1,0 +1,17 @@
+<dependencies>
+  <dependency>
+    <groupId>org.lance</groupId>
+    <artifactId>lance-core</artifactId>
+    <version>14.0.2</version>
+  </dependency>
+  <dependency>
+    <groupId>org.apache.arrow</groupId>
+    <artifactId>arrow-vector</artifactId>
+    <version>18.3.0</version>
+  </dependency>
+  <dependency>
+    <groupId>org.apache.arrow</groupId>
+    <artifactId>arrow-memory-netty</artifactId>
+    <version>18.3.0</version>
+  </dependency>
+</dependencies>

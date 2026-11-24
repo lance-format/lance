@@ -1,0 +1,63 @@
+[package]
+name = "lance-table-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Open and read Lance table snapshots"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lance-arrow.workspace = true
+lance-core.workspace = true
+lance-encoding.workspace = true
+lance-file.workspace = true
+lance-io.workspace = true
+lance-namespace.workspace = true
+lance-select.workspace = true
+lance-table.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+async-trait.workspace = true
+byteorder.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+itertools.workspace = true
+log.workspace = true
+object_store.workspace = true
+prost.workspace = true
+roaring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+lance-io = { workspace = true, features = ["test-util"] }
+prost-types.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+aws = ["lance-io/aws"]
+azure = ["lance-io/azure"]
+gcp = ["lance-io/gcp"]
+oss = ["lance-io/oss"]
+huggingface = ["lance-io/huggingface"]
+tencent = ["lance-io/tencent"]
+tos = ["lance-io/tos"]
+goosefs = ["lance-io/goosefs"]
+dynamodb = ["lance-table/dynamodb"]
+
+[lints]
+workspace = true

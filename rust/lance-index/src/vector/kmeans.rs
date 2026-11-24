@@ -32,7 +32,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::dot_f16::{
     PackedCentroidsF16, amx_fp16_available, amx_fp16_supported, dot_f16_batch_16,
 };
-use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
+use lance_linalg::distance::hamming::{hamming, hamming_distance_batch_into};
 use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch_into};
 use lance_linalg::kernels::{
     Normalizable, argmin_value_float, argmin_value_float_with_bias, normalize,
@@ -1932,6 +1932,17 @@ fn dot_f16_partitions_amx(centroids: &[f16], query: &[f16]) -> Option<Vec<f32>> 
     Some(dists)
 }
 
+/// The centroid count is `centroids.len() / query.len()`, so an empty query
+/// must be rejected before that division.
+fn check_query_not_empty(centroids_len: usize, query_len: usize) -> arrow::error::Result<()> {
+    if query_len == 0 {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "kmeans partition search got an empty query (centroids length {centroids_len})"
+        )));
+    }
+    Ok(())
+}
+
 /// - *centroids*: a `k * dimension` floating array.
 /// - *query*: a `dimension` floating array.
 /// - *nprobes*: the number of partitions to find.
@@ -1946,6 +1957,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     nprobes: usize,
     distance_type: DistanceType,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
+    check_query_not_empty(centroids.len(), query.len())?;
     let mut dists = vec![0.0; centroids.len() / query.len()];
     match distance_type {
         DistanceType::L2 => l2_distance_batch_into(query, centroids, query.len(), &mut dists),
@@ -1967,8 +1979,13 @@ pub fn kmeans_find_partitions_binary(
     nprobes: usize,
     distance_type: DistanceType,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
+    check_query_not_empty(centroids.len(), query.len())?;
     let dists: Vec<f32> = match distance_type {
-        DistanceType::Hamming => hamming_distance_batch(query, centroids, query.len()).collect(),
+        DistanceType::Hamming => {
+            let mut dists = vec![0.0; centroids.len() / query.len()];
+            hamming_distance_batch_into(query, centroids, query.len(), &mut dists);
+            dists
+        }
         _ => {
             panic!(
                 "KMeans::find_partitions: {} is not supported",
@@ -2477,6 +2494,23 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::dot(DistanceType::Dot)]
+    fn test_find_partitions_rejects_empty_query(#[case] distance_type: DistanceType) {
+        let centroids = [1.0f32; 8];
+        let err = kmeans_find_partitions::<f32>(&centroids, &[], 1, distance_type).unwrap_err();
+        assert!(err.to_string().contains("empty query"), "{err}");
+    }
+
+    #[test]
+    fn test_find_partitions_binary_rejects_empty_query() {
+        let centroids = [0xFFu8; 8];
+        let err =
+            kmeans_find_partitions_binary(&centroids, &[], 1, DistanceType::Hamming).unwrap_err();
+        assert!(err.to_string().contains("empty query"), "{err}");
+    }
+
     /// The SoA path and the per-centroid fallback must pick the centroids the
     /// per-centroid f64 path picks, up to rounding on exact ties.
     #[rstest]
@@ -2765,35 +2799,6 @@ mod tests {
         assert_eq!(kmeans.centroids.len(), K * DIM);
         assert_eq!(kmeans.dimension, DIM);
         assert_eq!(kmeans.centroids.data_type(), &DataType::UInt8);
-    }
-
-    #[tokio::test]
-    async fn test_hierarchical_kmeans() {
-        const DIM: usize = 64;
-        const K: usize = 257; // Greater than 256 to trigger hierarchical clustering
-        const NUM_VALUES: usize = 1024 * K;
-
-        let values = generate_random_array(NUM_VALUES * DIM);
-        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
-
-        let params = KMeansParams {
-            max_iters: 10,
-            hierarchical_k: 16,
-            ..Default::default()
-        };
-
-        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
-
-        // Verify that we have the correct number of clusters
-        assert_eq!(kmeans.centroids.len(), K * DIM);
-        assert_eq!(kmeans.dimension, DIM);
-        assert_eq!(kmeans.centroids.data_type(), &DataType::Float32);
-
-        // Verify that all centroids are valid (not NaN)
-        let centroids = kmeans.centroids.as_primitive::<Float32Type>().values();
-        for val in centroids {
-            assert!(!val.is_nan(), "Centroid should not contain NaN values");
-        }
     }
 
     #[tokio::test]
@@ -3478,6 +3483,16 @@ mod tests {
 
         let kmeans = KMeans::new_with_params(&data, K, &params).unwrap();
         assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+        assert!(
+            kmeans
+                .centroids
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|value| !value.is_nan()),
+            "centroids must not contain NaN"
+        );
         let again = KMeans::new_with_params(&data, K, &params).unwrap();
         assert_eq!(
             kmeans.centroids.as_primitive::<Float32Type>().values(),

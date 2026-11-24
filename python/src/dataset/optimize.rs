@@ -15,8 +15,9 @@
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        RewriteResult, commit_compaction, compact_files, plan_compaction,
+        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionScope,
+        CompactionTask, CompactionTaskKind, RewriteResult, SourceBudgetMode, commit_compaction,
+        compact_files, plan_compaction,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
@@ -43,6 +44,11 @@ fn parse_compaction_options(
             "max_bytes_per_file" => {
                 opts.max_bytes_per_file = value.extract()?;
             }
+            "min_bytes_per_file" => {
+                if let Some(bytes) = value.extract::<Option<usize>>()? {
+                    opts.min_bytes_per_file = Some(bytes);
+                }
+            }
             "materialize_deletions" => {
                 opts.materialize_deletions = value.extract()?;
             }
@@ -57,6 +63,9 @@ fn parse_compaction_options(
             }
             "batch_size" => {
                 opts.batch_size = value.extract()?;
+            }
+            "data_cache_bytes" => {
+                opts.data_cache_bytes = value.extract()?;
             }
             "io_buffer_size" => {
                 opts.io_buffer_size = value.extract()?;
@@ -82,6 +91,13 @@ fn parse_compaction_options(
             "max_source_bytes" => {
                 opts.max_source_bytes = value.extract()?;
             }
+            "source_budget_mode" => {
+                let mode_str: Option<String> = value.extract()?;
+                if let Some(mode_str) = mode_str {
+                    opts.source_budget_mode = SourceBudgetMode::try_from(mode_str.as_str())
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                }
+            }
             "excluded_fragment_ids" => {
                 opts.excluded_fragment_ids =
                     value.extract::<Option<Vec<u32>>>()?.unwrap_or_default();
@@ -90,6 +106,16 @@ fn parse_compaction_options(
                 let version: Option<String> = value.extract()?;
                 if let Some(version) = version {
                     opts.data_storage_version = Some(version.parse().infer_error()?);
+                }
+            }
+            "max_data_files_per_fragment" => {
+                opts.max_data_files_per_fragment = value.extract()?;
+            }
+            "scope" => {
+                let scope: Option<String> = value.extract()?;
+                if let Some(scope) = scope {
+                    opts.scope = CompactionScope::try_from(scope.as_str())
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
                 }
             }
             _ => {
@@ -104,18 +130,16 @@ fn parse_compaction_options(
     Ok(opts)
 }
 
-fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
+pub(crate) fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
     let ds = dataset.getattr("_ds")?;
     Ok(ds.cast::<Dataset>()?.clone())
 }
 
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
-    let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
-    let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
-        PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
-    })?;
-
-    fragment_metadata.call_method1("from_json", (fragment_json,))
+    // Build the dataclass directly. The JSON form of a fragment describes
+    // overlay coverage differently from the Python dataclass, so a round-trip
+    // fails on any fragment that carries overlays.
+    PyLance(fragment).into_pyobject(py)
 }
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]
@@ -129,8 +153,8 @@ pub struct PyCompactionMetrics {
     /// int : The number of files that have been removed, including deletion files.
     #[pyo3(get)]
     pub files_removed: usize,
-    /// int : The number of files that have been added, which is always equal to the
-    /// number of fragments.
+    /// int : The number of data files that have been added. A rewrite adds one
+    /// per new fragment, a column repack one per new file.
     #[pyo3(get)]
     pub files_added: usize,
 }
@@ -263,8 +287,10 @@ impl PyCompactionTask {
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
         Ok(format!(
-            "CompactionTask(read_version={}, fragments=[{}])",
-            self.0.read_version, fragment_reprs
+            "CompactionTask(read_version={}, kind={}, fragments=[{}])",
+            self.0.read_version,
+            self.kind(),
+            fragment_reprs
         ))
     }
 
@@ -272,6 +298,27 @@ impl PyCompactionTask {
     #[getter]
     pub fn read_version(&self) -> u64 {
         self.0.read_version
+    }
+
+    /// str : ``"rewrite_fragments"`` for a task that rewrites its fragments,
+    /// ``"repack_columns"`` for one that repacks its fragment's columns.
+    #[getter]
+    pub fn kind(&self) -> &'static str {
+        match self.0.task.kind {
+            CompactionTaskKind::RewriteFragments => "rewrite_fragments",
+            CompactionTaskKind::RepackColumns { .. } => "repack_columns",
+        }
+    }
+
+    /// Optional[List[List[int]]] : For a column repack, the new data files it
+    /// writes, each the field ids of the top-level columns it holds. ``None``
+    /// for a task that rewrites its fragments.
+    #[getter]
+    pub fn repack_files(&self) -> Option<Vec<Vec<i32>>> {
+        match &self.0.task.kind {
+            CompactionTaskKind::RewriteFragments => None,
+            CompactionTaskKind::RepackColumns { files } => Some(files.clone()),
+        }
     }
 
     /// List[lance.fragment.FragmentMetadata] : The fragments that will be compacted.
@@ -506,7 +553,8 @@ impl PyCompaction {
     /// ----------
     /// dataset : lance.Dataset
     ///    The dataset to compact. The dataset instance will be updated to the
-    ///    new version once complete.
+    ///    new version once complete. Rewrites and repacks commit separately,
+    ///    so after an error it may be at a version the rewrites made.
     /// options : CompactionOptions
     ///    The compaction options.
     ///
@@ -525,10 +573,14 @@ impl PyCompaction {
         let opts = parse_compaction_options(options, &config)?;
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
-        let metrics = rt().block_on(None, async move {
-            fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
-        })??;
-        dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        let result = rt().block_on(None, fut);
+        // A run that rewrites and repacks commits them separately. If the
+        // repack commit fails or is interrupted, `new_ds` is at the rewrite's
+        // version, which has landed.
+        if new_ds.manifest.version != dataset.ds.manifest.version {
+            dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        }
+        let metrics = result?.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
 
@@ -576,7 +628,9 @@ impl PyCompaction {
     /// ----------
     /// dataset : lance.Dataset
     ///     The dataset to compact. The dataset instance will be updated to the
-    ///     new version once committed.
+    ///     new version once committed. Rewrites and repacks commit separately,
+    ///     so after an error it may be at a version the rewrites made; plan
+    ///     again rather than passing the same results back.
     /// rewrites : List[RewriteResult]
     ///     The results of the compaction tasks to include in the commit.
     /// options : dict, optional
@@ -608,10 +662,12 @@ impl PyCompaction {
             Arc::new(DatasetIndexRemapperOptions::default()),
             &opts,
         );
-        let metrics = rt()
-            .block_on(None, fut)?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        let result = rt().block_on(None, fut);
+        // See `execute`: the rewrites may have landed even on an error.
+        if new_ds.manifest.version != dataset.ds.manifest.version {
+            dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        }
+        let metrics = result?.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
 }

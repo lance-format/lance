@@ -315,6 +315,34 @@ impl PhraseQueryExec {
         self
     }
 
+    pub(super) fn uses_shared_scorer(&self, scorer: &Arc<SharedFtsScorer>) -> bool {
+        self.shared_scorer
+            .as_ref()
+            .is_some_and(|shared| Arc::ptr_eq(shared, scorer))
+    }
+
+    pub(super) fn rebuilt_with_shared_scorer(
+        &self,
+        scorer: Arc<SharedFtsScorer>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params: self.params.clone(),
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            shared_scorer: Some(scorer),
+            segment_selection: self.segment_selection.clone(),
+            overlay_block: self.overlay_block.clone(),
+            document_granularity: self.document_granularity,
+            schema: self.schema.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
     /// The mask uses the index's row-id domain, including stable row IDs when
     /// enabled. Preserve it separately from the candidate prefilter.

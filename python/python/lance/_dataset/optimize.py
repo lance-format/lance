@@ -28,6 +28,7 @@ class DatasetOptimizer:
         target_rows_per_fragment: Optional[int] = None,
         max_rows_per_group: Optional[int] = None,
         max_bytes_per_file: Optional[int] = None,
+        min_bytes_per_file: Optional[int] = None,
         materialize_deletions: Optional[bool] = None,
         materialize_deletions_threshold: Optional[float] = None,
         defer_index_remap: Optional[bool] = None,
@@ -40,8 +41,12 @@ class DatasetOptimizer:
         max_source_fragments: Optional[int] = None,
         max_source_rows: Optional[int] = None,
         max_source_bytes: Optional[int] = None,
+        source_budget_mode: Optional[Literal["hard", "soft"]] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
         data_storage_version: Optional[str] = None,
+        max_data_files_per_fragment: Optional[int] = None,
+        scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]] = None,
+        data_cache_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -49,6 +54,8 @@ class DatasetOptimizer:
          * Removes deleted rows from fragments
          * Removes dropped columns from fragments
          * Merges small fragments into larger ones
+         * Repacks a fragment's columns into fewer data files, when
+           ``max_data_files_per_fragment`` asks for it
 
         This method preserves the insertion order of the dataset. This may mean
         it leaves small fragments in the dataset if they are not adjacent to
@@ -67,6 +74,7 @@ class DatasetOptimizer:
         Supported config keys: ``lance.compaction.target_rows_per_fragment``,
         ``lance.compaction.max_rows_per_group``,
         ``lance.compaction.max_bytes_per_file``,
+        ``lance.compaction.min_bytes_per_file``,
         ``lance.compaction.materialize_deletions``,
         ``lance.compaction.materialize_deletions_threshold``,
         ``lance.compaction.defer_index_remap``,
@@ -76,6 +84,8 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
         ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.max_data_files_per_fragment``,
+        ``lance.compaction.source_budget_mode``,
         ``lance.compaction.data_storage_version``.
 
         Parameters
@@ -92,12 +102,16 @@ class DatasetOptimizer:
             This setting only affects datasets using the legacy storage format.
             The newer format does not require row groups.
         max_bytes_per_file: Optional[int], default None
-            Max number of bytes in a single file.  This does not affect which
-            fragments need compaction, but does affect how they are re-written if
-            selected.  If this value is too small you may end up with fragments
-            that are smaller than `target_rows_per_fragment`.
-
-            The default will use the default from ``write_dataset``.
+            Maximum bytes per output file. See
+            :attr:`lance.optimize.CompactionOptions.max_bytes_per_file`
+            for defaults.
+        min_bytes_per_file: int, optional
+            Files at or above this size are excluded from small-file compaction.
+            When omitted or None, defaults to the dataset config value, or 95% of
+            :attr:`lance.optimize.CompactionOptions.max_bytes_per_file`.
+            Must be greater than zero and no greater than that limit.
+            Files needing cleanup may still be compacted.
+            For example, ``compact_files(min_bytes_per_file=512 * 1024 * 1024)``.
         materialize_deletions: bool, optional
             Whether to compact fragments with soft deleted rows so they are no
             longer present in the file. If not specified, uses the manifest
@@ -147,6 +161,16 @@ class DatasetOptimizer:
             would exceed this limit. Blob v2 payloads live in separate
             blob files and are not counted, so this is not a cap on total
             compaction I/O for datasets with blob columns.
+        source_budget_mode: {"hard", "soft"}, optional
+            Controls how all configured ``max_source_*`` budgets are applied
+            to cumulative totals across the tasks selected for one plan.
+            ``"hard"`` rejects a task when adding it would exceed any
+            cumulative budget and is the default. ``"soft"`` always admits
+            the first indivisible task. If that task exceeds a budget, the
+            plan stops there; otherwise later tasks use the same cumulative
+            checks as ``"hard"``. If a byte budget is set but the first task
+            has a source file without a recorded size, ``"soft"`` admits that
+            task and stops; ``"hard"`` reports an error.
         excluded_fragment_ids: list[int], optional
             Fragment IDs to exclude from compaction planning. Excluded
             fragments remain unchanged and act as boundaries, so fragments
@@ -157,6 +181,29 @@ class DatasetOptimizer:
             Uses the compaction config target when set, otherwise the dataset's
             default write version. Does not change that default or the versions
             of unselected files. V1/V2 cross-family targets are rejected.
+        max_data_files_per_fragment: int, optional
+            Maximum number of data files a fragment may hold columns in before
+            its columns are repacked into fewer files. Each ``add_columns``
+            backfill adds one file per fragment. A repack rewrites only the
+            columns that move and keeps rows, fragment ids and indices as they
+            are. If not specified, uses the manifest config value, or no limit.
+            The file count is the only repack trigger.
+        scope: str, optional
+            Which tasks to plan: ``"rewrite_fragments"`` only rewrites
+            fragments, ``"repack_columns"`` only repacks columns, and
+            ``"all"`` (the default) does both. ``"repack_columns"`` requires
+            ``max_data_files_per_fragment``, as an argument or from the table
+            config, and refuses the ``"force_binary_copy"`` mode. A run that
+            does both commits the rewrites and the repacks separately; if the
+            repack commit fails, the dataset is left at the rewrite's version.
+        data_cache_bytes: int, optional
+            Total budget in bytes for buffering column data in each output
+            file writer during re-encoding. Divided evenly among cache-owning
+            field encoders, including nested fields. Defaults to the Rust
+            writer's 8 MiB per cache owner when omitted or None. Must be
+            non-negative; zero is allowed. Does not affect binary copy or the
+            input scanner's buffers.
+            For example, ``compact_files(data_cache_bytes=4 * 1024 * 1024)``.
 
         Returns
         -------
@@ -173,6 +220,7 @@ class DatasetOptimizer:
                 target_rows_per_fragment=target_rows_per_fragment,
                 max_rows_per_group=max_rows_per_group,
                 max_bytes_per_file=max_bytes_per_file,
+                min_bytes_per_file=min_bytes_per_file,
                 materialize_deletions=materialize_deletions,
                 materialize_deletions_threshold=materialize_deletions_threshold,
                 defer_index_remap=defer_index_remap,
@@ -183,8 +231,12 @@ class DatasetOptimizer:
                 max_source_fragments=max_source_fragments,
                 max_source_rows=max_source_rows,
                 max_source_bytes=max_source_bytes,
+                source_budget_mode=source_budget_mode,
                 excluded_fragment_ids=excluded_fragment_ids,
                 data_storage_version=data_storage_version,
+                max_data_files_per_fragment=max_data_files_per_fragment,
+                scope=scope,
+                data_cache_bytes=data_cache_bytes,
             ).items()
             if v is not None
         }
@@ -230,7 +282,16 @@ class DatasetOptimizer:
         """
         return self._dataset._ds.inline_deletions()
 
-    def optimize_indices(self, **kwargs) -> None:
+    def optimize_indices(
+        self,
+        *,
+        num_indices_to_merge: Optional[int] = None,
+        index_names: Optional[list[str]] = None,
+        retrain: Optional[bool] = None,
+        max_rows_per_task: Optional[int] = None,
+        max_rows_per_segment: Optional[int] = None,
+        max_rows_to_consolidate: Optional[int] = None,
+    ) -> None:
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
@@ -248,11 +309,11 @@ class DatasetOptimizer:
         num_indices_to_merge: optional, int, default None
             The number of indices to merge.
             If set to 0, new delta index will be created.
-        index_names: List[str], default None
+        index_names: optional, list[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False
-            Whether to retrain the whole index.
+        retrain: optional, bool, default None
+            Whether to retrain the whole index. None is the same as False.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
             and all indices will be merged into one.
@@ -260,8 +321,43 @@ class DatasetOptimizer:
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
             This rebuilds the index from the source data and may be expensive.
+            Only vector indices are retrained; scalar and full-text search
+            indices are not.
+        max_rows_per_task: optional, int, default None
+            Upper bound on the rows one build task covers. Setting this or
+            `max_rows_per_segment` splits the build of every index whose
+            segments can be merged into several tasks; a split vector build
+            never rebalances the partitions (set `retrain` to rebuild).
+        max_rows_per_segment: optional, int, default None
+            Upper bound on the rows one committed segment holds.
+
+            The limits are packing targets: an indivisible fragment or segment
+            larger than a target is processed on its own.
+        max_rows_to_consolidate: optional, int, default None
+            Consolidate the newest segments of each vector index within this
+            budget of physical rows, reusing the newest selected segment's
+            model instead of training. At least two whole segments must fit;
+            older segments and unindexed fragments are left untouched. A
+            segment counts the greater of its physical index entries and the
+            physical rows of the fragments it covers, deleted rows included.
+            Cannot be combined with `retrain`, `num_indices_to_merge` or
+            `max_rows_per_segment`; `max_rows_per_task` may bound the
+            re-encoding tasks, each of which must fit its fragments.
+
+        See :py:class:`lance.optimize.OptimizeIndices` to run the same
+        optimization as a plan whose tasks execute on several workers. Options
+        that decide commit-time checks, such as `max_rows_to_consolidate`, also
+        belong to :py:meth:`lance.optimize.OptimizeIndices.commit`, which uses
+        the defaults when they are omitted.
         """
-        self._dataset._ds.optimize_indices(**kwargs)
+        self._dataset._ds.optimize_indices(
+            num_indices_to_merge=num_indices_to_merge,
+            index_names=index_names,
+            retrain=retrain,
+            max_rows_per_task=max_rows_per_task,
+            max_rows_per_segment=max_rows_per_segment,
+            max_rows_to_consolidate=max_rows_to_consolidate,
+        )
 
     def enable_auto_cleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
         """Enable autocleaning for an existing dataset.

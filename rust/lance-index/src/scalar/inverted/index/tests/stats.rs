@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 /// pulled from the posting file so we can assert that the stats path is
 /// O(1) in num_unique_tokens.
 #[derive(Debug, Default)]
-struct PostingMetadataCounter {
+pub(super) struct PostingMetadataCounter {
     rows_read: std::sync::atomic::AtomicUsize,
     metadata_rows_read: std::sync::atomic::AtomicUsize,
     posting_rows_read: std::sync::atomic::AtomicUsize,
     impact_rows_read: std::sync::atomic::AtomicUsize,
     read_range_calls: std::sync::atomic::AtomicUsize,
+    reads_in_flight: std::sync::atomic::AtomicUsize,
+    max_reads_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl PostingMetadataCounter {
@@ -27,7 +29,7 @@ impl PostingMetadataCounter {
         self.metadata_rows_read
             .load(std::sync::atomic::Ordering::Relaxed)
     }
-    fn posting_rows_read(&self) -> usize {
+    pub(super) fn posting_rows_read(&self) -> usize {
         self.posting_rows_read
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -37,6 +39,10 @@ impl PostingMetadataCounter {
     }
     fn read_range_calls(&self) -> usize {
         self.read_range_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn max_reads_in_flight(&self) -> usize {
+        self.max_reads_in_flight
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -90,7 +96,22 @@ impl IndexReader for CountingPostingReader {
                 .impact_rows_read
                 .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
-        self.inner.read_range(range, projection).await
+        let in_flight = self
+            .counter
+            .reads_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.counter
+            .max_reads_in_flight
+            .fetch_max(in_flight, std::sync::atomic::Ordering::Relaxed);
+        // Let other reads start before this one completes, so reads issued
+        // together are observed together.
+        tokio::task::yield_now().await;
+        let result = self.inner.read_range(range, projection).await;
+        self.counter
+            .reads_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        result
     }
     async fn num_batches(&self, batch_size: u64) -> u32 {
         self.inner.num_batches(batch_size).await
@@ -104,10 +125,10 @@ impl IndexReader for CountingPostingReader {
 }
 
 #[derive(Debug)]
-struct CountingStore {
-    inner: Arc<dyn IndexStore>,
-    posting_file: String,
-    counter: Arc<PostingMetadataCounter>,
+pub(super) struct CountingStore {
+    pub(super) inner: Arc<dyn IndexStore>,
+    pub(super) posting_file: String,
+    pub(super) counter: Arc<PostingMetadataCounter>,
 }
 
 impl DeepSizeOf for CountingStore {
@@ -204,6 +225,15 @@ async fn load_counted_v2_index(
     num_tokens: usize,
     cache: LanceCache,
 ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
+    load_counted_v2_index_with_counter(num_tokens, cache, Arc::default()).await
+}
+
+/// [`load_counted_v2_index`] with a counter shared across several segments.
+async fn load_counted_v2_index_with_counter(
+    num_tokens: usize,
+    cache: LanceCache,
+    counter: Arc<PostingMetadataCounter>,
+) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
     let tmpdir = TempObjDir::default();
     let inner_store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -241,7 +271,6 @@ async fn load_counted_v2_index(
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let counter = Arc::new(PostingMetadataCounter::default());
     let counting_store: Arc<dyn IndexStore> = Arc::new(CountingStore {
         inner: inner_store,
         posting_file: posting_file_path(0),
@@ -251,6 +280,47 @@ async fn load_counted_v2_index(
         .await
         .unwrap();
     (index, counter, tmpdir)
+}
+
+/// The cold scorer path of `prepare_bm25_query` reads every segment's
+/// statistics at once instead of one segment after another.
+#[tokio::test]
+async fn test_prepare_bm25_query_fetches_segment_stats_concurrently() {
+    let counter = Arc::new(PostingMetadataCounter::default());
+    let mut indices = Vec::new();
+    let mut tmpdirs = Vec::new();
+    for _ in 0..4 {
+        let (index, _, tmpdir) =
+            load_counted_v2_index_with_counter(1, LanceCache::no_cache(), counter.clone()).await;
+        indices.push(index);
+        tmpdirs.push(tmpdir);
+    }
+
+    let prepared = crate::scalar::inverted::prepare_bm25_query(
+        &indices,
+        Tokens::new(vec!["t0".to_owned()], DocType::Text),
+        &FtsSearchParams::new(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let window = indices
+        .iter()
+        .map(|index| index.store.io_parallelism())
+        .max()
+        .unwrap_or(1)
+        .min(indices.len());
+    assert!(
+        counter.max_reads_in_flight() >= window.min(2),
+        "at most {} statistics reads were in flight at once",
+        counter.max_reads_in_flight()
+    );
+    let scorer = prepared.scorer();
+    assert_eq!(scorer.total_tokens, 4);
+    assert_eq!(scorer.num_docs, 4);
+    assert_eq!(scorer.token_docs["t0"], 4);
 }
 
 fn set_test_posting_group_size(index: &mut Arc<InvertedIndex>, group_size: u32) {
@@ -1236,7 +1306,7 @@ async fn test_cache_aware_same_group_expansions_bound_read_amplification(
             Operator::Or,
             &scorer,
             &metrics,
-            PostingLoadOptions::cache_aware_exact(true),
+            PostingLoadOptions::cache_aware_exact(),
         )
         .await
         .unwrap();
@@ -1273,7 +1343,7 @@ async fn test_cache_aware_repeated_token_positions_share_one_singleton() {
             Operator::And,
             &scorer,
             &metrics,
-            PostingLoadOptions::cache_aware_exact(true),
+            PostingLoadOptions::cache_aware_exact(),
         )
         .await
         .unwrap();

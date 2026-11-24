@@ -19,7 +19,7 @@ from ..fragment import DataFile, FragmentMetadata
 if TYPE_CHECKING:
     from .. import mem_wal
     from ..dataset import LanceDataset
-    from ..lance import DatasetBasePath, LanceSchema
+    from ..lance import DatasetBasePath, InsertedRowsFilter, LanceSchema
     from .index import Index
 
 
@@ -306,6 +306,10 @@ class LanceOperation:
             The ``dir_id`` of the MemWAL the SSTables belong to. Required when
             ``compacted_sstables`` is non-empty; the commit fails if the
             table's MemWAL has since been disabled or replaced.
+        inserted_rows_filter: InsertedRowsFilter, optional
+            Keys inserted by a merge-insert, used for concurrent conflict
+            detection. ``might_contain`` compares stored key hashes for an
+            exact set and may have false positives for a bloom filter.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -323,6 +327,7 @@ class LanceOperation:
             default_factory=list
         )
         mem_wal_dir_id: Optional[str] = None
+        inserted_rows_filter: Optional[InsertedRowsFilter] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -518,9 +523,15 @@ class LanceOperation:
     class DataReplacement(BaseOperation):
         """
         Operation that replaces existing datafiles in the dataset.
+
+        ``data_change=False`` declares that the new files hold the same values
+        as the files they replace (compaction moved them). Indices then keep
+        their coverage, overlays keep shadowing, and no row is reported as
+        updated.
         """
 
         replacements: List[LanceOperation.DataReplacementGroup]
+        data_change: bool = True
 
     @dataclass
     class DataOverlayFile:

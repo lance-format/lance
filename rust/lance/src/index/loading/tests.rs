@@ -7,11 +7,14 @@ use crate::index::tests::support::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::utils::test::serializing_cache::SerializingCacheBackend;
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use all_asserts::assert_ge;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, Int32Type, UInt64Type};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
+use lance_core::cache::CacheNamespace;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
@@ -525,7 +528,13 @@ async fn test_vector_cache_uses_current_object_store(#[case] index_version: Inde
         .unwrap();
 
     let frag_reuse_uuid = dataset_a.frag_reuse_index_uuid().await;
-    let state_cache_key = IvfIndexStateCacheKey::new(&index_meta.uuid, frag_reuse_uuid.as_ref());
+    let index_path = dataset_a
+        .indice_files_dir(&index_meta)
+        .unwrap()
+        .join(index_meta.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let state_cache_key =
+        IvfIndexStateCacheKey::new(&index_meta.uuid, &store_a.store_prefix, index_path.as_ref());
     let cached_state = if matches!(index_version, IndexFileVersion::V3) {
         Some(
             dataset_a
@@ -695,5 +704,562 @@ async fn test_vector_cache_uses_current_object_store(#[case] index_version: Inde
     assert!(
         cache_backend.partition_hits() > partition_hits_before,
         "the second store should reuse portable partitions populated by the first"
+    );
+}
+
+mod multi_column_planner {
+    use std::any::Any;
+
+    use arrow::datatypes::UInt64Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::{Expr, utils::conjunction};
+    use lance_core::cache::LanceCache;
+    use lance_core::deepsize::{Context, DeepSizeOf};
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_datafusion::planner::Planner;
+    use lance_index::IndexType;
+    use lance_index::scalar::expression::{
+        ScalarIndexExpr, ScalarIndexLoader, ScalarIndexPlan, ScalarIndexSearch, ScalarQueryParser,
+        create_filter_plan,
+    };
+    use lance_index::scalar::{
+        AnyQuery, BuiltinIndexType, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndexParams,
+        SearchResult, UpdateCriteria,
+    };
+    use lance_select::RowAddrTreeMap;
+    use rstest::rstest;
+
+    use super::super::*;
+    use crate::dataset::WriteParams;
+    use crate::dataset::transaction::{Operation, Transaction};
+
+    const PAIR_DETAILS_URL: &str = "/lance.test.PairIndexDetails";
+
+    /// Has no index files: `load_index` panics, and [`PairLoader`] answers
+    /// `ab_idx` searches by scanning the dataset.
+    #[derive(Debug)]
+    struct PairPlugin;
+
+    #[async_trait]
+    impl ScalarIndexPlugin for PairPlugin {
+        fn name(&self) -> &str {
+            "Pair"
+        }
+
+        fn provides_exact_answer(&self) -> bool {
+            true
+        }
+
+        fn version(&self) -> u32 {
+            0
+        }
+
+        fn new_query_parser(
+            &self,
+            _index_name: String,
+            _index_details: &prost_types::Any,
+        ) -> Option<Box<dyn ScalarQueryParser>> {
+            None
+        }
+
+        fn new_planner(
+            &self,
+            index_name: String,
+            _index_details: &prost_types::Any,
+            keys: &Fields,
+        ) -> Option<Box<dyn ScalarIndexPlanner>> {
+            Some(Box::new(PairPlanner {
+                index_name,
+                keys: keys.clone(),
+            }))
+        }
+
+        async fn load_index(
+            &self,
+            _index_store: Arc<dyn IndexStore>,
+            _index_details: &prost_types::Any,
+            _index_version: u32,
+            _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+            _cache: &LanceCache,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            unimplemented!("PairLoader opens pair indices")
+        }
+    }
+
+    /// Consumes every conjunct that reads only its key columns.
+    #[derive(Debug)]
+    struct PairPlanner {
+        index_name: String,
+        keys: Fields,
+    }
+
+    impl ScalarIndexPlanner for PairPlanner {
+        fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+            let consumed = conjuncts
+                .iter()
+                .filter(|conjunct| {
+                    let columns = conjunct.column_refs();
+                    !columns.is_empty()
+                        && columns
+                            .iter()
+                            .all(|column| self.keys.find(&column.name).is_some())
+                })
+                .collect::<Vec<_>>();
+            let filter = conjunction(consumed.iter().map(|conjunct| (*conjunct).clone()))?;
+            Some(ScalarIndexPlan {
+                search: ScalarIndexSearch {
+                    column: self.keys[0].name().clone(),
+                    index_name: self.index_name.clone(),
+                    index_type: "Pair".to_string(),
+                    query: Arc::new(PairQuery(filter)),
+                    needs_recheck: false,
+                    fragment_bitmap: None,
+                },
+                consumed,
+            })
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PairQuery(Expr);
+
+    impl AnyQuery for PairQuery {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn format(&self, _col: &str) -> String {
+            self.0.to_string()
+        }
+
+        fn to_expr(&self, _col: String) -> Expr {
+            self.0.clone()
+        }
+
+        fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+            other.as_any().downcast_ref::<Self>() == Some(self)
+        }
+    }
+
+    #[derive(Debug)]
+    struct PairIndex(Dataset);
+
+    impl DeepSizeOf for PairIndex {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl Index for PairIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+        fn index_type(&self) -> IndexType {
+            IndexType::Scalar
+        }
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndex for PairIndex {
+        async fn search(
+            &self,
+            query: &dyn AnyQuery,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            let query = query.as_any().downcast_ref::<PairQuery>().unwrap();
+            Ok(SearchResult::exact(
+                row_addrs(&self.0, query.0.clone()).await,
+            ))
+        }
+        fn can_remap(&self) -> bool {
+            false
+        }
+        async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _: SendableRecordBatchStream,
+            _: &dyn IndexStore,
+            _: Option<lance_index::scalar::OldIndexDataFilter>,
+        ) -> Result<CreatedIndex> {
+            unimplemented!()
+        }
+        fn update_criteria(&self) -> UpdateCriteria {
+            unimplemented!()
+        }
+        fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+            unimplemented!()
+        }
+    }
+
+    struct PairLoader<'a>(&'a Dataset);
+
+    #[async_trait]
+    impl ScalarIndexLoader for PairLoader<'_> {
+        async fn load_index(
+            &self,
+            column: &str,
+            index_name: &str,
+            metrics: &dyn MetricsCollector,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            if index_name == "ab_idx" {
+                return Ok(Arc::new(PairIndex(self.0.clone())));
+            }
+            ScalarIndexLoader::load_index(self.0, column, index_name, metrics).await
+        }
+    }
+
+    async fn row_addrs(dataset: &Dataset, filter: Expr) -> RowAddrTreeMap {
+        let batch = dataset
+            .scan()
+            .filter_expr(filter)
+            .with_row_address()
+            .use_scalar_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let addrs = batch.column_by_name("_rowaddr").unwrap();
+        RowAddrTreeMap::from_iter(addrs.as_primitive::<UInt64Type>().values().iter().copied())
+    }
+
+    fn sorted(rows: &RowAddrTreeMap) -> Vec<u64> {
+        rows.row_addrs().unwrap().map(u64::from).collect()
+    }
+
+    async fn pair_dataset(uri: &str) -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(
+            ["a", "b", "c", "d"]
+                .map(|name| Field::new(name, DataType::Int32, false))
+                .to_vec(),
+        ));
+        let column = |modulus: i32| -> ArrayRef {
+            Arc::new(Int32Array::from_iter_values(
+                (0..600).map(|row| row % modulus),
+            ))
+        };
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![column(4), column(11), column(5), column(13)],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        dataset
+            .create_index(
+                &["c"],
+                IndexType::BTree,
+                Some("c_idx".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut ab_idx = dataset.load_indices().await.unwrap()[0].clone();
+        ab_idx.uuid = Uuid::new_v4();
+        ab_idx.name = "ab_idx".to_string();
+        ab_idx.fields = vec![
+            dataset.schema().field("a").unwrap().id,
+            dataset.schema().field("b").unwrap().id,
+        ];
+        ab_idx.index_details = Some(Arc::new(prost_types::Any {
+            type_url: PAIR_DETAILS_URL.to_string(),
+            value: Vec::new(),
+        }));
+        ab_idx.files = None;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![ab_idx],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        dataset
+    }
+
+    fn search<'e>(expr: &'e ScalarIndexExpr, index_name: &str) -> Option<&'e ScalarIndexSearch> {
+        match expr {
+            ScalarIndexExpr::Query(search) => (search.index_name == index_name).then_some(search),
+            ScalarIndexExpr::Not(inner) => search(inner, index_name),
+            ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+                search(lhs, index_name).or_else(|| search(rhs, index_name))
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::with_column_index(
+        "a = 1 AND b > 5 AND c = 3",
+        "AND([a = Int32(1) AND b > Int32(5)]@ab_idx(Pair),[c = 3]@c_idx(BTree))",
+        None
+    )]
+    #[case::with_row_residual(
+        "a = 1 AND b > 5 AND d < 7",
+        "[a = Int32(1) AND b > Int32(5)]@ab_idx(Pair)",
+        Some("d < Int32(7)")
+    )]
+    #[tokio::test]
+    async fn multi_column_planner_routes_and_matches_rows(
+        #[case] filter: &str,
+        #[case] index_query: &str,
+        #[case] refine: Option<&str>,
+    ) {
+        let test_dir = TempStrDir::default();
+        let dataset = pair_dataset(test_dir.as_str()).await;
+        // `load_indices` hides indices whose plugin this build lacks.
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let info = dataset
+            .scalar_index_info_with_plugins(&indices, &HashSet::new(), |details: &IndexDetails| {
+                if details.0.type_url == PAIR_DETAILS_URL {
+                    Ok(&PairPlugin as &dyn ScalarIndexPlugin)
+                } else {
+                    details.get_plugin()
+                }
+            })
+            .await
+            .unwrap();
+
+        let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
+        let parsed = planner.parse_filter(filter).unwrap();
+        let plan = create_filter_plan(planner.optimize_expr(parsed.clone()).unwrap(), &info, true)
+            .unwrap();
+        let index_expr = plan.index_query.as_ref().unwrap();
+        assert_eq!(index_expr.to_string(), index_query);
+        assert_eq!(
+            plan.refine_expr
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            refine
+        );
+        let all_fragments = RoaringBitmap::from_iter(0..3);
+        assert_eq!(
+            search(index_expr, "ab_idx").unwrap().fragment_bitmap,
+            Some(all_fragments)
+        );
+
+        let result = index_expr
+            .evaluate(&PairLoader(&dataset), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(result.is_exact());
+        let mut rows = result.lower.allow_list().unwrap().clone();
+        if let Some(refine) = plan.refine_expr {
+            rows &= row_addrs(&dataset, refine).await;
+        }
+        let expected = row_addrs(&dataset, parsed).await;
+        assert!(!sorted(&expected).is_empty());
+        assert_eq!(sorted(&rows), sorted(&expected));
+    }
+
+    #[tokio::test]
+    async fn ignored_multi_column_index_leaves_its_conjuncts_to_refine() {
+        let test_dir = TempStrDir::default();
+        let dataset = pair_dataset(test_dir.as_str()).await;
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let ignored = HashSet::from(["ab_idx".to_string()]);
+        let info = dataset
+            .scalar_index_info_with_plugins(&indices, &ignored, |details: &IndexDetails| {
+                if details.0.type_url == PAIR_DETAILS_URL {
+                    Ok(&PairPlugin as &dyn ScalarIndexPlugin)
+                } else {
+                    details.get_plugin()
+                }
+            })
+            .await
+            .unwrap();
+
+        let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
+        let filter = planner.parse_filter("a = 1 AND b > 5 AND c = 3").unwrap();
+        let plan = create_filter_plan(planner.optimize_expr(filter).unwrap(), &info, true).unwrap();
+        assert_eq!(
+            plan.index_query
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("[c = 3]@c_idx(BTree)")
+        );
+        assert_eq!(
+            plan.refine_expr
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("a = Int32(1) AND b > Int32(5)")
+        );
+    }
+}
+
+#[test]
+fn portable_state_key_preserves_physical_and_dataset_isolation() {
+    let uuid = Uuid::from_u128(1);
+    let other_uuid = Uuid::from_u128(2);
+    let digest = |dataset: &str, key: &IvfIndexStateCacheKey<'_>| {
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root().child(dataset),
+            IvfIndexStateCacheKey::stable_type_id(),
+            IvfIndexStateCacheKey::schema(),
+        );
+        key.write_key(&mut builder);
+        builder.finish()
+    };
+    let key = IvfIndexStateCacheKey::new(&uuid, "s3$bucket", "ds/_indices/1/index.idx");
+    let original = digest("dataset", &key);
+    assert_ne!(original, digest("clone", &key));
+    for candidate in [
+        IvfIndexStateCacheKey::new(&other_uuid, key.store, key.path),
+        IvfIndexStateCacheKey::new(&uuid, "s3$other-bucket", key.path),
+        IvfIndexStateCacheKey::new(&uuid, key.store, "elsewhere/_indices/1/index.idx"),
+    ] {
+        assert_ne!(original, digest("dataset", &candidate));
+    }
+    // A v1 key does not describe the physical store. Neither a plain nor a
+    // remapped v1 entry can be safely reinterpreted as the new identity.
+    for fri in [None, Some(&other_uuid)] {
+        let mut old = KeyBuilder::new(
+            CacheNamespace::root().child("dataset"),
+            "IvfIndexState",
+            CacheKeySchema::new("lance.index.ivf-state-key", 1),
+        );
+        write_index_identity(&mut old, &uuid, fri);
+        assert_ne!(original, old.finish());
+        let legacy = LegacyVectorIndexCacheKey::new(&uuid, fri);
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root().child("dataset"),
+            LegacyVectorIndexCacheKey::stable_type_id(),
+            LegacyVectorIndexCacheKey::schema(),
+        );
+        legacy.write_key(&mut builder);
+        assert_ne!(original, builder.finish());
+    }
+    assert_eq!(LegacyVectorIndexCacheKey::schema().version(), 1);
+}
+
+/// An old-key entry may be from another store binding at the same dataset URI.
+/// Keep its bytes untouched, but never promote it into the physical-file key.
+#[tokio::test]
+async fn portable_state_schema_change_does_not_promote_unqualified_state() {
+    #[derive(Debug)]
+    struct OldStateKey<'a>(&'a Uuid);
+    impl CacheKey for OldStateKey<'_> {
+        type ValueType = IvfStateEntryBox;
+        fn key(&self) -> std::borrow::Cow<'_, str> {
+            self.0.to_string().into()
+        }
+        fn type_name() -> &'static str {
+            "IvfIndexState"
+        }
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("lance.index.ivf-state-key", 1)
+        }
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            write_index_identity(builder, self.0, None);
+        }
+        fn codec() -> Option<lance_core::cache::CacheCodec> {
+            IvfIndexStateCacheKey::codec()
+        }
+    }
+    let mut dataset = gen_batch()
+        .col("vector", array::rand_vec::<Float32Type>(4.into()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    let meta = dataset
+        .load_indices_by_name("vector_idx")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let store = dataset.object_store_for_index(&meta).await.unwrap();
+    let path = dataset
+        .indice_files_dir(&meta)
+        .unwrap()
+        .join(meta.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let key = IvfIndexStateCacheKey::new(&meta.uuid, &store.store_prefix, path.as_ref());
+    dataset
+        .open_vector_index("vector", &meta.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let state = dataset.index_cache.get_with_key(&key).await.unwrap();
+    let backend = Arc::new(SerializingCacheBackend::new());
+    dataset.index_cache = crate::session::Session::with_index_cache_backend(
+        backend.clone(),
+        1024 * 1024,
+        Arc::default(),
+    )
+    .index_cache
+    .for_dataset(dataset.uri())
+    .into();
+    let old_key = OldStateKey(&meta.uuid);
+    dataset.index_cache.insert_with_key(&old_key, state).await;
+    assert!(dataset.index_cache.get_with_key(&key).await.is_none());
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    dataset
+        .open_vector_index("vector", &meta.uuid, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(dataset.index_cache.get_with_key(&key).await.is_some());
+    assert!(
+        dataset.index_cache.get_with_key(&old_key).await.is_some(),
+        "old bytes were not reinterpreted or removed"
+    );
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    dataset
+        .open_vector_index("vector", &meta.uuid, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
     );
 }

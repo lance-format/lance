@@ -9,6 +9,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::version::ConcreteFileVersion;
+use lance_file::writer::FileWriterOptions;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
@@ -58,6 +59,8 @@ pub struct Updater {
     write_schema: Option<Schema>,
 
     allow_external_blob_outside_bases: bool,
+
+    file_writer_options: FileWriterOptions,
 
     write_version: ConcreteFileVersion,
 
@@ -159,6 +162,7 @@ impl Updater {
             write_schema,
             final_schema,
             allow_external_blob_outside_bases: false,
+            file_writer_options: FileWriterOptions::default(),
             write_version,
             finished: false,
             deletion_restorer: DeletionRestorer::new(
@@ -241,13 +245,21 @@ impl Updater {
     ///
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<Box<dyn GenericWriter>> {
-        versions::open_update_writer(
+        versions::open_update_writer_with_options(
             self.write_version,
             self.dataset(),
             &schema,
             self.allow_external_blob_outside_bases,
+            self.file_writer_options.clone(),
         )
         .await
+    }
+
+    /// Write the new file with `options` instead of the defaults. Call before
+    /// the first [`Self::update`].
+    pub(super) fn set_file_writer_options(&mut self, options: FileWriterOptions) {
+        debug_assert!(self.writer.is_none(), "the writer is already open");
+        self.file_writer_options = options;
     }
 
     /// Allow trusted existing external blob references to pass through an update rewrite.
@@ -515,7 +527,7 @@ impl Updater {
         // comparing against it would reject sound updates. Those fragments keep the
         // weaker checks above.
         if self.dataset().manifest.writer_version.is_some()
-            && let Some(physical_rows) = self.fragment.metadata.physical_rows
+            && let Some(physical_rows) = self.fragment.metadata().physical_rows
         {
             let restored = self.deletion_restorer.current_row_id as usize;
             if restored != physical_rows {
@@ -536,7 +548,7 @@ impl Updater {
         if let Some(writer) = self.writer.as_mut() {
             self.seeds.flush(writer.as_mut()).await?;
             let (_, data_file) = writer.finish().await?;
-            self.fragment.metadata.files.push(data_file);
+            self.fragment.metadata_mut().files.push(data_file);
         }
         // A finished writer is no longer an unfinished resource to clean up, and
         // dropping it makes repeated `finish` calls idempotent instead of appending
@@ -572,8 +584,8 @@ impl Updater {
             base_id,
         ));
         cleanup_data_fragments(
-            &self.dataset().object_store,
-            &self.dataset().base,
+            &self.dataset().table_state.object_store,
+            &self.dataset().table_state.base,
             None,
             &[fragment],
         )

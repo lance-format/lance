@@ -93,6 +93,10 @@ def batch_udf(
         long running processes that may fail and need to be resumed. This file
         may get very large. It will hold up to an entire data files' worth of
         results on disk, which can be multiple gigabytes of data.
+        Resume with the same UDF, dataset snapshot, read columns, output schema,
+        and batch size. Reusing results for a different input raises an error;
+        use a new checkpoint file for a changed invocation. Checkpoints without
+        input-context metadata must also be replaced.
 
     Returns
     -------
@@ -133,6 +137,13 @@ class BatchUDFCheckpoint:
             # One table to store fully written (but not committed) fragments.
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS fragments (fragment_id INT, data BLOB)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS batches_lookup "
+                "ON batches(fragment_id, batch_index)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS fragments_lookup ON fragments(fragment_id)"
             )
             conn.commit()
 

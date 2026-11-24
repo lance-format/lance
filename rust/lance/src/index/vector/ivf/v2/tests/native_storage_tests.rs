@@ -36,6 +36,7 @@ pub(super) fn lazy_test_query(key: ArrayRef, k: usize, nprobes: usize) -> Query 
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Normal,
+        rq_graph_scoring: Default::default(),
     }
 }
 
@@ -121,11 +122,11 @@ async fn native_index(
 ) -> IvfRq {
     let index = dataset.load_indices().await.unwrap()[0].clone();
     IvfRq::try_new(
-        dataset.object_store.clone(),
+        dataset.table_state.object_store.clone(),
         dataset.indice_files_dir(&index).unwrap(),
         index.uuid,
         None,
-        &dataset.metadata_cache,
+        &dataset.table_state.metadata_cache,
         dataset.index_cache.for_index(&index.uuid, None),
         index.file_size_map(),
         IvfOpenContext::default(),

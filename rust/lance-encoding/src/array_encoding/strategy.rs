@@ -26,6 +26,7 @@ use crate::{
             packed_struct::PackedStructEncoder,
         },
     },
+    compression::validate_packed_struct_children,
     constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY,
         PACKED_STRUCT_META_KEY,
@@ -557,6 +558,7 @@ impl ArrayFieldEncodingStrategy {
                         .map(|v| str_is_truthy(v))
                         .unwrap_or(field_metadata.contains_key(PACKED_STRUCT_META_KEY))
                     {
+                        validate_packed_struct_children(field)?;
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
                             self.array_encoding_strategy.clone(),

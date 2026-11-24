@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import operator
 import os
 import random
 import re
@@ -35,6 +36,7 @@ from lance.log import LOGGER
 
 from ._dataset.cleanup import CleanupPolicy, KeepOne, _cleanup_policy_to_json
 from ._dataset.delta import DatasetDelta, _DatasetDeltaBuilder
+from ._dataset.merge_insert import MergeInsertAnalysis as MergeInsertAnalysis
 from ._dataset.merge_insert import MergeInsertBuilder
 from ._dataset.optimize import AutoCleanupConfig, DatasetOptimizer
 from ._dataset.refs import (
@@ -95,7 +97,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import DocumentGranularity, FullTextQuery, MinHashQuery
-from .types import _coerce_reader
+from .types import _coerce_reader, _coerce_source, _WriteSource
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -411,7 +413,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         branch: str
             Name of the branch to create. ``"main"`` is reserved for the
-            default branch and cannot be used as a new branch name.
+            default branch and cannot be used as a new branch name. A literal
+            ``"."`` path segment is rejected. New names are limited to a
+            portable budget of 211 bytes measured after the name is storage
+            path encoded twice; longer names that already exist remain
+            available for lookup, checkout, metadata updates, and deletion.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
@@ -631,6 +637,8 @@ class LanceDataset(pa.dataset.Dataset):
             used for batch nearest-neighbor search. When ``use_index`` is true and a
             vector index is available, each query vector is searched through the index
             path; otherwise the flat batch path is used.
+            For multivector columns, ``"warp_imputation_rank"`` tunes WARP search;
+            see :meth:`ScannerBuilder.nearest`.
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
@@ -851,11 +859,6 @@ class LanceDataset(pa.dataset.Dataset):
         builder = ScannerBuilder(self)
         builder = self._apply_default_scan_options(builder)
 
-        if order_by is not None:
-            order_by = [
-                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
-            ]
-
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
         # we don't override any defaults from _default_scan_options
@@ -955,6 +958,46 @@ class LanceDataset(pa.dataset.Dataset):
         whether the current version has any fragments.
         """
         return self._ds.has_stable_row_ids
+
+    def get_row_addresses(
+        self, row_ids: Union[List[int], pa.Array, pa.ChunkedArray]
+    ) -> pa.UInt64Array:
+        """
+        Resolve row IDs to their current row addresses, in input order.
+
+        A row address is ``(fragment_id << 32) | offset``. With stable row IDs,
+        null, unknown and deleted IDs come back as null. Without stable row IDs,
+        row IDs are row addresses, so each non-null ID is returned unchanged.
+
+        Parameters
+        ----------
+        row_ids : list of int, pyarrow.Array or pyarrow.ChunkedArray
+            Row IDs from ``_rowid``. Integer arrays are cast to uint64, so
+            negative values raise an error.
+
+        Returns
+        -------
+        pyarrow.UInt64Array
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> ds = lance.write_dataset(
+        ...     table, "memory://get_row_addresses", enable_stable_row_ids=True
+        ... )
+        >>> _ = ds.delete("x = 2")
+        >>> ds.get_row_addresses([0, 1, 2, 100]).to_pylist()
+        [0, None, 2, None]
+        """
+        if isinstance(row_ids, pa.ChunkedArray):
+            row_ids = row_ids.combine_chunks()
+        if isinstance(row_ids, pa.Array):
+            row_ids = row_ids.cast(pa.uint64())
+        else:
+            row_ids = pa.array(row_ids, type=pa.uint64())
+        return pa.array(self._ds.row_ids_to_row_addrs(row_ids))
 
     @property
     def max_field_id(self) -> int:
@@ -1671,6 +1714,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         indices: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        io_parallelism: Optional[int] = None,
     ) -> pa.Table:
         """Select rows of data by index.
 
@@ -1682,17 +1727,42 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
+        io_parallelism: int, optional
+            Maximum active fragment-reader data and overlay reads in the
+            primary base for this take. This overrides the store's
+            per-scheduler default and caps fragment-reader fanout at
+            ``min(store_parallelism, io_parallelism)``, without increasing
+            fanout above the store default, so actual concurrency may be lower.
+            Legacy v1 files, additional-base per-file schedulers, and auxiliary
+            metadata or lineage reads (such as deletion vectors and spilled
+            row-ID or row-version sequences) keep their existing schedulers.
 
         Returns
         -------
         table : pyarrow.Table
         """
+        if io_parallelism is not None:
+            if isinstance(io_parallelism, bool):
+                raise TypeError("io_parallelism must be an integer, not bool")
+            try:
+                io_parallelism = operator.index(io_parallelism)
+            except TypeError as err:
+                raise TypeError("io_parallelism must be an integer") from err
+            if io_parallelism <= 0:
+                raise ValueError("io_parallelism must be greater than 0")
         columns_with_transform = None
         if isinstance(columns, dict):
             columns_with_transform = list(columns.items())
             columns = None
         return pa.Table.from_batches(
-            [self._ds.take(indices, columns, columns_with_transform)]
+            [
+                self._ds.take(
+                    indices,
+                    columns,
+                    columns_with_transform,
+                    io_parallelism=io_parallelism,
+                )
+            ]
         )
 
     def _take_rows(
@@ -2004,19 +2074,27 @@ class LanceDataset(pa.dataset.Dataset):
     def count_rows(
         self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
-        """Count rows matching the scanner filter.
+        """Count rows in the dataset matching the filter.
 
         Parameters
         ----------
+        filter : str or pyarrow.compute.Expression, optional
+            Count only rows matching this predicate.
         **kwargs : dict, optional
-            See py:method:`scanner` method for full parameter description.
+            PyArrow scan tuning arguments are accepted for compatibility.
+            To count rows in a selected fragment, use :meth:`LanceFragment.count_rows`.
 
         Returns
         -------
         count : int
-            The total number of rows in the dataset.
+            The number of matching rows.
 
         """
+        if kwargs.get("fragments") is not None:
+            raise TypeError(
+                "LanceDataset.count_rows() does not support fragments. "
+                "Call LanceFragment.count_rows() on the selected fragments."
+            )
         if isinstance(filter, pa.compute.Expression):
             # TODO: consolidate all to use scanner
             return self.scanner(
@@ -2051,7 +2129,16 @@ class LanceDataset(pa.dataset.Dataset):
 
         Column types can be upcasted (such as int32 to int64) or downcasted
         (such as int64 to int32). However, downcasting will fail if there are
-        any values that cannot be represented in the new type. In general,
+        any values that cannot be represented in the new type, such as an
+        integer out of range, a timestamp with more precision than the new
+        unit, a timestamp that is not at midnight in its time zone when
+        casting to a date, a date64 value that is not a whole number of days
+        when casting to date32, or a decimal with digits beyond the new scale.
+        Casting a timestamp to time32 or time64 keeps only the time of day, so
+        it can discard the date and any subsecond precision without failing.
+        Floats can be downcasted with a loss of precision, but a finite value
+        that is too large for the new type fails rather than becoming
+        infinity. In general,
         columns can be casted to same general type: integers to integers,
         floats to floats, and strings to strings. However, strings, binary, and
         list columns can be casted between their size variants. For example,
@@ -2564,19 +2651,49 @@ class LanceDataset(pa.dataset.Dataset):
             data_storage_version,
         )
 
-    def versions(self) -> List[Version]:
+    def versions(
+        self,
+        *,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        descending: bool = False,
+    ) -> List[Version]:
         """
-        Return all versions in this dataset.
+        Return a page of versions in this dataset.
+
+        Versions are ordered ascending by version, or descending when
+        ``descending`` is ``True``. ``offset`` is the number of versions to skip
+        and ``limit`` is the maximum number to return, so the defaults return the
+        whole history. ``limit=None`` means no limit, ``limit=0`` returns an empty
+        list without listing or reading any manifest, and an ``offset`` past the
+        end of the history returns an empty list. Detached versions are never part
+        of the history.
 
         Each entry is a :class:`Version` with ``version``, ``timestamp``,
         ``metadata``, and ``manifest_size``. ``manifest_size`` is the size in
         bytes of that version's manifest file, or ``None`` if the commit
         handler could not report it.
+
+        Only the manifests in the returned page are read. A descending page on a
+        lexically ordered store with V2 manifest paths stops listing once the page
+        is filled; ascending pages, V1 manifest paths, and stores without lexically
+        ordered listings enumerate every manifest location before selecting the
+        page.
         """
-        versions = self._ds.versions()
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        versions = self._ds.versions(offset, limit, descending)
         for v in versions:
             _convert_version_timestamp(v)
         return versions
+
+    def count_versions(self) -> int:
+        """
+        Return the number of versions in this dataset.
+        """
+        return self._ds.count_versions()
 
     def get_version(self) -> Version:
         """
@@ -3436,6 +3553,8 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+            This option is not supported with the ``ngram`` tokenizer when creating
+            a new index.
         block_size: int, default 128
             This is for the ``INVERTED`` index. Number of documents per compressed
             posting block. Must be one of ``128`` or ``256``.
@@ -3472,8 +3591,11 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
         max_token_length: Optional[int], default 40
-            This is for the ``INVERTED`` index. The maximum token length.
-            Any token longer than this will be removed.
+            This is for the ``INVERTED`` index. The exclusive token length limit
+            in UTF-8 bytes, not characters. Tokens of this length or longer are
+            removed. For example, the default removes both 40 ASCII characters
+            and 20 repetitions of ``é`` (40 UTF-8 bytes). Set to ``None`` to
+            disable the limit.
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
@@ -3701,6 +3823,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_FLAT",
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
+            "IVF_HNSW_RQ",
             "IVF_RQ",
         ]
         if index_type not in valid_index_types:
@@ -4168,7 +4291,7 @@ class LanceDataset(pa.dataset.Dataset):
             - index_file_version
                 The version of the index file. Default is "V3".
 
-        Optional parameters for `IVF_RQ`:
+        Optional parameters for `IVF_RQ` and `IVF_HNSW_RQ`:
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
@@ -4348,7 +4471,7 @@ class LanceDataset(pa.dataset.Dataset):
           interprets partition ids within that segment. Keep independently
           trained segments as separate physical segments unless the merge
           workflow can preserve or reconcile the model state.
-        - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
+        - ``rabitq_model`` (``IVF_RQ`` and ``IVF_HNSW_RQ``): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
           rotation so every segment rotates vectors the same way. If omitted, each
@@ -4917,25 +5040,162 @@ class LanceDataset(pa.dataset.Dataset):
             explicit alias for the default branch in this reference context.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
-            endpoints). If not specified, the storage options of the source dataset
-            will be used.
+            endpoints). This replaces the store the target metadata is written
+            through; it does not replace the bindings used to read files that stay
+            in the source dataset. If not specified, the storage options of the
+            source dataset will be used.
+        **kwargs
+            Additional :class:`LanceDataset` constructor arguments for the returned
+            handle. ``read_params`` is applied to the returned native handle
+            directly. Arguments that configure native handle state, such as
+            ``block_size``, ``session``, cache sizes, ``commit_lock``, or
+            ``base_store_params``, reconfigure the returned handle while preserving
+            the clone's inherited source bindings and session.
 
         Returns
         -------
         LanceDataset
             A new LanceDataset representing the shallow-cloned dataset.
+
+        Notes
+        -----
+        Only metadata is copied, so the returned handle keeps the source dataset's
+        store bindings and session to read the shared data files. Reopening it later
+        in another process therefore requires the source store options, passed as
+        :func:`lance.dataset`'s ``base_store_params``.
         """
         if isinstance(target_path, Path):
             target_uri = os.fspath(target_path)
         else:
             target_uri = target_path
 
+        default_scan_options = kwargs.pop("default_scan_options", None)
+        read_params = kwargs.pop("read_params", None)
+
         if storage_options is None:
             storage_options = self._storage_options
-        self._ds.shallow_clone(target_uri, reference, storage_options)
+        # The native handle keeps the source store bindings for the files that stay
+        # behind. Reopening the target here would only have the target's options and
+        # could not read a single row of a cross-store clone.
+        new_ds = self._ds.shallow_clone(target_uri, reference, storage_options)
 
-        # Open and return a fresh dataset at the target URI to avoid manual overrides
-        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+        # Mirror the native bindings for Python-side reconstruction (e.g. pickling)
+        # and for the constructor-only arguments below: the clone's own base is this
+        # dataset, and bases inherited through earlier shallow clones keep the
+        # bindings this dataset was opened with. Binding the source explicitly, even
+        # with no options, prevents a rebuild from falling back to target options.
+        base_store_params = dict(self._base_store_params or {})
+        base_store_params[self.uri] = self._storage_options or {}
+
+        if not kwargs:
+            if read_params is not None:
+                new_ds = new_ds._with_read_params(read_params)
+
+            ds = LanceDataset.__new__(LanceDataset)
+            ds._ds = new_ds
+            ds._uri = new_ds.uri
+            ds._storage_options = storage_options
+            ds._base_store_params = base_store_params
+            ds._namespace_client = None
+            ds._table_id = None
+            ds._namespace_client_managed_versioning = False
+            ds._default_scan_options = default_scan_options
+            ds._read_params = read_params
+            return ds
+
+        # Constructor-only arguments reconfigure the native clone handle in place,
+        # so its inherited stores, session, and providers stay exactly as the native
+        # clone bound them. Only the caller's explicit options change.
+        version = kwargs.pop("version", None)
+        serialized_manifest = kwargs.pop("serialized_manifest", None)
+        explicit_base_store_params = kwargs.pop("base_store_params", None)
+        if explicit_base_store_params:
+            base_store_params.update(explicit_base_store_params)
+
+        cache_size_options = {
+            "index_cache_size",
+            "index_cache_size_bytes",
+            "metadata_cache_size",
+            "metadata_cache_size_bytes",
+        }
+
+        if serialized_manifest is not None:
+            # An explicit manifest replaces the target's, so reopen through the
+            # public constructor; inherited bindings and session keep shared files
+            # readable.
+            if "session" not in kwargs and cache_size_options.isdisjoint(kwargs):
+                kwargs["session"] = new_ds.session()
+            return LanceDataset(
+                target_uri,
+                version,
+                storage_options=storage_options,
+                serialized_manifest=serialized_manifest,
+                base_store_params=base_store_params,
+                default_scan_options=default_scan_options,
+                read_params=read_params,
+                **kwargs,
+            )
+
+        if "index_cache_size" in kwargs:
+            warnings.warn(
+                "The 'index_cache_size' parameter is deprecated. "
+                "Use 'index_cache_size_bytes' instead. "
+                "The old parameter will be converted to bytes using 20 MiB per entry.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if "index_cache_size_bytes" not in kwargs:
+                kwargs["index_cache_size_bytes"] = (
+                    kwargs["index_cache_size"] * 20 * 1024 * 1024
+                )
+            kwargs.pop("index_cache_size")
+        if "metadata_cache_size" in kwargs:
+            if "metadata_cache_size_bytes" not in kwargs:
+                kwargs["metadata_cache_size_bytes"] = (
+                    kwargs["metadata_cache_size"] * 10 * 1024 * 1024
+                )
+            kwargs.pop("metadata_cache_size")
+
+        namespace_client = kwargs.pop("namespace_client", None)
+        table_id = kwargs.pop("table_id", None)
+        namespace_client_managed_versioning = kwargs.pop(
+            "namespace_client_managed_versioning", False
+        )
+
+        new_ds = new_ds._reconfigure(
+            block_size=kwargs.pop("block_size", None),
+            index_cache_size_bytes=kwargs.pop("index_cache_size_bytes", None),
+            metadata_cache_size_bytes=kwargs.pop("metadata_cache_size_bytes", None),
+            commit_lock=kwargs.pop("commit_lock", None),
+            session=kwargs.pop("session", None),
+            namespace_client=namespace_client,
+            table_id=table_id,
+            namespace_client_managed_versioning=namespace_client_managed_versioning,
+            # The native clone already carries inherited bindings. Only explicit
+            # caller entries are reapplied, so those exact bindings stay untouched.
+            base_store_params=explicit_base_store_params,
+            storage_options=storage_options,
+        )
+        if kwargs:
+            raise TypeError(
+                f"shallow_clone() got unexpected keyword arguments {sorted(kwargs)}"
+            )
+        if read_params is not None:
+            new_ds = new_ds._with_read_params(read_params)
+        if version is not None:
+            new_ds = new_ds.checkout_version(version)
+
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._storage_options = storage_options
+        ds._base_store_params = base_store_params
+        ds._namespace_client = namespace_client
+        ds._table_id = table_id
+        ds._namespace_client_managed_versioning = namespace_client_managed_versioning
+        ds._default_scan_options = default_scan_options
+        ds._read_params = read_params
+        return ds
 
     def deep_clone(
         self,
@@ -5057,7 +5317,14 @@ class LanceDataset(pa.dataset.Dataset):
     def get_transactions(self, recent_transactions=10) -> List[Optional[Transaction]]:
         return self._ds.get_transactions(recent_transactions)
 
-    def sql(self, sql: str) -> "SqlQueryBuilder":
+    def sql(
+        self,
+        sql: str,
+        *,
+        parameters: Optional[
+            Union[Sequence[Any], Dict[str, Any], pa.RecordBatch]
+        ] = None,
+    ) -> "SqlQueryBuilder":
         """Execute SQL query on the dataset.
 
         Parameters
@@ -5065,6 +5332,9 @@ class LanceDataset(pa.dataset.Dataset):
         sql : str
             SQL SELECT statement to execute. The query must reference the dataset
             as the FROM clause or omit the FROM clause to query the current dataset.
+        parameters : sequence, dict, or pyarrow.RecordBatch, optional
+            Values to bind to SQL placeholders. See
+            :meth:`SqlQueryBuilder.parameters` for supported forms.
 
         Returns
         -------
@@ -5081,7 +5351,10 @@ class LanceDataset(pa.dataset.Dataset):
             query.to_batch_records()
 
         """
-        return SqlQueryBuilder(self._ds.sql(sql))
+        builder = SqlQueryBuilder(self._ds.sql(sql))
+        if parameters is not None:
+            builder.parameters(parameters)
+        return builder
 
     def delta(
         self,
@@ -5930,3 +6203,9 @@ def _merge_message_to_properties(
     if commit_message is not None:
         merged_properties[LANCE_COMMIT_MESSAGE_KEY] = commit_message
     return merged_properties
+
+
+@_coerce_source.register(LanceDataset)
+def _lance_dataset_source(data_obj: LanceDataset, schema=None) -> _WriteSource:
+    # Capture the native dataset version and all default scan options once.
+    return _coerce_source(data_obj.scanner(), schema)

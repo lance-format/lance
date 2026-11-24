@@ -22,12 +22,14 @@ use lance_table::system_index::is_system_index;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::Dataset;
-use crate::dataset::index::frag_reuse::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
 use crate::dataset::optimize::commit::normalize_source_fragments;
 use crate::dataset::optimize::execution::live_source_row_addrs;
 use crate::dataset::transaction::{Operation, RewriteGroup};
 use crate::index::frag_reuse::load_frag_reuse_index_details;
 use crate::index::loading::load_all_indices;
+use lance_table::system_index::frag_reuse::retention::{
+    is_index_remap_caught_up, reuse_chain_frag_bitmap,
+};
 
 /// The snapshot a writer read, fixed before any rebase, so a refusal can tell
 /// history the writer saw from history published after it read.
@@ -870,14 +872,15 @@ pub mod tests {
         let indices = vec![entry];
         apply_frag_reuse_with_stable_row_ids_flag(&mut manifest, &indices);
         let location = dataset
+            .table_state
             .commit_handler
             .commit(
                 &mut manifest,
                 Some(indices),
-                &dataset.base,
-                &dataset.object_store,
+                &dataset.table_state.base,
+                &dataset.table_state.object_store,
                 write_manifest_file_to_path,
-                dataset.manifest_location.naming_scheme,
+                dataset.table_state.manifest_location.naming_scheme,
                 None,
             )
             .await
@@ -1908,7 +1911,12 @@ pub mod tests {
             Storage::External => {
                 let bytes = content.encode_to_vec();
                 let path = dataset.indices_dir().join(uuid.to_string()).join(file_name);
-                dataset.object_store.put(&path, &bytes).await.unwrap();
+                dataset
+                    .table_state
+                    .object_store
+                    .put(&path, &bytes)
+                    .await
+                    .unwrap();
                 Content::External(ExternalFile {
                     path: file_name.to_string(),
                     offset: 0,
@@ -2242,6 +2250,7 @@ pub mod tests {
     /// the history a rewrite carries in memory; `None` if it caches none.
     async fn cached_rewrite_history(dataset: &Dataset, version: u64) -> Option<bool> {
         let transaction = dataset
+            .table_state
             .metadata_cache
             .get_with_key(&TransactionKey { version })
             .await?;

@@ -5,19 +5,148 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, TypedDict
+
+import pyarrow as pa
 
 from ..lance import _MergeInsertBuilder
-from ..types import _coerce_reader, _is_materialized
+from ..types import _coerce_source
 
 if TYPE_CHECKING:
     from datetime import timedelta
 
-    import pyarrow as pa
-
     from .. import mem_wal
     from ..types import ReaderLike
     from .transaction import Transaction
+
+
+def _type_contains_blob_v2(data_type: pa.DataType) -> bool:
+    if isinstance(data_type, pa.ExtensionType):
+        return data_type.extension_name == "lance.blob.v2"
+    if pa.types.is_struct(data_type):
+        return any(
+            _type_contains_blob_v2(data_type.field(index).type)
+            for index in range(data_type.num_fields)
+        )
+    if (
+        pa.types.is_list(data_type)
+        or pa.types.is_large_list(data_type)
+        or pa.types.is_fixed_size_list(data_type)
+    ):
+        return _type_contains_blob_v2(data_type.value_type)
+    if pa.types.is_map(data_type):
+        return _type_contains_blob_v2(data_type.item_type)
+    return False
+
+
+def _is_native_dataset_source(data_obj: ReaderLike) -> bool:
+    """Whether a merge can use the Lance dataset handle without a Python scanner."""
+    # Local import: ``lance.dataset`` imports this module.
+    from ..dataset import LanceDataset
+
+    return (
+        type(data_obj) is LanceDataset
+        and not data_obj._default_scan_options
+        and not any(_type_contains_blob_v2(field.type) for field in data_obj._ds.schema)
+    )
+
+
+class ExecutionMetric(TypedDict):
+    """An operator measurement; time values use nanoseconds, memory peaks use bytes."""
+
+    name: str
+    partition: Optional[int]
+    labels: List[Tuple[str, str]]
+    kind: Literal["count", "gauge", "peak_memory_bytes", "time_ns"]
+    value: int
+
+
+class OperatorMetrics(TypedDict):
+    """Measurements for one physical operator, identified by child indices from root."""
+
+    path: List[int]
+    name: str
+    metrics: List[ExecutionMetric]
+
+
+class MergeInsertJoin(TypedDict):
+    """Physical join choice after source/target side selection."""
+
+    path: List[int]
+    subplan_id: int
+    strategy: Literal["hash", "sort_merge"]
+    partition_mode: Optional[str]
+    join_type: str
+
+
+class MergeSpillUsage(TypedDict):
+    """Separate spill producers; unsupported readings are None, durations use ns."""
+
+    spill_count: Optional[int]
+    bytes_written: Optional[int]
+    bytes_read: Optional[int]
+    write_duration_ns: Optional[int]
+    read_duration_ns: Optional[int]
+    rows: Optional[int]
+    accepted_bytes: Optional[int]
+    charged_bytes: Optional[int]
+    peak_charged_bytes: Optional[int]
+    live_files: Optional[int]
+    files_created: Optional[int]
+    quota_failures: Optional[int]
+    cleanup_failures: Optional[int]
+
+
+class MergeSubplan(TypedDict):
+    """A separate plan whose operator paths are local to its operation-unique id."""
+
+    id: int
+    purpose: str
+    plan: str
+    outcome: Literal["complete", "failed", "cancelled"]
+    error: Optional[str]
+    elapsed_ns: int
+    pool_peak_reserved_bytes: Optional[int]
+    counts: Dict[str, int]
+    times_ns: Dict[str, int]
+    operators: List[OperatorMetrics]
+    joins: List[MergeInsertJoin]
+
+
+class MergeInsertAnalysis(TypedDict):
+    """Diagnostics from one uncommitted merge; unavailable statistics are None.
+
+    ``write_mode`` names the sink that ran. ``rewrite_rows`` covers whole-row
+    replacement and pure insertion, ``rewrite_columns`` covers column patches
+    (including mixed updates and insertions), and ``delete_only`` writes only
+    deletion files.
+    """
+
+    operation_id: str
+    plan: str
+    outcome: Literal["complete", "failed", "cancelled"]
+    error: Optional[str]
+    elapsed_ns: int
+    pool_peak_reserved_bytes: Optional[int]
+    write_mode: Literal["rewrite_rows", "rewrite_columns", "delete_only"]
+    fragments_touched: Optional[int]
+    stats: Optional[Dict[str, int]]
+    counts: Dict[str, int]
+    times_ns: Dict[str, int]
+    operators: List[OperatorMetrics]
+    joins: List[MergeInsertJoin]
+    subplans: List[MergeSubplan]
+    operator_spills: MergeSpillUsage
+    replay_spills: MergeSpillUsage
+    scratch_spills: Optional[MergeSpillUsage]
+    target_rows_read: Optional[int]
+    fragments_read: Optional[int]
+    index_used: Optional[bool]
+    join_index_segments: Optional[int]
+    join_duration_ns: Optional[int]
+    merge_write_duration_ns: Optional[int]
+    joined_rows: Optional[int]
+    mapped_target_rows: Optional[int]
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -38,15 +167,23 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         schema: Optional[pa.Schema]
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
+
+        Notes
+        -----
+        Repeatable sources provide fresh readers for conflict retries.
+        Keep external source files unchanged until the operation finishes.
+        Sources without a repeatability contract retain the replay buffer.
         """
-        reader = _coerce_reader(data_obj, schema)
-
-        # Materialized sources are wrapped in an in-memory table so retries never
-        # spill and the source's statistics can drive the join; everything else is
-        # treated as a one-shot stream.
-        if _is_materialized(data_obj):
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).execute_dataset(data_obj._ds)
+        source = _coerce_source(data_obj, schema)
+        if source.mode == "replayable":
+            return super(MergeInsertBuilder, self).execute_replayable(
+                source.schema, source.open_reader
+            )
+        reader = source.open_reader()
+        if source.mode == "materialized":
             return super(MergeInsertBuilder, self).execute_batches(reader)
-
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
@@ -69,9 +206,14 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
-        reader = _coerce_reader(data_obj, schema)
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_dataset(
+                data_obj._ds
+            )
+        source = _coerce_source(data_obj, schema)
+        reader = source.open_reader()
 
-        if _is_materialized(data_obj):
+        if source.mode == "materialized":
             return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
@@ -466,15 +608,74 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - task_wait_time: time spent waiting for scheduled I/O
         - decode_time: time spent decoding, summed over concurrent decode tasks
         """  # noqa: E501
-        reader = _coerce_reader(data_obj, schema)
-
-        # Route exactly as execute() does, so the reported plan is the one that
-        # would run. A materialized source reports exact statistics where a stream
-        # reports none, which can change which side of the join is collected.
-        if _is_materialized(data_obj):
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_dataset(data_obj._ds)
+        source = _coerce_source(data_obj, schema)
+        if source.mode == "replayable":
+            return super(MergeInsertBuilder, self).analyze_plan_replayable(
+                source.schema, source.open_reader
+            )
+        reader = source.open_reader()
+        if source.mode == "materialized":
             return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
 
         return super(MergeInsertBuilder, self).analyze_plan(reader)
+
+    def analyze_plan_report(
+        self,
+        data_obj: ReaderLike,
+        *,
+        schema: Optional[pa.Schema] = None,
+    ) -> MergeInsertAnalysis:
+        """Execute an uncommitted merge and return structured diagnostics.
+
+        Input routing follows :meth:`execute`: materialized inputs retain their
+        statistics. The returned plan and metrics describe the same execution.
+        Execution failures return ``outcome="failed"`` with partial metrics and
+        absent logical statistics. Planning errors raise an exception.
+
+        Analysis writes data and deletion files, then removes them without
+        changing the dataset version. ``stats.bytes_written`` counts data files
+        only, excluding deletion files, blob payloads, and spills. Cleanup failures
+        are logged and left for orphan cleanup. ``write_mode`` reports the sink
+        that ran, so an insert-only merge is ``rewrite_rows`` even when the
+        source omits a column.
+
+        ``elapsed_ns`` measures execution, excluding cleanup. The scalar-index
+        route includes interleaved planning and replay staging. Join and inclusive
+        merge-write times overlap. ``subplans`` identifies separately executed
+        probes, joins and fragment sorts. Spill traffic is split into operator,
+        replay and optional scratch measurements, separately from data-file bytes.
+        Optional readings are ``None`` when unavailable; registered zero values
+        remain zero. Pool peaks measure DataFusion reservations, not process RSS;
+        operator peaks must not be summed into a query peak.
+
+        Current scalar-index joins are supported when every join column is indexed
+        and unmatched target rows are kept. Existing text-analysis eligibility is
+        unchanged. Failed snapshots may precede background I/O reclamation;
+        cancelling the analysis can interrupt temporary-file cleanup.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> ds = lance.write_dataset(pa.table({"id": [1, 2]}), "memory://")
+        >>> builder = ds.merge_insert("id").when_not_matched_insert_all()
+        >>> report = builder.analyze_plan_report(pa.table({"id": [3]}))
+        >>> report["stats"]["num_inserted_rows"]
+        1
+        >>> ds.count_rows()
+        2
+        """
+        if _is_native_dataset_source(data_obj):
+            return super()._analyze_plan_report_dataset(data_obj._ds)
+        source = _coerce_source(data_obj, schema)
+        if source.mode == "replayable":
+            return super()._analyze_plan_report_replayable(
+                source.schema, source.open_reader
+            )
+        reader = source.open_reader()
+        return super()._analyze_plan_report(reader, source.mode == "materialized")
 
     def mark_sstables_as_compacted(
         self, sstables: "List[mem_wal.CompactedSsTable]", dir_id: str = ""

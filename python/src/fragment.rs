@@ -18,17 +18,19 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
-use arrow_array::RecordBatchReader;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use futures::TryFutureExt;
 use lance::Error;
-use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::fragment::FragmentAddColumnsCleanup as LanceFragmentAddColumnsCleanup;
+use lance::dataset::fragment::{FileFragment as LanceFragment, FragmentUpdateColumnsResult};
 use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
-use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::transaction::{DataOverlayGroup, Operation, Transaction};
 use lance::dataset::{
-    InsertBuilder, NewColumnTransform, UpdateJoinOptions, UpdateJoinStrategy, WriteParams,
+    InsertBuilder, NewColumnTransform, OverlayWriter as LanceOverlayWriter, UpdateJoinOptions,
+    UpdateJoinStrategy, WriteParams,
 };
 use lance_core::datatypes::BlobHandling;
+use lance_core::is_system_column;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
@@ -40,6 +42,7 @@ use pyo3::basic::CompareOp;
 use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
+use tokio::sync::Mutex;
 
 use crate::dataset::write::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
@@ -48,6 +51,29 @@ use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
 type UpdateColumnsResult = (PyLance<Fragment>, Vec<u32>, Option<Vec<u8>>);
+
+fn update_columns_result(
+    result: FragmentUpdateColumnsResult,
+    with_offsets: bool,
+) -> PyResult<UpdateColumnsResult> {
+    let matched_offsets = if with_offsets {
+        let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
+        result
+            .matched_offsets
+            .serialize_into(&mut buf)
+            .map_err(|err| {
+                PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
+            })?;
+        Some(buf)
+    } else {
+        None
+    };
+    Ok((
+        PyLance(result.fragment),
+        result.fields_modified,
+        matched_offsets,
+    ))
+}
 
 #[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
@@ -249,19 +275,32 @@ impl FileFragment {
     #[pyo3(signature=(row_indices, columns=None))]
     fn take<'py>(
         self_: PyRef<'py, Self>,
-        row_indices: Vec<usize>,
+        row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Fragment offsets are u32; reject larger values instead of letting
+        // them wrap around to a different, valid row.
+        let indices = row_indices
+            .iter()
+            .map(|&offset| {
+                u32::try_from(offset).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "Fragment offset {offset} is out of range (maximum is {})",
+                        u32::MAX
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
         let dataset_schema = self_.fragment.dataset().schema();
         let projection = if let Some(columns) = columns {
             dataset_schema
-                .project(&columns)
+                .project_preserve_system_columns(&columns)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         } else {
             dataset_schema.clone()
         };
 
-        let indices = row_indices.iter().map(|v| *v as u32).collect::<Vec<_>>();
         let fragment = self_.fragment.clone();
         let batch = rt()
             .spawn(Some(self_.py()), async move {
@@ -532,24 +571,58 @@ impl FileFragment {
                     .await
             })?
             .infer_error()?;
+        update_columns_result(result, with_offsets)
+    }
 
-        let matched_offsets = if with_offsets {
-            let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
-            result
-                .matched_offsets
-                .serialize_into(&mut buf)
-                .map_err(|err| {
-                    PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
-                })?;
-            Some(buf)
-        } else {
-            None
-        };
-        Ok((
-            PyLance(result.fragment),
-            result.fields_modified,
-            matched_offsets,
-        ))
+    #[pyo3(signature=(reader, batch_size=None, with_offsets=false))]
+    fn update_columns_from_stream(
+        &self,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        batch_size: Option<u32>,
+        with_offsets: bool,
+    ) -> PyResult<UpdateColumnsResult> {
+        let fragment = self.fragment.clone();
+        let result = rt()
+            .spawn(None, async move {
+                fragment
+                    .update_columns_from_stream(reader.0, batch_size)
+                    .await
+            })?
+            .infer_error()?;
+        update_columns_result(result, with_offsets)
+    }
+
+    /// Stage a data overlay supplying new values for cells of this fragment.
+    ///
+    /// `columns` names the dataset columns the overlay may cover; they are
+    /// resolved against the dataset schema so the writer knows their field ids
+    /// and exact types. Every batch fed to the writer must carry `_rowaddr`
+    /// plus a subset of these columns.
+    fn write_overlay(&self, py: Python<'_>, columns: Vec<String>) -> PyResult<OverlayWriter> {
+        if columns.is_empty() {
+            return Err(PyValueError::new_err(
+                "write_overlay requires at least one column to overlay",
+            ));
+        }
+        // `Schema::project` drops system columns instead of failing on them.
+        if let Some(column) = columns.iter().find(|c| is_system_column(c)) {
+            return Err(PyValueError::new_err(format!(
+                "cannot overlay system column '{column}'"
+            )));
+        }
+        let schema = self
+            .fragment
+            .dataset()
+            .schema()
+            .project(&columns)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let fragment = self.fragment.clone();
+        let writer = rt()
+            .spawn(Some(py), async move {
+                fragment.write_overlay(&schema).await.map_err(Error::from)
+            })?
+            .infer_error()?;
+        Ok(OverlayWriter::new(writer))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
@@ -645,6 +718,87 @@ impl From<FileFragment> for LanceFragment {
     }
 }
 
+/// Stages one data overlay file for one fragment.
+///
+/// Wraps [`lance::dataset::OverlayWriter`]. `finish` and `abort` consume the
+/// Rust writer, so it lives in an `Option` that is emptied by whichever of the
+/// two runs first; later calls report the writer as closed. Dropping an
+/// unfinished writer discards the staged file, mirroring `LanceFileWriter`.
+#[pyclass(name = "_OverlayWriter", module = "_lib")]
+pub struct OverlayWriter {
+    inner: Arc<Mutex<Option<LanceOverlayWriter>>>,
+}
+
+impl OverlayWriter {
+    fn new(writer: LanceOverlayWriter) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(writer))),
+        }
+    }
+
+    fn closed_error() -> PyErr {
+        PyRuntimeError::new_err("overlay writer has already been finished or aborted")
+    }
+}
+
+#[pymethods]
+impl OverlayWriter {
+    /// Stage the values in `batch`.
+    ///
+    /// The batch must contain a non-null `UInt64` `_rowaddr` column addressing
+    /// rows of the opened fragment in strictly ascending order, plus one or more
+    /// of the declared overlay columns. Row addresses must also ascend across
+    /// successive batches for each column.
+    fn write_batch(&self, py: Python<'_>, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        rt().spawn(Some(py), async move {
+            let mut guard = inner.lock().await;
+            let writer = guard.as_mut().ok_or_else(Self::closed_error)?;
+            writer
+                .write_batch(&batch.0)
+                .await
+                .map_err(Error::from)
+                .infer_error()
+        })?
+    }
+
+    /// Close the staged file and describe it as a `DataOverlayGroup`.
+    ///
+    /// Returns `None` when no cells were staged; the empty file is removed.
+    fn finish(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let inner = self.inner.clone();
+        let group: Option<DataOverlayGroup> = rt().spawn(Some(py), async move {
+            let writer = inner.lock().await.take().ok_or_else(Self::closed_error)?;
+            writer.finish().await.map_err(Error::from).infer_error()
+        })??;
+        match group {
+            Some(group) => Ok(PyLance(&group).into_pyobject(py)?.unbind()),
+            None => Ok(py.None()),
+        }
+    }
+
+    /// Discard the staged file. A no-op once the writer is finished or aborted.
+    fn abort(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        rt().spawn(Some(py), async move {
+            if let Some(writer) = inner.lock().await.take() {
+                writer.abort().await;
+            }
+        })
+    }
+}
+
+impl Drop for OverlayWriter {
+    fn drop(&mut self) {
+        let inner = self.inner.clone();
+        rt().runtime.block_on(async move {
+            if let Some(writer) = inner.lock().await.take() {
+                writer.abort().await;
+            }
+        });
+    }
+}
+
 fn do_write_fragments(
     dest: PyWriteDest,
     reader: &Bound<PyAny>,
@@ -721,7 +875,7 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
-    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None))]
+    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None, path=None))]
     fn new(
         read_version: u64,
         id: u64,
@@ -729,6 +883,7 @@ impl PyDeletionFile {
         num_deleted_rows: usize,
         base_id: Option<u32>,
         inline: Option<Vec<u8>>,
+        path: Option<String>,
     ) -> PyResult<Self> {
         let inline = inline.map(bytes::Bytes::from);
         let file_type = match file_type {
@@ -741,14 +896,19 @@ impl PyDeletionFile {
                 )));
             }
         };
-        Ok(Self(DeletionFile {
+        let deletion_file = DeletionFile {
             read_version,
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            path,
             inline,
-        }))
+        };
+        deletion_file
+            .validate_location()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(Self(deletion_file))
     }
 
     fn asdict(slf: PyRef<'_, Self>) -> PyResult<Bound<'_, PyDict>> {
@@ -762,6 +922,7 @@ impl PyDeletionFile {
             slf.0.num_deleted_rows,
         )?;
         dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
+        dict.set_item(intern!(slf.py(), "path"), &slf.0.path)?;
         // A list of ints rather than bytes, so the dict stays JSON-serializable.
         let inline = match &slf.0.inline {
             Some(bytes) => PyList::new(slf.py(), bytes.iter().copied())?
@@ -810,6 +971,12 @@ impl PyDeletionFile {
     #[getter]
     fn base_id(&self) -> &Option<u32> {
         &self.0.base_id
+    }
+
+    /// The stored relative deletion file path when explicitly set, else None.
+    #[getter]
+    fn stored_path(&self) -> Option<&str> {
+        self.0.path.as_deref()
     }
 
     /// The serialized deletion bitmap when it is stored in the manifest, else None.

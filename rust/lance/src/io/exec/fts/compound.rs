@@ -45,9 +45,10 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     DocumentGranularity, FTS_SCHEMA, InvertedIndex, MemBM25Scorer, PreparedBm25Query, SCORE_COL,
-    Scorer, build_global_bm25_scorer, compound_search, compound_search_prepared_match,
-    compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
-    cross_column_compound_search, exclusive_scaled_score_floor, materialized_compound_top_k,
+    Scorer, build_global_bm25_scorer, compound_search, compound_search_prepared_leaves,
+    compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
+    compound_search_with_base_scorer, cross_column_compound_search, exclusive_scaled_score_floor,
+    materialized_compound_top_k,
 };
 use tracing::instrument;
 use uuid::Uuid;
@@ -71,6 +72,48 @@ use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 const WAND_TIE_COMPLETION_BUDGET: usize = 128;
 
 /// One DataFusion boundary around a posting-backed compound scorer tree.
+///
+/// Reconstruction preserves the explicit selection kind, candidate scope and
+/// either the base scorer or canonical prepared Match override. Codecs supply
+/// decoded child plans and value objects; the example reuses existing children
+/// and uses the portable prepared-state constructor from `lance-index`.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance::{io::exec::fts::CompoundQueryExec, Error, Result};
+/// # use lance_index::scalar::inverted::PreparedBm25Query;
+/// # fn rebuild(exec: &CompoundQueryExec) -> Result<CompoundQueryExec> {
+/// let mut rebuilt = if let Some(segments) = exec.preset_segments() {
+///     CompoundQueryExec::new_with_segments(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), segments.to_vec(),
+///     )
+/// } else {
+///     let uuids = exec.explicit_segment_uuids()
+///         .ok_or_else(|| Error::invalid_input("compound FTS needs an explicit selection"))?;
+///     CompoundQueryExec::new_with_segment_uuids(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), uuids,
+///     )
+/// }.with_external_mask(exec.external_mask().cloned());
+/// if let Some(scorer) = exec.base_scorer() {
+///     rebuilt = rebuilt.with_base_scorer(scorer.clone());
+/// }
+/// if let Some(prepared) = exec.prepared_match() {
+///     rebuilt = rebuilt.with_prepared_match(Arc::new(PreparedBm25Query::from_parts(
+///         prepared.tokens().clone(), prepared.scorer().clone(),
+///         prepared.has_all_query_positions(),
+///     )));
+/// }
+/// # Ok(rebuilt)
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+enum PreparedCompoundOverride {
+    SingleMatch(Arc<PreparedBm25Query>),
+    Leaves(Vec<Arc<PreparedBm25Query>>),
+}
+
 #[derive(Debug)]
 pub struct CompoundQueryExec {
     dataset: Arc<Dataset>,
@@ -81,10 +124,9 @@ pub struct CompoundQueryExec {
     /// When set, leaf scorers use this instead of building one from the
     /// searched segments — see [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
-    /// Canonical vocabulary/scorer pair for a root Match query prepared over
-    /// the complete corpus before this exec was restricted to a segment
-    /// subset.
-    prepared_match: Option<Arc<PreparedBm25Query>>,
+    /// Canonical vocabulary/scorer override prepared over the complete corpus
+    /// before this exec was restricted to a segment subset.
+    prepared_override: Option<PreparedCompoundOverride>,
     segment_selection: FtsSegmentSelection,
     /// Caller-supplied row-address mask, intersected into the prefilter so the
     /// compound scorer ranks only surviving rows (see
@@ -141,7 +183,7 @@ impl CompoundQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            prepared_match: None,
+            prepared_override: None,
             segment_selection,
             external_mask: None,
             properties: Arc::new(PlanProperties::new(
@@ -166,7 +208,7 @@ impl CompoundQueryExec {
     /// expansions. Execution returns an error when any required token is absent.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
-        self.prepared_match = None;
+        self.prepared_override = None;
         self
     }
 
@@ -175,9 +217,17 @@ impl CompoundQueryExec {
     ///
     /// This is required for distributed fuzzy execution over a segment subset;
     /// a scorer alone cannot preserve the globally capped rewrite.
-    #[doc(hidden)]
     pub fn with_prepared_match(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
-        self.prepared_match = Some(prepared);
+        self.prepared_override = Some(PreparedCompoundOverride::SingleMatch(prepared));
+        self.base_scorer = None;
+        self
+    }
+
+    /// Override preparation for every leaf of a compound FTS query (in DFS
+    /// traversal order) with canonical vocabulary/scorer pairs built against
+    /// the complete corpus.
+    pub fn with_prepared_leaves(mut self, prepared: Vec<Arc<PreparedBm25Query>>) -> Self {
+        self.prepared_override = Some(PreparedCompoundOverride::Leaves(prepared));
         self.base_scorer = None;
         self
     }
@@ -202,6 +252,44 @@ impl CompoundQueryExec {
         self.base_scorer.as_ref()
     }
 
+    /// Canonical root-Match vocabulary and scorer, or `None` for native
+    /// preparation or multi-leaf prepared overrides. Restore its values with
+    /// [`PreparedBm25Query::from_parts`] so dictionary term IDs and other local
+    /// preparation caches are not copied. See [`Self`] for a reconstruction example.
+    pub fn prepared_match(&self) -> Option<&Arc<PreparedBm25Query>> {
+        match &self.prepared_override {
+            Some(PreparedCompoundOverride::SingleMatch(prepared)) => Some(prepared),
+            _ => None,
+        }
+    }
+
+    /// Canonical per-leaf vocabulary and scorer pairs in DFS traversal order,
+    /// or `None` for native preparation.
+    pub fn prepared_leaves(&self) -> Option<&[Arc<PreparedBm25Query>]> {
+        match &self.prepared_override {
+            Some(PreparedCompoundOverride::Leaves(leaves)) => Some(leaves.as_slice()),
+            Some(PreparedCompoundOverride::SingleMatch(prepared)) => {
+                Some(std::slice::from_ref(prepared))
+            }
+            None => None,
+        }
+    }
+
+    /// Additional candidate mask in the indices' row-id domain, or `None` for
+    /// no external restriction. It does not narrow the statistics corpus.
+    /// See [`Self`] for a reconstruction example.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
+    }
+
+    /// Exact resolved metadata in its original order. `None` denotes deferred
+    /// UUID selection; use [`Self::explicit_segment_uuids`] in that case.
+    /// An empty resolved selection remains explicit and must not widen to all
+    /// committed segments. See [`Self`] for a reconstruction example.
+    pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        self.segment_selection.preset_segments()
+    }
+
     /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
     /// scorers and masks.
     ///
@@ -220,7 +308,7 @@ impl CompoundQueryExec {
             params,
             prefilter_source: self.prefilter_source.clone(),
             base_scorer: self.base_scorer.clone(),
-            prepared_match: self.prepared_match.clone(),
+            prepared_override: self.prepared_override.clone(),
             segment_selection: self.segment_selection.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
@@ -459,8 +547,8 @@ impl HybridCompoundQueryExec {
     }
 
     /// The indexed segments this scorer reads. Paired with
-    /// [`Self::residual_input`] and [`Self::new`], this is what lets a caller
-    /// rebuild the node — the FTS top-k lives in [`Self::params`], not in a
+    /// [`Self::residual_input`], [`Self::indexed_input`] and [`Self::new`], this
+    /// lets a caller rebuild the node. The FTS top-k lives in [`Self::params`], not in a
     /// fetch node, so changing it means reconstruction.
     pub fn segments(&self) -> &[IndexMetadata] {
         &self.segments
@@ -514,6 +602,39 @@ impl HybridCompoundQueryExec {
         );
         result.indexed_input = Some((input, committed_scorer));
         Ok(result)
+    }
+
+    /// The externally computed indexed candidates and their committed-index
+    /// scorer, or `None` when this node searches its indexed segments locally.
+    ///
+    /// Preserve the pair together through [`Self::with_indexed_input`]. The
+    /// residual input remains separate, and its query-local index is rebuilt
+    /// during execution. A codec supplies decoded children; this example reuses
+    /// the existing children and reconstructs the scorer from its values.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::io::exec::fts::HybridCompoundQueryExec;
+    /// # use lance_index::scalar::inverted::MemBM25Scorer;
+    /// # fn rebuild(exec: &HybridCompoundQueryExec)
+    /// #     -> datafusion::error::Result<HybridCompoundQueryExec> {
+    /// let rebuilt = HybridCompoundQueryExec::new(
+    ///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+    ///     exec.column().to_owned(), exec.segments().to_vec(),
+    ///     exec.residual_input().clone(),
+    /// );
+    /// match exec.indexed_input() {
+    ///     Some((input, scorer)) => rebuilt.with_indexed_input(
+    ///         input.clone(), Arc::new(MemBM25Scorer::new(
+    ///             scorer.total_tokens, scorer.num_docs, scorer.token_docs.clone(),
+    ///         )),
+    ///     ),
+    ///     None => Ok(rebuilt),
+    /// }
+    /// # }
+    /// ```
+    pub fn indexed_input(&self) -> Option<&(Arc<dyn ExecutionPlan>, Arc<MemBM25Scorer>)> {
+        self.indexed_input.as_ref()
     }
 
     /// The scan over the fragments no segment covers.
@@ -946,7 +1067,7 @@ impl ExecutionPlan for CompoundQueryExec {
             params: self.params.clone(),
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
-            prepared_match: self.prepared_match.clone(),
+            prepared_override: self.prepared_override.clone(),
             segment_selection: self.segment_selection.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
@@ -966,7 +1087,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let params = self.params.clone();
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
-        let preset_prepared_match = self.prepared_match.clone();
+        let preset_prepared_override = self.prepared_override.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
         let metrics_set = self.metrics.clone();
@@ -993,12 +1114,29 @@ impl ExecutionPlan for CompoundQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
-            if preset_prepared_match.is_some() && !matches!(&query, FtsQuery::Match(_)) {
-                return Err(DataFusionError::Execution(
-                    "CompoundQueryExec prepared vocabulary requires a root Match query".to_string(),
-                ));
-            }
-            let scorer_only_fuzzy = preset_prepared_match.is_none()
+            let preset_prepared_leaves = match preset_prepared_override {
+                Some(PreparedCompoundOverride::SingleMatch(prepared)) => {
+                    if !matches!(&query, FtsQuery::Match(_)) {
+                        return Err(DataFusionError::Execution(
+                            "CompoundQueryExec prepared vocabulary requires a root Match query"
+                                .to_string(),
+                        ));
+                    }
+                    Some(vec![prepared])
+                }
+                Some(PreparedCompoundOverride::Leaves(leaves)) => {
+                    let expected_leaf_count = count_fts_leaves(&query);
+                    if leaves.len() != expected_leaf_count {
+                        return Err(DataFusionError::Execution(format!(
+                            "CompoundQueryExec prepared leaves count ({}) does not match query leaf count ({expected_leaf_count})",
+                            leaves.len()
+                        )));
+                    }
+                    Some(leaves)
+                }
+                None => None,
+            };
+            let scorer_only_fuzzy = preset_prepared_leaves.is_none()
                 && compound_query_uses_fuzzy_expansion(&query)
                 && preset_base_scorer.is_some();
             let scorer_override_covers_all = if scorer_only_fuzzy {
@@ -1052,13 +1190,13 @@ impl ExecutionPlan for CompoundQueryExec {
                     .sum::<usize>()
                     .saturating_mul(count_fts_leaves(&query)),
             );
-            let base_scorer = match (preset_prepared_match.is_some(), preset_base_scorer) {
+            let base_scorer = match (preset_prepared_leaves.is_some(), preset_base_scorer) {
                 (true, _) => None,
                 (false, scorer) => scorer,
             };
             if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
                 return Err(DataFusionError::Execution(
-                    "fuzzy CompoundQueryExec cannot use a scorer-only override over a segment subset; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_match"
+                    "fuzzy CompoundQueryExec cannot use a scorer-only override over a segment subset; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_match or with_prepared_leaves"
                     .to_string(),
                 ));
             }
@@ -1085,9 +1223,9 @@ impl ExecutionPlan for CompoundQueryExec {
                 let wand_params = MatchQueryExec::effective_params(&match_query, params.clone())
                     .with_phrase_slop(None)
                     .with_limit(Some(wand_limit));
-                let prepared = if let Some(prepared_match) = preset_prepared_match.clone() {
+                let prepared = if let Some(prepared_leaves) = &preset_prepared_leaves {
                     Arc::new(PreparedMatch {
-                        query: prepared_match,
+                        query: prepared_leaves[0].clone(),
                         params: Arc::new(wand_params),
                         operator: match_query.operator,
                     })
@@ -1277,21 +1415,21 @@ impl ExecutionPlan for CompoundQueryExec {
                         .await,
                     )
                 };
-                match (preset_prepared_match, base_scorer) {
-                    (Some(prepared_match), _) => {
+                match (preset_prepared_leaves, base_scorer) {
+                    (Some(prepared_leaves), _) => {
                         let indices = candidate_indices.await?;
                         if indices.is_empty() {
                             return Ok::<_, DataFusionError>(RecordBatch::new_empty(
                                 FTS_SCHEMA.clone(),
                             ));
                         }
-                        compound_search_prepared_match(
+                        compound_search_prepared_leaves(
                             &indices,
                             &query,
                             &params,
                             prefilter,
                             metrics.clone(),
-                            prepared_match,
+                            &prepared_leaves,
                         )
                         .await?
                     }
@@ -1348,7 +1486,7 @@ impl ExecutionPlan for CompoundQueryExec {
 #[derive(Debug, Clone)]
 struct CompoundColumnSelection {
     column: String,
-    segment_selection: FtsSegmentSelection,
+    segments: Arc<[IndexMetadata]>,
 }
 
 /// One DataFusion boundary around a cross-column posting-backed scorer tree.
@@ -1433,7 +1571,7 @@ impl CrossColumnCompoundQueryExec {
             .into_iter()
             .map(|(column, segments)| CompoundColumnSelection {
                 column,
-                segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+                segments: Arc::from(segments),
             })
             .collect::<Vec<_>>();
         Ok(Self {
@@ -1474,6 +1612,39 @@ impl CrossColumnCompoundQueryExec {
 
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
+    }
+
+    /// The exact resolved segments for each column, preserving both column order
+    /// and each column's segment order. Segment ordinals across columns are not
+    /// aligned and must not be zipped together.
+    ///
+    /// These are the inputs accepted by [`Self::new_with_segments`]. Execution
+    /// still validates the selected segments' document granularity before search.
+    ///
+    /// ```
+    /// # use lance::{io::exec::fts::CrossColumnCompoundQueryExec, Result};
+    /// # fn rebuild(exec: &CrossColumnCompoundQueryExec)
+    /// #     -> Result<CrossColumnCompoundQueryExec> {
+    /// let columns = exec.column_segments()
+    ///     .map(|(column, segments)| (column.to_owned(), segments.to_vec()))
+    ///     .collect();
+    /// Ok(CrossColumnCompoundQueryExec::new_with_segments(
+    ///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+    ///     exec.prefilter_source().clone(), columns,
+    /// )?.with_external_mask(exec.external_mask().cloned()))
+    /// # }
+    /// ```
+    pub fn column_segments(&self) -> impl ExactSizeIterator<Item = (&str, &[IndexMetadata])> {
+        self.columns
+            .iter()
+            .map(|selection| (selection.column.as_str(), selection.segments.as_ref()))
+    }
+
+    /// Additional candidate restriction in the indices' row-id domain, or
+    /// `None` for no external mask. Corpus statistics remain independent of it.
+    /// See [`Self::column_segments`] for a reconstruction example.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
     }
 
     /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
@@ -1597,20 +1768,8 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let selected_segments = columns
                 .iter()
-                .flat_map(|selection| {
-                    selection
-                        .segment_selection
-                        .preset_segments()
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                })
+                .flat_map(|selection| selection.segments.iter().cloned())
                 .collect::<Vec<_>>();
-            if selected_segments.is_empty() {
-                return Err(DataFusionError::Internal(
-                    "cross-column compound FTS lost its exact segment selections".to_string(),
-                ));
-            }
             // DatasetPreFilter starts its deletion and filter prerequisites in
             // the background. Construct it before opening index segments so
             // both I/O paths can make progress concurrently.
@@ -1630,8 +1789,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 let dataset = dataset.clone();
                 let metrics = metrics.clone();
                 async move {
-                    let segments = selection
-                        .segment_selection
+                    let segments = FtsSegmentSelection::ExactResolved(selection.segments)
                         .resolve(
                             &dataset,
                             &selection.column,
@@ -1835,5 +1993,176 @@ mod tests {
             WandExactnessCertificate::Ambiguous,
             "a full probe with no lower-score guard must replay exactly"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compound_query_exec_with_prepared_leaves_multi_leaf_fuzzy_segment_subset() {
+        use crate::dataset::WriteParams;
+        use crate::index::DatasetIndexExt;
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::collect;
+        use lance_index::IndexType;
+        use lance_index::scalar::InvertedIndexParams;
+        use lance_index::scalar::inverted::prepare_bm25_query;
+        use lance_index::scalar::inverted::query::{BooleanQuery, MatchQuery, Occur};
+        use std::collections::BTreeMap;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let b0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec![
+                    "abpa beta",
+                    "acpa gamma",
+                    "unrelated one",
+                ])),
+            ],
+        )
+        .unwrap();
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    "aapa beta",
+                    "adpa beta",
+                    "unrelated two",
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(b0), Ok(b1)], schema),
+            "memory://compound_prepared_leaves",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let frag_ids: Vec<u32> = ds.get_fragments().iter().map(|f| f.id() as u32).collect();
+        let index_params = InvertedIndexParams::default().stem(false);
+        let mut metas = Vec::new();
+        for fid in frag_ids {
+            let mut builder = ds
+                .create_index_builder(&["text"], IndexType::Inverted, &index_params)
+                .name("text_idx".to_string())
+                .fragments(vec![fid]);
+            metas.push(builder.execute_uncommitted().await.unwrap());
+        }
+        ds.commit_existing_index_segments("text_idx", "text", metas)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+        let segments =
+            crate::index::scalar::inverted::load_segments(&ds, "text", DocumentGranularity::Row)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(segments.len(), 2);
+
+        let fuzzy_leaf = MatchQuery::new("alpa".to_string())
+            .with_column(Some("text".to_string()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(2)
+            .with_document_granularity(DocumentGranularity::Row);
+        let exact_leaf = MatchQuery::new("beta".to_string())
+            .with_column(Some("text".to_string()))
+            .with_fuzziness(Some(0))
+            .with_document_granularity(DocumentGranularity::Row);
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (Occur::Should, FtsQuery::Match(exact_leaf.clone())),
+            (Occur::Must, FtsQuery::Match(fuzzy_leaf.clone())),
+        ]));
+        let params = FtsSearchParams::new().with_limit(Some(10));
+
+        // Full-corpus baseline.
+        let baseline_exec: Arc<dyn ExecutionPlan> = Arc::new(CompoundQueryExec::new_with_segments(
+            ds.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        ));
+        let task_ctx = Arc::new(datafusion::execution::TaskContext::default());
+        let baseline_batches = collect(baseline_exec, task_ctx.clone()).await.unwrap();
+
+        // Prepare each leaf over the full corpus (DFS order: should, must).
+        let indices = open_fts_segments(
+            &ds,
+            "text",
+            &segments,
+            &crate::io::exec::utils::IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+        )
+        .await
+        .unwrap();
+        let mut tok_exact = tokenizer_for_match_query(&indices[0], exact_leaf.fuzziness);
+        let exact_tokens = try_collect_query_tokens(&exact_leaf.terms, &mut tok_exact).unwrap();
+        let exact_params = MatchQueryExec::effective_params(&exact_leaf, params.clone());
+        let prepared_exact = Arc::new(
+            prepare_bm25_query(&indices, exact_tokens, &exact_params, None, None)
+                .await
+                .unwrap(),
+        );
+
+        let mut tok_fuzzy = tokenizer_for_match_query(&indices[0], fuzzy_leaf.fuzziness);
+        let fuzzy_tokens = try_collect_query_tokens(&fuzzy_leaf.terms, &mut tok_fuzzy).unwrap();
+        let fuzzy_params = MatchQueryExec::effective_params(&fuzzy_leaf, params.clone());
+        let prepared_fuzzy = Arc::new(
+            prepare_bm25_query(&indices, fuzzy_tokens, &fuzzy_params, None, None)
+                .await
+                .unwrap(),
+        );
+
+        // Run per-segment CompoundQueryExec with with_prepared_leaves.
+        let mut combined = BTreeMap::<u64, f32>::new();
+        for seg in &segments {
+            let sub_exec: Arc<dyn ExecutionPlan> = Arc::new(
+                CompoundQueryExec::new_with_segments(
+                    ds.clone(),
+                    query.clone(),
+                    params.clone(),
+                    PreFilterSource::None,
+                    vec![seg.clone()],
+                )
+                .with_prepared_leaves(vec![prepared_exact.clone(), prepared_fuzzy.clone()]),
+            );
+            let batches = collect(sub_exec, task_ctx.clone()).await.unwrap();
+            for b in batches {
+                let ids = b["_rowid"].as_primitive::<arrow_array::types::UInt64Type>();
+                let scores = b["_score"].as_primitive::<arrow_array::types::Float32Type>();
+                for (&id, &score) in ids.values().iter().zip(scores.values().iter()) {
+                    combined.insert(id, score);
+                }
+            }
+        }
+
+        let mut baseline_map = BTreeMap::<u64, f32>::new();
+        for b in baseline_batches {
+            let ids = b["_rowid"].as_primitive::<arrow_array::types::UInt64Type>();
+            let scores = b["_score"].as_primitive::<arrow_array::types::Float32Type>();
+            for (&id, &score) in ids.values().iter().zip(scores.values().iter()) {
+                baseline_map.insert(id, score);
+            }
+        }
+        assert_eq!(
+            combined.len(),
+            2,
+            "only aapa and abpa survive max_expansions=2"
+        );
+        assert_eq!(combined.len(), baseline_map.len());
+        for (id, expected_score) in baseline_map {
+            let got = combined[&id];
+            assert!(
+                (got - expected_score).abs() < 1e-5,
+                "row {id}: got={got} expected={expected_score}"
+            );
+        }
     }
 }

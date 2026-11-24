@@ -30,6 +30,16 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 | `LargeBinary` | Large binary data (64-bit offsets) | Large blobs |
 | `FixedSizeBinary(n)` | Fixed-length binary data | UUIDs, hashes |
 
+String and binary columns can opt in to general compression with the field metadata
+`lance-encoding:compression` (`zstd`, `lz4`, `fsst` or `none`) and `lance-encoding:compression-level`.
+Values of 32 KiB or more are compressed one value at a time (the full-zip layout) so that a random read
+decodes only the values it needs. In the stable 2.1 and 2.2 formats that per-value path honors only
+`zstd`: an `lz4` request on such a column falls back to the default `zstd`, because released readers
+cannot decode nullable `lz4` full-zip pages, and the writer logs a warning. Lance 2.3 honors the
+requested scheme. `compression-level` applies on the per-value path only together with an explicit
+`zstd`; on large text and JSON values level 1 compresses as well as the default level 3 and roughly
+twice as fast.
+
 ### Blob Type for Large Binary Objects
 
 Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Blob columns support planned full-payload reads as well as lazy file-like access for streaming, seeking, and partial reads.
@@ -348,6 +358,68 @@ table = pa.Table.from_pydict({
 
 ds = lance.write_dataset(table, "./with_maps.lance", data_storage_version="2.2")
 ```
+
+### Standard Variant arrays (Rust)
+
+Current-format dataset writers accept the canonical `arrow.parquet.variant`
+extension type, including arrays already shredded by Arrow's
+`parquet-variant-compute` kernels. Lance preserves the extension metadata and
+stores the struct's children as columns. Nested `BinaryView` and `Utf8View`
+arrays are stored and returned as `Binary` and `Utf8` arrays.
+
+For example, using a version of `parquet-variant-compute` compatible with Lance's
+Arrow dependencies:
+
+```rust
+use std::sync::Arc;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use lance::Dataset;
+use parquet_variant_compute::{json_to_variant, shred_variant, unshred_variant, VariantArray};
+
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"id":42,"extra":"retained in residual data"}"#,
+        r#"{"id":"a different type"}"#,
+    ]));
+    let variant = json_to_variant(&json)?;
+    let target = DataType::Struct(vec![Field::new("id", DataType::Int64, true)].into());
+    let shredded = shred_variant(&variant, &target)?;
+    let schema = Arc::new(Schema::new(vec![shredded.field("event")]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(shredded.into_inner())])?;
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    ).await?;
+
+    let batch = dataset.scan().try_into_batch().await?;
+    let stored = VariantArray::try_new(batch["event"].as_ref())?;
+    let reconstructed = unshred_variant(&stored)?;
+    assert_eq!(reconstructed.len(), 2);
+    Ok(())
+}
+```
+
+The physical layout for this example is:
+
+```text
+event (arrow.parquet.variant)
+|-- metadata: binary
+|-- value: binary (residual data)
+`-- typed_value: struct
+    `-- id: struct
+        |-- value: binary (values that do not fit int64)
+        `-- typed_value: int64
+```
+
+A projection such as `event.typed_value.id.typed_value` reads the typed child
+column, but it does not include values left in the residual data. Use the Arrow
+Variant kernels on the full Variant array when reconstruction or path extraction
+needs those values. Keep the same physical shredding schema across batches and
+appends. This interoperability does not automatically select fields to shred,
+rewrite existing data, or add Variant-aware SQL functions. Existing
+[JSON columns](json.md) continue to use their separate JSONB representation.
 
 ## Data Type Mapping for Integrations
 

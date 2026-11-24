@@ -15,7 +15,9 @@ package org.lance.index;
 
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.FragmentOperation;
 import org.lance.TestVectorDataset;
+import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
@@ -31,7 +33,14 @@ import org.lance.ipc.ScanOptions;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.TinyIntVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -39,6 +48,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -340,7 +350,11 @@ public class VectorIndexTest {
 
         float[] codebook =
             VectorTrainer.trainPqCodebook(
-                dataset, TestVectorDataset.vectorColumnName, pqTrainParams);
+                dataset,
+                TestVectorDataset.vectorColumnName,
+                pqTrainParams,
+                DistanceType.L2,
+                centroids);
 
         IvfBuildParams ivfParams =
             new IvfBuildParams.Builder()
@@ -473,9 +487,12 @@ public class VectorIndexTest {
     }
   }
 
-  @Test
-  public void testCreateIvfRqIndex(@TempDir Path tempDir) throws Exception {
-    Path datasetPath = tempDir.resolve("ivf_rq_index");
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"IVF_RQ", "IVF_HNSW_RQ"})
+  public void testCreateIvfRqIndex(IndexType indexType, @TempDir Path tempDir) throws Exception {
+    Path datasetPath = tempDir.resolve(indexType.name().toLowerCase());
 
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -487,14 +504,17 @@ public class VectorIndexTest {
                 .build();
 
         VectorIndexParams vectorIndexParams =
-            VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
+            indexType == IndexType.IVF_HNSW_RQ
+                ? VectorIndexParams.withIvfHnswRqParams(
+                    DistanceType.L2, ivf, new HnswBuildParams.Builder().build(), rq)
+                : VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
         IndexParams indexParams =
             IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
 
         dataset.createIndex(
             IndexOptions.builder(
                     Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_RQ,
+                    indexType,
                     indexParams)
                 .withIndexName(TestVectorDataset.indexName)
                 .build());
@@ -506,21 +526,55 @@ public class VectorIndexTest {
                 .findFirst()
                 .orElse(null);
 
-        assertNotNull(rqIndex, "Expected IVF_RQ index to be present");
+        assertNotNull(rqIndex, "Expected " + indexType + " index to be present");
 
-        IndexType indexType = rqIndex.indexType();
-        assertNotNull(indexType, "IndexType should be set for IVF_RQ index");
+        IndexType actualIndexType = rqIndex.indexType();
+        assertNotNull(actualIndexType, "IndexType should be set for " + indexType + " index");
 
         // Today all vector indices share the same VectorIndexDetails type and map to VECTOR.
-        // This assertion allows both VECTOR and IVF_RQ so it remains valid if the mapping
+        // This assertion allows both VECTOR and the concrete type so it remains valid if the
+        // mapping
         // is refined in the future.
         assertTrue(
-            indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
-            "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+            actualIndexType == IndexType.VECTOR || actualIndexType == indexType,
+            "IndexType for "
+                + indexType
+                + " should be VECTOR or "
+                + indexType
+                + " but was "
+                + actualIndexType);
         Map<String, Object> stats = dataset.getIndexStatistics(TestVectorDataset.indexName);
+        assertEquals(indexType.name(), stats.get("index_type"));
         List<?> segments = (List<?>) stats.get("segments");
         Map<?, ?> segment = (Map<?, ?>) segments.get(0);
         assertEquals("matrix", ((Map<?, ?>) segment.get("sub_index")).get("rotation_type"));
+
+        float[] key = new float[32];
+        for (int i = 0; i < key.length; i++) {
+          key[i] = 32 + i;
+        }
+        Query query =
+            new Query.Builder()
+                .setColumn(TestVectorDataset.vectorColumnName)
+                .setKey(key)
+                .setK(2)
+                .setNprobes(2)
+                .build();
+        try (LanceScanner scanner =
+                dataset.newScan(new ScanOptions.Builder().nearest(query).build());
+            ArrowReader reader = scanner.scanBatches()) {
+          Set<Integer> actual = new HashSet<>();
+          while (reader.loadNextBatch()) {
+            IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+            for (int row = 0; row < ids.getValueCount(); row++) {
+              actual.add(ids.get(row));
+            }
+          }
+          assertEquals(2, actual.size());
+          actual.retainAll(Set.of(1, 81, 161, 241, 321));
+          assertTrue(
+              actual.size() >= 1, "Expected Recall@2 >= 0.5 for " + indexType + ", got " + actual);
+        }
       }
     }
   }
@@ -721,6 +775,85 @@ public class VectorIndexTest {
             arraysApproximatelyEqual(l2Codebook, cosineCodebook),
             "L2 and Cosine PQ codebooks should differ — Cosine normalizes the training data."
                 + " If they are equal, the metric is not being threaded into the trainer.");
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = DistanceType.class,
+      names = {"L2", "Cosine", "Dot"})
+  public void testTrainPqCodebookWithIvfCentroids(DistanceType distanceType, @TempDir Path tempDir)
+      throws Exception {
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("pq_with_ivf"));
+        Dataset dataset = fixture.create()) {
+      PQBuildParams params = new PQBuildParams.Builder().setNumSubVectors(2).setNumBits(4).build();
+      float[] centroids = new float[32];
+      if (distanceType == DistanceType.Cosine) {
+        centroids[1] = 1.0f;
+      } else {
+        // Every coordinate in the fixture is between 0 and 2559.
+        Arrays.fill(centroids, 4096.0f);
+      }
+
+      float[] codebook =
+          VectorTrainer.trainPqCodebook(
+              dataset, TestVectorDataset.vectorColumnName, params, distanceType, centroids);
+
+      assertEquals(16 * centroids.length, codebook.length);
+      if (distanceType == DistanceType.Cosine) {
+        // The second coordinate is at least 1 before normalization and below 0.5 after.
+        assertTrue(codebook[1] < -0.5f, "Expected PQ to learn from normalized residuals");
+      } else {
+        for (float value : codebook) {
+          if (distanceType == DistanceType.L2) {
+            assertTrue(value < 0.0f, "Expected PQ to learn from IVF residuals");
+          } else {
+            assertTrue(value >= 0.0f, "Expected dot-product PQ to learn from the original vectors");
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testTrainPqCodebookWithInt8Residuals(@TempDir Path tempDir) {
+    Field vector =
+        new Field(
+            "vec",
+            FieldType.notNullable(new ArrowType.FixedSizeList(2)),
+            List.of(Field.notNullable("item", new ArrowType.Int(8, true))));
+    String path = tempDir.resolve("pq_int8").toString();
+    try (RootAllocator allocator = new RootAllocator();
+        VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(vector)), allocator)) {
+      batch.allocateNew();
+      FixedSizeListVector vectors = (FixedSizeListVector) batch.getVector("vec");
+      TinyIntVector values = (TinyIntVector) vectors.getDataVector();
+      for (int row = 0; row < 32; row++) {
+        vectors.setNotNull(row);
+        values.setSafe(2 * row, row);
+        values.setSafe(2 * row + 1, row + 1);
+      }
+      batch.setRowCount(32);
+
+      try (Dataset empty =
+              Dataset.write().allocator(allocator).uri(path).schema(batch.getSchema()).execute();
+          Dataset dataset =
+              Dataset.commit(
+                  allocator,
+                  path,
+                  new FragmentOperation.Append(
+                      Fragment.write().allocator(allocator).datasetUri(path).data(batch).execute()),
+                  Optional.of(empty.version()))) {
+        PQBuildParams params =
+            new PQBuildParams.Builder().setNumSubVectors(2).setNumBits(4).build();
+        float[] codebook =
+            VectorTrainer.trainPqCodebook(
+                dataset, "vec", params, DistanceType.L2, new float[] {200.5f, 200.5f});
+        assertEquals(16 * 2, codebook.length);
+        for (float value : codebook) {
+          assertTrue(value < -128.0f, "Expected a residual outside the Int8 range");
+        }
       }
     }
   }

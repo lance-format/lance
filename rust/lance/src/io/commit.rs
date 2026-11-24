@@ -25,7 +25,7 @@ use std::num::NonZero;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use conflict_resolver::TransactionRebase;
+use conflict_resolver::{AppendIdempotencyKey, TransactionRebase};
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
 use lance_core::utils::tracing::{AUDIT_MODE_DELETE, AUDIT_TYPE_TRANSACTION, TRACE_FILE_AUDIT};
 #[cfg(test)]
@@ -34,7 +34,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
-use lance_table::feature_flags::ensure_can_write_manifest;
+use lance_table::feature_flags::{CoveringContract, ensure_can_write_manifest};
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
     WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
@@ -59,7 +59,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
+    NewTransactionResult, TRANSACTIONS_DIR, TransactionReadSource, load_new_transactions,
     write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
@@ -72,12 +72,12 @@ use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
+use crate::utils::temporal::timestamp_to_nanos;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use log;
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -88,7 +88,9 @@ pub mod conflict_resolver;
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
-pub mod namespace_manifest;
+pub use lance_table_runtime::namespace_manifest;
+#[cfg(all(feature = "dynamodb", test))]
+mod s3_ddb_profile_test;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
 
@@ -167,7 +169,7 @@ async fn read_transaction_file_pb(
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
-    let result = object_store.inner.get(&path).await?;
+    let result = object_store.read_object(&path).await?;
     let data = result.bytes().await?;
     Ok(pb::Transaction::decode(data)?)
 }
@@ -248,9 +250,8 @@ enum CommitOutcome {
         manifest: Box<Manifest>,
         location: ManifestLocation,
     },
-    /// A manifest exists at the version and records a different transaction
-    /// file: another writer definitely won the version.
-    Foreign,
+    /// A manifest exists at the version and belongs to another writer.
+    Foreign { duplicate_append: bool },
     /// No manifest exists at the version: this attempt definitely did not
     /// land.
     Absent,
@@ -264,14 +265,13 @@ enum CommitOutcome {
 const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 
 /// Determine whether a failed commit attempt actually landed, by comparing
-/// the complete transaction recorded in the manifest at `version` with this
-/// attempt's transaction.
+/// the manifest at `version` with this attempt. A keyed append has a unique
+/// transaction file, which identifies the attempt even if another writer
+/// submitted the same transaction.
 ///
-/// The comparison is done between durable (protobuf) forms: the in-memory
-/// [`Transaction`] can carry state that is intentionally not serialized
-/// (e.g. the frag reuse payload attached to a rewrite), so comparing the
-/// read-back transaction against the in-memory one would misclassify our own
-/// landed commit as foreign.
+/// For unkeyed commits, compare the durable (protobuf) forms. The in-memory
+/// [`Transaction`] can carry state that is intentionally not serialized (e.g.
+/// the frag reuse payload attached to a rewrite).
 ///
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
@@ -281,6 +281,7 @@ async fn verify_commit_outcome(
     base_path: &Path,
     version: u64,
     transaction: &Transaction,
+    keyed_append: Option<(AppendIdempotencyKey<'_>, &str)>,
 ) -> CommitOutcome {
     enum VerificationFailure {
         NotFound,
@@ -300,19 +301,40 @@ async fn verify_commit_outcome(
             .await
         {
             Ok(Some((manifest, location))) => {
+                if keyed_append
+                    .is_some_and(|(_, file)| manifest.transaction_file.as_deref() == Some(file))
+                {
+                    return CommitOutcome::Ours {
+                        manifest: Box::new(manifest),
+                        location,
+                    };
+                }
                 match read_manifest_transaction(object_store, base_path, &manifest, &location).await
                 {
                     Ok(Some(committed_transaction)) => {
-                        return if committed_transaction == transaction_pb {
+                        return if keyed_append.is_none() && committed_transaction == transaction_pb
+                        {
                             CommitOutcome::Ours {
                                 manifest: Box::new(manifest),
                                 location,
                             }
                         } else {
-                            CommitOutcome::Foreign
+                            let duplicate_append = keyed_append.is_some_and(|(key, _)| {
+                                matches!(
+                                    committed_transaction.operation,
+                                    Some(pb::transaction::Operation::Append(_))
+                                ) && key.matches_properties(
+                                    &committed_transaction.transaction_properties,
+                                )
+                            });
+                            CommitOutcome::Foreign { duplicate_append }
                         };
                     }
-                    Ok(None) => return CommitOutcome::Foreign,
+                    Ok(None) => {
+                        return CommitOutcome::Foreign {
+                            duplicate_append: false,
+                        };
+                    }
                     Err(error) => VerificationFailure::Read(error),
                 }
             }
@@ -407,8 +429,13 @@ pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &pb::Transaction,
+    attempt_id: Option<uuid::Uuid>,
 ) -> Result<String> {
-    let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
+    let file_name = if let Some(attempt_id) = attempt_id {
+        format!("{}-{attempt_id}.txn", transaction.read_version)
+    } else {
+        format!("{}-{}.txn", transaction.read_version, transaction.uuid)
+    };
     let path = base_path
         .clone()
         .join(TRANSACTIONS_DIR)
@@ -436,12 +463,15 @@ async fn do_commit_new_dataset(
     base_path: &Path,
     uri: &str,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
     session: Arc<Session>,
     inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let build_config = build_config
+        .clone()
+        .with_timestamp_nanos(timestamp_to_nanos(None));
     let mut transaction = transaction.clone();
     if let Operation::Overwrite { schema, .. } = &mut transaction.operation {
         crate::dataset::write::assign_new_table_field_ids(schema, inherited_field_ids)?;
@@ -489,10 +519,11 @@ async fn do_commit_new_dataset(
             let reader = source_store.open(&source_manifest_location.path).await?;
             let section: pb::IndexSection =
                 lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            let contract = CoveringContract::of(&source_manifest);
             section
                 .indices
                 .into_iter()
-                .map(IndexMetadata::try_from)
+                .map(|proto| IndexMetadata::from_manifest_proto(proto, contract))
                 .collect::<Result<Vec<_>>>()?
         } else {
             vec![]
@@ -549,8 +580,8 @@ async fn do_commit_new_dataset(
         None
     };
 
-    let transaction_file = if !write_config.disable_transaction_file() {
-        match write_transaction_file(object_store, base_path, &pb_transaction).await {
+    let transaction_file = if !build_config.disable_transaction_file() {
+        match write_transaction_file(object_store, base_path, &pb_transaction, None).await {
             Ok(transaction_file) => transaction_file,
             Err(err) => {
                 cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
@@ -616,7 +647,8 @@ async fn do_commit_new_dataset(
                     None,
                     None,
                     None,
-                )?;
+                )
+                .await?;
                 crate::dataset::blob::clone::copy_blob_columns(
                     Arc::new(source),
                     Arc::new(object_store.clone()),
@@ -631,12 +663,8 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         }
     } else {
-        let (manifest, indices) = transaction.build_manifest(
-            None,
-            vec![],
-            &transaction_file,
-            &write_config.to_build_config(),
-        )?;
+        let (manifest, indices) =
+            transaction.build_manifest(None, vec![], &transaction_file, &build_config)?;
         (manifest, indices)
     };
 
@@ -654,7 +682,7 @@ async fn do_commit_new_dataset(
         } else {
             Some(indices.clone())
         },
-        write_config,
+        &build_config,
         manifest_naming_scheme,
         inline_transaction.then(|| pb_transaction.into()),
         may_change_schema,
@@ -680,6 +708,7 @@ async fn do_commit_new_dataset(
                 base_path,
                 manifest.version,
                 transaction,
+                None,
             )
             .await
             {
@@ -697,7 +726,7 @@ async fn do_commit_new_dataset(
                     .await;
                     return Ok((committed_manifest, location));
                 }
-                CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                CommitOutcome::Foreign { .. } | CommitOutcome::Absent => {}
                 CommitOutcome::Unknown => {
                     return Err(Error::commit_status_unknown_source(
                         manifest.version,
@@ -719,6 +748,7 @@ async fn do_commit_new_dataset(
                 base_path,
                 manifest.version,
                 transaction,
+                None,
             )
             .await
             {
@@ -739,7 +769,7 @@ async fn do_commit_new_dataset(
                     }
                     return Ok((committed_manifest, location));
                 }
-                CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                CommitOutcome::Foreign { .. } | CommitOutcome::Absent => {}
                 CommitOutcome::Unknown => {
                     return Err(Error::commit_status_unknown_source(
                         manifest.version,
@@ -786,7 +816,7 @@ pub(crate) async fn commit_new_dataset(
     base_path: &Path,
     uri: &str,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
     session: Arc<Session>,
@@ -799,7 +829,7 @@ pub(crate) async fn commit_new_dataset(
         base_path,
         uri,
         transaction,
-        write_config,
+        build_config,
         manifest_naming_scheme,
         metadata_cache,
         session,
@@ -856,7 +886,7 @@ async fn migrate_manifest(
 
 #[cfg(test)]
 fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
-    crate::dataset::versions::check_manifest_storage_version(manifest)
+    lance_table::format::storage_contract::check_manifest_storage_version(manifest)
 }
 
 /// Reject a manifest in which two fragments share an id. Per-fragment state is
@@ -881,7 +911,7 @@ fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
 
 #[cfg(test)]
 fn check_column_indices(manifest: &Manifest) -> Result<()> {
-    crate::dataset::versions::validate_column_indices(manifest)
+    lance_table::format::storage_contract::validate_column_indices(manifest)
 }
 
 /// Fix schema in case of duplicate field ids.
@@ -1091,7 +1121,7 @@ pub(crate) async fn migrate_fragments(
                 ..fragment.clone()
             })
         })
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.table_state.object_store.io_parallelism())
         // Filter out empty fragments
         .try_filter(|frag| futures::future::ready(frag.num_rows().map(|n| n > 0).unwrap_or(false)))
         .boxed();
@@ -1311,14 +1341,14 @@ pub(crate) async fn do_commit_detached_transaction(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
     // Definitions are allocated against the version chain: a detached
     // manifest's ids and field-identity activation would be invisible to it.
-    if write_config.has_clustering_definitions() {
+    if build_config.clustering_definitions().is_some() {
         return Err(Error::invalid_input(
             "a clustering definitions list cannot be committed detached",
         ));
@@ -1353,8 +1383,14 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
-    let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
+    let transaction_file = if !build_config.disable_transaction_file() {
+        write_transaction_file(
+            object_store,
+            &dataset.table_state.base,
+            &pb_transaction,
+            None,
+        )
+        .await?
     } else {
         String::new()
     };
@@ -1371,15 +1407,16 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
-        let build_config = build_config_for_attempt(dataset, transaction, write_config).await?;
+        let attempt_build_config =
+            build_config_for_attempt(dataset, transaction, build_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     version,
-                    &build_config,
+                    &attempt_build_config,
                     &transaction_file,
                     &dataset.manifest,
                 )
@@ -1389,25 +1426,46 @@ pub(crate) async fn do_commit_detached_transaction(
                 // Nothing is settled about a tagged fragment reuse entry
                 // on a detached commit: a tagged rewrite entry was refused
                 // above and a trim never commits detached.
-                let prepared =
-                    prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
-                        .await?;
-                let (mut manifest, indices) = transaction.build_manifest_prepared(
+                let prepared = prepare_attempt(
+                    dataset,
+                    transaction,
+                    &attempt_build_config,
+                    FragReuseUpdate::None,
+                )
+                .await?;
+                let (manifest, mut indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
-                    &build_config,
+                    &attempt_build_config,
                     None,
                 )?;
-                crate::dataset::write::seeds::apply_seed_feature_flags(
-                    &mut manifest,
-                    &indices,
-                    dataset,
-                )
-                .await?;
+                finish_built_manifest(dataset, transaction, &mut indices).await?;
                 (manifest, indices)
             }
         };
+
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                dataset,
+                &transaction.operation,
+                &manifest,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &transaction_file,
+                )
+                .await;
+            }
+            checked
+        })
+        .await?;
 
         manifest.version = random_version;
 
@@ -1422,7 +1480,9 @@ pub(crate) async fn do_commit_detached_transaction(
             &manifest,
             &transaction.operation,
         )?;
-        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
+        lance_table::format::storage_contract::check_manifest_storage_version_for_commit(
+            &mut manifest,
+        )?;
         check_fragment_ids(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
@@ -1447,22 +1507,24 @@ pub(crate) async fn do_commit_detached_transaction(
         )
         .await
         {
-            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            cleanup_transaction_file(object_store, &dataset.table_state.base, &transaction_file)
+                .await;
             return Err(error);
         }
 
         // Try to commit the manifest
+        dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
-            &dataset.base,
+            &dataset.table_state.base,
             &mut manifest,
             if indices.is_empty() {
                 None
             } else {
                 Some(indices.clone())
             },
-            write_config,
+            &attempt_build_config,
             ManifestNamingScheme::V2,
             inline_tx.take(),
             may_change_schema,
@@ -1480,9 +1542,10 @@ pub(crate) async fn do_commit_detached_transaction(
                 match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     manifest.version,
                     transaction,
+                    None,
                 )
                 .await
                 {
@@ -1492,7 +1555,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     } => {
                         return Ok((*committed_manifest, location));
                     }
-                    CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                    CommitOutcome::Foreign { .. } | CommitOutcome::Absent => {}
                     CommitOutcome::Unknown => {
                         return Err(Error::commit_status_unknown_source(
                             manifest.version,
@@ -1504,20 +1567,30 @@ pub(crate) async fn do_commit_detached_transaction(
                     }
                 }
                 if start.elapsed() > retry_timeout {
-                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.table_state.base,
+                        &transaction_file,
+                    )
+                    .await;
                     return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
                 }
                 let sleep_fut = tokio::time::sleep(backoff.next_backoff());
                 if let Err(error) =
                     maybe_timeout(backoff.attempt(), start, retry_timeout, sleep_fut).await
                 {
-                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.table_state.base,
+                        &transaction_file,
+                    )
+                    .await;
                     return Err(error);
                 }
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
                 inline_tx = if inline_transaction {
-                    Some(pb::Transaction::try_from(transaction)?.into())
+                    Some(lance_table::format::Transaction::try_from(transaction)?)
                 } else {
                     None
                 };
@@ -1526,9 +1599,10 @@ pub(crate) async fn do_commit_detached_transaction(
                 match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     manifest.version,
                     transaction,
+                    None,
                 )
                 .await
                 {
@@ -1541,7 +1615,7 @@ pub(crate) async fn do_commit_detached_transaction(
                         }
                         return Ok((*committed_manifest, location));
                     }
-                    CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                    CommitOutcome::Foreign { .. } | CommitOutcome::Absent => {}
                     CommitOutcome::Unknown => {
                         return Err(Error::commit_status_unknown_source(
                             manifest.version,
@@ -1549,7 +1623,12 @@ pub(crate) async fn do_commit_detached_transaction(
                         ));
                     }
                 }
-                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &transaction_file,
+                )
+                .await;
                 return Err(err);
             }
         }
@@ -1557,7 +1636,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+    cleanup_transaction_file(object_store, &dataset.table_state.base, &transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -1573,34 +1652,37 @@ pub(crate) async fn commit_detached_transaction(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
-    do_commit_detached_transaction(
+    dataset.ensure_branch_exists().await?;
+    let result = do_commit_detached_transaction(
         dataset,
         object_store,
         commit_handler,
         transaction,
-        write_config,
+        build_config,
         commit_config,
         retry_timeout,
     )
-    .await
+    .await;
+    dataset.ensure_branch_exists().await?;
+    result
 }
 
 /// The build config for one commit attempt against `dataset`'s current manifest.
 ///
-/// An operation that carries rows' lineage over from existing fragments needs
-/// their sequences at build time, and the build cannot read the ones spilled to
-/// data files; they are read here, per attempt, so a rebase onto a newer
-/// manifest sees that manifest's fragments.
+/// Resolves the commit timestamp through this crate's mockable clock and loads
+/// spilled row lineage when the operation needs existing lineage sequences.
 async fn build_config_for_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
 ) -> Result<ManifestBuildConfig> {
-    let mut config = write_config.to_build_config();
+    let mut config = build_config
+        .clone()
+        .with_timestamp_nanos(timestamp_to_nanos(None));
     let reads_existing_lineage = match &transaction.operation {
         // An update resolves its new fragments' created-at versions from the
         // existing fragments unless their writer placed them, and refreshes
@@ -1620,10 +1702,44 @@ async fn build_config_for_attempt(
         _ => false,
     };
     if reads_existing_lineage {
-        config.spilled_row_lineage =
-            load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+        let lineage = load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+        config = config.with_spilled_row_lineage(lineage);
     }
     Ok(config)
+}
+
+/// What an action-based transaction's attempt supplies for the fragment reuse
+/// history: the history itself when it lives in an external file, which
+/// applying the actions cannot read, and this build's notion of a usable
+/// segment, which a trim judges coverage by. `None` for any other operation.
+async fn composite_frag_reuse_update(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<Option<FragReuseUpdate>> {
+    if !matches!(transaction.operation, Operation::CompositeOperation(_)) {
+        return Ok(None);
+    }
+    let history = crate::index::frag_reuse::preload_external_frag_reuse_history(dataset).await?;
+    Ok(Some(FragReuseUpdate::Actions(Arc::new(
+        lance_table::system_index::frag_reuse::FragReuseActionInputs {
+            history,
+            index_is_usable: crate::index::segment::index_is_usable,
+        },
+    ))))
+}
+
+/// The IO a freshly built manifest still needs: an action-based history that
+/// outgrew the inline limit moves to an external file. Keeping this behind one
+/// await point keeps the commit loop's future under the `large_futures` limit.
+async fn finish_built_manifest(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    indices: &mut [IndexMetadata],
+) -> Result<()> {
+    if matches!(transaction.operation, Operation::CompositeOperation(_)) {
+        crate::index::frag_reuse::spill_frag_reuse_history(dataset, indices).await?;
+    }
+    Ok(())
 }
 
 /// Step one of a commit attempt (`Transaction::prepare_indices`): the index
@@ -1634,14 +1750,21 @@ async fn build_config_for_attempt(
 /// the lineage without guessing; other operations never interpret the
 /// entry: an append, or a merge that only adds columns, must carry a
 /// history a newer writer recorded through untouched. `frag_reuse` is what
-/// the rebase settled about the entry for this attempt. Nothing flows back
-/// into `transaction`.
+/// the rebase settled about the entry for this attempt; for an action-based
+/// transaction, which settles nothing beforehand, it is derived here. Nothing
+/// flows back into `transaction`.
 async fn prepare_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
     build_config: &lance_table::format::ManifestBuildConfig,
     frag_reuse: FragReuseUpdate,
 ) -> Result<PreparedIndices> {
+    let frag_reuse = match frag_reuse {
+        FragReuseUpdate::None => composite_frag_reuse_update(dataset, transaction)
+            .await?
+            .unwrap_or_default(),
+        settled => settled,
+    };
     let indices = load_all_indices(dataset).await?;
     // Same rewrite set the preparation withdraws from; nothing else interprets the entry.
     let rewrites_in_place = !Transaction::rewritten_physical_columns(
@@ -1650,7 +1773,14 @@ async fn prepare_attempt(
         &dataset.manifest.fragments,
     )
     .is_empty();
-    let ledger = if rewrites_in_place {
+    // A deferred rewrite withdrawing an undeferrable segment's coverage walks
+    // the history too, to find the retired sources that reach the rewritten
+    // fragments.
+    let withdraws_undeferrable = matches!(
+        &frag_reuse,
+        FragReuseUpdate::Rewrite(assembly) if !assembly.undeferrable_segments.is_empty()
+    );
+    let ledger = if rewrites_in_place || withdraws_undeferrable {
         match indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -1674,11 +1804,12 @@ async fn prepare_attempt(
 
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
+    source: TransactionReadSource,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
     let NewTransactionResult {
         dataset: new_ds,
         new_transactions,
-    } = load_new_transactions(dataset);
+    } = load_new_transactions(dataset, source);
     let new_transactions = new_transactions.try_collect::<Vec<_>>();
     let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
     txns.sort_by_key(|(version, _)| *version);
@@ -1695,11 +1826,13 @@ async fn record_successful_commit(
     location: &ManifestLocation,
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
-) {
+) -> Result<()> {
+    dataset.ensure_branch_exists().await?;
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
     };
     dataset
+        .table_state
         .metadata_cache
         .insert_with_key(&tx_key, Arc::new(transaction.clone()))
         .await;
@@ -1709,15 +1842,21 @@ async fn record_successful_commit(
         e_tag: location.e_tag.as_deref(),
     };
     dataset
+        .table_state
         .metadata_cache
         .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
         .await;
     if !indices.is_empty() {
         let key = IndexMetadataKey {
             version: manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
+            store_identity: &dataset.table_state.object_store.store_prefix,
             e_tag: location.e_tag.as_deref(),
         };
+        let contract = CoveringContract::of(manifest);
+        let indices = indices
+            .into_iter()
+            .map(|index| index.into_stored_shape(contract))
+            .collect::<Vec<_>>();
         dataset
             .index_cache
             .insert_with_key(&key, Arc::new(indices))
@@ -1734,22 +1873,96 @@ async fn record_successful_commit(
             _ => {}
         };
     }
+    dataset.ensure_branch_exists().await
+}
+
+/// Options for [`commit_transaction`].
+pub(crate) struct CommitTransactionOptions<'a> {
+    pub build_config: &'a ManifestBuildConfig,
+    pub commit_config: &'a CommitConfig,
+    pub retry_timeout: Duration,
+    pub manifest_naming_scheme: ManifestNamingScheme,
+    pub affected_rows: Option<&'a RowAddrTreeMap>,
+    append_idempotency_key: Option<AppendIdempotencyKey<'a>>,
+    pub expected_latest_version: Option<u64>,
+    /// Whether this commit is a tagged fragment-reuse-index trim derived by the
+    /// maintenance path against the current manifest entry (`FragReuseUpdate::Trim`).
+    pub tagged_frag_reuse_trim: bool,
+}
+
+impl<'a> CommitTransactionOptions<'a> {
+    pub(crate) fn new(
+        build_config: &'a ManifestBuildConfig,
+        commit_config: &'a CommitConfig,
+        manifest_naming_scheme: ManifestNamingScheme,
+    ) -> Self {
+        Self {
+            build_config,
+            commit_config,
+            retry_timeout: default_commit_retry_timeout(),
+            manifest_naming_scheme,
+            affected_rows: None,
+            append_idempotency_key: None,
+            expected_latest_version: None,
+            tagged_frag_reuse_trim: false,
+        }
+    }
+
+    pub(crate) fn with_retry_timeout(mut self, retry_timeout: Duration) -> Self {
+        self.retry_timeout = retry_timeout;
+        self
+    }
+
+    pub(crate) fn with_affected_rows(mut self, affected_rows: Option<&'a RowAddrTreeMap>) -> Self {
+        self.affected_rows = affected_rows;
+        self
+    }
+
+    pub(crate) fn with_append_idempotency_key(
+        mut self,
+        key: Option<AppendIdempotencyKey<'a>>,
+    ) -> Self {
+        self.append_idempotency_key = key;
+        self
+    }
+
+    pub(crate) fn with_expected_latest_version(mut self, version: u64) -> Self {
+        self.expected_latest_version = Some(version);
+        self
+    }
+
+    pub(crate) fn with_tagged_frag_reuse_trim(mut self) -> Self {
+        self.tagged_frag_reuse_trim = true;
+        self
+    }
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
-    commit_config: &CommitConfig,
-    retry_timeout: Duration,
-    manifest_naming_scheme: ManifestNamingScheme,
-    affected_rows: Option<&RowAddrTreeMap>,
-    expected_latest_version: Option<u64>,
+    options: CommitTransactionOptions<'_>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let CommitTransactionOptions {
+        build_config,
+        commit_config,
+        retry_timeout,
+        manifest_naming_scheme,
+        affected_rows,
+        append_idempotency_key,
+        expected_latest_version,
+        tagged_frag_reuse_trim,
+    } = options;
+    if append_idempotency_key.is_some()
+        && (expected_latest_version.is_some() || build_config.disable_transaction_file())
+    {
+        return Err(Error::invalid_input(
+            "append idempotency requires conflict resolution and transaction files",
+        ));
+    }
+    dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
@@ -1814,17 +2027,13 @@ pub(crate) async fn commit_transaction(
     // catch-up is work the commit must do however many retries it gets.
     let mut retry_start: Option<Instant> = None;
 
-    // Track the transaction file written in the current loop iteration so we can
-    // delete it if the commit ultimately fails.
-    let mut current_transaction_file = String::new();
-
     // An allocating clustering submission from a reusable-id snapshot: judge
     // every transaction in its window for field-identity changes; see
     // `refuse_field_identity_change`. Decided from the version the transaction
     // read, not from the handle it was submitted through, which may already
     // be at a later, activated version.
     let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
-        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+        && build_config.allocates_clustering_definitions(&read_version_dataset.manifest))
     .then(|| read_version_dataset.schema().clone());
 
     while backoff.attempt() < num_attempts {
@@ -1850,8 +2059,13 @@ pub(crate) async fn commit_transaction(
             }
         } else if !strict_overwrite {
             let checked_since = dataset.manifest.version;
+            let source = if append_idempotency_key.is_some() {
+                TransactionReadSource::Storage
+            } else {
+                TransactionReadSource::SessionCache
+            };
             let (loaded_dataset, other_transactions) =
-                load_and_sort_new_transactions(&dataset).await?;
+                load_and_sort_new_transactions(&dataset, source).await?;
             dataset = loaded_dataset;
 
             ensure_can_write_manifest(&dataset.manifest)?;
@@ -1862,7 +2076,9 @@ pub(crate) async fn commit_transaction(
             // started at exact same time better.
 
             let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+                TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
+                    .await?
+                    .with_read_version_dataset(&read_version_dataset);
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
@@ -1871,7 +2087,33 @@ pub(crate) async fn commit_transaction(
             let missing = (checked_since + 1..=dataset.manifest.version)
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
-            rebase.check_missing_versions(&missing, dataset.manifest.version)?;
+            if let Some(key) = append_idempotency_key {
+                if let Some(version) = key.committed_version(&other_transactions) {
+                    original_dataset.ensure_branch_exists().await?;
+                    return Err(Error::append_already_committed(version));
+                }
+                if !missing.is_empty() {
+                    return Err(Error::commit_conflict_source(
+                        dataset.manifest.version,
+                        format!(
+                            "Cannot check append idempotency because the transaction history is \
+                             missing at versions {missing:?}"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            rebase.check_missing_versions(
+                &missing,
+                dataset.manifest.version,
+                read_version_dataset.schema(),
+                dataset.schema(),
+            )?;
+            // A retry's window starts after its previous attempt, so it would
+            // miss the moves recorded there; not tracking only costs coverage.
+            if checked_since == read_version && missing.is_empty() {
+                rebase.track_moved_files();
+            }
             // A cleaned-up version may have replaced a key field; an identity
             // window with a hole cannot be judged, so it is refused.
             if identity_fence.is_some() && !missing.is_empty() {
@@ -1928,8 +2170,18 @@ pub(crate) async fn commit_transaction(
         // copy would tie the verdict to the payload size instead.
         let may_change_schema = operation_may_change_schema(&pb_transaction);
 
-        current_transaction_file = if !write_config.disable_transaction_file() {
-            write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
+        let current_transaction_file = if !build_config.disable_transaction_file() {
+            // Concurrent executions can submit the very same Transaction. Each
+            // keyed attempt must own its file so a loser cannot delete the
+            // winner's transaction record during conflict cleanup.
+            let attempt_id = append_idempotency_key.map(|_| uuid::Uuid::new_v4());
+            write_transaction_file(
+                object_store,
+                &dataset.table_state.base,
+                &pb_transaction,
+                attempt_id,
+            )
+            .await?
         } else {
             String::new()
         };
@@ -1944,8 +2196,8 @@ pub(crate) async fn commit_transaction(
         // Build an up-to-date manifest from the transaction and current
         // manifest: prepare the index list against this attempt's manifest
         // first, then build from the prepared result.
-        let build_config =
-            build_config_for_attempt(&dataset, &attempt_transaction, write_config).await?;
+        let attempt_build_config =
+            build_config_for_attempt(&dataset, &attempt_transaction, build_config).await?;
         let (mut manifest, mut indices) = match attempt_transaction.operation {
             Operation::Restore { version } => {
                 // A restore reinstates its snapshot's index list and entry
@@ -1953,9 +2205,9 @@ pub(crate) async fn commit_transaction(
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     version,
-                    &build_config,
+                    &attempt_build_config,
                     transaction_file,
                     &dataset.manifest,
                 )
@@ -1964,28 +2216,49 @@ pub(crate) async fn commit_transaction(
             _ => {
                 let frag_reuse = match tagged_rewrite.take() {
                     Some(assembly) => FragReuseUpdate::Rewrite(assembly),
-                    None if write_config.tagged_frag_reuse_trim() => FragReuseUpdate::Trim,
+                    None if tagged_frag_reuse_trim => FragReuseUpdate::Trim,
                     None => FragReuseUpdate::None,
                 };
-                let prepared =
-                    prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
-                        .await?;
-                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
+                let prepared = prepare_attempt(
+                    &dataset,
+                    &attempt_transaction,
+                    &attempt_build_config,
+                    frag_reuse,
+                )
+                .await?;
+                let (manifest, mut indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
-                    &build_config,
+                    &attempt_build_config,
                     read_version_state,
                 )?;
-                crate::dataset::write::seeds::apply_seed_feature_flags(
-                    &mut manifest,
-                    &indices,
-                    &dataset,
-                )
-                .await?;
+                finish_built_manifest(&dataset, &attempt_transaction, &mut indices).await?;
                 (manifest, indices)
             }
         };
+
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                &dataset,
+                &attempt_transaction.operation,
+                &manifest,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &current_transaction_file,
+                )
+                .await;
+            }
+            checked
+        })
+        .await?;
 
         manifest.version = target_version;
 
@@ -2005,7 +2278,9 @@ pub(crate) async fn commit_transaction(
             &attempt_transaction.operation,
         )?;
 
-        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
+        lance_table::format::storage_contract::check_manifest_storage_version_for_commit(
+            &mut manifest,
+        )?;
         check_fragment_ids(&manifest)?;
 
         // Runs after the coverage derivation and can replace a fragment bitmap
@@ -2031,28 +2306,38 @@ pub(crate) async fn commit_transaction(
         )
         .await
         {
-            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+            cleanup_transaction_file(
+                object_store,
+                &dataset.table_state.base,
+                &current_transaction_file,
+            )
+            .await;
             return Err(error);
         }
 
         // Try to commit the manifest
+        original_dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
-            &dataset.base,
+            &dataset.table_state.base,
             &mut manifest,
             if indices.is_empty() {
                 None
             } else {
                 Some(indices.clone())
             },
-            write_config,
+            &attempt_build_config,
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
             may_change_schema,
         )
         .await;
+        // Deletion can race the manifest PUT. Never acknowledge an orphaned
+        // commit, including when the handler reports an ambiguous result.
+        original_dataset.ensure_branch_exists().await?;
 
+        let keyed_append = append_idempotency_key.map(|key| (key, transaction_file));
         match result {
             Ok(manifest_location) => {
                 record_successful_commit(
@@ -2063,7 +2348,7 @@ pub(crate) async fn commit_transaction(
                     indices,
                     commit_config.skip_auto_cleanup,
                 )
-                .await;
+                .await?;
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {
@@ -2073,12 +2358,13 @@ pub(crate) async fn commit_transaction(
                 // "already exists"). Verify who owns the version before
                 // treating the attempt as lost: deleting the artifacts of a
                 // commit that actually landed corrupts the version.
-                match verify_commit_outcome(
+                let duplicate_append = match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     target_version,
                     &attempt_transaction,
+                    keyed_append,
                 )
                 .await
                 {
@@ -2095,14 +2381,14 @@ pub(crate) async fn commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         return Ok((committed_manifest, location));
                     }
                     // Confirmed loss: another writer owns the version (or,
-                    // for handlers that detect conflicts before writing,
-                    // the attempt never landed). Proceed with the normal
-                    // rebase-and-retry path.
-                    CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                    // for handlers that detect conflicts before writing, the
+                    // attempt never landed). Only a different key can be retried.
+                    CommitOutcome::Foreign { duplicate_append } => duplicate_append,
+                    CommitOutcome::Absent => false,
                     CommitOutcome::Unknown => {
                         return Err(Error::commit_status_unknown_source(
                             target_version,
@@ -2112,10 +2398,10 @@ pub(crate) async fn commit_transaction(
                                 .into(),
                         ));
                     }
-                }
+                };
                 let next_attempt_i = backoff.attempt() + 1;
 
-                if backoff.attempt() == 0 {
+                if !duplicate_append && backoff.attempt() == 0 {
                     // We add 10% buffer here, to allow concurrent writes to complete.
                     // We pass the first attempt's time to the backoff so it's used
                     // as the unit for backoff time slots. The catch-up before the
@@ -2126,15 +2412,17 @@ pub(crate) async fn commit_transaction(
                         backoff.with_unit((attempt_start.elapsed().as_millis() * 11 / 10) as u32);
                 }
 
+                // The attempt lost, so no committed manifest references its file.
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &current_transaction_file,
+                )
+                .await;
+                if duplicate_append {
+                    return Err(Error::append_already_committed(target_version));
+                }
                 if next_attempt_i < num_attempts {
-                    // The transaction file from this attempt is now stale; clean it up
-                    // before the next attempt writes a new one (possibly rebased).
-                    cleanup_transaction_file(
-                        object_store,
-                        &dataset.base,
-                        &current_transaction_file,
-                    )
-                    .await;
                     if retry_start.elapsed() > retry_timeout {
                         return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
                     }
@@ -2149,9 +2437,10 @@ pub(crate) async fn commit_transaction(
                 match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     target_version,
                     &attempt_transaction,
+                    keyed_append,
                 )
                 .await
                 {
@@ -2168,21 +2457,30 @@ pub(crate) async fn commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         if commit_handler.propagate_commit_error_after_success() {
                             return Err(err);
                         }
                         return Ok((committed_manifest, location));
                     }
-                    CommitOutcome::Foreign | CommitOutcome::Absent => {
+                    outcome @ (CommitOutcome::Foreign { .. } | CommitOutcome::Absent) => {
+                        let duplicate_append = matches!(
+                            outcome,
+                            CommitOutcome::Foreign {
+                                duplicate_append: true
+                            }
+                        );
                         // The attempt certainly did not land; its
                         // transaction file is orphaned.
                         cleanup_transaction_file(
                             object_store,
-                            &dataset.base,
+                            &dataset.table_state.base,
                             &current_transaction_file,
                         )
                         .await;
+                        if duplicate_append {
+                            return Err(Error::append_already_committed(target_version));
+                        }
                         if conditional_commit {
                             return Err(Error::retryable_commit_conflict_source(
                                 target_version,
@@ -2202,7 +2500,6 @@ pub(crate) async fn commit_transaction(
         }
     }
 
-    cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
     let message = format!(
         "Failed to commit the transaction after {} retries.",
         commit_config.num_retries
@@ -2222,14 +2519,14 @@ pub(crate) async fn commit_transaction(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::datatypes::{Field, Schema};
+    use lance_core::datatypes::{Field, LANCE_UNENFORCED_PRIMARY_KEY, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::ConcreteFileVersion;
@@ -2248,11 +2545,12 @@ mod tests {
     use super::*;
 
     use crate::Dataset;
+    use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::cleanup::CleanupPolicyBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{
-        CommitBuilder, DeleteBuilder, MergeInsertBuilder, UpdateBuilder, WhenMatched, WriteMode,
-        WriteParams,
+        CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, UpdateBuilder,
+        WhenMatched, WhenNotMatched, WriteMode, WriteParams,
     };
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
@@ -2477,10 +2775,174 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::append(false)]
-    #[case::index(true)]
+    #[case::intact_history(&[])]
+    #[case::gap_read_retained(&[2])]
+    #[case::gap_read_removed(&[1, 2])]
     #[tokio::test]
-    async fn test_safe_commit_survives_cleaned_history(#[case] is_index: bool) {
+    async fn test_insert_only_merge_insert_after_cleanup(
+        #[case] cleaned_versions: &[u64],
+        #[values(false, true)] is_staged: bool,
+        #[values("id", "value")] on: &str,
+    ) {
+        let initial =
+            arrow_array::record_batch!(("id", Int32, [0, 1, 2, 3]), ("value", Int32, [0, 1, 2, 3]))
+                .unwrap();
+        let mut fields = initial.schema().fields().to_vec();
+        fields[0] = Arc::new(
+            fields[0]
+                .as_ref()
+                .clone()
+                .with_nullable(false)
+                .with_metadata(HashMap::from([(
+                    LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+                    "true".to_string(),
+                )])),
+        );
+        let initial = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields)),
+            initial.columns().to_vec(),
+        )
+        .unwrap();
+        let stale = Arc::new(
+            crate::dataset::InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        assert_eq!(stale.get_fragments().len(), 2);
+        let upsert = |dataset| {
+            MergeInsertBuilder::try_new(dataset, vec![on.into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+        };
+        let batch = if on == "id" {
+            arrow_array::record_batch!(("id", Int32, [100]), ("value", Int32, [101])).unwrap()
+        } else {
+            arrow_array::record_batch!(("id", Int32, [101]), ("value", Int32, [100])).unwrap()
+        };
+        // Stage before the concurrent insert and cleanup, as a separate writer would.
+        let staged = if is_staged {
+            let staged = upsert(stale.clone())
+                .execute_uncommitted_batches(vec![batch.clone()])
+                .await
+                .unwrap();
+            let Operation::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                inserted_rows_filter,
+                ..
+            } = &staged.transaction.operation
+            else {
+                panic!("expected an Update transaction");
+            };
+            assert!(updated_fragments.is_empty());
+            assert!(removed_fragment_ids.is_empty());
+            assert_eq!(inserted_rows_filter.is_some(), on == "id");
+            Some(staged)
+        } else {
+            None
+        };
+        let concurrent =
+            arrow_array::record_batch!(("id", Int32, [100]), ("value", Int32, [100])).unwrap();
+        let (latest, _) = upsert(stale.clone())
+            .execute_batches(vec![concurrent])
+            .await
+            .unwrap();
+        let latest = CommitBuilder::new(latest)
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        if !cleaned_versions.is_empty() {
+            let stats = latest
+                .cleanup(
+                    CleanupPolicyBuilder::default()
+                        .versions(cleaned_versions.to_vec())
+                        .unwrap()
+                        .build(),
+                )
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(stats.old_versions, cleaned_versions.len() as u64);
+        }
+
+        let result = if let Some(staged) = staged {
+            let mut builder = CommitBuilder::new(stale);
+            if let Some(affected_rows) = staged.affected_rows {
+                builder = builder.with_affected_rows(affected_rows);
+            }
+            let result = builder.execute(staged.transaction).await;
+            if on == "id" {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "{error}"
+                );
+                let message = if cleaned_versions.is_empty() {
+                    "preempted by concurrent transaction"
+                } else {
+                    "inserted keys"
+                };
+                assert!(error.to_string().contains(message), "{error}");
+                if !cleaned_versions.is_empty() {
+                    assert!(error.to_string().contains("versions [2]"), "{error}");
+                }
+                assert_eq!(latest.latest_version_id().await.unwrap(), 3);
+                assert_eq!(latest.count_rows(None).await.unwrap(), 5);
+                assert_eq!(latest.count_rows(Some("id = 100".into())).await.unwrap(), 1);
+                return;
+            }
+            result.unwrap()
+        } else {
+            let (result, stats) = upsert(stale).execute_batches(vec![batch]).await.unwrap();
+            assert_eq!(stats.num_attempts, if on == "id" { 2 } else { 1 });
+            result.as_ref().clone()
+        };
+        assert_eq!(result.version().version, 4);
+        assert_eq!(
+            result
+                .count_rows(Some(format!("{on} = 100")))
+                .await
+                .unwrap(),
+            if on == "id" { 1 } else { 2 }
+        );
+        assert_eq!(
+            result
+                .count_rows(Some(if on == "id" {
+                    "id = 100 AND value = 101".into()
+                } else {
+                    "id = 101 AND value = 100".into()
+                }))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            result.count_rows(None).await.unwrap(),
+            if on == "id" { 5 } else { 6 }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::append(false, false)]
+    #[case::index_after_delete(true, false)]
+    #[case::index_after_add_columns(true, true)]
+    #[tokio::test]
+    async fn test_safe_commit_survives_cleaned_history(
+        #[case] is_index: bool,
+        #[case] is_column_add: bool,
+    ) {
         let stale = Arc::new(
             gen_batch()
                 .col("id", array::step::<Int32Type>())
@@ -2522,7 +2984,21 @@ mod tests {
                 .unwrap()
         };
         let mut latest = stale.as_ref().clone();
-        latest.delete("id = 0").await.unwrap();
+        if is_column_add {
+            latest
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        "extra".into(),
+                        "id * 2".into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            latest.delete("id = 0").await.unwrap();
+        }
         let latest = CommitBuilder::new(Arc::new(latest))
             .execute(Transaction::new(
                 2,
@@ -2547,15 +3023,215 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.version().version, 4);
-        assert_eq!(result.count_rows(Some("id = 0".into())).await.unwrap(), 0);
+        assert_eq!(
+            result.count_rows(Some("id = 0".into())).await.unwrap(),
+            usize::from(is_column_add)
+        );
         assert_eq!(
             result.count_rows(None).await.unwrap(),
-            if is_index { 7 } else { 8 }
+            if is_index {
+                7 + usize::from(is_column_add)
+            } else {
+                8
+            }
         );
         if is_index {
-            assert_eq!(result.load_indices().await.unwrap().len(), 1);
+            let indices = result.load_indices().await.unwrap();
+            assert_eq!(indices.len(), 1);
+            assert_eq!(
+                indices[0].fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1])
+            );
             assert_eq!(result.count_rows(Some("id = 3".into())).await.unwrap(), 1);
         }
+    }
+
+    #[rstest::rstest]
+    #[case::drop_columns_after_add_columns("add_columns")]
+    #[case::append_after_cast("cast")]
+    #[case::append_null_after_set_not_null("set_not_null")]
+    #[case::append_after_overwrite_reusing_field_ids("overwrite")]
+    #[case::append_after_overwrite_swapping_same_type_columns("overwrite_swap")]
+    #[case::append_after_overwrite_swapping_same_type_structs("overwrite_nested_swap")]
+    #[case::append_after_overwrite_struct_to_list("overwrite_struct_to_list")]
+    #[case::append_after_overwrite_list_to_struct("overwrite_list_to_struct")]
+    #[tokio::test]
+    async fn test_schema_dependent_commit_rejects_cleaned_history(#[case] concurrent: &str) {
+        let (initial, staged) = match concurrent {
+            "overwrite_nested_swap" => (
+                struct_pair_batch(["a", "b"], [0, 1]),
+                struct_pair_batch(["a", "b"], [7, 70]),
+            ),
+            "overwrite_struct_to_list" => (container_batch(false, 1), container_batch(false, 7)),
+            "overwrite_list_to_struct" => (container_batch(true, 1), container_batch(true, 7)),
+            _ => (
+                arrow_array::record_batch!(
+                    ("id", Int32, [0, 1, 2, 3]),
+                    ("x", Int32, [Some(0), Some(1), Some(2), Some(3)])
+                )
+                .unwrap(),
+                arrow_array::record_batch!(("id", Int32, [4]), ("x", Int32, [None])).unwrap(),
+            ),
+        };
+        let stale = Arc::new(
+            crate::dataset::InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        let staged_append = crate::dataset::InsertBuilder::new(stale.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![staged])
+            .await
+            .unwrap();
+        let mut latest = stale.as_ref().clone();
+        match concurrent {
+            "add_columns" => latest
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        "extra".into(),
+                        "id * 2".into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            "cast" => latest
+                .alter_columns(&[
+                    crate::dataset::ColumnAlteration::new("x".into()).cast_to(DataType::Int64)
+                ])
+                .await
+                .unwrap(),
+            "set_not_null" => latest
+                .alter_columns(&[
+                    crate::dataset::ColumnAlteration::new("x".into()).set_nullable(false)
+                ])
+                .await
+                .unwrap(),
+            "overwrite" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![
+                        arrow_array::record_batch!(("id", Utf8, ["a"]), ("x", Utf8, ["b"]))
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
+            }
+            // The reused field ids keep their types but now name the other column.
+            "overwrite_swap" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![
+                        arrow_array::record_batch!(("x", Int32, [Some(5)]), ("id", Int32, [6]))
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
+            }
+            // Only the parents swap: both written leaves are still `x: int32`.
+            "overwrite_nested_swap" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![struct_pair_batch(["b", "a"], [5, 6])])
+                    .await
+                    .unwrap();
+            }
+            // The leaf keeps its path `a.item` and type under another container kind.
+            "overwrite_struct_to_list" | "overwrite_list_to_struct" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![container_batch(
+                        concurrent == "overwrite_struct_to_list",
+                        20,
+                    )])
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let latest = CommitBuilder::new(Arc::new(latest))
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1, 2])
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        let result = if concurrent == "add_columns" {
+            let mut stale = stale.as_ref().clone();
+            stale.drop_columns(&["x"]).await
+        } else {
+            CommitBuilder::new(stale)
+                .execute(staged_append)
+                .await
+                .map(|_| ())
+        };
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("versions [2]"), "{error}");
+        assert_eq!(latest.latest_version_id().await.unwrap(), 3);
+    }
+
+    /// One row with two `struct<x: int32>` columns.
+    fn struct_pair_batch(names: [&str; 2], values: [i32; 2]) -> RecordBatch {
+        let column = |value: i32| -> arrow_array::ArrayRef {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(ArrowField::new("x", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![value])) as arrow_array::ArrayRef,
+            )]))
+        };
+        RecordBatch::try_from_iter([(names[0], column(values[0])), (names[1], column(values[1]))])
+            .unwrap()
+    }
+
+    /// One row with an `a` column that is either `list<item: int32>` or
+    /// `struct<item: int32>`.
+    fn container_batch(is_list: bool, value: i32) -> RecordBatch {
+        let column: arrow_array::ArrayRef = if is_list {
+            Arc::new(
+                arrow_array::ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![
+                    Some(value),
+                    Some(value + 1),
+                ])]),
+            )
+        } else {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![value])) as arrow_array::ArrayRef,
+            )]))
+        };
+        RecordBatch::try_from_iter([("a", column)]).unwrap()
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
@@ -2623,6 +3299,57 @@ mod tests {
         // Rename is default for memory
         let handler = Arc::new(RenameCommitHandler);
         test_commit_handler(handler, true).await;
+    }
+
+    /// The rename handler's staging object is not the object readers resolve:
+    /// a store without atomic rename publishes by copy, so the staging ETag
+    /// need not describe the final path. The location returned by a successful
+    /// commit must describe the published object, or writer and reader disagree
+    /// on the manifest generation token.
+    #[tokio::test]
+    async fn test_rename_commit_handler_reports_published_e_tag() {
+        let temp_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int64,
+            false,
+        )]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema),
+            temp_dir.as_str(),
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let published = dataset.manifest_location();
+        let resolved = dataset
+            .table_state
+            .commit_handler
+            .resolve_version_location(
+                &dataset.table_state.base,
+                dataset.manifest.version,
+                &dataset.table_state.object_store.inner,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            published.e_tag.is_some(),
+            "the local store reports a generation token for the published manifest"
+        );
+        assert_eq!(
+            published.e_tag, resolved.e_tag,
+            "the commit must report the published object's generation token"
+        );
     }
 
     #[tokio::test]
@@ -2735,7 +3462,7 @@ mod tests {
         manifest: Manifest,
         transaction: &Transaction,
     ) -> Arc<dyn CommitHandler> {
-        let transaction = pb::Transaction::try_from(transaction).unwrap().into();
+        let transaction = lance_table::format::Transaction::try_from(transaction).unwrap();
         Arc::new(InjectForeignCommitHandler {
             foreign: Mutex::new(Some((manifest, transaction))),
         })
@@ -2888,6 +3615,7 @@ mod tests {
             &object_store,
             &base_path,
             &pb::Transaction::try_from(&transaction).unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -3029,6 +3757,7 @@ mod tests {
 
         let broken = dataset.load_index_by_name("id_idx").await.unwrap().unwrap();
         dataset
+            .table_state
             .object_store
             .remove_dir_all(dataset.indices_dir().join(broken.uuid.to_string()))
             .await
@@ -3049,8 +3778,8 @@ mod tests {
         // emits one - untrained indices get an empty bitmap, not none at all - so
         // the state an old manifest arrives in is set here by hand.
         let indices = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -3080,8 +3809,8 @@ mod tests {
         dataset.delete("false").await.unwrap();
 
         let migrated = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -3127,7 +3856,10 @@ mod tests {
         // Now load the dataset at version 1 and check that load_and_sort_new_transactions
         // returns transactions in order
         let dataset_v1 = dataset.checkout_version(1).await.unwrap();
-        let (_, transactions) = load_and_sort_new_transactions(&dataset_v1).await.unwrap();
+        let (_, transactions) =
+            load_and_sort_new_transactions(&dataset_v1, TransactionReadSource::SessionCache)
+                .await
+                .unwrap();
 
         // Verify transactions are sorted by version
         let versions: Vec<u64> = transactions.iter().map(|(v, _)| *v).collect();
@@ -3761,6 +4493,313 @@ mod tests {
         )]))
     }
 
+    const APPEND_KEY_PROPERTY: &str = "job_id";
+
+    async fn create_append_test_dataset(uri: &str) -> Arc<Dataset> {
+        Arc::new(
+            InsertBuilder::new(uri)
+                .execute(vec![simple_batch(&simple_schema(), vec![0])])
+                .await
+                .unwrap(),
+        )
+    }
+
+    async fn stage_append(dataset: Arc<Dataset>, value: i32, key: &str) -> Transaction {
+        InsertBuilder::new(dataset)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                transaction_properties: Some(Arc::new(HashMap::from([(
+                    APPEND_KEY_PROPERTY.to_string(),
+                    key.to_string(),
+                )]))),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![simple_batch(&simple_schema(), vec![value])])
+            .await
+            .unwrap()
+    }
+
+    #[derive(Debug)]
+    struct ConcurrentAppendCommitHandler(tokio::sync::Barrier);
+
+    #[async_trait::async_trait]
+    impl CommitHandler for ConcurrentAppendCommitHandler {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            // Both writers must reach publication for version 2 before either
+            // publishes. A distinct-key writer may then retry at version 3.
+            if manifest.version == 2 {
+                self.0.wait().await;
+            }
+            RenameCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::same_key("job-a", false)]
+    #[case::same_transaction("job-a", true)]
+    #[case::distinct_keys("job-b", false)]
+    #[tokio::test]
+    async fn test_append_idempotency_concurrent(
+        #[case] second_key: &str,
+        #[case] same_transaction: bool,
+    ) {
+        let tmp = TempStrDir::default();
+        let dataset = create_append_test_dataset(tmp.as_str()).await;
+        let first_key = "job-a";
+        let mut first = stage_append(dataset.clone(), 1, first_key).await;
+        let second = if same_transaction {
+            // Force both submissions to use an external transaction file, so
+            // reopening the winner detects a loser unlinking the shared file.
+            Arc::make_mut(first.transaction_properties.as_mut().unwrap())
+                .insert("padding".into(), "x".repeat(MAX_INLINE_TRANSACTION_BYTES));
+            first.clone()
+        } else {
+            stage_append(dataset.clone(), 2, second_key).await
+        };
+        let handler = Arc::new(ConcurrentAppendCommitHandler(tokio::sync::Barrier::new(2)));
+        let same_key = first_key == second_key;
+        let retries = if same_key { 0 } else { 4 };
+        let commit = |transaction| {
+            CommitBuilder::new(dataset.clone())
+                .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+                .with_commit_handler(handler.clone())
+                .with_max_retries(retries)
+                .with_timeout(Some(Duration::from_secs(5)))
+                .execute(transaction)
+        };
+        let results = tokio::join!(commit(first), commit(second));
+        let expected_version = if same_key {
+            let (winner, duplicate) = match results {
+                (Ok(winner), Err(duplicate)) | (Err(duplicate), Ok(winner)) => (winner, duplicate),
+                results => panic!("expected one append and one duplicate: {results:?}"),
+            };
+            assert_eq!(winner.version().version, 2);
+            assert_eq!(duplicate.append_already_committed_version(), Some(2));
+            assert!(
+                duplicate
+                    .to_string()
+                    .contains("Append already committed at version 2")
+            );
+            2
+        } else {
+            let mut versions = [
+                results.0.unwrap().version().version,
+                results.1.unwrap().version().version,
+            ];
+            versions.sort_unstable();
+            assert_eq!(versions, [2, 3]);
+            3
+        };
+
+        let latest = Dataset::open(tmp.as_str()).await.unwrap();
+        assert_eq!(latest.version().version, expected_version);
+        assert_eq!(
+            latest.count_rows(None).await.unwrap(),
+            expected_version as usize
+        );
+        assert_eq!(count_txn_files(tmp.as_str()), expected_version as usize);
+        let committed = latest.read_transaction().await.unwrap().unwrap();
+        let properties = committed.transaction_properties.unwrap();
+        assert!(properties.contains_key(APPEND_KEY_PROPERTY));
+    }
+
+    #[rstest::rstest]
+    #[case::verified(crate::utils::test::AmbiguousFailure::LandAndConflict, false)]
+    #[case::unverifiable(
+        crate::utils::test::AmbiguousFailure::LandAndErrorWithoutVerification,
+        true
+    )]
+    #[tokio::test]
+    async fn test_append_idempotency_replay_after_lost_acknowledgment(
+        #[case] failure: crate::utils::test::AmbiguousFailure,
+        #[case] outcome_unknown: bool,
+    ) {
+        let tmp = TempStrDir::default();
+        let dataset = create_append_test_dataset(tmp.as_str()).await;
+        let transaction = stage_append(dataset.clone(), 1, "job-a").await;
+        let handler = Arc::new(crate::utils::test::AmbiguousCommitHandler::default());
+        handler.fail_next(failure);
+        let result = CommitBuilder::new(dataset.clone())
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .with_commit_handler(handler)
+            .execute(transaction)
+            .await;
+        if outcome_unknown {
+            assert!(result.unwrap_err().is_commit_status_unknown());
+        } else {
+            assert_eq!(result.unwrap().version().version, 2);
+        }
+
+        // An ordinary append can reuse the same metadata, advancing the branch
+        // while the logical append is waiting to be retried.
+        let ordinary = stage_append(dataset.clone(), 2, "job-a").await;
+        let advanced = CommitBuilder::new(dataset).execute(ordinary).await.unwrap();
+        assert_eq!(advanced.version().version, 3);
+
+        // Use a fresh handle at the original base to stage different files.
+        let latest = Arc::new(Dataset::open(tmp.as_str()).await.unwrap());
+        let base = Arc::new(latest.checkout_version(1).await.unwrap());
+        let replay = stage_append(base, 3, "job-a").await;
+        let duplicate = CommitBuilder::new(latest)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(replay)
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.append_already_committed_version(), Some(2));
+        let latest = Dataset::open(tmp.as_str()).await.unwrap();
+        assert_eq!(latest.version().version, 3);
+        assert_eq!(
+            latest.scan().try_into_batch().await.unwrap(),
+            simple_batch(&simple_schema(), vec![0, 1, 2]),
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::old_key("old-job", false)]
+    #[case::new_key("new-job", true)]
+    #[tokio::test]
+    async fn test_append_idempotency_after_recreate_at_same_uri(
+        #[case] key: &str,
+        #[case] is_duplicate: bool,
+    ) {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let original = create_append_test_dataset(uri).await;
+        let old_append = stage_append(original.clone(), -1, "old-job").await;
+        let old_uuid = old_append.uuid.clone();
+        let original = CommitBuilder::new(original)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(old_append)
+            .await
+            .unwrap();
+        let session = original.session.clone();
+        std::fs::remove_dir_all(uri).unwrap();
+
+        let recreated = create_append_test_dataset(uri).await;
+        let mut new_append = stage_append(recreated.clone(), 1, "new-job").await;
+        // A spilled transaction is not prefetched when version 2 is loaded.
+        // This leaves the original table's cached version 2 in the session.
+        Arc::make_mut(new_append.transaction_properties.as_mut().unwrap())
+            .insert("padding".into(), "x".repeat(MAX_INLINE_TRANSACTION_BYTES));
+        let recreated = CommitBuilder::new(recreated)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(new_append)
+            .await
+            .unwrap();
+        assert_eq!(recreated.version().version, 2);
+        assert!(recreated.manifest.transaction_section.is_none());
+
+        let base = Arc::new(
+            DatasetBuilder::from_uri(uri)
+                .with_session(session)
+                .with_version(1)
+                .load()
+                .await
+                .unwrap(),
+        );
+        let (_, cached) =
+            load_and_sort_new_transactions(&base, TransactionReadSource::SessionCache)
+                .await
+                .unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].0, 2);
+        assert_eq!(cached[0].1.uuid, old_uuid);
+
+        let append = stage_append(base.clone(), 2, key).await;
+        let result = CommitBuilder::new(base)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(append)
+            .await;
+        let latest = Dataset::open(uri).await.unwrap();
+        let (expected_version, expected_values) = if is_duplicate {
+            let error = result.unwrap_err();
+            assert_eq!(error.append_already_committed_version(), Some(2));
+            (2, vec![0, 1])
+        } else {
+            assert_eq!(result.unwrap().version().version, 3);
+            (3, vec![0, 1, 2])
+        };
+        assert_eq!(latest.version().version, expected_version);
+        assert_eq!(
+            latest.scan().try_into_batch().await.unwrap(),
+            simple_batch(&simple_schema(), expected_values),
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None)]
+    #[case::empty(Some(""))]
+    #[tokio::test]
+    async fn test_append_idempotency_requires_a_key(#[case] key: Option<&str>) {
+        let mut transaction = Transaction::new(1, Operation::Append { fragments: vec![] }, None);
+        transaction.transaction_properties = key.map(|key| {
+            Arc::new(HashMap::from([(
+                APPEND_KEY_PROPERTY.to_string(),
+                key.to_string(),
+            )]))
+        });
+        let error = CommitBuilder::new("memory://")
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("requires a nonempty transaction property")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_idempotency_refuses_missing_history() {
+        let tmp = TempStrDir::default();
+        let dataset = create_append_test_dataset(tmp.as_str()).await;
+        let transaction = stage_append(dataset.clone(), 1, "job-a").await;
+        let builder = CommitBuilder::new(dataset.clone())
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY);
+        let winner = builder.clone().execute(transaction.clone()).await.unwrap();
+        let other = stage_append(dataset.clone(), 2, "job-b").await;
+        assert_eq!(builder.execute(other).await.unwrap().version().version, 3);
+        dataset
+            .table_state
+            .object_store
+            .delete(&winner.table_state.manifest_location.path)
+            .await
+            .unwrap();
+
+        let latest = Arc::new(Dataset::open(tmp.as_str()).await.unwrap());
+        let error = CommitBuilder::new(latest)
+            .with_append_idempotency_property(APPEND_KEY_PROPERTY)
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { version: 3, .. }));
+        assert!(error.to_string().contains("missing at versions [2]"));
+        let latest = Dataset::open(tmp.as_str()).await.unwrap();
+        assert_eq!(latest.version().version, 3);
+        assert_eq!(latest.count_rows(None).await.unwrap(), 3);
+    }
+
     /// A commit whose manifest lands but is reported as a conflict (the
     /// incident shape: successful conditional PUT, response lost, internal
     /// retry sees "already exists") must be recognized as our own commit and
@@ -3921,20 +4960,21 @@ mod tests {
             Operation::Append { fragments: vec![] },
             None,
         );
-        let write_config = ManifestWriteConfig::default().with_transaction_file_disabled();
+        let build_config = ManifestBuildConfig::default().with_disable_transaction_file(true);
+        let commit_config = CommitConfig::default();
 
         handler.fail_next(AmbiguousFailure::LandAndConflict);
         let (manifest, _) = commit_transaction(
             &dataset,
-            dataset.object_store.as_ref(),
+            dataset.table_state.object_store.as_ref(),
             handler.as_ref(),
             &transaction,
-            &write_config,
-            &CommitConfig::default(),
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
-            dataset.manifest_location.naming_scheme,
-            None,
-            None,
+            CommitTransactionOptions::new(
+                &build_config,
+                &commit_config,
+                dataset.table_state.manifest_location.naming_scheme,
+            )
+            .with_retry_timeout(DEFAULT_COMMIT_RETRY_TIMEOUT),
         )
         .await
         .expect("the inline transaction must identify the landed commit");
@@ -4181,7 +5221,8 @@ mod tests {
             &[ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_2],
         );
 
-        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+        lance_table::format::storage_contract::finalize_manifest_storage_version(&mut manifest)
+            .unwrap();
 
         assert_ne!(
             manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
@@ -4200,7 +5241,8 @@ mod tests {
             make_storage_contract_manifest(ConcreteFileVersion::V2_1, &[ConcreteFileVersion::V1]);
 
         let err =
-            crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap_err();
+            lance_table::format::storage_contract::finalize_manifest_storage_version(&mut manifest)
+                .unwrap_err();
 
         assert!(err.to_string().contains("cannot be mixed"), "{err}");
         assert_eq!(
@@ -4277,7 +5319,8 @@ mod tests {
             ConcreteFileVersion::V1
         );
 
-        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+        lance_table::format::storage_contract::finalize_manifest_storage_version(&mut manifest)
+            .unwrap();
 
         assert_eq!(
             manifest.data_storage_format.lance_file_format(),
@@ -4871,5 +5914,109 @@ mod tests {
         // The comparison `verify_commit_outcome` performs: read-back durable
         // form against the regenerated durable form of this attempt.
         assert_eq!(read_back, pb::Transaction::try_from(&transaction).unwrap());
+    }
+
+    /// The manifest message of the file `dataset` was committed to, without
+    /// its length prefix.
+    async fn committed_manifest_message(dataset: &Dataset) -> Vec<u8> {
+        let location = dataset.manifest_location();
+        let file = dataset
+            .table_state
+            .object_store
+            .read_one_all(&location.path)
+            .await
+            .unwrap();
+        let footer = file.len() - 16;
+        let pos = i64::from_le_bytes(file[footer..footer + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;
+        assert_eq!(pos + 4 + len, footer);
+        file[pos + 4..footer].to_vec()
+    }
+
+    /// The committed message is byte-identical to encoding the committed
+    /// manifest from scratch.
+    async fn assert_committed_manifest_matches(dataset: &Dataset) {
+        use prost::Message;
+
+        assert_eq!(
+            committed_manifest_message(dataset).await,
+            lance_table::format::pb::Manifest::from(dataset.manifest.as_ref()).encode_to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_manifests_match_fresh_encoding() {
+        let test_dir = TempStrDir::default();
+        let rows = |start: i32| {
+            gen_batch()
+                .col("i", array::step_custom::<Int32Type>(start, 1))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(2))
+        };
+        let params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write(rows(0), &test_dir, Some(params.clone()))
+            .await
+            .unwrap();
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Append.
+        dataset
+            .append(rows(20), Some(params.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 4);
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Update: fragment 0 is rewritten entirely (removed), fragment 1 in
+        // part (updated with a deletion file), and the new rows are added.
+        let dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i < 15")
+            .unwrap()
+            .set("i", "i + 1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let ids: Vec<u64> = dataset.manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert!(dataset.manifest.fragments[0].deletion_file.is_some());
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Delete: fragment 2 entirely, fragment 3 in part.
+        let mut dataset = dataset.as_ref().clone();
+        dataset.delete("i >= 20 AND i < 35").await.unwrap();
+        let ids: Vec<u64> = dataset.manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1, 3, 4]);
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Rewrite: compaction replaces the fragments with deletions.
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.deletion_file.is_none())
+        );
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Cold start: commit after reopening the dataset.
+        let mut dataset = Dataset::open(&test_dir).await.unwrap();
+        dataset.delete("i = 1001").await.unwrap();
+        assert_committed_manifest_matches(&dataset).await;
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
     }
 }

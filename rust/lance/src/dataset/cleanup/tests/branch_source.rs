@@ -129,7 +129,7 @@ async fn cleanup_keeps_files_read_by_legacy_branches() {
         .await
         .unwrap();
     let expected = child.scan().try_into_batch().await.unwrap();
-    let legacy = Dataset::write(
+    Dataset::write(
         some_batch(),
         Arc::new(legacy),
         write_params(WriteMode::Overwrite),
@@ -139,17 +139,27 @@ async fn cleanup_keeps_files_read_by_legacy_branches() {
     fixture.overwrite_some_data().await.unwrap();
     // Lance 2.x and earlier write branch files with neither `identifier` nor `metadata`.
     for name in ["legacy", "legacy/child"] {
-        let path = branch_contents_path(&main.base, name);
-        let mut contents: serde_json::Value =
-            serde_json::from_slice(&main.object_store.read_one_all(&path).await.unwrap()).unwrap();
+        let path = branch_contents_path(&main.table_state.base, name);
+        let mut contents: serde_json::Value = serde_json::from_slice(
+            &main
+                .table_state
+                .object_store
+                .read_one_all(&path)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let contents_map = contents.as_object_mut().unwrap();
         contents_map.remove("identifier");
         contents_map.remove("metadata");
-        main.object_store
+        main.table_state
+            .object_store
             .put(&path, &serde_json::to_vec(&contents).unwrap())
             .await
             .unwrap();
     }
+    // Open after rewriting the refs so the handle captures the legacy identifier.
+    let legacy = main.checkout_version(("legacy", None)).await.unwrap();
 
     MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
     let before = utc_now() - TimeDelta::try_days(8).unwrap();

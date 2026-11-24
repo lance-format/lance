@@ -3,12 +3,15 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+mod prewarm;
+
 use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
 use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
 use crate::vector::bq::planes::{EntryColumns, PlaneBatch, PlaneKey, plane_columns};
 use crate::vector::bq::resident::{
     ResidentColumnStore, ResidentLoadTrigger, ResidentRows, is_resident,
 };
+use crate::vector::bq::row_addresses::{TranslatedRowAddresses, TranslatedRowAddressesKey};
 use crate::vector::bq::scan_stats;
 use crate::vector::bq::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQueryEstimator};
 use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
@@ -29,12 +32,15 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, ReaderProjection};
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, remap_row_ids_async, remap_row_ids_preserving_layout_async,
+};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
 use lance_io::spill::SpillStore;
 use lance_linalg::distance::DistanceType;
+use lance_select::RowAddrMask;
 use prost::Message;
 use std::{
     any::Any,
@@ -157,6 +163,12 @@ pub trait DistCalculator {
 
     fn prefetch(&self, _id: u32) {}
 
+    /// Whether the final score of `id`, scored `dist` by [`Self::distance`], lies
+    /// in `[lower, upper)`; [`VectorStore::rerank`] may replace `dist`.
+    fn in_range(&self, _id: u32, dist: f32, lower: f32, upper: f32) -> bool {
+        dist >= lower && dist < upper
+    }
+
     /// Whether [`Self::accumulate_topk_with_scratch`] can replace scoring every
     /// row with [`Self::distance_all`] and pushing each score into a top-k heap.
     ///
@@ -184,12 +196,42 @@ pub trait DistCalculator {
         u8_scratch: &mut Vec<u8>,
         u32_scratch: &mut Vec<u32>,
     ) {
+        self.accumulate_topk_with_mask(
+            k,
+            lower_bound,
+            upper_bound,
+            row_id,
+            None,
+            res,
+            dists,
+            u16_scratch,
+            u8_scratch,
+            u32_scratch,
+        );
+    }
+
+    /// Accumulate a dense scan. A masked-out row must never contribute to the
+    /// heap or to any threshold used to prune future candidates.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_mask(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        mask: Option<&RowAddrMask>,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
         if k == 0 {
             return;
         }
 
         self.distance_all_with_scratch(k, dists, u16_scratch, u8_scratch, u32_scratch);
-        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, mask, res, dists);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -243,6 +285,7 @@ pub(crate) fn accumulate_distances_into_heap(
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
     row_id: impl Fn(u32) -> u64,
+    mask: Option<&RowAddrMask>,
     res: &mut BinaryHeap<OrderedNode<u64>>,
     dists: &[f32],
 ) {
@@ -251,18 +294,28 @@ pub(crate) fn accumulate_distances_into_heap(
     let mut max_dist = res.peek().map(|node| node.dist);
 
     for (id, dist) in dists.iter().copied().enumerate() {
+        // Nearly every row of a full heap loses to its worst entry; one plain
+        // float compare settles those before the total-order compares below.
+        // A NaN fails this test and takes the ordered path unchanged.
+        if res.len() >= k && max_dist.is_some_and(|max_dist| dist >= max_dist.0) {
+            continue;
+        }
         let dist = OrderedFloat(dist);
         if dist < lower_bound || dist >= upper_bound {
             continue;
         }
+        let row_id = row_id(id as u32);
+        if mask.is_some_and(|mask| !mask.selected(row_id)) {
+            continue;
+        }
         if res.len() < k {
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            res.push(OrderedNode::new(row_id, dist));
             if res.len() == k {
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
             res.pop();
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            res.push(OrderedNode::new(row_id, dist));
             max_dist = res.peek().map(|node| node.dist);
         }
     }
@@ -661,6 +714,32 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
         selected
             .iter()
             .all(|other| candidate.dist < OrderedFloat(dist_cal_candidate.distance(other.id)))
+    }
+
+    /// The calculator a graph search walks with; [`Self::rerank`] corrects it.
+    fn graph_dist_calculator(
+        &self,
+        query: ArrayRef,
+        dist_q_c: f32,
+    ) -> Self::DistanceCalculator<'_> {
+        self.dist_calculator(query, dist_q_c)
+    }
+
+    /// Prepares a partition's storage for searches over its graph.
+    fn for_graph_search(self) -> Self {
+        self
+    }
+
+    /// Re-scores and re-sorts the candidates of a graph search. Returns
+    /// `false`, the default, when the search scores are final.
+    fn rerank(&self, _query: ArrayRef, _dist_q_c: f32, _results: &mut [OrderedNode]) -> bool {
+        false
+    }
+
+    /// Gives a partition's storage its IVF `centroid` before a graph build; RQ
+    /// stages its rows for code-to-code scoring with it.
+    fn with_centroid(self, _centroid: &dyn Array) -> Result<Self> {
+        Ok(self)
     }
 }
 
@@ -1342,6 +1421,8 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Address-only views under the current file and translation identity.
+    row_address_cache: Option<WeakLanceCache>,
     /// See [`Self::origin_latency`].
     origin_latency: OriginLatencyClass,
     /// See [`Self::resident_columns`].
@@ -1450,6 +1531,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
             resident_columns_enabled: false,
@@ -1470,9 +1552,19 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ) -> Self {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::from_cached_with_remapper(reader, ivf, metadata, distance_type, frag_reuse_index)
+        Self::from_cached_with_remapper(
+            reader,
+            ivf,
+            metadata,
+            distance_type,
+            frag_reuse_index,
+            None,
+        )
     }
 
+    /// `quantizer` is one built earlier for the same metadata, so that
+    /// reconstructing an index does not rebuild it (and its prepared targets)
+    /// from the metadata each time.
     #[doc(hidden)]
     pub fn from_cached_with_remapper(
         reader: FileReader,
@@ -1480,9 +1572,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         metadata: Q::Metadata,
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        quantizer: Option<Quantizer>,
     ) -> Self {
         let quantizer = if Q::retain_quantizer_for_partition_storage() {
-            Q::from_metadata(&metadata, distance_type).ok()
+            quantizer.or_else(|| Q::from_metadata(&metadata, distance_type).ok())
         } else {
             None
         };
@@ -1494,6 +1587,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
             resident_columns_enabled: false,
@@ -1511,6 +1605,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.frag_reuse_index = None;
         self.batch_remapper = Some(remapping);
         debug_assert!(self.frag_reuse_index.is_none() || self.batch_remapper.is_none());
+        self
+    }
+
+    /// Cache translated candidate addresses without retaining encoded columns.
+    ///
+    /// The caller must scope `cache` to both the immutable file location and
+    /// the current segment translation, including coverage and exclusions.
+    /// Query filters and current deletion masks are applied after this view.
+    pub fn with_row_address_cache(mut self, cache: WeakLanceCache) -> Self {
+        self.row_address_cache = Some(cache);
         self
     }
 
@@ -1673,6 +1777,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.partition_size(part_id)
     }
 
+    /// The quantizer this storage keeps, if its quantization retains one.
+    /// Unlike [`Self::quantizer`], never builds one from the metadata.
+    pub fn retained_quantizer(&self) -> Option<&Quantizer> {
+        self.quantizer.as_ref()
+    }
+
     pub fn quantizer(&self) -> Result<Quantizer> {
         match &self.quantizer {
             Some(quantizer) => Ok(quantizer.clone()),
@@ -1713,6 +1823,64 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         } else {
             Ok((batch, self.frag_reuse_index.clone()))
         }
+    }
+
+    /// Where each stored row of partition `part_id` sits in the storage
+    /// [`Self::load_partition`] builds: `Some(position)` for a row the
+    /// row-ID remapping keeps, `None` for one it drops. Surviving rows keep
+    /// their stored order, as every quantizer storage keeps them.
+    ///
+    /// Reads only the row-ID column. Errors if the storage has no remapping,
+    /// since no row is dropped then.
+    pub async fn partition_row_positions(
+        &self,
+        part_id: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<Vec<Option<u32>>> {
+        let batch = self
+            .read_file_columns(self.ivf.row_range(part_id), &[ROW_ID], io_stats)
+            .await?;
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .and_then(|ids| ids.as_primitive_opt::<UInt64Type>())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "partition {part_id} storage needs a uint64 {ROW_ID} column"
+                ))
+            })?;
+        let is_kept: Vec<bool> = if let Some(remapper) = &self.batch_remapper {
+            // Null addresses are dropped as tombstones by the batch remapping.
+            let ids: Vec<u64> = row_ids
+                .iter()
+                .map(|id| id.unwrap_or(RowAddress::TOMBSTONE_ROW))
+                .collect();
+            remap_row_ids_async(remapper.as_ref(), &ids)
+                .await?
+                .into_iter()
+                .map(|id| id.is_some_and(|id| id != RowAddress::TOMBSTONE_ROW))
+                .collect()
+        } else if let Some(remapper) = &self.frag_reuse_index {
+            row_ids
+                .values()
+                .iter()
+                .map(|&id| remapper.remap_row_id(id).is_some())
+                .collect()
+        } else {
+            return Err(Error::internal(format!(
+                "partition {part_id} storage has no row-ID remapping to drop rows"
+            )));
+        };
+        let mut num_kept = 0u32;
+        Ok(is_kept
+            .into_iter()
+            .map(|is_kept| {
+                is_kept.then(|| {
+                    let position = num_kept;
+                    num_kept += 1;
+                    position
+                })
+            })
+            .collect())
     }
 
     /// Load a partition's quantization storage, optionally measuring the exact
@@ -1959,53 +2127,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         Ok((storage, hit))
     }
 
-    /// Warm every plane entry a full-precision scan reads. Backend admission
-    /// enforces its byte budget.
-    ///
-    /// A backend that gates lower planes on their sign plane is warmed plane
-    /// by plane: all sign planes first, then the other planes of partitions
-    /// whose sign plane stayed resident. Other backends admit plane entries
-    /// like any entry, so they are warmed partition by partition, which loads
-    /// (and persists) every plane whatever fits in RAM, as the native
-    /// partition prewarm does.
-    pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
-        let planes = [0, 1];
-        if !cache.plane_admission_gated() {
-            for part_id in 0..self.num_partitions() {
-                for &plane in &planes {
-                    cache
-                        .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                            Ok(plane_cache_entry(
-                                self.read_plane_entry(part_id, plane, None).await?,
-                            ))
-                        })
-                        .await?;
-                }
-            }
-            return Ok(());
-        }
-        for &plane in &planes {
-            for part_id in 0..self.num_partitions() {
-                if plane > 0
-                    && cache
-                        .get_resident_with_key(&self.plane_key(part_id, 0))
-                        .await
-                        .is_none()
-                {
-                    continue;
-                }
-                cache
-                    .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                        Ok(plane_cache_entry(
-                            self.read_plane_entry(part_id, plane, None).await?,
-                        ))
-                    })
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
     /// Whether this file exposes the current RaBitQ sign/ex plane primitives.
     /// Historical native encodings and one-bit indices keep their ordinary
     /// partition reader; they are not adapted into the new scan path.
@@ -2125,9 +2246,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
         let sign_resident = plane == 0
             || cache
-                .get_resident_with_key(&self.plane_key(part_id, 0))
-                .await
-                .is_some();
+                .peek_resident_with_key(&self.plane_key(part_id, 0))
+                .await;
         let batch = if sign_resident {
             cache
                 .get_or_insert_with_key_hit(key, || async {
@@ -2341,35 +2461,58 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                         "sign preparation requires non-null uint64 column {ROW_ID}"
                     ))
                 })?;
-            if let Some(remapper) = &self.batch_remapper {
-                remap_row_ids_preserving_layout_async(remapper.as_ref(), sign, row_id_idx)
+            let translate = || async {
+                let started = Instant::now();
+                let ids = if let Some(remapper) = &self.batch_remapper {
+                    remap_row_ids_async(remapper.as_ref(), row_ids.values())
+                        .await?
+                        .into_iter()
+                        .map(|id| id.unwrap_or(RowAddress::TOMBSTONE_ROW))
+                        .collect::<Vec<_>>()
+                } else if let Some(remapper) = &self.frag_reuse_index {
+                    let remapper = remapper.clone();
+                    let row_ids = row_ids.clone();
+                    spawn_cpu(move || {
+                        Ok::<_, Error>(
+                            row_ids
+                                .values()
+                                .iter()
+                                .map(|&id| {
+                                    remapper
+                                        .remap_row_id(id)
+                                        .unwrap_or(RowAddress::TOMBSTONE_ROW)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
                     .await?
-                    .0
-            } else if let Some(remapper) = &self.frag_reuse_index {
-                let remapper = remapper.clone();
-                let row_ids = row_ids.clone();
-                spawn_cpu(move || {
-                    let mut translated: Option<Vec<u64>> = None;
-                    for (offset, &id) in row_ids.values().iter().enumerate() {
-                        let mapped = remapper
-                            .remap_row_id(id)
-                            .unwrap_or(RowAddress::TOMBSTONE_ROW);
-                        if mapped != id {
-                            translated.get_or_insert_with(|| row_ids.values().to_vec())[offset] =
-                                mapped;
-                        }
+                } else {
+                    return Err(Error::internal(
+                        "candidate address translation has no remapper",
+                    ));
+                };
+                // Own precisely this partition's addresses. An identity map
+                // must not pin a slice of the whole resident file store.
+                let stats = scan_stats::counters();
+                stats.row_address_translation_rows.add(ids.len() as u64);
+                stats.row_address_translation_ns.add_elapsed(started);
+                Ok(TranslatedRowAddresses(UInt64Array::from(ids)))
+            };
+            let addresses = match &self.row_address_cache {
+                Some(cache) => {
+                    let (addresses, hit) = cache
+                        .get_or_insert_with_key_hit(TranslatedRowAddressesKey(part_id), translate)
+                        .await?;
+                    if hit {
+                        scan_stats::counters().row_address_cache_hits.incr();
+                    } else {
+                        scan_stats::counters().row_address_cache_misses.incr();
                     }
-                    match translated {
-                        Some(ids) => {
-                            sign.replace_column_by_name(ROW_ID, Arc::new(UInt64Array::from(ids)))
-                        }
-                        None => Ok(sign),
-                    }
-                })
-                .await?
-            } else {
-                sign
-            }
+                    addresses
+                }
+                None => Arc::new(translate().await?),
+            };
+            sign.replace_column_by_name(ROW_ID, Arc::new(addresses.0.clone()))?
         } else {
             sign
         };

@@ -689,34 +689,45 @@ impl ExecutionPlan for MatchQueryExec {
                     operator: query.operator,
                 })
             } else {
-                let base_scorer = match (preset_base_scorer, shared_scorer) {
-                    (Some(scorer), _) => Some(scorer),
-                    (None, Some(shared_scorer)) => Some(shared_scorer.wait().await?),
-                    (None, None) => None,
+                let (base_scorer, shared_prepared) = match (preset_base_scorer, shared_scorer) {
+                    (Some(scorer), _) => (Some(scorer), None),
+                    (None, Some(shared_scorer)) => {
+                        let (scorer, prepared) = shared_scorer.wait_with_prepared().await?;
+                        (Some(scorer), prepared)
+                    }
+                    (None, None) => (None, None),
                 };
-                if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
-                    return Err(DataFusionError::Execution(
-                        "fuzzy MatchQuery cannot use a scorer-only override; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_query"
-                            .to_string(),
-                    ));
+                if let Some(prepared_query) = shared_prepared {
+                    Arc::new(PreparedMatch {
+                        query: prepared_query,
+                        params: Arc::new(params),
+                        operator: query.operator,
+                    })
+                } else {
+                    if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
+                        return Err(DataFusionError::Execution(
+                            "fuzzy MatchQuery cannot use a scorer-only override; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_query"
+                                .to_string(),
+                        ));
+                    }
+                    let builds_local_scorer = base_scorer.is_none();
+                    let scorer_start = std::time::Instant::now();
+                    let prepared = Arc::new(
+                        PreparedMatch::new(
+                            &indices,
+                            tokens,
+                            params,
+                            query.operator,
+                            metrics.as_ref(),
+                            base_scorer,
+                        )
+                        .await?,
+                    );
+                    if builds_local_scorer {
+                        metrics.record_scorer_build(scorer_start.elapsed());
+                    }
+                    prepared
                 }
-                let builds_local_scorer = base_scorer.is_none();
-                let scorer_start = std::time::Instant::now();
-                let prepared = Arc::new(
-                    PreparedMatch::new(
-                        &indices,
-                        tokens,
-                        params,
-                        query.operator,
-                        metrics.as_ref(),
-                        base_scorer,
-                    )
-                    .await?,
-                );
-                if builds_local_scorer {
-                    metrics.record_scorer_build(scorer_start.elapsed());
-                }
-                prepared
             };
 
             pre_filter.wait_for_ready().await?;

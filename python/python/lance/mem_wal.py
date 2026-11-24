@@ -204,8 +204,21 @@ class ShardWriter:
         """UUID string for this writer's shard."""
         return self._raw.shard_id
 
-    def put(self, data, *, schema: Optional[pa.Schema] = None) -> None:
+    def put(
+        self,
+        data,
+        *,
+        schema: Optional[pa.Schema] = None,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
         """Write data to the MemWAL.
+
+        Input is buffered for one atomic write. Reading stops at the first batch
+        that exceeds ``max_bytes`` or the writer's ``max_memtable_rows`` cap.
+        Limit errors, reader errors, and interrupts during input buffering write
+        nothing. A WAL error or interrupt after submission may leave the write
+        applied; this method does not split input into partial writes.
+        Exceptions raised by Python readers propagate to the caller.
 
         Parameters
         ----------
@@ -215,19 +228,41 @@ class ShardWriter:
             DataFrame, etc.
         schema : pa.Schema, optional
             Schema hint, needed when *data* is a generator.
+        max_bytes : int, default 268435456 (256 MiB)
+            Positive byte budget for owned Arrow array memory and batch
+            structures. Each batch is copied, including nested and dictionary
+            buffers, to release foreign owners such as NumPy views. The reader
+            must produce a batch before it can be copied and checked, so peak
+            input memory can exceed this budget by one incoming batch and its
+            owned copy. A single oversized copy is rejected without splitting
+            it. This budget excludes the writer's WAL, memtables, and indices.
 
         Raises
         ------
         IOError
-            On WAL flush failure.
-        RuntimeError
-            If the writer has already been closed.
+            If an input limit is exceeded, WAL flush fails, or the writer has
+            already been closed.
+
+        Examples
+        --------
+        ::
+
+            with dataset.mem_wal_writer(shard_id) as writer:
+                writer.put(reader, max_bytes=64 * 1024 * 1024)
         """
         reader = _coerce_reader(data, schema)
-        self._raw.put(reader)
+        self._raw.put(reader, max_bytes=max_bytes)
 
-    def delete(self, keys, *, schema: Optional[pa.Schema] = None) -> None:
+    def delete(
+        self,
+        keys,
+        *,
+        schema: Optional[pa.Schema] = None,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
         """Delete rows by primary key from the MemWAL.
+
+        Uses the same atomic input buffering and failure semantics as :meth:`put`.
 
         Parameters
         ----------
@@ -237,14 +272,18 @@ class ShardWriter:
             the Rust core delete path.
         schema : pa.Schema, optional
             Schema hint, needed when *keys* is a generator.
+        max_bytes : int, default 268435456 (256 MiB)
+            Positive input byte budget, measured as in :meth:`put`, including
+            any non-key columns supplied by the reader. Reading stops on the
+            first batch exceeding this budget or ``max_memtable_rows``; nothing
+            is deleted. A single oversized batch is rejected. Peak input memory
+            can exceed the budget by one incoming batch and its owned copy.
 
         Raises
         ------
         IOError
-            If delete validation fails, WAL flush fails, or the writer has
-            already been closed. Delete validation is centralized in Rust and
-            includes checks for primary-key metadata and tombstone-compatible
-            nullable non-key columns.
+            If an input limit is exceeded, delete validation or WAL flush fails,
+            or the writer has already been closed.
 
         Examples
         --------
@@ -254,7 +293,7 @@ class ShardWriter:
                 writer.delete(pa.table({"id": [42]}))
         """
         reader = _coerce_reader(keys, schema)
-        self._raw.delete(reader)
+        self._raw.delete(reader, max_bytes=max_bytes)
 
     def close(self) -> None:
         """Flush and close the writer.

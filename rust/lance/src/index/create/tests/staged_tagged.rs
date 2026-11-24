@@ -227,6 +227,43 @@ async fn staged_segments_merge_after_stable_partition(#[case] index_type: IndexT
     assert_queries_match_scans(&dataset, true).await;
 }
 
+/// Bloom filter segments on a tagged history are not merged by their zones,
+/// which that merge cannot translate: a bounded plan keeps the index in one
+/// task, and optimize rebuilds it over the destinations.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn bloom_filter_segments_rebuild_on_a_tagged_table() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let s1 = staged_segment(&mut dataset, "i", IndexType::BloomFilter, vec![0]).await;
+    let s2 = staged_segment(&mut dataset, "i", IndexType::BloomFilter, vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![s1, s2])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+
+    let bounded = OptimizeOptions::merge(2).max_rows_per_task(Some(4));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &bounded)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].old_segments.len(), 2);
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        dataset.load_indices_by_name("staged").await.unwrap().len(),
+        1
+    );
+    assert_queries_match_scans(&dataset, true).await;
+}
+
 /// One staged contributor covers only part of the partition: the merge
 /// succeeds, the merged segment claims nothing the group cannot serve (its
 /// derived coverage is empty), and the queries scan.
@@ -426,6 +463,237 @@ async fn staged_segments_merge_across_deferred_compaction_on_tagged_table() {
         );
         assert_eq!(values(&dataset, Some(&predicate), true).await, vec![value]);
     }
+}
+
+/// A staged inverted segment whose metadata is still only under `staging/`:
+/// the fragment-masked distributed build writes partition metadata there and
+/// the root `metadata.lance` is published by the finalize that the commit
+/// runs. Reading that absence as the LEGACY layout makes the staged replay's
+/// withdrawal selector treat a modern segment as untranslatable, so a
+/// deferred compaction committed in the build's window withdraws exactly the
+/// coverage the merge is about to claim.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_inverted_segments_merge_across_deferred_compaction_on_tagged_table() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    // The appended rows the staged build indexes. Two hold the query term in
+    // another case form or inflection, which only the index's own analyzer
+    // (lowercasing and stemming) reaches; the bare tokenizer the flat path
+    // falls back to matches neither.
+    let texts = ["Running", "RUNS", "walked", "walking"];
+    let batch = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("text", lance_datagen::array::cycle_utf8_literals(&texts))
+        .into_batch_rows(lance_datagen::RowCount::from(4))
+        .unwrap();
+    let mut dataset = crate::dataset::InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: crate::dataset::WriteMode::Append,
+            max_rows_per_file: 2,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+    let appended: Vec<u32> = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .filter(|id| *id > 11)
+        .collect();
+    assert_eq!(appended.len(), 2, "{appended:?}");
+
+    // The distributed build: one fragment-masked worker segment each, never
+    // finalized, so neither has a root metadata file yet.
+    let s1 = staged_inverted_segment(&mut dataset, "text", vec![appended[0]]).await;
+    let s2 = staged_inverted_segment(&mut dataset, "text", vec![appended[1]]).await;
+    for segment in [&s1, &s2] {
+        assert!(
+            !root_metadata_exists(&dataset, segment).await,
+            "the staged build must not have published a root metadata file yet"
+        );
+    }
+
+    // The row set the staged configuration's analyzer defines for this query.
+    // Taken against the fallback tokenizer first: with no committed index on
+    // the column the flat path answers with a STRICTLY SMALLER set, so a
+    // withdrawn segment is detectable in the row set and not merely in the
+    // coverage bitmap.
+    let expected_ids = vec![8, 9];
+    let (fallback_ids, fallback_plan) = fts_ids(&dataset, "text", ANALYZER_SENSITIVE_QUERY).await;
+    assert!(
+        fallback_plan
+            .lines()
+            .any(|line| line.trim_start().starts_with("FlatMatchQuery:")),
+        "with no committed index on the column this baseline must come from \
+         the flat (fallback tokenizer) path: {fallback_plan}"
+    );
+    assert_ne!(
+        fallback_ids, expected_ids,
+        "the fallback tokenizer must answer differently from the staged \
+         analyzer, or the test cannot tell the two configurations apart: \
+         {fallback_plan}"
+    );
+
+    // A committed index over the appended fragments makes the compaction
+    // record a transition for them (uncovered fragments would compact plainly).
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("committed".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let compacted: Vec<u32> = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .filter(|id| !appended.contains(id) && *id > 11)
+        .collect();
+    assert_eq!(compacted.len(), 1, "{compacted:?}");
+    let destination: RoaringBitmap = compacted.iter().copied().collect();
+
+    let merged = dataset
+        .merge_existing_index_segments(vec![s1, s2])
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &destination,
+        "the staged replay must not withdraw a modern segment's coverage for \
+         a root metadata file the build has not published yet"
+    );
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![merged])
+        .await
+        .unwrap();
+
+    // Immediately after the replay committed, on the handle that performed
+    // it: the row set must already be the staged configuration's, so the
+    // answer never passes through the default tokenizer.
+    let (replayed_ids, replayed_plan) = fts_ids(&dataset, "text", ANALYZER_SENSITIVE_QUERY).await;
+    assert_eq!(
+        replayed_ids, expected_ids,
+        "the replayed segment must answer with its own tokenizer's row set: \
+         {replayed_plan}"
+    );
+
+    // Finalization happened at commit time, so the committed segment now has
+    // its root metadata and the reader derives the compacted coverage.
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert!(
+        root_metadata_exists(&dataset, &stored_segment(&dataset, "staged").await).await,
+        "the commit must have finalized the staged segment"
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(destination)
+    );
+
+    // The same row set the staged configuration defined, now answered through
+    // the finalized index rather than by a stemming flat scan.
+    let (final_ids, final_plan) = fts_ids(&dataset, "text", ANALYZER_SENSITIVE_QUERY).await;
+    assert!(
+        final_plan
+            .lines()
+            .any(|line| line.trim_start().starts_with("MatchQuery:")),
+        "the finalized segment must serve full-text search from the index: \
+         {final_plan}"
+    );
+    assert_eq!(
+        final_ids, expected_ids,
+        "the committed index must answer with the row set its own tokenizer \
+         defines, not the default tokenizer's stemmed superset: {final_plan}"
+    );
+}
+
+/// The staged build's inverted configuration. Its analyzer lowercases and
+/// stems; the tokenizer the flat path falls back to when no segment is
+/// available is a bare simple tokenizer that does neither. So a query in one
+/// case form matches a differently-cased or inflected document only through
+/// the index, which is what makes a withdrawn segment visible in the ROW SET
+/// and not merely in the coverage bitmap.
+fn analyzed_params() -> InvertedIndexParams {
+    InvertedIndexParams::default()
+        .lower_case(true)
+        .stem(true)
+        .remove_stop_words(false)
+}
+
+/// A lowercase query whose matches in the fixture are written in other case
+/// forms, so only the index's own analyzer finds them.
+const ANALYZER_SENSITIVE_QUERY: &str = "running";
+
+/// A fragment-masked uncommitted inverted build, as a distributed worker
+/// produces it.
+async fn staged_inverted_segment(
+    dataset: &mut Dataset,
+    column: &str,
+    fragments: Vec<u32>,
+) -> IndexMetadata {
+    let params = analyzed_params();
+    CreateIndexBuilder::new(dataset, &[column], IndexType::Inverted, &params)
+        .name("staged".to_string())
+        .fragments(fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap()
+}
+
+/// The sorted `i` values full-text search returns for `query` on `column`,
+/// with the plan, so a test can compare the ACTUAL matching row set rather
+/// than a count.
+async fn fts_ids(dataset: &Dataset, column: &str, query: &str) -> (Vec<i32>, String) {
+    let mut scan = dataset.scan();
+    scan.full_text_search(
+        FullTextSearchQuery::new(query.to_string())
+            .with_column(column.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    scan.project(&["i"]).unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids: Vec<i32> = batch["i"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    (ids, plan)
+}
+
+/// Whether the segment has published the root metadata file that marks a
+/// finalized inverted index.
+async fn root_metadata_exists(dataset: &Dataset, segment: &IndexMetadata) -> bool {
+    let path = dataset
+        .indices_dir()
+        .join(segment.uuid.to_string())
+        .join(lance_index::scalar::inverted::METADATA_FILE);
+    dataset
+        .table_state
+        .object_store
+        .exists(&path)
+        .await
+        .unwrap()
 }
 
 /// The NGram merge reads spill files and translates only through the v0
@@ -709,6 +977,104 @@ async fn staged_segments_rewritten_before_the_partition_are_validated_before_the
         values(&dataset, None, true).await,
         values(&dataset, None, false).await
     );
+}
+
+/// An in-place rewrite of `w = 9` (F2) narrows its segment to F1 while the
+/// segment's file keeps the old entry, and an append optimize indexes F2
+/// again, so the query must restrict each segment to its own coverage. A
+/// stable partition of F0 then leaves the other segment's stored bitmap on
+/// its retired source: that segment answers for the destinations the reader
+/// derives, and the restriction must keep those hits.
+#[rstest::rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn narrowed_segment_beside_a_translated_segment(#[case] index_type: IndexType) {
+    let dir = TempStrDir::default();
+    let dataset = disk_fixture(dir.as_str()).await;
+    let mut dataset = append_scalar_rows(dataset, 8, 4).await;
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, 2]);
+    let translated = staged_segment(&mut dataset, "i", index_type, vec![0]).await;
+    let narrowed = staged_segment(&mut dataset, "i", index_type, vec![1, 2]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![translated.clone(), narrowed.clone()])
+        .await
+        .unwrap();
+    rewrite_in_place(
+        dir.as_str(),
+        "i",
+        9,
+        Arc::new(arrow_array::Int32Array::from(vec![999])),
+    )
+    .await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0], 10).await;
+    assert_eq!(
+        dataset.table_state.fragment_bitmap.as_ref(),
+        &RoaringBitmap::from_iter([1u32, 2, 10, 11])
+    );
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+
+    let stored = stored_segments(&dataset, "staged").await;
+    assert!(!dataset.manifest.uses_stable_row_ids());
+    assert!(
+        stored
+            .iter()
+            .all(|segment| !segment.results_are_row_addrs()),
+        "without stable row ids the segments are labeled row-id domain"
+    );
+    let stored_bitmap = |uuid: Uuid| {
+        stored
+            .iter()
+            .find(|segment| segment.uuid == uuid)
+            .and_then(|segment| segment.fragment_bitmap.clone())
+            .unwrap()
+    };
+    assert_eq!(
+        stored_bitmap(translated.uuid),
+        RoaringBitmap::from_iter([0u32]),
+        "the stored bitmap keeps the retired source"
+    );
+    assert_eq!(
+        stored_bitmap(narrowed.uuid),
+        RoaringBitmap::from_iter([1u32]),
+        "the rewrite withdrew F2"
+    );
+    assert!(
+        stored.iter().any(|segment| segment.uuid != narrowed.uuid
+            && segment.fragment_bitmap.as_ref().unwrap().contains(2)),
+        "the append optimize indexes F2 again"
+    );
+    let listed = dataset.load_indices_by_name("staged").await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|segment| segment.uuid == translated.uuid)
+            .and_then(|segment| segment.fragment_bitmap.clone()),
+        Some(RoaringBitmap::from_iter([10u32, 11])),
+        "the reader derives the destinations"
+    );
+
+    let plan = dataset
+        .scan()
+        .filter("i = 9")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_eq!(
+        values(&dataset, Some("i = 9"), true).await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(values(&dataset, Some("i = 999"), true).await, vec![999]);
+    assert_scalar_queries_match(&dataset).await;
 }
 
 /// A committed vector index whose coverage an in-place rewrite of the
@@ -1900,6 +2266,120 @@ async fn v0_deferred_vector_segment_merge_keeps_the_legacy_version_pinned() {
     let (_, indexed) = nearest(&dataset, &query, total, true).await;
     assert_eq!(flat.len(), total);
     assert_eq!(indexed, flat, "every row is reachable through the index");
+}
+
+/// A committed bloom filter segment over a source a stable partition retired,
+/// which the reader translates, and over a live fragment rewritten in place:
+/// the default optimize indexes that fragment into the segment again. The
+/// rewritten fragment's old null rows go, and the retired source's zones and
+/// null rows are translated rather than dropped.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn bloom_filter_optimize_drops_rewritten_null_rows_on_a_tagged_history() {
+    let dir = TempStrDir::default();
+    // Three fragments of four rows; `value` is null where `i % 4 == 1`.
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("i", arrow_schema::DataType::Int32, false),
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true),
+        arrow_schema::Field::new("w", arrow_schema::DataType::Int32, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..12)),
+            Arc::new(arrow_array::Int32Array::from_iter(
+                (0..12).map(|i| (i % 4 != 1).then_some(i)),
+            )),
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..12)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BloomFilter,
+            Some("value_idx".into()),
+            &ScalarIndexParams::for_builtin(IndexType::BloomFilter.try_into().unwrap()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0], 10).await;
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+    let mut fragments = fragment_ids(&dataset);
+    fragments.sort_unstable();
+    assert_eq!(fragments, vec![1, 2, 10, 11]);
+    let stored = stored_segment(&dataset, "value_idx").await;
+    assert_eq!(
+        stored.fragment_bitmap.unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2])
+    );
+
+    // `w = 5` is the null of fragment 1.
+    rewrite_in_place(
+        dir.as_str(),
+        "value",
+        5,
+        Arc::new(arrow_array::Int32Array::from(vec![500])),
+    )
+    .await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        derived_coverage(&dataset, "value_idx").await,
+        Some(RoaringBitmap::from_iter([2u32, 10, 11]))
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(stored_segments(&dataset, "value_idx").await.len(), 1);
+    // Merged rather than rebuilt: the segment keeps the provenance it was
+    // stored with, where a rebuild would claim the live fragments.
+    assert_eq!(
+        stored_segment(&dataset, "value_idx")
+            .await
+            .fragment_bitmap
+            .unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2])
+    );
+    let plan = dataset
+        .scan()
+        .filter("value IS NULL")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("@value_idx(BloomFilter)"), "{plan}");
+    assert_eq!(
+        values(&dataset, Some("value IS NULL"), false).await,
+        vec![1, 9]
+    );
+    assert_eq!(
+        values(&dataset, Some("value IS NULL"), true).await,
+        vec![1, 9]
+    );
+    for value in [0, 2, 3, 4, 6, 7, 8, 10, 11, 500] {
+        let predicate = format!("value = {value}");
+        assert_eq!(
+            values(&dataset, Some(&predicate), true).await,
+            values(&dataset, Some(&predicate), false).await,
+            "{predicate}"
+        );
+    }
 }
 
 /// RTree on a tagged history: segments covering a stable partition's sources

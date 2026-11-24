@@ -224,7 +224,7 @@ pub async fn open_sstable(
     if let Some(warmer) = warmer {
         let warmer = Arc::clone(warmer);
         let path = path.to_string();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             if let Err(e) = warmer.warm(&path).await {
                 tracing::debug!(generation = %path, error = %e, "warm-on-open failed");
             }

@@ -20,6 +20,7 @@ use lance_table::rowids::read_row_ids;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::compute::concat_batches;
+use arrow_array::types::{Float32Type, Int64Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Int32Array, Int64Array, ListArray, RecordBatchIterator,
     StructArray, UInt32Array,
@@ -155,14 +156,14 @@ async fn test_fix_v0_8_0_broken_migration() {
     let physical_rows: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .map(|f| f.metadata.physical_rows)
+        .map(|f| f.metadata().physical_rows)
         .collect();
     assert_eq!(physical_rows, vec![Some(100), Some(2), Some(5)]);
     let num_deletions: Vec<_> = dataset
         .get_fragments()
         .iter()
         .map(|f| {
-            f.metadata
+            f.metadata()
                 .deletion_file
                 .as_ref()
                 .and_then(|df| df.num_deleted_rows)
@@ -826,6 +827,111 @@ async fn test_v10_0_0_dictionary_merged_past_key_type() {
         .map(|i| (i % 100 % 25 != 3).then(|| format!("v{i:03}")))
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+/// Lance 11.0.0 wrote a zero control-word byte before each value of the second file's
+/// full-zip pages while their layouts record no control-word bits. The binary column
+/// could not be read and the vector column read back shifted by one byte per value.
+/// A batch size of 3 rows reads each padded page in two parts.
+#[rstest]
+#[case::scan(None, None)]
+#[case::scan_small_batches(None, Some(3))]
+#[case::take(Some(vec![2, 5, 7]), None)]
+#[tokio::test]
+async fn test_v11_0_0_fullzip_padded_control_words(
+    #[case] rows: Option<Vec<u64>>,
+    #[case] batch_size: Option<usize>,
+) {
+    let test_dir = copy_test_data_to_tmp("v11.0.0/fullzip_padded_control_words.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let (batch, rows) = match rows {
+        Some(rows) => {
+            let schema = Arc::new(dataset.schema().clone());
+            (dataset.take(&rows, schema).await.unwrap(), rows)
+        }
+        None => {
+            let mut scan = dataset.scan();
+            if let Some(batch_size) = batch_size {
+                scan.batch_size(batch_size);
+            }
+            (scan.try_into_batch().await.unwrap(), (0..8).collect())
+        }
+    };
+    assert_eq!(batch.num_rows(), rows.len());
+    let binary = batch["binary"].as_fixed_size_list();
+    let vector = batch["vector"].as_fixed_size_list();
+    let binary_items = binary.values().as_struct().column_by_name("b").unwrap();
+    let binary_items = binary_items.as_binary::<i64>();
+    let vector_items = vector.values().as_struct().column_by_name("v").unwrap();
+    let vector_items = vector_items.as_fixed_size_list();
+    for (index, row) in rows.into_iter().enumerate() {
+        // Rows 0 and 1 are null lists.
+        assert_eq!(binary.is_valid(index), row >= 2, "row {row}");
+        assert_eq!(vector.is_valid(index), row >= 2, "row {row}");
+        if row < 2 {
+            continue;
+        }
+        for item in [row as u32 * 2, row as u32 * 2 + 1] {
+            let position = index * 2 + (item % 2) as usize;
+            assert_eq!(binary_items.value(position), item.to_le_bytes().repeat(75));
+            let expected = (item * 128..(item + 1) * 128)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vector_items
+                    .value(position)
+                    .as_primitive::<Float32Type>()
+                    .values(),
+                expected.as_slice()
+            );
+        }
+    }
+}
+
+/// `array_length` reads these pages through the list structure path, which skips the
+/// values.
+#[rstest]
+#[case::binary("binary")]
+#[case::vector("vector")]
+#[tokio::test]
+async fn test_v11_0_0_fullzip_padded_control_words_list_length(#[case] column: &str) {
+    let test_dir = copy_test_data_to_tmp("v11.0.0/fullzip_padded_control_words.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let expression = format!("array_length({column})");
+    let lengths = dataset
+        .scan()
+        .project_with_transform(&[("length", expression.as_str())])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let lengths = lengths["length"].as_primitive::<UInt64Type>();
+    let expected = (0..8)
+        .map(|row| (row >= 2).then_some(2))
+        .collect::<Vec<_>>();
+    assert_eq!(lengths.iter().collect::<Vec<_>>(), expected);
+}
+
+/// Lance 4.0.1 wrote a zero control-word byte before each value that a merge_insert
+/// updating only some columns stored, while the page layout records no control-word
+/// bits (#6338).
+#[tokio::test]
+async fn test_v4_0_1_merge_insert_padded_control_words() {
+    let test_dir = copy_test_data_to_tmp("v4.0.1/merge_insert_padded_control_words.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner.project(&["id", "a"]).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<Int64Type>();
+    let values = batch["a"].as_binary::<i32>();
+    let mut rows = (0..batch.num_rows())
+        .map(|row| (ids.value(row), values.value(row).to_vec()))
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, [(0, vec![1_u8; 256]), (1, vec![2_u8; 256])]);
 }
 
 // Helper: create a simple dataset with one fragment of `n` rows at the given URI.
@@ -1635,7 +1741,7 @@ async fn test_migrate_to_stable_row_ids_with_deletions() {
 
     // physical_rows counts the pre-deletion slots; row IDs must cover all of
     // them so that the deleted rows' IDs are never reused.
-    let physical_rows = dataset.get_fragments()[0].metadata.physical_rows.unwrap();
+    let physical_rows = dataset.get_fragments()[0].metadata().physical_rows.unwrap();
     assert_eq!(physical_rows, 10);
 
     dataset.migrate_to_stable_row_ids().await.unwrap();

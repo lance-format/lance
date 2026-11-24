@@ -22,9 +22,11 @@ use lance_arrow::{
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 
+use super::BlobWriteSources;
 use super::external::{
     ExternalBaseResolver, collect_external_blob_uris, normalize_external_absolute_uri,
 };
+use super::write_sources::BlobWriteObject;
 use crate::blob::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobIdAllocator, BlobObjectWriter, BlobRange,
     ManagedBlobLocation, blob_v2_layout, blob_v2_shape_error, sidecar_path_for_data_file,
@@ -39,6 +41,8 @@ use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 pub(super) const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
+// Some Reader implementations buffer a whole requested range.
+const BLOB_SOURCE_MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
 /// The `_blobs/<uuid>.blob` payload objects a write created.
 ///
@@ -181,9 +185,13 @@ impl BlobPack {
     async fn write(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
         let range = match source {
             BlobWriteSource::Bytes(data) => self.writer.write_blob(data).await?,
-            BlobWriteSource::External(source) => {
+            BlobWriteSource::Reader(source) => {
                 self.writer
-                    .write_blob_from_reader(source.reader.as_ref(), source.reader_range()?)
+                    .write_blob_from_reader(
+                        source.reader.as_ref(),
+                        source.reader_range()?,
+                        source.max_request_size,
+                    )
                     .await?
             }
         };
@@ -205,6 +213,8 @@ impl BlobPack {
 /// - Emits relative Managed addresses for dataset writes; low-level sidecar writers retain their existing descriptors.
 /// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
+    sidecar_rewrite: Option<Arc<super::SidecarRewrite>>,
+    copied_dedicated: HashMap<u32, BlobDescriptor>,
     managed_base: Option<(Option<u32>, Path)>,
     created_payloads: Option<BlobPayloadInventory>,
     object_store: ObjectStore,
@@ -225,21 +235,19 @@ pub struct BlobPreprocessor {
     source_store_params: ObjectStoreParams,
 }
 
-/// A logical slice of an external blob that can be materialized or streamed into Lance-managed
-/// storage.
-struct ExternalBlobSource {
+/// A resolved payload range that can be inlined or streamed into destination storage.
+struct BlobReaderSource {
     reader: Box<dyn Reader>,
     start: u64,
     size: u64,
+    max_request_size: usize,
 }
 
 /// A blob payload source used by packed and dedicated writers.
 ///
-/// Inline blobs still need an in-memory byte slice because they are embedded into the descriptor
-/// array, while external ingest can stream bytes from the source reader.
 enum BlobWriteSource<'a> {
     Bytes(&'a [u8]),
-    External(&'a ExternalBlobSource),
+    Reader(&'a BlobReaderSource),
 }
 
 #[derive(Clone, Debug)]
@@ -342,8 +350,8 @@ impl BlobPreprocessField {
     }
 }
 
-impl ExternalBlobSource {
-    /// Return the logical payload size after applying any external slice.
+impl BlobReaderSource {
+    /// Return the logical payload size after applying the source range.
     fn size(&self) -> u64 {
         self.size
     }
@@ -352,19 +360,19 @@ impl ExternalBlobSource {
     fn reader_range(&self) -> Result<Range<usize>> {
         let start = usize::try_from(self.start).map_err(|_| {
             Error::invalid_input(format!(
-                "External blob position {} does not fit into usize",
+                "Blob source position {} does not fit into usize",
                 self.start
             ))
         })?;
         let size = usize::try_from(self.size).map_err(|_| {
             Error::invalid_input(format!(
-                "External blob size {} does not fit into usize",
+                "Blob source size {} does not fit into usize",
                 self.size
             ))
         })?;
         let end = start.checked_add(size).ok_or_else(|| {
             Error::invalid_input(format!(
-                "External blob range overflows usize: position={}, size={}",
+                "Blob source range overflows usize: position={}, size={}",
                 self.start, self.size
             ))
         })?;
@@ -377,19 +385,25 @@ impl ExternalBlobSource {
             return Ok(bytes::Bytes::new());
         }
         let range = self.reader_range()?;
-        self.reader.get_range(range).await.map_err(Into::into)
+        let data = self.reader.get_range(range).await?;
+        if data.len() as u64 != self.size {
+            return Err(Error::io(format!(
+                "Blob source '{}' returned {} bytes, expected {}",
+                self.reader.path(),
+                data.len(),
+                self.size
+            )));
+        }
+        Ok(data)
     }
 }
 
 impl BlobWriteSource<'_> {
-    /// Return the payload size regardless of whether bytes come from memory or an external reader.
-    fn size(&self) -> usize {
+    /// Return the payload size for a value that can be packed.
+    fn size(&self) -> u64 {
         match self {
-            Self::Bytes(data) => data.len(),
-            Self::External(source) => source
-                .size()
-                .try_into()
-                .expect("packed and inline external blobs must fit into usize"),
+            Self::Bytes(data) => data.len() as u64,
+            Self::Reader(source) => source.size(),
         }
     }
 }
@@ -408,6 +422,7 @@ impl BlobPreprocessor {
         source_store_params: ObjectStoreParams,
         pack_file_size_override: Option<usize>,
     ) -> Result<Self> {
+        schema.check_blob_nesting(lance_core::datatypes::Field::is_blob_v2)?;
         let arrow_schema = arrow_schema::Schema::from(schema);
         let field_processors = arrow_schema
             .fields()
@@ -415,6 +430,8 @@ impl BlobPreprocessor {
             .map(|field| BlobPreprocessField::new(field.as_ref()))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            sidecar_rewrite: None,
+            copied_dedicated: HashMap::new(),
             managed_base: None,
             created_payloads: None,
             object_store,
@@ -431,6 +448,14 @@ impl BlobPreprocessor {
             source_store_registry,
             source_store_params,
         })
+    }
+
+    pub(in crate::dataset) fn with_sidecar_rewrite(
+        mut self,
+        context: Option<Arc<super::SidecarRewrite>>,
+    ) -> Self {
+        self.sidecar_rewrite = context;
+        self
     }
 
     pub(in crate::dataset) fn with_managed_base(
@@ -491,9 +516,13 @@ impl BlobPreprocessor {
             let mut writer = BlobObjectWriter::try_new(self.object_store.clone(), path).await?;
             let range = match source {
                 BlobWriteSource::Bytes(data) => writer.write_blob(data).await?,
-                BlobWriteSource::External(source) => {
+                BlobWriteSource::Reader(source) => {
                     writer
-                        .write_blob_from_reader(source.reader.as_ref(), source.reader_range()?)
+                        .write_blob_from_reader(
+                            source.reader.as_ref(),
+                            source.reader_range()?,
+                            source.max_request_size,
+                        )
                         .await?
                 }
             };
@@ -513,9 +542,13 @@ impl BlobPreprocessor {
         .await?;
         match source {
             BlobWriteSource::Bytes(data) => writer.write(data).await?,
-            BlobWriteSource::External(source) => {
+            BlobWriteSource::Reader(source) => {
                 writer
-                    .write_from_reader(source.reader.as_ref(), source.reader_range()?)
+                    .write_from_reader(
+                        source.reader.as_ref(),
+                        source.reader_range()?,
+                        source.max_request_size,
+                    )
                     .await?;
             }
         }
@@ -530,7 +563,7 @@ impl BlobPreprocessor {
         let max_pack_size = self
             .pack_file_size_override
             .unwrap_or(field_pack_file_threshold);
-        let len = source.size() as u64;
+        let len = source.size();
         let needs_new_pack = self.current_pack.as_ref().is_none_or(|pack| {
             pack.max_size != max_pack_size
                 || pack
@@ -575,14 +608,24 @@ impl BlobPreprocessor {
             .await
     }
 
-    async fn prepare_blob_for_part(
+    async fn prepare_blob_references(
         &mut self,
         array: ArrayRef,
         field: &ArrowField,
-        pack_file_threshold: usize,
-        writer_metadata: &HashMap<String, String>,
+        processor: &BlobPreprocessFieldKind,
+        write_sources: Option<(&Path, &BlobWriteSources)>,
     ) -> Result<(ArrayRef, Arc<ArrowField>)> {
-        validate_prepared_blob_array(field, &array)?;
+        let BlobPreprocessFieldKind::BlobV2 {
+            inline_threshold,
+            dedicated_threshold,
+            pack_file_threshold,
+            writer_metadata,
+        } = processor
+        else {
+            return Err(Error::internal(
+                "Prepared Blob is missing its write configuration",
+            ));
+        };
         let values = array.as_struct();
         let kinds = values
             .column_by_name("kind")
@@ -610,12 +653,14 @@ impl BlobPreprocessor {
             .as_primitive::<UInt64Type>();
         let mut output = self.blob_writer_with_metadata(field, writer_metadata.clone())?;
 
-        for row in 0..values.len() {
-            if values.is_null(row) {
-                continue;
-            }
-            match BlobKind::try_from(kinds.value(row))? {
-                BlobKind::Packed | BlobKind::Dedicated => {
+        if self.is_part && write_sources.is_none() {
+            for row in 0..values.len() {
+                if !values.is_null(row)
+                    && matches!(
+                        BlobKind::try_from(kinds.value(row))?,
+                        BlobKind::Packed | BlobKind::Dedicated
+                    )
+                {
                     let blob_id = blob_ids.value(row);
                     self.blob_id_allocator.reserve(blob_id).map_err(|error| {
                         Error::invalid_input(format!(
@@ -624,10 +669,6 @@ impl BlobPreprocessor {
                         ))
                     })?;
                 }
-                BlobKind::Inline
-                | BlobKind::External
-                | BlobKind::Managed
-                | BlobKind::ManagedWithBase => {}
             }
         }
 
@@ -639,25 +680,42 @@ impl BlobPreprocessor {
             match BlobKind::try_from(kinds.value(row))? {
                 BlobKind::Inline => {
                     let value = data.value(row);
-                    if value.is_empty() {
-                        output.push_inline(Bytes::new())?;
-                    } else {
+                    if self.is_part && !value.is_empty() {
                         let descriptor = self
-                            .write_packed(pack_file_threshold, BlobWriteSource::Bytes(value))
+                            .write_packed(*pack_file_threshold, BlobWriteSource::Bytes(value))
                             .await?;
                         output.push(descriptor)?;
+                    } else {
+                        output.push_inline(Bytes::copy_from_slice(value))?;
                     }
                 }
                 BlobKind::Packed => {
-                    output.push_packed(
-                        blob_ids.value(row),
-                        BlobRange {
-                            offset: positions.value(row),
-                            size: sizes.value(row),
-                        },
-                    )?;
+                    let id = blob_ids.value(row);
+                    let offset = positions.value(row);
+                    let size = sizes.value(row);
+                    if let Some((root, sources)) = write_sources {
+                        let source = sources.get(id, offset, size)?;
+                        let descriptor = self
+                            .write_registered_blob(
+                                source,
+                                root,
+                                *inline_threshold,
+                                *dedicated_threshold,
+                                *pack_file_threshold,
+                            )
+                            .await?;
+                        output.push(descriptor)?;
+                    } else {
+                        output.push_packed(id, BlobRange { offset, size })?;
+                    }
                 }
                 BlobKind::Dedicated => {
+                    if write_sources.is_some() {
+                        return Err(Error::invalid_input(format!(
+                            "Blob field '{}' row {row} must register existing Dedicated payloads as a write source",
+                            field.name()
+                        )));
+                    }
                     output.push_dedicated(blob_ids.value(row), sizes.value(row))?;
                 }
                 BlobKind::Managed | BlobKind::ManagedWithBase => {
@@ -683,6 +741,175 @@ impl BlobPreprocessor {
         Ok((array, Arc::new(field)))
     }
 
+    async fn write_registered_blob(
+        &mut self,
+        source: &BlobWriteObject,
+        root: &Path,
+        inline_threshold: usize,
+        dedicated_threshold: usize,
+        pack_file_threshold: usize,
+    ) -> Result<BlobDescriptor> {
+        let (store, path, start, size) = match source {
+            BlobWriteObject::Upload {
+                relative_path,
+                size,
+            } => {
+                let path = root.parts().chain(relative_path.parts()).collect();
+                let actual_size = self.object_store.size(&path).await?;
+                if actual_size != *size {
+                    return Err(Error::invalid_input(format!(
+                        "Blob upload '{relative_path}' has size {actual_size}, expected {size}"
+                    )));
+                }
+                if let Some((base_id, _)) = &self.managed_base {
+                    return Ok(BlobDescriptor::Managed {
+                        base_id: *base_id,
+                        uri: relative_path.to_string(),
+                        offset: 0,
+                        size: *size,
+                    });
+                }
+                (&self.object_store, path, 0, *size)
+            }
+            BlobWriteObject::Stored(file) => (
+                file.object_store().as_ref(),
+                file.data_path().clone(),
+                file.position(),
+                file.size(),
+            ),
+        };
+        if size == 0 {
+            return Ok(BlobDescriptor::Inline { data: Bytes::new() });
+        }
+        let source = BlobReaderSource {
+            reader: store.open(&path).await?,
+            start,
+            size,
+            max_request_size: BLOB_SOURCE_MAX_REQUEST_SIZE,
+        };
+        if size > dedicated_threshold as u64 {
+            self.write_dedicated(BlobWriteSource::Reader(&source)).await
+        } else if size > inline_threshold.min(INLINE_MAX) as u64 {
+            // Uploaded values may be much larger than the write's memory budget,
+            // even when the field allows an unusually high inline threshold.
+            self.write_packed(pack_file_threshold, BlobWriteSource::Reader(&source))
+                .await
+        } else {
+            Ok(BlobDescriptor::Inline {
+                data: source.read_all().await?,
+            })
+        }
+    }
+
+    /// Resolve task-local source IDs before descriptors reach the encoder.
+    /// Packed values stream through the rolling pack writer, so each output
+    /// retains only its live ranges. Dedicated objects can be copied whole.
+    async fn rewrite_sidecars(
+        &mut self,
+        array: ArrayRef,
+        field: &ArrowField,
+        pack_file_threshold: usize,
+        writer_metadata: &HashMap<String, String>,
+    ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        let context = self
+            .sidecar_rewrite
+            .clone()
+            .ok_or_else(|| Error::internal("Missing compaction sidecar context"))?;
+        let values = array.as_struct();
+        let kinds = values
+            .column_by_name("kind")
+            .expect("validated kind")
+            .as_primitive::<UInt8Type>();
+        let ids = values
+            .column_by_name("blob_id")
+            .expect("validated blob_id")
+            .as_primitive::<UInt32Type>();
+        let positions = values
+            .column_by_name("position")
+            .expect("validated position")
+            .as_primitive::<UInt64Type>();
+        let sizes = values
+            .column_by_name("blob_size")
+            .expect("validated blob_size")
+            .as_primitive::<UInt64Type>();
+        let data = values
+            .column_by_name("data")
+            .expect("validated data")
+            .as_binary::<i64>();
+        let uris = values
+            .column_by_name("uri")
+            .expect("validated uri")
+            .as_string::<i32>();
+        let mut output = self.blob_writer_with_metadata(field, writer_metadata.clone())?;
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                output.push_null()?;
+                continue;
+            }
+            let kind = BlobKind::try_from(kinds.value(row))?;
+            match kind {
+                BlobKind::Packed | BlobKind::Dedicated => {
+                    if kind == BlobKind::Packed && sizes.value(row) == 0 {
+                        // Empty ranges need no object access, including readers
+                        // that reject empty range requests.
+                        output.push_inline(Bytes::new())?;
+                        continue;
+                    }
+                    if kind == BlobKind::Dedicated
+                        && let Some(descriptor) = self.copied_dedicated.get(&ids.value(row))
+                    {
+                        output.push(descriptor.clone())?;
+                        continue;
+                    }
+                    let source = context.source(ids.value(row))?;
+                    let descriptor = if kind == BlobKind::Packed {
+                        let source = BlobReaderSource {
+                            reader: source.store.open(&source.path).await?,
+                            start: positions.value(row),
+                            size: sizes.value(row),
+                            max_request_size: usize::MAX,
+                        };
+                        self.write_packed(pack_file_threshold, BlobWriteSource::Reader(&source))
+                            .await?
+                    } else {
+                        let id = self.blob_id_allocator.next()?;
+                        let destination = lance_core::utils::blob::blob_path(
+                            &self.data_dir,
+                            &self.data_file_key,
+                            id,
+                        );
+                        source
+                            .store
+                            .copy_bulk(&source.path, &self.object_store, &destination)
+                            .await?;
+                        BlobDescriptor::Dedicated {
+                            blob_id: id,
+                            size: sizes.value(row),
+                        }
+                    };
+                    output.push(descriptor.clone())?;
+                    if kind == BlobKind::Dedicated {
+                        self.copied_dedicated.insert(ids.value(row), descriptor);
+                    }
+                }
+                BlobKind::Inline => output.push_inline(Bytes::copy_from_slice(data.value(row)))?,
+                BlobKind::External => output.push(BlobDescriptor::External {
+                    base_id: ids.value(row),
+                    uri: uris.value(row).to_string(),
+                    offset: positions.value(row),
+                    size: sizes.value(row),
+                })?,
+                BlobKind::Managed | BlobKind::ManagedWithBase => {
+                    return Err(Error::internal(
+                        "Managed reference in ordinary sidecar rewrite",
+                    ));
+                }
+            }
+        }
+        let (field, array) = output.finish()?.into_parts();
+        Ok((array, Arc::new(field)))
+    }
+
     async fn resolve_external_reference(&mut self, uri: &str) -> Result<(u32, String)> {
         let mapped = if let Some(resolver) = &self.external_base_resolver {
             resolver.resolve_external_uri(uri).await?
@@ -691,6 +918,19 @@ impl BlobPreprocessor {
         };
         if let Some(mapped) = mapped {
             return Ok((mapped.base_id, mapped.relative_path));
+        }
+
+        if self
+            .external_base_resolver
+            .as_ref()
+            .is_some_and(|resolver| {
+                resolver.unregistered_external_blob_policy
+                    == crate::session::UnregisteredExternalBlobPolicy::Deny
+            })
+        {
+            return Err(Error::invalid_input(
+                "Remote tables only support external blobs under registered storage bases",
+            ));
         }
 
         if self.allow_external_blob_outside_bases {
@@ -733,7 +973,7 @@ impl BlobPreprocessor {
         uri: &str,
         position: Option<u64>,
         size: Option<u64>,
-    ) -> Result<ExternalBlobSource> {
+    ) -> Result<BlobReaderSource> {
         let (object_store, path) = ObjectStore::from_uri_and_params(
             self.source_store_registry.clone(),
             uri,
@@ -749,18 +989,20 @@ impl BlobPreprocessor {
                         position, size
                     ))
                 })?;
-                Ok(ExternalBlobSource {
+                Ok(BlobReaderSource {
                     reader,
                     start: position,
                     size,
+                    max_request_size: usize::MAX,
                 })
             }
             (None, None) => {
                 let size = reader.size().await? as u64;
-                Ok(ExternalBlobSource {
+                Ok(BlobReaderSource {
                     reader,
                     start: 0,
                     size,
+                    max_request_size: usize::MAX,
                 })
             }
             _ => Err(Error::invalid_input(format!(
@@ -771,6 +1013,14 @@ impl BlobPreprocessor {
     }
 
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+        self.preprocess_batch_with_sources(batch, None).await
+    }
+
+    pub(in crate::dataset) async fn preprocess_batch_with_sources(
+        &mut self,
+        batch: &RecordBatch,
+        write_sources: Option<(&Path, &BlobWriteSources)>,
+    ) -> Result<RecordBatch> {
         self.validate_batch(batch).await?;
         let expected_columns = self.field_processors.len();
         if batch.num_columns() != expected_columns {
@@ -794,7 +1044,7 @@ impl BlobPreprocessor {
             .zip(batch_fields.iter())
         {
             let (new_column, new_field) = self
-                .preprocess_field(processor, array.clone(), field)
+                .preprocess_field(processor, array.clone(), field, write_sources)
                 .await?;
             new_columns.push(new_column);
             new_fields.push(new_field);
@@ -817,6 +1067,7 @@ impl BlobPreprocessor {
         processor: &'a BlobPreprocessField,
         array: ArrayRef,
         field: &'a Arc<ArrowField>,
+        write_sources: Option<(&'a Path, &'a BlobWriteSources)>,
     ) -> BoxFuture<'a, Result<(ArrayRef, Arc<ArrowField>)>> {
         async move {
             if blob_v2_layout(field.as_ref()) == Some(BlobV2Layout::Prepared) {
@@ -861,7 +1112,7 @@ impl BlobPreprocessor {
                     }
                 }
 
-                if self.is_part
+                if self.sidecar_rewrite.is_some()
                     && let BlobPreprocessFieldKind::BlobV2 {
                         pack_file_threshold,
                         writer_metadata,
@@ -869,11 +1120,22 @@ impl BlobPreprocessor {
                     } = &processor.kind
                 {
                     return self
-                        .prepare_blob_for_part(
+                        .rewrite_sidecars(
                             array,
                             field.as_ref(),
                             *pack_file_threshold,
                             writer_metadata,
+                        )
+                        .await;
+                }
+
+                if self.is_part || write_sources.is_some() {
+                    return self
+                        .prepare_blob_references(
+                            array,
+                            field.as_ref(),
+                            &processor.kind,
+                            write_sources,
                         )
                         .await;
                 }
@@ -899,17 +1161,27 @@ impl BlobPreprocessor {
                     .await
                 }
                 BlobPreprocessFieldKind::Struct { children } => {
-                    self.preprocess_struct_array(array, field.as_ref(), children)
+                    self.preprocess_struct_array(array, field.as_ref(), children, write_sources)
                         .await
                 }
                 BlobPreprocessFieldKind::List { child } => match field.data_type() {
                     ArrowDataType::List(_) => {
-                        self.preprocess_list_array::<i32>(array, field.as_ref(), child)
-                            .await
+                        self.preprocess_list_array::<i32>(
+                            array,
+                            field.as_ref(),
+                            child,
+                            write_sources,
+                        )
+                        .await
                     }
                     ArrowDataType::LargeList(_) => {
-                        self.preprocess_list_array::<i64>(array, field.as_ref(), child)
-                            .await
+                        self.preprocess_list_array::<i64>(
+                            array,
+                            field.as_ref(),
+                            child,
+                            write_sources,
+                        )
+                        .await
                     }
                     _ => Err(Error::internal(format!(
                         "Blob list preprocessor received non-list field '{}'",
@@ -926,6 +1198,7 @@ impl BlobPreprocessor {
         array: ArrayRef,
         field: &ArrowField,
         children: &[BlobPreprocessField],
+        write_sources: Option<(&Path, &BlobWriteSources)>,
     ) -> Result<(ArrayRef, Arc<ArrowField>)> {
         let struct_arr = array
             .as_any()
@@ -952,7 +1225,7 @@ impl BlobPreprocessor {
             children.iter().zip(child_columns).zip(child_fields.iter())
         {
             let (new_column, new_field) = self
-                .preprocess_field(child_processor, child_array, child_field)
+                .preprocess_field(child_processor, child_array, child_field, write_sources)
                 .await?;
             new_columns.push(new_column);
             new_fields.push(new_field);
@@ -976,6 +1249,7 @@ impl BlobPreprocessor {
         array: ArrayRef,
         field: &ArrowField,
         child: &BlobPreprocessField,
+        write_sources: Option<(&Path, &BlobWriteSources)>,
     ) -> Result<(ArrayRef, Arc<ArrowField>)> {
         let list_arr = array.as_list::<O>();
         let list_arr = if list_arr.null_count() > 0 {
@@ -1024,8 +1298,9 @@ impl BlobPreprocessor {
                 )));
             }
         };
-        let (new_values, new_child_field) =
-            self.preprocess_field(child, values, &child_field).await?;
+        let (new_values, new_child_field) = self
+            .preprocess_field(child, values, &child_field, write_sources)
+            .await?;
 
         let list_array = GenericListArray::<O>::try_new(
             new_child_field,
@@ -1186,7 +1461,7 @@ impl BlobPreprocessor {
 
                     if data_len > dedicated_threshold as u64 {
                         let value = self
-                            .write_dedicated(BlobWriteSource::External(&source))
+                            .write_dedicated(BlobWriteSource::Reader(&source))
                             .await?;
                         blob_writer.push(value)?;
                         continue;
@@ -1194,7 +1469,7 @@ impl BlobPreprocessor {
 
                     if data_len > inline_threshold as u64 {
                         let value = self
-                            .write_packed(pack_file_threshold, BlobWriteSource::External(&source))
+                            .write_packed(pack_file_threshold, BlobWriteSource::Reader(&source))
                             .await?;
                         blob_writer.push(value)?;
                         continue;
@@ -1254,6 +1529,60 @@ impl BlobPreprocessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_rewrites_empty_packed_blob_without_source_io() {
+        let field = crate::blob_field("blob", true);
+        let schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![field]))
+                .unwrap();
+        let mut preprocessor = BlobPreprocessor::new(
+            ObjectStore::memory(),
+            Path::from("data"),
+            "output".into(),
+            &schema,
+            None,
+            false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
+            None,
+        )
+        .unwrap()
+        .with_sidecar_rewrite(Some(Arc::new(super::super::SidecarRewrite::default())));
+        let mut values = BlobDescriptorArrayBuilder::new("blob");
+        values
+            .push_packed(
+                1,
+                BlobRange {
+                    offset: 123,
+                    size: 0,
+                },
+            )
+            .unwrap();
+        let (field, array) = values.finish().unwrap().into_parts();
+        let (array, _) = preprocessor
+            .rewrite_sidecars(array, &field, 1024, field.metadata())
+            .await
+            .unwrap();
+        let array = array.as_struct();
+        assert_eq!(
+            array
+                .column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(0),
+            BlobKind::Inline as u8
+        );
+        assert_eq!(
+            array
+                .column_by_name("data")
+                .unwrap()
+                .as_binary::<i64>()
+                .value(0),
+            b""
+        );
+    }
 
     use crate::dataset::blob::test_util::{
         complete_blob_v2_array, complete_blob_v2_field, nested_blob_v2_batch,
@@ -1637,13 +1966,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_external_blob_source_read_all_empty_range_returns_empty_bytes() {
+    async fn test_blob_reader_source_read_all_empty_range_returns_empty_bytes() {
         let store = reject_empty_range_store();
         let reader = store.open(&Path::from("blobs/test.bin")).await.unwrap();
-        let source = ExternalBlobSource {
+        let source = BlobReaderSource {
             reader,
             start: 0,
             size: 0,
+            max_request_size: usize::MAX,
         };
 
         assert!(source.read_all().await.unwrap().is_empty());

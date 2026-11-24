@@ -56,7 +56,8 @@ use super::marker::{MarkerFileError, put_marker_file_atomic};
 use super::query::{apply_probe_bounds, build_engine_fts_query};
 use super::versions::{ExistingTableVersionResolve, TableDeleteEntry};
 use super::{
-    DirectoryNamespace, build_column_alterations, build_sql_expressions, manifest_feature_flags,
+    DirectoryNamespace, TableDiscoveryMode, build_column_alterations, build_sql_expressions,
+    manifest_feature_flags,
 };
 use crate::merge_insert_on_columns;
 
@@ -166,15 +167,14 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
 
+        let mode = self.table_discovery_mode;
+
         // Self-heal the manifest wherever it can be authoritative: a child
         // namespace, a manifest-only namespace, or migration mode (which merges
         // manifest entries -- including registered aliases -- into the root
-        // listing). The bypass applies only to migration-disabled directory-backed
-        // root lists.
-        if !namespace_id.is_empty()
-            || !self.dir_listing_enabled
-            || self.dir_listing_to_manifest_migration_enabled
-        {
+        // listing). The bypass applies only to directory-backed root lists
+        // without migration.
+        if !namespace_id.is_empty() || mode.uses_manifest_for_root() {
             self.ensure_read_manifest().await?;
         }
 
@@ -186,39 +186,29 @@ impl LanceNamespace for DirectoryNamespace {
             return Err(self.child_namespace_requires_manifest_error());
         }
 
-        // When only manifest is enabled (no directory listing), delegate directly to manifest
-        if let Some(manifest_ns) = self.manifest_ns_for_read()
-            && !self.dir_listing_enabled
-        {
-            return manifest_ns.list_tables(request).await;
+        if mode == TableDiscoveryMode::ManifestOnly {
+            return match self.manifest_ns_for_read() {
+                Some(manifest_ns) => manifest_ns.list_tables(request).await,
+                None => Ok(ListTablesResponse::new(vec![])),
+            };
         }
-        if !self.dir_listing_enabled {
+        if !mode.has_directory_listing() {
             return Ok(ListTablesResponse::new(vec![]));
         }
 
         // When both manifest and directory listing are enabled with migration mode,
         // we need to merge and deduplicate
-        let mut tables = if self.manifest_ns_for_read().is_some()
-            && self.dir_listing_enabled
-            && self.dir_listing_to_manifest_migration_enabled
+        let mut tables = if mode.merges_manifest_listing()
+            && let Some(manifest_ns) = self.manifest_ns_for_read()
         {
             // Get all manifest table locations (for deduplication)
-            let manifest_locations = if let Some(manifest_ns) = self.manifest_ns_for_read() {
-                manifest_ns.list_manifest_table_locations().await?
-            } else {
-                std::collections::HashSet::new()
-            };
+            let manifest_locations = manifest_ns.list_manifest_table_locations().await?;
 
             // Get all manifest tables (without pagination for merging)
             let mut manifest_request = request.clone();
             manifest_request.limit = None;
             manifest_request.page_token = None;
-            let manifest_tables = if let Some(manifest_ns) = self.manifest_ns_for_read() {
-                let manifest_response = manifest_ns.list_tables(manifest_request).await?;
-                manifest_response.tables
-            } else {
-                vec![]
-            };
+            let manifest_tables = manifest_ns.list_tables(manifest_request).await?.tables;
 
             // Start with all manifest table names
             // Add directory tables that aren't already in the manifest (by location)
@@ -262,15 +252,13 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("table_exists");
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
-        let skip_manifest_for_root = self.dir_listing_enabled
-            && is_root_level
-            && !self.dir_listing_to_manifest_migration_enabled;
+        let probe_manifest_for_root = self.table_discovery_mode.uses_manifest_for_root();
+        let skip_manifest_for_root = is_root_level
+            && self.table_discovery_mode.has_directory_listing()
+            && !probe_manifest_for_root;
         // Child table, manifest-only, or migration mode (see describe_table_impl).
-        // Only a migration-disabled directory-backed root read bypasses the probe.
-        if is_child_table
-            || !self.dir_listing_enabled
-            || self.dir_listing_to_manifest_migration_enabled
-        {
+        // Only a directory-backed root read without migration bypasses the probe.
+        if is_child_table || probe_manifest_for_root {
             self.ensure_read_manifest().await?;
         }
         if let Some(manifest_ns) = self.manifest_ns_for_read()
@@ -283,7 +271,7 @@ impl LanceNamespace for DirectoryNamespace {
                     // rather than degrading to a directory-listing view.
                     return Err(e);
                 }
-                Err(e) if self.dir_listing_enabled && is_root_level => {
+                Err(e) if self.table_discovery_mode.has_directory_listing() && is_root_level => {
                     // Only a genuinely-absent table (e.g. an unmigrated on-disk
                     // table) may fall through to the directory check; any other
                     // manifest error must propagate rather than be read as missing.
@@ -300,7 +288,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
-        if !self.dir_listing_enabled {
+        if !self.table_discovery_mode.has_directory_listing() {
             return Err(NamespaceError::TableNotFound { message: table_id }.into());
         }
 
@@ -376,10 +364,10 @@ impl LanceNamespace for DirectoryNamespace {
             .new_namespace_id
             .as_ref()
             .is_none_or(|namespace| !namespace.is_empty());
-        let manifest_is_authoritative =
-            !self.dir_listing_enabled || (source_is_child && destination_is_child);
+        let manifest_is_authoritative = !self.table_discovery_mode.has_directory_listing()
+            || (source_is_child && destination_is_child);
 
-        if !self.manifest_enabled || !manifest_is_authoritative {
+        if !self.table_discovery_mode.has_manifest() || !manifest_is_authoritative {
             return Err(NamespaceError::Unsupported {
                 message: "rename_table requires manifest-authoritative source and destination resolution; directory-only and directory-listing root tables are not supported".to_string(),
             }
@@ -666,12 +654,7 @@ impl LanceNamespace for DirectoryNamespace {
                 None,
             )
             .await
-            .map_err(|e| {
-                Error::io_source(box_error(std::io::Error::other(format!(
-                    "Failed to add columns: {}",
-                    e
-                ))))
-            })?;
+            .map_err(|e| Self::map_mutation_error(e, "add_columns", &table_uri))?;
 
         let version = dataset.version().version as i64;
         Ok(AlterTableAddColumnsResponse::new(version))
@@ -838,7 +821,7 @@ impl LanceNamespace for DirectoryNamespace {
         })?;
 
         // Idempotent retry: version path already published with the same content.
-        match self.object_store.inner.head(&final_path).await {
+        match self.object_store.stat(&final_path).await {
             Ok(existing_meta) => {
                 return self
                     .resolve_existing_table_version(ExistingTableVersionResolve {
@@ -884,7 +867,7 @@ impl LanceNamespace for DirectoryNamespace {
             Err(ObjectStoreError::AlreadyExists { .. })
             | Err(ObjectStoreError::Precondition { .. }) => {
                 // Lost a Create race: succeed only if the winner published identical bytes.
-                let existing_meta = self.object_store.inner.head(&final_path).await.map_err(|e| {
+                let existing_meta = self.object_store.stat(&final_path).await.map_err(|e| {
                     lance_core::Error::from(NamespaceError::Internal {
                         message: format!(
                             "Version {} conflict for table at '{}' but failed to stat winner: {}",
@@ -921,19 +904,14 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        let final_meta = self
-            .object_store
-            .inner
-            .head(&final_path)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to stat created version {} for table at '{}': {}",
-                        version, table_uri, e
-                    ),
-                })
-            })?;
+        let final_meta = self.object_store.stat(&final_path).await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to stat created version {} for table at '{}': {}",
+                    version, table_uri, e
+                ),
+            })
+        })?;
 
         // Delete the staging manifest after successful copy
         if let Err(e) = self.object_store.inner.delete(&staging_path).await {

@@ -8,6 +8,24 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 
 ## List of datasets
 
+* `v14.0.2/stable_row_id_*.lance`: Seven datasets written by Lance 14.0.2 with
+  stable row IDs enabled. They cover a contiguous `Range`, sparse
+  `RangeWithHoles`, dense `RangeWithBitmap`, `SortedArray` with both 16-bit and
+  32-bit offsets, an unsorted `Array` from a reverse-order merge, and inline
+  row version sequences with multiple update versions. `expected.json` records
+  the exact `_rowid`, `_row_created_at_version`, and
+  `_row_last_updated_at_version` values plus the `next_row_id` high-water mark
+  of the writer. `datagen.py` regenerates the datasets and expected values with
+  pylance 14.0.2.
+
+* `v14.0.2/blob_v2_raw_reader/blob_v2_raw.lance`: A raw v2.2 file written by
+  the Lance 14.0.2 `LanceFileWriter` with two top-level Blob v2 columns and one
+  nested Blob v2 column. It contains an ordinary `id` column, inline payloads,
+  nulls, and empty values. The writer stores each Blob's descriptor children as
+  anonymous root fields, so the fixture reproduces the released raw-reader
+  failure. `datagen.py` regenerates it with pylance 14.0.2 and asserts that the
+  released reader still rejects the footer.
+
 * `v6.0.1/wrapped_bitpacked_levels.lance`: Synthetic nullable half-float lists
   with a dense prefix and a long null run. The legacy writer wraps a mini-block
   structural count at 65,536; its out-of-line bitpacked buffers retain all levels.
@@ -55,3 +73,10 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   dictionary columns whose pages store 32-bit indices. Lance 10.0.0 widened
   them for the null slot it appended past the last Int8 key, and for two
   chunks whose dictionaries did not fit Int8 together.
+* `v4.0.1/merge_insert_padded_control_words.lance` and
+  `v11.0.0/fullzip_padded_control_words.lance`: full-zip pages whose layout
+  records no control-word bits but which hold a zero byte before each value.
+  Lance 4.0.1 wrote them for a binary column updated by a merge_insert of some
+  columns (#6338); Lance 11.0.0 still wrote them for `FixedSizeList<Struct>`
+  columns, binary and fixed-width, in a file whose slice of the list validity
+  bitmap had no nulls.

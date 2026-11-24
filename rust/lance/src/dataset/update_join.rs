@@ -583,6 +583,11 @@ pub(super) async fn update_columns_with_options(
         )));
     }
     let requested_write_schema = original_right_schema.as_ref().without_column(right_on);
+    if requested_write_schema.fields().is_empty() {
+        return Err(Error::invalid_input(format!(
+            "The right side has no columns besides the join key '{right_on}', so there is nothing to update"
+        )));
+    }
     for field in requested_write_schema.fields() {
         if field.name() == ROW_ID || field.name() == ROW_ADDR {
             return Err(Error::invalid_input(format!(
@@ -618,7 +623,7 @@ pub(super) async fn update_columns_with_options(
                 stats,
             );
             Ok(FragmentUpdateColumnsResult {
-                fragment: fragment.metadata.clone(),
+                fragment: fragment.metadata().clone(),
                 fields_modified: Vec::new(),
                 matched_offsets: RoaringBitmap::new(),
             })
@@ -1425,10 +1430,10 @@ impl SortedPatchCursor {
 }
 
 fn fragment_id(fragment: &FileFragment) -> Result<u32> {
-    u32::try_from(fragment.metadata.id).map_err(|_| {
+    u32::try_from(fragment.metadata().id).map_err(|_| {
         Error::invalid_input(format!(
             "Fragment id {} does not fit RowAddress fragment id",
-            fragment.metadata.id
+            fragment.metadata().id
         ))
     })
 }

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -21,11 +20,12 @@ use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datagen::{
     ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
 };
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::inverted::query::{
-    BooleanQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
+    BooleanQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
 };
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
@@ -41,15 +41,16 @@ use rstest::rstest;
 use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::scanner::test_dataset::{
     TestVectorDataset, append_scalar_filter_test_data, assert_plan_equals,
-    assert_query_index_field, limit_offset_equivalency_test, make_scalar_filter_test_dataset,
+    assert_query_index_field, find_filtered_read, limit_offset_equivalency_test,
+    make_scalar_filter_test_dataset,
 };
 use crate::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::{StageParams, VectorIndexParams};
 use crate::io::exec::Planner;
-use crate::io::exec::filtered_read::filter_read_columns;
-use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+use crate::io::exec::filtered_read::{FilteredReadThreadingMode, filter_read_columns};
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use crate::{Error, Result};
 
 /// A physical deleted-row scan cannot late-materialize: the take would
@@ -160,7 +161,7 @@ async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
 
     // Baseline: materializing the column costs at least its payload.
     let dataset = Dataset::open(&test_dir).await.unwrap();
-    dataset.object_store.io_stats_incremental();
+    dataset.table_state.object_store.io_stats_incremental();
     let full = dataset
         .scan()
         .project(&["cells"])
@@ -169,7 +170,11 @@ async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
         .await
         .unwrap();
     assert_eq!(full.num_rows(), num_rows);
-    let full_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+    let full_bytes = dataset
+        .table_state
+        .object_store
+        .io_stats_incremental()
+        .read_bytes;
     assert!(full_bytes >= data_bytes, "{full_bytes} < {data_bytes}");
 
     for (filter, wants_null) in [("cells IS NULL", true), ("cells IS NOT NULL", false)] {
@@ -178,9 +183,13 @@ async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
         scan.project(&["id"]).unwrap().filter(filter).unwrap();
         let plan = scan.explain_plan(true).await.unwrap();
         assert!(plan.contains("projection=[id, cells.item.idx]"), "{plan}");
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let batch = scan.try_into_batch().await.unwrap();
-        let read_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+        let read_bytes = dataset
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_bytes;
         assert_eq!(batch.schema().fields().len(), 1, "{:?}", batch.schema());
         let mut ids = batch
             .column(0)
@@ -673,9 +682,17 @@ async fn test_late_materialization(
         .unwrap();
 
     // First run a full scan to get a baseline
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let _ = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // reset
     dataset.scan().try_into_batch().await.unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let full_scan_bytes = io_stats.read_bytes;
 
     // Next do a scan without pushdown, we should still see a benefit from late materialization
@@ -687,7 +704,11 @@ async fn test_late_materialization(
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
     let filtered_scan_bytes = io_stats.read_bytes;
 
@@ -701,7 +722,11 @@ async fn test_late_materialization(
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
     }
 
@@ -715,7 +740,11 @@ async fn test_late_materialization(
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
     let index_scan_bytes = io_stats.read_bytes;
 
@@ -728,7 +757,11 @@ async fn test_late_materialization(
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
 }
 
@@ -764,7 +797,11 @@ async fn test_blob_all_binary_late_materialization() {
     .unwrap();
 
     // Baseline: read the blob column as binary for the whole table.
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let _ = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // reset
     dataset
         .scan()
         .project(&["blobs"])
@@ -774,6 +811,7 @@ async fn test_blob_all_binary_late_materialization() {
         .await
         .unwrap();
     let full_scan_bytes = dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()
@@ -791,7 +829,11 @@ async fn test_blob_all_binary_late_materialization() {
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
 }
 
@@ -850,7 +892,11 @@ async fn test_nested_blob_all_binary_late_materialization() {
     .await
     .unwrap();
 
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let _ = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // reset
     dataset
         .scan()
         .project(&["s"])
@@ -860,6 +906,7 @@ async fn test_nested_blob_all_binary_late_materialization() {
         .await
         .unwrap();
     let full_scan_bytes = dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()
@@ -875,7 +922,11 @@ async fn test_nested_blob_all_binary_late_materialization() {
         .try_into_batch()
         .await
         .unwrap();
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
 }
 
@@ -1875,8 +1926,9 @@ CoalesceBatchesExec: target_batch_size=8192
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
 MatchQuery: column=s, query=[hello]
-  LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+  PrefilterUnion: scalar_fragments=4, evaluated_fragments=5
+    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+    LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1989,12 +2041,12 @@ MatchCorpus
     CoalescePartitionsExec
       UnionExec
         MatchQuery: column=s, query=[hello]
-          LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+          PrefilterUnion: scalar_fragments=4, evaluated_fragments=5
             ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+            LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
         FlatMatchQuery: column=s, query=hello
           LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
-          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-            ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -2275,6 +2327,148 @@ async fn test_batch_fast_search_without_index_returns_empty_with_query_index() {
     assert_query_index_field(&batch);
 }
 
+#[rstest]
+#[case::default(None, None, None, 16 * 1024 * 1024)]
+#[case::dataset(Some(1024), None, None, 1024)]
+#[case::reader(None, Some(2048), None, 2048)]
+#[case::reader_over_dataset(Some(1024), Some(2048), None, 2048)]
+#[case::scanner_over_reader(Some(1024), Some(2048), Some(4096), 4096)]
+#[case::larger_explicit(None, None, Some(64 * 1024 * 1024), 64 * 1024 * 1024)]
+#[tokio::test]
+async fn test_fts_tail_decode_byte_target(
+    #[case] dataset_bytes: Option<u64>,
+    #[case] reader_bytes: Option<u64>,
+    #[case] scanner_bytes: Option<u64>,
+    #[case] expected_bytes: u64,
+) {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            Some("needle"),
+            Some("other"),
+            None,
+            Some("needle needle"),
+            Some("needle filler"),
+            Some("unrelated")
+        ]
+    ))
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.slice(0, 3))], batch.schema()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch.slice(3, 3))], batch.schema()),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    let query = FullTextSearchQuery::new("needle".into())
+        .with_column("text".into())
+        .unwrap();
+    let expected = dataset
+        .scan()
+        .batch_size(1)
+        .full_text_search(query.clone())
+        .unwrap()
+        .project(&[ROW_ID, SCORE_COL])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    dataset.table_state.file_reader_options = dataset_bytes.map(|batch_size_bytes| {
+        Arc::new(FileReaderOptions {
+            batch_size_bytes: Some(batch_size_bytes),
+            ..Default::default()
+        })
+    });
+    let ordinary = dataset.scan().create_plan().await.unwrap();
+    assert_eq!(
+        find_filtered_read(ordinary.as_ref())
+            .unwrap()
+            .options()
+            .file_reader_options
+            .as_ref()
+            .and_then(|opts| opts.batch_size_bytes),
+        dataset_bytes
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(query)
+        .unwrap()
+        .project(&[ROW_ID, SCORE_COL])
+        .unwrap();
+    scanner.batch_readahead(3).io_buffer_size(8192);
+    if let Some(batch_size_bytes) = reader_bytes {
+        scanner.with_file_reader_options(FileReaderOptions {
+            batch_size_bytes: Some(batch_size_bytes),
+            ..Default::default()
+        });
+    }
+    if let Some(batch_size_bytes) = scanner_bytes {
+        scanner.batch_size_bytes(batch_size_bytes);
+    }
+    let plan = scanner.create_plan().await.unwrap();
+    let options = find_filtered_read(plan.as_ref()).unwrap().options();
+    assert_eq!(
+        options
+            .file_reader_options
+            .as_ref()
+            .and_then(|opts| opts.batch_size_bytes),
+        Some(expected_bytes)
+    );
+    assert_eq!(options.io_buffer_size_bytes, Some(8192));
+    assert_eq!(
+        options.threading_mode,
+        FilteredReadThreadingMode::OnePartitionMultipleThreads(3)
+    );
+    let actual = scanner.try_into_batch().await.unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.num_rows(), 3);
+    if dataset_bytes.is_none() && reader_bytes.is_none() && scanner_bytes.is_none() {
+        // The internal text budget must not conflict with strict output batching.
+        let batches = scanner
+            .batch_size(2)
+            .strict_batch_size(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(concat_batches(&actual.schema(), &batches).unwrap(), actual);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fts_multiple_unindexed_appends() {
     // An FTS query over an indexed dataset plus more than one unindexed append
@@ -2518,7 +2712,11 @@ pub async fn test_scan_planning_io(
         .unwrap();
 
     // First pass will need to perform some IOPs to determine what scalar indices are available
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_gt!(io_stats, read_iops, 0);
 
     // Second planning cycle should not perform any I/O
@@ -2531,7 +2729,11 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 
     dataset
@@ -2543,7 +2745,11 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 
     dataset
@@ -2556,7 +2762,11 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 
     dataset
@@ -2569,7 +2779,11 @@ pub async fn test_scan_planning_io(
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
 }
 
@@ -2746,6 +2960,162 @@ async fn test_fts_ordered_limit_offset(
             .all(|scores| scores[0] < scores[1])
     );
     limit_offset_equivalency_test(&scanner).await;
+}
+
+/// A zero candidate budget must stop at the leaf sort boundary without building
+/// a zero-fetch `SortExec`, which DataFusion turns into a `TopK` heap that
+/// asserts `k > 0`. A non-default WAND factor keeps the root Match off the
+/// corpus planner, whose own zero branch would short-circuit before index
+/// coverage is known, so the indexed, flat, and mixed leaf plans actually reach
+/// that boundary.
+#[rstest]
+#[case::flat(false, false)]
+#[case::indexed(true, false)]
+#[case::mixed(true, true)]
+#[tokio::test]
+async fn test_fts_zero_candidate_limit_at_leaf_sort(
+    #[case] has_index: bool,
+    #[case] has_append: bool,
+) {
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, [0, 1, 2]),
+        ("text", Utf8, ["needle", "needle filler", "other"])
+    )
+    .unwrap();
+    let initial_rows = if has_append { 2 } else { 3 };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.slice(0, initial_rows))], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if has_index {
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    if has_append {
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.slice(2, 1))], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id", SCORE_COL])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new("needle".into())
+                .with_column("text".into())
+                .unwrap()
+                .wand_factor(Some(2.0))
+                .limit(Some(0)),
+        )
+        .unwrap();
+    let expected_schema = scanner.schema().await.unwrap();
+    let plan_text = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !plan_text.contains("EmptyExec"),
+        "the zero-candidate query must reach the leaf boundary, not the corpus short circuit:\n{plan_text}"
+    );
+    if !has_index || has_append {
+        assert!(
+            plan_text.contains("SortExec"),
+            "flat and mixed leaf plans must reach the revised sort boundary:\n{plan_text}"
+        );
+    }
+    // No outer pagination: the optimized plan itself must stay single-partition,
+    // especially when the leaf fallback unions indexed and flat children.
+    let plan = scanner.create_plan().await.unwrap();
+    assert_eq!(plan.schema(), expected_schema);
+    assert_eq!(
+        plan.properties().output_partitioning().partition_count(),
+        1,
+        "the optimized zero-candidate leaf plan must expose one partition"
+    );
+    let batches: Vec<RecordBatch> = plan
+        .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
+    for batch in &batches {
+        assert_eq!(batch.schema(), expected_schema);
+    }
+}
+
+/// The MultiMatch fallback aggregates per-field hits and sorts them. A partial
+/// index keeps it on that fallback, so the zero budget has to be handled at the
+/// aggregate's sort boundary rather than delegated to a single index search.
+#[tokio::test]
+async fn test_fts_zero_candidate_limit_multimatch_fallback() {
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, [0, 1]),
+        ("title", Utf8, ["needle", "other"]),
+        ("body", Utf8, ["other", "needle"])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // Only one field is indexed, so the whole MultiMatch keeps the fallback.
+    dataset
+        .create_index(
+            &["title"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = FtsQuery::MultiMatch(
+        MultiMatchQuery::try_new(
+            "needle".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap(),
+    );
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id", SCORE_COL])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(0)))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    let expected_schema = scanner.schema().await.unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema(), expected_schema);
 }
 
 #[tokio::test]
@@ -2988,20 +3358,12 @@ async fn test_fts_global_statistics_compound_leaves(
 
 #[tokio::test]
 async fn test_fts_global_statistics_preserves_ngram_fuzzy_and_phrase_positions() {
-    let batch =
-        arrow_array::record_batch!(("text", Utf8, ["abcd", "xbcd", "axcd", "abxd"])).unwrap();
-    let schema = batch.schema();
-    let reader = RecordBatchIterator::new([Ok(batch)], schema);
-    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
-    let params = InvertedIndexParams::default()
-        .base_tokenizer("ngram".into())
-        .ngram_min_length(2)
-        .ngram_max_length(2)
-        .with_position(true);
-    dataset
-        .create_index(&["text"], IndexType::Inverted, None, &params, true)
-        .await
-        .unwrap();
+    // A bigram index with positions over "abcd", "xbcd", "axcd" and "abxd".
+    // New indexes refuse these settings, so it was built by 13.0.0.
+    let test_dir =
+        copy_test_data_to_tmp("v13.0.0/ngram_with_position/ngram_bigram_with_position.lance")
+            .unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
 
     let match_query: FtsQuery = BooleanQuery::new([
         (

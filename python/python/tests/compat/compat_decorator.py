@@ -11,9 +11,11 @@ for testing forward and backward compatibility across Lance versions.
 import inspect
 import json
 import os
+import re
 import sys
 import urllib.request
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -46,9 +48,21 @@ def _fetch_stable_versions() -> List[Version]:
         return []
 
 
+def _source_version() -> Version:
+    """The version of the Lance checkout these tests run from."""
+    cargo_toml = Path(__file__).resolve().parents[3] / "Cargo.toml"
+    match = re.search(r'^version = "(.+)"$', cargo_toml.read_text(), re.MULTILINE)
+    return Version(match.group(1))
+
+
 def recent_major_versions(n: int) -> List[str]:
-    """Returns the n most recent major versions of pylance as strings."""
-    stable_versions = pylance_stable_versions()
+    """Returns the n most recent major versions of pylance as strings.
+
+    Releases newer than this checkout are skipped: an older build is not
+    expected to write data that a newer release created.
+    """
+    source = _source_version()
+    stable_versions = [v for v in pylance_stable_versions() if v <= source]
     major_versions = []
     seen_majors = set()
 
@@ -139,6 +153,15 @@ class UpgradeDowngradeTest:
 
     def skip_downgrade(self, version: str) -> bool:
         """Return True to skip the current-write -> old-read downgrade test."""
+        return False
+
+    def skip_upgrade_downgrade(self, version: str) -> bool:
+        """Return True to skip the old-write -> current -> old-read round trip.
+
+        Use this when the fixture itself cannot be produced by the old
+        build -- e.g. a capability this test exercises was outright rejected
+        by that release, not merely written in an older format.
+        """
         return False
 
     def current_env(self, method_name: str) -> Dict[str, str]:
@@ -341,6 +364,10 @@ def test_func({sig_params}):
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
     obj.compat_version = version
+    if obj.skip_upgrade_downgrade(version):
+        pytest.skip(
+            "upgrade/downgrade compatibility is intentionally unsupported for this test"
+        )
     venv = venv_factory.get_venv(version)
     # Old version: create data
     venv.execute_method(obj, "create", obj.compat_env(version, "create"))

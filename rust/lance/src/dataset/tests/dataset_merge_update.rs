@@ -14,7 +14,10 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
-use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
+use crate::dataset::{
+    AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder, UpdateJoinOptions,
+    UpdateJoinStrategy,
+};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
 use lance_core::{ROW_ADDR, ROW_LAST_UPDATED_AT_VERSION};
@@ -230,6 +233,66 @@ async fn test_merge_rejects_duplicate_right_keys(
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), original);
 }
 
+/// A right side holding only the join key has nothing to merge, which every
+/// entry point that joins on it reports as an input error.
+#[rstest]
+#[case::dataset_merge("merge")]
+#[case::fragment_merge_columns("merge_columns")]
+#[case::fragment_update_columns("update_columns")]
+#[case::fragment_update_columns_sort_merge("update_columns_sort_merge")]
+#[tokio::test]
+async fn test_merge_rejects_a_key_only_right_side(
+    #[case] entry_point: &str,
+    #[values(false, true)] empty: bool,
+) {
+    let original =
+        arrow_array::record_batch!(("id", Int32, [1, 2, 3]), ("value", Int32, [10, 20, 30]))
+            .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(original.clone())], original.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let right = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let batches = if empty {
+        vec![]
+    } else {
+        vec![Ok(right.clone())]
+    };
+    let reader = RecordBatchIterator::new(batches, right.schema());
+    let error = match entry_point {
+        "merge" => dataset.merge(reader, "id", "id").await.unwrap_err(),
+        "merge_columns" => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            fragment
+                .merge_columns(reader, "id", "id")
+                .await
+                .unwrap_err()
+        }
+        "update_columns" => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            fragment
+                .update_columns(reader, "id", "id")
+                .await
+                .unwrap_err()
+        }
+        _ => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            let options = UpdateJoinOptions::default().with_strategy(UpdateJoinStrategy::SortMerge);
+            fragment
+                .update_columns_with_options(reader, "id", "id", options)
+                .await
+                .unwrap_err()
+        }
+    };
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("no columns besides the join key 'id'"),
+        "{error}"
+    );
+    assert_eq!(dataset.version().version, 1);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_large_merge(
@@ -441,8 +504,8 @@ async fn test_insert_subschema() {
     // Looking at the fragments, there is no data file with the missing field
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[0]);
 
     // When reading back, columns that are missing are null
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -489,8 +552,8 @@ async fn test_insert_subschema() {
     dataset.validate().await.unwrap();
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0, 1]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[0, 1]);
 
     // Can scan and get expected data.
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -622,10 +685,10 @@ async fn test_insert_nested_subschemas() {
     dataset.validate().await.unwrap();
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[2, 1]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[2, 1]);
     assert_eq!(
-        fragments[0].metadata.files[0].column_indices.as_ref(),
+        fragments[0].metadata().files[0].column_indices.as_ref(),
         &[0, 1]
     );
 
@@ -653,10 +716,10 @@ async fn test_insert_nested_subschemas() {
     dataset.validate().await.unwrap();
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
-    assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[3, 2]);
+    assert_eq!(fragments[1].metadata().files.len(), 1);
+    assert_eq!(fragments[1].metadata().files[0].fields.as_ref(), &[3, 2]);
     assert_eq!(
-        fragments[1].metadata.files[0].column_indices.as_ref(),
+        fragments[1].metadata().files[0].column_indices.as_ref(),
         &[0, 1]
     );
 
@@ -864,8 +927,8 @@ async fn test_insert_balanced_subschemas() {
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[0]);
 
     // Insert right side
     let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
@@ -880,8 +943,8 @@ async fn test_insert_balanced_subschemas() {
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
-    assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[1]);
+    assert_eq!(fragments[1].metadata().files.len(), 1);
+    assert_eq!(fragments[1].metadata().files[0].fields.as_ref(), &[1]);
 
     let data = dataset
         .take(
@@ -927,6 +990,7 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(dataset.clone()),
         Operation::DataReplacement {
             replacements: vec![],
+            data_change: true,
         },
         Some(1),
         None,
@@ -956,6 +1020,7 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![],
+            data_change: true,
         },
         Some(3),
         None,
@@ -984,6 +1049,7 @@ async fn test_datafile_replacement() {
 
     // write a new datafile
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/test.lance"))
         .await
@@ -1010,6 +1076,7 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(4),
         None,
@@ -1022,7 +1089,7 @@ async fn test_datafile_replacement() {
 
     assert_eq!(dataset.version().version, 5);
     assert_eq!(dataset.get_fragments().len(), 1);
-    assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 1);
+    assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 1);
 
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 3);
@@ -1060,7 +1127,7 @@ async fn test_datafile_partial_replacement() {
         .await
         .unwrap();
 
-    let fragment = dataset.get_fragments().pop().unwrap().metadata;
+    let fragment = Fragment::from(dataset.get_fragments().pop().unwrap());
 
     let extended_schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("a", DataType::Int32, true),
@@ -1092,6 +1159,7 @@ async fn test_datafile_partial_replacement() {
 
     // write a new datafile
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/test.lance"))
         .await
@@ -1128,6 +1196,7 @@ async fn test_datafile_partial_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(3),
         None,
@@ -1140,13 +1209,17 @@ async fn test_datafile_partial_replacement() {
 
     assert_eq!(dataset.version().version, 4);
     assert_eq!(dataset.get_fragments().len(), 1);
-    assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
+    assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 2);
     assert_eq!(
-        dataset.get_fragments()[0].metadata.files[0].fields.as_ref(),
+        dataset.get_fragments()[0].metadata().files[0]
+            .fields
+            .as_ref(),
         &[0]
     );
     assert_eq!(
-        dataset.get_fragments()[0].metadata.files[1].fields.as_ref(),
+        dataset.get_fragments()[0].metadata().files[1]
+            .fields
+            .as_ref(),
         &[1]
     );
 
@@ -1190,6 +1263,7 @@ async fn test_datafile_partial_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(4),
         None,
@@ -1202,7 +1276,7 @@ async fn test_datafile_partial_replacement() {
 
     assert_eq!(dataset.version().version, 5);
     assert_eq!(dataset.get_fragments().len(), 1);
-    assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
+    assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 2);
 
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 3);
@@ -1249,7 +1323,7 @@ async fn test_datafile_replacement_error() {
         .await
         .unwrap();
 
-    let fragment = dataset.get_fragments().pop().unwrap().metadata;
+    let fragment = Fragment::from(dataset.get_fragments().pop().unwrap());
 
     let extended_schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("a", DataType::Int32, true),
@@ -1296,6 +1370,7 @@ async fn test_datafile_replacement_error() {
         WriteDestination::Dataset(Arc::new(dataset.clone())),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         // read at the current version (after the Merge above)
         Some(dataset.manifest.version),
@@ -1331,7 +1406,8 @@ async fn test_replace_dataset() {
         .await
         .unwrap();
 
-    ds.object_store
+    ds.table_state
+        .object_store
         .as_ref()
         .remove_dir_all(test_path)
         .await
@@ -2355,7 +2431,7 @@ async fn test_update_struct_column_keeps_nested_index() {
         .expect("nested s.x index")
         .clone();
     let effective = sx_idx
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .expect("index has a fragment bitmap");
     assert_eq!(
         effective.iter().collect::<Vec<_>>(),
@@ -2498,12 +2574,16 @@ async fn test_merge_insert_flat_index_stable_row_id() {
     // coverage ({0}) is a strict subset of the live fragments ({0, 1}), so the
     // rewritten fragment is left to a full scan.
     assert_eq!(
-        dataset.fragment_bitmap.iter().collect::<Vec<_>>(),
+        dataset
+            .table_state
+            .fragment_bitmap
+            .iter()
+            .collect::<Vec<_>>(),
         vec![0, 1],
         "the update should have produced a second fragment"
     );
     let effective = val_idx
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .expect("index has a fragment bitmap");
     assert_eq!(
         effective.iter().collect::<Vec<_>>(),
@@ -2511,7 +2591,7 @@ async fn test_merge_insert_flat_index_stable_row_id() {
         "index effectively covers only fragment 0"
     );
     assert!(
-        effective.len() < dataset.fragment_bitmap.len(),
+        effective.len() < dataset.table_state.fragment_bitmap.len(),
         "scan must be partially indexed: the rewritten fragment is not covered by the index"
     );
 
@@ -2770,7 +2850,11 @@ async fn test_merge_insert_flat_index_stable_row_id_multiple_indexes() {
 
     // The update produced a second fragment holding the rewritten row id=1.
     assert_eq!(
-        dataset.fragment_bitmap.iter().collect::<Vec<_>>(),
+        dataset
+            .table_state
+            .fragment_bitmap
+            .iter()
+            .collect::<Vec<_>>(),
         vec![0, 1],
         "update should have produced a second fragment"
     );
@@ -2839,6 +2923,7 @@ async fn test_data_replacement_advances_row_lineage() {
     )
     .unwrap();
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/lineage_replacement.lance"))
         .await
@@ -2861,6 +2946,7 @@ async fn test_data_replacement_advances_row_lineage() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -2945,6 +3031,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
     .unwrap();
 
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/replacement.lance"))
         .await
@@ -2970,6 +3057,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -2984,7 +3072,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
     let indices = dataset.load_indices().await.unwrap();
     let a_index = indices.iter().find(|idx| idx.name == "a_idx").unwrap();
     let effective = a_index
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .unwrap();
     assert!(
         !effective.contains(0),
@@ -3126,7 +3214,12 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
     )
     .unwrap();
     let new_a_path = dataset.data_dir().join("merge_new_a.lance");
-    let object_writer = dataset.object_store.create(&new_a_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&new_a_path)
+        .await
+        .unwrap();
     let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         a_only.as_ref().try_into().unwrap(),
@@ -3227,6 +3320,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
     .unwrap();
 
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/replacement_inv.lance"))
         .await
@@ -3254,6 +3348,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -3352,6 +3447,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
     .unwrap();
     let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&replacement_path)
         .await
@@ -3373,6 +3469,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -3484,6 +3581,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
     .unwrap();
     let replacement_path = dataset.data_dir().join("body_replacement.lance");
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&replacement_path)
         .await
@@ -3514,6 +3612,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, replacement_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -3664,6 +3763,7 @@ async fn test_vector_index_after_data_replacement() {
 
     let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&replacement_path)
         .await
@@ -3685,6 +3785,7 @@ async fn test_vector_index_after_data_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(frag1_id, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -4411,11 +4512,11 @@ async fn multi_base_fixture(indexed: bool) -> MultiBaseFixture {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 3);
     for fragment in &fragments[..2] {
-        for file in &fragment.metadata.files {
+        for file in &fragment.metadata().files {
             assert_eq!(file.base_id, Some(1));
         }
     }
-    for file in &fragments[2].metadata.files {
+    for file in &fragments[2].metadata().files {
         assert_eq!(file.base_id, None);
     }
 
@@ -4490,7 +4591,7 @@ async fn test_merge_insert_on_multi_base_table(#[values(false, true)] indexed: b
     assert_eq!(dataset.count_rows(None).await.unwrap(), 11);
 
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         if metadata.id >= 3 {
             // Fragments written by the merge live in primary storage.
             for file in &metadata.files {
@@ -4552,7 +4653,7 @@ async fn test_merge_insert_route_to_target_bases(#[values(false, true)] indexed:
     // files sit directly under it.
     let mut merge_files = 0;
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         if metadata.id >= 3 {
             for file in &metadata.files {
                 assert_eq!(file.base_id, Some(2));
@@ -4585,7 +4686,7 @@ async fn test_merge_insert_route_to_target_bases(#[values(false, true)] indexed:
 
     let mut merge_files = 0;
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         if metadata.id > max_fragment_id {
             for file in &metadata.files {
                 assert_eq!(file.base_id, Some(1));
@@ -4652,7 +4753,7 @@ async fn test_merge_insert_partial_schema_multi_base() {
     assert_eq!(stats.num_inserted_rows, 2);
 
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         match metadata.id {
             0 | 1 => {
                 // Patched fragments: the original file in base1 plus a column
@@ -4773,8 +4874,8 @@ async fn test_merge_insert_round_robin_target_bases() {
     let merge_file_bases: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|fragment| fragment.metadata.id >= 1)
-        .flat_map(|fragment| fragment.metadata.files.iter().map(|file| file.base_id))
+        .filter(|fragment| fragment.metadata().id >= 1)
+        .flat_map(|fragment| fragment.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(merge_file_bases, vec![Some(1), Some(2)]);
 }
@@ -4951,8 +5052,8 @@ async fn test_merge_insert_target_bases_include_primary() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id >= 3)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id >= 3)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![None]);
 
@@ -4974,8 +5075,8 @@ async fn test_merge_insert_target_bases_include_primary() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id > max_id)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id > max_id)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![Some(2)]);
 
@@ -4997,8 +5098,8 @@ async fn test_merge_insert_target_bases_include_primary() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id > max_id)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id > max_id)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![None]);
 
@@ -5070,7 +5171,7 @@ async fn test_merge_insert_conflict_retry_cleans_routed_files() {
 
     let mut referenced: HashSet<(Option<u32>, String)> = HashSet::new();
     for fragment in dataset.get_fragments() {
-        for file in &fragment.metadata.files {
+        for file in &fragment.metadata().files {
             referenced.insert((file.base_id, file.path.to_string()));
         }
     }
@@ -5130,8 +5231,8 @@ async fn test_merge_insert_target_all_bases() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id >= 3)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id >= 3)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![None]);
 
@@ -5153,8 +5254,8 @@ async fn test_merge_insert_target_all_bases() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id > max_id)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id > max_id)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![Some(1)]);
 
@@ -5965,4 +6066,68 @@ async fn test_merge_staged_new_fragments_concurrent_append_conflicts() {
         "unexpected message: {}",
         err
     );
+}
+
+/// An update that matches no rows leaves the table as it was: no version, no
+/// manifest, so it cannot pre-empt a concurrent writer or a compaction.
+#[rstest]
+#[tokio::test]
+async fn test_update_matching_no_rows_commits_nothing(
+    #[values(false, true)] use_stable_row_id: bool,
+) {
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .col("value", array::fill_utf8("value".to_string()))
+        .into_reader_rows(RowCount::from(10), BatchCount::from(3));
+    let test_uri = TempStrDir::default();
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(data, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+    let version = dataset.manifest.version;
+    let dataset = Arc::new(dataset);
+
+    let result = UpdateBuilder::new(dataset.clone())
+        .update_where("key < 0")
+        .unwrap()
+        .set("value", "'changed'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 0);
+    assert_eq!(result.new_dataset.manifest.version, version);
+    assert_eq!(
+        Dataset::open(&test_uri).await.unwrap().manifest.version,
+        version
+    );
+    assert_eq!(
+        result
+            .new_dataset
+            .count_rows(Some("value = 'value'".to_string()))
+            .await
+            .unwrap(),
+        30
+    );
+
+    // An update that does match still commits.
+    let result = UpdateBuilder::new(dataset)
+        .update_where("key < 5")
+        .unwrap()
+        .set("value", "'changed'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 5);
+    assert_eq!(result.new_dataset.manifest.version, version + 1);
 }

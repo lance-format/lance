@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{BlockingDataset, NATIVE_DATASET};
+use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::block_on;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::utils::build_compaction_options;
+use crate::utils::{apply_repack_options, build_compaction_options};
 use chrono::{DateTime, Utc};
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValue};
@@ -95,6 +95,14 @@ fn convert_java_compaction_options_to_rust(
         .call_method(
             &java_options,
             "getMaxBytesPerFile",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let min_bytes_per_file = env
+        .call_method(
+            &java_options,
+            "getMinBytesPerFile",
             "()Ljava/util/Optional;",
             &[],
         )?
@@ -190,12 +198,41 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let source_budget_mode = env
+        .call_method(
+            &java_options,
+            "getSourceBudgetMode",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
-    build_compaction_options(
+    let max_data_files_per_fragment = env
+        .call_method(
+            &java_options,
+            "getMaxDataFilesPerFragment",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let scope = env
+        .call_method(&java_options, "getScope", "()Ljava/util/Optional;", &[])?
+        .l()?;
+    let data_cache_bytes = env
+        .call_method(
+            &java_options,
+            "getDataCacheBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+
+    let mut options = build_compaction_options(
         env,
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &min_bytes_per_file,
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,
@@ -208,8 +245,12 @@ fn convert_java_compaction_options_to_rust(
         &max_source_bytes,
         &excluded_fragment_ids,
         &data_storage_version,
+        Some(&source_budget_mode),
+        &data_cache_bytes,
         config,
-    )
+    )?;
+    apply_repack_options(env, &mut options, &max_data_files_per_fragment, &scope)?;
+    Ok(options)
 }
 
 #[unsafe(no_mangle)]
@@ -328,8 +369,7 @@ fn inner_explain_cleanup_with_policy<'local>(
         .transpose()?;
 
     let explanation = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let dataset = clone_dataset(env, &jdataset)?;
         let mut operation = dataset.inner.cleanup(policy);
         if let Some(value) = retention_policy {
             operation = operation.with_retention_policy(parse_cleanup_policy(&value)?)?;
@@ -387,11 +427,7 @@ fn inner_explain_expire_versions<'local>(
 ) -> Result<JObject<'local>> {
     let policy = extract_expire_versions_policy(env, &jpolicy)?;
 
-    let plan = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.explain_expire_versions(policy)
-    }?;
+    let plan = clone_dataset(env, &jdataset)?.explain_expire_versions(policy)?;
 
     expire_versions_plan_to_java(env, plan)
 }

@@ -662,7 +662,7 @@ async fn load_source_leaves(
                         leaf.operator,
                         leaf.query.scorer().as_ref(),
                         metrics.as_ref(),
-                        PostingLoadOptions::cache_aware_exact(true),
+                        PostingLoadOptions::cache_aware_exact(),
                     )
                     .await?
                     .postings

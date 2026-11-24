@@ -5,15 +5,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
-use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
 use lance_core::datatypes::{NullabilityComparison, Schema};
 use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
-use lance_datafusion::utils::StreamingWriteSource;
+use lance_datafusion::utils::{StreamingWriteSource, from_datafusion_stream};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 
 use lance_io::object_store::ObjectStore;
+use lance_io::stream::{SendableRecordBatchStream, StreamingWriteSource as LanceWriteSource};
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
@@ -123,7 +123,8 @@ impl<'a> InsertBuilder<'a> {
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<Dataset> {
         let (stream, schema) = source.into_stream_and_schema().await?;
-        self.execute_stream_impl(stream, schema).await
+        self.execute_stream_impl(from_datafusion_stream(stream), schema)
+            .await
     }
 
     async fn execute_stream_impl(
@@ -208,7 +209,7 @@ impl<'a> InsertBuilder<'a> {
             }
         }
         let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
-        let (stream, schema) = reader.into_stream_and_schema().await?;
+        let (stream, schema) = LanceWriteSource::into_stream_and_schema(reader).await?;
         self.write_uncommitted_stream_impl(stream, schema).await
     }
 
@@ -220,7 +221,9 @@ impl<'a> InsertBuilder<'a> {
         source: impl StreamingWriteSource,
     ) -> Result<Transaction> {
         let (stream, schema) = source.into_stream_and_schema().await?;
-        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        let (transaction, _) = self
+            .write_uncommitted_stream_impl(from_datafusion_stream(stream), schema)
+            .await?;
         Ok(transaction)
     }
 
@@ -268,6 +271,7 @@ impl<'a> InsertBuilder<'a> {
             self.preassigned_data_file_name.clone(),
             self.inherited_field_ids,
             self.disable_dictionary_split,
+            None,
             None,
         ))
         .await?;
@@ -340,7 +344,7 @@ impl<'a> InsertBuilder<'a> {
         // Write mode
         match (&context.params.mode, &context.dest) {
             (WriteMode::Create, WriteDestination::Dataset(ds)) => {
-                return Err(Error::dataset_already_exists(ds.uri.clone()));
+                return Err(Error::dataset_already_exists(ds.table_state.uri.clone()));
             }
             (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
                 log::warn!("No existing dataset at {uri}, it will be created");
@@ -424,12 +428,12 @@ impl<'a> InsertBuilder<'a> {
         }
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
-                dataset.object_store.clone(),
-                dataset.base.clone(),
+                dataset.table_state.object_store.clone(),
+                dataset.table_state.base.clone(),
                 params
                     .commit_handler
                     .clone()
-                    .unwrap_or_else(|| dataset.commit_handler.clone()),
+                    .unwrap_or_else(|| dataset.table_state.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let registry = params
@@ -510,7 +514,10 @@ mod test {
     use arrow_array::{
         ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray, record_batch,
     };
-    use arrow_schema::{ArrowError, DataType, Field, Schema};
+    use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+    use datafusion::physical_plan::{
+        SendableRecordBatchStream as DataFusionRecordBatchStream, stream::RecordBatchStreamAdapter,
+    };
     use lance_arrow::BLOB_META_KEY;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -520,6 +527,46 @@ mod test {
     use crate::session::Session;
 
     use super::*;
+
+    #[tokio::test]
+    async fn insert_uses_custom_streaming_write_source_schema() {
+        struct CustomWriteSource(DataFusionRecordBatchStream);
+
+        #[async_trait::async_trait]
+        impl StreamingWriteSource for CustomWriteSource {
+            fn arrow_schema(&self) -> SchemaRef {
+                self.0.schema()
+            }
+
+            fn into_stream(self) -> DataFusionRecordBatchStream {
+                self.0
+            }
+
+            async fn into_stream_and_schema(
+                self,
+            ) -> Result<(DataFusionRecordBatchStream, lance_core::datatypes::Schema)> {
+                let mut schema =
+                    lance_core::datatypes::Schema::try_from(self.arrow_schema().as_ref())?;
+                schema
+                    .metadata
+                    .insert("write_source".into(), "custom".into());
+                Ok((self.0, schema))
+            }
+        }
+
+        let batch = record_batch!(("id", Int32, [1, 2, 3])).unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let dataset = InsertBuilder::new("memory://")
+            .execute_stream(CustomWriteSource(stream))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.schema().metadata["write_source"], "custom");
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
 
     #[rstest]
     #[tokio::test]
@@ -865,7 +912,7 @@ mod test {
             ))
             .await
             .unwrap();
-        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+        dataset.table_state.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
             .await
             .unwrap();
 

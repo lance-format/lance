@@ -14,7 +14,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
 use lance_datafusion::exec::OneShotExec;
 use lance_index::scalar::inverted::query::CombinedFieldsQuery;
-use lance_index::scalar::inverted::query::FtsQuery;
+use lance_index::scalar::inverted::query::{FtsQuery, Operator, PhraseQuery};
 use lance_index::{
     IndexType,
     scalar::{FullTextSearchQuery, InvertedIndexParams},
@@ -581,4 +581,38 @@ async fn shared_corpus_cloned_nested_owner_keeps_its_scope() {
         SharedFtsScorerExec::try_new(owner.children()[0].clone(), owner.binding().unwrap())
             .unwrap();
     assert_eq!(execute_results(&rebuilt).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn shared_corpus_binding_accepts_phrase_pair() {
+    let dataset = indexed_match_dataset().await;
+    let phrase = PhraseQuery::new("alpha beta".to_string())
+        .with_column(Some("text".to_string()))
+        .with_document_granularity(DocumentGranularity::Row);
+    let match_query = MatchQuery::new(phrase.terms.clone())
+        .with_column(phrase.column.clone())
+        .with_operator(Operator::And)
+        .with_document_granularity(DocumentGranularity::Row);
+    let flat_params = FtsSearchParams::default().with_phrase_slop(Some(phrase.slop));
+    let consumer: Arc<dyn ExecutionPlan> = Arc::new(
+        PhraseQueryExec::new(
+            dataset.clone(),
+            phrase,
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        )
+        .unwrap(),
+    );
+    let producer: Arc<dyn ExecutionPlan> = Arc::new(
+        FlatMatchQueryExec::new(
+            Arc::new(dataset.as_ref().clone()),
+            match_query,
+            flat_params,
+            memory_input(residual_batch()),
+        )
+        .unwrap(),
+    );
+    let owner =
+        SharedFtsScorerExec::try_new(branches(vec![consumer, producer]), binding()).unwrap();
+    assert_eq!(owner.binding().unwrap(), binding());
 }
