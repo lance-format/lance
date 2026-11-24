@@ -35,7 +35,7 @@ use lance_file::concat::EncodedFileInput;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::writer::FileWriterOptions;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 use crate::blob::{
     BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobFile, BlobWriteSources, blob_field,
 };
-use crate::dataset::blob::test_util::{managed_blob_schema, recording_range_store};
+use crate::dataset::blob::test_util::managed_blob_schema;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::fragment::FileFragment;
@@ -1466,8 +1466,10 @@ async fn fragment_copies_registered_blob_ranges_with_bounded_requests() {
     let mut source_data = vec![0x13; MAX_REQUEST + 64];
     source_data[MAX_REQUEST..].fill(0x71);
     let source_data = Bytes::from(source_data);
-    let (store, recorded) = recording_range_store(source_data.clone());
+    let (store, _) = ObjectStore::from_uri("memory://").await.unwrap();
     let path = Path::from("existing-sidecar");
+    store.put(&path, &source_data).await.unwrap();
+    store.io_stats_incremental();
     let ranges = [5..9, 7..(128 * 1024 + 7), 9..(MAX_REQUEST + 27)];
     let mut sources = BlobWriteSources::default();
     let mut blobs = BlobDescriptorArrayBuilder::for_field(&field).unwrap();
@@ -1494,7 +1496,13 @@ async fn fragment_copies_registered_blob_ranges_with_bounded_requests() {
         )
         .await
         .unwrap();
-    let requests = recorded.requested_ranges();
+    let requests = store
+        .io_stats_incremental()
+        .requests
+        .into_iter()
+        .filter(|request| request.path == path)
+        .filter_map(|request| request.range)
+        .collect::<Vec<_>>();
     assert!(
         requests
             .iter()

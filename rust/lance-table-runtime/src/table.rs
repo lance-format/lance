@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
-use lance_core::{Error, Result, datatypes::Schema};
+use lance_core::{
+    Error, Result,
+    datatypes::{Projectable, Schema},
+};
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptions, StorageOptionsAccessor, WrappingObjectStore,
@@ -40,6 +43,12 @@ pub struct Table {
     pub manifest: Arc<Manifest>,
     /// Branch and tag operations bound to this table.
     pub refs: Refs,
+}
+
+impl Projectable for Table {
+    fn schema(&self) -> &Schema {
+        self.schema()
+    }
 }
 
 impl std::fmt::Debug for Table {

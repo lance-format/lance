@@ -4,6 +4,7 @@
 //! Read and validate stable row IDs and per-row dataset versions.
 
 mod spill;
+mod take;
 mod validate;
 
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use crate::io::deletion::read_table_deletion_file;
 #[doc(hidden)]
 pub use spill::lineage_field;
 pub use spill::{read_spilled_row_ids, read_spilled_versions};
+pub(crate) use take::resolve_take_row_ids;
 pub use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the fragment's metadata and table files.

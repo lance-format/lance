@@ -3,6 +3,7 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod blob;
 pub mod branch_location;
 pub mod builder;
 pub mod caches;
@@ -13,6 +14,7 @@ mod overlay;
 pub mod refs;
 pub mod rowids;
 pub mod session;
+pub mod take;
 
 #[doc(hidden)]
 pub mod base;
@@ -21,8 +23,11 @@ pub mod paths;
 
 mod manifest;
 mod table;
+#[cfg(test)]
+mod test_util;
 
 pub use builder::TableBuilder;
 pub use fragment::{BaseSchedulers, FileFragment, FragReadConfig, FragmentReader, FragmentSession};
 pub use session::TableSession;
 pub use table::{Table, TableState, TableView, Version, VersionRef, VersionTransaction};
+pub use take::{MissingRowPolicy, TakeOptions, TakeProjection, TakeSelection};

@@ -219,6 +219,10 @@ impl FileFragment {
         Self { dataset, core }
     }
 
+    pub(super) fn as_runtime(&self) -> &lance_table_runtime::FileFragment {
+        &self.core
+    }
+
     /// Create a new [`FileFragment`] from a [`StreamingWriteSource`].
     ///
     /// This method can be used before a `Dataset` is created. For example,

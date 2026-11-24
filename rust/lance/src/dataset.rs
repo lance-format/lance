@@ -1716,7 +1716,10 @@ impl Dataset {
         row_ids: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
-        blob::take_blobs(self, row_ids, column.as_ref()).await
+        self.table_view()
+            .to_table()
+            .take_blobs(row_ids, column)
+            .await
     }
 
     /// Take [BlobFile] by row addresses.
@@ -1749,7 +1752,10 @@ impl Dataset {
         row_addrs: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
-        blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
+        self.table_view()
+            .to_table()
+            .take_blobs_by_addresses(row_addrs, column)
+            .await
     }
 
     /// Scan every row of this dataset with its blob v2 columns as values another
@@ -1804,9 +1810,10 @@ impl Dataset {
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
-        let fragments = self.get_fragments();
-        let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
-        blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
+        self.table_view()
+            .to_table()
+            .take_blobs_by_indices(row_indices, column)
+            .await
     }
 
     /// Create a planned blob reader for a blob column.
@@ -1834,13 +1841,7 @@ impl Dataset {
     /// # }
     /// ```
     pub fn read_blobs(self: &Arc<Self>, column: impl AsRef<str>) -> Result<ReadBlobsBuilder> {
-        let column = column.as_ref();
-        let blob_field_id = blob::validate_blob_column(self, column)?;
-        Ok(ReadBlobsBuilder::new(
-            self.clone(),
-            column.to_string(),
-            blob_field_id,
-        ))
+        self.table_view().to_table().read_blobs(column)
     }
 
     /// Create a planned reader for row-specific blob-local byte ranges.
@@ -1872,7 +1873,7 @@ impl Dataset {
         self: &Arc<Self>,
         column: impl AsRef<str>,
     ) -> Result<ReadBlobRangesBuilder> {
-        Ok(ReadBlobRangesBuilder::new(self.read_blobs(column)?))
+        self.table_view().to_table().read_blob_ranges(column)
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -2481,17 +2482,7 @@ impl Dataset {
     }
 
     pub(crate) fn blob_base_path(&self, base_id: Option<u32>) -> Result<Path> {
-        match base_id {
-            Some(id) => self
-                .manifest
-                .base_paths
-                .get(&id)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
-                })?
-                .extract_path(self.session.store_registry()),
-            None => Ok(self.table_state.base.clone()),
-        }
+        self.table_view().blob_base_path(base_id)
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
