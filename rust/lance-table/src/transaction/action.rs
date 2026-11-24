@@ -125,7 +125,7 @@ pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::{AdjustIndexCoverage, AdjustIndexCoverageParts};
 pub use alter_field::AlterField;
 pub use append_frag_reuse_transition::{AppendFragReuseTransition, FragReuseMapping};
-pub use apply::ApplyState;
+pub use apply::WorkingManifest;
 pub use assert_cells_unchanged::AssertCellsUnchanged;
 pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
@@ -410,7 +410,7 @@ macro_rules! define_action {
             }
 
             /// Fold this action into the state the next manifest is built from.
-            fn apply(&self, state: &mut ApplyState) -> Result<()> {
+            fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
                 match self {
                     $(Self::$variant(action) => action.apply(state),)*
                 }

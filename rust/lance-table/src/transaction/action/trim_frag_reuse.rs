@@ -4,7 +4,7 @@
 //! Trim the fragment reuse history.
 
 use super::Footprint;
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -21,7 +21,7 @@ use lance_core::{Error, Result};
 pub struct TrimFragReuse {}
 
 impl TrimFragReuse {
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         state.request_frag_reuse_trim();
         Ok(())
     }

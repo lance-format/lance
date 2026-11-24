@@ -3,7 +3,7 @@
 
 //! Add a data file to a fragment.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{FieldRef, Footprint, Ref};
 use crate::format::{DataFile, pb, pb_actions};
@@ -130,7 +130,7 @@ impl AddDataFile {
         self.base
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
         if self.data_change {
             state.reject_data_change_to_rearranged(fragment_id, "AddDataFile")?;

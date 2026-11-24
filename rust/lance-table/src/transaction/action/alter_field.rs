@@ -3,7 +3,7 @@
 
 //! Alter facets of an existing field in place.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{Coordinate, FieldRef, Footprint};
 use crate::format::pb_actions;
@@ -62,7 +62,7 @@ impl AlterField {
         self.nullable
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let field_id = state.resolve_schema_field(self.field, "AlterField")?;
         let missing = || {
             Error::invalid_input(format!(

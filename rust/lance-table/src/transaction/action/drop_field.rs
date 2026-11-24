@@ -3,7 +3,7 @@
 
 //! Remove a field from the schema.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{FieldRef, Footprint};
 use crate::format::pb_actions;
@@ -35,7 +35,7 @@ impl DropField {
         self.field
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let field_id = state.resolve_schema_field(self.field, "DropField")?;
         let field = state.schema().field_by_id(field_id).ok_or_else(|| {
             Error::invalid_input(format!(

@@ -3,7 +3,7 @@
 
 //! Restamp the row-version metadata of rows rewritten in place.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::row_selection::{reject_repeated_fragments, row_selections_from_proto};
 use super::{Coordinate, Footprint, Ref, RowSelection, SelectedRows};
 use crate::format::pb_actions;
@@ -74,7 +74,7 @@ impl RefreshRowVersionMetadata {
         &self.rows
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         if !self.rows.is_empty() && !state.uses_stable_row_ids() {
             return Err(Error::invalid_input(
                 "RefreshRowVersionMetadata restamps the per-row version sequences, which only \

@@ -11,7 +11,7 @@
 //! being committed on top of carries, never from a copy the writer read, which
 //! is what makes a retry merge onto whatever a concurrent writer recorded.
 
-use super::{ApplyState, RemovedFragment};
+use super::{RemovedFragment, WorkingManifest};
 use crate::feature_flags::{FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX};
 use crate::format::pb::fragment_reuse_index_details as pb_fri;
 use crate::format::{Fragment, IndexMetadata, Manifest};
@@ -79,7 +79,7 @@ pub(super) fn set_feature_flags(manifest: &mut Manifest, indices: &[IndexMetadat
     manifest.writer_feature_flags |= flags;
 }
 
-impl ApplyState {
+impl WorkingManifest {
     pub(in crate::transaction::action) fn stage_frag_reuse_transition(
         &mut self,
         sources: Vec<u64>,

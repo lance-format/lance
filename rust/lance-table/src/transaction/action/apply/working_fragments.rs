@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Copy-on-write fragment working set and lazy dropped-field masking for
-//! [`ApplyState`](super::ApplyState).
+//! [`WorkingManifest`](super::WorkingManifest).
 
 use super::{MAX_FRAGMENT_ID, TOMBSTONED_FIELD};
 use crate::format::{Fragment, Manifest, RowIdMeta};
@@ -19,7 +19,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(super) struct WorkingFragments {
     base: Arc<Vec<Fragment>>,
-    pub(super) patched: BTreeMap<u64, Option<Arc<Fragment>>>,
+    patched: BTreeMap<u64, Option<Arc<Fragment>>>,
     dropped_fields: Arc<BTreeSet<i32>>,
 }
 
@@ -41,6 +41,17 @@ impl WorkingFragments {
             .binary_search_by_key(&fragment_id, |fragment| fragment.id)
             .ok()
             .map(|position| &self.base[position])
+    }
+
+    /// The step's own copy of `fragment_id`, if any step touched it. `Some(None)`
+    /// means a step removed it.
+    pub(super) fn patch(&self, fragment_id: u64) -> Option<Option<&Arc<Fragment>>> {
+        self.patched.get(&fragment_id).map(Option::as_ref)
+    }
+
+    #[cfg(test)]
+    pub(super) fn patched_ids(&self) -> Vec<u64> {
+        self.patched.keys().copied().collect()
     }
 
     pub(super) fn contains(&self, fragment_id: u64) -> bool {
@@ -313,7 +324,7 @@ pub(super) fn fresh_row_id_count(fragment: &Fragment) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ApplyState;
+    use super::super::WorkingManifest;
     use super::super::tests::{apply_steps, config_update, remove_fragment_zero, whole_fragment};
     use super::*;
     use crate::format::DataFile;
@@ -329,7 +340,7 @@ mod tests {
     fn test_a_step_patches_only_the_fragments_it_touches_and_shares_the_rest() {
         let base = Arc::new(frag_reuse::table(4, false));
         let config = default_build_config();
-        let working = ApplyState::at_read_version(base.clone(), Vec::new(), &config).unwrap();
+        let working = WorkingManifest::at_read_version(base.clone(), Vec::new(), &config).unwrap();
         assert!(Arc::ptr_eq(&working.fragments.base, &base.fragments));
 
         let mut stepped = working.clone();
@@ -337,16 +348,15 @@ mod tests {
         actions.push(remove_fragment_zero());
         stepped.apply_step(&UserStep::new("step", actions)).unwrap();
 
-        assert!(working.fragments.patched.is_empty());
+        assert!(working.fragments.patched_ids().is_empty());
         assert!(Arc::ptr_eq(&stepped.fragments.base, &base.fragments));
-        let patched_ids: Vec<u64> = stepped.fragments.patched.keys().copied().collect();
-        assert_eq!(patched_ids, vec![0, 4]);
-        assert!(stepped.fragments.patched[&0].is_none());
+        assert_eq!(stepped.fragments.patched_ids(), vec![0, 4]);
+        assert_eq!(stepped.fragments.patch(0), Some(None));
 
         let mut mutated_clone = stepped.clone();
         assert!(Arc::ptr_eq(
-            stepped.fragments.patched[&4].as_ref().unwrap(),
-            mutated_clone.fragments.patched[&4].as_ref().unwrap()
+            stepped.fragments.patch(4).flatten().unwrap(),
+            mutated_clone.fragments.patch(4).flatten().unwrap()
         ));
         assert!(Arc::ptr_eq(
             &stepped.fragment_tokens,
@@ -372,7 +382,7 @@ mod tests {
                 ],
             ))
             .unwrap();
-        assert!(!stepped.fragments.patched.contains_key(&1));
+        assert!(stepped.fragments.patch(1).is_none());
         assert!(stepped.config.is_empty());
 
         let (manifest, _) = stepped.build_manifest().unwrap();
@@ -414,7 +424,8 @@ mod tests {
 
         let base = Arc::new(manifest);
         let config = default_build_config();
-        let mut state = ApplyState::at_read_version(base.clone(), Vec::new(), &config).unwrap();
+        let mut state =
+            WorkingManifest::at_read_version(base.clone(), Vec::new(), &config).unwrap();
 
         state
             .apply_step(&UserStep::new(
@@ -423,7 +434,7 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(state.fragments.patched.is_empty());
+        assert!(state.fragments.patched_ids().is_empty());
         assert_eq!(base.fragments[0].files[0].fields.as_ref(), &[0, 1]);
         assert_eq!(base.fragments[1].files[0].fields.as_ref(), &[0, 1]);
 
@@ -493,7 +504,8 @@ mod tests {
         assert_eq!(fragment_ids, vec![0, 2]);
         assert_eq!(next.fragments[0], base.fragments[1]);
 
-        ApplyState::at_read_version(Arc::new(base), Vec::new(), &default_build_config()).unwrap();
+        WorkingManifest::at_read_version(Arc::new(base), Vec::new(), &default_build_config())
+            .unwrap();
     }
 
     #[test]
@@ -503,9 +515,13 @@ mod tests {
         duplicate.fragments = Arc::new(vec![repeated.clone(), repeated]);
         for err in [
             apply_steps(&duplicate, vec![whole_fragment(0)]).unwrap_err(),
-            ApplyState::at_read_version(Arc::new(duplicate), Vec::new(), &default_build_config())
-                .err()
-                .unwrap(),
+            WorkingManifest::at_read_version(
+                Arc::new(duplicate),
+                Vec::new(),
+                &default_build_config(),
+            )
+            .err()
+            .unwrap(),
         ] {
             assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
             assert!(
@@ -521,7 +537,7 @@ mod tests {
         out_of_range.fragments = Arc::new(vec![bad_frag]);
         for err in [
             apply_steps(&out_of_range, vec![whole_fragment(0)]).unwrap_err(),
-            ApplyState::at_read_version(
+            WorkingManifest::at_read_version(
                 Arc::new(out_of_range),
                 Vec::new(),
                 &default_build_config(),

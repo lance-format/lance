@@ -3,7 +3,7 @@
 
 //! Remove a fragment entirely.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{Footprint, Ref};
 use crate::format::pb_actions;
@@ -49,7 +49,7 @@ impl RemoveFragment {
         self.fragment
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
         if !state.remove_fragment(fragment_id, self.data_change)? {
             return Err(Error::invalid_input(format!(

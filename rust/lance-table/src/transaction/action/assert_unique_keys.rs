@@ -3,7 +3,7 @@
 
 //! Assert that no concurrent commit inserted a colliding key.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::assert_cells_unchanged::check_assertable;
 use super::proto::required;
 use super::{FieldRef, Footprint};
@@ -86,7 +86,7 @@ impl AssertUniqueKeys {
     /// still resolved and looked up, so an assertion naming a field that is not
     /// there fails at the commit that carries it rather than silently guarding
     /// nothing.
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         for key_field in &self.key_fields {
             let field_id = state.resolve_schema_field(*key_field, "AssertUniqueKeys")?;
             let field = state.schema().field_by_id(field_id).ok_or_else(|| {

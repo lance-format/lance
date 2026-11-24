@@ -3,7 +3,7 @@
 
 //! Assert that the cells an operation read are unchanged.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::row_selection::{reject_repeated_fragments, row_selections_from_proto};
 use super::{FieldRef, Footprint, Ref, RowSelection};
 use crate::format::pb_actions;
@@ -74,7 +74,7 @@ impl AssertCellsUnchanged {
     /// compared. What it names is still checked against the version it lands
     /// on, so an assertion over something that is not there fails rather than
     /// silently guarding nothing.
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         for field in &self.fields {
             let field_id = state.resolve_schema_field(*field, "AssertCellsUnchanged")?;
             let field = state.schema().field_by_id(field_id).ok_or_else(|| {

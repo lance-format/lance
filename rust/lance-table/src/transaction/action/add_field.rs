@@ -3,7 +3,7 @@
 
 //! Mint a new schema field.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{Coordinate, FieldRef, Footprint};
 use crate::format::pb_actions;
@@ -59,7 +59,7 @@ impl AddField {
         &self.def
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let id = state.mint_field(self.local)?;
         let parent_id = self
             .parent

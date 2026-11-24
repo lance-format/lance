@@ -19,7 +19,7 @@
 //! own mints. A reservation creates nothing another action can name, so the
 //! order has no other visible effect.
 //!
-//! [`ApplyState`] is that working copy, and its methods are the API the action
+//! [`WorkingManifest`] is that working copy, and its methods are the API the action
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
@@ -102,7 +102,7 @@ impl Transaction {
             }
         };
 
-        let mut state = ApplyState::new(
+        let mut state = WorkingManifest::new(
             Arc::new(current_manifest.clone()),
             current_indices,
             config,
@@ -242,21 +242,20 @@ fn merge_loaded_row_lineage(
 /// row-id slot so later staged fragments do not shift ids between snapshots.
 /// Replaying the steps onto a newer committed version renumbers local fragment
 /// ids and fresh row ids from that version's watermarks, so callers that expose
-/// intermediate ids or stage steps that depend on them must require the commit
-/// to land on `read_version` rather than rebase.
+/// intermediate ids or stage steps that depend on them cannot rebase.
 ///
 /// ```
 /// # use std::sync::Arc;
 /// # use lance_core::Result;
 /// # use lance_table::format::{IndexMetadata, Manifest, ManifestBuildConfig};
-/// # use lance_table::transaction::action::{ApplyState, UserStep};
+/// # use lance_table::transaction::action::{WorkingManifest, UserStep};
 /// # fn example(
 /// #     base: Arc<Manifest>,
 /// #     indices: Vec<IndexMetadata>,
 /// #     config: &ManifestBuildConfig,
 /// #     steps: &[UserStep],
 /// # ) -> Result<()> {
-/// let mut state = ApplyState::at_read_version(base, indices, config)?;
+/// let mut state = WorkingManifest::at_read_version(base, indices, config)?;
 /// for step in steps {
 ///     state = state.apply_step_checked(step)?;
 /// }
@@ -266,7 +265,7 @@ fn merge_loaded_row_lineage(
 /// # }
 /// ```
 #[derive(Clone)]
-pub struct ApplyState {
+pub struct WorkingManifest {
     /// The version being committed on top of: the read version on a first
     /// attempt, the latest committed version on a retry.
     current_manifest: Arc<Manifest>,
@@ -385,8 +384,8 @@ pub struct ApplyState {
     read_version: u64,
 }
 
-/// Pending changes made by [`ApplyState::apply_step`] since the state was
-/// created or last validated by [`ApplyState::validate_step_invariants`].
+/// Pending changes made by [`WorkingManifest::apply_step`] since the state was
+/// created or last validated by [`WorkingManifest::validate_step_invariants`].
 #[derive(Clone, Default)]
 struct UnvalidatedScope {
     dirty_fragments: Vec<u64>,
@@ -421,7 +420,7 @@ struct RemovedFragment {
     modified: bool,
 }
 
-impl ApplyState {
+impl WorkingManifest {
     /// Start a state on `base`, the version the transaction read. The read
     /// marks come from that same manifest.
     pub fn at_read_version(
@@ -979,7 +978,7 @@ impl ApplyState {
         self.added_fragment_order
             .iter()
             .filter_map(|slot| match slot {
-                AddedFragment::Present(id) => self.fragments.patched.get(id)?.as_deref(),
+                AddedFragment::Present(id) => self.fragments.patch(*id)?.map(Arc::as_ref),
                 AddedFragment::Removed { .. } => None,
             })
     }
@@ -3434,7 +3433,8 @@ mod tests {
         };
 
         let mut working =
-            ApplyState::at_read_version(Arc::new(base.clone()), indices.clone(), &config).unwrap();
+            WorkingManifest::at_read_version(Arc::new(base.clone()), indices.clone(), &config)
+                .unwrap();
         let mut last_snapshot = None;
         for applied in 1..=steps.len() {
             let mut next = working.clone();
@@ -3482,7 +3482,8 @@ mod tests {
 
         let base = table(1, true);
         let config = default_build_config();
-        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+        let mut state =
+            WorkingManifest::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
 
         state
             .apply_step(&UserStep::new(
@@ -3527,7 +3528,8 @@ mod tests {
 
         let base = table(1, true);
         let config = default_build_config();
-        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+        let mut state =
+            WorkingManifest::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
 
         state
             .apply_step(&UserStep::new("append_a", whole_fragment(0)))
@@ -3618,7 +3620,8 @@ mod tests {
         let step_two = UserStep::new("step_two", whole_fragment(1));
 
         let mut state =
-            ApplyState::at_read_version(Arc::new(base.clone()), indices.clone(), &config).unwrap();
+            WorkingManifest::at_read_version(Arc::new(base.clone()), indices.clone(), &config)
+                .unwrap();
         state.apply_step(&step_one).unwrap();
 
         let first_build = state.build_manifest().unwrap();
@@ -3664,7 +3667,7 @@ mod tests {
         let step_two = UserStep::new("append_b", whole_fragment(1));
 
         let mut staged =
-            ApplyState::at_read_version(Arc::new(read_manifest.clone()), Vec::new(), &config)
+            WorkingManifest::at_read_version(Arc::new(read_manifest.clone()), Vec::new(), &config)
                 .unwrap();
         staged.apply_step(&step_one).unwrap();
         staged.apply_step(&step_two).unwrap();
@@ -3787,7 +3790,7 @@ mod tests {
             ),
         ];
 
-        let mut state = ApplyState::at_read_version(
+        let mut state = WorkingManifest::at_read_version(
             Arc::new(base.clone()),
             vec![initial_index.clone()],
             &config,
@@ -3819,7 +3822,8 @@ mod tests {
         let base = table(1, true);
         let config = default_build_config();
         let seg_uuid = Uuid::from_u128(77);
-        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+        let mut state =
+            WorkingManifest::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
 
         state
             .apply_step(&UserStep::new(
@@ -3874,7 +3878,7 @@ mod tests {
         let base = table(2, true);
         let config = default_build_config();
         let mut working =
-            ApplyState::at_read_version(Arc::new(base.clone()), Vec::new(), &config).unwrap();
+            WorkingManifest::at_read_version(Arc::new(base.clone()), Vec::new(), &config).unwrap();
         let first = UserStep::new("step", whole_fragment(0));
         working = working.apply_step_checked(&first).unwrap();
         let before = working.build_manifest().unwrap();
@@ -4030,7 +4034,7 @@ mod tests {
         #[case] rejected_with: Option<&str>,
     ) {
         let config = default_build_config();
-        let mut stepped = ApplyState::at_read_version(
+        let mut stepped = WorkingManifest::at_read_version(
             Arc::new(base),
             vec![sample_index_metadata("idx")],
             &config,
@@ -4151,7 +4155,8 @@ mod tests {
         #[case] needs_build: bool,
     ) {
         let config = default_build_config();
-        let mut stepped = ApplyState::at_read_version(Arc::new(base), indices, &config).unwrap();
+        let mut stepped =
+            WorkingManifest::at_read_version(Arc::new(base), indices, &config).unwrap();
         stepped.apply_step(&UserStep::new("step", step)).unwrap();
 
         let dirty = stepped.unvalidated_dirty_fragments().unwrap();
@@ -4167,10 +4172,13 @@ mod tests {
     #[test]
     fn test_unvalidated_scope_accumulates_across_unchecked_steps_and_clears_on_validation() {
         let config = default_build_config();
-        let mut working =
-            ApplyState::at_read_version(Arc::new(frag_reuse::table(4, false)), Vec::new(), &config)
-                .unwrap();
-        let dirty_ids = |state: &ApplyState| -> Vec<u64> {
+        let mut working = WorkingManifest::at_read_version(
+            Arc::new(frag_reuse::table(4, false)),
+            Vec::new(),
+            &config,
+        )
+        .unwrap();
+        let dirty_ids = |state: &WorkingManifest| -> Vec<u64> {
             state
                 .unvalidated_dirty_fragments()
                 .unwrap()
@@ -4221,7 +4229,7 @@ mod tests {
             ))
             .unwrap();
         assert!(working.unvalidated.dirty_fragments.is_empty());
-        assert!(!working.fragments.patched.contains_key(&1));
+        assert!(working.fragments.patch(1).is_none());
     }
 
     #[rstest]
@@ -4239,9 +4247,12 @@ mod tests {
         #[case] expected_error: &str,
     ) {
         let config = default_build_config();
-        let mut working =
-            ApplyState::at_read_version(Arc::new(frag_reuse::table(2, true)), Vec::new(), &config)
-                .unwrap();
+        let mut working = WorkingManifest::at_read_version(
+            Arc::new(frag_reuse::table(2, true)),
+            Vec::new(),
+            &config,
+        )
+        .unwrap();
         working
             .apply_step(&UserStep::new("unchecked", bad_unchecked))
             .unwrap();
@@ -4283,7 +4294,8 @@ mod tests {
 
         let empty_config = default_build_config();
         let state =
-            ApplyState::at_read_version(Arc::new(base.clone()), Vec::new(), &empty_config).unwrap();
+            WorkingManifest::at_read_version(Arc::new(base.clone()), Vec::new(), &empty_config)
+                .unwrap();
         assert!(state.spilled_row_lineage_for(0).is_none());
 
         let after_append = state
@@ -4414,8 +4426,9 @@ mod tests {
         let mut config_flags_off = default_build_config();
         config_flags_off.auto_set_feature_flags = false;
 
-        let state = ApplyState::at_read_version(Arc::new(empty_base), Vec::new(), &config_flags_on)
-            .unwrap();
+        let state =
+            WorkingManifest::at_read_version(Arc::new(empty_base), Vec::new(), &config_flags_on)
+                .unwrap();
         let step_one = state
             .apply_step_checked(&UserStep::new(
                 "with_row_ids",
@@ -4434,7 +4447,7 @@ mod tests {
         );
 
         let non_empty_base = frag_reuse::table(2, false);
-        let state = ApplyState::at_read_version(
+        let state = WorkingManifest::at_read_version(
             Arc::new(non_empty_base.clone()),
             Vec::new(),
             &config_flags_off,
@@ -4450,10 +4463,13 @@ mod tests {
 
         let mut clustering_config = default_build_config();
         clustering_config.clustering_definitions = Some(Vec::new());
-        let clustering_err =
-            ApplyState::at_read_version(Arc::new(non_empty_base), Vec::new(), &clustering_config)
-                .err()
-                .unwrap();
+        let clustering_err = WorkingManifest::at_read_version(
+            Arc::new(non_empty_base),
+            Vec::new(),
+            &clustering_config,
+        )
+        .err()
+        .unwrap();
         assert!(
             clustering_err
                 .to_string()
@@ -4468,7 +4484,8 @@ mod tests {
         base.next_row_id = 1_000;
         let config = default_build_config();
 
-        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+        let mut state =
+            WorkingManifest::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
         state
             .apply_step(&UserStep::new(
                 "carried_row_ids",
@@ -4501,7 +4518,7 @@ mod tests {
         let mut overflow_base = frag_reuse::table(1, true);
         overflow_base.next_row_id = 0;
         let mut overflow_state =
-            ApplyState::at_read_version(Arc::new(overflow_base), Vec::new(), &config).unwrap();
+            WorkingManifest::at_read_version(Arc::new(overflow_base), Vec::new(), &config).unwrap();
         let huge_frag = |token| {
             Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(token),

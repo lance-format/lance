@@ -3,7 +3,7 @@
 
 //! Record a compaction's row moves in the fragment reuse history.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{Footprint, Ref};
 use crate::format::pb::fragment_reuse_index_details as pb_fri;
@@ -90,7 +90,7 @@ impl AppendFragReuseTransition {
         &self.mapping
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let resolve = |refs: &[Ref]| {
             refs.iter()
                 .map(|fragment| state.resolve_fragment(*fragment))
