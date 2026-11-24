@@ -749,6 +749,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
                 })
                 .transpose()?,
             metadata: crate::fragment::extract_metadata_map(env, self, "metadata")?,
+            local_fragment_aliases: Default::default(),
         })
     }
 }
@@ -1777,7 +1778,10 @@ fn convert_to_rust_operation(
     read_version: u64,
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
-    let read_dataset = if matches!(op_name.as_str(), "Project" | "Overwrite" | "Merge") {
+    let read_dataset = if matches!(
+        op_name.as_str(),
+        "Project" | "Overwrite" | "Merge" | "CreateIndex"
+    ) {
         match dataset {
             Some(dataset) if dataset.inner.version().version != read_version => {
                 Some(dataset.checkout_version(read_version)?)
@@ -2176,7 +2180,7 @@ fn convert_to_rust_operation(
             Operation::ReserveFragments { num_fragments }
         }
         "CreateIndex" => {
-            let new_indices =
+            let new_indices: Vec<IndexMetadata> =
                 import_vec_from_method(env, java_operation, "getNewIndices", |env, index| {
                     index.extract_object(env)
                 })?;
@@ -2184,6 +2188,24 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "getRemovedIndices", |env, index| {
                     index.extract_object(env)
                 })?;
+            if !new_indices.is_empty()
+                && let Some(dataset) = read_dataset.as_ref()
+            {
+                let existing_indices = dataset.list_indexes()?;
+                for new_index in &new_indices {
+                    if new_index.local_fragment_aliases.is_empty()
+                        && existing_indices.iter().any(|existing| {
+                            existing.uuid == new_index.uuid
+                                && !existing.local_fragment_aliases.is_empty()
+                        })
+                    {
+                        return Err(Error::unsupported_error(format!(
+                            "Cannot republish aliased index segment {} through Java CreateIndex: Java Index does not carry local_fragment_aliases",
+                            new_index.uuid
+                        )));
+                    }
+                }
+            }
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,

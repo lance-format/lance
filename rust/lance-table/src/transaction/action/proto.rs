@@ -289,7 +289,7 @@ mod tests {
                         value: vec![1, 2, 3],
                     })),
                     index_version: 2,
-                    covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
+                    covered_fragments: Some(vec![Ref::Local(0), Ref::Local(1)]),
                     files: vec![IndexFile {
                         path: "index.idx".into(),
                         size_bytes: 512,

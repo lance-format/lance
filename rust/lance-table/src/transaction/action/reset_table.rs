@@ -35,8 +35,7 @@ pub struct ResetTable;
 
 impl ResetTable {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        state.reset();
-        Ok(())
+        state.reset()
     }
 
     /// Emptying the table discards every row it held.

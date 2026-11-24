@@ -28,6 +28,15 @@ pub(in crate::index) async fn merge_segments(
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
+    if let Some(segment) = segments
+        .iter()
+        .find(|segment| !segment.local_fragment_aliases.is_empty())
+    {
+        return Err(Error::not_supported(format!(
+            "BloomFilter segment {} stores provisional fragment ids and cannot be merged directly; rebuild the index instead",
+            segment.uuid
+        )));
+    }
 
     let field_id = *segments[0].fields.first().ok_or_else(|| {
         Error::invalid_input(format!(
@@ -71,6 +80,7 @@ pub(in crate::index) async fn merge_segments(
         files: Some(index_files_to_table(created_index.files)),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
         ..segments[0].clone()
     })
 }

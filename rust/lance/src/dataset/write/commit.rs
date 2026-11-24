@@ -21,6 +21,7 @@ use crate::{
         ManifestWriteConfig, ReadParams,
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
+        ensure_prepared_on_published,
         refs::Refs,
         transaction::{Operation, Transaction},
     },
@@ -64,6 +65,8 @@ pub struct CommitBuilder<'a> {
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Whether the caller has opted in to committing a [`CompositeOperation`].
     allow_composite_operations: bool,
+    /// Require this version to still be the latest version when committing.
+    expected_latest_version: Option<u64>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -93,7 +96,14 @@ impl<'a> CommitBuilder<'a> {
             inherited_field_ids: false,
             clustering_definitions: None,
             allow_composite_operations: false,
+            expected_latest_version: None,
         }
+    }
+
+    /// Commit only if `version` is still the latest version, without rebasing.
+    pub(crate) fn with_expected_latest_version(mut self, version: u64) -> Self {
+        self.expected_latest_version = Some(version);
+        self
     }
 
     /// Whether to use stable row ids. A row then keeps the same `_rowid` for
@@ -605,7 +615,7 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
-                    None,
+                    self.expected_latest_version,
                 )
                 .await?
             }
@@ -697,6 +707,7 @@ impl<'a> CommitBuilder<'a> {
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
                     base_object_stores: Default::default(),
+                    staged_indices: None,
                 })
             }
         }
@@ -723,6 +734,11 @@ impl<'a> CommitBuilder<'a> {
             ));
         }
 
+        // Batch merge takes the minimum read_version, which would mask a
+        // STAGED_VERSION transaction mixed with committed ones.
+        transactions
+            .iter()
+            .try_for_each(ensure_prepared_on_published)?;
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
         let merged = Transaction {

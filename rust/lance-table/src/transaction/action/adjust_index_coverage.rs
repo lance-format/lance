@@ -134,6 +134,12 @@ impl AdjustIndexCoverage {
         )?;
 
         let segment = state.index_segment_mut(self.parts.uuid, &self.parts.name)?;
+        if !segment.local_fragment_aliases.is_empty() {
+            return Err(Error::not_supported(format!(
+                "AdjustIndexCoverage cannot change segment {} of index '{}' while it carries local_fragment_aliases",
+                self.parts.uuid, self.parts.name
+            )));
+        }
         if segment.fields != fields || segment.covering_fields != covering_fields {
             return Err(Error::invalid_input(format!(
                 "AdjustIndexCoverage for segment {} of index '{}' declares fields {fields:?} \

@@ -121,7 +121,7 @@ impl AddOverlays {
             // ids, gets one. Scans read missing lineage as version 1, so that
             // keeps every uncovered row where it was, as the legacy path does.
             1,
-            spilled,
+            &spilled,
         )
     }
 

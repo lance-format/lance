@@ -165,7 +165,9 @@ impl DatasetDeltaBuilder {
     /// - Both `compared_against_version` and explicit version range are specified
     /// - Neither `compared_against_version` nor explicit version range are specified
     /// - Only one of `with_begin_version` or `with_end_version` is specified
+    /// - The dataset is an uncommitted staged dataset
     pub fn build(self) -> Result<DatasetDelta> {
+        self.dataset.ensure_published()?;
         // Validate incompatible combinations
         if self.compared_against_version.is_some()
             && (self.begin_version.is_some()

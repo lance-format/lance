@@ -1626,7 +1626,7 @@ impl MergeInsertJob {
                 &self.spill_session_context,
                 &self.spill_execution_options,
                 (
-                    self.dataset.manifest.version + 1,
+                    self.dataset.manifest.version.saturating_add(1),
                     self.params.write_version(&self.dataset),
                 ),
                 &self.params.on,
