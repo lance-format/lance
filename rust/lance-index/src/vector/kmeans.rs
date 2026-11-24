@@ -2944,7 +2944,9 @@ mod tests {
             .centroids
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(DIM)
+            .as_chunks::<DIM>()
+            .0
+            .iter()
             .map(|centroid| centroid[0])
             .collect();
         first_components.sort_by(f32::total_cmp);

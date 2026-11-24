@@ -184,9 +184,17 @@ fn centroid_mean(centroids: &[f32], dimension: usize) -> Vec<f32> {
 /// by at most `u` of itself. All of these are below
 /// `(dimension + 4) * u * (|x| + |c|)^2` per score. `f32::EPSILON` is `2u`,
 /// which covers the two scores being compared.
+///
+/// Every score is at most `(|x| + |c|)^2` in magnitude, so the margin is
+/// infinite, and no score trusted, once that bound nears `f32::MAX`.
 fn ambiguity_margin(dimension: usize, vector_norm: f32, max_centroid_norm: f32) -> f32 {
     let scale = vector_norm + max_centroid_norm;
-    (dimension + 4) as f32 * f32::EPSILON * scale * scale
+    let bound = scale * scale;
+    if bound < f32::MAX / 2.0 {
+        (dimension + 4) as f32 * f32::EPSILON * bound
+    } else {
+        f32::INFINITY
+    }
 }
 
 /// Vectors and centroids per GEMM tile, sized so that a tile's product stays
@@ -289,13 +297,13 @@ fn assign_rows_gemm(
             vectors.chunks_exact(dimension).zip(tile_rows).zip(&nearest)
         {
             let original = &values[row * dimension..(row + 1) * dimension];
-            let Some(centroid) = centroid else {
-                assignments.push(None);
-                continue;
-            };
             let margin = ambiguity_margin(dimension, dot(vector, vector).sqrt(), centered.max_norm);
-            // An infinite runner-up means a single centroid, nothing to swap.
-            if runner_up - score > margin || runner_up.is_infinite() {
+            // A margin that is not finite means the scores may have overflowed,
+            // so neither the winner nor a missing winner can be trusted.
+            let confident = centroid.filter(|_| {
+                margin.is_finite() && (centered.norms.len() == 1 || runner_up - score > margin)
+            });
+            if let Some(centroid) = confident {
                 let chosen = &centroids[centroid as usize * dimension..][..dimension];
                 assignments.push(Some((centroid, f32::l2(original, chosen))));
             } else {
@@ -376,6 +384,29 @@ mod tests {
             &mut assignments,
         );
         assert_eq!(assignments, vec![Some((0, 0.0)), None]);
+    }
+
+    /// Centroids so far apart that the centered scores overflow still give
+    /// the vector its finite exact match, through direct L2.
+    #[test]
+    fn test_gemm_assignment_survives_overflowing_scores() {
+        let dimension = 32;
+        let values = vec![0.0f32; dimension];
+        let centroids: Vec<f32> = [0.0f32, 4e20]
+            .into_iter()
+            .flat_map(|x| std::iter::repeat_n(x, dimension))
+            .collect();
+        let prepared = f32::prepare_centroids(&centroids, dimension);
+        let mut assignments = Vec::new();
+        f32::assign_rows(
+            &values,
+            dimension,
+            &centroids,
+            &prepared,
+            &[0],
+            &mut assignments,
+        );
+        assert_eq!(assignments, vec![Some((0, 0.0))]);
     }
 
     #[test]

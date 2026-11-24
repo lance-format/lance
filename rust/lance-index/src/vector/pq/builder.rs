@@ -611,13 +611,17 @@ mod tests {
             .values()
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(DIM)
+            .as_chunks::<DIM>()
+            .0
+            .iter()
             .enumerate()
         {
             for s in 0..NUM_SUB_VECTORS {
                 let sub = &vector[s * SUB_DIM..][..SUB_DIM];
                 let nearest = codebook[s * 256 * SUB_DIM..][..256 * SUB_DIM]
-                    .chunks_exact(SUB_DIM)
+                    .as_chunks::<SUB_DIM>()
+                    .0
+                    .iter()
                     .map(|code| l2(sub, code))
                     .fold(f32::INFINITY, f32::min);
                 assert!(nearest < 1e-9, "row {row}, sub-vector {s}: {nearest}");
