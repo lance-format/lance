@@ -1972,6 +1972,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Create a new IVF index.
+    #[instrument(
+        name = "ivf_index_initialize",
+        target = TRACE_IO_EVENTS,
+        level = "info",
+        skip_all,
+        fields(index_reader_us, model_read_us, model_decode_us, quantizer_open_us,
+            resident_open_us, query_state_us, scheduler_requests, scheduler_bytes)
+    )]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -1983,6 +1991,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_sizes: HashMap<String, u64>,
         context: IvfOpenContext,
     ) -> Result<Self> {
+        // Consecutive wall intervals include time awaiting their futures. Keep counters
+        // on the initialization span so segment fanout does not multiply phase spans.
+        // A filtered instrumented future runs in its caller's span.
+        let span = Some(tracing::Span::current()).filter(|span| {
+            span.metadata().is_some_and(|meta| {
+                meta.target() == TRACE_IO_EVENTS && meta.name() == "ivf_index_initialize"
+            })
+        });
+        let mut checkpoint = span.as_ref().map(|_| Instant::now());
+        let mut finish_phase = |field: &'static str| {
+            if let (Some(span), Some(last)) = (&span, &mut checkpoint) {
+                let now = Instant::now();
+                span.record(
+                    field,
+                    i64::try_from((now - *last).as_micros()).unwrap_or(i64::MAX),
+                );
+                *last = now;
+            }
+        };
         let io_parallelism = object_store.io_parallelism();
         let origin_latency =
             Self::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
@@ -2041,7 +2068,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", IVF_METADATA_KEY)))?
             .parse()
             .map_err(|e| Error::index(format!("Failed to decode IVF position: {}", e)))?;
+        finish_phase("index_reader_us");
         let ivf_pb_bytes = index_reader.read_global_buffer(ivf_pos).await?;
+        finish_phase("model_read_us");
         let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_pb_bytes)?)?;
 
         let sub_index_metadata = index_reader
@@ -2051,6 +2080,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
+        finish_phase("model_decode_us");
         let aux_cached_size = file_sizes
             .get(INDEX_AUXILIARY_FILE_NAME)
             .map(|&size| CachedFileSize::new(size))
@@ -2079,6 +2109,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?
             }
         };
+        finish_phase("quantizer_open_us");
         let resident_columns = Self::resident_columns_at_open(
             &storage,
             context.file_cache.as_ref(),
@@ -2106,6 +2137,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         // load's requests with the rest of the open's I/O, so the load adds
         // them to no other stats.
         storage.load_resident_store(None).await?;
+        finish_phase("resident_open_us");
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
@@ -2131,6 +2163,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
+        finish_phase("query_state_us");
+        if let Some(span) = span {
+            span.record(
+                "scheduler_requests",
+                i64::try_from(open_io_stats.requests).unwrap_or(i64::MAX),
+            );
+            span.record(
+                "scheduler_bytes",
+                i64::try_from(open_io_stats.bytes_read).unwrap_or(i64::MAX),
+            );
+        }
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),

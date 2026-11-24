@@ -8,12 +8,8 @@
 use lance_core::{Error, Result};
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::registry::display_type_from_url;
-use lance_table::feature_flags::{
-    FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, frag_reuse_with_stable_row_ids_enabled,
-};
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
-use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
-use lance_table::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
+use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
 use prost::Name;
 use prost_types::Any;
 
@@ -37,10 +33,11 @@ fn is_mem_wal_index_entry(index: &IndexMetadata) -> bool {
         })
 }
 
-/// An empty fragment reuse index counts.
-pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexMetadata]) -> bool {
-    manifest.uses_stable_row_ids() && indices.iter().any(is_frag_reuse_index_entry)
-}
+#[cfg(test)]
+use lance_table::feature_flags::FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+#[cfg(test)]
+pub use lance_table_runtime::frag_reuse::apply_frag_reuse_with_stable_row_ids_flag;
+pub use lance_table_runtime::frag_reuse::has_frag_reuse_with_stable_row_ids;
 
 /// `supports_batch_row_id_remapping` is only a proxy for applying the legacy
 /// fragment reuse index on load, so every admitted type needs a query test on
@@ -104,68 +101,28 @@ fn list_incompatible(incompatible: &[(&IndexMetadata, String)]) -> String {
         .join("; ")
 }
 
-pub fn apply_frag_reuse_with_stable_row_ids_flag(
-    manifest: &mut Manifest,
-    indices: &[IndexMetadata],
-) {
-    if has_frag_reuse_with_stable_row_ids(manifest, indices) {
-        manifest.reader_feature_flags |= FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-        manifest.writer_feature_flags |= FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-    } else {
-        manifest.reader_feature_flags &= !FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-        manifest.writer_feature_flags &= !FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-    }
-}
-
-pub fn validate_frag_reuse_with_stable_row_ids(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-) -> Result<()> {
-    validate_frag_reuse_with_stable_row_ids_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
 /// Split out so the release-build refusal is testable from a debug build.
+#[cfg(test)]
 fn validate_frag_reuse_with_stable_row_ids_when(
     manifest: &Manifest,
     indices: &[IndexMetadata],
     is_supported: bool,
 ) -> Result<()> {
-    if !has_frag_reuse_with_stable_row_ids(manifest, indices) {
+    if !lance_table_runtime::frag_reuse::validate_stable_row_id_fri_shape(
+        manifest,
+        indices,
+        is_supported,
+    )? {
         return Ok(());
     }
+    validate_stable_row_id_user_indices(manifest, indices)
+}
+
+pub fn validate_stable_row_id_user_indices(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+) -> Result<()> {
     let version = manifest.version;
-    if !is_supported {
-        return Err(Error::not_supported(format!(
-            "Cannot commit version {version}: the dataset uses stable row IDs and carries a \
-             fragment reuse index, which this build of Lance does not support"
-        )));
-    }
-    let frag_reuse_entries: Vec<_> = indices
-        .iter()
-        .filter(|index| is_frag_reuse_index_entry(index))
-        .collect();
-    if frag_reuse_entries.len() != 1 {
-        return Err(Error::invalid_input(format!(
-            "Cannot commit version {version}: the dataset carries {} fragment reuse index \
-             entries, but exactly one is allowed",
-            frag_reuse_entries.len()
-        )));
-    }
-    // A tagged history (index_version 1) is allowed beside stable row ids as
-    // long as every index stores row addresses, which the check below holds
-    // every index to.
-    let frag_reuse_version = frag_reuse_entries[0].index_version;
-    if !matches!(frag_reuse_version, 0 | 1) {
-        return Err(Error::invalid_input(format!(
-            "Cannot commit version {version}: the dataset uses stable row IDs and carries a \
-             fragment reuse index with index_version {frag_reuse_version}, which this build of \
-             Lance does not support"
-        )));
-    }
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());
@@ -179,41 +136,21 @@ fn validate_frag_reuse_with_stable_row_ids_when(
     )))
 }
 
-pub fn ensure_frag_reuse_recording_allowed(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-) -> Result<()> {
-    ensure_frag_reuse_recording_allowed_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
+#[cfg(test)]
 fn ensure_frag_reuse_recording_allowed_when(
     manifest: &Manifest,
     indices: &[IndexMetadata],
     is_supported: bool,
 ) -> Result<()> {
-    if !is_supported {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
-             recording their row-address moves in a fragment reuse index is not supported by \
-             this build of Lance",
-        ));
-    }
-    // The tagged-history flag is sticky, so it can outlive a trim and a
-    // migration to stable row ids.
-    let frag_reuse_entry = indices
-        .iter()
-        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
-    if uses_tagged_fri(manifest, frag_reuse_entry) {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
-             manifest requires a tagged fragment reuse history, which stable row IDs do not \
-             support",
-        ));
-    }
+    lance_table_runtime::frag_reuse::validate_stable_row_id_recording_format(
+        manifest,
+        indices,
+        is_supported,
+    )?;
+    validate_compaction_index_recording(indices)
+}
+
+pub fn validate_compaction_index_recording(indices: &[IndexMetadata]) -> Result<()> {
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());

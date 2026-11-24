@@ -4,6 +4,76 @@
 use super::*;
 use lance_datagen::ArrayGeneratorExt;
 
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_standalone_json_key() {
+    use crate::io::commit::conflict_resolver::TransactionRebase;
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, convert_json_columns};
+    use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(HashMap::from([
+            (ARROW_EXT_NAME_KEY.into(), ARROW_JSON_EXT_NAME.into()),
+            (LANCE_UNENFORCED_PRIMARY_KEY.into(), "true".into()),
+        ])),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = |keys: Vec<&str>, value| {
+        let values = Int32Array::from(vec![value; keys.len()]);
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(keys)), Arc::new(values)],
+        )
+        .unwrap()
+    };
+    let read = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![batch(vec!["2"], 0)])
+            .await
+            .unwrap(),
+    );
+    let stage = |rows| {
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![rows])
+    };
+    let text = stage(batch(vec![" 90 "], 10)).await.unwrap();
+    let binary = stage(convert_json_columns(&batch(vec!["2", "90"], 20)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(text.stats.num_inserted_rows, 1);
+    assert_eq!(
+        (
+            binary.stats.num_inserted_rows,
+            binary.stats.num_updated_rows
+        ),
+        (1, 1)
+    );
+    let latest = CommitBuilder::new(read.clone())
+        .execute(text.transaction)
+        .await
+        .unwrap();
+    let mut rebase =
+        TransactionRebase::try_new(&latest, binary.transaction, binary.affected_rows.as_ref())
+            .await
+            .unwrap();
+    rebase
+        .check_txn(
+            &latest.read_transaction().await.unwrap().unwrap(),
+            latest.version_id(),
+        )
+        .unwrap();
+    assert!(matches!(
+        rebase.finish(&latest).await,
+        Err(Error::RetryableCommitConflict { .. })
+    ));
+    assert_eq!(latest.count_rows(None).await.unwrap(), 2);
+}
+
 #[rstest::rstest]
 #[case::disjoint_update(1, false)]
 #[case::disjoint_delete(1, true)]

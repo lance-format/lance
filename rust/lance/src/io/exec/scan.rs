@@ -246,11 +246,15 @@ impl LanceStream {
             frag_parallelism
         );
 
+        let table = Arc::new(dataset.table_view().to_table());
         let mut file_fragments = fragments
             .iter()
-            .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .map(|fragment| FragmentWithRange {
-                fragment,
+                fragment: FileFragment::from_table(
+                    dataset.clone(),
+                    table.clone(),
+                    fragment.clone(),
+                ),
                 range: None,
             })
             .collect::<Vec<_>>();
@@ -464,9 +468,12 @@ impl LanceStream {
             fragment_readahead, batch_readahead
         );
 
+        let table = Arc::new(dataset.table_view().to_table());
         let file_fragments = fragments
             .iter()
-            .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
+            .map(|fragment| {
+                FileFragment::from_table(dataset.clone(), table.clone(), fragment.clone())
+            })
             .collect::<Vec<_>>();
 
         let batches = if config.ordered_output {

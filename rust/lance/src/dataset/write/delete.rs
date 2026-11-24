@@ -72,7 +72,7 @@ async fn apply_deletions(
                 if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                     match fragment.extend_deletions(*bitmap).await {
                         Ok(Some(new_fragment)) => {
-                            Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
+                            Ok(FragmentChange::Modified(Box::new(new_fragment.into())))
                         }
                         Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                         Err(e) => Err(e),
@@ -262,7 +262,7 @@ impl DeleteJob {
     }
 }
 
-impl RetryExecutor for DeleteJob {
+impl RetryExecutor<Dataset> for DeleteJob {
     type Data = DeleteData;
     type Result = DeleteResult;
 
@@ -299,7 +299,7 @@ impl RetryExecutor for DeleteJob {
                     let fragments = self.dataset.get_fragments();
                     let num_deleted_rows: u64 = fragments
                         .iter()
-                        .map(|f| f.metadata.num_rows().unwrap_or(0) as u64)
+                        .map(|f| f.metadata().num_rows().unwrap_or(0) as u64)
                         .sum();
                     let deleted_fragment_ids = fragments.iter().map(|f| f.id() as u64).collect();
 
@@ -466,8 +466,8 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 2);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 0);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
-        assert!(fragments[0].metadata.deletion_file.is_none());
-        assert!(fragments[1].metadata.deletion_file.is_none());
+        assert!(fragments[0].metadata().deletion_file.is_none());
+        assert!(fragments[1].metadata().deletion_file.is_none());
 
         // Delete rows
         let result = dataset.delete("i < 10 OR i >= 90").await.unwrap();
@@ -479,11 +479,11 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(dataset.count_fragments(), 2);
-        assert!(fragments[0].metadata.deletion_file.is_some());
-        assert!(fragments[1].metadata.deletion_file.is_some());
+        assert!(fragments[0].metadata().deletion_file.is_some());
+        assert!(fragments[1].metadata().deletion_file.is_some());
         assert_eq!(
             fragments[0]
-                .metadata
+                .metadata()
                 .deletion_file
                 .as_ref()
                 .unwrap()
@@ -492,7 +492,7 @@ mod tests {
         );
         assert_eq!(
             fragments[1]
-                .metadata
+                .metadata()
                 .deletion_file
                 .as_ref()
                 .unwrap()
@@ -517,7 +517,7 @@ mod tests {
             deletion_vector.iter().collect::<HashSet<_>>(),
             (40..50).collect::<HashSet<_>>()
         );
-        let second_deletion_file = fragments[1].metadata.deletion_file.clone().unwrap();
+        let second_deletion_file = fragments[1].metadata().deletion_file.clone().unwrap();
 
         // Delete more rows (only 10 new rows since 0..10 already deleted)
         let result = dataset.delete("i < 20").await.unwrap();
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 30);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
-        assert!(fragments[0].metadata.deletion_file.is_some());
+        assert!(fragments[0].metadata().deletion_file.is_some());
         let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(deletion_vector.len(), 20);
         assert_eq!(
@@ -537,7 +537,7 @@ mod tests {
         );
         // Second deletion vector was not rewritten
         assert_eq!(
-            fragments[1].metadata.deletion_file.as_ref().unwrap(),
+            fragments[1].metadata().deletion_file.as_ref().unwrap(),
             &second_deletion_file
         );
 
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 100);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
-        assert!(fragments[0].metadata.deletion_file.is_none());
+        assert!(fragments[0].metadata().deletion_file.is_none());
     }
 
     #[tokio::test]

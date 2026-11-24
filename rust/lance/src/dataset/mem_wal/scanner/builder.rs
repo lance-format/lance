@@ -34,7 +34,7 @@ use super::vector_search::ProbeBounds;
 use super::{SearchQuery, SearchState, validate_nearest_query};
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
-use crate::dataset::utils::SchemaAdapter;
+use crate::dataset::utils::to_logical_stream;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -824,7 +824,7 @@ impl LsmScanner {
     /// [`crate::dataset::scanner::Scanner::try_into_stream`] does.
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
         let stream = self.execute_plan().await?;
-        Ok(SchemaAdapter::new(stream.schema()).to_logical_stream(stream))
+        Ok(to_logical_stream(stream))
     }
 
     /// Execute the scan without converting Lance JSON columns to Arrow JSON.

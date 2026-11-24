@@ -1682,6 +1682,13 @@ async fn sorted_id_values(dataset: &Dataset) -> Vec<(i32, i32)> {
     rows
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RowCommitPath {
+    Commit,
+    Rebase,
+    RebaseNewestFirst,
+}
+
 #[rstest::rstest]
 #[case::cleared(false, false)]
 #[case::cleared_then_deleted(false, true)]
@@ -1690,6 +1697,12 @@ async fn sorted_id_values(dataset: &Dataset) -> Vec<(i32, i32)> {
 async fn test_staged_merge_row_conflicts_after_intermediate_undelete(
     #[values(false, true)] supply_rows: bool,
     #[values(0, 1)] concurrent_id: i32,
+    #[values(
+        RowCommitPath::Commit,
+        RowCommitPath::Rebase,
+        RowCommitPath::RebaseNewestFirst
+    )]
+    path: RowCommitPath,
     #[case] replace_inline: bool,
     #[case] delete_again: bool,
 ) {
@@ -1739,11 +1752,36 @@ async fn test_staged_merge_row_conflicts_after_intermediate_undelete(
         dataset.delete("id = 2").await.unwrap();
     }
     let latest_version = dataset.version().version;
-    let mut commit = CommitBuilder::new(read);
-    if supply_rows {
-        commit = commit.with_affected_rows(staged.affected_rows.unwrap());
-    }
-    let result = commit.execute(staged.transaction).await;
+    let affected = supply_rows.then(|| staged.affected_rows.unwrap());
+    let result = if !matches!(path, RowCommitPath::Commit) {
+        async {
+            let mut rebase = crate::io::commit::conflict_resolver::TransactionRebase::try_new(
+                &read,
+                staged.transaction,
+                affected.as_ref(),
+            )
+            .await?;
+            let mut versions: Vec<_> = (read.version_id() + 1..=latest_version).collect();
+            if matches!(path, RowCommitPath::RebaseNewestFirst) {
+                versions.reverse();
+            }
+            for version in versions {
+                let other = dataset.read_transaction_by_version(version).await?.unwrap();
+                rebase.check_txn(&other, version)?;
+            }
+            let transaction = rebase.finish(&dataset).await?;
+            CommitBuilder::new(Arc::new(dataset.clone()))
+                .execute(transaction)
+                .await
+        }
+        .await
+    } else {
+        let mut commit = CommitBuilder::new(read);
+        if let Some(affected) = affected {
+            commit = commit.with_affected_rows(affected);
+        }
+        commit.execute(staged.transaction).await
+    };
     let conflicts = !supply_rows || concurrent_id == 1;
     if conflicts {
         assert!(

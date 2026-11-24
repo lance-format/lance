@@ -3266,6 +3266,87 @@ def test_staged_merge_conflicts_when_an_inserted_key_is_revived(
     )
 
 
+@pytest.mark.parametrize(
+    "updated_key,keep_deleted,restore,include_key,allow_insert",
+    [
+        pytest.param(1, False, True, True, True, id="same_fragment_empty_mask"),
+        pytest.param(4, True, True, True, True, id="other_fragment_nonempty_mask"),
+        pytest.param(1, False, False, True, True, id="disjoint_rewrite"),
+        pytest.param(1, False, True, False, False, id="update_only"),
+        pytest.param(4, True, True, False, True, id="upsert_without_inserts"),
+    ],
+)
+def test_staged_merge_after_relocated_key(
+    tmp_path,
+    keyed_merge_schema,
+    updated_key,
+    keep_deleted,
+    restore,
+    include_key,
+    allow_insert,
+):
+    from lance.commit import CommitConflictError
+
+    def table(keys, values):
+        return pa.table({"id": keys, "value": values}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(range(8), [0] * 8), tmp_path, max_rows_per_file=4)
+    if keep_deleted:
+        ds.delete("id = 2")
+    before = ds.get_fragments()[0].metadata
+    ds.delete("id = 0")
+    source = (
+        table([0, updated_key], [10, 30]) if include_key else table([updated_key], [30])
+    )
+
+    def stage(snapshot):
+        merge = snapshot.merge_insert("id").when_matched_update_all()
+        if allow_insert:
+            merge = merge.when_not_matched_insert_all()
+        return merge.execute_uncommitted(source)
+
+    txn, stats = stage(ds)
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == int(include_key)
+    if allow_insert:
+        assert txn.operation.inserted_rows_filter is not None
+    if restore:
+        ds = lance.LanceDataset.commit(
+            tmp_path,
+            lance.LanceOperation.Delete([before], [], ""),
+            read_version=ds.version,
+        )
+    moved = 0 if restore else 3
+    stats = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(table([moved], [99]))
+    )
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 0
+    txn = pickle.loads(pickle.dumps(txn))
+    keys = [key for key in range(8) if key != 2 or not keep_deleted]
+    if restore and include_key:
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, txn)
+        current = lance.dataset(tmp_path)
+        assert current.version == ds.version
+        assert current.to_table().sort_by("id") == table(
+            keys, [99 if key == moved else 0 for key in keys]
+        )
+        txn, stats = stage(current)
+        assert stats["num_updated_rows"] == 2
+        assert stats["num_inserted_rows"] == 0
+    result = lance.LanceDataset.commit(tmp_path, txn)
+    changes = {moved: 99, updated_key: 30}
+    if include_key:
+        changes[0] = 10
+    assert result.to_table().sort_by("id") == table(
+        keys, [changes.get(key, 0) for key in keys]
+    )
+
+
 @pytest.mark.parametrize("drop", [True, False], ids=["drop_key", "rename_key"])
 def test_staged_merge_after_composite_key_projection(tmp_path, drop):
     from lance.commit import CommitConflictError

@@ -1,112 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::rowids::resolve_take_row_ids;
-use crate::io::exec::AddRowOffsetExec;
-use crate::{Error, Result};
-use arrow::{compute::concat_batches, datatypes::UInt64Type};
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, UInt64Array};
-use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
-use arrow_schema::Field as ArrowField;
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field as ArrowField};
 use datafusion::common::Column;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_expr::Expr;
-use futures::{Future, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::json::convert_lance_json_to_arrow;
+use lance_core::ROW_ADDR;
 use lance_core::datatypes::Schema;
-use lance_core::utils::address::RowAddress;
-use lance_core::utils::deletion::OffsetMapper;
-use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_table_runtime::{Table, TakeOptions, TakeProjection, TakeSelection};
 
-use super::ProjectionRequest;
-use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
+use super::{
+    Dataset, ProjectionRequest, fragment::FileFragment, scanner::DatasetRecordBatchStream,
+};
+use crate::{Error, Result};
 
-/// Convert a list of row offsets to a list of row addresses
-///
-/// A row offset is a 64-bit integer in the range [0, num_rows_in_dataset]
-///
-/// For example, if there are two fragments, each with 100 rows, then the row offset
-/// 150 maps to the address (1, 50), the 50th row in the second fragment
-///
-/// Row offsets are useful for sampling because you don't need to know the ids / addresses
-/// up front (you can just use the range [0, num_rows_in_dataset]) and they can be cheaply
-/// converted to row addresses in a single pass through fragment sizes (which is what this method does)
-///
-/// This method accounts for deletions.  If there is one fragment with 100 rows and rows 50-59 are
-/// deleted then the row offset 70 will map to the address (0, 80) and the row offset 100 will map
-/// to the address (1, 10), assuming the second fragment starts with 10 undeleted rows.
-///
-/// If any offsets are beyond the end of the dataset, they will be mapped to a tombstone row address.
 pub async fn row_offsets_to_row_addresses(
     fragments: &[FileFragment],
     row_indices: &[u64],
 ) -> Result<Vec<u64>> {
-    if row_indices.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut perm = permutation::sort(row_indices);
-    let sorted_offsets = perm.apply_slice(row_indices);
-
-    let mut frag_iter = fragments.iter();
-    let mut cur_frag = frag_iter.next();
-    let mut cur_frag_rows = if let Some(cur_frag) = cur_frag {
-        cur_frag.count_rows(None).await? as u64
-    } else {
-        0
-    };
-    let mut offset_mapper = None;
-    let mut is_mapper_loaded = false;
-    let mut frag_offset = 0;
-
-    let mut addrs: Vec<u64> = Vec::with_capacity(sorted_offsets.len());
-    for sorted_offset in sorted_offsets.into_iter() {
-        while cur_frag.is_some() && sorted_offset >= frag_offset + cur_frag_rows {
-            frag_offset += cur_frag_rows;
-            cur_frag = frag_iter.next();
-            cur_frag_rows = if let Some(cur_frag) = cur_frag {
-                cur_frag.count_rows(None).await? as u64
-            } else {
-                0
-            };
-            offset_mapper = None;
-            is_mapper_loaded = false;
-        }
-        let Some(cur_frag) = cur_frag else {
-            addrs.push(RowAddress::TOMBSTONE_ROW);
-            continue;
-        };
-
-        // Fragment counts usually come from metadata; only selected fragments need
-        // deletion contents to translate logical offsets into physical addresses.
-        if !is_mapper_loaded {
-            offset_mapper = cur_frag.get_deletion_vector().await?.map(OffsetMapper::new);
-            is_mapper_loaded = true;
-        }
-
-        let mut local_offset = (sorted_offset - frag_offset) as u32;
-        if let Some(offset_mapper) = &mut offset_mapper {
-            local_offset = offset_mapper.map_offset(local_offset);
-        };
-        let row_addr = RowAddress::new_from_parts(cur_frag.id() as u32, local_offset);
-        addrs.push(u64::from(row_addr));
-    }
-
-    // Restore the original order
-    perm.apply_inv_slice_in_place(&mut addrs);
-    Ok(addrs)
+    lance_table_runtime::take::row_offsets_to_row_addresses(
+        fragments.iter().map(FileFragment::as_runtime),
+        row_indices,
+    )
+    .await
 }
 
 pub async fn take(
@@ -123,317 +50,77 @@ pub async fn take_with_io_parallelism(
     projection: ProjectionRequest,
     io_parallelism: Option<u32>,
 ) -> Result<RecordBatch> {
-    if io_parallelism == Some(0) {
-        return Err(Error::invalid_input(
-            "take io_parallelism must be greater than 0, got 0",
-        ));
-    }
-    let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
-    if offsets.is_empty() {
-        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
-            projection.output_schema()?,
-        )));
-    }
-
-    // First, convert the dataset offsets into row addresses
-    let fragments = dataset.get_fragments();
-    let addrs = row_offsets_to_row_addresses(&fragments, offsets).await?;
-
-    let mut builder = TakeBuilder::try_new_from_addresses(
-        Arc::new(dataset.clone()),
-        addrs,
-        Arc::new(projection),
-    )?;
-    if let Some(io_parallelism) = io_parallelism {
-        builder = builder.with_io_parallelism(io_parallelism);
-    }
-
-    take_rows(builder).await
-}
-
-/// Take rows by the internal ROW ids.
-#[allow(clippy::needless_question_mark)]
-async fn do_take_rows(
-    mut builder: TakeBuilder,
-    projection: Arc<ProjectionPlan>,
-    io_parallelism: Option<NonZeroU32>,
-) -> Result<RecordBatch> {
-    // If we need row addresses in output, add to projection's output expressions
-    let projection = if builder.with_row_address {
-        let mut proj = (*projection).clone();
-        // Add _rowaddr to output if not already present
-        if !proj
-            .requested_output_expr
-            .iter()
-            .any(|c| c.name == ROW_ADDR)
-        {
-            proj.requested_output_expr.push(OutputColumn {
-                expr: Expr::Column(Column::from_name(ROW_ADDR)),
-                name: ROW_ADDR.to_string(),
-            });
-        }
-        Arc::new(proj)
-    } else {
-        projection
-    };
-
-    let with_row_id_in_projection = projection.physical_projection.with_row_id;
-    let with_row_addr_in_projection = projection.physical_projection.with_row_addr;
-    let with_row_created_at_version_in_projection =
-        projection.physical_projection.with_row_created_at_version;
-    let with_row_last_updated_at_version_in_projection = projection
-        .physical_projection
-        .with_row_last_updated_at_version;
-
-    let row_addrs = builder.get_row_addrs().await?.clone();
-
-    if row_addrs.is_empty() {
-        // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
-        return builder.empty_batch();
-    }
-
-    let row_addr_stats = check_row_addrs(&row_addrs);
-
-    // This method is mostly to annotate the send bound to avoid the
-    // higher-order lifetime error.
-    // manually implemented async for Send bound
-    #[allow(clippy::manual_async_fn)]
-    fn do_take(
-        fragment: FileFragment,
-        row_offsets: Vec<u32>,
-        projection: Arc<Schema>,
-        read_config: FragReadConfig,
-    ) -> impl Future<Output = Result<RecordBatch>> + Send {
-        async move {
-            fragment
-                .take_rows(&row_offsets, projection.as_ref(), read_config)
-                .await
-        }
-    }
-
-    let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
-    // Keep an internal address so empty and constant projections retain row counts.
-    let read_config = FragReadConfig::default()
-        .with_row_id(with_row_id_in_projection)
-        .with_row_address(with_row_addr_in_projection || projection.physical_projection.is_empty())
-        .with_row_created_at_version(with_row_created_at_version_in_projection)
-        .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
-        .with_ignore_deletions(builder.ignore_deletions);
-    let store_parallelism = builder.dataset.table_state.object_store.io_parallelism();
-    let fragment_concurrency = match io_parallelism {
-        Some(io_parallelism) => store_parallelism.min(io_parallelism.get() as usize),
-        None => store_parallelism,
-    };
-    let read_config = match io_parallelism {
-        Some(io_parallelism) => {
-            let config = SchedulerConfig::new(SchedulerConfig::max_bandwidth_bytes(
-                io_parallelism.get() as usize,
-            ));
-            read_config.with_scan_scheduler(ScanScheduler::new_with_io_parallelism(
-                builder.dataset.table_state.object_store.clone(),
-                config,
-                io_parallelism,
-            ))
-        }
-        None => read_config,
-    };
-    let mut batch = if row_addr_stats.contiguous {
-        // Fastest path: Can use `read_range` directly
-        let start = row_addrs.first().expect("empty range passed to take_rows");
-        let fragment_id = (start >> 32) as usize;
-        let range_start = *start as u32 as usize;
-        let range_end = *row_addrs.last().expect("empty range passed to take_rows") as u32 as usize;
-        let range = range_start..(range_end + 1);
-
-        let fragment = builder.dataset.get_fragment(fragment_id).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "rowaddr start: {} belongs to non-existent fragment: {}",
-                start, fragment_id
-            ))
-        })?;
-
-        let reader = fragment.open(&physical_schema, read_config).await?;
-        reader.read_range_as_batch(range).await
-    } else if row_addr_stats.sorted {
-        // Don't need to re-arrange data, just concatenate
-        let mut batches: Vec<_> = Vec::new();
-        let mut current_fragment = row_addrs[0] >> 32;
-        let mut current_start = 0;
-        let mut row_addr_iter = row_addrs.iter().enumerate();
-        'outer: loop {
-            let (fragment_id, range) = loop {
-                if let Some((i, row_addr)) = row_addr_iter.next() {
-                    let fragment_id = row_addr >> 32;
-                    if fragment_id != current_fragment {
-                        let next = (current_fragment, current_start..i);
-                        current_fragment = fragment_id;
-                        current_start = i;
-                        break next;
-                    }
-                } else if current_start != row_addrs.len() {
-                    let next = (current_fragment, current_start..row_addrs.len());
-                    current_start = row_addrs.len();
-                    break next;
-                } else {
-                    break 'outer;
-                }
-            };
-
-            let fragment = builder
-                .dataset
-                .get_fragment(fragment_id as usize)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "rowaddr {} belongs to non-existent fragment: {}",
-                        row_addrs[range.start], fragment_id
-                    ))
-                })?;
-            let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
-
-            let batch_fut = do_take(
-                fragment,
-                row_offsets,
-                physical_schema.clone(),
-                read_config.clone(),
-            );
-            batches.push(batch_fut);
-        }
-        let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-            .buffered(fragment_concurrency)
-            .try_collect()
-            .await?;
-        Ok(concat_batches(&batches[0].schema(), &batches)?)
-    } else {
-        // Slow case: need to re-map data into expected order
-        let mut sorted_row_addrs = row_addrs.clone();
-        sorted_row_addrs.sort();
-        // Go ahead and dedup, we will reinsert duplicates during the remapping
-        sorted_row_addrs.dedup();
-        // Group ROW Ids by the fragment
-        let mut row_addrs_per_fragment: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        sorted_row_addrs.iter().for_each(|row_addr| {
-            let row_addr = RowAddress::from(*row_addr);
-            let fragment_id = row_addr.fragment_id();
-            let offset = row_addr.row_offset();
-            row_addrs_per_fragment
-                .entry(fragment_id)
-                .and_modify(|v| v.push(offset))
-                .or_insert_with(|| vec![offset]);
-        });
-
-        let addressed_ids: Vec<u32> = row_addrs_per_fragment.keys().copied().collect();
-        let fragments = builder.dataset.get_fragments_from_ids(&addressed_ids)?;
-        let fragment_and_indices = fragments.into_iter().filter_map(|f| {
-            let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
-            Some((f, row_offset))
-        });
-
-        let mut batches = futures::stream::iter(fragment_and_indices)
-            .map(|(fragment, indices)| {
-                do_take(
-                    fragment,
-                    indices,
-                    physical_schema.clone(),
-                    read_config.clone().with_row_address(true),
-                )
-            })
-            .buffered(fragment_concurrency)
-            .try_collect::<Vec<_>>()
-            .await?;
-        let one_batch = if batches.len() > 1 {
-            concat_batches(&batches[0].schema(), &batches)?
-        } else {
-            batches.pop().unwrap()
-        };
-        // Note: one_batch may contains fewer rows than the number of requested
-        // row ids because some rows may have been deleted. Because of this, we
-        // get the results with row ids so that we can re-order the results
-        // to match the requested order.
-
-        let returned_row_addr = one_batch
-            .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::internal("_rowaddr column not found"))?
-            .as_primitive::<UInt64Type>()
-            .values();
-
-        let addr_to_pos: HashMap<u64, u64> = returned_row_addr
-            .iter()
-            .enumerate()
-            .map(|(i, addr)| (*addr, i as u64))
-            .collect();
-        let remapping_index: UInt64Array = row_addrs
-            .iter()
-            .filter_map(|o| addr_to_pos.get(o).copied())
-            .collect();
-
-        // remapping_index may be greater than the number of rows in one_batch
-        // if there are duplicates in the requested row ids. This is expected.
-        debug_assert!(remapping_index.len() >= one_batch.num_rows());
-
-        // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
-        // so we need to handle it manually here.
-        // TODO: remove this once the bug is fixed.
-        let struct_arr: StructArray = one_batch.into();
-        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
-        Ok(reordered.into())
-    }?;
-
-    if builder.with_row_address || projection.must_add_row_offset {
-        // compile `ROW_ADDR` column
-        if batch.num_rows() != row_addrs.len() {
-            return Err(Error::not_supported_source(format!(
-                "Expected {} rows, got {}.  A take operation that includes row addresses must not target deleted rows.",
-                row_addrs.len(),
-                batch.num_rows()
-            ).into()));
-        }
-
-        let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs));
-
-        if projection.must_add_row_offset {
-            // compile and inject `ROW_OFFSET` column
-            let row_offset_col =
-                AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
-            let row_offset_field =
-                ArrowField::new(ROW_OFFSET, arrow::datatypes::DataType::UInt64, false);
-            if batch.schema().column_with_name(ROW_OFFSET).is_none() {
-                batch = batch.try_with_column(row_offset_field, row_offset_col)?;
-            }
-        }
-
-        if builder.with_row_address {
-            // inject `ROW_ADDR` column
-            let row_addr_field =
-                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            if batch.schema().column_with_name(ROW_ADDR).is_none() {
-                batch = batch.try_with_column(row_addr_field, row_addr_col)?;
-            }
-        }
-    }
-
-    to_logical_json_batch(projection.project_batch(batch).await?)
-}
-
-async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
-    let io_parallelism = builder
-        .io_parallelism
-        .map(|io_parallelism| {
-            NonZeroU32::new(io_parallelism).ok_or_else(|| {
-                Error::invalid_input("TakeBuilder io_parallelism must be greater than 0, got 0")
+    let io_parallelism = io_parallelism
+        .map(|limit| {
+            NonZeroU32::new(limit).ok_or_else(|| {
+                Error::invalid_input("take io_parallelism must be greater than 0, got 0")
             })
         })
         .transpose()?;
-    if builder.is_empty() {
-        return builder.empty_batch();
+    let table = dataset.table_view().to_table();
+    match projection {
+        ProjectionRequest::Schema(schema) => {
+            table
+                .take_with_io_parallelism(offsets, &schema, io_parallelism)
+                .await
+        }
+        projection @ ProjectionRequest::Sql(_) => {
+            let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
+            take_expressions(
+                &table,
+                TakeSelection::Indices(offsets),
+                Arc::new(projection),
+                TakeOptions {
+                    io_parallelism,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
     }
-
-    let projection = builder.projection.clone();
-
-    do_take_rows(builder, projection, io_parallelism).await
 }
 
-fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
-    Ok(convert_lance_json_to_arrow(&batch)?)
+async fn take_expressions(
+    table: &Table,
+    selection: TakeSelection<'_>,
+    mut projection: Arc<ProjectionPlan>,
+    options: TakeOptions,
+) -> Result<RecordBatch> {
+    let batch = table
+        .take_physical(
+            selection,
+            &projection.physical_projection,
+            projection.must_add_row_offset,
+            options,
+        )
+        .await?;
+    let Some(batch) = batch else {
+        let mut batch = RecordBatch::new_empty(Arc::new(projection.output_schema()?));
+        if options.with_row_address && batch.column_by_name(ROW_ADDR).is_none() {
+            batch = batch.try_with_column(
+                ArrowField::new(ROW_ADDR, DataType::UInt64, false),
+                Arc::new(UInt64Array::from(Vec::<u64>::new())),
+            )?;
+        }
+        return Ok(convert_lance_json_to_arrow(&batch)?);
+    };
+
+    if options.with_row_address
+        && !projection
+            .requested_output_expr
+            .iter()
+            .any(|c| c.name == ROW_ADDR)
+    {
+        Arc::make_mut(&mut projection)
+            .requested_output_expr
+            .push(OutputColumn {
+                expr: Expr::Column(Column::from_name(ROW_ADDR)),
+                name: ROW_ADDR.to_string(),
+            });
+    }
+    Ok(convert_lance_json_to_arrow(
+        &projection.project_batch(batch).await?,
+    )?)
 }
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -480,51 +167,27 @@ pub fn take_scan(
     )))
 }
 
-struct RowAddressStats {
-    sorted: bool,
-    contiguous: bool,
+#[derive(Clone, Debug)]
+enum TakeRows {
+    Ids(Vec<u64>),
+    Addresses(Vec<u64>),
 }
 
-fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
-    let mut sorted = true;
-    let mut contiguous = true;
-
-    if row_addrs.is_empty() {
-        return RowAddressStats { sorted, contiguous };
-    }
-
-    let mut last_offset = row_addrs[0];
-    let first_fragment_id = row_addrs[0] >> 32;
-
-    for addr in row_addrs.iter().skip(1) {
-        sorted &= *addr >= last_offset;
-        contiguous &= last_offset.checked_add(1) == Some(*addr);
-        // Contiguous also requires the fragment ids are all the same
-        contiguous &= (*addr >> 32) == first_fragment_id;
-        last_offset = *addr;
-    }
-
-    RowAddressStats { sorted, contiguous }
+#[derive(Clone, Debug)]
+enum TakeOutput {
+    Schema(TakeProjection),
+    Expressions(Arc<ProjectionPlan>),
 }
 
 /// Builder for the `take` operation.
 #[derive(Clone, Debug)]
 pub struct TakeBuilder {
     dataset: Arc<Dataset>,
-    row_ids: Option<Vec<u64>>,
-    row_addrs: Option<Vec<u64>>,
-    projection: Arc<ProjectionPlan>,
+    rows: TakeRows,
+    output: TakeOutput,
     with_row_address: bool,
-    missing_row_policy: MissingRowPolicy,
     ignore_deletions: bool,
     io_parallelism: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum MissingRowPolicy {
-    #[default]
-    Ignore,
-    Error,
 }
 
 impl TakeBuilder {
@@ -534,13 +197,19 @@ impl TakeBuilder {
         row_ids: Vec<u64>,
         projection: ProjectionRequest,
     ) -> Result<Self> {
+        let output = match projection {
+            ProjectionRequest::Schema(schema) => {
+                TakeOutput::Schema(TakeProjection::try_new(dataset.clone(), &schema)?)
+            }
+            projection @ ProjectionRequest::Sql(_) => {
+                TakeOutput::Expressions(Arc::new(projection.into_projection_plan(dataset.clone())?))
+            }
+        };
         Ok(Self {
-            row_ids: Some(row_ids),
-            row_addrs: None,
-            projection: Arc::new(projection.into_projection_plan(dataset.clone())?),
             dataset,
+            rows: TakeRows::Ids(row_ids),
+            output,
             with_row_address: false,
-            missing_row_policy: MissingRowPolicy::default(),
             ignore_deletions: false,
             io_parallelism: None,
         })
@@ -553,12 +222,10 @@ impl TakeBuilder {
         projection: Arc<ProjectionPlan>,
     ) -> Result<Self> {
         Ok(Self {
-            row_ids: None,
-            row_addrs: Some(addresses),
-            projection,
             dataset,
+            rows: TakeRows::Addresses(addresses),
+            output: TakeOutput::Expressions(projection),
             with_row_address: false,
-            missing_row_policy: MissingRowPolicy::default(),
             ignore_deletions: false,
             io_parallelism: None,
         })
@@ -614,122 +281,65 @@ impl TakeBuilder {
         self
     }
 
-    pub(super) fn with_missing_row_policy(mut self, policy: MissingRowPolicy) -> Self {
-        self.missing_row_policy = policy;
-        self
-    }
-
     /// Execute the take operation and return a single batch
     pub async fn execute(self) -> Result<RecordBatch> {
-        take_rows(self).await
+        let io_parallelism = self
+            .io_parallelism
+            .map(|limit| {
+                NonZeroU32::new(limit).ok_or_else(|| {
+                    Error::invalid_input("TakeBuilder io_parallelism must be greater than 0, got 0")
+                })
+            })
+            .transpose()?;
+        let options = TakeOptions {
+            with_row_address: self.with_row_address,
+            ignore_deletions: self.ignore_deletions,
+            io_parallelism,
+            ..Default::default()
+        };
+        let selection = match &self.rows {
+            TakeRows::Ids(ids) => TakeSelection::RowIds(ids),
+            TakeRows::Addresses(addrs) => TakeSelection::RowAddresses(addrs),
+        };
+        let table = self.dataset.table_view().to_table();
+        match self.output {
+            TakeOutput::Schema(projection) => {
+                table
+                    .take_with_options(selection, &projection, options)
+                    .await
+            }
+            TakeOutput::Expressions(projection) => {
+                take_expressions(&table, selection, projection, options).await
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        match (self.row_ids.as_ref(), self.row_addrs.as_ref()) {
-            (Some(ids), _) => ids.is_empty(),
-            (_, Some(addrs)) => addrs.is_empty(),
-            _ => unreachable!(),
+        match &self.rows {
+            TakeRows::Ids(rows) | TakeRows::Addresses(rows) => rows.is_empty(),
         }
     }
-
-    fn empty_batch(&self) -> Result<RecordBatch> {
-        let mut batch = RecordBatch::new_empty(Arc::new(self.projection.output_schema()?));
-        if self.with_row_address && batch.column_by_name(ROW_ADDR).is_none() {
-            batch = batch.try_with_column(
-                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false),
-                Arc::new(UInt64Array::from(Vec::<u64>::new())),
-            )?;
-        }
-        to_logical_json_batch(batch)
-    }
-
-    async fn get_row_addrs(&mut self) -> Result<&Vec<u64>> {
-        if self.row_addrs.is_none() {
-            let row_ids = self
-                .row_ids
-                .as_ref()
-                .expect("row_ids must be set if row_addrs is not");
-            let addrs = if let Some(resolved) =
-                resolve_take_row_ids(&self.dataset, row_ids, !self.ignore_deletions).await?
-            {
-                if self.missing_row_policy == MissingRowPolicy::Error
-                    && let Some(first_missing_index) =
-                        resolved.iter().position(|address| address.is_none())
-                {
-                    let missing_count = resolved.iter().filter(|address| address.is_none()).count();
-                    return Err(Error::invalid_input(format!(
-                        "Could not resolve all requested row IDs: requested {}, resolved {}; first missing row ID {} was deleted or not found",
-                        row_ids.len(),
-                        row_ids.len() - missing_count,
-                        row_ids[first_missing_index]
-                    )));
-                }
-                resolved
-                    .into_iter()
-                    .filter_map(|opt| opt.map(|address| address.into()))
-                    .collect::<Vec<_>>()
-            } else {
-                row_ids.clone()
-            };
-            self.row_addrs = Some(addrs);
-        }
-        Ok(self.row_addrs.as_ref().unwrap())
-    }
-}
-
-fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<StructArray> {
-    let nulls = array.nulls().map(|nulls| {
-        let is_valid = indices.iter().map(|index| {
-            if let Some(index) = index {
-                nulls.is_valid(index.to_usize().unwrap())
-            } else {
-                false
-            }
-        });
-        NullBuffer::new(BooleanBuffer::new(
-            Buffer::from_iter(is_valid),
-            0,
-            indices.len(),
-        ))
-    });
-
-    if array.fields().is_empty() {
-        return Ok(StructArray::new_empty_fields(indices.len(), nulls));
-    }
-
-    let arrays = array
-        .columns()
-        .iter()
-        .map(|array| {
-            let array = match array.data_type() {
-                arrow::datatypes::DataType::Struct(_) => {
-                    Arc::new(take_struct_array(array.as_struct(), indices)?)
-                }
-                _ => arrow_select::take::take(array, indices, None)?,
-            };
-            Ok(array)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(StructArray::new(array.fields().clone(), arrays, nulls))
 }
 
 #[cfg(test)]
 mod test {
+    use arrow_array::cast::AsArray;
     use arrow_array::types::Int64Type;
+    use arrow_array::{Array, ArrayRef};
     use arrow_array::{
         Int32Array, LargeBinaryArray, ListArray, MapArray, RecordBatchIterator, StringArray,
         StructArray,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
+    use futures::TryStreamExt;
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
-    use lance_core::utils::deletion::DeletionVector;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use lance_io::stream::RecordBatchStream;
-    use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
@@ -1375,154 +985,6 @@ mod test {
     }
 
     #[rstest]
-    #[case::last_fragment(vec![23], vec![31], vec![7], true, true)]
-    #[case::duplicates_unordered(vec![23, 21, 23, 22], vec![31, 29, 31, 30], vec![7], true, true)]
-    #[case::multiple_fragments(vec![23, 0, 22, 3], vec![31, 1, 30, 5], vec![0, 1, 7], true, true)]
-    #[case::empty(vec![], vec![], vec![], true, true)]
-    #[case::empty_missing_deletion_counts(vec![], vec![], vec![], true, false)]
-    #[case::no_deletions(vec![31, 28, 31, 0], vec![31, 28, 31, 0], vec![], false, true)]
-    #[case::missing_deletion_counts(vec![23], vec![31], (0..8).collect(), true, false)]
-    #[tokio::test]
-    async fn test_take_selected_deletion_reads(
-        #[case] offsets: Vec<u64>,
-        #[case] expected_values: Vec<i32>,
-        #[case] expected_deletion_fragments: Vec<usize>,
-        #[case] has_deletions: bool,
-        #[case] has_deletion_counts: bool,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let data = arrow_array::record_batch!(("i", Int32, (0..32).collect::<Vec<_>>())).unwrap();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
-            uri,
-            Some(WriteParams {
-                max_rows_per_file: 4,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        if has_deletions {
-            dataset.delete("i % 4 = 0").await.unwrap();
-        }
-        let mut dataset = Dataset::open(uri).await.unwrap();
-        if !has_deletion_counts {
-            let manifest = Arc::make_mut(&mut dataset.manifest);
-            for fragment in Arc::make_mut(&mut manifest.fragments) {
-                fragment.deletion_file.as_mut().unwrap().num_deleted_rows = None;
-            }
-        }
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 8);
-        let expected_paths: Vec<_> = expected_deletion_fragments
-            .into_iter()
-            .map(|i| {
-                deletion_file_path(
-                    &dataset.table_state.base,
-                    fragments[i].id() as u64,
-                    fragments[i].metadata().deletion_file.as_ref().unwrap(),
-                )
-            })
-            .collect();
-        dataset.table_state.object_store.io_stats_incremental();
-        if offsets.is_empty() {
-            assert!(
-                row_offsets_to_row_addresses(&fragments, &[])
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(
-                dataset
-                    .table_state
-                    .object_store
-                    .io_stats_snapshot()
-                    .read_iops,
-                0
-            );
-        }
-        let batch = dataset
-            .take(
-                &offsets,
-                ProjectionRequest::from_columns(["i"], dataset.schema()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            batch["i"]
-                .as_primitive::<arrow_array::types::Int32Type>()
-                .values()
-                .as_ref(),
-            expected_values
-        );
-        let deletion_reads: Vec<_> = dataset
-            .table_state
-            .object_store
-            .io_stats_incremental()
-            .requests
-            .into_iter()
-            .filter(|r| r.path.parts().any(|part| part.as_ref() == "_deletions"))
-            .map(|r| r.path)
-            .collect();
-        assert_eq!(deletion_reads, expected_paths);
-    }
-
-    #[tokio::test]
-    async fn test_offset_mapping_skips_wholly_deleted_fragment() {
-        let data = arrow_array::record_batch!(("i", Int32, (0..12).collect::<Vec<_>>())).unwrap();
-        let dataset = Arc::new(
-            Dataset::write(
-                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
-                "memory://",
-                Some(WriteParams {
-                    max_rows_per_file: 4,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap(),
-        );
-        let mut fragments = dataset.get_fragments();
-        // Dataset deletion normally removes empty fragments from the manifest. Keep
-        // a valid empty fragment here to exercise the mapper's zero-row boundary.
-        let mut metadata = fragments[1].metadata().clone();
-        metadata.deletion_file = write_deletion_file(
-            &dataset.table_state.base,
-            metadata.id,
-            dataset.version().version,
-            &DeletionVector::from_iter(0..4),
-            &dataset.table_state.object_store,
-            0,
-        )
-        .await
-        .unwrap();
-        fragments[1] = FileFragment::new(dataset.clone(), metadata);
-        dataset.table_state.object_store.io_stats_incremental();
-        let addresses = row_offsets_to_row_addresses(&fragments, &[4, 3, 4, 8])
-            .await
-            .unwrap();
-        assert_eq!(
-            addresses,
-            vec![
-                u64::from(RowAddress::new_from_parts(2, 0)),
-                3,
-                u64::from(RowAddress::new_from_parts(2, 0)),
-                RowAddress::TOMBSTONE_ROW
-            ]
-        );
-        assert!(
-            dataset
-                .table_state
-                .object_store
-                .io_stats_incremental()
-                .requests
-                .iter()
-                .all(|r| !r.path.parts().any(|part| part.as_ref() == "_deletions"))
-        );
-    }
-
-    #[rstest]
     #[tokio::test]
     async fn test_take_with_projection(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -1541,7 +1003,8 @@ mod test {
             .unwrap();
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
-        let projection = ProjectionRequest::from_sql(vec![("foo", "i"), ("bar", "i*2")]);
+        let projection =
+            ProjectionRequest::from_sql([("foo", "i"), ("bar", "i*2"), ("offset", "_rowoffset")]);
         let values = dataset
             .take(&[10, 50, 100], projection.clone())
             .await
@@ -1550,6 +1013,7 @@ mod test {
         let expected_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("foo", DataType::Int32, false),
             ArrowField::new("bar", DataType::Int32, false),
+            ArrowField::new("offset", DataType::UInt64, false),
         ]));
         assert_eq!(
             RecordBatch::try_new(
@@ -1557,6 +1021,7 @@ mod test {
                 vec![
                     Arc::new(Int32Array::from_iter_values([10, 50, 100])),
                     Arc::new(Int32Array::from_iter_values([20, 100, 200])),
+                    Arc::new(UInt64Array::from(vec![10, 50, 100])),
                 ],
             )
             .unwrap(),
@@ -2358,7 +1823,7 @@ mod test {
                 .unwrap();
         }
         assert_eq!(dataset.get_fragments().len(), 1);
-        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 4);
+        assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 4);
 
         let active_reads = Arc::new(AtomicUsize::new(0));
         let peak_reads = Arc::new(AtomicUsize::new(0));
@@ -2570,171 +2035,6 @@ mod test {
             .unwrap(),
             result
         );
-    }
-
-    #[tokio::test]
-    async fn test_stable_point_take_reads_candidate_deletions() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let data = test_batch(0..32);
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
-            uri,
-            Some(WriteParams {
-                max_rows_per_file: 4,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let original_version = dataset.manifest.version;
-        dataset.delete("i % 4 = 0").await.unwrap();
-        let dataset = Arc::new(Dataset::open(uri).await.unwrap());
-        let values = |batch: RecordBatch| {
-            batch["i"]
-                .as_primitive::<arrow_array::types::Int32Type>()
-                .values()
-                .to_vec()
-        };
-        let deletion_reads = || {
-            dataset
-                .table_state
-                .object_store
-                .io_stats_incremental()
-                .requests
-                .into_iter()
-                .map(|request| request.path)
-                .filter(|path| path.parts().any(|part| part.as_ref() == "_deletions"))
-                .collect::<Vec<_>>()
-        };
-        let last = &dataset.manifest.fragments[7];
-        let expected_path = deletion_file_path(
-            &dataset.table_state.base,
-            last.id,
-            last.deletion_file.as_ref().unwrap(),
-        );
-        dataset.table_state.object_store.io_stats_incremental();
-        let take = |ids: &[u64]| dataset.take_builder(ids, dataset.schema().clone()).unwrap();
-        assert_eq!(values(take(&[31]).execute().await.unwrap()), [31]);
-        assert_eq!(deletion_reads(), [expected_path]);
-        assert_eq!(values(take(&[31]).execute().await.unwrap()), [31]);
-        assert!(deletion_reads().is_empty());
-        for missing in [28, u64::MAX] {
-            assert!(values(take(&[missing]).execute().await.unwrap()).is_empty());
-            let error = take(&[missing])
-                .with_missing_row_policy(MissingRowPolicy::Error)
-                .execute()
-                .await
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("first missing row ID {missing}"))
-            );
-        }
-        assert!(deletion_reads().is_empty());
-        assert_eq!(
-            values(
-                take(&[28])
-                    .with_ignore_deletions(true)
-                    .execute()
-                    .await
-                    .unwrap()
-            ),
-            [28]
-        );
-        assert_eq!(
-            values(take(&[31, 28, 2, 31]).execute().await.unwrap()),
-            [31, 2, 31]
-        );
-
-        let original = dataset.checkout_version(original_version).await.unwrap();
-        assert_eq!(
-            values(
-                original
-                    .take_rows(&[28], original.schema().clone())
-                    .await
-                    .unwrap()
-            ),
-            [28]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_stable_point_take_checks_each_candidate_copy() {
-        use lance_table::format::RowIdMeta;
-        use lance_table::rowids::{RowIdSequence, write_row_ids};
-
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let data = test_batch(0..16);
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
-            uri,
-            Some(WriteParams {
-                max_rows_per_file: 4,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        dataset.delete("i % 4 = 0").await.unwrap();
-        let mut dataset = Dataset::open(uri).await.unwrap();
-        // Snapshot without a shared cache identity. Fragment 0 covers 0..4
-        // and fragment 1 now covers 2..6. Both have offset 0 tombstoned.
-        dataset.table_state.manifest_location.e_tag = None;
-        let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
-        fragments[1].row_id_meta = Some(RowIdMeta::Inline(
-            write_row_ids(&RowIdSequence::from(2..6)).into(),
-        ));
-        let mut expected_paths: Vec<_> = fragments[..2]
-            .iter()
-            .map(|f| {
-                deletion_file_path(
-                    &dataset.table_state.base,
-                    f.id,
-                    f.deletion_file.as_ref().unwrap(),
-                )
-            })
-            .collect();
-        expected_paths.sort();
-        let dataset = Arc::new(dataset);
-        dataset.table_state.object_store.io_stats_incremental();
-        let take = |id, ignore| {
-            dataset
-                .take_builder(&[id], dataset.schema().clone())
-                .unwrap()
-                .with_ignore_deletions(ignore)
-        };
-        let batch = take(2, true).execute().await.unwrap();
-        assert_eq!(
-            batch["i"]
-                .as_primitive::<arrow_array::types::Int32Type>()
-                .value(0),
-            2
-        );
-        let mut paths: Vec<_> = dataset
-            .table_state
-            .object_store
-            .io_stats_incremental()
-            .requests
-            .into_iter()
-            .map(|request| request.path)
-            .filter(|path| path.parts().any(|part| part.as_ref() == "_deletions"))
-            .collect();
-        paths.sort();
-        assert_eq!(paths, expected_paths);
-        assert_eq!(take(0, true).execute().await.unwrap().num_rows(), 0);
-        for ignore in [false, true] {
-            let err = take(3, ignore).execute().await.unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("stable row id 3 is live in multiple fragments"),
-                "{err}"
-            );
-        }
     }
 
     /// An update keeps the old copy of a row under a deletion vector and writes

@@ -884,10 +884,10 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let fragment = cloned
         .get_fragments()
         .into_iter()
-        .find(|fragment| fragment.metadata.deletion_file.is_some())
+        .find(|fragment| fragment.metadata().deletion_file.is_some())
         .unwrap();
     assert_eq!(
-        fragment.metadata.deletion_file.as_ref().unwrap().base_id,
+        fragment.metadata().deletion_file.as_ref().unwrap().base_id,
         Some(base.id)
     );
 
@@ -1057,7 +1057,7 @@ async fn test_cold_prefiltered_vector_search_reads_each_deletion_file_once() {
     let deletion_files = dataset
         .get_fragments()
         .iter()
-        .filter(|fragment| fragment.metadata.deletion_file.is_some())
+        .filter(|fragment| fragment.metadata().deletion_file.is_some())
         .count();
     assert_eq!(deletion_files, 8);
 
@@ -1242,7 +1242,7 @@ async fn test_base_files_share_one_scheduler_per_scan() {
     // exactly one scheduler. Reverting the open_current_file_reader change
     // (a fresh scheduler per file) leaves the cache empty and fails this.
     assert_eq!(
-        cache.len(),
+        cache.num_cached_bases(),
         1,
         "all files of one base must share a single scheduler"
     );
@@ -1762,13 +1762,10 @@ async fn test_write_params(
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
         // No group / batch concept in v2
         if data_storage_version == LanceFileVersion::Legacy {
-            let reader = crate::dataset::versions::open_v1_fragment_reader(
-                fragment,
-                dataset.schema(),
-                &FragReadConfig::default(),
-            )
-            .await
-            .unwrap();
+            let reader = fragment
+                .open_v1_fragment_reader(dataset.schema(), &FragReadConfig::default())
+                .await
+                .unwrap();
             assert_eq!(reader.num_batches(), 10);
             for i in 0..reader.num_batches() as u32 {
                 assert_eq!(reader.num_rows_in_batch(i).unwrap(), 10);
@@ -5586,7 +5583,7 @@ async fn forge_legacy_nullable_primary_key(uri: &str, with_mem_wal: bool) -> Dat
     // make building the fixture depend on the very validation these tests
     // exercise, so a regression would show up as a fixture that cannot be
     // built rather than as the behaviour under test changing.
-    manifest.set_timestamp(crate::dataset::timestamp_to_nanos(None));
+    manifest.set_timestamp(crate::utils::temporal::timestamp_to_nanos(None));
     manifest.update_max_fragment_id();
     dataset
         .table_state
