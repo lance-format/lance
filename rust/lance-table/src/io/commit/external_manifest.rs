@@ -171,17 +171,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
     ) -> Result<ManifestLocation> {
         let path = self.get(base_uri, version).await?;
-        let path = Path::parse(&path).map_err(|e| Error::invalid_input(e.to_string()))?;
-        let naming_scheme = detect_naming_scheme_from_path(&path)?;
-        Ok(ManifestLocation {
-            version,
-            path,
-            size: None,
-            naming_scheme,
-            e_tag: None,
-            identity: None,
-            last_modified: None,
-        })
+        ManifestLocation::from_external_path(version, &path)
     }
 
     /// Get the latest version of a dataset at the base_uri, and the path to the manifest.
@@ -198,22 +188,10 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         &self,
         base_uri: &str,
     ) -> Result<Option<ManifestLocation>> {
-        self.get_latest_version(base_uri).await.and_then(|res| {
-            res.map(|(version, uri)| {
-                let path = Path::parse(&uri).map_err(|e| Error::invalid_input(e.to_string()))?;
-                let naming_scheme = detect_naming_scheme_from_path(&path)?;
-                Ok(ManifestLocation {
-                    version,
-                    path,
-                    size: None,
-                    naming_scheme,
-                    e_tag: None,
-                    identity: None,
-                    last_modified: None,
-                })
-            })
+        self.get_latest_version(base_uri)
+            .await?
+            .map(|(version, path)| ManifestLocation::from_external_path(version, &path))
             .transpose()
-        })
     }
 
     /// Put the manifest to the external store.
@@ -568,61 +546,85 @@ pub struct ExternalManifestCommitHandler {
 }
 
 impl ExternalManifestCommitHandler {
+    fn check_manifest_size(location: &ManifestLocation, expected: u64, actual: u64) -> Result<()> {
+        if actual != expected {
+            return Err(Error::corrupt_file(
+                location.path.clone(),
+                format!(
+                    "Manifest size mismatch for version {}: external store expected {expected}, object store returned {actual}",
+                    location.version
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     async fn verify_finalized_manifest_location(
         &self,
         base_path: &Path,
         location: ManifestLocation,
         object_store: &dyn OSObjectStore,
-    ) -> std::result::Result<ManifestLocation, Error> {
-        match object_store.head(&location.path).await {
-            Ok(ObjectMeta { size, e_tag, .. }) => {
-                let ManifestLocation {
-                    version,
-                    path,
-                    size: expected_size,
-                    naming_scheme,
-                    e_tag: _,
-                    identity,
-                    ..
-                } = location;
-
-                let size = match expected_size {
-                    Some(expected_size) if expected_size != size => {
-                        return Err(Error::corrupt_file(
-                            path,
-                            format!(
-                                "Manifest size mismatch for version {}: external store expected {}, object store returned {}",
-                                version, expected_size, size
-                            ),
-                        ));
-                    }
-                    Some(expected_size) => Some(expected_size),
-                    None => Some(size),
-                };
-
-                // Ignore any ETag returned by the external index. It may be a
-                // legacy value published after a later equivalent COPY and is
-                // therefore neither a safe generation fence nor content proof.
-                // The HEAD result is the canonical object's current generation
-                // and is returned only as an ephemeral cache discriminator.
-
-                Ok(ManifestLocation {
-                    version,
-                    path,
-                    size,
-                    naming_scheme,
-                    e_tag,
-                    identity,
-                    last_modified: None,
-                })
-            }
+    ) -> Result<ManifestLocation> {
+        let expected_size = location.size;
+        let observed = match object_store.head(&location.path).await {
+            // A registry ETag can predate an equivalent COPY. Only the live
+            // object's generation is useful for separating cache entries.
+            Ok(meta) => ManifestLocation {
+                size: Some(meta.size),
+                e_tag: meta.e_tag,
+                last_modified: None,
+                ..location
+            },
             Err(ObjectStoreError::NotFound { .. }) => {
-                // The external store may hold a stale finalized V2 path while
-                // the object store still has the manifest at the V1 location.
-                default_resolve_version(base_path, location.version, object_store).await
+                default_resolve_version(base_path, location.version, object_store).await?
             }
-            Err(e) => Err(e.into()),
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(expected) = expected_size {
+            // V1 fallback can return a path without size or generation. Probe it
+            // for validation, retaining its uncached read semantics.
+            let actual = match observed.size {
+                Some(size) => size,
+                None => match object_store.head(&observed.path).await {
+                    Ok(meta) => meta.size,
+                    // The registry still claims this version. Existence probes
+                    // use the location, and opening its bytes reports the loss.
+                    Err(ObjectStoreError::NotFound { .. }) => return Ok(observed),
+                    Err(e) => return Err(e.into()),
+                },
+            };
+            Self::check_manifest_size(&observed, expected, actual)?;
         }
+        Ok(observed)
+    }
+
+    /// Another finalizer may have removed the staged path after the list.
+    /// Use the exact key now registered for that version.
+    async fn refresh_staged_location(
+        &self,
+        base: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+    ) -> Result<ManifestLocation> {
+        let mut location = self
+            .external_manifest_store
+            .get_manifest_location(base.as_ref(), version)
+            .await?;
+        if location.identity.is_none()
+            && location.path.extension() == Some(MANIFEST_EXTENSION)
+            && let Some(expected) = location.size
+        {
+            match object_store.head(&location.path).await {
+                Ok(meta) => Self::check_manifest_size(&location, expected, meta.size)?,
+                Err(ObjectStoreError::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+            // The cache key omits the physical path. Even a live ETag may match
+            // an object at a different key, so read the refreshed path afresh.
+            location.size = None;
+            location.e_tag = None;
+        }
+        Ok(location)
     }
 
     /// Recording the staging path in the external store reserves the version
@@ -796,12 +798,13 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     match object_store.stat(&path).await {
                         Ok(meta) => meta.size,
                         Err(ObjectStoreError::NotFound { .. }) => {
-                            // there may be other threads that have finished executing finalize_manifest.
-                            let new_location = self
-                                .external_manifest_store
-                                .get_manifest_location(base_path.as_ref(), version)
-                                .await?;
-                            return Ok(new_location);
+                            return self
+                                .refresh_staged_location(
+                                    base_path,
+                                    version,
+                                    object_store.inner.as_ref(),
+                                )
+                                .await;
                         }
                         Err(e) => return Err(e.into()),
                     }
