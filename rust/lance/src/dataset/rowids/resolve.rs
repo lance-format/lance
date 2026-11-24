@@ -2091,12 +2091,8 @@ mod tests {
         lance_table::io::deletion::read_deletion_file(
             changed.id,
             file,
-            &current.dataset_dir_for_deletion(file).unwrap(),
-            current
-                .object_store_for_deletion(file)
-                .await
-                .unwrap()
-                .as_ref(),
+            &current.table_view().dataset_dir_for_deletion(file).unwrap(),
+            current.object_store(file.base_id).await.unwrap().as_ref(),
         )
         .await
         .unwrap();

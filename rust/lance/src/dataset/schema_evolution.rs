@@ -492,7 +492,7 @@ pub(super) async fn add_columns_to_fragments(
 
             let fragments = fragments
                 .iter()
-                .map(|f| f.metadata.clone())
+                .map(|f| f.metadata().clone())
                 .collect::<Vec<_>>();
 
             super::versions::validate_metadata_only_null_columns(version)?;
@@ -715,7 +715,7 @@ pub(super) async fn cleanup_new_column_data_files(
         .iter()
         .map(|fragment| {
             let files = fragment
-                .metadata
+                .metadata()
                 .files
                 .iter()
                 .map(|file| (file.base_id, file.path.clone()))
@@ -1371,7 +1371,7 @@ pub(super) async fn alter_columns(
         let source_fragments = dataset.get_fragments();
         let original_file_counts = source_fragments
             .iter()
-            .map(|fragment| (fragment.id() as u64, fragment.metadata.files.len()))
+            .map(|fragment| (fragment.id() as u64, fragment.metadata().files.len()))
             .collect::<HashMap<_, _>>();
         let result = add_columns_impl(
             &source_fragments,
@@ -4952,11 +4952,11 @@ mod test {
         let mut total_physical_rows = 0;
         for (fragment, expected_rows) in fragments.iter().zip(expected_fragment_rows) {
             assert!(
-                fragment.metadata.files.is_empty(),
+                fragment.metadata().files.is_empty(),
                 "fragment {} should not contain data files",
                 fragment.id()
             );
-            assert_eq!(fragment.metadata.physical_rows, Some(*expected_rows));
+            assert_eq!(fragment.metadata().physical_rows, Some(*expected_rows));
             total_physical_rows += expected_rows;
         }
         assert_eq!(total_physical_rows, num_rows);
@@ -5128,7 +5128,7 @@ mod test {
         assert!(
             fragments
                 .iter()
-                .all(|fragment| fragment.metadata.deletion_file.is_some())
+                .all(|fragment| fragment.metadata().deletion_file.is_some())
         );
         dataset.validate().await?;
 

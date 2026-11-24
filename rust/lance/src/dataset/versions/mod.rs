@@ -34,10 +34,7 @@ use object_store::path::Path;
 
 use super::Dataset;
 use super::blob::{BlobPayloadInventory, SidecarRewrite};
-use super::fragment::{
-    FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
-    write::FragmentCreateBuilder,
-};
+use super::fragment::{FileFragment, FragReadConfig, write::FragmentCreateBuilder};
 use super::optimize::CompactionOptions;
 use super::scanner::{PlannedFilteredScan, Scanner};
 use super::schema_evolution::optimize::{
@@ -624,58 +621,15 @@ pub fn index_file_version(version: ConcreteFileVersion) -> ConcreteFileVersion {
     }
 }
 
-pub async fn open_file_reader(
-    version: ConcreteFileVersion,
-    fragment: &FileFragment,
-    data_file: &DataFile,
-    projection: Option<&Schema>,
-    read_config: &FragReadConfig,
-    metadata_mode: MetadataMode,
-) -> Result<Option<Box<dyn GenericFileReader>>> {
-    match version {
-        ConcreteFileVersion::V1 => fragment.open_v1_file_reader(data_file, projection).await,
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => {
-            fragment
-                .open_current_file_reader(data_file, projection, read_config, metadata_mode)
-                .await
-        }
-    }
-}
-
-pub async fn open_v1_fragment_reader(
-    fragment: &FileFragment,
-    projection: &Schema,
-    read_config: &FragReadConfig,
-) -> Result<V1FragmentReader> {
-    for data_file in &fragment.metadata().files {
-        let actual = data_file.file_version()?;
-        if actual != ConcreteFileVersion::V1 {
-            return Err(Error::invalid_input(format!(
-                "Cannot open file {} with the v1 reader because it has version {}",
-                data_file.path, actual
-            )));
-        }
-    }
-    fragment
-        .open_v1_fragment_reader(projection, read_config)
-        .await
-}
-
 pub async fn row_group_size_for_rewrite(
     version: ConcreteFileVersion,
     fragment: &FileFragment,
 ) -> Result<Option<u32>> {
     match version {
         ConcreteFileVersion::V1 => {
-            let reader = open_v1_fragment_reader(
-                fragment,
-                fragment.dataset().schema(),
-                &FragReadConfig::default(),
-            )
-            .await?;
+            let reader = fragment
+                .open_v1_fragment_reader(fragment.schema(), &FragReadConfig::default())
+                .await?;
             Ok(reader.num_rows_in_batch(0))
         }
         ConcreteFileVersion::V2_0

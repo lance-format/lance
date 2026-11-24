@@ -239,8 +239,8 @@ pub(super) async fn load_deletions(
             read_deletion_file(
                 fragment.id,
                 file,
-                &dataset.dataset_dir_for_deletion(file)?,
-                dataset.object_store_for_deletion(file).await?.as_ref(),
+                &dataset.table_view().dataset_dir_for_deletion(file)?,
+                dataset.object_store(file.base_id).await?.as_ref(),
             )
             .await
         })

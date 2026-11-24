@@ -744,7 +744,7 @@ mod tests {
         let fixture = create_multi_base_blob_v2_fixture(vec![1], None, false).await;
         let dataset = &fixture.dataset;
         let field_id = dataset.schema().field("blob").unwrap().id as u32;
-        let data_file = dataset.get_fragment(0).unwrap().metadata.files[0].clone();
+        let data_file = dataset.get_fragment(0).unwrap().metadata().files[0].clone();
         let data_dir = dataset.data_file_dir(&data_file).unwrap();
         let base_root = dataset.blob_base_path(Some(1)).unwrap();
         let sidecar = blob_path(&data_dir, data_file_key_from_path(&data_file.path), 7);

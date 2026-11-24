@@ -527,7 +527,7 @@ impl Updater {
         // comparing against it would reject sound updates. Those fragments keep the
         // weaker checks above.
         if self.dataset().manifest.writer_version.is_some()
-            && let Some(physical_rows) = self.fragment.metadata.physical_rows
+            && let Some(physical_rows) = self.fragment.metadata().physical_rows
         {
             let restored = self.deletion_restorer.current_row_id as usize;
             if restored != physical_rows {
@@ -548,7 +548,7 @@ impl Updater {
         if let Some(writer) = self.writer.as_mut() {
             self.seeds.flush(writer.as_mut()).await?;
             let (_, data_file) = writer.finish().await?;
-            self.fragment.metadata.files.push(data_file);
+            self.fragment.metadata_mut().files.push(data_file);
         }
         // A finished writer is no longer an unfinished resource to clean up, and
         // dropping it makes repeated `finish` calls idempotent instead of appending

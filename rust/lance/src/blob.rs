@@ -39,7 +39,7 @@ use lance_arrow::{
 use lance_core::{
     datatypes::{
         BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
-        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+        BlobV2Layout, Field as LanceField, Schema as LanceSchema, stamp_field_id,
     },
     utils::blob::blob_path,
 };
@@ -154,10 +154,7 @@ pub(crate) fn prepared_blob_field_with_metadata(
 /// under the table's ids.
 pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Result<Field> {
     let source = LanceField::try_from(source)?;
-    Ok(crate::dataset::mem_wal::stamp_field_id(
-        &prepared,
-        std::slice::from_ref(&source),
-    ))
+    Ok(stamp_field_id(&prepared, std::slice::from_ref(&source)))
 }
 
 pub(crate) fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {

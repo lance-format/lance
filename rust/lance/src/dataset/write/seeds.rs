@@ -25,10 +25,10 @@ use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::pbold;
-use lance_index::scalar::seed::IndexSeedWriter;
 use lance_index::scalar::zonemap::{ZoneMapSeedVersion, ZoneMapSeedWriter};
 use lance_table::feature_flags::write_v1_zone_write_seeds;
 use lance_table::format::IndexMetadata;
+use lance_table::format::index_seed::IndexSeedWriter;
 
 use super::GenericWriter;
 use crate::Dataset;

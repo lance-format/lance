@@ -281,7 +281,7 @@ impl MergeInsertJob {
                 versions: (u64, ConcreteFileVersion),
                 diagnostics: Option<Arc<analysis::AnalysisScope>>,
             ) -> Result<usize> {
-                let mut metadata = fragment.metadata.clone();
+                let mut metadata = fragment.metadata().clone();
                 let (current_version, write_version) = versions;
                 // batches still have _rowaddr
                 let write_schema = batches[0]

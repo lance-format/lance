@@ -2359,7 +2359,7 @@ mod test {
                 .unwrap();
         }
         assert_eq!(dataset.get_fragments().len(), 1);
-        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 4);
+        assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 4);
 
         let active_reads = Arc::new(AtomicUsize::new(0));
         let peak_reads = Arc::new(AtomicUsize::new(0));

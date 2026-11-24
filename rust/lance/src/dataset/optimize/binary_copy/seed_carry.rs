@@ -18,12 +18,12 @@ use bytes::Bytes;
 use lance_core::Error;
 use lance_file::reader::CachedFileMetadata;
 use lance_file::versions::data_file_columns;
-use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
-use lance_index::scalar::zonemap::{
-    CarriedSeed, MergeableSeed, merge_seeds_for_binary_copy, parse_seed_for_binary_copy,
-};
 use lance_io::scheduler::FileScheduler;
 use lance_table::format::DataFile;
+use lance_table::format::index_seed::{
+    CarriedSeed, MergeableSeed, ROWS_PER_ZONE_DEFAULT, SEED_META_KEY_PREFIX,
+    merge_seeds_for_binary_copy, parse_seed_for_binary_copy,
+};
 
 use crate::Dataset;
 use crate::Result;
@@ -43,7 +43,7 @@ pub enum SourceColumnSeed {
 /// index specification for the column when one exists, else the writer
 /// default. It is write-time configuration; zones are located by length.
 pub fn output_rows_per_zone(index_rows_per_zone: Option<u64>) -> u64 {
-    index_rows_per_zone.unwrap_or(lance_index::scalar::zonemap::ROWS_PER_ZONE_DEFAULT)
+    index_rows_per_zone.unwrap_or(ROWS_PER_ZONE_DEFAULT)
 }
 
 /// The configured `rows_per_zone` of each column's current usable ZoneMap

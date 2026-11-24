@@ -8,6 +8,7 @@ pub(crate) mod clustering;
 mod encoded_fragments;
 mod fragment;
 mod index;
+pub mod index_seed;
 pub mod key_existence;
 mod manifest;
 pub mod overlay;

@@ -2522,7 +2522,10 @@ async fn test_any_element_nested_hidden_values_under_null_struct() {
         .await
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
-    assert_eq!(dataset.get_fragment(0).unwrap().metadata.overlays.len(), 1);
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1
+    );
 
     // Prove the scanner input carries `tag` below a NULL `details` and a NULL
     // `info`: the filter below can only tell the fix from the bug if it does.
