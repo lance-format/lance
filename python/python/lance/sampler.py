@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import math
+import operator
 import random
 import warnings
 from abc import ABC, abstractmethod
@@ -14,6 +15,7 @@ from heapq import heappush, heappushpop
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     Generic,
     Iterable,
@@ -312,8 +314,8 @@ class _SharedEpoch:
     :meth:`_share_epoch_with_workers`. A persistent worker keeps the sampler copy
     it received at startup, so an int set by ``set_epoch`` in the main process
     never reaches it. Torch's multiprocessing pickler sends a shared-memory tensor
-    as a handle to the same storage, so once shared, every copy of the sampler,
-    including every worker, reads the epoch the main process last set.
+    as a handle to the same storage, so once shared, DataLoader workers and
+    shallow copies of the sampler read the epoch the main process last set.
     """
 
     _epoch_value: Union[int, torch.Tensor] = 0
@@ -324,6 +326,15 @@ class _SharedEpoch:
 
     @_epoch.setter
     def _epoch(self, epoch: int) -> None:
+        try:
+            epoch = operator.index(epoch)
+        except TypeError:
+            # Earlier releases accepted float epochs, so keep accepting integral
+            # ones and reject the rest rather than truncating them.
+            if isinstance(epoch, float) and epoch.is_integer():
+                epoch = int(epoch)
+            else:
+                raise TypeError(f"epoch must be an integer, got {epoch!r}") from None
         if isinstance(self._epoch_value, int):
             self._epoch_value = epoch
         else:
@@ -333,20 +344,38 @@ class _SharedEpoch:
         """Set the epoch that is combined with ``seed`` to shuffle.
 
         Call it before each epoch. Once the sampler is passed to
-        :class:`lance.torch.data.LanceDataset`, the epoch is shared by every copy
-        of the sampler, including DataLoader workers, so per-worker epochs set in
-        ``worker_init_fn`` overwrite each other.
+        :class:`lance.torch.data.LanceDataset`, DataLoader workers and shallow
+        copies of the sampler share one epoch, so per-worker epochs set in
+        ``worker_init_fn`` overwrite each other. Copies made with :mod:`pickle` or
+        :func:`copy.deepcopy` keep an independent epoch.
         """
         self._epoch = epoch
 
+    def __setstate__(self, state: Any) -> None:
+        # A subclass with __slots__ pickles as (__dict__, slots).
+        state, slots = state if isinstance(state, tuple) else (state, None)
+        state = dict(state or {})
+        # Samplers pickled by earlier releases stored the epoch as ``_epoch``,
+        # which the property now shadows.
+        legacy_epoch = state.pop("_epoch", None)
+        self.__dict__.update(state)
+        for name, value in (slots or {}).items():
+            setattr(self, name, value)
+        if legacy_epoch is not None and "_epoch_value" not in state:
+            self._epoch = legacy_epoch
+
     def _share_epoch_with_workers(self) -> None:
-        if not isinstance(self._epoch_value, int):
-            return
-        # Pin to CPU so a default device (e.g. CUDA) cannot redirect it, and keep
-        # it a normal tensor so set_epoch can update it outside inference mode.
+        # Create the tensor on CPU so a default device (e.g. CUDA) cannot redirect
+        # it, and outside inference mode so set_epoch can update it later. A copy
+        # made inside inference mode holds an inference tensor, so rebuild that too.
         with torch.inference_mode(False):
-            shared = torch.tensor(self._epoch_value, dtype=torch.int64, device="cpu")
-            self._epoch_value = shared.share_memory_()
+            if isinstance(self._epoch_value, int) or self._epoch_value.is_inference():
+                self._epoch_value = torch.tensor(
+                    int(self._epoch_value), dtype=torch.int64, device="cpu"
+                )
+            # Also covers a deep copy of a shared sampler, whose tensor is not
+            # shared. A no-op for a tensor that already is.
+            self._epoch_value.share_memory_()
 
 
 class FragmentSampler(Sampler):
