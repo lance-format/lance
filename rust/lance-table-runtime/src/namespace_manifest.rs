@@ -16,7 +16,7 @@ use object_store::path::Path;
 
 use lance_namespace::error::NamespaceError;
 
-use crate::dataset::branch_location::BranchLocation;
+use crate::branch_location::BranchLocation;
 
 /// Whether `e` says the requested chain (table or branch) does not exist, as
 /// opposed to a failure talking to the namespace.

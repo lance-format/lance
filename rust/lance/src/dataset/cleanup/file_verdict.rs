@@ -173,9 +173,15 @@ impl Verdict {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::Schema as ArrowSchema;
+    use lance_core::{datatypes::Schema, utils::blob::blob_path};
+    use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
     use super::*;
+    use crate::{blob::blob_field, dataset::DataFileTarget};
 
     const UUID: &str = "0b5e2a7c-8a4f-4b8e-9d3a-2f1c6e7d8a90";
 
@@ -229,6 +235,7 @@ mod tests {
         listed(Kind::Data, Ref::ManagedBlob(path("_blobs/a/b/0001.blob")))
     )]
     #[case::blob_outside_managed_dirs("images/clip.blob", None)]
+    #[case::reserved_blob_payload("_blobs/functions/attempt-1/value.payload", None)]
     #[case::deletion_arrow(
         "_deletions/0-1-2.arrow",
         listed(Kind::Deletion, Ref::DeletionFile(path("_deletions/0-1-2.arrow")))
@@ -323,6 +330,47 @@ mod tests {
         let file = ListedFile::classify(&path(relative_path)).unwrap();
         assert!(manifests_naming_one_of_each().contains(&file.reference));
         assert!(!ReferencedFiles::default().contains(&file.reference));
+    }
+
+    #[rstest]
+    #[case::within_unverified_retention(true, Verdict::Keep)]
+    #[case::without_unverified_retention(false, Verdict::Delete { unverified: true })]
+    fn current_ordinary_sidecar_retention_before_publication(
+        #[case] maybe_in_progress: bool,
+        #[case] expected: Verdict,
+    ) {
+        // Model the current classifier before the target appears in a manifest.
+        // The delete verdict is a policy characterization. A collector that can
+        // identify an active target may retain it.
+        let schema = Schema::try_from(&ArrowSchema::new(vec![blob_field("blob", false)])).unwrap();
+        let target =
+            DataFileTarget::new(None, Arc::new(schema), ConcreteFileVersion::V2_2).unwrap();
+        let data_dir = path("data");
+        let sidecar = blob_path(&data_dir, target.data_file_key(), 1);
+        let file = ListedFile::classify(&sidecar).unwrap();
+        assert!(matches!(file.reference, Ref::BlobSidecar { .. }));
+
+        let mut retained = manifests_naming_one_of_each();
+        let expiring = ReferencedFiles::default();
+        assert!(!retained.contains(&file.reference));
+        assert_eq!(
+            Verdict::decide(
+                retained.contains(&file.reference),
+                expiring.contains(&file.reference),
+                maybe_in_progress,
+            ),
+            expected
+        );
+
+        retained.data_paths.insert(target.object_path(&data_dir));
+        assert_eq!(
+            Verdict::decide(
+                retained.contains(&file.reference),
+                expiring.contains(&file.reference),
+                maybe_in_progress,
+            ),
+            Verdict::Keep
+        );
     }
 
     #[rstest]

@@ -19,6 +19,7 @@ pub async fn read_dataset_deletion_file(
     };
 
     dataset
+        .table_state
         .metadata_cache
         .get_or_insert_with_key(key, || async {
             // Resolve the store inside the loader so cache hits skip it.

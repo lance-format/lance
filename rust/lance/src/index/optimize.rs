@@ -499,7 +499,8 @@ fn may_hold_stale_postings(dataset: &Dataset, segment: &IndexMetadata) -> bool {
     {
         return false;
     }
-    let Some(covered) = segment.effective_fragment_bitmap(&dataset.fragment_bitmap) else {
+    let Some(covered) = segment.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
+    else {
         return false;
     };
     dataset
@@ -1060,7 +1061,7 @@ async fn plan_split_scalar_index(
         .iter()
         .filter(|segment| {
             segment
-                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                 .is_some_and(|bitmap| bitmap.is_empty())
         })
         .map(|segment| segment.uuid)
@@ -1097,7 +1098,7 @@ async fn bloomfilter_split_merges(
         .into_iter()
         .filter(|segment| {
             segment
-                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                 .is_some_and(|bitmap| !bitmap.is_empty())
         })
         .collect::<Vec<_>>();
@@ -1216,7 +1217,7 @@ async fn absorbable(
 ) -> Result<Vec<IndexMetadata>> {
     absorbed.retain(|segment| {
         segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .is_some_and(|bitmap| !bitmap.is_empty())
     });
     let reason = if absorbed
@@ -1294,7 +1295,7 @@ async fn pack_split_index(
     let mut merge_inputs = Vec::with_capacity(absorbed.len() + fragment_groups.len());
     for segment in absorbed {
         let rows = segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .unwrap_or_default()
             .iter()
             .map(|id| rows_by_fragment.get(&id).copied().unwrap_or(0))
@@ -1311,7 +1312,7 @@ async fn pack_split_index(
     // In fragment order, so an output segment covers a contiguous run too.
     merge_inputs.sort_by_cached_key(|(input, _)| match input {
         MergeInput::Absorbed(segment) => segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .and_then(|bitmap| bitmap.min()),
         MergeInput::Build(fragments) => fragments.first().copied(),
     });
@@ -1697,7 +1698,7 @@ pub async fn commit_optimize_indices(
             .filter(|segment| segment.name == name && !replaced.contains(&segment.uuid))
         {
             let effective = old
-                .effective_fragment_bitmap(&planned.fragment_bitmap)
+                .effective_fragment_bitmap(&planned.table_state.fragment_bitmap)
                 .unwrap_or_default();
             if !effective.is_disjoint(&incoming) {
                 return Err(Error::internal(format!(
@@ -1915,6 +1916,7 @@ mod tests {
     /// The paths the store read since the last call.
     fn read_paths(dataset: &Dataset) -> Vec<String> {
         dataset
+            .table_state
             .object_store
             .io_stats_incremental()
             .requests
@@ -2148,8 +2150,8 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert!(!old_uuids.contains(&segments[0].uuid));
         assert_eq!(
-            coverage(&segments) & dataset.fragment_bitmap.as_ref(),
-            *dataset.fragment_bitmap.as_ref()
+            coverage(&segments) & dataset.table_state.fragment_bitmap.as_ref(),
+            *dataset.table_state.fragment_bitmap.as_ref()
         );
         // The rows of the retired fragment were filtered out of the merge.
         assert_eq!(indexed_rows(&dataset, &segments).await, 1250);
@@ -2336,7 +2338,10 @@ mod tests {
 
         let segments = segments(&dataset, BLOOM_INDEX).await;
         assert_eq!(segments.len(), segment_count);
-        assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
+        assert_eq!(
+            coverage(&segments),
+            *dataset.table_state.fragment_bitmap.as_ref()
+        );
         let live = (0..200 + added as i32)
             .filter(|id| *id != 1)
             .collect::<Vec<_>>();
@@ -2390,7 +2395,10 @@ mod tests {
         assert!(read_any(&read_paths(&dataset), &indexed_files));
         let segments = segments(&dataset, BLOOM_INDEX).await;
         assert_eq!(segments.len(), 1);
-        assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
+        assert_eq!(
+            coverage(&segments),
+            *dataset.table_state.fragment_bitmap.as_ref()
+        );
         assert_bloom_answers(&dataset, &(0..250).collect::<Vec<_>>()).await;
     }
 
@@ -2491,7 +2499,10 @@ mod tests {
         assert!(!read_any(&paths, &other_files), "{paths:?}");
         let segments = segments(&dataset, BLOOM_INDEX).await;
         assert_eq!(segments.len(), 1);
-        assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
+        assert_eq!(
+            coverage(&segments),
+            *dataset.table_state.fragment_bitmap.as_ref()
+        );
         // One zone per fragment, so no old zone of the rewritten fragment is left.
         let index = dataset
             .open_scalar_index("value", &segments[0].uuid, &NoOpMetricsCollector)
@@ -2531,7 +2542,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            *dataset.fragment_bitmap.as_ref(),
+            *dataset.table_state.fragment_bitmap.as_ref(),
             RoaringBitmap::from_iter([0, 1, 2, 4])
         );
         let frag_reuse_index = dataset
@@ -2636,7 +2647,10 @@ mod tests {
             &frag_reuse_index,
             segments.iter()
         ));
-        assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
+        assert_eq!(
+            coverage(&segments),
+            *dataset.table_state.fragment_bitmap.as_ref()
+        );
         assert_bloom_answers(&dataset, &(0..200).collect::<Vec<_>>()).await;
     }
 
@@ -2667,7 +2681,10 @@ mod tests {
             .unwrap();
         let segments = segments(&dataset, BLOOM_INDEX).await;
         assert_eq!(segments.len(), 1);
-        assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
+        assert_eq!(
+            coverage(&segments),
+            *dataset.table_state.fragment_bitmap.as_ref()
+        );
         let live = (0..250).filter(|id| *id != 1).collect::<Vec<_>>();
         assert_bloom_answers(&dataset, &live).await;
     }
@@ -2732,7 +2749,7 @@ mod tests {
         assert!(merged_segments.iter().any(|segment| segment.uuid == older));
         assert_eq!(
             coverage(&merged_segments),
-            *dataset.fragment_bitmap.as_ref()
+            *dataset.table_state.fragment_bitmap.as_ref()
         );
         assert_eq!(ids_where(&dataset, "value = 1000").await, vec![5]);
         assert!(ids_where(&dataset, "value = 5").await.is_empty());
@@ -2751,7 +2768,10 @@ mod tests {
         assert!(!read_any(&paths, &indexed_files), "{paths:?}");
         let segments = segments(&dataset, BLOOM_INDEX).await;
         assert_eq!(segments.len(), 1);
-        assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
+        assert_eq!(
+            coverage(&segments),
+            *dataset.table_state.fragment_bitmap.as_ref()
+        );
         assert_eq!(ids_where(&dataset, "value = 1000").await, vec![5]);
         assert_bloom_answers(&dataset, &unchanged).await;
     }

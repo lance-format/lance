@@ -33,6 +33,7 @@ use lance_linalg::distance::{Cosine, DistanceType, Dot, L2, dot::DotPrepared, l2
 use lance_linalg::simd::dist_table::{
     filter_4bit_dist_table_transposed, sum_4bit_dist_table_transposed,
 };
+use lance_select::RowAddrMask;
 use lance_table::utils::LanceIteratorExtension;
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -1198,6 +1199,7 @@ impl DistCalculator for PQDistCalculator {
                 lower_bound,
                 upper_bound,
                 |i| chunk_row_ids[i as usize],
+                None,
                 res,
                 dists,
             );
@@ -1205,12 +1207,13 @@ impl DistCalculator for PQDistCalculator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn accumulate_topk_with_scratch(
+    fn accumulate_topk_with_mask(
         &self,
         k: usize,
         lower_bound: Option<f32>,
         upper_bound: Option<f32>,
         row_id: impl Fn(u32) -> u64,
+        mask: Option<&RowAddrMask>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
@@ -1231,7 +1234,7 @@ impl DistCalculator for PQDistCalculator {
         .flatten();
         let Some(table) = table else {
             self.distance_all_with_scratch(k, dists, quantized_dists, quantized_table, candidates);
-            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, mask, res, dists);
             return;
         };
 
@@ -1338,8 +1341,13 @@ impl DistCalculator for PQDistCalculator {
             // distance of this partition before any row is scored. A row marked
             // `u16::MAX` only raises its block's minimum, so the bound holds.
             if lower_bound <= OrderedFloat(f32::MIN)
-                && let Some(sum) =
-                    kth_smallest_sum_bound(&quantized_dists[..num_rows], k, candidates)
+                && let Some(sum) = kth_smallest_sum_bound(
+                    &quantized_dists[..num_rows],
+                    k,
+                    candidates,
+                    mask,
+                    &row_id,
+                )
             {
                 threshold = threshold.min(OrderedFloat(table.kth_bound_distance(sum, score_diff)));
                 let Some(sum) = table.sum_cutoff(threshold.0, score_diff) else {
@@ -1384,14 +1392,17 @@ impl DistCalculator for PQDistCalculator {
                 if dist < lower_bound || dist >= upper_bound {
                     continue;
                 }
-                if res.len() < k {
-                    res.push(OrderedNode::new(row_id(id), dist));
-                } else if let Some(mut top) = res.peek_mut()
-                    && top.dist > dist
-                {
-                    *top = OrderedNode::new(row_id(id), dist);
-                } else {
+                if res.len() >= k && res.peek().is_some_and(|top| top.dist <= dist) {
                     continue;
+                }
+                let row_id = row_id(id);
+                if mask.is_some_and(|mask| !mask.selected(row_id)) {
+                    continue;
+                }
+                if res.len() < k {
+                    res.push(OrderedNode::new(row_id, dist));
+                } else if let Some(mut top) = res.peek_mut() {
+                    *top = OrderedNode::new(row_id, dist);
                 }
                 if res.len() >= k
                     && let Some(node) = res.peek()
@@ -1510,21 +1521,33 @@ fn fused_candidate_budget(num_rows: usize, k: usize) -> usize {
 /// fewer than `k` sums. Each of about `4 * k` contiguous blocks contributes its
 /// minimum, a distinct row, so the k-th smallest block minimum is reached by at
 /// least `k` rows while costing only a vectorizable pass and a small selection.
-fn kth_smallest_sum_bound(sums: &[u16], k: usize, block_mins: &mut Vec<u32>) -> Option<u16> {
+fn kth_smallest_sum_bound(
+    sums: &[u16],
+    k: usize,
+    block_mins: &mut Vec<u32>,
+    mask: Option<&RowAddrMask>,
+    row_id: &impl Fn(u32) -> u64,
+) -> Option<u16> {
     if k == 0 || sums.len() < k {
         return None;
     }
     let block_len = (sums.len() / (4 * k)).max(1);
     block_mins.clear();
-    block_mins.extend(
-        sums.chunks(block_len)
-            .map(|block| block.iter().copied().min().unwrap_or(u16::MAX) as u32),
-    );
-    debug_assert!(
-        block_mins.len() >= k,
-        "{} blocks for k={k}",
-        block_mins.len()
-    );
+    for (i, block) in sums.chunks(block_len).enumerate() {
+        let min = block.iter().copied().min()?;
+        // Each minimum needs a live witness. Skipping a block with a
+        // deleted minimum only loosens this optional initial bound.
+        if let Some(mask) = mask {
+            let first = block.iter().position(|&sum| sum == min)?;
+            if !mask.selected(row_id((i * block_len + first) as u32)) {
+                continue;
+            }
+        }
+        block_mins.push(u32::from(min));
+    }
+    if block_mins.len() < k {
+        return None;
+    }
     let (_, kth, _) = block_mins.select_nth_unstable(k - 1);
     Some(*kth as u16)
 }
@@ -2020,6 +2043,47 @@ mod tests {
         assert_eq!(key(actual), key(expected));
     }
 
+    #[test]
+    fn test_pq4_deleted_rows_cannot_set_initial_cutoff() {
+        let storage = create_4bit_pq_storage(1024, DistanceType::L2);
+        let query: ArrayRef = Arc::new(Float32Array::from_iter_values(
+            (0..DIM).map(|i| i as f32 / DIM as f32),
+        ));
+        let calc = storage.dist_calculator(query, 0.0);
+        let mut by_distance: Vec<_> = (0..storage.len() as u32)
+            .map(|id| (OrderedFloat(calc.distance(id)), storage.row_id(id)))
+            .collect();
+        by_distance.sort_by_key(|&(distance, _)| distance);
+        let k = 10;
+        let (blocked, live) = by_distance.split_at(by_distance.len() - k);
+        let mask = RowAddrMask::from_block(blocked.iter().map(|&(_, row_id)| row_id).collect());
+        let mut actual = BinaryHeap::new();
+        calc.accumulate_topk_with_mask(
+            k,
+            None,
+            None,
+            |id| storage.row_id(id),
+            Some(&mask),
+            &mut actual,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        // Even the farthest k must be returned if every closer row was deleted.
+        let mut actual: Vec<_> = actual
+            .into_iter()
+            .map(|node| (node.id, node.dist.0.to_bits()))
+            .collect();
+        let mut expected: Vec<_> = live
+            .iter()
+            .map(|&(dist, id)| (id, dist.0.to_bits()))
+            .collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
     /// The 4-bit bulk scan must select the same top-k, with the same
     /// distances, as scoring every row with `distance()`, from an empty heap or
     /// one already holding another partition's rows, with or without bounds.
@@ -2055,7 +2119,15 @@ mod tests {
         }
         let row_id = |id: u32| id as u64 + 1_000_000;
         let mut expected = heap.clone();
-        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, &mut expected, &exact);
+        accumulate_distances_into_heap(
+            k,
+            lower_bound,
+            upper_bound,
+            row_id,
+            None,
+            &mut expected,
+            &exact,
+        );
 
         let mut actual = heap;
         calc.accumulate_topk_with_scratch(

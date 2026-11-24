@@ -268,8 +268,13 @@ async fn test_create_index_revived_rows(
         let path = current
             .manifest_location()
             .naming_scheme
-            .manifest_path(&current.base, intervening_version);
-        current.object_store.delete(&path).await.unwrap();
+            .manifest_path(&current.table_state.base, intervening_version);
+        current
+            .table_state
+            .object_store
+            .delete(&path)
+            .await
+            .unwrap();
         let mut submission = if submit_from_updated_handle {
             current.clone()
         } else {
@@ -784,10 +789,12 @@ async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_u
         .checkout_version(compaction)
         .await
         .unwrap()
+        .table_state
         .manifest_location
         .path
         .clone();
     dataset
+        .table_state
         .object_store
         .delete(&compaction_manifest)
         .await
@@ -876,7 +883,11 @@ async fn rtree_merge_history_reads(dir: &TempStrDir, fragments: i32) -> usize {
     let groups = fragments / 2;
     assert_eq!(dataset.get_fragments().len(), groups as usize);
 
-    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let _ = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert_eq!(
         merged.fragment_bitmap.as_ref().unwrap().len() as i32,
@@ -884,6 +895,7 @@ async fn rtree_merge_history_reads(dir: &TempStrDir, fragments: i32) -> usize {
         "every group is covered whole, so coverage follows the rows"
     );
     dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()

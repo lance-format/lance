@@ -2094,6 +2094,7 @@ async fn test_compaction_planning_skips_ineligible_index_io(
         segment.fragment_bitmap = Some(RoaringBitmap::from_iter([fragment]));
         for file in template.files.as_ref().unwrap() {
             dataset
+                .table_state
                 .object_store
                 .copy(
                     &dataset
@@ -2129,7 +2130,7 @@ async fn test_compaction_planning_skips_ineligible_index_io(
     // Keep metadata-loading I/O separate from grouping (legacy inference can
     // read index files; these fixtures have explicit modern manifest details).
     load_all_indices(&dataset).await.unwrap();
-    dataset.object_store.io_stats_incremental();
+    dataset.table_state.object_store.io_stats_incremental();
     let plan = DefaultCompactionPlanner::new(CompactionOptions {
         target_rows_per_fragment,
         ..Default::default()
@@ -2140,13 +2141,25 @@ async fn test_compaction_planning_skips_ineligible_index_io(
     .await
     .unwrap();
     assert_eq!(plan.num_tasks(), 0);
-    assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+    assert_eq!(
+        dataset
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_iops,
+        0
+    );
     dataset
         .open_logical_vector_index("vec", "vec_idx")
         .await
         .unwrap();
     assert!(
-        dataset.object_store.io_stats_incremental().read_iops > 0,
+        dataset
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_iops
+            > 0,
         "opening the cold, readable segments must register index-file I/O"
     );
 }

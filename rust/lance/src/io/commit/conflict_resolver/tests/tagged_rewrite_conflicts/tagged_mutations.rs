@@ -2009,7 +2009,7 @@ async fn vector_index_live_only_remainder_is_withdrawn_whole_and_agrees_with_the
         .await;
     // Fragment 2 is untouched by the partition and stays live.
     Arc::make_mut(&mut dataset.manifest).fragments = live.into();
-    dataset.fragment_bitmap = Arc::new(
+    dataset.table_state.fragment_bitmap = Arc::new(
         dataset
             .manifest
             .fragments
