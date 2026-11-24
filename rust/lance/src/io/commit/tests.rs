@@ -2385,6 +2385,101 @@ async fn test_covered_index_commit_recalculates_fragment_bitmap_without_panickin
     );
 }
 
+/// A list-element index persists `fields=[input, dependency]` with nothing
+/// carried, so it has no single keyed field. Recovering its coverage must
+/// still open it through the one query input.
+#[tokio::test]
+async fn test_list_element_index_commit_recalculates_fragment_bitmap() {
+    use arrow_array::{Array, ArrayRef, ListArray, StructArray};
+    use arrow_buffer::OffsetBuffer;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let reader = |ids: std::ops::Range<i32>| {
+        let elements = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("key", DataType::Int32, true)),
+                Arc::new(Int32Array::from_iter_values(ids.clone())) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("label", DataType::Int32, true)),
+                Arc::new(Int32Array::from_iter_values(ids.clone().map(|id| id * 10))) as ArrayRef,
+            ),
+        ]);
+        let objects = ListArray::new(
+            Arc::new(ArrowField::new("item", elements.data_type().clone(), true)),
+            OffsetBuffer::from_lengths(vec![1; ids.len()]),
+            Arc::new(elements),
+            None,
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(ids)) as ArrayRef,
+            ),
+            ("objects", Arc::new(objects) as ArrayRef),
+        ])
+        .unwrap();
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema())
+    };
+    let mut dataset = Dataset::write(
+        reader(0..4),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let trained_fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<RoaringBitmap>();
+    assert_eq!(trained_fragments.len(), 2);
+    dataset
+        .create_index(
+            &["objects"],
+            IndexType::Scalar,
+            Some("objects_idx".to_string()),
+            &ScalarIndexParams::new("listelement".to_string())
+                .with_params(&serde_json::json!({"keys": ["key"]})),
+            false,
+        )
+        .await
+        .unwrap();
+    // An unindexed fragment distinguishes the trained coverage from the table.
+    dataset.append(reader(4..6), None).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    let root = dataset.schema().field("objects").unwrap();
+    let dependency_fields = vec![root.id, root.children[0].children[0].id];
+    let current = dataset.load_indices().await.unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].fields, dependency_fields);
+    assert_eq!(current[0].keyed_field(), None);
+    let mut missing_coverage = current[0].clone();
+    missing_coverage.fragment_bitmap = None;
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![missing_coverage],
+            removed_indices: current.to_vec(),
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let recomputed = dataset.load_indices().await.unwrap();
+    assert_eq!(recomputed.len(), 1);
+    assert_eq!(recomputed[0].fields, dependency_fields);
+    assert_eq!(recomputed[0].fragment_bitmap, Some(trained_fragments));
+}
+
 fn index_segment(name: &str, fragment_bitmap: Option<RoaringBitmap>) -> IndexMetadata {
     IndexMetadata {
         uuid: uuid::Uuid::new_v4(),
