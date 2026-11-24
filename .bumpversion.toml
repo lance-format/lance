@@ -127,6 +127,11 @@ replace = 'lance-table = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-table-runtime = {{ version = "={current_version}"'
+replace = 'lance-table-runtime = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'lance-test-macros = {{ version = "={current_version}"'
 replace = 'lance-test-macros = {{ version = "={new_version}"'
 
