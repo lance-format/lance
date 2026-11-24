@@ -20,7 +20,7 @@ The FTS index consists of multiple files storing the token dictionary, document 
 
 An FTS index may contain multiple partitions. Each partition has its own set of token, document, and posting list files, prefixed with the partition ID (e.g. `part_0_tokens.lance`, `part_0_docs.lance`, `part_0_invert.lance`). The `metadata.lance` file lists all partition IDs in the index. At query time, every partition must be searched and the results combined to produce the final ranked output. Fewer partitions generally means better query performance, since each partition requires its own token dictionary lookup and posting list scan. The number of partitions is controlled by the training configuration -- specifically `LANCE_FTS_TARGET_SIZE` determines how large each merged partition can grow (see [Training Process](#training-process) for details).
 
-From format version 4 (`INVERTED_ROW_ADDR_DOMAIN_VERSION`) onward, each document's identity is stored in `docs.lance._rowaddr` and holds the document's physical row address (`fragment_id << 32 | offset`). In versions 1 through 3 it is stored in `docs.lance._rowid` and holds the dataset's row id. The column name therefore tracks `index_version`: a reader must select the column for the segment's version, and a reader that looks for the wrong one finds no such column rather than silently reading one domain's values as the other's. Writers may label a segment with version 1 through 3 only on a dataset without stable row ids, where row ids and row addresses are equal, and must then name the column `_rowid` so that a reader supporting only those versions can still read it. A reader that supports version 4 must also support every capability of version 3. The posting-list format is recorded separately and must not be inferred from `index_version`.
+From format version 4 onward, a segment stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id. A segment persisted before version 4 stores a row id there instead. The current implementation supports format versions 1 through 3; format version 4 is specified here but is not yet implemented.
 
 ### Token Dictionary File Schema
 
@@ -33,7 +33,8 @@ From format version 4 (`INVERTED_ROW_ADDR_DOMAIN_VERSION`) onward, each document
 
 | Column        | Type   | Nullable | Description                      |
 |---------------|--------|----------|----------------------------------|
-| `_rowid` / `_rowaddr` | UInt64 | false | Document row ID, named `_rowid` (format version <= 3), or row address, named `_rowaddr` (format version >= 4); see above |
+| `_rowid`      | UInt64 | false    | Document row ID (only if format version <= 3) |
+| `_rowaddr`    | UInt64 | false    | Physical row address (`fragment_id << 32 \| offset`) of the document (only if format version >= 4) |
 | `_num_tokens` | UInt32 | false    | Number of tokens in the document |
 
 Partitioned `docs.lance` files may include the optional schema metadata key
@@ -49,7 +50,7 @@ loaded, is file corruption.
 
 | Column                 | Type                    | Nullable | Description                                                      |
 |------------------------|-------------------------|----------|------------------------------------------------------------------|
-| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded document IDs and frequencies). A document ID is a dense, partition-local `u32` assigned when the document is appended, not a row id or row address; it is resolved to the document's row through `docs.lance`'s identity column (`_rowaddr` or `_rowid`, see above). |
+| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded document IDs and frequencies). A document ID is a dense, partition-local `u32` assigned when the document is appended, not a row id or row address; it is resolved to the document's row through `docs.lance._rowid` or `docs.lance._rowaddr`. |
 | `_max_score`           | Float32                 | false    | Maximum score for the token (for query optimization)             |
 | `_length`              | UInt32                  | false    | Number of documents containing the token                         |
 | `_compressed_position` | List<List<LargeBinary>> | true     | Optional compressed position lists for phrase queries            |
