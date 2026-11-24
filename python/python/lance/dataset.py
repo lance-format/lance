@@ -859,11 +859,6 @@ class LanceDataset(pa.dataset.Dataset):
         builder = ScannerBuilder(self)
         builder = self._apply_default_scan_options(builder)
 
-        if order_by is not None:
-            order_by = [
-                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
-            ]
-
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
         # we don't override any defaults from _default_scan_options
