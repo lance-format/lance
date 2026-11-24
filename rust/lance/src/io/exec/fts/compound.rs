@@ -904,7 +904,11 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     .total_cmp(&left.score.0)
                     .then_with(|| left.row_id.cmp(&right.row_id))
             });
-            documents.truncate(limit);
+            // `limit` is the widened search bound (see `widen_limit_for_tie_rerank`);
+            // what the caller asked for is `requested_limit`. Truncating to the
+            // widened one would return up to the whole tie margin past `k` on a
+            // mixed indexed/residual plan with no outer scanner limit.
+            documents.truncate(requested_limit.unwrap_or(limit));
             metrics.baseline_metrics.record_output(documents.len());
             scored_documents_batch(schema, documents, None, None).map_err(DataFusionError::from)
         });

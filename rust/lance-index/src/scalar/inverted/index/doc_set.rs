@@ -545,13 +545,17 @@ impl DocSet {
             };
             doc_indices.push(column.as_primitive::<datatypes::UInt32Type>());
         }
-        Self::from_columns_with_doc_indices(
+        let mut docs = Self::from_columns_with_doc_indices(
             row_id_col,
             num_tokens_col,
             &doc_indices,
             is_legacy,
             frag_reuse_index,
-        )
+        )?;
+        // Same as `load`: a rewrite derived from this set keeps the source's
+        // `index_version`, so it has to keep the column that version names.
+        docs.identity_column = identity;
+        Ok(docs)
     }
 
     /// Build a `DocSet` carrying only the per-doc `num_tokens` array;

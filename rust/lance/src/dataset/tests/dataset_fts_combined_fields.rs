@@ -3243,3 +3243,236 @@ async fn test_fts_docs_identity_column_matches_index_version(
     .await;
     assert_eq!(unique_ids(ids), HashSet::from([0, 1, 2, 3, 4, 5]));
 }
+
+/// Without stable row ids a logical row id *is* a physical row address, so a
+/// whole-fragment (`Full`) allow or block mask is a legitimate shape rather
+/// than the mislabelled one `translate_treemap_to_row_addr_domain` reports.
+/// Forcing it through translation regressed these queries, which pass on the
+/// base commit.
+#[rstest]
+#[case::allow_list(true)]
+#[case::block_list(false)]
+#[tokio::test]
+async fn test_fts_whole_fragment_mask_without_stable_row_ids(#[case] allow: bool) {
+    let dir = TempStrDir::default();
+    let mut ds = write_fts_dataset(
+        &dir,
+        combined_fields_batch(vec![0, 1, 2, 3], vec!["alpha"; 4], vec!["beta"; 4]),
+        Some(WriteParams {
+            enable_stable_row_ids: false,
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await;
+    create_inverted_indices(&mut ds, &["title"], &combined_fields_test_params()).await;
+
+    // A mask naming whole fragments, not individual rows.
+    let mut fragments = RowAddrTreeMap::new();
+    fragments.insert_fragment(0);
+    let mask = if allow {
+        RowAddrMask::from_allowed(fragments)
+    } else {
+        RowAddrMask::from_block(fragments)
+    };
+
+    let mut scan = ds.scan();
+    scan.project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            MatchQuery::new("alpha".into())
+                .with_column(Some("title".into()))
+                .into(),
+        ))
+        .unwrap()
+        .with_row_id_prefilter(mask);
+    let batch = scan
+        .try_into_batch()
+        .await
+        .expect("a whole-fragment mask must not fail the query");
+    let ids = batch["id"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    // Fragment 0 holds ids 0 and 1 (two rows per file).
+    let expected: HashSet<i32> = if allow {
+        HashSet::from([0, 1])
+    } else {
+        HashSet::from([2, 3])
+    };
+    assert_eq!(ids, expected);
+}
+
+/// `HybridCompoundQueryExec` widens its limit for tie re-ranking, so its final
+/// truncation has to use the limit the caller asked for. With a mixed
+/// indexed/residual plan and no outer scanner limit, truncating to the widened
+/// bound returned up to the whole tie margin past `k`.
+#[tokio::test]
+async fn test_fts_hybrid_compound_respects_requested_limit() {
+    use lance_index::scalar::inverted::query::{BooleanQuery, Occur};
+
+    let dir = TempStrDir::default();
+    let mut ds = write_fts_dataset(
+        &dir,
+        combined_fields_batch((0..40).collect(), vec!["alpha"; 40], vec!["beta"; 40]),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 20,
+            ..Default::default()
+        }),
+    )
+    .await;
+    create_inverted_indices(&mut ds, &["title", "body"], &combined_fields_test_params()).await;
+    // Unindexed rows force the residual side, making this the hybrid plan.
+    let ds = append_fts_dataset(
+        &dir,
+        combined_fields_batch((40..45).collect(), vec!["alpha"; 5], vec!["beta"; 5]),
+        None,
+    )
+    .await;
+
+    let query: FtsQuery = BooleanQuery::new([(
+        Occur::Must,
+        MatchQuery::new("alpha".into())
+            .with_column(Some("title".into()))
+            .into(),
+    )])
+    .into();
+    // No outer scanner limit: the FTS node's own `k` is the only bound.
+    let batch = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(1)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        batch.num_rows(),
+        1,
+        "a k=1 hybrid query must return one row, got {}",
+        batch.num_rows()
+    );
+}
+
+/// A rewrite keeps its source's `index_version`, so it has to keep the column
+/// that version names. `DocSet::load_with_remapping` detected the column but
+/// dropped it on the returned set, so a batch-remapped merge wrote `_rowid`
+/// while still committing version 4 -- readable only because the reader
+/// resolves either name, and unreadable to a strict v4 reader.
+#[tokio::test]
+async fn test_fts_identity_column_survives_a_batch_remapped_merge() {
+    use crate::dataset::index::LanceIndexStoreExt;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use lance_core::cache::LanceCache;
+    use lance_index::progress::noop_progress;
+    use lance_index::scalar::BatchRowIdRemapper;
+    use lance_index::scalar::IndexStore;
+    use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::registry::ScalarIndexPlugin;
+
+    #[derive(Debug)]
+    struct IdentityRemapper;
+    #[async_trait::async_trait]
+    impl BatchRowIdRemapper for IdentityRemapper {
+        async fn remap_row_ids(&self, ids: &[u64]) -> lance_core::Result<Vec<Option<u64>>> {
+            Ok(ids.iter().copied().map(Some).collect())
+        }
+    }
+
+    /// Every `docs.lance` file an index committed, by name.
+    async fn docs_columns(ds: &Dataset, meta: &lance_table::format::IndexMetadata) -> Vec<String> {
+        let store = LanceIndexStore::from_dataset_for_existing(ds, meta)
+            .await
+            .unwrap();
+        let mut columns = Vec::new();
+        for file in meta
+            .files
+            .as_ref()
+            .expect("committed index records its files")
+            .iter()
+            .filter(|file| file.path.ends_with("docs.lance"))
+        {
+            let reader = store.open_index_file(&file.path).await.unwrap();
+            columns.extend(reader.schema().fields.iter().map(|f| f.name.clone()));
+        }
+        columns
+    }
+
+    let dir = TempStrDir::default();
+    let mut ds = write_fts_dataset(
+        &dir,
+        combined_fields_batch(vec![0, 1, 2, 3], vec!["alpha"; 4], vec!["beta"; 4]),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await;
+    create_inverted_indices(&mut ds, &["title"], &combined_fields_test_params()).await;
+    let meta = ds.load_index_by_name("title_idx").await.unwrap().unwrap();
+    assert!(
+        docs_columns(&ds, &meta)
+            .await
+            .iter()
+            .any(|c| c == "_rowaddr"),
+        "the source index should already be _rowaddr"
+    );
+
+    // Open through the batch-remapping loader, then rewrite via a merge.
+    let store = LanceIndexStore::from_dataset_for_existing(&ds, &meta)
+        .await
+        .unwrap();
+    let opened = InvertedIndexPlugin
+        .load_index_with_remapping(
+            Arc::new(store),
+            meta.index_details.as_ref().unwrap().as_ref(),
+            meta.index_version as u32,
+            Some(Arc::new(IdentityRemapper)),
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+    let source = Arc::new(
+        opened
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .unwrap()
+            .clone(),
+    );
+
+    let uuid = uuid::Uuid::new_v4();
+    let dest = LanceIndexStore::from_dataset_for_new(&ds, &uuid).unwrap();
+    let empty = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("title", DataType::Utf8, false),
+        ArrowField::new("_rowaddr", DataType::UInt64, false),
+    ]));
+    let stream = Box::pin(RecordBatchStreamAdapter::new(
+        empty,
+        futures::stream::empty(),
+    ));
+    let created = InvertedIndex::merge_segments(&[source], stream, &dest, &[None], noop_progress())
+        .await
+        .unwrap();
+    assert_eq!(
+        created.index_version, 4,
+        "the rewrite keeps the source's version"
+    );
+
+    let rewritten = lance_table::format::IndexMetadata {
+        uuid,
+        index_details: Some(Arc::new(created.index_details)),
+        files: Some(lance_index::scalar::index_files_to_table(created.files)),
+        ..meta
+    };
+    let columns = docs_columns(&ds, &rewritten).await;
+    assert!(
+        columns.iter().any(|c| c == "_rowaddr") && !columns.iter().any(|c| c == "_rowid"),
+        "a version-4 rewrite must write _rowaddr, got {columns:?}"
+    );
+}

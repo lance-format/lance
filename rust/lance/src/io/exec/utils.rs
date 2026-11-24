@@ -555,6 +555,13 @@ async fn row_id_mask_to_row_addr_domain(
     dataset: &Dataset,
     mask: Arc<RowAddrMask>,
 ) -> Result<Arc<RowAddrMask>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        // A row id and a row address are the same number here, so the mask is
+        // already in the domain the caller wants. Returning it untouched also
+        // keeps a legitimate whole-fragment entry intact -- those are only a
+        // sign of a mislabelled mask where the two domains can actually differ.
+        return Ok(mask);
+    }
     let translated = match mask.as_ref() {
         RowAddrMask::AllowList(allow) => {
             RowAddrMask::AllowList(translate_treemap_to_row_addr_domain(dataset, allow).await?)
