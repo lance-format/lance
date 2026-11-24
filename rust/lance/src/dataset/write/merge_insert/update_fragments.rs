@@ -48,7 +48,7 @@ use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::BatchStreamGrouper,
     exec::{HardCapBatchSizeExec, LanceExecutionOptions, provider_to_stream},
-    utils::reader_to_stream,
+    utils::{from_datafusion_stream, reader_to_stream},
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::Fragment;
@@ -240,7 +240,7 @@ impl MergeInsertJob {
         let diagnostics = analysis::scope(spill_session_context);
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
-        let task_limit = dataset.object_store.as_ref().io_parallelism();
+        let task_limit = dataset.table_state.object_store.as_ref().io_parallelism();
         let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
@@ -258,8 +258,8 @@ impl MergeInsertJob {
             tasks.shutdown().await;
             let written = new_fragments.lock().unwrap().clone();
             cleanup_data_fragments(
-                &dataset.object_store,
-                &dataset.base,
+                &dataset.table_state.object_store,
+                &dataset.table_state.base,
                 target_bases_info.as_deref(),
                 &written,
             )
@@ -593,10 +593,10 @@ impl MergeInsertJob {
                     write_fragments_internal_impl(
                         write_version,
                         Some(dataset.as_ref()),
-                        dataset.object_store.clone(),
-                        &dataset.base,
+                        dataset.table_state.object_store.clone(),
+                        &dataset.table_state.base,
                         write_schema,
-                        stream,
+                        from_datafusion_stream(stream),
                         write_params.as_ref().clone(),
                         (*target_bases_info).clone(),
                         None,
@@ -611,8 +611,8 @@ impl MergeInsertJob {
                     write_fragments_internal(
                         write_version,
                         Some(dataset.as_ref()),
-                        dataset.object_store.clone(),
-                        &dataset.base,
+                        dataset.table_state.object_store.clone(),
+                        &dataset.table_state.base,
                         write_schema,
                         stream,
                         write_params.as_ref().clone(),

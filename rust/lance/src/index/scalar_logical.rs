@@ -326,10 +326,9 @@ fn combine_search_results(results: Vec<SearchResult>) -> Result<SearchResult> {
 }
 
 fn index_intersects_dataset(index: &IndexMetadata, dataset: &Dataset) -> bool {
-    index
-        .fragment_bitmap
-        .as_ref()
-        .is_some_and(|index_bitmap| index_bitmap.intersection_len(&dataset.fragment_bitmap) > 0)
+    index.fragment_bitmap.as_ref().is_some_and(|index_bitmap| {
+        index_bitmap.intersection_len(&dataset.table_state.fragment_bitmap) > 0
+    })
 }
 
 /// List the committed, dataset-intersecting segments of a named scalar index.
@@ -847,14 +846,17 @@ mod tests {
                 .unwrap();
         assert_eq!(
             logical.calculate_included_frags().await.unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
 
         let combined_bitmap = scalar_index_fragment_bitmap(&dataset, "value", "value_zonemap")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+        assert_eq!(
+            combined_bitmap,
+            dataset.table_state.fragment_bitmap.as_ref().clone()
+        );
     }
 
     #[tokio::test]
@@ -917,7 +919,7 @@ mod tests {
         assert_eq!(logical.index_type(), IndexType::BTree);
         assert_eq!(
             logical.calculate_included_frags().await.unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
 
         let query = SargableQuery::Equals(ScalarValue::Int32(Some(99)));
@@ -942,7 +944,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+        assert_eq!(
+            combined_bitmap,
+            dataset.table_state.fragment_bitmap.as_ref().clone()
+        );
     }
 
     #[tokio::test]
@@ -1228,7 +1233,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
 
         let logical =
@@ -1398,7 +1403,7 @@ mod tests {
         );
         assert_eq!(
             logical.calculate_included_frags().await.unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
 
         let query = SargableQuery::Range(
@@ -1495,7 +1500,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let live_frags = dataset.fragment_bitmap.as_ref().clone();
+        let live_frags = dataset.table_state.fragment_bitmap.as_ref().clone();
         assert!(!live_frags.contains(0), "compaction should retire frag 0");
 
         let merged = dataset
@@ -1589,7 +1594,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let live_frags = dataset.fragment_bitmap.as_ref().clone();
+        let live_frags = dataset.table_state.fragment_bitmap.as_ref().clone();
         assert!(!live_frags.contains(0), "compaction should retire frag 0");
 
         let merged = dataset
@@ -1728,7 +1733,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
     }
 
@@ -1832,7 +1837,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
     }
 
@@ -2207,7 +2212,7 @@ mod tests {
         assert_eq!(committed[0].dataset_version, rebuild_version);
         assert_eq!(
             committed[0].fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
 
         let logical =

@@ -1281,7 +1281,7 @@ impl DefaultCompactionPlanner {
                         .await
                         .map(|metrics| (group_index, Some((fragment.metadata, metrics))))
                 })
-                .buffered(dataset.object_store.as_ref().io_parallelism())
+                .buffered(dataset.table_state.object_store.as_ref().io_parallelism())
                 .try_collect()
                 .await?;
         measured.reverse();
@@ -1659,7 +1659,7 @@ impl DefaultCompactionPlanner {
                         .map(|metrics| Some((fragment.metadata, metrics)))
                 }
             })
-            .buffered(dataset.object_store.as_ref().io_parallelism());
+            .buffered(dataset.table_state.object_store.as_ref().io_parallelism());
 
         let schema_field_ids = dataset
             .schema()

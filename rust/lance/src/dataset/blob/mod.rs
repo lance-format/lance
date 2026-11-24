@@ -16,6 +16,7 @@ mod rewrite_tests;
 #[cfg(test)]
 pub mod test_util;
 mod write;
+mod write_sources;
 
 pub(super) use compaction::SidecarRewrite;
 pub(super) use external::{
@@ -46,3 +47,4 @@ pub(super) use write::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata, validate_blob_threshold_metadata,
 };
+pub use write_sources::BlobWriteSources;

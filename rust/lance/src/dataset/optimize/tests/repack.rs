@@ -1194,7 +1194,7 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
             .unwrap()
             .join(file.path.as_str());
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
+            dataset.table_state.object_store.clone(),
             SchedulerConfig::default_for_testing(),
         );
         let file_scheduler = scheduler

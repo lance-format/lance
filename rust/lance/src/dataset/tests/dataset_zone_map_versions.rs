@@ -44,8 +44,8 @@ const INDEX_NAME: &str = "val_zonemap";
 /// Indices the manifest itself carries, bypassing the usable-index filter.
 async fn raw_manifest_indices(dataset: &Dataset) -> Vec<IndexMetadata> {
     lance_table::io::manifest::read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -324,7 +324,7 @@ async fn test_v8_zonemap_segment_is_rebuilt_as_version_1() {
     assert_ne!(after[0].uuid, before[0].uuid);
     assert_eq!(
         after[0].fragment_bitmap.as_ref().unwrap(),
-        dataset.fragment_bitmap.as_ref(),
+        dataset.table_state.fragment_bitmap.as_ref(),
         "the rebuilt segment covers every fragment"
     );
     assert_eq!(
@@ -433,7 +433,7 @@ async fn test_version_0_float_segment_is_read_then_rebuilt() {
     );
     assert_eq!(
         v1.fragment_bitmap.as_ref().unwrap(),
-        dataset.fragment_bitmap.as_ref()
+        dataset.table_state.fragment_bitmap.as_ref()
     );
     // Appended rows: 8:20.0 9:NaN 10:-NaN 11:2.5.
     assert_finite_rows(

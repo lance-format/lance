@@ -200,7 +200,7 @@ async fn take_matching_row(
     }
     if let Some(position) = positions.next() {
         return Err(Error::corrupt_file(
-            dataset.base.clone(),
+            dataset.table_state.base.clone(),
             format!("SSTable PK row position {position} exceeds {fragment_start} physical rows"),
         ));
     }

@@ -314,7 +314,7 @@ async fn fri_query_plan(
 ) -> lance_core::Result<Arc<FriQueryPlan>> {
     let cache = dataset
         .index_cache
-        .with_key_prefix(dataset.manifest_location.path.as_ref());
+        .with_key_prefix(dataset.table_state.manifest_location.path.as_ref());
     let key = FriQueryPlanKey {
         fri_uuid: &fri.uuid,
     };
@@ -385,7 +385,7 @@ async fn fri_query_plan(
                 } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
                     && let Some(bitmap) = &entry.fragment_bitmap
                 {
-                    let coverage = bitmap & dataset.fragment_bitmap.as_ref();
+                    let coverage = bitmap & dataset.table_state.fragment_bitmap.as_ref();
                     // Other selected segments own their direct coverage.
                     // Drop paths entering those fragments before later
                     // mappings can merge them with this segment's
@@ -447,7 +447,7 @@ pub(crate) async fn resolve_query_segment_coverages(
 ) -> lance_core::Result<Vec<RoaringBitmap>> {
     let direct = |segment: &IndexMetadata| {
         segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Index '{}' segment {} is missing fragment coverage",
@@ -971,7 +971,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
             .indices_dir()
             .join(index_id.to_string())
             .join(FRAG_REUSE_DETAILS_FILE_NAME);
-        let mut writer = dataset.object_store.create(&file_path).await?;
+        let mut writer = dataset.table_state.object_store.create(&file_path).await?;
         writer
             .write_all(new_index_details_proto.encode_to_vec().as_slice())
             .await?;
@@ -1249,7 +1249,7 @@ async fn validate_folded_deletions(
         Some(Mapping::StablePartition(reference)) => {
             // Open the row map exactly as the reader does (base-aware).
             let base = match reference.base_id {
-                None => dataset.base.clone(),
+                None => dataset.table_state.base.clone(),
                 Some(id) => dataset
                     .manifest
                     .base_paths
@@ -1264,7 +1264,10 @@ async fn validate_folded_deletions(
             };
             let directory = base.join("_fri").join(reference.map_id.as_str());
             let store = dataset.object_store(reference.base_id).await?;
-            let metadata_cache = dataset.metadata_cache.file_metadata_cache(&directory);
+            let metadata_cache = dataset
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(&directory);
             let store =
                 LanceIndexStore::new(store, directory, Arc::new(metadata_cache)).with_file_sizes(
                     HashMap::from([(MAPPING_FILE.to_string(), reference.map_size_bytes)]),
@@ -2240,7 +2243,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
 ) -> lance_core::Result<IndexMetadata> {
     let index_id = Uuid::new_v4();
     let details_value = encode_tagged_frag_reuse_details(
-        &dataset.object_store,
+        &dataset.table_state.object_store,
         dataset.indices_dir(),
         index_id,
         content,
@@ -2354,7 +2357,7 @@ pub(crate) async fn spill_frag_reuse_history(
         })
         .await?;
         let value = encode_tagged_frag_reuse_details(
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             dataset.indices_dir(),
             entry.uuid,
             content,
@@ -2753,7 +2756,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
         }
         // The same base-aware resolution the reader opens the map with.
         let base_root = match reference.base_id {
-            None => dataset.base.clone(),
+            None => dataset.table_state.base.clone(),
             Some(id) => dataset
                 .manifest
                 .base_paths
@@ -2771,7 +2774,10 @@ pub(crate) async fn collect_tagged_row_map_paths(
             .join(FRAG_REUSE_DIR)
             .join(reference.map_id.as_str());
         let mut mapping_size = None;
-        let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
+        let mut stream = dataset
+            .table_state
+            .object_store
+            .read_dir_all(&map_dir, None);
         loop {
             match stream.try_next().await {
                 Ok(Some(meta)) => {
@@ -3410,11 +3416,19 @@ mod tests {
             .as_deref()
             .expect("the landed manifest records its transaction file");
         let path = dataset
+            .table_state
             .base
             .clone()
             .join(crate::dataset::TRANSACTIONS_DIR)
             .join(transaction_file);
-        assert!(dataset.object_store.exists(&path).await.unwrap());
+        assert!(
+            dataset
+                .table_state
+                .object_store
+                .exists(&path)
+                .await
+                .unwrap()
+        );
     }
 
     /// A 0 -> 1 lift reinterprets the committed v0 bytes without re-encoding
@@ -4593,8 +4607,8 @@ mod tests {
         }
         let raw_key = IndexMetadataKey {
             version: dataset.manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
-            e_tag: dataset.manifest_location.e_tag.as_deref(),
+            store_identity: &dataset.table_state.object_store.store_prefix,
+            e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
         };
         dataset
             .index_cache
@@ -4702,9 +4716,9 @@ mod tests {
 
         /// The `_fri/<map_id>/` directories under the dataset's own base.
         pub(super) async fn list_fri_map_dirs(dataset: &Dataset) -> Vec<String> {
-            let prefix = dataset.base.clone().join("_fri");
+            let prefix = dataset.table_state.base.clone().join("_fri");
             let mut ids = HashSet::new();
-            let mut stream = dataset.object_store.read_dir_all(&prefix, None);
+            let mut stream = dataset.table_state.object_store.read_dir_all(&prefix, None);
             loop {
                 match stream.try_next().await {
                     Ok(Some(meta)) => {
@@ -5251,9 +5265,13 @@ mod tests {
 
         /// The `_indices/<uuid>/` directories under the dataset's own base.
         async fn list_index_dirs(dataset: &Dataset) -> Vec<String> {
-            let prefix = dataset.base.clone().join(crate::dataset::INDICES_DIR);
+            let prefix = dataset
+                .table_state
+                .base
+                .clone()
+                .join(crate::dataset::INDICES_DIR);
             let mut ids = HashSet::new();
-            let mut stream = dataset.object_store.read_dir_all(&prefix, None);
+            let mut stream = dataset.table_state.object_store.read_dir_all(&prefix, None);
             loop {
                 match stream.try_next().await {
                     Ok(Some(meta)) => {
@@ -5572,15 +5590,15 @@ mod tests {
                 None,
             );
             let error = crate::io::commit::commit_new_dataset(
-                &dataset.object_store,
+                &dataset.table_state.object_store,
                 None,
-                &dataset.commit_handler,
-                &clone.base,
+                &dataset.table_state.commit_handler,
+                &clone.table_state.base,
                 clone.uri(),
                 &transaction,
                 &Default::default(),
-                clone.manifest_location.naming_scheme,
-                dataset.metadata_cache.as_ref(),
+                clone.table_state.manifest_location.naming_scheme,
+                dataset.table_state.metadata_cache.as_ref(),
                 dataset.session.clone(),
                 false,
             )
@@ -5612,7 +5630,12 @@ mod tests {
             let dataset = commit_stable_partition(dataset, &source_ids, 10).await;
             let map_dirs = list_fri_map_dirs(&dataset).await;
             assert_eq!(map_dirs.len(), 1);
-            let map_dir = dataset.base.clone().join("_fri").join(map_dirs[0].as_str());
+            let map_dir = dataset
+                .table_state
+                .base
+                .clone()
+                .join("_fri")
+                .join(map_dirs[0].as_str());
             let mapping = map_dir
                 .clone()
                 .join(lance_index::frag_reuse::stable_partition::MAPPING_FILE);
@@ -5632,11 +5655,17 @@ mod tests {
             // The directory still lists a file, so only the mapping file's
             // own presence can catch this.
             dataset
+                .table_state
                 .object_store
                 .put(&map_dir.join("stray.bin"), b"x")
                 .await
                 .unwrap();
-            dataset.object_store.delete(&mapping).await.unwrap();
+            dataset
+                .table_state
+                .object_store
+                .delete(&mapping)
+                .await
+                .unwrap();
 
             let version = dataset.manifest.version;
             let error = dataset
@@ -5660,6 +5689,7 @@ mod tests {
             let clone_uri = format!("{}/deep", clone_dir.as_str());
             let (mut dataset, _, mapping) = tagged_source(source_dir.as_str()).await;
             let bytes = dataset
+                .table_state
                 .object_store
                 .open(&mapping)
                 .await
@@ -5668,6 +5698,7 @@ mod tests {
                 .await
                 .unwrap();
             dataset
+                .table_state
                 .object_store
                 .put(&mapping, &bytes[..bytes.len() - 1])
                 .await
@@ -5896,8 +5927,8 @@ mod tests {
             // The persisted form (the manifest round-trip truncates
             // `created_at`), which is what byte-identical carry-over yields.
             let stored = lance_table::io::manifest::read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
+                &dataset.table_state.object_store,
+                &dataset.table_state.manifest_location,
                 &dataset.manifest,
             )
             .await
@@ -6281,11 +6312,11 @@ mod tests {
         let deletion_vector: lance_core::utils::deletion::DeletionVector =
             offsets.iter().copied().collect();
         let file = lance_table::io::deletion::write_deletion_file(
-            &harness.dataset.base,
+            &harness.dataset.table_state.base,
             harness.destinations[destination].id,
             harness.read_version,
             &deletion_vector,
-            &harness.dataset.object_store,
+            &harness.dataset.table_state.object_store,
             0,
         )
         .await
@@ -6481,11 +6512,11 @@ mod tests {
         let deletion_vector: lance_core::utils::deletion::DeletionVector =
             [0u32].into_iter().collect();
         let file = lance_table::io::deletion::write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             0,
             dataset.manifest.version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             0,
         )
         .await
@@ -6532,11 +6563,11 @@ mod tests {
         let deletion_vector: lance_core::utils::deletion::DeletionVector =
             [1u32, 2].into_iter().collect();
         let file = lance_table::io::deletion::write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             0,
             dataset.manifest.version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             0,
         )
         .await
@@ -6559,11 +6590,11 @@ mod tests {
         let deletion_vector: lance_core::utils::deletion::DeletionVector =
             [0u32].into_iter().collect();
         let file = lance_table::io::deletion::write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             destinations[1].id,
             read_version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             0,
         )
         .await
@@ -6671,11 +6702,11 @@ mod tests {
         let deletion_vector: lance_core::utils::deletion::DeletionVector =
             offsets.iter().copied().collect();
         let file = lance_table::io::deletion::write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             fragment.id,
             read_version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             0,
         )
         .await
@@ -6821,11 +6852,11 @@ mod tests {
             let deletion_vector: lance_core::utils::deletion::DeletionVector =
                 [1u32, 2].into_iter().collect();
             let file = lance_table::io::deletion::write_deletion_file(
-                &dataset.base,
+                &dataset.table_state.base,
                 frag.id,
                 base_version,
                 &deletion_vector,
-                &dataset.object_store,
+                &dataset.table_state.object_store,
                 0,
             )
             .await
@@ -6993,11 +7024,11 @@ mod tests {
         // Forge the group copy of fragment 0: same count, different offset.
         let forged: lance_core::utils::deletion::DeletionVector = [2u32].into_iter().collect();
         let file = lance_table::io::deletion::write_deletion_file(
-            &harness.dataset.base,
+            &harness.dataset.table_state.base,
             0,
             harness.read_version,
             &forged,
-            &harness.dataset.object_store,
+            &harness.dataset.table_state.object_store,
             0,
         )
         .await
@@ -7343,6 +7374,7 @@ mod tests {
         );
         let trim_version = dataset.manifest.version;
         dataset
+            .table_state
             .metadata_cache
             .insert_with_key(
                 &crate::session::caches::TransactionKey {

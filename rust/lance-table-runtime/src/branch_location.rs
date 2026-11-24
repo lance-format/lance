@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::refs::Branches;
+use crate::refs::Branches;
 use lance_core::{Error, Result};
 use object_store::path::Path;
 
@@ -167,7 +167,7 @@ impl BranchLocation {
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::branch_location::BranchLocation;
+    use crate::branch_location::BranchLocation;
     use lance_core::utils::tempfile::TempStdDir;
     use object_store::path::Path;
     use rstest::rstest;

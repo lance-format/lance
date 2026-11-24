@@ -25,7 +25,9 @@ use super::exec::{
     SCORE_COLUMN, ScalarMemIndexExec, VectorIndexExec,
 };
 use crate::dataset::mem_wal::index::{FtsQueryExpr, IndexedFilter, MemTableVisibility};
-use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
+use crate::dataset::mem_wal::scanner::{
+    SearchQuery, SearchState, exec::validate_pk_types, parse_filter_expr, validate_nearest_query,
+};
 
 use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
@@ -541,8 +543,8 @@ pub struct MemTableScanner {
     filter: Option<Expr>,
     limit: Option<usize>,
     offset: Option<usize>,
-    nearest: Option<VectorQuery>,
-    full_text_query: Option<FtsQuery>,
+    /// Vector KNN and full-text search; mutually exclusive at plan time.
+    search: SearchState<VectorQuery, FtsQuery>,
     use_index: bool,
     batch_size: Option<usize>,
     /// Whether to include _rowid column in output.
@@ -603,8 +605,7 @@ impl MemTableScanner {
             filter: None,
             limit: None,
             offset: None,
-            nearest: None,
-            full_text_query: None,
+            search: SearchState::new(),
             use_index: true,
             batch_size: None,
             with_row_id: false,
@@ -730,15 +731,8 @@ impl MemTableScanner {
     /// * `query` - The query vector.
     /// * `k` - Number of nearest neighbors to return.
     pub fn nearest(&mut self, column: &str, query: &dyn Array, k: usize) -> Result<&mut Self> {
-        if k == 0 {
-            return Err(Error::invalid_input("k must be positive".to_string()));
-        }
-        if query.is_empty() {
-            return Err(Error::invalid_input(
-                "query vector must have non-zero length".to_string(),
-            ));
-        }
-        self.nearest = Some(VectorQuery {
+        validate_nearest_query(query, k)?;
+        self.search.set_vector(VectorQuery {
             column: column.to_string(),
             query_vector: query.slice(0, query.len()),
             k,
@@ -757,7 +751,7 @@ impl MemTableScanner {
     ///
     /// Sets both the minimum and maximum to `n`.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.nprobes = n;
             q.maximum_nprobes = Some(n);
         } else {
@@ -771,7 +765,7 @@ impl MemTableScanner {
     /// This is the minimum number of partitions to search. More partitions may be
     /// searched if needed to satisfy k results or recall requirements. Defaults to 1.
     pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.nprobes = n;
         } else {
             log::warn!("minimum_nprobes is not set because nearest has not been called yet");
@@ -783,7 +777,7 @@ impl MemTableScanner {
     ///
     /// If not set, all partitions may be searched if needed to satisfy k results.
     pub fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.maximum_nprobes = Some(n);
         } else {
             log::warn!("maximum_nprobes is not set because nearest has not been called yet");
@@ -795,7 +789,7 @@ impl MemTableScanner {
     ///
     /// If not set, uses the index's default metric type.
     pub fn distance_metric(&mut self, metric: DistanceType) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.distance_type = Some(metric);
         } else {
             log::warn!("distance_metric is not set because nearest has not been called yet");
@@ -808,7 +802,7 @@ impl MemTableScanner {
     /// The number of candidates to reserve while searching. This controls the
     /// accuracy/speed tradeoff for HNSW-based indices.
     pub fn ef(&mut self, ef: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.ef = Some(ef);
         } else {
             log::warn!("ef is not set because nearest has not been called yet");
@@ -821,7 +815,7 @@ impl MemTableScanner {
     /// When set, the search will first retrieve `k * refine_factor` candidates
     /// using the approximate index, then re-rank them using the original vectors.
     pub fn refine(&mut self, factor: u32) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.refine_factor = Some(factor);
         } else {
             log::warn!("refine is not set because nearest has not been called yet");
@@ -834,7 +828,7 @@ impl MemTableScanner {
     /// * `lower` - The lower bound (inclusive) of the distance.
     /// * `upper` - The upper bound (exclusive) of the distance.
     pub fn distance_range(&mut self, lower: Option<f32>, upper: Option<f32>) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.distance_lower_bound = lower;
             q.distance_upper_bound = upper;
         } else {
@@ -850,7 +844,8 @@ impl MemTableScanner {
     /// queries are supported; compound queries (boolean/boost/multi-match) are
     /// not yet supported by the MemTable path and return an error.
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
-        self.full_text_query = Some(local_fts_query(query, Some(self.indexes.as_ref()))?);
+        self.search
+            .set_full_text(local_fts_query(query, Some(self.indexes.as_ref()))?);
         Ok(self)
     }
 
@@ -863,7 +858,8 @@ impl MemTableScanner {
     /// * `slop` - Maximum allowed distance between consecutive tokens.
     ///   0 means exact phrase match (tokens must be adjacent).
     pub fn full_text_phrase(&mut self, column: &str, phrase: &str, slop: u32) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::phrase(column, phrase, slop));
+        self.search
+            .set_full_text(FtsQuery::phrase(column, phrase, slop));
         self
     }
 
@@ -882,7 +878,8 @@ impl MemTableScanner {
         should: Vec<String>,
         must_not: Vec<String>,
     ) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::boolean(column, must, should, must_not));
+        self.search
+            .set_full_text(FtsQuery::boolean(column, must, should, must_not));
         self
     }
 
@@ -898,7 +895,7 @@ impl MemTableScanner {
     /// * `column` - The column to search.
     /// * `query` - The search query (may contain typos).
     pub fn full_text_fuzzy(&mut self, column: &str, query: &str) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::fuzzy(column, query));
+        self.search.set_full_text(FtsQuery::fuzzy(column, query));
         self
     }
 
@@ -915,7 +912,8 @@ impl MemTableScanner {
         query: &str,
         fuzziness: u32,
     ) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::fuzzy_with_distance(column, query, fuzziness));
+        self.search
+            .set_full_text(FtsQuery::fuzzy_with_distance(column, query, fuzziness));
         self
     }
 
@@ -934,7 +932,7 @@ impl MemTableScanner {
         fuzziness: Option<u32>,
         max_expansions: usize,
     ) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::fuzzy_with_options(
+        self.search.set_full_text(FtsQuery::fuzzy_with_options(
             column,
             query,
             fuzziness,
@@ -956,7 +954,7 @@ impl MemTableScanner {
     ///
     /// * `wand_factor` - Value between 0.0 and 1.0
     pub fn fts_wand_factor(&mut self, wand_factor: f32) -> &mut Self {
-        if let Some(ref mut q) = self.full_text_query {
+        if let Some(q) = self.search.full_text_mut() {
             q.wand_factor = wand_factor.clamp(0.0, 1.0);
         } else {
             log::warn!(
@@ -971,7 +969,7 @@ impl MemTableScanner {
     /// does not reflect rows written since the last freeze). Only applies when a
     /// full-text query is set.
     pub fn fts_include_tail(&mut self, include_tail: bool) -> &mut Self {
-        if let Some(ref mut q) = self.full_text_query {
+        if let Some(q) = self.search.full_text_mut() {
             q.include_tail = include_tail;
         } else {
             log::warn!(
@@ -1087,19 +1085,13 @@ impl MemTableScanner {
 
     /// Create the execution plan based on the query configuration.
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.nearest.is_some() && self.full_text_query.is_some() {
-            return Err(Error::invalid_input(
-                "MemTableScanner cannot combine vector and full-text search".to_string(),
-            ));
-        }
-
-        // Determine which type of plan to create
-        if let Some(ref vector_query) = self.nearest {
-            return self.plan_vector_search(vector_query).await;
-        }
-
-        if let Some(ref fts_query) = self.full_text_query {
-            return self.plan_fts_search(fts_query).await;
+        match self
+            .search
+            .resolve("MemTableScanner cannot combine vector and full-text search")?
+        {
+            SearchQuery::Vector(query) => return self.plan_vector_search(query).await,
+            SearchQuery::FullText(query) => return self.plan_fts_search(query).await,
+            SearchQuery::Scan => {}
         }
 
         // Split the filter into index searches and whatever is left.
