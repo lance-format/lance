@@ -25,8 +25,9 @@
 
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::{
-    FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, inherit_sticky_feature_flags,
-    managed_blobs_enabled, validate_auto_cleanup_config,
+    FLAG_MANAGED_BLOBS, ZONE_WRITE_SEEDS_CONFIG_PREFIX, apply_index_object_metadata_flag,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
+    validate_zone_write_seeds_config,
 };
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
@@ -421,10 +422,15 @@ impl<'a> ApplyState<'a> {
         manifest.table_metadata = table_metadata;
         // Only a change is validated: settings inherited as they were, even
         // invalid ones, must not block an unrelated commit.
-        if auto_cleanup_settings(&current_manifest.config)
-            != auto_cleanup_settings(&manifest.config)
+        if settings_with_prefix(&current_manifest.config, AUTO_CLEANUP_CONFIG_PREFIX)
+            != settings_with_prefix(&manifest.config, AUTO_CLEANUP_CONFIG_PREFIX)
         {
             validate_auto_cleanup_config(&manifest)?;
+        }
+        if settings_with_prefix(&current_manifest.config, ZONE_WRITE_SEEDS_CONFIG_PREFIX)
+            != settings_with_prefix(&manifest.config, ZONE_WRITE_SEEDS_CONFIG_PREFIX)
+        {
+            validate_zone_write_seeds_config(&manifest)?;
         }
         // Both read the final schema and config, so they come after those land.
         apply_range_segments(&mut manifest, Some(current_manifest))?;
@@ -1406,10 +1412,15 @@ fn check_schema(schema: &Schema) -> Result<()> {
     schema.validate()
 }
 
-fn auto_cleanup_settings(config: &HashMap<String, String>) -> BTreeMap<&str, &str> {
+const AUTO_CLEANUP_CONFIG_PREFIX: &str = "lance.auto_cleanup.";
+
+fn settings_with_prefix<'a>(
+    config: &'a HashMap<String, String>,
+    prefix: &str,
+) -> BTreeMap<&'a str, &'a str> {
     config
         .iter()
-        .filter(|(key, _)| key.starts_with("lance.auto_cleanup."))
+        .filter(|(key, _)| key.starts_with(prefix))
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect()
 }

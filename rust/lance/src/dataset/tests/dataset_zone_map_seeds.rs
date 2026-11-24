@@ -12,11 +12,13 @@
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
+use arrow_array::types::Float32Type;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, StringViewArray, StructArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, FixedSizeListArray, Int32Array, Int64Array,
+    RecordBatch, RecordBatchIterator, StringArray, StringViewArray, StructArray,
+    TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -41,6 +43,10 @@ use crate::dataset::optimize::CompactionScope;
 use crate::dataset::schema_evolution::{ColumnAlteration, NewColumnTransform};
 use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
+use crate::dataset::write::seeds::{
+    ZONE_WRITE_SEEDS_ENABLED_KEY, ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY,
+    ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY,
+};
 use crate::dataset::{
     CommitBuilder, DATA_DIR, InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode,
     UpdateBuilder, WriteDestination, WriteMode, WriteParams,
@@ -1903,6 +1909,7 @@ async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
     manifest.writer_feature_flags &= !FLAG_ZONE_WRITE_SEEDS;
     manifest.version += 1;
     let indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
+    let index_count = indices.len();
     write_manifest_file(
         dataset.object_store.as_ref(),
         dataset.commit_handler.as_ref(),
@@ -1919,7 +1926,7 @@ async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
     let mut reopened = dataset.clone();
     reopened.checkout_latest().await.unwrap();
     assert!(!seed_flags_set(&reopened));
-    assert_eq!(reopened.load_indices().await.unwrap().len(), 1);
+    assert_eq!(reopened.load_indices().await.unwrap().len(), index_count);
     reopened
 }
 
@@ -2557,4 +2564,1655 @@ async fn test_binary_copy_translates_remapped_seed_fields() {
         "{plan}"
     );
     assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
+}
+
+// --- Zone write seeds from the dataset config --------------------------------
+//
+// `lance.zone_write_seeds.*` seeds every column that no seeded ZoneMap index
+// covers, so an index created later can be built from the seeds.
+
+const CONFIG_COLUMNS: [&str; 4] = ["id", "val", "name", "ts"];
+/// Columns of [`config_schema`] whose types the config never seeds.
+const UNSEEDED_CONFIG_COLUMNS: [&str; 2] = ["vec", "meta"];
+
+fn config_meta_field() -> Arc<ArrowField> {
+    Arc::new(ArrowField::new("a", DataType::Int32, true))
+}
+
+fn config_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("val", DataType::Int64, true),
+        ArrowField::new("name", DataType::Utf8, true),
+        ArrowField::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        ),
+        ArrowField::new(
+            "meta",
+            DataType::Struct(vec![config_meta_field()].into()),
+            true,
+        ),
+    ]))
+}
+
+fn config_rows(ids: std::ops::Range<i64>) -> RecordBatch {
+    RecordBatch::try_new(
+        config_schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(ids.clone())),
+            Arc::new(Int64Array::from_iter(
+                ids.clone().map(|i| (i % 7 != 3).then_some(i)),
+            )),
+            Arc::new(StringArray::from_iter(
+                ids.clone()
+                    .map(|i| (i % 5 != 2).then(|| format!("n{i:03}"))),
+            )),
+            Arc::new(TimestampMicrosecondArray::from_iter(
+                ids.clone()
+                    .map(|i| Some(1_700_000_000_000_000 + i * 1_000_000)),
+            )),
+            Arc::new(
+                FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                    ids.clone().map(|i| Some(vec![Some(i as f32); 4])),
+                    4,
+                ),
+            ),
+            Arc::new(StructArray::from(vec![(
+                config_meta_field(),
+                Arc::new(Int32Array::from_iter(ids.map(|i| Some(i as i32)))) as ArrayRef,
+            )])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Ten rows in one fragment, written before any config is set.
+async fn dataset_with_config_rows(uri: &str) -> Dataset {
+    Dataset::write(
+        RecordBatchIterator::new([Ok(config_rows(0..10))], config_schema()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+async fn append_config_rows(dataset: &mut Dataset, ids: std::ops::Range<i64>) {
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(config_rows(ids))], config_schema()),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+async fn enable_zone_write_seeds(dataset: &mut Dataset, rows_per_zone: u64) {
+    let rows_per_zone = rows_per_zone.to_string();
+    dataset
+        .update_config([
+            (ZONE_WRITE_SEEDS_ENABLED_KEY, "true"),
+            (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, rows_per_zone.as_str()),
+        ])
+        .await
+        .unwrap();
+}
+
+/// The `rows_per_zone` the seed locator of `column` declares in the data file
+/// serving it, or `None` when that file carries no seed for the column.
+async fn seed_locator_rows_per_zone(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    column: &str,
+) -> Option<u64> {
+    let file = serving_file(fragment, field_id(dataset, column));
+    let reader = open_data_file(dataset, &file.path).await;
+    let value = reader
+        .metadata()
+        .file_schema
+        .metadata
+        .get(&format!("{SEED_META_KEY_PREFIX}{column}"))?
+        .clone();
+    Some(value.split_once(':').unwrap().1.parse().unwrap())
+}
+
+/// The commit that enables the setting publishes the seed flags, so the next
+/// append seeds every column at the configured size; earlier files stay
+/// unseeded.
+#[tokio::test]
+async fn test_config_seeds_columns_without_index() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    assert!(!seed_flags_set(&dataset));
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    assert_seed_flags_set(&dataset);
+
+    append_config_rows(&mut dataset, 10..20).await;
+    let fragments = dataset.fragments().clone();
+    assert_eq!(fragments.len(), 2);
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &fragments[0], column).await,
+            None,
+            "first file, column {column}"
+        );
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &fragments[1], column).await,
+            Some(ROWS_PER_ZONE),
+            "appended file, column {column}"
+        );
+    }
+    for column in UNSEEDED_CONFIG_COLUMNS {
+        assert!(
+            !fragment_has_seed_locator(&dataset, &fragments[1], column).await,
+            "appended file, unsupported column {column}"
+        );
+    }
+}
+
+/// Whether any data file of `fragment` carries a seed locator for `column`.
+/// Nested columns may have no file that stores the parent field itself.
+async fn fragment_has_seed_locator(dataset: &Dataset, fragment: &Fragment, column: &str) -> bool {
+    let key = format!("{SEED_META_KEY_PREFIX}{column}");
+    for file in &fragment.files {
+        let reader = open_data_file(dataset, &file.path).await;
+        if reader.metadata().file_schema.metadata.contains_key(&key) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A snapshot that enables the setting but does not carry the seed flags
+/// writes no seed; its commit sets the flags and the next write is seeded.
+#[tokio::test]
+async fn test_config_seeds_wait_for_seed_flags() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    let mut legacy = reopen_with_seed_flags_cleared(&dataset).await;
+
+    append_config_rows(&mut legacy, 10..20).await;
+    assert_seed_flags_set(&legacy);
+    append_config_rows(&mut legacy, 20..30).await;
+    let fragments = legacy.fragments().clone();
+    assert_eq!(fragments.len(), 3);
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&legacy, &fragments[1], column).await,
+            None,
+            "append without flags, column {column}"
+        );
+        assert_eq!(
+            seed_locator_rows_per_zone(&legacy, &fragments[2], column).await,
+            Some(ROWS_PER_ZONE),
+            "append with flags, column {column}"
+        );
+    }
+}
+
+/// Without the setting, or with it set to false, appends carry no seeds and
+/// the seed flags stay unset.
+#[rstest::rstest]
+#[case::absent(None)]
+#[case::disabled(Some("false"))]
+#[tokio::test]
+async fn test_config_seeds_off(#[case] enabled: Option<&'static str>) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    if let Some(enabled) = enabled {
+        dataset
+            .update_config([
+                (ZONE_WRITE_SEEDS_ENABLED_KEY, enabled),
+                (ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "4"),
+            ])
+            .await
+            .unwrap();
+    }
+    append_config_rows(&mut dataset, 10..20).await;
+    assert!(!seed_flags_set(&dataset));
+    let fragments = dataset.fragments().clone();
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &fragments[1], column).await,
+            None,
+            "column {column}"
+        );
+    }
+}
+
+/// A ZoneMap index created after a seeded append reuses the configured seeds
+/// for that fragment and answers queries like a scan.
+#[tokio::test]
+async fn test_index_built_from_config_seeds() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+    let appended = dataset.fragments()[1].id;
+
+    // An index without a null bitmap ignores the positions the seeds carry.
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": ROWS_PER_ZONE,
+            "use_seeds": true,
+            "store_null_bitmap": false,
+        }));
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![appended]);
+
+    for filter in ["val >= 5 AND val < 15", "val = 12", "val IS NULL"] {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let expected = unindexed.try_into_batch().await.unwrap();
+        assert!(expected.num_rows() > 0, "filter {filter}");
+        assert_eq!(indexed, expected, "filter {filter}");
+    }
+}
+
+/// Whether a ZoneMap index on `val` built from configured seeds reuses the
+/// appended fragment, depending on the null-position setting of the seeds
+/// (`None` leaves the key absent) and the index's `store_null_bitmap`.
+/// Results of null filters always match a scan.
+#[rstest::rstest]
+#[case::default_seeds_bitmap_index(None, true, true)]
+#[case::default_seeds_no_bitmap_index(None, false, true)]
+#[case::explicit_seeds_bitmap_index(Some("true"), true, true)]
+#[case::no_position_seeds_bitmap_index(Some("false"), true, false)]
+#[tokio::test]
+async fn test_config_seed_null_positions_serve_index(
+    #[case] seeds_store_null_bitmap: Option<&'static str>,
+    #[case] index_store_null_bitmap: bool,
+    #[case] expect_reuse: bool,
+) {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    if let Some(value) = seeds_store_null_bitmap {
+        dataset
+            .update_config([(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, value)])
+            .await
+            .unwrap();
+    }
+    append_config_rows(&mut dataset, 10..20).await;
+    let appended = dataset.fragments()[1].id;
+
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": ROWS_PER_ZONE,
+            "use_seeds": true,
+            "store_null_bitmap": index_store_null_bitmap,
+        }));
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    if expect_reuse {
+        assert_eq!(reports[0].reused_fragments, vec![appended]);
+        assert!(!reports[0].scanned_fragments.contains(&appended));
+    } else {
+        // A seed without null positions is rejected and its fragment scanned.
+        assert!(reports[0].reused_fragments.is_empty());
+        assert!(reports[0].partial_fragments.is_empty());
+        assert!(reports[0].scanned_fragments.contains(&appended));
+    }
+
+    assert_indexed_ids_match_scan(
+        &dataset,
+        &["val IS NULL", "val IS NOT NULL", "val >= 5 AND val < 15"],
+        "null positions",
+    )
+    .await;
+}
+
+/// A column with a seeded ZoneMap index follows that index's zone size even
+/// when the configured size is smaller; a ZoneMap index without seeds does
+/// not take part, so its column gets the configured size like any other.
+#[rstest::rstest]
+#[case::seeded_index(true, 8)]
+#[case::unseeded_index(false, ROWS_PER_ZONE)]
+#[tokio::test]
+async fn test_config_seed_size_with_zone_map_index(
+    #[case] use_seeds: bool,
+    #[case] expected_val_rows_per_zone: u64,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+        .with_params(&serde_json::json!({"rows_per_zone": 8, "use_seeds": use_seeds}));
+    dataset
+        .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+        .await
+        .unwrap();
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+
+    let appended = dataset.fragments()[1].clone();
+    for column in CONFIG_COLUMNS {
+        let expected = if column == "val" {
+            expected_val_rows_per_zone
+        } else {
+            ROWS_PER_ZONE
+        };
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &appended, column).await,
+            Some(expected),
+            "column {column}"
+        );
+    }
+}
+
+/// Binary-copy compaction declares the configured zone size for carried
+/// seeds of columns without a seeded index, as the write path does.
+#[tokio::test]
+async fn test_binary_copy_declares_configured_rows_per_zone() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+    append_config_rows(&mut dataset, 20..30).await;
+    // Drop the unseeded first fragment so every compaction input is seeded.
+    dataset.delete("id < 10").await.unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    let output = dataset.fragments()[0].clone();
+    assert_eq!(output.physical_rows, Some(20));
+    for column in CONFIG_COLUMNS {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, &output, column).await,
+            Some(ROWS_PER_ZONE),
+            "column {column}"
+        );
+    }
+}
+
+/// Setting an invalid zone write seed value is rejected by its commit and
+/// leaves the config as it was; unrelated config changes still commit.
+#[rstest::rstest]
+#[case::enabled(ZONE_WRITE_SEEDS_ENABLED_KEY, "yes")]
+#[case::rows_per_zone(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY, "0")]
+#[case::store_null_bitmap(ZONE_WRITE_SEEDS_STORE_NULL_BITMAP_KEY, "yes")]
+#[tokio::test]
+async fn test_config_rejects_invalid_zone_write_seeds_value(
+    #[case] key: &'static str,
+    #[case] value: &'static str,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    let before = dataset.config().clone();
+    let version = dataset.manifest.version;
+
+    let err = dataset.update_config([(key, value)]).await.unwrap_err();
+    assert!(err.to_string().contains(key), "{err}");
+    assert_eq!(dataset.config(), &before);
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(reopened.manifest.version, version);
+    assert_eq!(reopened.config(), &before);
+
+    dataset
+        .update_config([("app.owner", "analytics")])
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.config().get("app.owner").map(String::as_str),
+        Some("analytics")
+    );
+    assert_eq!(
+        dataset
+            .config()
+            .get(ZONE_WRITE_SEEDS_ENABLED_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+/// Disabling the setting stops seeding new files while the flags and the
+/// seeds already written stay; re-enabling with another size seeds new files
+/// at that size, also after a reopen.
+#[tokio::test]
+async fn test_config_seeds_lifecycle() {
+    const RESIZED_ROWS_PER_ZONE: u64 = 8;
+
+    async fn assert_locators(dataset: &Dataset, expected: &[Option<u64>]) {
+        let fragments = dataset.fragments().clone();
+        assert_eq!(fragments.len(), expected.len());
+        for (fragment, expected) in fragments.iter().zip(expected) {
+            for column in CONFIG_COLUMNS {
+                assert_eq!(
+                    seed_locator_rows_per_zone(dataset, fragment, column).await,
+                    *expected,
+                    "fragment {}, column {column}",
+                    fragment.id
+                );
+            }
+        }
+    }
+
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+    assert_locators(&dataset, &[None, Some(ROWS_PER_ZONE)]).await;
+
+    dataset
+        .update_config([(ZONE_WRITE_SEEDS_ENABLED_KEY, "false")])
+        .await
+        .unwrap();
+    append_config_rows(&mut dataset, 20..30).await;
+    assert_seed_flags_set(&dataset);
+    assert_locators(&dataset, &[None, Some(ROWS_PER_ZONE), None]).await;
+
+    enable_zone_write_seeds(&mut dataset, RESIZED_ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 30..40).await;
+    assert_locators(
+        &dataset,
+        &[None, Some(ROWS_PER_ZONE), None, Some(RESIZED_ROWS_PER_ZONE)],
+    )
+    .await;
+
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    append_config_rows(&mut dataset, 40..50).await;
+    assert_locators(
+        &dataset,
+        &[
+            None,
+            Some(ROWS_PER_ZONE),
+            None,
+            Some(RESIZED_ROWS_PER_ZONE),
+            Some(RESIZED_ROWS_PER_ZONE),
+        ],
+    )
+    .await;
+}
+
+/// Indexed results of `filters` on `dataset` equal those of a scan without
+/// scalar indices, compared as sorted `id` lists.
+async fn assert_indexed_ids_match_scan(dataset: &Dataset, filters: &[&str], context: &str) {
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int64Type;
+
+    fn sorted_ids(batch: &RecordBatch) -> Vec<i64> {
+        let mut ids = batch["id"].as_primitive::<Int64Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    for filter in filters {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+        let indexed = sorted_ids(&indexed.try_into_batch().await.unwrap());
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let expected = sorted_ids(&unindexed.try_into_batch().await.unwrap());
+        assert!(!expected.is_empty(), "{context}: filter {filter}");
+        assert_eq!(indexed, expected, "{context}: filter {filter}");
+    }
+}
+
+/// ZoneMap params that build from seeds without a null bitmap.
+fn config_seed_index_params(rows_per_zone: u64) -> ScalarIndexParams {
+    ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+        "rows_per_zone": rows_per_zone,
+        "use_seeds": true,
+        "store_null_bitmap": false,
+    }))
+}
+
+fn typed_schema(data_type: &DataType) -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("col", data_type.clone(), true),
+    ]))
+}
+
+/// Deterministic values in `0..61` with a null every ninth row.
+fn typed_value(i: i64) -> Option<i64> {
+    (i % 9 != 4).then_some((i * 7) % 61)
+}
+
+/// [`typed_value`] as a float, with NaN, infinities and negative zero mixed in.
+fn typed_float(i: i64) -> Option<f64> {
+    typed_value(i).map(|v| match i % 13 {
+        0 => f64::NAN,
+        1 => f64::INFINITY,
+        2 => f64::NEG_INFINITY,
+        3 => -0.0,
+        _ => v as f64 / 2.0,
+    })
+}
+
+fn typed_column(data_type: &DataType, ids: std::ops::Range<i64>) -> ArrayRef {
+    use arrow_array::{
+        BooleanArray, Date32Array, Date64Array, Decimal128Array, DurationMicrosecondArray,
+        DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, Float32Array,
+        Float64Array, Int8Array, Int16Array, LargeBinaryArray, LargeStringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+
+    let values = ids.clone().map(typed_value);
+    match data_type {
+        DataType::Boolean => Arc::new(BooleanArray::from_iter(
+            values.map(|v| v.map(|v| v % 3 == 0)),
+        )),
+        DataType::Int8 => Arc::new(Int8Array::from_iter(values.map(|v| v.map(|v| v as i8)))),
+        DataType::Int32 => Arc::new(Int32Array::from_iter(values.map(|v| v.map(|v| v as i32)))),
+        DataType::Int64 => Arc::new(Int64Array::from_iter(values)),
+        DataType::UInt16 => Arc::new(UInt16Array::from_iter(values.map(|v| v.map(|v| v as u16)))),
+        DataType::UInt64 => Arc::new(UInt64Array::from_iter(values.map(|v| v.map(|v| v as u64)))),
+        DataType::Float32 => Arc::new(Float32Array::from_iter(
+            ids.map(|i| typed_float(i).map(|v| v as f32)),
+        )),
+        DataType::Float64 => Arc::new(Float64Array::from_iter(ids.map(typed_float))),
+        DataType::Date32 => Arc::new(Date32Array::from_iter(
+            values.map(|v| v.map(|v| 19_000 + v as i32)),
+        )),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            Arc::new(TimestampMillisecondArray::from_iter(
+                values.map(|v| v.map(|v| 1_700_000_000_000 + v * 1_000)),
+            ))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) => Arc::new(
+            TimestampNanosecondArray::from_iter(
+                values.map(|v| v.map(|v| 1_700_000_000_000_000_000 + v * 1_000)),
+            )
+            .with_timezone(tz.clone()),
+        ),
+        DataType::Duration(TimeUnit::Microsecond) => Arc::new(DurationMicrosecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 1_000)),
+        )),
+        DataType::Time32(TimeUnit::Second) => Arc::new(Time32SecondArray::from_iter(
+            values.map(|v| v.map(|v| (v * 60) as i32)),
+        )),
+        DataType::Utf8 => Arc::new(StringArray::from_iter(
+            values.map(|v| v.map(|v| format!("v{v:03}"))),
+        )),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::from_iter(
+            values.map(|v| v.map(|v| format!("v{v:03}"))),
+        )),
+        DataType::Binary => Arc::new(BinaryArray::from_iter(
+            values.map(|v| v.map(|v| v.to_be_bytes().to_vec())),
+        )),
+        DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter(
+            values.map(|v| v.map(|v| v.to_be_bytes().to_vec())),
+        )),
+        DataType::Decimal128(precision, scale) => Arc::new(
+            Decimal128Array::from_iter(values.map(|v| v.map(|v| v as i128 * 10_000)))
+                .with_precision_and_scale(*precision, *scale)
+                .unwrap(),
+        ),
+        DataType::Int16 => Arc::new(Int16Array::from_iter(values.map(|v| v.map(|v| v as i16)))),
+        DataType::UInt8 => Arc::new(UInt8Array::from_iter(values.map(|v| v.map(|v| v as u8)))),
+        DataType::UInt32 => Arc::new(UInt32Array::from_iter(values.map(|v| v.map(|v| v as u32)))),
+        // Halves of `typed_value` are exact in Float16; no NaN is generated.
+        DataType::Float16 => arrow::compute::cast(
+            &Float32Array::from_iter(values.map(|v| v.map(|v| v as f32 / 2.0))),
+            data_type,
+        )
+        .unwrap(),
+        DataType::Date64 => Arc::new(Date64Array::from_iter(
+            values.map(|v| v.map(|v| (19_000 + v) * 86_400_000)),
+        )),
+        DataType::Time32(TimeUnit::Millisecond) => Arc::new(Time32MillisecondArray::from_iter(
+            values.map(|v| v.map(|v| (v * 60_000) as i32)),
+        )),
+        DataType::Time64(TimeUnit::Microsecond) => Arc::new(Time64MicrosecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 60_000_000)),
+        )),
+        DataType::Time64(TimeUnit::Nanosecond) => Arc::new(Time64NanosecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 60_000_000_000)),
+        )),
+        DataType::Timestamp(TimeUnit::Second, None) => Arc::new(TimestampSecondArray::from_iter(
+            values.map(|v| v.map(|v| 1_700_000_000 + v)),
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Arc::new(TimestampMicrosecondArray::from_iter(
+                values.map(|v| v.map(|v| 1_700_000_000_000_000 + v * 1_000_000)),
+            ))
+        }
+        DataType::Duration(TimeUnit::Second) => Arc::new(DurationSecondArray::from_iter(values)),
+        DataType::Duration(TimeUnit::Millisecond) => Arc::new(DurationMillisecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 1_000)),
+        )),
+        DataType::Duration(TimeUnit::Nanosecond) => Arc::new(DurationNanosecondArray::from_iter(
+            values.map(|v| v.map(|v| v * 1_000)),
+        )),
+        DataType::Decimal256(_, scale) => arrow::compute::cast(
+            &Decimal128Array::from_iter(values.map(|v| v.map(|v| v as i128 * 10_000)))
+                .with_precision_and_scale(38, *scale)
+                .unwrap(),
+            data_type,
+        )
+        .unwrap(),
+        other => panic!("no generator for {other}"),
+    }
+}
+
+fn typed_rows(data_type: &DataType, ids: std::ops::Range<i64>) -> RecordBatch {
+    RecordBatch::try_new(
+        typed_schema(data_type),
+        vec![
+            Arc::new(Int64Array::from_iter_values(ids.clone())),
+            typed_column(data_type, ids),
+        ],
+    )
+    .unwrap()
+}
+
+const INT_FILTERS: &[&str] = &["col >= 10 AND col < 30", "col = 21"];
+const FLOAT_FILTERS: &[&str] = &["col >= 2.0 AND col < 20.0", "col > 1000.0"];
+const STRING_FILTERS: &[&str] = &["col >= 'v010' AND col < 'v030'", "col = 'v021'"];
+
+/// For every candidate type family, an append after enabling the setting
+/// seeds the column, a ZoneMap index created afterwards reuses that seed for
+/// the appended fragment, and indexed filters match a scan. `filters` adds
+/// value predicates to the null checks every type runs.
+#[rstest::rstest]
+#[case::boolean(DataType::Boolean, &["col = true"])]
+#[case::int8(DataType::Int8, INT_FILTERS)]
+#[case::int32(DataType::Int32, INT_FILTERS)]
+#[case::int64(DataType::Int64, INT_FILTERS)]
+#[case::uint16(DataType::UInt16, INT_FILTERS)]
+#[case::uint64(DataType::UInt64, INT_FILTERS)]
+#[case::float32(DataType::Float32, FLOAT_FILTERS)]
+#[case::float64(DataType::Float64, FLOAT_FILTERS)]
+#[case::date32(DataType::Date32, &["col >= DATE '2022-02-07'"])]
+#[case::timestamp_ms(
+    DataType::Timestamp(TimeUnit::Millisecond, None),
+    &["col >= TIMESTAMP '2023-11-14 22:13:50'"]
+)]
+#[case::timestamp_ns_utc(DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), &[])]
+#[case::duration_us(DataType::Duration(TimeUnit::Microsecond), &[])]
+#[case::time32_s(
+    DataType::Time32(TimeUnit::Second),
+    &["col >= arrow_cast(1800, 'Time32(Second)')"]
+)]
+#[case::utf8(DataType::Utf8, STRING_FILTERS)]
+#[case::large_utf8(DataType::LargeUtf8, STRING_FILTERS)]
+#[case::binary(DataType::Binary, &["col >= X'000000000000001E'"])]
+#[case::large_binary(DataType::LargeBinary, &["col >= X'000000000000001E'"])]
+#[case::decimal128(DataType::Decimal128(38, 4), &["col >= 30"])]
+#[tokio::test]
+async fn test_config_seed_round_trip_per_type(
+    #[case] data_type: DataType,
+    #[case] filters: &'static [&'static str],
+) {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+    const TYPED_ROWS_PER_ZONE: u64 = 8;
+
+    let dir = TempStrDir::default();
+    let schema = typed_schema(&data_type);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(typed_rows(&data_type, 0..40))], schema.clone()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    enable_zone_write_seeds(&mut dataset, TYPED_ROWS_PER_ZONE).await;
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(typed_rows(&data_type, 40..140))], schema),
+            None,
+        )
+        .await
+        .unwrap();
+    let fragments = dataset.fragments().clone();
+    assert_eq!(fragments.len(), 2, "{data_type}");
+    let appended = fragments[1].id;
+    assert_eq!(
+        seed_locator_rows_per_zone(&dataset, &fragments[1], "col").await,
+        Some(TYPED_ROWS_PER_ZONE),
+        "{data_type}"
+    );
+
+    let params = config_seed_index_params(TYPED_ROWS_PER_ZONE);
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["col"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{data_type}");
+    assert_eq!(reports[0].reused_fragments, vec![appended], "{data_type}");
+
+    let mut all_filters: Vec<&str> = filters.to_vec();
+    all_filters.extend(["col IS NULL", "col IS NOT NULL"]);
+    assert_indexed_ids_match_scan(&dataset, &all_filters, &data_type.to_string()).await;
+}
+
+/// Binary-copy compaction of files whose configured seeds were written at
+/// different sizes still carries a seed, an index whose zones end at the
+/// input file boundaries is built from it without a scan, and it answers
+/// filters like a scan.
+#[tokio::test]
+async fn test_binary_copy_carries_config_seeds_of_different_sizes() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+    const RESIZED_ROWS_PER_ZONE: u64 = 8;
+    // Each input holds 10 rows, so no carried record crosses a target zone.
+    const INDEX_ROWS_PER_ZONE: u64 = 10;
+
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_config_rows(dir.as_str()).await;
+    enable_zone_write_seeds(&mut dataset, ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 10..20).await;
+    enable_zone_write_seeds(&mut dataset, RESIZED_ROWS_PER_ZONE).await;
+    append_config_rows(&mut dataset, 20..30).await;
+    // Drop the unseeded first fragment so every compaction input is seeded.
+    dataset.delete("id < 10").await.unwrap();
+    let inputs = dataset.fragments().clone();
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(
+        seed_locator_rows_per_zone(&dataset, &inputs[0], "val").await,
+        Some(ROWS_PER_ZONE)
+    );
+    assert_eq!(
+        seed_locator_rows_per_zone(&dataset, &inputs[1], "val").await,
+        Some(RESIZED_ROWS_PER_ZONE)
+    );
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    let output = dataset.fragments()[0].clone();
+    assert_eq!(output.physical_rows, Some(20));
+    for column in CONFIG_COLUMNS {
+        assert!(
+            seed_locator_rows_per_zone(&dataset, &output, column)
+                .await
+                .is_some(),
+            "column {column}"
+        );
+    }
+
+    let params = config_seed_index_params(INDEX_ROWS_PER_ZONE);
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![output.id]);
+    assert!(reports[0].partial_fragments.is_empty());
+    assert!(reports[0].scanned_fragments.is_empty());
+    assert_eq!(reports[0].scanned_rows, 0);
+
+    assert_indexed_ids_match_scan(
+        &dataset,
+        &["val >= 12 AND val < 22", "val = 25", "val IS NULL"],
+        "binary copy",
+    )
+    .await;
+}
+
+/// Rows of the creating write in [`test_config_seed_boundary_matrix`]; that
+/// write happens before the config is enabled and carries no seed.
+const BOUNDARY_CREATE_ROWS: i64 = 11;
+/// Fragments appended after the config is enabled.
+const BOUNDARY_APPENDED_FRAGMENTS: i64 = 3;
+
+fn boundary_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("val", DataType::Int64, true),
+    ]))
+}
+
+/// The generator every expectation is computed from: three times the row
+/// position, null on every seventh position.
+fn boundary_value(position: i64) -> Option<i64> {
+    (position % 7 != 0).then_some(position * 3)
+}
+
+fn boundary_rows(positions: std::ops::Range<i64>) -> RecordBatch {
+    RecordBatch::try_new(
+        boundary_schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(positions.clone())),
+            Arc::new(Int64Array::from_iter(positions.map(boundary_value))),
+        ],
+    )
+    .unwrap()
+}
+
+/// Appends `positions` as one fragment, streamed in batches of `batch_size`.
+async fn append_boundary_fragment(
+    dataset: &mut Dataset,
+    positions: std::ops::Range<i64>,
+    batch_size: i64,
+) {
+    let mut batches = Vec::new();
+    let mut start = positions.start;
+    while start < positions.end {
+        let end = (start + batch_size).min(positions.end);
+        batches.push(boundary_rows(start..end));
+        start = end;
+    }
+    dataset
+        .append(
+            RecordBatchIterator::new(
+                batches
+                    .into_iter()
+                    .map(Ok::<RecordBatch, arrow_schema::ArrowError>),
+                boundary_schema(),
+            ),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: (positions.end - positions.start) as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+/// `(id, val)` pairs, sorted by `id`.
+type BoundaryRows = Vec<(i64, Option<i64>)>;
+
+/// Sorted `(id, val)` pairs a filter returns.
+async fn boundary_query(dataset: &Dataset, filter: &str, use_index: bool) -> BoundaryRows {
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int64Type;
+
+    let mut scan = dataset.scan();
+    scan.use_scalar_index(use_index)
+        .filter(filter)
+        .unwrap()
+        .project(&["id", "val"])
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut rows: BoundaryRows = batch["id"]
+        .as_primitive::<Int64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(batch["val"].as_primitive::<Int64Type>().iter())
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// Configured seeds of one zone size serve a ZoneMap index of another size
+/// across fragment and batch boundaries. A seed record is reused when it lies
+/// inside one index zone (index zones restart at every fragment); records that
+/// cross an index zone boundary leave their fragment partly scanned. Indexed
+/// results always match both the generator and an unindexed scan.
+#[rstest::rstest]
+#[case::equal_aligned(8, 8, 64, 64)]
+#[case::equal_partial_final_zone(8, 8, 61, 61)]
+#[case::batches_cross_zones(8, 8, 61, 5)]
+#[case::coarsen_multiple(8, 32, 64, 13)]
+#[case::coarsen_multiple_partial_fragment(8, 32, 61, 13)]
+#[case::coarsen_not_multiple(8, 20, 64, 13)]
+#[case::seed_coarser_than_index(32, 8, 64, 13)]
+#[case::fragment_shorter_than_seed_zone(8, 8, 5, 5)]
+#[tokio::test]
+async fn test_config_seed_boundary_matrix(
+    #[case] seed_rows_per_zone: u64,
+    #[case] index_rows_per_zone: u64,
+    #[case] rows_per_fragment: i64,
+    #[case] batch_size: i64,
+) {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let context = format!(
+        "seed {seed_rows_per_zone}, index {index_rows_per_zone}, \
+         fragment {rows_per_fragment}, batch {batch_size}"
+    );
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(
+            [Ok(boundary_rows(0..BOUNDARY_CREATE_ROWS))],
+            boundary_schema(),
+        ),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let creating = dataset.fragments()[0].id;
+    enable_zone_write_seeds(&mut dataset, seed_rows_per_zone).await;
+    for fragment in 0..BOUNDARY_APPENDED_FRAGMENTS {
+        let start = BOUNDARY_CREATE_ROWS + fragment * rows_per_fragment;
+        append_boundary_fragment(&mut dataset, start..start + rows_per_fragment, batch_size).await;
+    }
+    let fragments = dataset.fragments().clone();
+    assert_eq!(
+        fragments.len() as i64,
+        BOUNDARY_APPENDED_FRAGMENTS + 1,
+        "{context}"
+    );
+    let mut appended: Vec<u64> = fragments
+        .iter()
+        .map(|f| f.id)
+        .filter(|id| *id != creating)
+        .collect();
+    appended.sort_unstable();
+    for fragment in &fragments[1..] {
+        assert_eq!(
+            seed_locator_rows_per_zone(&dataset, fragment, "val").await,
+            Some(seed_rows_per_zone),
+            "{context}: fragment {}",
+            fragment.id
+        );
+    }
+
+    let params = config_seed_index_params(index_rows_per_zone);
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{context}: {reports:?}");
+    let report = &reports[0];
+    let sorted = |ids: &[u64]| {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    let reused = sorted(&report.reused_fragments);
+    let partial = sorted(&report.partial_fragments);
+    let scanned = sorted(&report.scanned_fragments);
+    // A partly reused fragment is listed as both partial and scanned.
+    assert_eq!(
+        reused.len() + scanned.len(),
+        fragments.len(),
+        "{context}: {report:?}"
+    );
+    assert!(
+        reused.iter().all(|id| !scanned.contains(id)),
+        "{context}: {report:?}"
+    );
+    assert!(
+        partial.iter().all(|id| scanned.contains(id)),
+        "{context}: {report:?}"
+    );
+
+    // `scanned_rows` includes the creating fragment's BOUNDARY_CREATE_ROWS (11)
+    // rows.
+    let index_multiple_of_seed = index_rows_per_zone.is_multiple_of(seed_rows_per_zone);
+    if index_multiple_of_seed {
+        // Every seed record lies inside one index zone: no appended fragment
+        // is scanned.
+        assert_eq!(reused, appended, "{context}: {report:?}");
+        assert!(partial.is_empty(), "{context}: {report:?}");
+        assert_eq!(scanned, vec![creating], "{context}: {report:?}");
+        assert_eq!(report.scanned_rows, 11, "{context}: {report:?}");
+    } else if seed_rows_per_zone < index_rows_per_zone {
+        // 8-row records over index zones [0,20), [20,40), [40,60), [60,64)
+        // in a 64-row fragment: the records [16,24) and [56,64) cross an
+        // index zone boundary and are scanned, the other six are reused.
+        assert_eq!(
+            (seed_rows_per_zone, index_rows_per_zone, rows_per_fragment),
+            (8, 20, 64),
+            "{context}: expectation only derived for this shape"
+        );
+        assert!(reused.is_empty(), "{context}: {report:?}");
+        assert_eq!(partial, appended, "{context}: {report:?}");
+        let mut all_fragments = appended.clone();
+        all_fragments.push(creating);
+        all_fragments.sort_unstable();
+        assert_eq!(scanned, all_fragments, "{context}: {report:?}");
+        // Six reused records and 16 scanned rows per appended fragment, plus
+        // the creating fragment's 11 rows.
+        assert_eq!(report.reused_records, 18, "{context}: {report:?}");
+        assert_eq!(report.scanned_rows, 59, "{context}: {report:?}");
+    } else {
+        // In this fixture every 32-row record crosses 8-row index zones and
+        // none fits, so each appended seed is rejected before any reuse is
+        // recorded and its fragment is scanned in full.
+        assert_eq!(
+            (seed_rows_per_zone, index_rows_per_zone, rows_per_fragment),
+            (32, 8, 64),
+            "{context}: expectation only derived for this shape"
+        );
+        assert!(reused.is_empty(), "{context}: {report:?}");
+        assert!(partial.is_empty(), "{context}: {report:?}");
+        let mut all_fragments = appended.clone();
+        all_fragments.push(creating);
+        all_fragments.sort_unstable();
+        assert_eq!(scanned, all_fragments, "{context}: {report:?}");
+        assert_eq!(report.reused_records, 0, "{context}: {report:?}");
+        // The creating fragment's 11 rows plus three fully scanned 64-row
+        // fragments.
+        assert_eq!(report.scanned_rows, 203, "{context}: {report:?}");
+    }
+
+    // Positions at an index zone boundary inside the first appended fragment,
+    // and just before and after the first boundary between appended fragments.
+    let first_appended = BOUNDARY_CREATE_ROWS;
+    assert_boundary_predicates(
+        &dataset,
+        BOUNDARY_CREATE_ROWS + BOUNDARY_APPENDED_FRAGMENTS * rows_per_fragment,
+        first_appended + (index_rows_per_zone as i64).min(rows_per_fragment),
+        first_appended + rows_per_fragment,
+        &context,
+    )
+    .await;
+
+    let mut fragment_ranges = vec![(creating, 0..BOUNDARY_CREATE_ROWS)];
+    for (k, fragment) in fragments[1..].iter().enumerate() {
+        let start = BOUNDARY_CREATE_ROWS + k as i64 * rows_per_fragment;
+        fragment_ranges.push((fragment.id, start..start + rows_per_fragment));
+    }
+    assert_boundary_zone_statistics(&dataset, index_rows_per_zone, &fragment_ranges, &context)
+        .await;
+}
+
+/// One stored or expected zone of the ZoneMap index on `val`.
+#[derive(Debug, Clone, PartialEq)]
+struct BoundaryZone {
+    fragment_id: u64,
+    /// Offset of the zone's first row within its fragment.
+    zone_start: u64,
+    zone_length: u64,
+    null_count: u32,
+    min: Option<i64>,
+    max: Option<i64>,
+    nan_count: u32,
+    negative_nan_count: Option<u32>,
+}
+
+/// Every zone stored by the ZoneMap index on `val`, across all its segments,
+/// equals the zone computed from the generator: zones of `index_rows_per_zone`
+/// rows restart at each fragment's first row, the last one short, and
+/// `zone_start` is the offset within the fragment.
+/// `fragment_ranges` maps each fragment id to its generator positions.
+async fn assert_boundary_zone_statistics(
+    dataset: &Dataset,
+    index_rows_per_zone: u64,
+    fragment_ranges: &[(u64, std::ops::Range<i64>)],
+    context: &str,
+) {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Int64Type, UInt32Type, UInt64Type};
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
+
+    use crate::dataset::index::LanceIndexStoreExt;
+
+    let val = field_id(dataset, "val");
+    let indices = dataset.load_indices().await.unwrap();
+    let segments: Vec<_> = indices
+        .iter()
+        .filter(|index| index.fields == vec![val])
+        .collect();
+    assert!(!segments.is_empty(), "{context}: no index on val");
+
+    let mut batches = Vec::new();
+    let mut stored: Vec<BoundaryZone> = Vec::new();
+    for segment in segments {
+        let store = LanceIndexStore::from_dataset_for_existing(dataset, segment)
+            .await
+            .unwrap();
+        let version = ZoneMapIndexVersion::from_metadata(segment.index_version as u32).unwrap();
+        let batch = ZoneMapIndex::load_zone_statistics(&store, version)
+            .await
+            .unwrap();
+        let min = batch["min"].as_primitive::<Int64Type>();
+        let max = batch["max"].as_primitive::<Int64Type>();
+        let null_count = batch["null_count"].as_primitive::<UInt32Type>();
+        let nan_count = batch["nan_count"].as_primitive::<UInt32Type>();
+        let negative_nan_count = batch["negative_nan_count"].as_primitive::<UInt32Type>();
+        let fragment_id = batch["fragment_id"].as_primitive::<UInt64Type>();
+        let zone_start = batch["zone_start"].as_primitive::<UInt64Type>();
+        let zone_length = batch["zone_length"].as_primitive::<UInt64Type>();
+        for row in 0..batch.num_rows() {
+            stored.push(BoundaryZone {
+                fragment_id: fragment_id.value(row),
+                zone_start: zone_start.value(row),
+                zone_length: zone_length.value(row),
+                null_count: null_count.value(row),
+                min: min.is_valid(row).then(|| min.value(row)),
+                max: max.is_valid(row).then(|| max.value(row)),
+                nan_count: nan_count.value(row),
+                negative_nan_count: negative_nan_count
+                    .is_valid(row)
+                    .then(|| negative_nan_count.value(row)),
+            });
+        }
+        batches.push(batch);
+    }
+    stored.sort_unstable_by_key(|zone| (zone.fragment_id, zone.zone_start));
+
+    let zone_rows = index_rows_per_zone as i64;
+    let mut expected: Vec<BoundaryZone> = Vec::new();
+    for (fragment_id, positions) in fragment_ranges {
+        let mut start = positions.start;
+        while start < positions.end {
+            let end = (start + zone_rows).min(positions.end);
+            let values: Vec<Option<i64>> = (start..end).map(boundary_value).collect();
+            let non_null = values.iter().flatten();
+            expected.push(BoundaryZone {
+                fragment_id: *fragment_id,
+                zone_start: (start - positions.start) as u64,
+                zone_length: (end - start) as u64,
+                null_count: values.iter().filter(|v| v.is_none()).count() as u32,
+                min: non_null.clone().min().copied(),
+                max: non_null.max().copied(),
+                nan_count: 0,
+                negative_nan_count: Some(0),
+            });
+            start = end;
+        }
+    }
+    expected.sort_unstable_by_key(|zone| (zone.fragment_id, zone.zone_start));
+
+    assert_eq!(
+        stored.len(),
+        expected.len(),
+        "{context}: zone count, stored {batches:?}"
+    );
+    for (stored, expected) in stored.iter().zip(&expected) {
+        assert_eq!(
+            stored, expected,
+            "{context}: zone {expected:?}, stored {stored:?} in {batches:?}"
+        );
+    }
+}
+
+/// Range, null and equality predicates around `zone_boundary` and
+/// `fragment_boundary` return the rows the generator yields for positions
+/// `0..total_rows`, with and without the scalar index.
+async fn assert_boundary_predicates(
+    dataset: &Dataset,
+    total_rows: i64,
+    zone_boundary: i64,
+    fragment_boundary: i64,
+    context: &str,
+) {
+    let generated: BoundaryRows = (0..total_rows).map(|p| (p, boundary_value(p))).collect();
+    let oracle = |keep: &dyn Fn(Option<i64>) -> bool| -> BoundaryRows {
+        generated
+            .iter()
+            .filter(|(_, v)| keep(*v))
+            .copied()
+            .collect()
+    };
+
+    let zone_value = zone_boundary * 3;
+    let mut cases: Vec<(String, BoundaryRows)> = vec![
+        (
+            format!("val < {zone_value}"),
+            oracle(&|v: Option<i64>| v.is_some_and(|v| v < zone_value)),
+        ),
+        (
+            format!("val >= {zone_value}"),
+            oracle(&|v: Option<i64>| v.is_some_and(|v| v >= zone_value)),
+        ),
+        (
+            "val IS NULL".to_string(),
+            oracle(&|v: Option<i64>| v.is_none()),
+        ),
+        (
+            "val IS NOT NULL".to_string(),
+            oracle(&|v: Option<i64>| v.is_some()),
+        ),
+    ];
+    for position in [zone_boundary, fragment_boundary - 1, fragment_boundary] {
+        let x = position * 3;
+        cases.push((format!("val = {x}"), oracle(&|v: Option<i64>| v == Some(x))));
+    }
+
+    for (filter, expected) in cases {
+        let indexed = boundary_query(dataset, &filter, true).await;
+        let unindexed = boundary_query(dataset, &filter, false).await;
+        assert_eq!(unindexed, expected, "{context}: unindexed {filter}");
+        assert_eq!(indexed, expected, "{context}: indexed {filter}");
+    }
+}
+
+/// Configured seeds at production zone sizes serve a ZoneMap index over one
+/// appended fragment whose length no zone size divides. Seed records are
+/// `seed_rows_per_zone` rows from the fragment start with a short final
+/// record; with seed records no larger than index zones, a record is reused
+/// when it lies inside one index zone and scanned when it straddles an index
+/// zone boundary.
+#[rstest::rstest]
+#[case::small_seed_crosses_index_boundary(8192, 1_000_000, 1_050_000, 100_003)]
+#[case::equal_sizes_short_final_zone(1_000_000, 1_000_000, 1_050_000, 100_003)]
+#[case::equal_small_sizes(8192, 8192, 20_000, 4_099)]
+#[tokio::test]
+async fn test_config_seed_boundary_real_sizes(
+    #[case] seed_rows_per_zone: u64,
+    #[case] index_rows_per_zone: u64,
+    #[case] rows_per_fragment: i64,
+    #[case] batch_size: i64,
+) {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let context = format!(
+        "seed {seed_rows_per_zone}, index {index_rows_per_zone}, \
+         fragment {rows_per_fragment}, batch {batch_size}"
+    );
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(
+            [Ok(boundary_rows(0..BOUNDARY_CREATE_ROWS))],
+            boundary_schema(),
+        ),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let creating = dataset.fragments()[0].id;
+    enable_zone_write_seeds(&mut dataset, seed_rows_per_zone).await;
+    let first_appended = BOUNDARY_CREATE_ROWS;
+    append_boundary_fragment(
+        &mut dataset,
+        first_appended..first_appended + rows_per_fragment,
+        batch_size,
+    )
+    .await;
+    let fragments = dataset.fragments().clone();
+    assert_eq!(fragments.len(), 2, "{context}");
+    let appended = fragments[1].id;
+    assert_eq!(
+        seed_locator_rows_per_zone(&dataset, &fragments[1], "val").await,
+        Some(seed_rows_per_zone),
+        "{context}"
+    );
+
+    // Expected reuse, computed from the sizes alone.
+    let seed = seed_rows_per_zone as i64;
+    let index = index_rows_per_zone as i64;
+    assert!(
+        seed <= index,
+        "{context}: expectation assumes seed <= index"
+    );
+    let records: Vec<(i64, i64)> = (0..rows_per_fragment)
+        .step_by(seed as usize)
+        .map(|start| (start, (start + seed).min(rows_per_fragment)))
+        .collect();
+    let crossing: Vec<&(i64, i64)> = records
+        .iter()
+        .filter(|(start, end)| start / index != (end - 1) / index)
+        .collect();
+    let expected_reused_records = records.len() - crossing.len();
+    let expected_scanned_rows =
+        BOUNDARY_CREATE_ROWS + crossing.iter().map(|(start, end)| end - start).sum::<i64>();
+
+    let params = config_seed_index_params(index_rows_per_zone);
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{context}: {reports:?}");
+    let report = &reports[0];
+    let mut scanned = report.scanned_fragments.clone();
+    scanned.sort_unstable();
+    if crossing.is_empty() {
+        assert_eq!(
+            report.reused_fragments,
+            vec![appended],
+            "{context}: {report:?}"
+        );
+        assert!(report.partial_fragments.is_empty(), "{context}: {report:?}");
+        assert_eq!(scanned, vec![creating], "{context}: {report:?}");
+    } else {
+        // A partly reused fragment is listed as both partial and scanned.
+        assert!(report.reused_fragments.is_empty(), "{context}: {report:?}");
+        assert_eq!(
+            report.partial_fragments,
+            vec![appended],
+            "{context}: {report:?}"
+        );
+        let mut all_fragments = vec![creating, appended];
+        all_fragments.sort_unstable();
+        assert_eq!(scanned, all_fragments, "{context}: {report:?}");
+    }
+    assert_eq!(
+        report.reused_records, expected_reused_records,
+        "{context}: {report:?}"
+    );
+    assert_eq!(
+        report.scanned_rows, expected_scanned_rows as u64,
+        "{context}: {report:?}"
+    );
+
+    // With a single appended fragment the fragment boundary is the one
+    // between the creating fragment and the appended fragment.
+    assert_boundary_predicates(
+        &dataset,
+        BOUNDARY_CREATE_ROWS + rows_per_fragment,
+        first_appended + index.min(rows_per_fragment),
+        first_appended,
+        &context,
+    )
+    .await;
+
+    assert_boundary_zone_statistics(
+        &dataset,
+        index_rows_per_zone,
+        &[
+            (creating, 0..BOUNDARY_CREATE_ROWS),
+            (appended, first_appended..first_appended + rows_per_fragment),
+        ],
+        &context,
+    )
+    .await;
+}
+
+/// One stored or expected zone of the ZoneMap index on `col`; `min` and `max`
+/// are one-element arrays of the column's type.
+#[derive(Debug)]
+struct TypedZone {
+    fragment_id: u64,
+    zone_start: u64,
+    zone_length: u64,
+    null_count: u32,
+    nan_count: u32,
+    min: ArrayRef,
+    max: ArrayRef,
+}
+
+impl PartialEq for TypedZone {
+    fn eq(&self, other: &Self) -> bool {
+        self.fragment_id == other.fragment_id
+            && self.zone_start == other.zone_start
+            && self.zone_length == other.zone_length
+            && self.null_count == other.null_count
+            && self.nan_count == other.nan_count
+            && self.min.as_ref() == other.min.as_ref()
+            && self.max.as_ref() == other.max.as_ref()
+    }
+}
+
+/// The boundary shape where reused and scanned seed records mix (seed zones
+/// of 8 rows, index zones of 20, 64-row fragments written in 13-row batches),
+/// for each type family and both null-bitmap settings of the index. Stored
+/// zone statistics equal those computed from the generated arrays, and
+/// indexed filters match a scan.
+#[rstest::rstest]
+#[case::boolean(DataType::Boolean, &["col = true"])]
+#[case::int8(DataType::Int8, INT_FILTERS)]
+#[case::int32(DataType::Int32, INT_FILTERS)]
+#[case::int64(DataType::Int64, INT_FILTERS)]
+#[case::uint16(DataType::UInt16, INT_FILTERS)]
+#[case::uint64(DataType::UInt64, INT_FILTERS)]
+#[case::float32(DataType::Float32, FLOAT_FILTERS)]
+#[case::float64(DataType::Float64, FLOAT_FILTERS)]
+#[case::date32(DataType::Date32, &["col >= DATE '2022-02-07'"])]
+#[case::timestamp_ms(
+    DataType::Timestamp(TimeUnit::Millisecond, None),
+    &["col >= TIMESTAMP '2023-11-14 22:13:50'"]
+)]
+#[case::timestamp_ns_utc(DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), &[])]
+#[case::duration_us(DataType::Duration(TimeUnit::Microsecond), &[])]
+#[case::time32_s(
+    DataType::Time32(TimeUnit::Second),
+    &["col >= arrow_cast(1800, 'Time32(Second)')"]
+)]
+#[case::utf8(DataType::Utf8, STRING_FILTERS)]
+#[case::large_utf8(DataType::LargeUtf8, STRING_FILTERS)]
+#[case::binary(DataType::Binary, &["col >= X'000000000000001E'"])]
+#[case::large_binary(DataType::LargeBinary, &["col >= X'000000000000001E'"])]
+#[case::decimal128(DataType::Decimal128(38, 4), &["col >= 30"])]
+#[case::int16(DataType::Int16, &[])]
+#[case::uint8(DataType::UInt8, &[])]
+#[case::uint32(DataType::UInt32, &[])]
+#[case::float16(DataType::Float16, &[])]
+#[case::date64(DataType::Date64, &[])]
+#[case::time32_ms(DataType::Time32(TimeUnit::Millisecond), &[])]
+#[case::time64_us(DataType::Time64(TimeUnit::Microsecond), &[])]
+#[case::time64_ns(DataType::Time64(TimeUnit::Nanosecond), &[])]
+#[case::timestamp_s(DataType::Timestamp(TimeUnit::Second, None), &[])]
+#[case::timestamp_us(DataType::Timestamp(TimeUnit::Microsecond, None), &[])]
+#[case::duration_s(DataType::Duration(TimeUnit::Second), &[])]
+#[case::duration_ms(DataType::Duration(TimeUnit::Millisecond), &[])]
+#[case::duration_ns(DataType::Duration(TimeUnit::Nanosecond), &[])]
+#[case::decimal256(DataType::Decimal256(50, 4), &[])]
+#[tokio::test]
+async fn test_config_seed_boundary_per_type(
+    #[case] data_type: DataType,
+    #[case] filters: &'static [&'static str],
+    #[values(false, true)] index_store_null_bitmap: bool,
+) {
+    use arrow::array::{AsArray, BooleanArray, new_null_array};
+    use arrow::datatypes::{Float32Type, Float64Type, UInt32Type, UInt64Type};
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
+
+    use crate::dataset::index::LanceIndexStoreExt;
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    const SEED_ROWS_PER_ZONE: u64 = 8;
+    const INDEX_ROWS_PER_ZONE: usize = 20;
+    const CREATE_ROWS: i64 = 11;
+    const APPENDED_FRAGMENTS: i64 = 2;
+    const FRAGMENT_ROWS: i64 = 64;
+    const BATCH_ROWS: i64 = 13;
+
+    let context = format!("{data_type}, index store_null_bitmap {index_store_null_bitmap}");
+    let dir = TempStrDir::default();
+    let schema = typed_schema(&data_type);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(typed_rows(&data_type, 0..CREATE_ROWS))], schema.clone()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let creating = dataset.fragments()[0].id;
+    enable_zone_write_seeds(&mut dataset, SEED_ROWS_PER_ZONE).await;
+    let mut fragment_ranges = vec![(creating, 0..CREATE_ROWS)];
+    for k in 0..APPENDED_FRAGMENTS {
+        let start = CREATE_ROWS + k * FRAGMENT_ROWS;
+        let end = start + FRAGMENT_ROWS;
+        let batches: Vec<RecordBatch> = (start..end)
+            .step_by(BATCH_ROWS as usize)
+            .map(|b| typed_rows(&data_type, b..(b + BATCH_ROWS).min(end)))
+            .collect();
+        dataset
+            .append(
+                RecordBatchIterator::new(
+                    batches
+                        .into_iter()
+                        .map(Ok::<RecordBatch, arrow_schema::ArrowError>),
+                    schema.clone(),
+                ),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: FRAGMENT_ROWS as usize,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        fragment_ranges.push((dataset.fragments().last().unwrap().id, start..end));
+    }
+    assert_eq!(
+        dataset.fragments().len(),
+        fragment_ranges.len(),
+        "{context}"
+    );
+    let mut appended: Vec<u64> = fragment_ranges[1..].iter().map(|(id, _)| *id).collect();
+    appended.sort_unstable();
+    let mut all_fragments = appended.clone();
+    all_fragments.push(creating);
+    all_fragments.sort_unstable();
+
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": INDEX_ROWS_PER_ZONE,
+            "use_seeds": true,
+            "store_null_bitmap": index_store_null_bitmap,
+        }));
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["col"], IndexType::ZoneMap, None, &params, false)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{context}: {reports:?}");
+    let report = &reports[0];
+    let sorted = |ids: &[u64]| {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    // Per 64-row fragment, the 8-row records [16,24) and [56,64) cross an
+    // index zone boundary and are scanned; the other six are reused.
+    assert!(report.reused_fragments.is_empty(), "{context}: {report:?}");
+    assert_eq!(
+        sorted(&report.partial_fragments),
+        appended,
+        "{context}: {report:?}"
+    );
+    assert_eq!(
+        sorted(&report.scanned_fragments),
+        all_fragments,
+        "{context}: {report:?}"
+    );
+    assert_eq!(report.reused_records, 12, "{context}: {report:?}");
+    assert_eq!(report.scanned_rows, 11 + 2 * 16, "{context}: {report:?}");
+
+    let col = field_id(&dataset, "col");
+    let indices = dataset.load_indices().await.unwrap();
+    let mut batches = Vec::new();
+    let mut stored: Vec<TypedZone> = Vec::new();
+    for segment in indices.iter().filter(|index| index.fields == vec![col]) {
+        let store = LanceIndexStore::from_dataset_for_existing(&dataset, segment)
+            .await
+            .unwrap();
+        let version = ZoneMapIndexVersion::from_metadata(segment.index_version as u32).unwrap();
+        let batch = ZoneMapIndex::load_zone_statistics(&store, version)
+            .await
+            .unwrap();
+        let null_count = batch["null_count"].as_primitive::<UInt32Type>();
+        let nan_count = batch["nan_count"].as_primitive::<UInt32Type>();
+        let fragment_id = batch["fragment_id"].as_primitive::<UInt64Type>();
+        let zone_start = batch["zone_start"].as_primitive::<UInt64Type>();
+        let zone_length = batch["zone_length"].as_primitive::<UInt64Type>();
+        for row in 0..batch.num_rows() {
+            stored.push(TypedZone {
+                fragment_id: fragment_id.value(row),
+                zone_start: zone_start.value(row),
+                zone_length: zone_length.value(row),
+                null_count: null_count.value(row),
+                nan_count: nan_count.value(row),
+                min: batch["min"].slice(row, 1),
+                max: batch["max"].slice(row, 1),
+            });
+        }
+        batches.push(batch);
+    }
+    assert!(!batches.is_empty(), "{context}: no index on col");
+    stored.sort_unstable_by_key(|zone| (zone.fragment_id, zone.zone_start));
+
+    // Min and max exclude nulls and NaN; the rest is ordered by Arrow's sort,
+    // which orders floats totally.
+    let mut expected: Vec<TypedZone> = Vec::new();
+    for (fragment_id, positions) in &fragment_ranges {
+        let column = typed_column(&data_type, positions.clone());
+        let mut offset = 0;
+        while offset < column.len() {
+            let length = INDEX_ROWS_PER_ZONE.min(column.len() - offset);
+            let zone = column.slice(offset, length);
+            let doubles = zone.as_primitive_opt::<Float64Type>();
+            let singles = zone.as_primitive_opt::<Float32Type>();
+            let is_nan = |row: usize| {
+                doubles.is_some_and(|f| f.is_valid(row) && f.value(row).is_nan())
+                    || singles.is_some_and(|f| f.is_valid(row) && f.value(row).is_nan())
+            };
+            let keep: Vec<bool> = (0..length)
+                .map(|row| zone.is_valid(row) && !is_nan(row))
+                .collect();
+            let values = arrow::compute::filter(zone.as_ref(), &BooleanArray::from(keep)).unwrap();
+            let (min, max) = if values.is_empty() {
+                (new_null_array(&data_type, 1), new_null_array(&data_type, 1))
+            } else {
+                let order = arrow::compute::sort_to_indices(values.as_ref(), None, None).unwrap();
+                let ordered = arrow::compute::take(values.as_ref(), &order, None).unwrap();
+                (ordered.slice(0, 1), ordered.slice(ordered.len() - 1, 1))
+            };
+            expected.push(TypedZone {
+                fragment_id: *fragment_id,
+                zone_start: offset as u64,
+                zone_length: length as u64,
+                null_count: zone.null_count() as u32,
+                nan_count: (0..length).filter(|row| is_nan(*row)).count() as u32,
+                min,
+                max,
+            });
+            offset += length;
+        }
+    }
+
+    assert_eq!(
+        stored.len(),
+        expected.len(),
+        "{context}: zone count, stored {batches:?}"
+    );
+    for (stored, expected) in stored.iter().zip(&expected) {
+        assert_eq!(
+            stored, expected,
+            "{context}: zone {expected:?}, stored {stored:?} in {batches:?}"
+        );
+    }
+
+    let mut all_filters: Vec<&str> = filters.to_vec();
+    all_filters.extend(["col IS NULL", "col IS NOT NULL"]);
+    assert_indexed_ids_match_scan(&dataset, &all_filters, &context).await;
 }

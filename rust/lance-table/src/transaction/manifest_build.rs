@@ -12,10 +12,11 @@
 
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
-    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
-    ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
-    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS,
+    ZONE_WRITE_SEEDS_CONFIG_PREFIX, apply_feature_flags, apply_index_object_metadata_flag,
+    apply_row_addr_index_feature_flag, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
+    validate_non_reusable_field_id_flags, validate_zone_write_seeds_config,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -136,6 +137,27 @@ fn changes_auto_cleanup_config(operation: &Operation) -> bool {
                     .update_entries
                     .iter()
                     .any(|entry| is_auto_cleanup_key(&entry.key))
+        }
+        _ => false,
+    }
+}
+
+fn changes_zone_write_seeds_config(operation: &Operation) -> bool {
+    let is_zone_write_seeds_key = |key: &str| key.starts_with(ZONE_WRITE_SEEDS_CONFIG_PREFIX);
+    match operation {
+        Operation::Overwrite {
+            config_upsert_values: Some(values),
+            ..
+        } => values.keys().any(|key| is_zone_write_seeds_key(key)),
+        Operation::UpdateConfig {
+            config_updates: Some(update),
+            ..
+        } => {
+            update.replace
+                || update
+                    .update_entries
+                    .iter()
+                    .any(|entry| is_zone_write_seeds_key(&entry.key))
         }
         _ => false,
     }
@@ -2057,6 +2079,9 @@ impl Transaction {
 
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;
+        }
+        if changes_zone_write_seeds_config(&self.operation) {
+            validate_zone_write_seeds_config(&manifest)?;
         }
 
         apply_range_segments(&mut manifest, current_manifest)?;
@@ -4232,6 +4257,36 @@ mod tests {
             activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
             0
         );
+    }
+
+    #[test]
+    fn zone_write_seeds_settings_invalid_before_the_commit_do_not_block_it() {
+        let mut manifest = sample_manifest();
+        manifest.config.insert(
+            crate::feature_flags::ZONE_WRITE_SEEDS_ENABLED_KEY.into(),
+            "yes".into(),
+        );
+        assert!(validate_zone_write_seeds_config(&manifest).is_err());
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateConfig {
+                config_updates: Some(crate::transaction::UpdateMap {
+                    update_entries: vec![crate::transaction::update_map::UpdateMapEntry {
+                        key: "unrelated".into(),
+                        value: Some("1".into()),
+                    }],
+                    replace: false,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+
+        transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
     }
 
     fn covered_index(name: &str, fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
