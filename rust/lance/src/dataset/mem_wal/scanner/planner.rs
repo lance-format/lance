@@ -180,6 +180,7 @@ impl LsmScanPlanner {
     /// the output order, and with it any limit / offset, is the same on every
     /// run. `_memtable_gen` / `_rowaddr` are output-only and only produced
     /// when the caller opts in.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(name = "lsm_plan_scan", level = "debug", skip_all, fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
@@ -1272,7 +1273,9 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
-            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".to_string())]))
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                "id".to_string(),
+            )]))
             .unwrap()
             .limit(Some(3), None)
             .unwrap();
@@ -1301,7 +1304,9 @@ mod integration_tests {
         );
 
         let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
-            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".to_string())]))
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                "id".to_string(),
+            )]))
             .unwrap()
             .limit(Some(3), None)
             .unwrap();
@@ -1341,7 +1346,9 @@ mod integration_tests {
                     frozen: vec![],
                 },
             )
-            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("name".to_string())]))
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                "name".to_string(),
+            )]))
             .unwrap()
             .limit(Some(2), None)
             .unwrap();

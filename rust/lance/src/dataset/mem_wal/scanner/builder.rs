@@ -34,8 +34,8 @@ use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use super::vector_search::ProbeBounds;
 use super::{SearchQuery, SearchState, validate_nearest_query};
 use crate::dataset::Dataset;
-use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::mem_wal::util::derived_store_params;
+use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::utils::SchemaAdapter;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
@@ -635,8 +635,7 @@ impl LsmScanner {
         // silently dropping the full-text query under the vector dispatch.
         if self.ordering.is_some() && self.search.has_search() {
             return Err(Error::invalid_input(
-                "LSM scanner does not support order_by with vector or full-text search"
-                    .to_string(),
+                "LSM scanner does not support order_by with vector or full-text search".to_string(),
             ));
         }
         match self
