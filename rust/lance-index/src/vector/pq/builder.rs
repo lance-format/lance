@@ -25,6 +25,10 @@ use super::utils::divide_to_subvectors;
 use super::validate_supplied_codebook;
 use crate::vector::kmeans::{KMeansParams, train_kmeans};
 
+/// Training rows per code below which L2 codebooks train with Lloyd instead
+/// of e-means.
+const EMEANS_MIN_ROWS_PER_CODE: usize = 16;
+
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
 pub struct PQBuildParams {
@@ -35,7 +39,7 @@ pub struct PQBuildParams {
     pub num_bits: usize,
 
     /// The max number of iterations for kmeans training. Only Lloyd uses it:
-    /// L2 codebooks trained from scratch use e-means, see
+    /// L2 codebooks trained from scratch on enough rows use e-means, see
     /// [`PQBuildParams::build`].
     pub max_iters: usize,
 
@@ -157,8 +161,14 @@ impl PQBuildParams {
             .map(|(sub_vec_idx, sub_vec)| {
                 // e-means reaches the codebook loss of 50 Lloyd iterations at a
                 // small fraction of the cost. Lloyd stays for refining a
-                // supplied codebook and for distances e-means does not support.
-                if self.codebook.is_none() && distance_type == DistanceType::L2 {
+                // supplied codebook, for distances e-means does not support,
+                // and for samples too small for mini-batches: there Lloyd is
+                // cheap, and with few rows per code it keeps every distinct
+                // row as an exact code.
+                if self.codebook.is_none()
+                    && distance_type == DistanceType::L2
+                    && training_rows >= EMEANS_MIN_ROWS_PER_CODE * num_centroids
+                {
                     let sub_vec = FixedSizeListArray::try_new_from_values(
                         sub_vec,
                         sub_vector_dimension as i32,
@@ -259,7 +269,8 @@ impl PQBuildParams {
     /// Build a [ProductQuantizer] from the given data.
     ///
     /// Each sub-vector codebook is trained with e-means under L2 when no
-    /// codebook is supplied, and with Lloyd ([`Self::max_iters`]) otherwise.
+    /// codebook is supplied and the sample has at least 16 rows per code, and
+    /// with Lloyd ([`Self::max_iters`]) otherwise.
     ///
     /// If the [`DistanceType`] is [`DistanceType::Cosine`], the input data will be normalized.
     pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
@@ -578,6 +589,40 @@ mod tests {
         );
         assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    /// A sample with fewer rows per code than e-means needs trains with Lloyd.
+    /// With one row per code, Lloyd keeps every row as an exact code, so a
+    /// row's PQ distance to itself stays zero.
+    #[test]
+    fn test_build_keeps_small_samples_exact() {
+        const DIM: usize = 32;
+        const NUM_SUB_VECTORS: usize = 4;
+        const SUB_DIM: usize = DIM / NUM_SUB_VECTORS;
+        let mut rng = SmallRng::seed_from_u64(5);
+        let values = Float32Array::from_iter((0..256 * DIM).map(|_| rng.random_range(-1.0..1.0)));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let pq = PQBuildParams::new(NUM_SUB_VECTORS, 8)
+            .build(&fsl, DistanceType::L2)
+            .unwrap();
+        let codebook = pq.codebook.values().as_primitive::<Float32Type>().values();
+        for (row, vector) in fsl
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks_exact(DIM)
+            .enumerate()
+        {
+            for s in 0..NUM_SUB_VECTORS {
+                let sub = &vector[s * SUB_DIM..][..SUB_DIM];
+                let nearest = codebook[s * 256 * SUB_DIM..][..256 * SUB_DIM]
+                    .chunks_exact(SUB_DIM)
+                    .map(|code| l2(sub, code))
+                    .fold(f32::INFINITY, f32::min);
+                assert!(nearest < 1e-9, "row {row}, sub-vector {s}: {nearest}");
+            }
+        }
     }
 
     /// A supplied codebook is sliced with offsets derived from the column, so a
