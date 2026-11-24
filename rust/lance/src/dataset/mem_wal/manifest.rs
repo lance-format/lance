@@ -237,7 +237,7 @@ impl ShardManifestStore {
         let filename = manifest_filename(version);
         let path = self.manifest_dir.clone().join(filename.as_str());
 
-        let data = self.object_store.inner.get(&path).await.map_err(|e| {
+        let data = self.object_store.read_object(&path).await.map_err(|e| {
             Error::io(format!(
                 "Failed to read manifest version {} for shard {}: {}",
                 version, self.shard_id, e
@@ -423,7 +423,7 @@ impl ShardManifestStore {
         let filename = manifest_filename(version);
         let path = self.manifest_dir.clone().join(filename.as_str());
 
-        match self.object_store.inner.head(&path).await {
+        match self.object_store.stat(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(Error::io(format!(
@@ -438,7 +438,7 @@ impl ShardManifestStore {
     /// versions instead.
     async fn read_version_hint(&self) -> Option<u64> {
         let path = self.manifest_dir.clone().join("version_hint.json");
-        let read = async { self.object_store.inner.get(&path).await?.bytes().await };
+        let read = async { self.object_store.read_object(&path).await?.bytes().await };
         let bytes = match read.await {
             Ok(bytes) => bytes,
             Err(object_store::Error::NotFound { .. }) => return None,
@@ -464,8 +464,7 @@ impl ShardManifestStore {
             Ok(bytes) => {
                 if let Err(e) = self
                     .object_store
-                    .inner
-                    .put(&path, Bytes::from(bytes).into())
+                    .put_payload(&path, Bytes::from(bytes).into())
                     .await
                 {
                     warn!(
@@ -494,7 +493,7 @@ impl ShardManifestStore {
     /// version order.
     async fn list_version_times(&self) -> Result<Vec<(u64, DateTime<Utc>)>> {
         let mut versions = Vec::new();
-        let mut listing = self.object_store.inner.list(Some(&self.manifest_dir));
+        let mut listing = self.object_store.list_objects(Some(&self.manifest_dir));
         while let Some(item) = listing.next().await {
             let meta = item.map_err(|e| {
                 Error::io(format!(
@@ -1371,8 +1370,7 @@ mod tests {
     async fn write_hint(store: &ObjectStore, base_path: &Path, shard_id: &Uuid, version: u64) {
         let hint = serde_json::to_vec(&VersionHint { version }).unwrap();
         store
-            .inner
-            .put(&hint_path(base_path, shard_id), Bytes::from(hint).into())
+            .put_payload(&hint_path(base_path, shard_id), Bytes::from(hint).into())
             .await
             .unwrap();
     }
@@ -1594,8 +1592,7 @@ mod tests {
         // by one is the ordinary state during any commit.
         let hint_path = shard_manifest_path(&base_path, "", &shard_id).join("version_hint.json");
         store
-            .inner
-            .put(
+            .put_payload(
                 &hint_path,
                 Bytes::from(serde_json::to_vec(&VersionHint { version: 2 }).unwrap()).into(),
             )

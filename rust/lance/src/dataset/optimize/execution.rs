@@ -40,7 +40,6 @@ use lance_core::datatypes::{BlobHandling, Field as LanceField};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::writer::FileWriterOptions;
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{Fragment, RowDatasetVersionSequence};
 use lance_table::rowids::RowIdSequence;
@@ -718,11 +717,6 @@ pub(super) async fn rewrite_files(
     };
     let max_rows_per_file = file_row_counts.first().copied().unwrap_or(1);
 
-    let file_writer_options = FileWriterOptions {
-        data_cache_bytes: options.data_cache_bytes,
-        ..Default::default()
-    };
-
     let mut params = WriteParams {
         max_rows_per_file,
         max_rows_per_group: options.max_rows_per_group,
@@ -732,7 +726,7 @@ pub(super) async fn rewrite_files(
         // the writer would reject such blobs.
         allow_external_blob_outside_bases: true,
         data_storage_version: Some(write_version.to_selector()),
-        file_writer_options: Some(file_writer_options),
+        file_writer_options: Some(options.file_writer_options()),
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {

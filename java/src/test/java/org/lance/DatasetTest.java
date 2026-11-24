@@ -94,7 +94,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -2208,6 +2210,129 @@ public class DatasetTest {
           assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
           assertEquals(srcRowCount, opened.countRows());
         }
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testCreateBranchDataset(boolean callerOwnsResources, @TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        Append append = Append.builder().fragments(suite.createNewFragment(4, 2)).build();
+        empty.newTransactionBuilder().operation(append).build().commit().close();
+      }
+      OpenDatasetBuilder open = Dataset.open().uri(path);
+      if (callerOwnsResources) {
+        open.allocator(allocator).session(session);
+      }
+      try (Dataset parent = open.build();
+          Dataset branch =
+              callerOwnsResources
+                  ? parent.createBranch("dev", Ref.ofMain(), Map.of("allow_http", "true"))
+                  : parent.createBranch("dev", Ref.ofMain())) {
+        Session branchSession = branch.session();
+        assertNotNull(branchSession, "expected an initialized branch session");
+        assertEquals(suite.getSchema(), branch.getSchema());
+        try (Dataset sibling = open.build()) {
+          assertEquals(suite.getSchema(), sibling.getSchema());
+        }
+        assertEquals(suite.getSchema(), parent.getSchema());
+        BufferAllocator branchAllocator = branch.allocator();
+        if (callerOwnsResources) {
+          assertSame(allocator, branchAllocator);
+        }
+        try (LanceScanner scanner = branch.newScan();
+            ArrowReader reader = scanner.scanBatches()) {
+          parent.close();
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("id");
+            for (int i = 0; i < ids.getValueCount(); i++) {
+              assertEquals(rows, ids.get(i));
+              rows++;
+            }
+          }
+          assertEquals(4, rows);
+          assertTrue(branchSession.sizeBytes() >= 0);
+        }
+        branch.close();
+        assertTrue(branchSession.isClosed());
+        if (!callerOwnsResources) {
+          assertThrows(IllegalStateException.class, branchAllocator::assertOpen);
+        }
+      }
+      allocator.assertOpen();
+      assertFalse(session.isClosed());
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testCreateBranchFromCommit(boolean nativeCommit, @TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      suite.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = suite.createNewFragment(4, 2);
+      try (Dataset parent = Dataset.open().uri(path).build();
+          Transaction update =
+              new Transaction.Builder()
+                  .readVersion(parent.version())
+                  .operation(Append.builder().fragments(fragments).build())
+                  .build();
+          Dataset committed =
+              nativeCommit
+                  ? Dataset.commitAppend(path, Optional.of(parent.version()), fragments, Map.of())
+                  : new CommitBuilder(parent).execute(update);
+          Dataset branch = committed.createBranch("dev", Ref.ofMain());
+          Dataset checkout = branch.checkoutVersion(branch.version())) {
+        if (!nativeCommit) {
+          assertSame(parent.allocator(), committed.allocator());
+        }
+        BufferAllocator branchAllocator = branch.allocator();
+        assertNotSame(parent.allocator(), branchAllocator);
+        committed.close();
+        parent.close();
+        assertEquals(suite.getSchema(), branch.getSchema());
+        branch.close();
+        try (LanceScanner scanner = checkout.newScan()) {
+          suite.validateScanResults(checkout, scanner, 4, 2, 0);
+        }
+        checkout.close();
+        assertThrows(IllegalStateException.class, branchAllocator::assertOpen);
+      }
+    }
+  }
+
+  @Test
+  void testCreateBranchConfig(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        suite.write(empty.version(), 2).close();
+      }
+      try (Dataset parent = Dataset.open().uri(path).build();
+          Dataset branch = parent.createBranch("dev", Ref.ofMain());
+          LanceScanner scanner = branch.newScan();
+          ArrowReader reader = scanner.scanBatches()) {
+        Session branchSession = branch.session();
+        long version = branch.version();
+        branch.updateConfig(Map.of("key", "value"));
+        assertEquals("value", branch.getConfig().get("key"));
+        branch.deleteConfigKeys(Collections.singleton("key"));
+        assertFalse(branch.getConfig().containsKey("key"));
+        assertEquals(version + 2, branch.version());
+        assertSame(branchSession, branch.session());
+        assertFalse(branchSession.isClosed());
+        assertEquals(suite.getSchema(), branch.getSchema());
+        assertTrue(reader.loadNextBatch());
+        assertEquals(2, reader.getVectorSchemaRoot().getRowCount());
       }
     }
   }

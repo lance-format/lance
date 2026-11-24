@@ -56,6 +56,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     source_budget_mode: JObject,              // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
     scope: JObject,                           // Optional<String>
+    data_cache_bytes: JObject,                // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -80,7 +81,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             data_storage_version,
             source_budget_mode,
             max_data_files_per_fragment,
-            scope
+            scope,
+            data_cache_bytes
         ),
         JObject::null()
     )
@@ -109,6 +111,7 @@ fn inner_plan_compaction<'local>(
     source_budget_mode: JObject,              // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
     scope: JObject,                           // Optional<String>
+    data_cache_bytes: JObject,                // Optional<Long>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -134,6 +137,7 @@ fn inner_plan_compaction<'local>(
         &excluded_fragment_ids,
         &data_storage_version,
         Some(&source_budget_mode),
+        &data_cache_bytes,
         &config,
     )?;
     apply_repack_options(
@@ -241,6 +245,7 @@ fn inner_commit_compaction<'local>(
         &excluded_fragment_ids,
         &JObject::null(),
         None,
+        &JObject::null(),
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -285,6 +290,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     data_storage_version: JObject,            // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
     scope: JObject,                           // Optional<String>
+    data_cache_bytes: JObject,                // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -310,7 +316,8 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             excluded_fragment_ids,
             data_storage_version,
             max_data_files_per_fragment,
-            scope
+            scope,
+            data_cache_bytes
         ),
         JObject::null()
     )
@@ -340,6 +347,7 @@ fn inner_execute_task<'local>(
     data_storage_version: JObject,            // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
     scope: JObject,                           // Optional<String>
+    data_cache_bytes: JObject,                // Optional<Long>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
     let config = {
@@ -366,6 +374,7 @@ fn inner_execute_task<'local>(
         &excluded_fragment_ids,
         &data_storage_version,
         None,
+        &data_cache_bytes,
         &config,
     )?;
     apply_repack_options(
@@ -402,7 +411,7 @@ const REWRITE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/compaction/CompactionM
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
 const SOURCE_BUDGET_MODE_CLASS: &str = "org/lance/compaction/SourceBudgetMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 /// The Java `TaskData` carries no output properties, so a task whose outputs
 /// carry a clustering id or metadata cannot cross into Java without losing
@@ -552,6 +561,8 @@ impl IntoJava for &CompactionOptions {
         };
         let scope: JObject = env.new_string(scope)?.into();
         let scope_opt = to_java_optional(env, scope)?;
+        let data_cache_bytes = to_java_long_obj(env, self.data_cache_bytes.map(|v| v as i64))?;
+        let data_cache_bytes_opt = to_java_optional(env, data_cache_bytes)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -576,6 +587,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&source_budget_mode_opt),
                 JValueGen::Object(&max_data_files_per_fragment_opt),
                 JValueGen::Object(&scope_opt),
+                JValueGen::Object(&data_cache_bytes_opt),
             ],
         )?)
     }

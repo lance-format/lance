@@ -25,9 +25,6 @@ use crate::schema::LanceSchemaProvider;
 /// [`SessionBuilder::with_default_catalog`].
 #[derive(Debug, Clone)]
 pub struct LanceCatalogProviderList {
-    /// Root Lance namespace used to resolve catalogs / schemas / tables.
-    #[allow(dead_code)]
-    ns_level: NamespaceLevel,
     /// Catalogs that have been loaded from the root namespace.
     ///
     /// Note: The values in this map may become stale over time, as there is currently
@@ -44,10 +41,7 @@ impl LanceCatalogProviderList {
             catalogs.insert(catalog_name, catalog_provider as Arc<dyn CatalogProvider>);
         }
 
-        Ok(Self {
-            ns_level: namespace,
-            catalogs,
-        })
+        Ok(Self { catalogs })
     }
 }
 
@@ -87,8 +81,6 @@ impl CatalogProviderList for LanceCatalogProviderList {
 /// Child namespaces are automatically loaded as [`LanceSchemaProvider`] instances.
 #[derive(Debug, Clone)]
 pub struct LanceCatalogProvider {
-    #[allow(dead_code)]
-    ns_level: NamespaceLevel,
     /// Note: The values in this map may become stale over time, as there is currently
     /// no mechanism to automatically refresh or invalidate cached schema providers.
     schemas: DashMap<String, Arc<dyn SchemaProvider>>,
@@ -103,10 +95,7 @@ impl LanceCatalogProvider {
             schemas.insert(schema_name, schema_provider as Arc<dyn SchemaProvider>);
         }
 
-        Ok(Self {
-            ns_level: namespace,
-            schemas,
-        })
+        Ok(Self { schemas })
     }
 }
 

@@ -59,8 +59,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions, write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
     ReadSnapshot, validate_frag_reuse_history,
@@ -72,12 +71,12 @@ use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
+use crate::utils::temporal::timestamp_to_nanos;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use log;
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -89,6 +88,8 @@ mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
 pub mod namespace_manifest;
+#[cfg(all(feature = "dynamodb", test))]
+mod s3_ddb_profile_test;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
 
@@ -167,7 +168,7 @@ async fn read_transaction_file_pb(
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
-    let result = object_store.inner.get(&path).await?;
+    let result = object_store.read_object(&path).await?;
     let data = result.bytes().await?;
     Ok(pb::Transaction::decode(data)?)
 }
@@ -436,12 +437,15 @@ async fn do_commit_new_dataset(
     base_path: &Path,
     uri: &str,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
     session: Arc<Session>,
     inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let build_config = build_config
+        .clone()
+        .with_timestamp_nanos(timestamp_to_nanos(None));
     let mut transaction = transaction.clone();
     if let Operation::Overwrite { schema, .. } = &mut transaction.operation {
         crate::dataset::write::assign_new_table_field_ids(schema, inherited_field_ids)?;
@@ -550,7 +554,7 @@ async fn do_commit_new_dataset(
         None
     };
 
-    let transaction_file = if !write_config.disable_transaction_file() {
+    let transaction_file = if !build_config.disable_transaction_file() {
         match write_transaction_file(object_store, base_path, &pb_transaction).await {
             Ok(transaction_file) => transaction_file,
             Err(err) => {
@@ -633,12 +637,8 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         }
     } else {
-        let (manifest, indices) = transaction.build_manifest(
-            None,
-            vec![],
-            &transaction_file,
-            &write_config.to_build_config(),
-        )?;
+        let (manifest, indices) =
+            transaction.build_manifest(None, vec![], &transaction_file, &build_config)?;
         (manifest, indices)
     };
 
@@ -656,7 +656,7 @@ async fn do_commit_new_dataset(
         } else {
             Some(indices.clone())
         },
-        write_config,
+        &build_config,
         manifest_naming_scheme,
         inline_transaction.then(|| pb_transaction.into()),
         may_change_schema,
@@ -788,7 +788,7 @@ pub(crate) async fn commit_new_dataset(
     base_path: &Path,
     uri: &str,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
     session: Arc<Session>,
@@ -801,7 +801,7 @@ pub(crate) async fn commit_new_dataset(
         base_path,
         uri,
         transaction,
-        write_config,
+        build_config,
         manifest_naming_scheme,
         metadata_cache,
         session,
@@ -1313,14 +1313,14 @@ pub(crate) async fn do_commit_detached_transaction(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
     // Definitions are allocated against the version chain: a detached
     // manifest's ids and field-identity activation would be invisible to it.
-    if write_config.has_clustering_definitions() {
+    if build_config.clustering_definitions().is_some() {
         return Err(Error::invalid_input(
             "a clustering definitions list cannot be committed detached",
         ));
@@ -1355,7 +1355,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
-    let transaction_file = if !write_config.disable_transaction_file() {
+    let transaction_file = if !build_config.disable_transaction_file() {
         write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
     } else {
         String::new()
@@ -1373,7 +1373,8 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
-        let build_config = build_config_for_attempt(dataset, transaction, write_config).await?;
+        let attempt_build_config =
+            build_config_for_attempt(dataset, transaction, build_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
@@ -1381,7 +1382,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    &build_config,
+                    &attempt_build_config,
                     &transaction_file,
                     &dataset.manifest,
                 )
@@ -1391,22 +1392,21 @@ pub(crate) async fn do_commit_detached_transaction(
                 // Nothing is settled about a tagged fragment reuse entry
                 // on a detached commit: a tagged rewrite entry was refused
                 // above and a trim never commits detached.
-                let prepared =
-                    prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
-                        .await?;
-                let (mut manifest, indices) = transaction.build_manifest_prepared(
+                let prepared = prepare_attempt(
+                    dataset,
+                    transaction,
+                    &attempt_build_config,
+                    FragReuseUpdate::None,
+                )
+                .await?;
+                let (mut manifest, mut indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
-                    &build_config,
+                    &attempt_build_config,
                     None,
                 )?;
-                crate::dataset::write::seeds::apply_seed_feature_flags(
-                    &mut manifest,
-                    &indices,
-                    dataset,
-                )
-                .await?;
+                finish_built_manifest(dataset, transaction, &mut manifest, &mut indices).await?;
                 (manifest, indices)
             }
         };
@@ -1417,6 +1417,7 @@ pub(crate) async fn do_commit_detached_transaction(
             let checked = crate::index::vector::ivf::validate_committed_vector_segments(
                 dataset,
                 &transaction.operation,
+                &manifest,
                 &indices,
             )
             .await;
@@ -1481,7 +1482,7 @@ pub(crate) async fn do_commit_detached_transaction(
             } else {
                 Some(indices.clone())
             },
-            write_config,
+            &attempt_build_config,
             ManifestNamingScheme::V2,
             inline_tx.take(),
             may_change_schema,
@@ -1536,7 +1537,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
                 inline_tx = if inline_transaction {
-                    Some(pb::Transaction::try_from(transaction)?.into())
+                    Some(lance_table::format::Transaction::try_from(transaction)?)
                 } else {
                     None
                 };
@@ -1592,7 +1593,7 @@ pub(crate) async fn commit_detached_transaction(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
@@ -1602,7 +1603,7 @@ pub(crate) async fn commit_detached_transaction(
         object_store,
         commit_handler,
         transaction,
-        write_config,
+        build_config,
         commit_config,
         retry_timeout,
     )
@@ -1613,16 +1614,16 @@ pub(crate) async fn commit_detached_transaction(
 
 /// The build config for one commit attempt against `dataset`'s current manifest.
 ///
-/// An operation that carries rows' lineage over from existing fragments needs
-/// their sequences at build time, and the build cannot read the ones spilled to
-/// data files; they are read here, per attempt, so a rebase onto a newer
-/// manifest sees that manifest's fragments.
+/// Resolves the commit timestamp through this crate's mockable clock and loads
+/// spilled row lineage when the operation needs existing lineage sequences.
 async fn build_config_for_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
+    build_config: &ManifestBuildConfig,
 ) -> Result<ManifestBuildConfig> {
-    let mut config = write_config.to_build_config();
+    let mut config = build_config
+        .clone()
+        .with_timestamp_nanos(timestamp_to_nanos(None));
     let reads_existing_lineage = match &transaction.operation {
         // An update resolves its new fragments' created-at versions from the
         // existing fragments unless their writer placed them, and refreshes
@@ -1642,10 +1643,46 @@ async fn build_config_for_attempt(
         _ => false,
     };
     if reads_existing_lineage {
-        config.spilled_row_lineage =
-            load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+        let lineage = load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+        config = config.with_spilled_row_lineage(lineage);
     }
     Ok(config)
+}
+
+/// What an action-based transaction's attempt supplies for the fragment reuse
+/// history: the history itself when it lives in an external file, which
+/// applying the actions cannot read, and this build's notion of a usable
+/// segment, which a trim judges coverage by. `None` for any other operation.
+async fn composite_frag_reuse_update(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<Option<FragReuseUpdate>> {
+    if !matches!(transaction.operation, Operation::CompositeOperation(_)) {
+        return Ok(None);
+    }
+    let history = crate::index::frag_reuse::preload_external_frag_reuse_history(dataset).await?;
+    Ok(Some(FragReuseUpdate::Actions(Arc::new(
+        lance_table::system_index::frag_reuse::FragReuseActionInputs {
+            history,
+            index_is_usable: crate::index::segment::index_is_usable,
+        },
+    ))))
+}
+
+/// The IO a freshly built manifest still needs: an action-based history that
+/// outgrew the inline limit moves to an external file, and the seed feature
+/// flags follow the final index list. One await point, rather than one per
+/// step, keeps the commit loop's future under the `large_futures` limit.
+async fn finish_built_manifest(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    manifest: &mut Manifest,
+    indices: &mut [IndexMetadata],
+) -> Result<()> {
+    if matches!(transaction.operation, Operation::CompositeOperation(_)) {
+        crate::index::frag_reuse::spill_frag_reuse_history(dataset, indices).await?;
+    }
+    crate::dataset::write::seeds::apply_seed_feature_flags(manifest, indices, dataset).await
 }
 
 /// Step one of a commit attempt (`Transaction::prepare_indices`): the index
@@ -1656,14 +1693,21 @@ async fn build_config_for_attempt(
 /// the lineage without guessing; other operations never interpret the
 /// entry: an append, or a merge that only adds columns, must carry a
 /// history a newer writer recorded through untouched. `frag_reuse` is what
-/// the rebase settled about the entry for this attempt. Nothing flows back
-/// into `transaction`.
+/// the rebase settled about the entry for this attempt; for an action-based
+/// transaction, which settles nothing beforehand, it is derived here. Nothing
+/// flows back into `transaction`.
 async fn prepare_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
     build_config: &lance_table::format::ManifestBuildConfig,
     frag_reuse: FragReuseUpdate,
 ) -> Result<PreparedIndices> {
+    let frag_reuse = match frag_reuse {
+        FragReuseUpdate::None => composite_frag_reuse_update(dataset, transaction)
+            .await?
+            .unwrap_or_default(),
+        settled => settled,
+    };
     let indices = load_all_indices(dataset).await?;
     // Same rewrite set the preparation withdraws from; nothing else interprets the entry.
     let rewrites_in_place = !Transaction::rewritten_physical_columns(
@@ -1772,20 +1816,74 @@ async fn record_successful_commit(
     dataset.ensure_branch_exists().await
 }
 
+/// Options for [`commit_transaction`].
+pub(crate) struct CommitTransactionOptions<'a> {
+    pub build_config: &'a ManifestBuildConfig,
+    pub commit_config: &'a CommitConfig,
+    pub retry_timeout: Duration,
+    pub manifest_naming_scheme: ManifestNamingScheme,
+    pub affected_rows: Option<&'a RowAddrTreeMap>,
+    pub expected_latest_version: Option<u64>,
+    /// Whether this commit is a tagged fragment-reuse-index trim derived by the
+    /// maintenance path against the current manifest entry (`FragReuseUpdate::Trim`).
+    pub tagged_frag_reuse_trim: bool,
+}
+
+impl<'a> CommitTransactionOptions<'a> {
+    pub(crate) fn new(
+        build_config: &'a ManifestBuildConfig,
+        commit_config: &'a CommitConfig,
+        manifest_naming_scheme: ManifestNamingScheme,
+    ) -> Self {
+        Self {
+            build_config,
+            commit_config,
+            retry_timeout: default_commit_retry_timeout(),
+            manifest_naming_scheme,
+            affected_rows: None,
+            expected_latest_version: None,
+            tagged_frag_reuse_trim: false,
+        }
+    }
+
+    pub(crate) fn with_retry_timeout(mut self, retry_timeout: Duration) -> Self {
+        self.retry_timeout = retry_timeout;
+        self
+    }
+
+    pub(crate) fn with_affected_rows(mut self, affected_rows: Option<&'a RowAddrTreeMap>) -> Self {
+        self.affected_rows = affected_rows;
+        self
+    }
+
+    pub(crate) fn with_expected_latest_version(mut self, version: u64) -> Self {
+        self.expected_latest_version = Some(version);
+        self
+    }
+
+    pub(crate) fn with_tagged_frag_reuse_trim(mut self) -> Self {
+        self.tagged_frag_reuse_trim = true;
+        self
+    }
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
-    commit_config: &CommitConfig,
-    retry_timeout: Duration,
-    manifest_naming_scheme: ManifestNamingScheme,
-    affected_rows: Option<&RowAddrTreeMap>,
-    expected_latest_version: Option<u64>,
+    options: CommitTransactionOptions<'_>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let CommitTransactionOptions {
+        build_config,
+        commit_config,
+        retry_timeout,
+        manifest_naming_scheme,
+        affected_rows,
+        expected_latest_version,
+        tagged_frag_reuse_trim,
+    } = options;
     dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -1861,7 +1959,7 @@ pub(crate) async fn commit_transaction(
     // read, not from the handle it was submitted through, which may already
     // be at a later, activated version.
     let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
-        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+        && build_config.allocates_clustering_definitions(&read_version_dataset.manifest))
     .then(|| read_version_dataset.schema().clone());
 
     while backoff.attempt() < num_attempts {
@@ -1910,7 +2008,12 @@ pub(crate) async fn commit_transaction(
             let missing = (checked_since + 1..=dataset.manifest.version)
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
-            rebase.check_missing_versions(&missing, dataset.manifest.version)?;
+            rebase.check_missing_versions(
+                &missing,
+                dataset.manifest.version,
+                read_version_dataset.schema(),
+                dataset.schema(),
+            )?;
             // A retry's window starts after its previous attempt, so it would
             // miss the moves recorded there; not tracking only costs coverage.
             if checked_since == read_version && missing.is_empty() {
@@ -1972,7 +2075,7 @@ pub(crate) async fn commit_transaction(
         // copy would tie the verdict to the payload size instead.
         let may_change_schema = operation_may_change_schema(&pb_transaction);
 
-        current_transaction_file = if !write_config.disable_transaction_file() {
+        current_transaction_file = if !build_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
         } else {
             String::new()
@@ -1988,8 +2091,8 @@ pub(crate) async fn commit_transaction(
         // Build an up-to-date manifest from the transaction and current
         // manifest: prepare the index list against this attempt's manifest
         // first, then build from the prepared result.
-        let build_config =
-            build_config_for_attempt(&dataset, &attempt_transaction, write_config).await?;
+        let attempt_build_config =
+            build_config_for_attempt(&dataset, &attempt_transaction, build_config).await?;
         let (mut manifest, mut indices) = match attempt_transaction.operation {
             Operation::Restore { version } => {
                 // A restore reinstates its snapshot's index list and entry
@@ -1999,7 +2102,7 @@ pub(crate) async fn commit_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    &build_config,
+                    &attempt_build_config,
                     transaction_file,
                     &dataset.manifest,
                 )
@@ -2008,25 +2111,25 @@ pub(crate) async fn commit_transaction(
             _ => {
                 let frag_reuse = match tagged_rewrite.take() {
                     Some(assembly) => FragReuseUpdate::Rewrite(assembly),
-                    None if write_config.tagged_frag_reuse_trim() => FragReuseUpdate::Trim,
+                    None if tagged_frag_reuse_trim => FragReuseUpdate::Trim,
                     None => FragReuseUpdate::None,
                 };
-                let prepared =
-                    prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
-                        .await?;
-                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
+                let prepared = prepare_attempt(
+                    &dataset,
+                    &attempt_transaction,
+                    &attempt_build_config,
+                    frag_reuse,
+                )
+                .await?;
+                let (mut manifest, mut indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
-                    &build_config,
+                    &attempt_build_config,
                     read_version_state,
                 )?;
-                crate::dataset::write::seeds::apply_seed_feature_flags(
-                    &mut manifest,
-                    &indices,
-                    &dataset,
-                )
-                .await?;
+                finish_built_manifest(&dataset, &attempt_transaction, &mut manifest, &mut indices)
+                    .await?;
                 (manifest, indices)
             }
         };
@@ -2037,6 +2140,7 @@ pub(crate) async fn commit_transaction(
             let checked = crate::index::vector::ivf::validate_committed_vector_segments(
                 &dataset,
                 &attempt_transaction.operation,
+                &manifest,
                 &indices,
             )
             .await;
@@ -2108,7 +2212,7 @@ pub(crate) async fn commit_transaction(
             } else {
                 Some(indices.clone())
             },
-            write_config,
+            &attempt_build_config,
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
             may_change_schema,
@@ -2813,6 +2917,194 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::drop_columns_after_add_columns("add_columns")]
+    #[case::append_after_cast("cast")]
+    #[case::append_null_after_set_not_null("set_not_null")]
+    #[case::append_after_overwrite_reusing_field_ids("overwrite")]
+    #[case::append_after_overwrite_swapping_same_type_columns("overwrite_swap")]
+    #[case::append_after_overwrite_swapping_same_type_structs("overwrite_nested_swap")]
+    #[case::append_after_overwrite_struct_to_list("overwrite_struct_to_list")]
+    #[case::append_after_overwrite_list_to_struct("overwrite_list_to_struct")]
+    #[tokio::test]
+    async fn test_schema_dependent_commit_rejects_cleaned_history(#[case] concurrent: &str) {
+        let (initial, staged) = match concurrent {
+            "overwrite_nested_swap" => (
+                struct_pair_batch(["a", "b"], [0, 1]),
+                struct_pair_batch(["a", "b"], [7, 70]),
+            ),
+            "overwrite_struct_to_list" => (container_batch(false, 1), container_batch(false, 7)),
+            "overwrite_list_to_struct" => (container_batch(true, 1), container_batch(true, 7)),
+            _ => (
+                arrow_array::record_batch!(
+                    ("id", Int32, [0, 1, 2, 3]),
+                    ("x", Int32, [Some(0), Some(1), Some(2), Some(3)])
+                )
+                .unwrap(),
+                arrow_array::record_batch!(("id", Int32, [4]), ("x", Int32, [None])).unwrap(),
+            ),
+        };
+        let stale = Arc::new(
+            crate::dataset::InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        let staged_append = crate::dataset::InsertBuilder::new(stale.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![staged])
+            .await
+            .unwrap();
+        let mut latest = stale.as_ref().clone();
+        match concurrent {
+            "add_columns" => latest
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        "extra".into(),
+                        "id * 2".into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            "cast" => latest
+                .alter_columns(&[
+                    crate::dataset::ColumnAlteration::new("x".into()).cast_to(DataType::Int64)
+                ])
+                .await
+                .unwrap(),
+            "set_not_null" => latest
+                .alter_columns(&[
+                    crate::dataset::ColumnAlteration::new("x".into()).set_nullable(false)
+                ])
+                .await
+                .unwrap(),
+            "overwrite" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![
+                        arrow_array::record_batch!(("id", Utf8, ["a"]), ("x", Utf8, ["b"]))
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
+            }
+            // The reused field ids keep their types but now name the other column.
+            "overwrite_swap" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![
+                        arrow_array::record_batch!(("x", Int32, [Some(5)]), ("id", Int32, [6]))
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
+            }
+            // Only the parents swap: both written leaves are still `x: int32`.
+            "overwrite_nested_swap" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![struct_pair_batch(["b", "a"], [5, 6])])
+                    .await
+                    .unwrap();
+            }
+            // The leaf keeps its path `a.item` and type under another container kind.
+            "overwrite_struct_to_list" | "overwrite_list_to_struct" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![container_batch(
+                        concurrent == "overwrite_struct_to_list",
+                        20,
+                    )])
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let latest = CommitBuilder::new(Arc::new(latest))
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1, 2])
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        let result = if concurrent == "add_columns" {
+            let mut stale = stale.as_ref().clone();
+            stale.drop_columns(&["x"]).await
+        } else {
+            CommitBuilder::new(stale)
+                .execute(staged_append)
+                .await
+                .map(|_| ())
+        };
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("versions [2]"), "{error}");
+        assert_eq!(latest.latest_version_id().await.unwrap(), 3);
+    }
+
+    /// One row with two `struct<x: int32>` columns.
+    fn struct_pair_batch(names: [&str; 2], values: [i32; 2]) -> RecordBatch {
+        let column = |value: i32| -> arrow_array::ArrayRef {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(ArrowField::new("x", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![value])) as arrow_array::ArrayRef,
+            )]))
+        };
+        RecordBatch::try_from_iter([(names[0], column(values[0])), (names[1], column(values[1]))])
+            .unwrap()
+    }
+
+    /// One row with an `a` column that is either `list<item: int32>` or
+    /// `struct<item: int32>`.
+    fn container_batch(is_list: bool, value: i32) -> RecordBatch {
+        let column: arrow_array::ArrayRef = if is_list {
+            Arc::new(
+                arrow_array::ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![
+                    Some(value),
+                    Some(value + 1),
+                ])]),
+            )
+        } else {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![value])) as arrow_array::ArrayRef,
+            )]))
+        };
+        RecordBatch::try_from_iter([("a", column)]).unwrap()
+    }
+
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -3040,7 +3332,7 @@ mod tests {
         manifest: Manifest,
         transaction: &Transaction,
     ) -> Arc<dyn CommitHandler> {
-        let transaction = pb::Transaction::try_from(transaction).unwrap().into();
+        let transaction = lance_table::format::Transaction::try_from(transaction).unwrap();
         Arc::new(InjectForeignCommitHandler {
             foreign: Mutex::new(Some((manifest, transaction))),
         })
@@ -4226,7 +4518,8 @@ mod tests {
             Operation::Append { fragments: vec![] },
             None,
         );
-        let write_config = ManifestWriteConfig::default().with_transaction_file_disabled();
+        let build_config = ManifestBuildConfig::default().with_disable_transaction_file(true);
+        let commit_config = CommitConfig::default();
 
         handler.fail_next(AmbiguousFailure::LandAndConflict);
         let (manifest, _) = commit_transaction(
@@ -4234,12 +4527,12 @@ mod tests {
             dataset.object_store.as_ref(),
             handler.as_ref(),
             &transaction,
-            &write_config,
-            &CommitConfig::default(),
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
-            dataset.manifest_location.naming_scheme,
-            None,
-            None,
+            CommitTransactionOptions::new(
+                &build_config,
+                &commit_config,
+                dataset.manifest_location.naming_scheme,
+            )
+            .with_retry_timeout(DEFAULT_COMMIT_RETRY_TIMEOUT),
         )
         .await
         .expect("the inline transaction must identify the landed commit");

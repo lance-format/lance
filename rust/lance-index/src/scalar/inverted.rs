@@ -32,10 +32,13 @@ use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 pub use combined::{
     CombinedCorpusStats, CombinedFieldColumn, FlatFieldStats, build_combined_bm25_scorer,
-    combined_fields_search, flat_combined_fields_search_stream, validate_combined_tokenizers,
+    build_combined_bm25_scorer_from_totals, collect_flat_combined_field_stats,
+    combined_fields_search, flat_combined_fields_search_stream,
+    flat_combined_fields_search_with_scorer_stream, validate_combined_tokenizers,
 };
 pub use compound::{
     PreparedFtsGlobalStatistics, PreparedFtsQueryLeaf, compound_search,
+    compound_search_prepared_leaves, compound_search_prepared_leaves_with_score_floor,
     compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
     compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
     exclusive_scaled_score_floor, materialized_compound_top_k, prepare_fts_global_statistics,

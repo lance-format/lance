@@ -299,22 +299,73 @@ impl DeepSizeOf for CompressedPositionStorage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SharedPositionStream {
     codec: PositionStreamCodec,
     block_offsets: Arc<[u32]>,
     // Stored with shared ownership so cache hits can clone position streams
     // without copying either offsets or bytes.
     bytes: bytes::Bytes,
+    retained_bytes: usize,
 }
+
+impl PartialEq for SharedPositionStream {
+    fn eq(&self, other: &Self) -> bool {
+        self.codec == other.codec
+            && self.block_offsets == other.block_offsets
+            && self.bytes == other.bytes
+    }
+}
+
+impl Eq for SharedPositionStream {}
 
 impl SharedPositionStream {
     pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
             codec,
             block_offsets: Arc::from(block_offsets.into_boxed_slice()),
+            retained_bytes: bytes.len(),
             bytes,
         }
+    }
+
+    pub(super) fn from_arrow(
+        codec: PositionStreamCodec,
+        block_offsets: Vec<u32>,
+        values: LargeBinaryArray,
+    ) -> Self {
+        debug_assert_eq!(values.len(), 1);
+        let offset = values.value_offsets()[0] as usize;
+        let len = values.value_length(0) as usize;
+        let (_, buffer, _) = values.into_parts();
+        let capacity = buffer.capacity();
+        // Capacity alone is insufficient: custom owners can report a small
+        // visible span while retaining a much larger allocation. Consuming
+        // conversions certify unique standard ownership without copying.
+        // Permit at most one 64-byte alignment tail, charged in full.
+        let bytes = if capacity > 0 && capacity <= len.saturating_add(64) {
+            match buffer.into_vec::<u8>() {
+                Ok(bytes) => Ok(bytes::Bytes::from(bytes).slice(offset..offset + len)),
+                Err(buffer) => buffer.into_mutable().map(|buffer| {
+                    let buffer = arrow::buffer::ScalarBuffer::<u8>::from(
+                        Buffer::from(buffer).slice_with_length(offset, len),
+                    );
+                    bytes::Bytes::from_owner(buffer)
+                }),
+            }
+        } else {
+            Err(buffer)
+        };
+        let (bytes, retained_bytes) = match bytes {
+            Ok(bytes) => (bytes, capacity),
+            Err(buffer) => (
+                bytes::Bytes::copy_from_slice(&buffer[offset..offset + len]),
+                len,
+            ),
+        };
+        let mut stream = Self::new(codec, block_offsets, bytes);
+        stream.retained_bytes = retained_bytes;
+        stream
     }
 
     pub fn codec(&self) -> PositionStreamCodec {
@@ -349,7 +400,7 @@ impl SharedPositionStream {
     }
 
     pub fn size(&self) -> usize {
-        self.block_offsets.len() * std::mem::size_of::<u32>() + self.bytes.len()
+        self.block_offsets.len() * std::mem::size_of::<u32>() + self.retained_bytes
     }
 }
 

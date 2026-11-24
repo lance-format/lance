@@ -185,7 +185,6 @@ pub fn vector_index_details_default() -> prost_types::Any {
 /// also silently ignored — the stage keeps its existing default.
 // TODO: wire into a general `Dataset::rebuild_index` method so users can
 // regenerate an index from its stored details (e.g. after file corruption).
-#[allow(dead_code)]
 pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorIndexParams) {
     fn parse<T: FromStr>(hints: &HashMap<String, String>, key: &str) -> Option<T> {
         hints.get(key)?.parse().ok()
@@ -253,7 +252,6 @@ pub fn target_partition_size_from_details(details: &prost_types::Any) -> Option<
 /// Runtime hints are applied on top of the reconstructed spec.
 // TODO: wire into a general `Dataset::rebuild_index` method so users can
 // regenerate an index from its stored details (e.g. after file corruption).
-#[allow(dead_code)]
 pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIndexParams> {
     if details.value.is_empty() {
         return None;

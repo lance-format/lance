@@ -17,7 +17,8 @@ import textwrap
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -36,6 +37,7 @@ import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
 from lance._dataset.optimize import AutoCleanupConfig
+from lance._dataset.refs import _convert_version_timestamp
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
@@ -115,6 +117,70 @@ def test_from_pydantic_model(tmp_path: Path):
     assert table.schema.names == ["name", "score"]
     assert table.column("name").to_pylist() == ["alice", "bob"]
     assert table.column("score").to_pylist() == [0.9, 0.8]
+
+
+class _Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Priority(Enum):
+    LOW = 1
+    HIGH = 2
+
+
+class _Tag(BaseModel):
+    color: _Color
+
+
+class _EnumRecord(BaseModel):
+    color: _Color
+    priority: _Priority
+    tags: List[_Tag]
+    colors: List[_Color]
+    vector: List[float]
+
+
+@pytest.mark.parametrize("entry_point", ["write_dataset", "from_pydantic_model"])
+def test_pydantic_enum_fields_store_enum_values(tmp_path: Path, entry_point):
+    data = [
+        _EnumRecord(
+            color=_Color.BLUE,
+            priority=_Priority.HIGH,
+            tags=[],
+            colors=[],
+            vector=[0.5, 1.5],
+        ),
+        _EnumRecord(
+            color=_Color.RED,
+            priority=_Priority.LOW,
+            tags=[_Tag(color=_Color.BLUE)],
+            colors=[_Color.RED, _Color.BLUE],
+            vector=[2.5, 3.5],
+        ),
+    ]
+    uri = str(tmp_path / "enum_record")
+    if entry_point == "from_pydantic_model":
+        ds = lance.LanceDataset.from_pydantic_model(_EnumRecord, data, uri=uri)
+    else:
+        ds = lance.write_dataset(data, uri)
+
+    assert ds.to_table().to_pylist() == [
+        {
+            "color": "blue",
+            "priority": 2,
+            "tags": [],
+            "colors": [],
+            "vector": [0.5, 1.5],
+        },
+        {
+            "color": "red",
+            "priority": 1,
+            "tags": [{"color": "blue"}],
+            "colors": ["red", "blue"],
+            "vector": [2.5, 3.5],
+        },
+    ]
 
 
 def test_from_pydantic_model_rejects_non_model_class(tmp_path: Path):
@@ -670,11 +736,45 @@ def test_asof_checkout(tmp_path: Path):
     assert ds.version == 3
     assert len(ds.to_table()) == 9
 
+    # Aware cutoffs name the same instants in any zone.
+    for offset in (timedelta(hours=-12), timedelta(hours=14)):
+        aware_ts_1 = ts_1.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_1).version == 1
+        assert lance.dataset(base_dir, asof=pd.Timestamp(aware_ts_1)).version == 1
+        aware_ts_2 = ts_2.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_2.isoformat()).version == 2
+
     with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
         lance.dataset(base_dir, asof=pd.NaT)
 
     # An explicit version takes precedence over the timestamp cutoff.
     assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
+
+
+class _NoOffsetTzInfo(tzinfo):
+    """A tzinfo without a UTC offset; Python treats such datetimes as naive."""
+
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return None
+
+
+def test_asof_cutoff_without_utc_offset_is_naive(tmp_path: Path):
+    lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+    version_ts = lance.dataset(tmp_path).versions()[0]["timestamp"]
+    cutoff = (version_ts + timedelta(days=1)).replace(tzinfo=_NoOffsetTzInfo())
+    assert cutoff.tzinfo is not None
+    assert cutoff.utcoffset() is None
+
+    # Python compares this as a naive local time, so it keeps the pre-existing
+    # behavior for naive cutoffs instead of treating it as an aware instant.
+    assert lance.dataset(tmp_path, asof=cutoff).version == 1
+    assert lance.dataset(tmp_path, asof=cutoff.replace(tzinfo=None)).version == 1
 
 
 @pytest.mark.parametrize("cleanup", ["explicit", "branch", "tag", "all_older"])
@@ -715,6 +815,37 @@ def test_asof_checkout_after_cleanup(tmp_path: Path, cleanup):
         after_cleanup = lance.dataset(tmp_path, asof=cutoff)
         assert after_cleanup.version == 1
         assert after_cleanup.to_table()["x"].to_pylist() == [1]
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is Unix-only")
+def test_asof_aware_cutoff_in_repeated_local_hour(tmp_path: Path, monkeypatch):
+    # In New York, 05:30Z and 06:30Z are both 01:30 local time on 2026-11-01.
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+        for x in (2, 3):
+            lance.write_dataset(pa.table({"x": [x]}), tmp_path, mode="append")
+        versions = [
+            _convert_version_timestamp(
+                {"version": version, "timestamp": int(instant.timestamp()) * 10**9}
+            )
+            for version, instant in enumerate(
+                [
+                    datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+                ],
+                start=1,
+            )
+        ]
+        monkeypatch.setattr(lance.LanceDataset, "versions", lambda self: versions)
+
+        cutoff = datetime(2026, 11, 1, 5, 45, tzinfo=timezone.utc)
+        assert lance.dataset(tmp_path, asof=cutoff).version == 2
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 @pytest.mark.parametrize(
@@ -1090,6 +1221,25 @@ def test_take(tmp_path: Path):
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1
+
+
+def test_take_with_io_parallelism(tmp_path: Path):
+    table = pa.table({"a": range(8), "b": [str(i) for i in range(8)]})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
+    indices = [7, 0, 4, 2]
+
+    expected = dataset.take(indices)
+    assert dataset.take(indices, io_parallelism=None) == expected
+    assert dataset.take(indices, io_parallelism=1) == expected
+    assert dataset.take(indices, io_parallelism=np.int64(1)) == expected
+
+    for invalid in (0, -1):
+        with pytest.raises(ValueError, match="io_parallelism must be greater than 0"):
+            dataset.take(indices, io_parallelism=invalid)
+
+    for invalid in (True, False, 0.0, -1.5):
+        with pytest.raises(TypeError, match="io_parallelism must be an integer"):
+            dataset.take(indices, io_parallelism=invalid)
 
 
 @pytest.mark.parametrize("columns", [["a", "nope"], ["s.nope"], ["a.b"]])
@@ -7770,6 +7920,33 @@ def test_late_materialization_batch_size(tmp_path: Path):
         late_materialization=True,
     ):
         assert batch.num_rows == 32
+
+
+@pytest.mark.parametrize("batch_size", [7, 10, 20])
+@pytest.mark.parametrize("late_materialization", [None, True])
+def test_late_materialization_max_batch_size(
+    tmp_path: Path, batch_size: int, late_materialization
+):
+    n = 300
+    table = pa.table(
+        {
+            "id": pa.array(range(n), pa.int64()),
+            "v": pa.array([i % 5 for i in range(n)], pa.int64()),
+            "s": pa.array([str(i) * 3 for i in range(n)]),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=100)
+    sizes = [
+        batch.num_rows
+        for batch in dataset.to_batches(
+            columns=["s"],
+            filter="v = 2",
+            batch_size=batch_size,
+            late_materialization=late_materialization,
+        )
+    ]
+    assert sum(sizes) == n // 5
+    assert all(rows <= batch_size for rows in sizes), sizes
 
 
 def test_batch_size_bytes_chopping_fallback(tmp_path: Path):

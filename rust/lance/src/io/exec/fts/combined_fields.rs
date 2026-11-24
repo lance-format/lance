@@ -15,13 +15,15 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning, PhysicalExpr};
 use futures::stream::{self};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
+use roaring::RoaringBitmap;
 
 use crate::Dataset;
-use crate::index::scalar::inverted::{load_segment_details, load_segments};
+use crate::index::frag_reuse::resolve_query_segment_coverages;
+use crate::index::scalar::inverted::{load_segment_details, load_segment_params, load_segments};
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::utils::{
     PreFilterMasks, build_prefilter, build_prefilter_restricted_to_fragments,
@@ -33,7 +35,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     CombinedCorpusStats, CombinedFieldColumn, CombinedFieldsBM25Scorer, DocumentGranularity,
-    FTS_SCHEMA, build_combined_bm25_scorer, combined_fields_search, validate_combined_tokenizers,
+    FTS_SCHEMA, InvertedIndexParams, build_combined_bm25_scorer, combined_fields_search,
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use tracing::instrument;
@@ -328,23 +330,23 @@ pub(super) struct CombinedFieldsScan {
     pub(super) tokenizer: Box<dyn LanceTokenizer>,
 }
 
-/// Open every target column's segments, pair each with its boost, and tokenize
-/// the query once.
+/// Open target columns' segments, pair each with its boost, validate tokenizer
+/// consistency across every committed segment, and tokenize the query once.
 ///
-/// Always every committed segment at row granularity: BM25F blends the target
-/// columns per row, and query planning rejects a column that only has a
-/// list-element index. The query stores each column together with its weight, so
-/// no column can be dropped here for want of one.
-///
-/// Both sides count the opened segments toward parts searched: the flat side needs
-/// them for the tokenizer and the blended corpus statistics, the indexed side for
-/// scoring.
+/// When `selected_fragments` is `None`, every committed row-granularity segment
+/// is opened (required whenever local corpus statistics must be computed from
+/// the opened indexes). When `selected_fragments` is `Some(fragments)`, only
+/// segments whose resolved query-time fragment coverage overlaps `fragments`
+/// (or whose coverage cannot be resolved) are opened; omitted segments still
+/// participate in full tokenizer validation through bounded concurrent cached
+/// parameter loads (`load_segment_params`).
 ///
 /// `stale_rows` is empty, or one entry per target column in query column order.
 /// See [`CombinedFieldColumn::stale_rows`].
 pub(super) async fn open_combined_fields_scan(
     dataset: &Dataset,
     query: &CombinedFieldsQuery,
+    selected_fragments: Option<&RoaringBitmap>,
     index_requirement: CombinedFieldsIndexRequirement,
     stale_rows: &[Arc<RowAddrTreeMap>],
     tokenized_query: &OnceLock<TokenizedQuery>,
@@ -352,6 +354,8 @@ pub(super) async fn open_combined_fields_scan(
 ) -> DataFusionResult<CombinedFieldsScan> {
     let mut columns = Vec::with_capacity(query.column_names().len());
     let mut all_segments = Vec::new();
+    let mut reference_tokenizer: Option<(&str, InvertedIndexParams)> = None;
+
     for (slot, (column, weight)) in query.weighted_columns().enumerate() {
         let segments = match index_requirement {
             CombinedFieldsIndexRequirement::EveryColumn => Some(
@@ -370,16 +374,72 @@ pub(super) async fn open_combined_fields_scan(
                     .map(Arc::from)
             }
         };
-        let indices = match segments {
+        let (indices, omitted_segments) = match segments {
             Some(segments) => {
-                let _details = load_segment_details(dataset, column, &segments).await?;
-                let indices =
-                    open_fts_segments(dataset, column, &segments, &metrics.index_metrics).await?;
-                all_segments.extend(segments.iter().cloned());
-                indices
+                let (selected, omitted): (Vec<IndexMetadata>, Vec<IndexMetadata>) =
+                    match selected_fragments {
+                        None => (segments.iter().cloned().collect(), Vec::new()),
+                        Some(fragments) if fragments.is_empty() => {
+                            (Vec::new(), segments.iter().cloned().collect())
+                        }
+                        Some(fragments) => {
+                            let refs: Vec<&IndexMetadata> = segments.iter().collect();
+                            match resolve_query_segment_coverages(dataset, &refs).await {
+                                Ok(coverages) => {
+                                    let mut selected = Vec::new();
+                                    let mut omitted = Vec::new();
+                                    for (segment, coverage) in segments.iter().zip(coverages) {
+                                        if coverage.is_disjoint(fragments) {
+                                            omitted.push(segment.clone());
+                                        } else {
+                                            selected.push(segment.clone());
+                                        }
+                                    }
+                                    (selected, omitted)
+                                }
+                                Err(_) => (segments.iter().cloned().collect(), Vec::new()),
+                            }
+                        }
+                    };
+                let indices = if selected.is_empty() {
+                    Vec::new()
+                } else {
+                    let _details = load_segment_details(dataset, column, &selected).await?;
+                    let indices =
+                        open_fts_segments(dataset, column, &selected, &metrics.index_metrics)
+                            .await?;
+                    all_segments.extend(selected);
+                    indices
+                };
+                (indices, omitted)
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
+
+        let mut field_params = Vec::with_capacity(indices.len() + omitted_segments.len());
+        for index in &indices {
+            field_params.push(index.params().clone());
+        }
+        if !omitted_segments.is_empty() {
+            let omitted_loaded: Vec<InvertedIndexParams> = stream::iter(omitted_segments)
+                .map(|segment| async move { load_segment_params(dataset, &segment).await })
+                .buffered(dataset.object_store.io_parallelism())
+                .try_collect()
+                .await?;
+            field_params.extend(omitted_loaded);
+        }
+        for params in field_params {
+            if let Some((reference, expected)) = &reference_tokenizer {
+                if !expected.same_tokenization(&params) {
+                    return Err(DataFusionError::Execution(format!(
+                        "combined_fields requires every target column to share the same tokenizer/index configuration; column '{column}' differs from column '{reference}'"
+                    )));
+                }
+            } else {
+                reference_tokenizer = Some((column, params));
+            }
+        }
+
         columns.push(CombinedFieldColumn {
             column: column.to_string(),
             weight,
@@ -390,7 +450,6 @@ pub(super) async fn open_combined_fields_scan(
                 .cloned(),
         });
     }
-    validate_combined_tokenizers(&columns)?;
     metrics.record_parts_searched(
         columns
             .iter()
@@ -400,25 +459,20 @@ pub(super) async fn open_combined_fields_scan(
     );
 
     // Fields share a tokenizer (validated above), so tokenize once.
-    let first_index = columns
-        .iter()
-        .find_map(|column| column.indices.first())
-        .ok_or_else(|| match index_requirement {
-            // Not a user error: `EveryColumn` resolution already failed for any
-            // column without an index, and `CombinedFieldsQuery::try_new` rejects
-            // an empty column list, so reaching this means one of those two
-            // guarantees broke.
-            CombinedFieldsIndexRequirement::EveryColumn => DataFusionError::Internal(
-                "combined_fields query reached execution with no target columns".to_string(),
-            ),
-            CombinedFieldsIndexRequirement::AtLeastOneColumn => {
-                DataFusionError::Execution(format!(
-                    "combined_fields requires an inverted index on at least one of {:?}",
-                    query.column_names().collect::<Vec<_>>()
-                ))
-            }
-        })?;
-    let mut tokenizer = first_index.tokenizer();
+    let (_, params) = reference_tokenizer.ok_or_else(|| match index_requirement {
+        // Not a user error: `EveryColumn` resolution already failed for any
+        // column without an index, and `CombinedFieldsQuery::try_new` rejects
+        // an empty column list, so reaching this means one of those two
+        // guarantees broke.
+        CombinedFieldsIndexRequirement::EveryColumn => DataFusionError::Internal(
+            "combined_fields query reached execution with no target columns".to_string(),
+        ),
+        CombinedFieldsIndexRequirement::AtLeastOneColumn => DataFusionError::Execution(format!(
+            "combined_fields requires an inverted index on at least one of {:?}",
+            query.column_names().collect::<Vec<_>>()
+        )),
+    })?;
+    let mut tokenizer = tokenizer_for_scan(&columns, &params)?;
     let tokens = try_collect_query_tokens(query.terms(), &mut tokenizer)?;
     record_tokenized_query(tokenized_query, &tokens);
 
@@ -428,6 +482,21 @@ pub(super) async fn open_combined_fields_scan(
         tokens,
         tokenizer,
     })
+}
+
+/// Reuse a cached tokenizer from an already-opened index whenever one is
+/// available (preserving dictionary sharing for heavy tokenizers such as Jieba
+/// on warm queries); only construct from persisted parameters when scoped
+/// execution opened zero segments.
+fn tokenizer_for_scan(
+    columns: &[CombinedFieldColumn],
+    fallback_params: &InvertedIndexParams,
+) -> DataFusionResult<Box<dyn LanceTokenizer>> {
+    if let Some(index) = columns.iter().find_map(|column| column.indices.first()) {
+        Ok(index.tokenizer())
+    } else {
+        fallback_params.build().map_err(Into::into)
+    }
 }
 
 impl ExecutionPlan for CombinedFieldsQueryExec {
@@ -496,6 +565,11 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             let address_domain = !ds.manifest.uses_stable_row_ids();
             let ds_for_scope = ds.clone();
 
+            let selected_fragments = if preset_base_scorer.is_some() {
+                covered_fragments.as_ref()
+            } else {
+                None
+            };
             let CombinedFieldsScan {
                 columns,
                 segments: all_segments,
@@ -504,6 +578,7 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             } = open_combined_fields_scan(
                 &ds,
                 &query,
+                selected_fragments,
                 CombinedFieldsIndexRequirement::EveryColumn,
                 // Nothing to subtract: this side either scores against index
                 // statistics alone or against the scorer the flat sibling built,
@@ -513,6 +588,14 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 metrics.as_ref(),
             )
             .await?;
+
+            if preset_base_scorer.is_some()
+                && covered_fragments
+                    .as_ref()
+                    .is_some_and(RoaringBitmap::is_empty)
+            {
+                return Ok::<_, DataFusionError>(RecordBatch::new_empty(FTS_SCHEMA.clone()));
+            }
 
             // With mixed coverage the planner supplies the fragments every target
             // column indexes, and the scan is restricted to exactly those: the
@@ -622,5 +705,81 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::DatasetIndexExt;
+    use arrow_array::{RecordBatchIterator, record_batch};
+    use lance_index::IndexType;
+
+    #[tokio::test]
+    async fn tokenizer_for_scan_reuses_opened_index_and_falls_back_when_empty() {
+        let batch = record_batch!(
+            ("title", Utf8, ["alpha beta"]),
+            ("body", Utf8, ["gamma delta"])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let valid_params = InvertedIndexParams::default();
+        for column in ["title", "body"] {
+            dataset
+                .create_index(&[column], IndexType::Inverted, None, &valid_params, true)
+                .await
+                .unwrap();
+        }
+        let query = CombinedFieldsQuery::try_new(
+            "alpha".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = FtsIndexMetrics::new(&metrics_set, 0);
+        let scan = open_combined_fields_scan(
+            &dataset,
+            &query,
+            None,
+            CombinedFieldsIndexRequirement::EveryColumn,
+            &[],
+            &OnceLock::new(),
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert!(!scan.columns[0].indices.is_empty());
+
+        // Passing invalid fallback params proves an opened index's cached
+        // tokenizer is cloned rather than rebuilt from InvertedIndexParams.
+        let invalid_params =
+            InvertedIndexParams::default().base_tokenizer("nonexistent_tokenizer".to_string());
+        let mut reused = tokenizer_for_scan(&scan.columns, &invalid_params)
+            .expect("opened index tokenizer should be cloned without calling params.build()");
+        let tokens = try_collect_query_tokens("alpha", &mut reused).unwrap();
+        assert_eq!(tokens.len(), 1);
+
+        // When scoped execution opens zero segments, parameter-based
+        // construction is used.
+        let empty_columns = vec![CombinedFieldColumn {
+            column: "title".to_string(),
+            weight: 1.0,
+            indices: Vec::new(),
+            stale_rows: None,
+        }];
+        let mut built = tokenizer_for_scan(&empty_columns, &valid_params)
+            .expect("zero-segment scan should build tokenizer from params");
+        assert_eq!(
+            try_collect_query_tokens("alpha", &mut built).unwrap().len(),
+            1
+        );
+        assert!(tokenizer_for_scan(&empty_columns, &invalid_params).is_err());
     }
 }

@@ -64,6 +64,7 @@ use crate::io::exec::{
 use crate::session::index_caches::QuantizedRefinementOptions;
 use crate::{Error, Result};
 
+use super::source::ScanOptions;
 use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
@@ -954,17 +955,16 @@ impl Scanner {
             // but the most common case is that fragments newer than the vector index are also
             // newer than the scalar indices.
             let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                false,
-                false,
+                ScanOptions {
+                    with_row_id: true,
+                    // We are re-ordering anyways, so no need to get data in a deterministic order.
+                    ordered: false,
+                    ..Default::default()
+                },
                 vector_scan_projection,
                 Arc::new(fallback_fragments),
                 // Can't pushdown limit/offset in an ANN search
                 None,
-                // We are re-ordering anyways, so no need to get data in a deterministic order.
-                false,
             );
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);

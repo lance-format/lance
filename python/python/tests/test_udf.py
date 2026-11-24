@@ -61,3 +61,40 @@ def test_batch_udf_decorator() -> None:
     # testable on its own.
     result = udf(pa.RecordBatch.from_pydict({"a": [1, 2, 3]}))
     assert result.column("doubled").to_pylist() == [2, 4, 6]
+
+
+def test_checkpoint_adds_indices_to_existing_database(tmp_path: Path) -> None:
+    import sqlite3
+
+    from lance.udf import BatchUDFCheckpoint
+
+    path = tmp_path / "old.sqlite"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE fragments (fragment_id INT, data BLOB)")
+        conn.execute(
+            "CREATE TABLE batches (fragment_id INT, batch_index INT, result BLOB)"
+        )
+        conn.execute("INSERT INTO fragments VALUES (7, 'saved')")
+    checkpoint = BatchUDFCheckpoint(path)
+    assert checkpoint.get_fragment(7) == "saved"
+    assert checkpoint.get_fragment(8) is None
+    batch = pa.record_batch({"a": [1, 2]})
+    info = BatchUDFCheckpoint.BatchInfo(8, 0)
+    other = BatchUDFCheckpoint.BatchInfo(9, 0)
+    checkpoint.insert_batch(info, batch)
+    checkpoint.insert_batch(other, batch)
+    cached = checkpoint.get_batch(info)
+    assert cached is not None and cached.equals(batch)
+    checkpoint.insert_fragment(8, "finished")
+    assert checkpoint.get_batch(info) is None
+    cached = checkpoint.get_batch(other)
+    assert cached is not None and cached.equals(batch)
+    assert BatchUDFCheckpoint(path).get_fragment(8) == "finished"
+    with sqlite3.connect(path) as conn:
+        for sql in (
+            "SELECT data FROM fragments WHERE fragment_id = 7",
+            "SELECT result FROM batches WHERE fragment_id = 7 AND batch_index = 1",
+            "DELETE FROM batches WHERE fragment_id = 7",
+        ):
+            plan = conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
+            assert "USING INDEX" in str(plan)

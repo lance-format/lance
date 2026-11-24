@@ -1258,6 +1258,7 @@ impl Dataset {
                 query_parallelism,
                 approx_mode,
                 search_effort,
+                rq_graph_scoring,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1338,6 +1339,7 @@ impl Dataset {
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
+                    s = s.rq_graph_scoring(rq_graph_scoring);
                     s = s.search_effort(search_effort)?;
                     if let Some(rank) = warp_imputation_rank {
                         s = s.warp_imputation_rank(rank);
@@ -1410,12 +1412,13 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
+    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None, io_parallelism = None))]
     fn take<'py>(
         self_: PyRef<'py, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
+        io_parallelism: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let projection = match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
@@ -1430,8 +1433,18 @@ impl Dataset {
             (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }?;
+        let ds = self_.ds.clone();
+        let read = async move {
+            match io_parallelism {
+                Some(io_parallelism) => {
+                    ds.take_with_io_parallelism(&row_indices, projection, io_parallelism)
+                        .await
+                }
+                None => ds.take(&row_indices, projection).await,
+            }
+        };
         let batch = rt()
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
+            .block_on(Some(self_.py()), read)?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
