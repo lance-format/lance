@@ -8,7 +8,7 @@
 //! Tests live in `optimize/tests/planning.rs`.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use lance_table::format::{
 };
 use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_table::system_index::is_system_index;
+use lance_table::transaction::Operation;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -33,7 +34,8 @@ use crate::commit::index::{index_usability, open_v0_frag_reuse_index};
 use crate::commit::load_all_indices;
 use crate::frag_reuse::validate_stable_row_id_recording_format;
 use crate::fragment::validate_write_version;
-use crate::{FileFragment, Table, WriteParams};
+use crate::write::dictionary_budget::DictionaryValueBudget;
+use crate::{FileFragment, FragReadConfig, Table, WriteParams};
 
 /// Default small-file threshold as a percentage of the maximum file size.
 const DEFAULT_MIN_FILE_SIZE_PERCENT: u128 = 95;
@@ -1669,6 +1671,8 @@ impl DefaultCompactionPlanner {
             CompactionMode::ForceBinaryCopy
         );
 
+        let unconsolidated = unconsolidated_dictionary_rewrite_outputs(dataset).await;
+
         let mut candidate_bins: Vec<CandidateBin> = Vec::new();
         let mut current_bin: Option<CandidateBin> = None;
         let mut i = 0;
@@ -1685,8 +1689,12 @@ impl DefaultCompactionPlanner {
                 continue;
             };
 
-            let candidacy =
-                self.candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only);
+            let candidacy = self
+                .candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only)
+                .filter(|candidacy| {
+                    !matches!(candidacy, CompactionCandidacy::CompactWithNeighbors)
+                        || !u32::try_from(fragment.id).is_ok_and(|id| unconsolidated.contains(id))
+                });
 
             let indices = Vec::new();
 
@@ -1882,6 +1890,147 @@ impl DefaultCompactionPlanner {
             .collect();
         Ok(tasks)
     }
+}
+
+/// Rows read at a time when checking whether rewritten fragments' dictionaries fit together.
+const DICTIONARY_CHECK_BATCH_SIZE: u32 = 8192;
+
+/// Fragments that the dataset's latest commit, a compaction, rewrote without reducing
+/// the number of fragments in their group because their dictionaries could not share a
+/// data file.
+///
+/// With narrow dictionary keys the writer finishes a file before its dictionaries
+/// outgrow the key type, so fragments whose values cannot share one dictionary come
+/// back as many as they went in. Merging them again would rewrite the same rows into
+/// the same fragments, so they are no longer candidates for merging with their
+/// neighbors. Any later commit (an append, a delete, a config change, an index) makes
+/// another commit the latest one and lets them be planned again; deletions, overlays
+/// and dropped columns still compact a fragment by itself.
+///
+/// This is best effort: if the check fails, nothing is held back.
+async fn unconsolidated_dictionary_rewrite_outputs(dataset: &Table) -> RoaringBitmap {
+    match dictionary_limited_rewrite_outputs(dataset).await {
+        Ok(fragment_ids) => fragment_ids,
+        Err(err) => {
+            warn!(
+                "could not check version {} for an ineffective compaction, planning every \
+                 candidate: {err}",
+                dataset.manifest.version
+            );
+            RoaringBitmap::new()
+        }
+    }
+}
+
+async fn dictionary_limited_rewrite_outputs(dataset: &Table) -> Result<RoaringBitmap> {
+    // Only dictionaries narrower than 32-bit keys make the writer keep small files
+    // apart, so other datasets skip reading the transaction.
+    let dictionary_fields = arrow_schema::Schema::from(dataset.schema())
+        .fields()
+        .iter()
+        .filter(|field| {
+            matches!(
+                DictionaryValueBudget::try_new(&arrow_schema::Schema::new(vec![Arc::clone(field)])),
+                Ok(Some(_))
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if dictionary_fields.is_empty() {
+        return Ok(RoaringBitmap::new());
+    }
+    let Some(Operation::Rewrite { groups, .. }) = dataset
+        .read_transaction()
+        .await?
+        .map(|transaction| transaction.operation)
+    else {
+        return Ok(RoaringBitmap::new());
+    };
+    // The transaction can record the outputs before the commit gave them ids, so they
+    // are found by their data files. One that took on deletions or overlays at commit
+    // has changed since.
+    let unchanged = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter(|fragment| fragment.deletion_file.is_none() && fragment.overlays.is_empty())
+        .filter_map(|fragment| {
+            let file = fragment.files.first()?;
+            Some((file.path.as_str(), fragment))
+        })
+        .collect::<HashMap<_, _>>();
+    let dictionary_schema = arrow_schema::Schema::new(dictionary_fields);
+    let mut unconsolidated = RoaringBitmap::new();
+    // A group of one fragment is rewritten for its deletions, overlays or columns,
+    // not to merge it.
+    for group in groups.iter().filter(|group| {
+        group.old_fragments.len() > 1 && group.new_fragments.len() >= group.old_fragments.len()
+    }) {
+        let Some(outputs) = group
+            .new_fragments
+            .iter()
+            .map(|fragment| {
+                let file = fragment.files.first()?;
+                unchanged.get(file.path.as_str()).copied()
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if are_kept_apart_by_dictionaries(dataset, &dictionary_schema, &outputs).await? {
+            unconsolidated.extend(
+                outputs
+                    .iter()
+                    .filter_map(|fragment| u32::try_from(fragment.id).ok()),
+            );
+        }
+    }
+    Ok(unconsolidated)
+}
+
+/// Whether every two neighboring `fragments` hold more distinct values in some
+/// dictionary column than its key type addresses, so a rewrite that reads each of them
+/// whole would split them apart again.
+///
+/// A rewrite can also keep its fragment count for other reasons, such as a row target
+/// smaller than the one the next run uses; those fragments must stay candidates.
+/// Smaller read batches (`batch_size`) can still pack values across the file
+/// boundaries; such a run merges them only once a later commit clears this check.
+/// Only the dictionary columns are read.
+async fn are_kept_apart_by_dictionaries(
+    dataset: &Table,
+    dictionary_schema: &arrow_schema::Schema,
+    fragments: &[&Fragment],
+) -> Result<bool> {
+    let Some(mut budget) = DictionaryValueBudget::try_new(dictionary_schema)? else {
+        return Ok(false);
+    };
+    let columns = dictionary_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    let projection = dataset.schema().project(&columns)?;
+    let table = Arc::new(dataset.clone());
+    for pair in fragments.windows(2) {
+        budget.reset();
+        let mut is_full = false;
+        for fragment in pair {
+            let reader = FileFragment::new(Arc::clone(&table), (*fragment).clone())
+                .open(&projection, FragReadConfig::default())
+                .await?;
+            let mut batches = reader.read_all(DICTIONARY_CHECK_BATCH_SIZE).await?;
+            while !is_full && let Some(batch) = batches.next().await {
+                is_full = budget
+                    .admit(&VecDeque::from([batch.await?]), usize::MAX)?
+                    .is_full;
+            }
+        }
+        if !is_full {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Information about a fragment used to decide its fate in compaction

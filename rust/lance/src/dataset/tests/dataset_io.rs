@@ -4404,6 +4404,163 @@ async fn write_splits_files_before_dictionary_outgrows_key_type(
     dataset.validate().await.unwrap();
 }
 
+/// Int8 dictionary fragments of 100 values each with no values in common: no two fit
+/// one file, so compaction rewrites them into as many fragments as it read. Later runs
+/// must not rewrite them again until a commit changes the dataset.
+#[rstest]
+#[tokio::test]
+async fn compaction_skips_fragments_dictionary_keeps_apart(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let batch = |start: usize| {
+        let values = StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+        let keys = Int8Array::from_iter_values((0..100).cycle().take(1000));
+        let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+    };
+    let reader = |batch: RecordBatch| RecordBatchIterator::new([Ok(batch)], schema.clone());
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader(batch(0)), "memory://", Some(params))
+        .await
+        .unwrap();
+    for start in [100, 200] {
+        dataset.append(reader(batch(start)), None).await.unwrap();
+    }
+    let compact = async |dataset: &mut Dataset| {
+        let metrics = compact_files(dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        (metrics.fragments_removed, metrics.fragments_added)
+    };
+    let data_files = |dataset: &Dataset| {
+        dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(compact(&mut dataset).await, (3, 3));
+    let rewritten = data_files(&dataset);
+    let version_after_rewrite = dataset.version().version;
+    assert_eq!(compact(&mut dataset).await, (0, 0));
+    assert_eq!(compact(&mut dataset).await, (0, 0));
+    assert_eq!(data_files(&dataset), rewritten);
+    assert_eq!(dataset.version().version, version_after_rewrite);
+
+    // A delete is a newer commit: the fragments are planned again, and the rewrite
+    // drops the deleted rows from their files.
+    dataset.delete("d = 'v0'").await.unwrap();
+    assert_eq!(compact(&mut dataset).await, (3, 3));
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().deletion_file.is_none())
+    );
+    assert_eq!(compact(&mut dataset).await, (0, 0));
+
+    // New rows that share the last fragment's values can join it.
+    dataset.append(reader(batch(200)), None).await.unwrap();
+    assert_eq!(compact(&mut dataset).await, (4, 3));
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(990), Some(1000), Some(2000)]);
+
+    // The files' dictionaries cannot share one Int8 array, so compare the values as strings.
+    let actual = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .map_ok(|batch| arrow_cast::cast(&batch["d"], &DataType::Utf8).unwrap())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let actual = arrow_select::concat::concat(
+        &actual
+            .iter()
+            .map(|array| array.as_ref())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let expected = StringArray::from_iter_values(
+        [0, 100, 200, 200]
+            .into_iter()
+            .flat_map(|start| (0..1000).map(move |i| format!("v{}", start + i % 100)))
+            .filter(|value| value != "v0")
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(as_string_array(&actual), &expected);
+    dataset.validate().await.unwrap();
+}
+
+/// Two fragments over the same 100 Int8 dictionary values, with 20 of them deleted,
+/// rewritten into two fragments only because of a small row target. A later run with a
+/// larger target must still merge them: their dictionaries fit one file.
+#[rstest]
+#[tokio::test]
+async fn compaction_merges_rewritten_fragments_whose_dictionaries_fit(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let reader = |rows: usize| {
+        let values = StringArray::from_iter_values((0..100).map(|i| format!("v{i}")));
+        let keys = Int8Array::from_iter_values((0..100).cycle().take(rows));
+        let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+        RecordBatchIterator::new([Ok(batch)], schema.clone())
+    };
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader(3000), "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset.append(reader(500), None).await.unwrap();
+    let deleted = (0..20).map(|i| format!("'v{i}'")).collect::<Vec<_>>();
+    dataset
+        .delete(&format!("d IN ({})", deleted.join(", ")))
+        .await
+        .unwrap();
+    let mut compact = async |options: CompactionOptions| {
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        (metrics.fragments_removed, metrics.fragments_added)
+    };
+
+    let small_target = CompactionOptions {
+        target_rows_per_fragment: 1000,
+        ..Default::default()
+    };
+    assert_eq!(compact(small_target).await, (2, 2));
+    assert_eq!(compact(CompactionOptions::default()).await, (2, 1));
+    assert_eq!(compact(CompactionOptions::default()).await, (0, 0));
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2800);
+    dataset.validate().await.unwrap();
+}
+
 /// A file finished early for its dictionary leaves the input's row-limit cuts out of line
 /// with the files. The next file must still stop at `max_rows_per_file` rows.
 #[rstest]
