@@ -16,6 +16,8 @@ Pages are designed so readers can fetch contiguous row ranges with a small and p
 
 The file layer does not bundle table-level statistics or query-side indices into the base file structure. Those capabilities are defined as separate index formats so they can evolve independently of the core file container.
 
+The file layer only stores and decodes data; higher-level operations such as filtering and projection are the responsibility of the query engine. As an optimization, a reader may provide hints about the data before decoding it, which can be used to skip redundant work. It is up to the query engine to ensure its results are correct regardless of the presence of these hints.
+
 ### Encodings as Extensions, Not Built-Ins
 
 Most columnar file formats bundle a fixed catalog of encodings directly into the format specification. Adding a new one means changing the spec and updating every reader implementation, which is slow and tends to fragment the ecosystem as readers fall in and out of sync with which encodings they support.
