@@ -994,6 +994,7 @@ mod tests {
         read_spilled_row_ids, read_spilled_versions,
     };
     use crate::dataset::{NewColumnTransform, WriteDestination, WriteMode};
+    use crate::index::CreateIndexBuilder;
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
@@ -1879,16 +1880,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Need to use a row-id-domain index (while we still have one)
         let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["str"], IndexType::Inverted, &scalar_params)
+                .name("str_idx".to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
         dataset
-            .create_index(
-                &["str"],
-                IndexType::Inverted,
-                Some("str_idx".to_string()),
-                &scalar_params,
-                true,
-            )
+            .commit_existing_index_segments("str_idx", "str", vec![legacy_segment])
             .await
             .unwrap();
 

@@ -1251,3 +1251,32 @@ pub async fn data_file_schema(dataset: &Dataset, path: &str) -> Schema {
     .unwrap();
     reader.schema().as_ref().clone()
 }
+
+/// Relabel a freshly built index segment as a pre-migration, row-id-domain
+/// one.
+///
+/// Every builtin scalar index type now trains in the row-address domain
+/// unconditionally, so a row-id-domain segment -- what every segment
+/// predating its type's `*_ROW_ADDR_DOMAIN_VERSION` is -- can only be
+/// obtained by relabeling a fresh one's `index_version` down. That is the
+/// same signal `IndexMetadata::results_are_row_addrs` reads to tell the two
+/// apart, and a real legacy segment on disk differs from a fresh one only in
+/// that label: each plugin's `load_index` derives the domain from the version
+/// its caller passes in, never from the file itself.
+///
+/// **The returned segment's stored identifiers are still row addresses while
+/// it claims to store row ids.** That makes it right for testing that the
+/// system *detects* the domain -- a guard, a rejected commit, a forced
+/// rebuild -- and wrong for testing what a query through it returns, which
+/// would read addresses as ids and silently produce wrong rows. For a
+/// queryable legacy segment the identities have to be remapped too, not just
+/// relabeled.
+#[cfg(test)]
+pub fn as_legacy_row_id_segment(
+    segment: lance_table::format::IndexMetadata,
+) -> lance_table::format::IndexMetadata {
+    lance_table::format::IndexMetadata {
+        index_version: 0,
+        ..segment
+    }
+}

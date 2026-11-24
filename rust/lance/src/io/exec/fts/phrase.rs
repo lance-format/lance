@@ -22,7 +22,7 @@ use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
 use crate::io::exec::PreFilterSource;
-use crate::io::exec::utils::{PreFilterMasks, build_prefilter};
+use crate::io::exec::utils::{PreFilterMasks, build_prefilter_in_domain};
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::query::{
     FtsSearchParams, PhraseQuery, try_collect_query_tokens,
@@ -36,7 +36,11 @@ use uuid::Uuid;
 use super::corpus::SharedFtsScorer;
 use super::matches::scored_documents_batch;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
-use super::segments::{open_fts_segments, search_segments, segments_the_prefilter_may_match};
+use super::segments::{
+    cutoff_tie_unresolved, fts_row_addr_to_row_id, fts_segments_are_address_domain,
+    open_fts_segments, search_segments, segments_the_prefilter_may_match,
+    widen_limit_for_tie_rerank,
+};
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
 /// Indexed phrase search with an explicit document boundary and candidate scope.
@@ -529,12 +533,12 @@ impl ExecutionPlan for PhraseQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
-            let address_domain = !ds.manifest.uses_stable_row_ids();
+            let address_domain = fts_segments_are_address_domain(&ds, &segments)?;
             let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter_in_domain(
                 context.clone(),
                 partition,
                 &prefilter_source,
@@ -545,7 +549,9 @@ impl ExecutionPlan for PhraseQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-            )?;
+                address_domain,
+            )
+            .await?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -600,19 +606,59 @@ impl ExecutionPlan for PhraseQueryExec {
             .await;
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
-            let documents = search_segments(
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
+            // Selection ranks ties by stored row address, so any tie at the
+            // cutoff has to survive translation intact before `_rowid` order is
+            // restored; see `finalize_row_ids_and_scores`.
+            let requested_limit = params.limit;
+            let params =
+                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != requested_limit => {
+                        let mut widened_params = params.as_ref().clone();
+                        widened_params.limit = widened;
+                        Arc::new(widened_params)
+                    }
+                    _ => params,
+                };
+            let mut documents = search_segments(
                 &indices,
-                tokens,
-                params,
+                tokens.clone(),
+                params.clone(),
                 lance_index::scalar::inverted::query::Operator::And,
-                pre_filter,
+                pre_filter.clone(),
                 metrics.clone(),
-                base_scorer,
+                base_scorer.clone(),
                 None,
             )
             .await?;
+            // A tie larger than the widened cap cannot be ordered from what came
+            // back, so complete it exactly.
+            let scores = documents
+                .iter()
+                .map(|document| document.score.0)
+                .collect::<Vec<_>>();
+            if cutoff_tie_unresolved(&scores, requested_limit, params.limit) {
+                let mut exact_params = params.as_ref().clone();
+                exact_params.limit = None;
+                documents = search_segments(
+                    &indices,
+                    tokens,
+                    Arc::new(exact_params),
+                    lance_index::scalar::inverted::query::Operator::And,
+                    pre_filter,
+                    metrics.clone(),
+                    base_scorer,
+                    None,
+                )
+                .await?;
+            }
             metrics.baseline_metrics.record_output(documents.len());
-            let batch = scored_documents_batch(schema, documents)?;
+            let batch = scored_documents_batch(
+                schema,
+                documents,
+                row_addr_to_row_id.as_deref(),
+                requested_limit,
+            )?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(

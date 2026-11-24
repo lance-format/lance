@@ -150,6 +150,34 @@ impl SegmentCoverage {
         .await
     }
 
+    /// The rows segment `index` may report, as a mask over its own stored
+    /// identifiers.
+    ///
+    /// [`Self::restrict`] and [`Self::restrict_lookup`] filter hits a segment
+    /// has already produced, so they can test one row at a time against
+    /// [`AllowedRows`]. FTS instead hands the restriction to the segment's own
+    /// search to apply while it scores (see
+    /// [`InvertedIndex::with_allowed_rows`](lance_index::scalar::inverted::InvertedIndex::with_allowed_rows)),
+    /// which needs it up front as a mask.
+    ///
+    /// For row-address hits that mask allows the segment's covered fragments
+    /// whole, which is what `AllowedRows::Fragments` tests one row at a time.
+    /// Each fragment is one entry carrying no per-row bitmap, so a coverage
+    /// spanning the whole table costs one small entry per fragment rather than
+    /// one per row.
+    pub(crate) async fn allowed_row_mask(&self, index: usize) -> Result<Arc<RowAddrMask>> {
+        match &self.restriction {
+            Restriction::LiveRowIds(_) => self.live_rows(index).await,
+            Restriction::Fragments => {
+                let mut allowed = RowAddrTreeMap::new();
+                for fragment in self.coverage(index)? {
+                    allowed.insert_fragment(fragment);
+                }
+                Ok(Arc::new(RowAddrMask::from_allowed(allowed)))
+            }
+        }
+    }
+
     async fn allowed_rows(&self, index: usize) -> Result<AllowedRows<'_>> {
         Ok(match &self.restriction {
             Restriction::LiveRowIds(_) => AllowedRows::LiveRowIds(self.live_rows(index).await?),
@@ -261,6 +289,58 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn two_fragment_dataset() -> Dataset {
+        let batch = record_batch!(("value", Int32, [1, 2])).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// FTS applies a segment's coverage inside its own search rather than
+    /// filtering hits afterward, so it takes the restriction as a mask. For
+    /// row-address hits that mask has to allow each covered fragment whole --
+    /// including offsets it holds no posting for -- and agree with the per-row
+    /// test the filtering paths use.
+    #[tokio::test]
+    async fn row_address_coverage_masks_whole_fragments() {
+        let dataset = two_fragment_dataset().await;
+        let first = segment(Some(RoaringBitmap::from_iter([0])));
+        let second = segment(Some(RoaringBitmap::from_iter([1])));
+        let coverage =
+            SegmentCoverage::resolve(&dataset, &[&first, &second], SegmentRowDomain::RowAddress)
+                .await
+                .unwrap()
+                .expect("two segments need masking");
+
+        for (index, covered, uncovered) in [(0usize, 0u32, 1u32), (1, 1, 0)] {
+            let mask = coverage.allowed_row_mask(index).await.unwrap();
+            let per_row = coverage.allowed_rows(index).await.unwrap();
+            for offset in [0u32, 7, u32::MAX] {
+                let inside = u64::from(RowAddress::new_from_parts(covered, offset));
+                let outside = u64::from(RowAddress::new_from_parts(uncovered, offset));
+                assert!(
+                    mask.selected(inside),
+                    "segment {index} should allow all of fragment {covered}"
+                );
+                assert!(
+                    !mask.selected(outside),
+                    "segment {index} should not allow fragment {uncovered}"
+                );
+                assert_eq!(mask.selected(inside), per_row.contains(inside));
+                assert_eq!(mask.selected(outside), per_row.contains(outside));
+            }
+        }
     }
 
     #[tokio::test]

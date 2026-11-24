@@ -51,6 +51,7 @@ use tracing::Instrument;
 
 use super::row_addr_mask::MaskAndLoader;
 use crate::Dataset;
+use crate::dataset::rowids::row_ids_to_row_addrs;
 use crate::index::prefilter::DatasetPreFilter;
 
 /// Open fragments on cancellation-safe tasks while preserving the stream's
@@ -508,6 +509,144 @@ pub(crate) fn build_prefilter(
     Ok(Arc::new(prefilter))
 }
 
+/// Translates one treemap's entries from row-id domain to row-address
+/// domain.
+///
+/// A "whole fragment" entry cannot be enumerated one id at a time, and in a
+/// row-id-domain mask it should not exist: it would mean 2^32 contiguous row
+/// ids, so in practice it means a fragment-shaped (already address-domain)
+/// mask was labelled as row-id domain somewhere upstream. Returning the
+/// treemap untranslated would hand the caller a mask it then ANDs into an
+/// address-domain one, silently selecting unrelated rows -- and would drop
+/// the translation of every `Partial` entry alongside it. It is reported
+/// instead.
+pub(crate) async fn translate_treemap_to_row_addr_domain(
+    dataset: &Dataset,
+    treemap: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let Some(row_ids) = treemap.row_addrs() else {
+        return Err(Error::internal(
+            "a row-id-domain mask cannot hold a whole-fragment entry; it would mean 2^32 \
+             contiguous row ids, so this mask is really address-domain and was mislabelled \
+             before it reached the FTS prefilter",
+        ));
+    };
+    let row_ids: Vec<u64> = row_ids.map(u64::from).collect();
+    let addrs = row_ids_to_row_addrs(dataset, &row_ids).await?;
+    Ok(addrs.into_iter().flatten().collect())
+}
+
+/// Translates a row-id-domain mask into row-address domain. Every prefilter
+/// mask reaching a `PreFilter` is expressed in row-id domain by convention: an
+/// external mask is built that way, and a scalar-index source is finalized to
+/// it by [`SelectionVectorToPrefilter`] (vector and PQ indices are keyed by
+/// stable row id). The deletion mask FTS ANDs it against, however, is forced
+/// to physical addresses by `build_prefilter_in_domain`/
+/// `build_prefilter_restricted_to_fragments_in_domain`. Combining the two
+/// without this translation compares unrelated numeric domains wherever a
+/// row's address differs from its id (e.g. any fragment beyond the first,
+/// under stable row ids).
+///
+/// FTS therefore pays a round trip (address -> id in
+/// [`SelectionVectorToPrefilter`], id -> address here) for a scalar-index
+/// prefilter source. Teaching that conversion to stop at the domain its
+/// consumer wants is a follow-up, not a correctness concern.
+async fn row_id_mask_to_row_addr_domain(
+    dataset: &Dataset,
+    mask: Arc<RowAddrMask>,
+) -> Result<Arc<RowAddrMask>> {
+    let translated = match mask.as_ref() {
+        RowAddrMask::AllowList(allow) => {
+            RowAddrMask::AllowList(translate_treemap_to_row_addr_domain(dataset, allow).await?)
+        }
+        RowAddrMask::BlockList(block) => {
+            RowAddrMask::BlockList(translate_treemap_to_row_addr_domain(dataset, block).await?)
+        }
+    };
+    Ok(Arc::new(translated))
+}
+
+/// Wraps `filter` to translate its resolved mask into row-address domain
+/// (see [`row_id_mask_to_row_addr_domain`]) whenever `address_domain` is set.
+fn translate_filter_in_domain(
+    filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
+    ds: Arc<Dataset>,
+    address_domain: bool,
+) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
+    if !address_domain {
+        return filter;
+    }
+    filter.map(|filter| {
+        async move {
+            let mask = filter.await?;
+            row_id_mask_to_row_addr_domain(&ds, mask).await
+        }
+        .boxed()
+    })
+}
+
+/// Translates `overlay_block` into row-address domain (see
+/// [`row_id_mask_to_row_addr_domain`]) whenever `address_domain` is set. The
+/// overlay block follows the same row-id-domain convention as any prefilter
+/// source and external mask, so it needs the same translation those get via
+/// `translate_filter_in_domain` before it is combined (logical AND) into an
+/// address-domain-forced deletion mask.
+async fn translate_overlay_block_in_domain(
+    overlay_block: Option<RowAddrMask>,
+    ds: &Dataset,
+    address_domain: bool,
+) -> Result<Option<RowAddrMask>> {
+    let Some(overlay_block) = overlay_block else {
+        return Ok(None);
+    };
+    if !address_domain {
+        return Ok(Some(overlay_block));
+    }
+    let translated = row_id_mask_to_row_addr_domain(ds, Arc::new(overlay_block)).await?;
+    Ok(Some(translated.as_ref().clone()))
+}
+
+/// Like [`build_prefilter`], but the deletion mask is kept in physical row
+/// address domain even on a stable-row-id dataset -- see
+/// [`DatasetPreFilter::new_with_filter_future_in_domain`]. FTS needs this: it
+/// consults the prefilter mask directly against its own stored addresses
+/// while scoring, before any row-id translation happens, so the mask must
+/// already be in that same domain whenever the segments it is built for are
+/// address-domain (an address-domain segment is the only kind a fresh build
+/// now produces; see `INVERTED_ROW_ADDR_DOMAIN_VERSION`). The externally
+/// supplied `filter` (any prefilter source and external mask, row-id domain
+/// by convention) is translated into the same address domain so ANDing it
+/// into the deletion mask compares like with like, and so is `overlay_block`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_prefilter_in_domain(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    index_meta: &[IndexMetadata],
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
+    address_domain: bool,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+        ds.clone(),
+    )?;
+    let filter = translate_filter_in_domain(filter, ds.clone(), address_domain);
+    let overlay_block =
+        translate_overlay_block_in_domain(masks.overlay_block, &ds, address_domain).await?;
+    let mut prefilter =
+        DatasetPreFilter::new_with_filter_future_in_domain(ds, index_meta, filter, address_domain);
+    if let Some(overlay_block) = overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
+}
+
 /// Build a prefilter restricted to `fragments` rather than to the union of
 /// `index_meta`'s fragment bitmaps. See
 /// [`DatasetPreFilter::new_restricted_to_fragments`].
@@ -530,6 +669,42 @@ pub(crate) fn build_prefilter_restricted_to_fragments(
     )?;
     let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
     if let Some(overlay_block) = masks.overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
+}
+
+/// Like [`build_prefilter_restricted_to_fragments`], with the same
+/// `address_domain` meaning as [`build_prefilter_in_domain`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_prefilter_restricted_to_fragments_in_domain(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    fragments: RoaringBitmap,
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
+    address_domain: bool,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+        ds.clone(),
+    )?;
+    let filter = translate_filter_in_domain(filter, ds.clone(), address_domain);
+    let overlay_block =
+        translate_overlay_block_in_domain(masks.overlay_block, &ds, address_domain).await?;
+    let mut prefilter = DatasetPreFilter::new_restricted_to_fragments_in_domain(
+        ds,
+        fragments,
+        filter,
+        address_domain,
+    );
+    if let Some(overlay_block) = overlay_block {
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))
@@ -2811,5 +2986,134 @@ mod tests {
             Some(16.0),
             "two int64s, not the 999 measured"
         );
+    }
+}
+
+#[cfg(test)]
+mod row_addr_domain_tests {
+    use super::*;
+    use crate::dataset::{UpdateBuilder, WriteParams};
+    use arrow_array::{RecordBatchIterator, record_batch};
+    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_select::RowSetOps;
+
+    /// Four rows over two fragments under stable row ids, so a row id and its
+    /// row address are two different numbers for every row past the first
+    /// fragment.
+    async fn two_fragment_dataset(uri: &str) -> Dataset {
+        let batch = record_batch!(("id", Int32, [0, 1, 2, 3])).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn treemap(rows: impl IntoIterator<Item = u64>) -> RowAddrTreeMap {
+        let mut map = RowAddrTreeMap::new();
+        for row in rows {
+            map.insert(row);
+        }
+        map
+    }
+
+    fn addr(fragment: u32, offset: u32) -> u64 {
+        u64::from(RowAddress::new_from_parts(fragment, offset))
+    }
+
+    /// Row ids 0..4 lie in fragments 0 and 1, so the second fragment's ids and
+    /// addresses disagree. Translating has to move exactly those.
+    #[tokio::test]
+    async fn translates_row_ids_in_every_fragment() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+
+        let translated = translate_treemap_to_row_addr_domain(&dataset, &treemap(0..4))
+            .await
+            .unwrap();
+        let expected = treemap([addr(0, 0), addr(0, 1), addr(1, 0), addr(1, 1)]);
+        assert_eq!(translated, expected);
+
+        // The ids of the second fragment really do differ from their
+        // addresses, or this test would pass without translating anything.
+        assert_ne!(treemap(0..4), expected);
+    }
+
+    /// Both mask shapes carry the same translation: an allow-list and a
+    /// block-list of the same rows must name the same addresses.
+    #[tokio::test]
+    async fn translates_allow_lists_and_block_lists_alike() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+        let rows = treemap([2, 3]);
+        let expected = treemap([addr(1, 0), addr(1, 1)]);
+
+        let allow = row_id_mask_to_row_addr_domain(
+            &dataset,
+            Arc::new(RowAddrMask::from_allowed(rows.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(allow.allow_list(), Some(&expected));
+        assert!(allow.block_list().is_none());
+
+        let block =
+            row_id_mask_to_row_addr_domain(&dataset, Arc::new(RowAddrMask::from_block(rows)))
+                .await
+                .unwrap();
+        assert_eq!(block.block_list(), Some(&expected));
+        assert!(block.allow_list().is_none());
+    }
+
+    /// An update rewrites a row into a new fragment while it keeps its row id.
+    /// The translation has to follow it there -- taking the id for an address
+    /// would name whatever now sits at the old location.
+    #[tokio::test]
+    async fn follows_a_row_moved_by_an_update() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+        let before = translate_treemap_to_row_addr_domain(&dataset, &treemap([0]))
+            .await
+            .unwrap();
+        assert_eq!(before, treemap([addr(0, 0)]));
+
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 0")
+            .unwrap()
+            .set("id", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // Row id 0 survives the update; its address does not.
+        let after = translate_treemap_to_row_addr_domain(&dataset, &treemap([0]))
+            .await
+            .unwrap();
+        assert_ne!(after, before, "the row moved, so its address must change");
+        assert_eq!(after.len(), Some(1));
+    }
+
+    /// A row id that no longer resolves contributes no address rather than
+    /// leaking through untranslated.
+    #[tokio::test]
+    async fn drops_row_ids_that_no_longer_resolve() {
+        let dir = TempStrDir::default();
+        let dataset = two_fragment_dataset(&dir).await;
+        let translated = translate_treemap_to_row_addr_domain(&dataset, &treemap([0, 9_999]))
+            .await
+            .unwrap();
+        assert_eq!(translated, treemap([addr(0, 0)]));
     }
 }

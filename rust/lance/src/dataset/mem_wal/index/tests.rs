@@ -760,6 +760,9 @@ fn fts_from_metadata_preserves_format_version() {
         (1, InvertedListFormatVersion::V1),
         (2, InvertedListFormatVersion::V2),
         (3, InvertedListFormatVersion::V3),
+        // INVERTED_ROW_ADDR_DOMAIN_VERSION: orthogonal to the posting-list
+        // format, which defaults to V3 for it just as it does for V3 itself.
+        (4, InvertedListFormatVersion::V3),
     ] {
         let config = FtsMemIndexPlugin::resolve_from_metadata(
             "fts_idx",
@@ -781,10 +784,11 @@ fn fts_from_metadata_rejects_unsupported_format_version() {
     let arrow_schema = create_test_schema();
     let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-    let err = FtsMemIndexPlugin::resolve_from_metadata("fts_idx", &schema, &fts_index_metadata(4))
+    // 4 (INVERTED_ROW_ADDR_DOMAIN_VERSION) is supported now; 5 is not.
+    let err = FtsMemIndexPlugin::resolve_from_metadata("fts_idx", &schema, &fts_index_metadata(5))
         .unwrap_err();
     assert!(
-        err.to_string().contains("unsupported index_version 4"),
+        err.to_string().contains("unsupported index_version 5"),
         "{err}"
     );
 }

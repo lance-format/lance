@@ -241,11 +241,9 @@ impl<'a> CreateIndexBuilder<'a> {
         // manifest carries: one this build cannot read still owns its name, and
         // handing that name out again commits two indices under it.
         let indices = load_all_indices(self.dataset).await?;
-        // These always store row ids, so refuse them before training.
+        // Vector indices always store row ids, so refuse them before training.
         let index_kind = if self.index_type.is_vector() {
             Some("vector")
-        } else if self.index_type == IndexType::Inverted || scalar_fts_request {
-            Some("full-text")
         } else {
             None
         };

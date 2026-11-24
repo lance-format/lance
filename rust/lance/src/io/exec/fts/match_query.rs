@@ -22,7 +22,7 @@ use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
 use crate::io::exec::PreFilterSource;
-use crate::io::exec::utils::{PreFilterMasks, build_prefilter};
+use crate::io::exec::utils::{PreFilterMasks, build_prefilter_in_domain};
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::query::{
     FtsSearchParams, MatchQuery, try_collect_query_tokens, uses_fuzzy_expansion,
@@ -39,7 +39,9 @@ use super::query_tokens::{
     TokenizedQuery, fmt_tokenized_query, record_tokenized_query, tokenizer_for_match_query,
 };
 use super::segments::{
+    cutoff_tie_unresolved, fts_row_addr_to_row_id, fts_segments_are_address_domain,
     open_fts_segments, search_prepared_segments, segments_the_prefilter_may_match,
+    widen_limit_for_tie_rerank,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -616,12 +618,12 @@ impl ExecutionPlan for MatchQueryExec {
             } else {
                 true
             };
-            let address_domain = !ds.manifest.uses_stable_row_ids();
+            let address_domain = fts_segments_are_address_domain(&ds, &segments)?;
             let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter_in_domain(
                 context.clone(),
                 partition,
                 &prefilter_source,
@@ -632,7 +634,9 @@ impl ExecutionPlan for MatchQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-            )?;
+                address_domain,
+            )
+            .await?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -713,15 +717,62 @@ impl ExecutionPlan for MatchQueryExec {
                 &metrics,
             )
             .await;
-            let mut documents =
-                search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
-                    .await?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
+            // Selection ranks ties by stored row address, so any tie at the
+            // cutoff has to survive translation intact before `_rowid` order is
+            // restored; see `finalize_row_ids_and_scores`.
+            let requested_limit = prepared.params.limit;
+            let prepared =
+                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != requested_limit => {
+                        let mut widened_params = prepared.params.as_ref().clone();
+                        widened_params.limit = widened;
+                        Arc::new(PreparedMatch {
+                            query: prepared.query.clone(),
+                            params: Arc::new(widened_params),
+                            operator: prepared.operator,
+                        })
+                    }
+                    _ => prepared,
+                };
+            let mut documents = search_prepared_segments(
+                &indices,
+                prepared.clone(),
+                pre_filter.clone(),
+                metrics.clone(),
+                None,
+            )
+            .await?;
+            // A tie larger than the widened cap cannot be ordered from what came
+            // back, so complete it exactly rather than cutting it at an
+            // arbitrary address.
+            let scores = documents
+                .iter()
+                .map(|document| document.score.0)
+                .collect::<Vec<_>>();
+            if cutoff_tie_unresolved(&scores, requested_limit, prepared.params.limit) {
+                let mut exact_params = prepared.params.as_ref().clone();
+                exact_params.limit = None;
+                let exact = Arc::new(PreparedMatch {
+                    query: prepared.query.clone(),
+                    params: Arc::new(exact_params),
+                    operator: prepared.operator,
+                });
+                documents =
+                    search_prepared_segments(&indices, exact, pre_filter, metrics.clone(), None)
+                        .await?;
+            }
             documents.iter_mut().for_each(|document| {
                 document.score.0 *= query.boost;
             });
             metrics.baseline_metrics.record_output(documents.len());
 
-            let batch = scored_documents_batch(schema, documents)?;
+            let batch = scored_documents_batch(
+                schema,
+                documents,
+                row_addr_to_row_id.as_deref(),
+                requested_limit,
+            )?;
             Ok::<_, DataFusionError>(batch)
         });
 

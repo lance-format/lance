@@ -26,9 +26,10 @@ use crate::index::frag_reuse::resolve_query_segment_coverages;
 use crate::index::scalar::inverted::{load_segment_details, load_segment_params, load_segments};
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::utils::{
-    PreFilterMasks, build_prefilter, build_prefilter_restricted_to_fragments,
+    PreFilterMasks, build_prefilter_in_domain, build_prefilter_restricted_to_fragments_in_domain,
 };
 use lance_index::prefilter::PreFilter;
+use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::inverted::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsSearchParams, Tokens, try_collect_query_tokens,
@@ -42,7 +43,11 @@ use tracing::instrument;
 
 use super::corpus::SharedFtsScorer;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
-use super::segments::{combined_columns_the_prefilter_may_match, open_fts_segments};
+use super::segments::{
+    combined_columns_the_prefilter_may_match, cutoff_tie_unresolved, finalize_row_ids_and_scores,
+    fts_row_addr_to_row_id, fts_segments_are_address_domain, open_fts_segments,
+    widen_limit_for_tie_rerank,
+};
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
 /// Cross-field BM25F full-text search (`combined_fields`).
@@ -440,14 +445,31 @@ pub(super) async fn open_combined_fields_scan(
             }
         }
 
+        // `stale_rows` is built by the scanner in row-id domain (the
+        // convention every prefilter source and external mask follows), but
+        // it is checked here against this column's own index directly --
+        // `bm25_row_stats_for_terms` compares it to the index's stored
+        // identifiers, physical addresses for the address-domain index every
+        // fresh build now produces (see `INVERTED_ROW_ADDR_DOMAIN_VERSION`).
+        let column_stale_rows = match stale_rows.get(slot).filter(|rows| !rows.is_empty()) {
+            Some(rows)
+                if !dataset.manifest.uses_stable_row_ids()
+                    || indices
+                        .first()
+                        .is_some_and(|index| index.results_are_row_addresses()) =>
+            {
+                Some(Arc::new(
+                    crate::io::exec::utils::translate_treemap_to_row_addr_domain(dataset, rows)
+                        .await?,
+                ))
+            }
+            other => other.cloned(),
+        };
         columns.push(CombinedFieldColumn {
             column: column.to_string(),
             weight,
             indices,
-            stale_rows: stale_rows
-                .get(slot)
-                .filter(|rows| !rows.is_empty())
-                .cloned(),
+            stale_rows: column_stale_rows,
         });
     }
     metrics.record_parts_searched(
@@ -562,7 +584,6 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let address_domain = !ds.manifest.uses_stable_row_ids();
             let ds_for_scope = ds.clone();
 
             let selected_fragments = if preset_base_scorer.is_some() {
@@ -588,6 +609,11 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 metrics.as_ref(),
             )
             .await?;
+            // `all_segments` spans every target column, so this is also what
+            // rejects two columns' indexes that disagree on the domain: their
+            // postings are merged on the stored identifier alone.
+            let address_domain = fts_segments_are_address_domain(&ds_for_scope, &all_segments)?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
 
             if preset_base_scorer.is_some()
                 && covered_fragments
@@ -602,24 +628,32 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             // rest go to the flat sibling. Otherwise the prefilter spans the union
             // of the target columns' segments.
             let mut pre_filter = match covered_fragments {
-                Some(covered) => build_prefilter_restricted_to_fragments(
-                    context.clone(),
-                    partition,
-                    &prefilter_source,
-                    ds,
-                    covered,
-                    masks,
-                    &exec_metrics,
-                )?,
-                None => build_prefilter(
-                    context.clone(),
-                    partition,
-                    &prefilter_source,
-                    ds,
-                    &all_segments,
-                    masks,
-                    &exec_metrics,
-                )?,
+                Some(covered) => {
+                    build_prefilter_restricted_to_fragments_in_domain(
+                        context.clone(),
+                        partition,
+                        &prefilter_source,
+                        ds,
+                        covered,
+                        masks,
+                        &exec_metrics,
+                        address_domain,
+                    )
+                    .await?
+                }
+                None => {
+                    build_prefilter_in_domain(
+                        context.clone(),
+                        partition,
+                        &prefilter_source,
+                        ds,
+                        &all_segments,
+                        masks,
+                        &exec_metrics,
+                        address_domain,
+                    )
+                    .await?
+                }
             };
             let deleted_fragments = columns.iter().flat_map(|column| &column.indices).fold(
                 roaring::RoaringBitmap::new(),
@@ -667,16 +701,53 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 &metrics,
             )
             .await;
+            // Hold a tie group at the cutoff whole so it can be ordered by
+            // row id after translation; see `finalize_row_ids_and_scores`.
+            let search_params =
+                match widen_limit_for_tie_rerank(params.limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != params.limit => {
+                        let mut widened_params = params.clone();
+                        widened_params.limit = widened;
+                        widened_params
+                    }
+                    _ => params.clone(),
+                };
             let (doc_ids, scores) = combined_fields_search(
                 &columns,
                 &tokens,
-                &params,
+                &search_params,
                 query.operator(),
                 scorer.as_ref(),
-                pre_filter,
+                pre_filter.clone(),
                 metrics.as_ref(),
             )
             .await?;
+            // A tie larger than the widened cap cannot be ordered from what
+            // came back, so complete it exactly rather than truncating it at an
+            // arbitrary address.
+            let (doc_ids, scores) =
+                if cutoff_tie_unresolved(&scores, params.limit, search_params.limit) {
+                    let mut exact_params = params.clone();
+                    exact_params.limit = None;
+                    combined_fields_search(
+                        &columns,
+                        &tokens,
+                        &exact_params,
+                        query.operator(),
+                        scorer.as_ref(),
+                        pre_filter,
+                        metrics.as_ref(),
+                    )
+                    .await?
+                } else {
+                    (doc_ids, scores)
+                };
+            let (doc_ids, scores) = finalize_row_ids_and_scores(
+                doc_ids,
+                scores,
+                row_addr_to_row_id.as_deref(),
+                params.limit,
+            );
             metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(
