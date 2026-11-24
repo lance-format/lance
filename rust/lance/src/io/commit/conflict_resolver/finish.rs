@@ -64,14 +64,7 @@ impl<'a> TransactionRebase<'a> {
             .iter()
             .any(|(_, (_, needs_rewrite))| *needs_rewrite)
         {
-            if let Some(rows) = &self.affected_rows {
-                let affected_rows = match rows {
-                    UpdateRows::Supplied(rows) => *rows,
-                    UpdateRows::DeletionOverlaps(rows) => rows,
-                    UpdateRows::Deferred => {
-                        return Err(Error::internal("staged update offsets were not resolved"));
-                    }
-                };
+            if let Some(affected_rows) = self.affected_rows {
                 // Then we do the rebase
 
                 // 1. Load the deletion files that need a rewrite.
@@ -105,15 +98,15 @@ impl<'a> TransactionRebase<'a> {
                     .collect::<Vec<_>>();
                 let existing_deletion_vecs = futures::stream::iter(files_to_rewrite)
                     .map(|(fragment_id, deletion_file)| async move {
-                        read_dataset_deletion_file(
-                            dataset,
-                            fragment_id,
-                            &deletion_file.expect("there should be a deletion file"),
-                        )
-                        .await
-                        .map(|dv| (fragment_id, dv))
+                        let dv = match deletion_file {
+                            Some(file) => {
+                                read_dataset_deletion_file(dataset, fragment_id, &file).await?
+                            }
+                            None => Arc::new(DeletionVector::NoDeletions),
+                        };
+                        Ok::<_, Error>((fragment_id, dv))
                     })
-                    .buffered(dataset.object_store.as_ref().io_parallelism())
+                    .buffered(dataset.table_state.object_store.as_ref().io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -144,12 +137,10 @@ impl<'a> TransactionRebase<'a> {
                 let mut new_deleted_frag_ids = Vec::new();
                 let mut new_deletion_files = HashMap::with_capacity(fragments_ids_to_rewrite.len());
                 for fragment_id in fragments_ids_to_rewrite.iter() {
-                    let dv = DeletionVector::from(
-                        merged
-                            .get_fragment_bitmap(*fragment_id as u32)
-                            .unwrap()
-                            .clone(),
-                    );
+                    let offsets = merged.get_fragment_bitmap(*fragment_id as u32).ok_or_else(|| {
+                        Error::retryable_commit_conflict_source(dataset.manifest.version,
+                            format!("Missing physical deletion offsets for fragment {fragment_id} during rebase").into())
+                    })?;
                     // If we've deleted all rows in the fragment, we can delete it.
                     // It's acceptable if we don't handle it here, as the commit step
                     // can handle it later. Though it should be rare that physical_rows
@@ -158,32 +149,42 @@ impl<'a> TransactionRebase<'a> {
                         .initial_fragments
                         .get(fragment_id)
                         .and_then(|(fragment, _)| fragment.physical_rows)
-                        && dv.len() == physical_rows
                     {
-                        new_deleted_frag_ids.push(*fragment_id);
-                        continue;
+                        if let Some(last) = offsets.max()
+                            && last as usize >= physical_rows
+                        {
+                            return Err(Error::retryable_commit_conflict_source(dataset.manifest.version,
+                                format!("Deletion offset {last} exceeds the {physical_rows} physical rows in fragment {fragment_id}").into()));
+                        }
+                        if offsets.len() == physical_rows as u64 {
+                            new_deleted_frag_ids.push(*fragment_id);
+                            continue;
+                        }
                     }
 
+                    let dv = DeletionVector::from(offsets.clone());
                     let new_deletion_file = write_deletion_file(
-                        &dataset.base,
+                        &dataset.table_state.base,
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
-                        dataset.object_store.as_ref(),
+                        dataset.table_state.object_store.as_ref(),
                         dataset.inline_deletions_max_bytes()?,
                     )
                     .await?;
 
                     // Make sure this is available in the cache for future conflict resolution.
-                    let deletion_file = new_deletion_file.as_ref().unwrap();
-                    let key = crate::session::caches::DeletionFileKey {
-                        fragment_id: *fragment_id,
-                        deletion_file,
-                    };
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&key, Arc::new(dv))
-                        .await;
+                    if let Some(deletion_file) = &new_deletion_file {
+                        let key = crate::session::caches::DeletionFileKey {
+                            fragment_id: *fragment_id,
+                            deletion_file,
+                        };
+                        dataset
+                            .table_state
+                            .metadata_cache
+                            .insert_with_key(&key, Arc::new(dv))
+                            .await;
+                    }
 
                     // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
@@ -410,7 +411,7 @@ impl<'a> TransactionRebase<'a> {
                     new_indices,
                     rewrites,
                     dataset.schema(),
-                    dataset.fragment_bitmap.as_ref(),
+                    dataset.table_state.fragment_bitmap.as_ref(),
                     self.current_lineage.as_ref(),
                 );
 
@@ -793,7 +794,7 @@ impl<'a> TransactionRebase<'a> {
 
 /// Read a fragment's deletion vector as a bitmap of physical offsets, or an
 /// empty bitmap when the fragment has no deletion file.
-pub(super) async fn read_fragment_deletion_bitmap(
+async fn read_fragment_deletion_bitmap(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<RoaringBitmap> {

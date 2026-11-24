@@ -1010,7 +1010,14 @@ fn merge_list_struct_helper<T: OffsetSizeTrait>(
         )
     } else {
         if left_list.offsets().inner() != right_list.offsets().inner() {
-            panic!("Attempt to merge list struct arrays which do not have same offsets");
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Cannot merge list struct arrays with different offsets \
+                 (left: {} rows, {} values; right: {} rows, {} values)",
+                left_list.len(),
+                left_list.values().len(),
+                right_list.len(),
+                right_list.values().len(),
+            )));
         }
         // The lists share offsets, and an entry is valid if either side has it,
         // as for struct rows. Each side's items under its own null entries are
@@ -1039,7 +1046,7 @@ fn merge_list_struct_helper<T: OffsetSizeTrait>(
 }
 
 /// Merge two lists whose items hold structs. Only succeeds if both lists have
-/// the same offsets or one of them is all-null; panics otherwise.
+/// the same offsets or one of them is all-null; returns an error otherwise.
 ///
 /// `left_parent` and `right_parent`, when given, null each side's entries under
 /// its null parent rows before the merge.
@@ -1345,7 +1352,7 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
                         } else {
                             // The struct fields differ, so merge them structurally. merge_list_struct
                             // only succeeds when both lists share offsets or one side is all-null;
-                            // it panics otherwise.
+                            // it returns an error otherwise.
                             let merged_sub_array = merge_list_struct(
                                 left_column,
                                 right_column,
@@ -2056,6 +2063,44 @@ mod tests {
             RecordBatch::try_new(Arc::new(both_schema), vec![Arc::new(both_null_list)]).unwrap();
         let merged = x_batch.merge(&y_null_batch).unwrap();
         assert_eq!(merged, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::different_lengths(vec![1, 1], vec![2, 1])]
+    #[case::same_total_length(vec![1, 1], vec![2, 0])]
+    fn test_merge_list_struct_mismatched_offsets(
+        #[case] left_lengths: Vec<usize>,
+        #[case] right_lengths: Vec<usize>,
+        #[values(false, true)] large: bool,
+    ) {
+        let batch = |name: &str, lengths: &[usize]| {
+            let values = StructArray::from(vec![(
+                Arc::new(Field::new(name, DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![0; lengths.iter().sum()])) as ArrayRef,
+            )]);
+            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+            let list: ArrayRef = if large {
+                Arc::new(LargeListArray::new(
+                    field,
+                    OffsetBuffer::from_lengths(lengths.iter().copied()),
+                    Arc::new(values),
+                    None,
+                ))
+            } else {
+                Arc::new(ListArray::new(
+                    field,
+                    OffsetBuffer::from_lengths(lengths.iter().copied()),
+                    Arc::new(values),
+                    None,
+                ))
+            };
+            RecordBatch::try_from_iter([("cells", list)]).unwrap()
+        };
+        let error = batch("idx", &left_lengths)
+            .merge(&batch("timestamp", &right_lengths))
+            .unwrap_err();
+        assert!(matches!(error, ArrowError::InvalidArgumentError(_)));
+        assert!(error.to_string().contains("different offsets"), "{error}");
     }
 
     #[test]

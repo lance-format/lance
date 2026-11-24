@@ -40,6 +40,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
 use lance_io::spill::SpillStore;
 use lance_linalg::distance::DistanceType;
+use lance_select::RowAddrMask;
 use prost::Message;
 use std::{
     any::Any,
@@ -195,12 +196,42 @@ pub trait DistCalculator {
         u8_scratch: &mut Vec<u8>,
         u32_scratch: &mut Vec<u32>,
     ) {
+        self.accumulate_topk_with_mask(
+            k,
+            lower_bound,
+            upper_bound,
+            row_id,
+            None,
+            res,
+            dists,
+            u16_scratch,
+            u8_scratch,
+            u32_scratch,
+        );
+    }
+
+    /// Accumulate a dense scan. A masked-out row must never contribute to the
+    /// heap or to any threshold used to prune future candidates.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_mask(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        mask: Option<&RowAddrMask>,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
         if k == 0 {
             return;
         }
 
         self.distance_all_with_scratch(k, dists, u16_scratch, u8_scratch, u32_scratch);
-        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, mask, res, dists);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -254,6 +285,7 @@ pub(crate) fn accumulate_distances_into_heap(
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
     row_id: impl Fn(u32) -> u64,
+    mask: Option<&RowAddrMask>,
     res: &mut BinaryHeap<OrderedNode<u64>>,
     dists: &[f32],
 ) {
@@ -272,14 +304,18 @@ pub(crate) fn accumulate_distances_into_heap(
         if dist < lower_bound || dist >= upper_bound {
             continue;
         }
+        let row_id = row_id(id as u32);
+        if mask.is_some_and(|mask| !mask.selected(row_id)) {
+            continue;
+        }
         if res.len() < k {
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            res.push(OrderedNode::new(row_id, dist));
             if res.len() == k {
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
             res.pop();
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            res.push(OrderedNode::new(row_id, dist));
             max_dist = res.peek().map(|node| node.dist);
         }
     }

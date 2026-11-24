@@ -639,15 +639,15 @@ async fn resolve_target_bases(
         target_base_names_or_paths: params.target_base_names_or_paths.clone(),
         target_all_bases: params.target_all_bases,
         session: Some(dataset.session.clone()),
-        store_params: dataset.store_params.as_deref().cloned(),
-        base_store_params: dataset.base_store_params.as_deref().cloned(),
+        store_params: dataset.table_state.store_params.as_deref().cloned(),
+        base_store_params: dataset.table_state.base_store_params.as_deref().cloned(),
         ..Default::default()
     };
     validate_and_resolve_target_bases_with_primary(
         &mut write_params,
         Some(&dataset.manifest.base_paths),
-        &dataset.object_store,
-        &dataset.base,
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
         dataset.uri(),
     )
     .await
@@ -873,6 +873,9 @@ pub struct MergeStats {
 
 pub struct UncommittedMergeInsert {
     pub transaction: Transaction,
+    /// Physical row addresses removed by this merge. Pass these to
+    /// [`CommitBuilder::with_affected_rows`](crate::dataset::CommitBuilder::with_affected_rows) when committing the staged transaction
+    /// to distinguish disjoint row updates within the same fragment.
     pub affected_rows: Option<RowAddrTreeMap>,
     pub stats: MergeStats,
     pub inserted_rows_filter: Option<KeyExistenceFilter>,

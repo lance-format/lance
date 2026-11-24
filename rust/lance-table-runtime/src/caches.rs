@@ -17,23 +17,27 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
-use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_select::RowAddrMask;
 use lance_table::{
     format::{
-        DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
+        DataFile, DeletionFile, DeletionFileType, IndexMetadata, Manifest,
+        RowDatasetVersionSequence, RowIdMeta,
     },
-    rowids::RowIdSequence,
+    rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
-use uuid::Uuid;
 
-use crate::dataset::transaction::Transaction;
+use lance_table::transaction::Transaction;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for dataset metadata.
-pub struct GlobalMetadataCache(pub(super) LanceCache);
+pub struct GlobalMetadataCache(pub(crate) LanceCache);
 
 impl GlobalMetadataCache {
+    /// Access the cache before applying a dataset URI prefix.
+    pub fn cache(&self) -> &LanceCache {
+        &self.0
+    }
+
     pub fn for_dataset(&self, uri: &str) -> DSMetadataCache {
         // Create a sub-cache for the dataset by adding the URI as a key prefix.
         // This prevents collisions between different datasets.
@@ -150,7 +154,7 @@ impl CacheKey for DeletionFileKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -173,6 +177,9 @@ impl CacheKey for DeletionFileKey<'_> {
             builder.write_str(path);
         } else {
             builder.write_none();
+        }
+        if let Some(inline) = &self.deletion_file.inline {
+            builder.write_bytes(inline);
         }
     }
 }
@@ -331,39 +338,111 @@ impl CacheKey for RowVersionSequenceKey<'_> {
     }
 }
 
-/// Complete persisted inverted-index tokenizer parameters, independent of row
-/// remapping. Stored in the metadata cache so parameter checks never populate
-/// the index partition cache.
-#[derive(Debug)]
-pub struct InvertedIndexParamsKey<'a> {
-    pub uuid: &'a Uuid,
-}
-
-impl CacheKey for InvertedIndexParamsKey<'_> {
-    type ValueType = InvertedIndexParams;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("inverted_params/{}", self.uuid))
-    }
-
-    fn type_name() -> &'static str {
-        "InvertedIndexParams"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.inverted-params-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_fixed_bytes(self.uuid.as_bytes());
-    }
-}
-
 impl DSMetadataCache {
     /// Create a file-specific metadata cache with the given prefix.
     /// This is used by file readers and other components that need file-level caching.
-    pub(crate) fn file_metadata_cache(&self, prefix: &Path) -> LanceCache {
+    pub fn file_metadata_cache(&self, prefix: &Path) -> LanceCache {
         self.0.with_key_prefix(prefix.as_ref())
+    }
+}
+
+/// Whole-dataset row-id lookup for one manifest and deletion mode.
+#[derive(Debug)]
+pub struct RowIdIndexKey<'a> {
+    pub version: u64,
+    /// Whether the index knows the deleted rows (it then maps them to `None`).
+    /// An index built without deletion vectors reads no deletion file.
+    pub with_deletions: bool,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise return the
+    /// previous incarnation's index for a version number the new incarnation
+    /// now also holds. The e-tag disambiguates generations the same way
+    /// [`ManifestKey::e_tag`] does. Callers without one must not
+    /// share the cached index at all (see `get_row_id_index`).
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for RowIdIndexKey<'_> {
+    type ValueType = RowIdIndex;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_id_index/{}/{}/{}",
+            self.version,
+            self.with_deletions,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+    fn type_name() -> &'static str {
+        "RowIdIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_u64(self.with_deletions as u64);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IndexMetadataKey<'a> {
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for IndexMetadataKey<'_> {
+    type ValueType = Vec<IndexMetadata>;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{}:{}/{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "Vec<IndexMetadata>"
+    }
+
+    fn schema() -> CacheKeySchema {
+        // v3 entries carry each segment's clustering reference and metadata;
+        // a v2 entry, written by a build that did not know those fields, holds
+        // every segment unlabelled, and a writer trusting it would republish
+        // the index section without the labels. v2 in turn holds every index
+        // the manifest names where v1 held only the readable ones. On a
+        // persistent backend shared with another release nothing but this
+        // version stops each build from reading the other's entry as its own
+        // meaning.
+        CacheKeySchema::new("lance.index.metadata-key", 3)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+    }
+
+    fn codec() -> Option<lance_core::cache::CacheCodec> {
+        Some(lance_table::format::index_metadata_codec())
     }
 }
 

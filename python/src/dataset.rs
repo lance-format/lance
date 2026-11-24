@@ -22,7 +22,7 @@ use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
-use pyo3::exceptions::{PyStopIteration, PyTypeError};
+use pyo3::exceptions::{PyAttributeError, PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PyString, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3::{
@@ -40,7 +40,7 @@ use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
-    MaterializationStyle, RowAddrMask,
+    MaterializationStyle, RowAddrMask, RowAddrTreeMap,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
@@ -3125,6 +3125,17 @@ impl Dataset {
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20))
             .with_timeout(commit_timeout);
+
+        match transaction.getattr("_affected_rows") {
+            Ok(rows) if !rows.is_none() => {
+                let rows = rows.cast::<PyBytes>()?;
+                let rows = RowAddrTreeMap::deserialize_from(rows.as_bytes()).infer_error()?;
+                builder = builder.with_affected_rows(rows);
+            }
+            Ok(_) => {}
+            Err(err) if err.is_instance_of::<PyAttributeError>(transaction.py()) => {}
+            Err(err) => return Err(err),
+        }
 
         if let Some(enable) = enable_stable_row_ids {
             builder = builder.use_stable_row_ids(enable);

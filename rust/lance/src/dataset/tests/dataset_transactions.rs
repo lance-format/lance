@@ -9,7 +9,7 @@ use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
     ColumnAlteration, MergeInsertBuilder, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
-    UpdateBuilder, WhenMatched, write_manifest_file,
+    UncommittedMergeInsert, UpdateBuilder, WhenMatched, write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
@@ -206,8 +206,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 1);
     assert_eq!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset2.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset2.table_state.object_store.as_ref().inner)
     );
 
     // If we create another with **different parameters**, it should create a new store.
@@ -226,8 +226,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 2);
     assert_ne!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset3.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset3.table_state.object_store.as_ref().inner)
     );
 
     // Remove both datasets
@@ -236,37 +236,6 @@ async fn test_session_store_registry() {
     drop(dataset2);
     drop(dataset);
     assert_eq!(registry.active_stores().len(), 0);
-}
-
-#[test]
-fn test_decode_inline_transaction_tolerates_unknown_operations() {
-    use crate::dataset::decode_inline_transaction;
-    use lance_table::format::pb;
-    use prost::Message;
-
-    // A transaction written by a newer version of Lance may carry an operation
-    // this version cannot decode; prost surfaces it as a missing oneof. It
-    // decodes as `Operation::Unknown` rather than failing.
-    let unknown_operation = pb::Transaction {
-        read_version: 1,
-        uuid: "test".to_string(),
-        ..Default::default()
-    };
-    let decoded = decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Unknown { .. }));
-
-    // Corrupt bytes are likewise tolerated.
-    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
-
-    // A decodable transaction is returned.
-    let known = pb::Transaction::try_from(&Transaction::new(
-        1,
-        Operation::Append { fragments: vec![] },
-        None,
-    ))
-    .unwrap();
-    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Append { .. }));
 }
 
 /// A transaction as a future Lance might write it: the `operation` oneof holds
@@ -306,7 +275,7 @@ async fn rewrite_inline_transaction(
 
     assert!(dataset.manifest.index_section.is_none());
     let path = &dataset.manifest_location().path;
-    let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), path)
+    let mut writer = ObjectWriter::new(dataset.table_state.object_store.as_ref(), path)
         .await
         .unwrap();
     let tx_pos = writer.write_protobuf(inline_tx).await.unwrap() as u64;
@@ -393,6 +362,7 @@ async fn test_inline_transaction_written_to_new_field() {
     let test_uri = TempStrDir::default();
     let dataset = two_version_dataset(&test_uri).await;
     let bytes = dataset
+        .table_state
         .object_store
         .read_one_all(&dataset.manifest_location().path)
         .await
@@ -420,11 +390,18 @@ async fn test_read_inline_transaction_from_deprecated_field() {
     .await;
     // Remove the external copy so only field 21 can supply the transaction.
     let tx_path = dataset
+        .table_state
         .base
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(dataset.manifest.transaction_file.as_deref().unwrap());
-    dataset.object_store.inner.delete(&tx_path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .inner
+        .delete(&tx_path)
+        .await
+        .unwrap();
 
     let dataset = Dataset::open(&test_uri).await.unwrap();
     assert!(dataset.manifest.transaction_section.is_some());
@@ -449,13 +426,16 @@ async fn test_read_inline_transaction_from_released_deprecated_field() {
 
 #[test]
 fn test_distinct_unknown_transactions_are_not_equal() {
-    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
     use prost::Message;
 
     // Commit-outcome detection compares transactions for equality; two
     // unknown operations must not be mistaken for the same commit.
     let decode = |uuid: &str| {
-        decode_inline_transaction(&future_transaction(uuid).encode_to_vec(), 2).unwrap()
+        Transaction::try_from(
+            pb::Transaction::decode(future_transaction(uuid).encode_to_vec().as_slice()).unwrap(),
+        )
+        .unwrap()
     };
     assert_eq!(decode("a"), decode("a"));
     assert_ne!(decode("a"), decode("b"));
@@ -594,11 +574,12 @@ async fn test_inline_transaction() {
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
             let tx_path = ds
+                .table_state
                 .base
                 .clone()
                 .join(TRANSACTIONS_DIR)
                 .join(tx_file.as_str());
-            let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
+            let _ = ds.table_state.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }
 
@@ -617,17 +598,25 @@ async fn test_inline_transaction() {
     assert_eq!(read_tx, tx.clone());
 
     // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
-    let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+    let read_ds2 = DatasetBuilder::from_uri(ds2.table_state.uri.clone())
         .with_session(session.clone())
         .load()
         .await
         .unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // Reset
     assert!(stats.read_bytes < 64 * 1024);
     // Because the manifest is so small, we should have opportunistically
     // cached the transaction in memory already.
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
     assert_eq!(inline_tx, tx);
@@ -636,9 +625,10 @@ async fn test_inline_transaction() {
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file = crate::io::commit::write_transaction_file(
-        ds.object_store.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        &ds.table_state.base,
         &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
+        None,
     )
     .await
     .unwrap();
@@ -652,9 +642,9 @@ async fn test_inline_transaction() {
         )
         .unwrap();
     let location = write_manifest_file(
-        ds.object_store.as_ref(),
-        ds.commit_handler.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        ds.table_state.commit_handler.as_ref(),
+        &ds.table_state.base,
         &mut manifest,
         if indices.is_empty() {
             None
@@ -662,7 +652,7 @@ async fn test_inline_transaction() {
             Some(indices.clone())
         },
         &build_config,
-        ds.manifest_location.naming_scheme,
+        ds.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -675,12 +665,12 @@ async fn test_inline_transaction() {
 
     // The handle's own version takes the same external-file fallback without
     // touching the manifest again.
-    ds_new.object_store.io_stats_incremental();
+    ds_new.table_state.object_store.io_stats_incremental();
     let version_transaction = ds_new
         .read_version_transaction(location.version)
         .await
         .unwrap();
-    let stats = ds_new.object_store.io_stats_incremental();
+    let stats = ds_new.table_state.object_store.io_stats_incremental();
     assert_eq!(version_transaction.transaction, Some(tx.clone()));
     assert!(
         stats.read_iops >= 1,
@@ -812,7 +802,8 @@ fn ranged_read_bytes(stats: &IoStats) -> u64 {
 
 /// Manifest body bytes of the dataset handle's current version.
 async fn manifest_size(ds: &Dataset) -> u64 {
-    ds.object_store
+    ds.table_state
+        .object_store
         .stat(&ds.manifest_location().path)
         .await
         .unwrap()
@@ -862,15 +853,15 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    yardstick.object_store.io_stats_incremental();
+    yardstick.table_state.object_store.io_stats_incremental();
     let expected_transaction = yardstick.read_transaction().await.unwrap();
-    let yardstick_stats = yardstick.object_store.io_stats_incremental();
+    let yardstick_stats = yardstick.table_state.object_store.io_stats_incremental();
 
     // Same version as the handle: no resolve, no manifest body, just the
     // transaction message (one block).
-    ds.object_store.io_stats_incremental();
+    ds.table_state.object_store.io_stats_incremental();
     let same_version = ds.read_version_transaction(latest).await.unwrap();
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
     assert!(
@@ -886,7 +877,7 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // The session transaction cache is keyed only by version, so it is not
     // populated: `read_transaction()` still pays its own storage read.
     assert_eq!(ds.read_transaction().await.unwrap(), expected_transaction);
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
 
@@ -898,9 +889,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    historical.object_store.io_stats_incremental();
+    historical.table_state.object_store.io_stats_incremental();
     let via_fallback = historical.read_version_transaction(latest).await.unwrap();
-    let stats = historical.object_store.io_stats_incremental();
+    let stats = historical.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "fallback should read the manifest body: {:#?}",
@@ -921,9 +912,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // and still resolves latest through the fallback.
     let old_version = 3;
     let old = ds.checkout_version(old_version).await.unwrap();
-    old.object_store.io_stats_incremental();
+    old.table_state.object_store.io_stats_incremental();
     let old_transaction = old.read_version_transaction(old_version).await.unwrap();
-    let stats = old.object_store.io_stats_incremental();
+    let stats = old.table_state.object_store.io_stats_incremental();
     assert!(
         stats.read_bytes <= 4 * 1024,
         "expected at most one 4 KiB block, read {} bytes",
@@ -951,9 +942,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .unwrap();
     assert_eq!(other.version().version, latest);
     let metadata_stats_before = session.metadata_cache_stats().await;
-    other.object_store.io_stats_incremental();
+    other.table_state.object_store.io_stats_incremental();
     let via_cached_manifest = other.read_version_transaction(old_version).await.unwrap();
-    let stats = other.object_store.io_stats_incremental();
+    let stats = other.table_state.object_store.io_stats_incremental();
     // Resolving the location still costs a HEAD, but the manifest body is not
     // fetched.
     assert!(
@@ -977,12 +968,12 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    uncached.object_store.io_stats_incremental();
+    uncached.table_state.object_store.io_stats_incremental();
     let via_uncached_manifest = uncached
         .read_version_transaction(old_version)
         .await
         .unwrap();
-    let stats = uncached.object_store.io_stats_incremental();
+    let stats = uncached.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "uncached manifest should be read in full: {:#?}",
@@ -1044,8 +1035,8 @@ async fn test_read_version_transaction_after_recreate_at_same_uri() {
         .unwrap();
     assert_eq!(reopened.version().version, 1);
     assert_ne!(
-        reopened.manifest_location.e_tag,
-        old_reader.manifest_location.e_tag
+        reopened.table_state.manifest_location.e_tag,
+        old_reader.table_state.manifest_location.e_tag
     );
 
     let actual = reopened.read_version_transaction(1).await.unwrap();
@@ -1066,6 +1057,7 @@ async fn test_read_transaction_recovers_from_stale_manifest_size() {
     let mut stale = ds.manifest_location().clone();
     stale.size = Some(1);
     let recovered = ds
+        .table_state
         .read_transaction_from_storage(&manifest, &stale)
         .await
         .unwrap();
@@ -1596,7 +1588,7 @@ impl CommitHandler for GateNextCommitHandler {
     }
 }
 
-async fn stage_one_row_update(dir: &str) -> (Dataset, Transaction) {
+async fn stage_one_row_update(dir: &str) -> (Dataset, UncommittedMergeInsert) {
     let dataset = InsertBuilder::new(dir)
         .execute(vec![
             record_batch!(("id", Int32, [0, 1, 2, 3]), ("value", Int32, [0, 0, 0, 0])).unwrap(),
@@ -1613,15 +1605,23 @@ async fn stage_one_row_update(dir: &str) -> (Dataset, Transaction) {
         ])
         .await
         .unwrap();
-    (dataset, staged.transaction)
+    (dataset, staged)
 }
 
+#[rstest::rstest]
+#[case::another_delete("id = 0", false)]
+#[case::restore_rows("id = 0", true)]
+#[case::restore_after_tentative_removal("id IN (0, 2, 3)", true)]
 #[tokio::test]
-async fn test_staged_merge_row_conflicts_retry_after_publication_race() {
+async fn test_staged_merge_row_conflicts_retry_after_publication_race(
+    #[case] first_delete: &str,
+    #[case] restore: bool,
+) {
     let dir = TempStrDir::default();
     let (mut dataset, staged) = stage_one_row_update(&dir).await;
     let read = Arc::new(dataset.clone());
-    dataset.delete("id = 0").await.unwrap();
+    let original_fragment = read.fragments()[0].clone();
+    dataset.delete(first_delete).await.unwrap();
 
     let handler = Arc::new(GateNextCommitHandler {
         inner: Arc::new(ConditionalPutCommitHandler),
@@ -1631,19 +1631,45 @@ async fn test_staged_merge_row_conflicts_retry_after_publication_race() {
     });
     let commit = CommitBuilder::new(read)
         .with_commit_handler(handler.clone())
-        .execute(staged);
+        .with_affected_rows(staged.affected_rows.unwrap())
+        .execute(staged.transaction);
     tokio::pin!(commit);
     tokio::select! {
         _ = handler.entered.notified() => {}
         result = &mut commit => panic!("expected staged disjoint rows to commit after retry: {result:?}"),
     }
-    dataset.delete("id = 2").await.unwrap();
+    if restore {
+        let txn = Transaction::new(
+            dataset.version_id(),
+            Operation::Delete {
+                updated_fragments: vec![original_fragment],
+                deleted_fragment_ids: vec![],
+                predicate: String::new(),
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+    } else {
+        dataset.delete("id = 2").await.unwrap();
+    }
     handler.release.notify_one();
     let committed = commit
         .await
         .expect("expected staged disjoint rows to commit after retry");
     assert_eq!(committed.version().version, 4);
-    let rows = committed.scan().try_into_batch().await.unwrap();
+    let expected = if restore {
+        vec![(0, 0), (1, 10), (2, 0), (3, 0)]
+    } else {
+        vec![(1, 10), (3, 0)]
+    };
+    assert_eq!(sorted_id_values(&committed).await, expected);
+}
+
+async fn sorted_id_values(dataset: &Dataset) -> Vec<(i32, i32)> {
+    let rows = dataset.scan().try_into_batch().await.unwrap();
     let ids = rows["id"].as_primitive::<Int32Type>();
     let values = rows["value"].as_primitive::<Int32Type>();
     let mut rows: Vec<_> = ids
@@ -1653,22 +1679,53 @@ async fn test_staged_merge_row_conflicts_retry_after_publication_race() {
         .map(|(&id, &value)| (id, value))
         .collect();
     rows.sort_unstable();
-    assert_eq!(rows, [(1, 10), (3, 0)]);
+    rows
 }
 
+#[rstest::rstest]
+#[case::cleared(false, false)]
+#[case::cleared_then_deleted(false, true)]
+#[case::different_inline_mask(true, false)]
 #[tokio::test]
-async fn test_staged_merge_row_conflicts_after_intermediate_undelete() {
+async fn test_staged_merge_row_conflicts_after_intermediate_undelete(
+    #[values(false, true)] supply_rows: bool,
+    #[values(0, 1)] concurrent_id: i32,
+    #[case] replace_inline: bool,
+    #[case] delete_again: bool,
+) {
     let dir = TempStrDir::default();
     let (mut dataset, staged) = stage_one_row_update(&dir).await;
     let read = Arc::new(dataset.clone());
-    let original = read.fragments()[0].clone();
-    dataset.delete("id = 1").await.unwrap();
-    // Restore the original deletion mask, then change a different row. Looking
-    // at the endpoints alone would miss the change to row 1.
+    let mut restored = read.fragments()[0].clone();
+    if replace_inline {
+        dataset
+            .update_config([(
+                crate::dataset::deletions::INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY,
+                "4096",
+            )])
+            .await
+            .unwrap();
+    }
+    dataset
+        .delete(&format!("id = {concurrent_id}"))
+        .await
+        .unwrap();
+    if replace_inline {
+        // The row set of an inline deletion file lives in the manifest itself.
+        restored = dataset.fragments()[0].clone();
+        let file = restored.deletion_file.as_mut().unwrap();
+        assert!(file.inline.is_some());
+        let mut bytes = Vec::new();
+        RoaringBitmap::from_iter([2])
+            .serialize_into(&mut bytes)
+            .unwrap();
+        file.inline = Some(bytes.into());
+    }
+    // The final mask omits the concurrent writer's original deletion.
     let restore_rows = Transaction::new(
         dataset.version().version,
         Operation::Delete {
-            updated_fragments: vec![original],
+            updated_fragments: vec![restored],
             deleted_fragment_ids: vec![],
             predicate: String::new(),
         },
@@ -1678,21 +1735,57 @@ async fn test_staged_merge_row_conflicts_after_intermediate_undelete() {
         .execute(restore_rows)
         .await
         .unwrap();
-    dataset.delete("id = 2").await.unwrap();
-    let result = CommitBuilder::new(read).execute(staged).await;
+    if delete_again {
+        dataset.delete("id = 2").await.unwrap();
+    }
+    let latest_version = dataset.version().version;
+    let mut commit = CommitBuilder::new(read);
+    if supply_rows {
+        commit = commit.with_affected_rows(staged.affected_rows.unwrap());
+    }
+    let result = commit.execute(staged.transaction).await;
+    let conflicts = !supply_rows || concurrent_id == 1;
+    if conflicts {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+    } else {
+        result.expect("the transient deletion was disjoint from the staged write");
+    }
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        dataset.version().version,
+        latest_version + u64::from(!conflicts)
+    );
+    let value = if conflicts { 0 } else { 10 };
+    let mut expected = vec![(0, 0), (1, value), (3, 0)];
+    if !replace_inline && !delete_again {
+        expected.insert(2, (2, 0));
+    }
+    assert_eq!(sorted_id_values(&dataset).await, expected);
+}
+
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_out_of_bounds_deletion() {
+    let dir = TempStrDir::default();
+    let (mut dataset, staged) = stage_one_row_update(&dir).await;
+    let read = Arc::new(dataset.clone());
+    dataset.delete("id IN (0, 2)").await.unwrap();
+    let mut rows = staged.affected_rows.unwrap();
+    // Cardinality alone is insufficient to prove that every physical row was deleted.
+    rows.insert(RowAddress::new_from_parts(0, 4).into());
+    let result = CommitBuilder::new(read)
+        .with_affected_rows(rows)
+        .execute(staged.transaction)
+        .await;
     assert!(
         matches!(result, Err(Error::RetryableCommitConflict { .. })),
         "{result:?}"
     );
-    dataset.checkout_latest().await.unwrap();
-    assert_eq!(dataset.version().version, 4);
-    assert_eq!(
-        dataset
-            .count_rows(Some("id = 1 AND value = 0".into()))
-            .await
-            .unwrap(),
-        1
-    );
+    let latest = Dataset::open(&dir).await.unwrap();
+    assert_eq!(latest.version_id(), dataset.version_id());
+    assert_eq!(latest.count_rows(Some("id = 3".into())).await.unwrap(), 1);
 }
 
 /// Once the restore has checked its predecessor, a commit that wins the next

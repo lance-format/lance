@@ -206,10 +206,10 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             let Ok(fragment_id) = u32::try_from(fragment.id) else {
                 return false;
             };
-            if !dataset.fragment_bitmap.contains(fragment_id) {
+            if !dataset.table_state.fragment_bitmap.contains(fragment_id) {
                 return false;
             }
-            let fragment_index = dataset.fragment_bitmap.rank(fragment_id) as usize - 1;
+            let fragment_index = dataset.table_state.fragment_bitmap.rank(fragment_id) as usize - 1;
             dataset.fragments().get(fragment_index) == Some(fragment)
         });
         if has_duplicate_fragments || !descriptors_are_current {

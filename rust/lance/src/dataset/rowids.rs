@@ -10,6 +10,8 @@ use crate::session::caches::{RowIdSequenceKey, RowVersionSequenceKey};
 use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{
     NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
@@ -22,9 +24,11 @@ use lance_table::{
     },
     rowids::{
         FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids,
+        segment::U64Segment,
         version::{LoadedRowLineage, SpilledRowLineage},
     },
 };
+use std::borrow::Cow;
 use std::sync::Arc;
 
 pub(crate) use spill::place_carried_row_lineage;
@@ -50,6 +54,7 @@ pub async fn load_row_id_sequence(
         lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
     };
     dataset
+        .table_state
         .metadata_cache
         .get_or_insert_with_key(key, || read_row_id_sequence(dataset, fragment))
         .await
@@ -115,7 +120,7 @@ pub async fn load_row_version_sequence(
         RowDatasetVersionMeta::Column => {
             let data_file = fragment.row_lineage_file(kind.field_id())?.ok_or_else(|| {
                 Error::corrupt_file(
-                    dataset.base.clone(),
+                    dataset.table_state.base.clone(),
                     format!(
                         "fragment {} marks its {kind:?} versions as spilled but none of its \
                          data files carries field {}",
@@ -130,6 +135,7 @@ pub async fn load_row_version_sequence(
                 data_file,
             };
             dataset
+                .table_state
                 .metadata_cache
                 .get_or_insert_with_key(key, || {
                     spill::read_spilled_versions(dataset, fragment, kind.field_id())
@@ -163,7 +169,7 @@ pub async fn load_spilled_row_lineage<'a>(
         }
     }
     let loaded: SpilledRowLineage = futures::stream::iter(loads)
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
     Ok(Arc::new(loaded))
@@ -210,7 +216,7 @@ pub fn load_row_id_sequences<'a>(
         .map(|fragment| {
             load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
 }
 
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
@@ -234,7 +240,7 @@ pub(crate) async fn get_row_id_index_with(
     // and recreated there restarts at version 1. Without a token for this
     // manifest generation a cached index could be the old generation's, so
     // build a private one instead of sharing.
-    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+    let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref() else {
         return Ok(Some(Arc::new(
             load_row_id_index(dataset, with_deletions).await?,
         )));
@@ -249,6 +255,183 @@ pub(crate) async fn get_row_id_index_with(
         .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
         .await?;
     Ok(Some(index))
+}
+
+/// A dense fragment maps an ID to a physical offset by subtraction. Cache only
+/// its endpoints and manifest slot. Prefix maxima let a point lookup skip
+/// disjoint ranges and still find old and new copies after an update.
+#[derive(DeepSizeOf)]
+struct InlineRowIdRange {
+    start: u64,
+    end: u64,
+    prefix_end: u64,
+    slot: usize,
+}
+
+struct InlineRowIdRangesKey<'a> {
+    version: u64,
+    e_tag: &'a str,
+}
+
+impl CacheKey for InlineRowIdRangesKey<'_> {
+    type ValueType = Option<Vec<InlineRowIdRange>>;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("inline_row_id_ranges/{}/{}", self.version, self.e_tag).into()
+    }
+
+    fn type_name() -> &'static str {
+        "InlineRowIdRanges"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.inline-row-id-ranges", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_str(self.e_tag);
+    }
+}
+
+fn inline_row_id_ranges(dataset: &Dataset) -> Result<Option<Vec<InlineRowIdRange>>> {
+    let mut ranges = Vec::new();
+    for (slot, fragment) in dataset.iter_fragments().enumerate() {
+        let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+            return Ok(None);
+        };
+        // A protobuf sequence with one Range (two u64 varints) fits in 32
+        // bytes. Avoid decoding an arbitrarily large inline array to reject it.
+        if data.len() > 32 {
+            return Ok(None);
+        }
+        let sequence = read_row_ids(data)?;
+        let [U64Segment::Range(range)] = sequence.segments() else {
+            return Ok(None);
+        };
+        // Leave legacy or unrepresentable physical addresses to the existing index.
+        if u32::try_from(fragment.id).is_err()
+            || range.end.saturating_sub(range.start) > u64::from(u32::MAX) + 1
+            || slot > 0 && dataset.manifest.fragments[slot - 1].id >= fragment.id
+        {
+            return Ok(None);
+        }
+        if range.is_empty() {
+            continue;
+        }
+        ranges.push(InlineRowIdRange {
+            start: range.start,
+            end: range.end,
+            prefix_end: 0,
+            slot,
+        });
+    }
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut prefix_end = 0;
+    for range in &mut ranges {
+        prefix_end = prefix_end.max(range.end);
+        range.prefix_end = prefix_end;
+    }
+    Ok(Some(ranges))
+}
+
+/// Resolve one stable ID using only a dense inline snapshot and its candidate
+/// deletion files. The outer None means the snapshot needs the general index;
+/// the inner None means the ID is missing or deleted.
+async fn lookup_inline_row_id(
+    dataset: &Dataset,
+    row_id: u64,
+    with_deletions: bool,
+) -> Result<Option<Option<RowAddress>>> {
+    let ranges = if let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref() {
+        let key = InlineRowIdRangesKey {
+            version: dataset.manifest.version,
+            e_tag,
+        };
+        dataset
+            .index_cache
+            .get_or_insert_with_key(key, || async { inline_row_id_ranges(dataset) })
+            .await?
+    } else {
+        // As with RowIdIndex, an unversioned cache identity cannot be shared
+        // across a drop and recreate at the same URI.
+        Arc::new(inline_row_id_ranges(dataset)?)
+    };
+    let Some(ranges) = ranges.as_ref() else {
+        return Ok(None);
+    };
+    let lower = ranges.partition_point(|range| range.prefix_end <= row_id);
+    let upper = ranges.partition_point(|range| range.start <= row_id);
+    let mut lookups = Vec::new();
+    for idx in lower..upper {
+        let range = &ranges[idx];
+        if range.end <= row_id {
+            continue;
+        }
+        let fragment = &dataset.manifest.fragments[range.slot];
+        let address = RowAddress::new_from_parts(fragment.id as u32, (row_id - range.start) as u32);
+        // The general ignore-deletions index also applies tombstones to a
+        // fragment whose span overlaps another, even for its unique IDs.
+        let overlaps = idx > 0 && ranges[idx - 1].prefix_end > range.start
+            || ranges
+                .get(idx + 1)
+                .is_some_and(|next| next.start < range.end);
+        lookups.push(async move {
+            if (with_deletions || overlaps)
+                && let Some(file) = &fragment.deletion_file
+                && read_dataset_deletion_file(dataset, fragment.id, file)
+                    .await?
+                    .contains(address.row_offset())
+            {
+                return Ok(None);
+            }
+            Ok::<_, Error>(Some(address))
+        });
+    }
+    let mut live = None;
+    let mut candidates = futures::stream::iter(lookups)
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
+    while let Some(candidate) = candidates.try_next().await? {
+        if let Some(address) = candidate
+            && live.replace(address).is_some()
+        {
+            return Err(Error::internal(format!(
+                "row id index corrupt: stable row id {row_id} is live in multiple fragments"
+            )));
+        }
+    }
+    Ok(Some(live))
+}
+
+pub(super) async fn resolve_take_row_ids(
+    dataset: &Dataset,
+    row_ids: &[u64],
+    with_deletions: bool,
+) -> Result<Option<Vec<Option<RowAddress>>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
+    }
+    if let [id] = row_ids {
+        if let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref()
+            && let Some(index) = dataset
+                .index_cache
+                .get_with_key(&RowIdIndexKey {
+                    version: dataset.manifest.version,
+                    with_deletions,
+                    e_tag: Some(e_tag),
+                })
+                .await
+        {
+            return Ok(Some(vec![index.get(*id)?]));
+        }
+        if let Some(address) = lookup_inline_row_id(dataset, *id, with_deletions).await? {
+            return Ok(Some(vec![address]));
+        }
+    }
+    get_row_id_index_with(dataset, with_deletions)
+        .await?
+        .map(|index| index.get_many(row_ids))
+        .transpose()
 }
 
 /// The [`RowIdIndex`] a row-id -> row-address translation needs, or `None` when
@@ -515,7 +698,7 @@ pub(crate) async fn live_row_addr_to_row_id_lookup(
             let deletion_vector = fragment.get_deletion_vector().await?;
             Result::Ok((fragment_id, sequence, deletion_vector))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
     let fragments: std::collections::HashMap<_, _> = loaded
@@ -567,7 +750,7 @@ pub(crate) async fn load_row_id_index_for_fragments(
         loads.push(read_row_id_sequence(dataset, fragment).map_ok(Arc::new));
     }
     let sequences: Vec<Arc<RowIdSequence>> = futures::stream::iter(loads)
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
 
@@ -600,7 +783,7 @@ pub(crate) async fn load_row_id_index_for_fragments(
         });
     }
     let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
     RowIdIndex::new(&fragment_indices)
@@ -684,7 +867,6 @@ mod test {
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
-    use lance_table::rowids::segment::U64Segment;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -948,7 +1130,7 @@ mod test {
             .unwrap();
         // Without an e-tag the version-only key could alias a dataset recreated
         // at the same URI, so the index must be built privately, never cached.
-        dataset.manifest_location.e_tag = None;
+        dataset.table_state.manifest_location.e_tag = None;
         let session = dataset.session();
         let entries_before = session.index_cache_stats().await.num_entries;
         let first = get_row_id_index(&dataset).await.unwrap().unwrap();

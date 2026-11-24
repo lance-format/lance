@@ -47,6 +47,39 @@ class Transaction:
     )
     tag: Optional[str] = None
 
+    def _row_deletions(self):
+        op = self.operation
+        if not (
+            isinstance(op, LanceOperation.Update)
+            and op.update_mode == "rewrite_rows"
+            and not op.fields_modified
+            and op.updated_fragment_offsets is None
+            and op.updated_fragments
+        ):
+            return None
+        return (
+            self.read_version,
+            tuple(op.removed_fragment_ids),
+            tuple(
+                (fragment.id, fragment.deletion_file)
+                for fragment in op.updated_fragments
+            ),
+        )
+
+    def _set_affected_rows(self, rows: bytes) -> None:
+        # DeletionFile values are immutable and pickle shares them with the
+        # operation. Bind the hint to the deletions the worker actually staged.
+        deletions = self._row_deletions()
+        if deletions is not None:
+            self._staged_rows = (deletions, rows)
+
+    @property
+    def _affected_rows(self) -> Optional[bytes]:
+        staged = getattr(self, "_staged_rows", None)
+        if staged is not None and staged[0] == self._row_deletions():
+            return staged[1]
+        return None
+
 
 class UpdateResult(TypedDict):
     num_rows_updated: int

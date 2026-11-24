@@ -926,7 +926,7 @@ fn test_update_conflicts_with_data_overlay() {
             transaction: Transaction::new(0, update_op.clone(), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(&update_op).collect::<HashSet<_>>(),
-            affected_rows: affected_rows.as_ref().map(UpdateRows::Supplied),
+            affected_rows: affected_rows.as_ref(),
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,

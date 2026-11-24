@@ -69,7 +69,7 @@ pub(super) async fn remap_merged_segment_coverage(
                 Some(SegmentRemappingPlan::Identity) => segment
                     .fragment_bitmap
                     .as_ref()
-                    .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
+                    .map(|bitmap| bitmap & dataset.table_state.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
                 Some(SegmentRemappingPlan::MissingCoverage(_)) | None => {
                     return Err(Error::not_supported(format!(
@@ -109,7 +109,7 @@ pub(super) async fn remap_merged_segment_coverage(
     let has_fragment_reuse_index = frag_reuse_index.is_some();
     // Partly retired counts as stale: the retired half is about to be
     // intersected away, which drops its rows from the merged index.
-    let coverage_is_stale = !staged_coverage.is_subset(&dataset.fragment_bitmap);
+    let coverage_is_stale = !staged_coverage.is_subset(&dataset.table_state.fragment_bitmap);
     let Some(frag_reuse_index) = frag_reuse_index
         .filter(|index| append::fragment_reuse_affects_segments(index, segments.iter()))
     else {
@@ -515,11 +515,13 @@ pub(crate) async fn revives_rows<T: TableVersion>(
     let Some(deleted_now) = &now.deletion_file else {
         return Ok(true);
     };
-    if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
+    if deleted_now == deleted_then {
         return Ok(false);
     }
-    let rows_then = before.deleted_rows(then, deleted_then).await?;
-    let rows_now = after.deleted_rows(now, deleted_now).await?;
+    let (rows_then, rows_now) = futures::try_join!(
+        before.deleted_rows(then, deleted_then),
+        after.deleted_rows(now, deleted_now)
+    )?;
     Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
 }
 
@@ -994,9 +996,12 @@ async fn replay_staged_segments_from(
     .await?
     .for_staged_replay();
     rebase.load_current_lineage(dataset).await?;
-    let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(&read_dataset)
-        .await
-        .map_err(|error| rebuild(read_version, &error))?;
+    let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(
+        &read_dataset,
+        crate::dataset::TransactionReadSource::SessionCache,
+    )
+    .await
+    .map_err(|error| rebuild(read_version, &error))?;
     let snapshot = dataset.manifest.version;
     let window: Vec<_> = transactions
         .into_iter()

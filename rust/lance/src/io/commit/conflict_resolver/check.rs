@@ -196,45 +196,7 @@ impl<'a> TransactionRebase<'a> {
                     deleted_fragment_ids: removed_fragment_ids,
                     ..
                 } => {
-                    if !updated_fragments
-                        .iter()
-                        .map(|f| f.id)
-                        .chain(removed_fragment_ids.iter().copied())
-                        .any(|id| self.modified_fragment_ids.contains(&id))
-                    {
-                        return Ok(());
-                    }
-
-                    if self.affected_rows.is_none() {
-                        // We don't have any affected rows, so we can't
-                        // do the rebase anyways.
-                        return Err(self.retryable_conflict_err(other_transaction, other_version));
-                    }
-                    for updated in updated_fragments {
-                        if let Some((fragment, needs_rewrite)) =
-                            self.initial_fragments.get_mut(&updated.id)
-                        {
-                            // If data files, not just deletion files, are modified,
-                            // then we can't rebase.
-                            if fragment.files != updated.files {
-                                return Err(
-                                    self.retryable_conflict_err(other_transaction, other_version)
-                                );
-                            }
-
-                            // Mark any modified fragments as needing a rewrite.
-                            *needs_rewrite |= updated.deletion_file != fragment.deletion_file;
-                        }
-                    }
-
-                    for removed_fragment_id in removed_fragment_ids {
-                        if self.initial_fragments.contains_key(removed_fragment_id) {
-                            return Err(
-                                self.retryable_conflict_err(other_transaction, other_version)
-                            );
-                        }
-                    }
-                    Ok(())
+                    self.check_named_row_changes(updated_fragments, removed_fragment_ids, other_transaction, other_version)
                 }
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -250,6 +212,34 @@ impl<'a> TransactionRebase<'a> {
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
         }
+    }
+
+    fn check_named_row_changes(
+        &mut self,
+        updated_fragments: &[Fragment],
+        removed_fragment_ids: &[u64],
+        other: &Transaction,
+        version: u64,
+    ) -> Result<()> {
+        for id in removed_fragment_ids {
+            if self.modified_fragment_ids.contains(id) {
+                return Err(self.retryable_conflict_err(other, version));
+            }
+        }
+        for updated in updated_fragments {
+            if !self.modified_fragment_ids.contains(&updated.id) {
+                continue;
+            }
+            let Some((original, needs_rewrite)) = self.initial_fragments.get_mut(&updated.id)
+            else {
+                return Err(self.retryable_conflict_err(other, version));
+            };
+            if self.affected_rows.is_none() || !staged_update::same_row_layout(original, updated) {
+                return Err(self.retryable_conflict_err(other, version));
+            }
+            *needs_rewrite |= updated.deletion_file != original.deletion_file;
+        }
+        Ok(())
     }
 
     fn check_update_txn(
@@ -390,7 +380,7 @@ impl<'a> TransactionRebase<'a> {
                         if !self.modified_fragment_ids.contains(&group.fragment_id) {
                             continue;
                         }
-                        let Some(UpdateRows::Supplied(affected_rows)) = &self.affected_rows else {
+                        let Some(affected_rows) = self.affected_rows else {
                             return Err(
                                 self.retryable_conflict_err(other_transaction, other_version)
                             );
@@ -449,57 +439,12 @@ impl<'a> TransactionRebase<'a> {
                     updated_fragments,
                     deleted_fragment_ids: removed_fragment_ids,
                     ..
-                } => {
-                    if !updated_fragments
-                        .iter()
-                        .map(|f| f.id)
-                        .chain(removed_fragment_ids.iter().copied())
-                        .any(|id| self.modified_fragment_ids.contains(&id))
-                    {
-                        return Ok(());
-                    }
-
-                    if self.affected_rows.is_none() {
-                        // We don't have any affected rows, so we can't
-                        // do the rebase anyways.
-                        return Err(self.retryable_conflict_err(other_transaction, other_version));
-                    }
-                    for updated in updated_fragments {
-                        if let Some((fragment, needs_rewrite)) =
-                            self.initial_fragments.get_mut(&updated.id)
-                        {
-                            // If data files, not just deletion files, are modified,
-                            // then we can't rebase.
-                            if fragment.files != updated.files {
-                                return Err(
-                                    self.retryable_conflict_err(other_transaction, other_version)
-                                );
-                            }
-
-                            // Mark any modified fragments as needing a rewrite.
-                            *needs_rewrite |= updated.deletion_file != fragment.deletion_file
-                                || matches!(self.affected_rows, Some(UpdateRows::Deferred));
-                        } else if matches!(self.affected_rows, Some(UpdateRows::Deferred))
-                            && self.modified_fragment_ids.contains(&updated.id)
-                        {
-                            return Err(
-                                self.retryable_conflict_err(other_transaction, other_version)
-                            );
-                        }
-                    }
-
-                    for removed_fragment_id in removed_fragment_ids {
-                        if self.initial_fragments.contains_key(removed_fragment_id)
-                            || (matches!(self.affected_rows, Some(UpdateRows::Deferred))
-                                && self.modified_fragment_ids.contains(removed_fragment_id))
-                        {
-                            return Err(
-                                self.retryable_conflict_err(other_transaction, other_version)
-                            );
-                        }
-                    }
-                    Ok(())
-                }
+                } => self.check_named_row_changes(
+                    updated_fragments,
+                    removed_fragment_ids,
+                    other_transaction,
+                    other_version,
+                ),
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
