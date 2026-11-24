@@ -17,8 +17,10 @@ import org.lance.file.FileWriteOptions;
 import org.lance.fragment.DeletionFile;
 import org.lance.fragment.DeletionFileType;
 import org.lance.fragment.FragmentMergeResult;
+import org.lance.fragment.OverlayWriter;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.operation.DataOverlay;
 import org.lance.operation.Merge;
 import org.lance.operation.Project;
 import org.lance.operation.Update;
@@ -59,9 +61,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -608,6 +612,126 @@ public class FragmentTest {
     }
 
     return rowAddrs.stream().map(RowAddress::rowIndex).collect(Collectors.toList());
+  }
+
+  @Test
+  void testWriteSparseOverlay(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("sparse_overlay").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentOperation.Append append =
+          new FragmentOperation.Append(testDataset.createNewFragment(8, 4));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, append, Optional.of(1L))) {
+        assertEquals(2, dataset.getFragments().size());
+        Fragment fragment = dataset.getFragments().get(1);
+        long readVersion = dataset.version();
+        SourcedTransaction.Builder transaction = dataset.newTransactionBuilder();
+        DataOverlay.DataOverlayGroup group;
+        try (LanceScanner sourceScanner =
+                fragment.newScan(new ScanOptions.Builder().withRowAddress(true).build());
+            OverlayWriter writer = fragment.writeOverlay(List.of("id", "name"));
+            ArrowReader sourceReader = sourceScanner.scanBatches()) {
+          assertTrue(sourceReader.loadNextBatch());
+          VectorSchemaRoot source = sourceReader.getVectorSchemaRoot();
+          assertEquals(4, source.getRowCount());
+          UInt8Vector rowAddresses = (UInt8Vector) source.getVector(MetadataColumns.ROWADDR);
+          try (VectorSchemaRoot batch =
+              VectorSchemaRoot.of(
+                  new UInt8Vector(MetadataColumns.ROWADDR, allocator),
+                  new IntVector("id", allocator))) {
+            batch.allocateNew();
+            ((UInt8Vector) batch.getVector(MetadataColumns.ROWADDR))
+                .setSafe(0, rowAddresses.get(1));
+            ((IntVector) batch.getVector("id")).setSafe(0, -1);
+            batch.setRowCount(1);
+            writer.writeBatch(batch);
+          }
+          try (VectorSchemaRoot batch =
+              VectorSchemaRoot.of(
+                  new UInt8Vector(MetadataColumns.ROWADDR, allocator),
+                  new IntVector("id", allocator),
+                  new VarCharVector("name", allocator))) {
+            batch.allocateNew();
+            ((UInt8Vector) batch.getVector(MetadataColumns.ROWADDR))
+                .setSafe(0, rowAddresses.get(2));
+            ((IntVector) batch.getVector("id")).setSafe(0, -2);
+            ((VarCharVector) batch.getVector("name")).setNull(0);
+            batch.setRowCount(1);
+            writer.writeBatch(batch);
+          }
+          group = writer.finish().orElseThrow();
+        }
+
+        assertEquals(fragment.getId(), group.getFragmentId());
+        assertEquals(1, group.getOverlays().size());
+        assertFalse(group.getOverlays().get(0).getCoverage().isShared());
+        assertEquals(0, dataset.countRows("id < 0"));
+
+        try (SourcedTransaction staged =
+                transaction
+                    .operation(DataOverlay.builder().groups(List.of(group)).build())
+                    .build();
+            Dataset committed = staged.commit();
+            LanceScanner scanner = committed.getFragments().get(1).newScan();
+            ArrowReader reader = scanner.scanBatches()) {
+          assertEquals(readVersion, staged.readVersion());
+          assertEquals(readVersion + 1, committed.version());
+          assertEquals(2, committed.countRows("id < 0"));
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+          assertEquals(4, batch.getRowCount());
+          IntVector ids = (IntVector) batch.getVector("id");
+          VarCharVector names = (VarCharVector) batch.getVector("name");
+          assertEquals(4, ids.get(0));
+          assertEquals(-1, ids.get(1));
+          assertEquals(-2, ids.get(2));
+          assertEquals(7, ids.get(3));
+          assertEquals("Person 5", names.getObject(1).toString());
+          assertTrue(names.isNull(2));
+        }
+      }
+    }
+  }
+
+  @Test
+  void testOverlayWriterLifecycle(@TempDir Path tempDir) throws IOException {
+    Path datasetDir = tempDir.resolve("overlay_writer_lifecycle");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetDir.toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 4);
+          VectorSchemaRoot batch =
+              VectorSchemaRoot.of(
+                  new UInt8Vector(MetadataColumns.ROWADDR, allocator),
+                  new IntVector("id", allocator))) {
+        Fragment fragment = dataset.getFragments().get(0);
+        batch.allocateNew();
+        ((UInt8Vector) batch.getVector(MetadataColumns.ROWADDR))
+            .setSafe(0, (long) fragment.getId() << 32);
+        ((IntVector) batch.getVector("id")).setSafe(0, -1);
+        batch.setRowCount(1);
+
+        assertThrows(IllegalArgumentException.class, () -> fragment.writeOverlay(List.of()));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> fragment.writeOverlay(List.of(MetadataColumns.ROWADDR)));
+        try (OverlayWriter writer = fragment.writeOverlay(List.of("id"))) {
+          assertTrue(writer.finish().isEmpty());
+          assertThrows(IllegalStateException.class, writer::finish);
+          assertThrows(IllegalStateException.class, () -> writer.writeBatch(batch));
+        }
+        try (OverlayWriter writer = fragment.writeOverlay(List.of("id"))) {
+          writer.writeBatch(batch);
+        }
+        try (Stream<Path> files = Files.list(datasetDir.resolve("data"))) {
+          assertEquals(1, files.count());
+        }
+        assertEquals(0, dataset.countRows("id < 0"));
+      }
+    }
   }
 
   @Test
