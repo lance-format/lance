@@ -152,7 +152,9 @@ impl DeleteBuilder {
         self
     }
 
-    /// Set the timeout for retry operations
+    /// Set the timeout for retry operations.
+    ///
+    /// A commit that has already started finishes even if this timeout expires.
     pub fn retry_timeout(mut self, timeout: Duration) -> Self {
         self.retry_timeout = timeout;
         self
