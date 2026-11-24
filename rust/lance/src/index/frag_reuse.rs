@@ -11,6 +11,7 @@ use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::fragment_reuse::{MappingReader, OrderedCompactionMapping};
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
@@ -24,6 +25,9 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
+use lance_table::system_index::frag_reuse::stable_partition::{
+    MAPPING_FILE, StablePartitionMapping,
+};
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
 use prost::Message;
@@ -1214,9 +1218,6 @@ async fn validate_folded_deletions(
     manifest_by_id: &HashMap<u64, &Fragment>,
     source_deltas: &[u64],
 ) -> lance_core::Result<()> {
-    use lance_core::utils::fragment_reuse::{MappingReader, OrderedCompactionMapping};
-    use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
-    use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_table::format::pb::fragment_reuse_index_details::transition::Mapping;
 
     /// Deleted offsets translated per request; bounds the translation
@@ -1268,14 +1269,14 @@ async fn validate_folded_deletions(
                 .table_state
                 .metadata_cache
                 .file_metadata_cache(&directory);
-            let store =
-                LanceIndexStore::new(store, directory, Arc::new(metadata_cache)).with_file_sizes(
-                    HashMap::from([(MAPPING_FILE.to_string(), reference.map_size_bytes)]),
-                );
-            Arc::new(StablePartitionMapping::try_new(
-                Arc::new(store),
+            Arc::new(StablePartitionMapping::try_from_file(
+                store,
+                directory.join(MAPPING_FILE),
+                reference.map_size_bytes,
+                metadata_cache,
                 transition.sources.clone(),
                 transition.destinations.clone(),
+                None,
             )?)
         }
         None => {
@@ -2734,7 +2735,6 @@ pub(crate) async fn collect_tagged_row_map_paths(
 ) -> lance_core::Result<Vec<(String, Path)>> {
     use crate::dataset::FRAG_REUSE_DIR;
     use futures::TryStreamExt;
-    use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
     use lance_table::system_index::frag_reuse::ledger::Mapping;
 
     let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
