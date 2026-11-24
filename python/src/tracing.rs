@@ -23,6 +23,7 @@ use pyo3::IntoPyObject;
 use pyo3::PyErr;
 use pyo3::PyResult;
 use pyo3::Python;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::pyfunction;
 use pyo3::pymethods;
 use pyo3::types::PyDict;
@@ -120,9 +121,13 @@ impl LoggingPassthroughState {
         self.inner = Some(inner);
     }
 
-    fn set_callback(&mut self, callback: Py<PyAny>) {
+    fn set_callback(&mut self, callback: Py<PyAny>) -> PyResult<()> {
         if self.callback_sender.is_some() {
-            panic!("Callback already set");
+            // Panicking here would poison SUBSCRIBER and every later span would panic too.
+            return Err(PyRuntimeError::new_err(
+                "A trace event callback is already registered; call \
+                 lance.lance.shutdown_tracing() before registering another one",
+            ));
         }
         let (sender, receiver) = mpsc::sync_channel(1000);
         self.callback_sender = Some(sender);
@@ -161,6 +166,7 @@ impl LoggingPassthroughState {
                 });
             }
         }));
+        Ok(())
     }
 
     fn shutdown(&mut self) {
@@ -375,13 +381,13 @@ pub fn initialize_tracing(level: log::Level) {
 
 #[pyfunction]
 #[pyo3(signature=(callback))]
-pub fn capture_trace_events(callback: Py<PyAny>, py: Python<'_>) {
+pub fn capture_trace_events(callback: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
     SUBSCRIBER
         .write()
         .unwrap()
         .as_mut()
         .unwrap()
-        .set_callback(callback.clone_ref(py));
+        .set_callback(callback.clone_ref(py))
 }
 
 #[pyfunction]

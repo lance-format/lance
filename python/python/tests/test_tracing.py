@@ -126,3 +126,38 @@ for e in events:
             "LANCE_LOG": "debug",
         },
     )
+
+
+def test_tracing_callback_twice(tmp_path):
+    # A second registration must raise a catchable error. Panicking would poison the
+    # subscriber lock and every later operation in the process would panic too.
+    script = tmp_path / "script.py"
+    script.write_text(
+        """import sys
+
+import lance
+import pyarrow as pa
+
+from lance.tracing import capture_trace_events
+
+capture_trace_events(lambda evt: None)
+try:
+    capture_trace_events(lambda evt: None)
+except RuntimeError as err:
+    assert "already registered" in str(err)
+else:
+    raise AssertionError("the second capture_trace_events call did not raise")
+
+path = sys.argv[1]
+lance.write_dataset(pa.table({"x": range(10)}), path)
+assert lance.dataset(path).count_rows() == 10
+"""
+    )
+    subprocess.run(
+        [sys.executable, script, str(tmp_path / "data")],
+        capture_output=True,
+        check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
+    )
