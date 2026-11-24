@@ -994,9 +994,12 @@ async fn replay_staged_segments_from(
     .await?
     .for_staged_replay();
     rebase.load_current_lineage(dataset).await?;
-    let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(&read_dataset)
-        .await
-        .map_err(|error| rebuild(read_version, &error))?;
+    let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(
+        &read_dataset,
+        crate::dataset::TransactionReadSource::SessionCache,
+    )
+    .await
+    .map_err(|error| rebuild(read_version, &error))?;
     let snapshot = dataset.manifest.version;
     let window: Vec<_> = transactions
         .into_iter()

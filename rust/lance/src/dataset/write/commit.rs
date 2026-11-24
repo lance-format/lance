@@ -14,7 +14,9 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::{CommitTransactionOptions, default_commit_retry_timeout};
+use crate::io::commit::{
+    CommitTransactionOptions, conflict_resolver::AppendIdempotencyKey, default_commit_retry_timeout,
+};
 use crate::{
     Dataset, Error, Result,
     dataset::{
@@ -51,6 +53,7 @@ pub struct CommitBuilder<'a> {
     retry_timeout: Duration,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    append_idempotency_property: Option<String>,
     timeout: Option<Duration>,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
@@ -79,6 +82,7 @@ impl<'a> CommitBuilder<'a> {
             retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
+            append_idempotency_property: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             deep_clone_files_copied: false,
             inherited_field_ids: false,
@@ -314,6 +318,33 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Deduplicate an [`Operation::Append`] by a property in
+    /// [`Transaction::transaction_properties`]. The property value must be nonempty.
+    ///
+    /// Use the same property name, value and original `read_version` on every
+    /// submission of a logical append. If an append with the same property value
+    /// has already committed on this branch after `read_version`, the call returns
+    /// an error with [`Error::append_already_committed_version`] and publishes no
+    /// version. The first append wins even when the staged fragments differ. It
+    /// may also reference the same staged files. Use distinct values for distinct
+    /// appends, and retain the base version and intervening history for as long
+    /// as the append can be retried. If there is a gap and no known match, the
+    /// commit fails.
+    ///
+    /// A committed append is matched by its stored property, including appends
+    /// written before this option was introduced. Every writer submitting the
+    /// logical append concurrently must use the option. This is for individual,
+    /// non-detached appends to an existing dataset.
+    ///
+    /// ```
+    /// # use lance::dataset::CommitBuilder;
+    /// let builder = CommitBuilder::new("memory://").with_append_idempotency_property("job_id");
+    /// ```
+    pub fn with_append_idempotency_property(mut self, property: impl Into<String>) -> Self {
+        self.append_idempotency_property = Some(property.into());
+        self
+    }
+
     /// Configure this commit as the second step of a stable row ID migration.
     ///
     /// Sets `use_stable_row_ids = true` and supplies the `next_row_id` that was
@@ -426,6 +457,33 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        let append_idempotency_key = if let Some(property) =
+            self.append_idempotency_property.as_deref()
+        {
+            if self.detached
+                || transaction.read_version == 0
+                || is_detached_version(transaction.read_version)
+                || !matches!(transaction.operation, Operation::Append { .. })
+            {
+                return Err(Error::invalid_input(
+                    "append idempotency requires a non-detached Append based on an existing version",
+                ));
+            }
+            let value = transaction
+                .transaction_properties
+                .as_deref()
+                .and_then(|properties| properties.get(property))
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "append idempotency requires a nonempty transaction property {property:?}"
+                    ))
+                })?;
+            Some(AppendIdempotencyKey { property, value })
+        } else {
+            None
+        };
+
         // A definitions list is a commit-time input for UpdateConfig alone. Every
         // other operation is refused here, before any path is chosen: the
         // new-dataset paths never reach the manifest builder's own check.
@@ -598,7 +656,8 @@ impl<'a> CommitBuilder<'a> {
                         manifest_naming_scheme,
                     )
                     .with_retry_timeout(self.retry_timeout)
-                    .with_affected_rows(self.affected_rows.as_ref()),
+                    .with_affected_rows(self.affected_rows.as_ref())
+                    .with_append_idempotency_key(append_idempotency_key),
                 )
                 .await?
             }
@@ -702,6 +761,11 @@ impl<'a> CommitBuilder<'a> {
     ///   will be supported in the future.
     /// </div>
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
+        if self.append_idempotency_property.is_some() {
+            return Err(Error::invalid_input(
+                "append idempotency requires an individual Append transaction",
+            ));
+        }
         if transactions.is_empty() {
             return Err(Error::invalid_input_source(
                 "No transactions to commit".into(),
