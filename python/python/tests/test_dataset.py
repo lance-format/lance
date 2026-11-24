@@ -11112,3 +11112,31 @@ def test_cleanup_rejects_negative_age(tmp_path: Path, method, keyword, error_typ
     with pytest.raises(error_type, match=f"{keyword} must be non-negative"):
         getattr(ds, method)(**{keyword: timedelta(days=-1)})
     assert len(ds.versions()) == 1
+
+
+def test_auto_cleanup_options_reject_invalid_values(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100)})
+    # An invalid value must be rejected. Falling back to the default would configure a
+    # retention the caller never asked for.
+    with pytest.raises(TypeError):
+        lance.write_dataset(
+            table,
+            tmp_path / "a",
+            mode="create",
+            auto_cleanup_options={"interval": "5", "older_than_seconds": 3600},
+        )
+    with pytest.raises(TypeError):
+        lance.write_dataset(
+            table, tmp_path / "b", mode="create", auto_cleanup_options=True
+        )
+
+    # A key that is left out still gets its default.
+    lance.write_dataset(
+        table,
+        tmp_path / "c",
+        mode="create",
+        auto_cleanup_options={"older_than_seconds": 3600},
+    )
+    config = lance.dataset(tmp_path / "c").config()
+    assert config["lance.auto_cleanup.interval"] == "20"
+    assert config["lance.auto_cleanup.older_than"] == "1h"

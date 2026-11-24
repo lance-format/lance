@@ -252,21 +252,20 @@ pub fn get_write_params(
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
-        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyAny>>(options, "auto_cleanup_options")? {
+        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyDict>>(options, "auto_cleanup_options")?
+        {
             let mut auto_cleanup_params = AutoCleanupParams::default();
 
-            auto_cleanup_params.interval = auto_cleanup
-                .get_item("interval")
-                .and_then(|i| i.extract::<usize>())
-                .ok()
-                .unwrap_or(auto_cleanup_params.interval);
-
-            auto_cleanup_params.older_than = auto_cleanup
-                .get_item("older_than_seconds")
-                .and_then(|i| i.extract::<i64>())
-                .ok()
-                .map(TimeDelta::seconds)
-                .unwrap_or(auto_cleanup_params.older_than);
+            // A key that is absent keeps its default. A key that is present must be
+            // valid: falling back to the default would install a retention policy the
+            // caller never asked for.
+            if let Some(interval) = auto_cleanup.get_item("interval")? {
+                auto_cleanup_params.interval = interval.extract::<usize>()?;
+            }
+            if let Some(older_than_seconds) = auto_cleanup.get_item("older_than_seconds")? {
+                auto_cleanup_params.older_than =
+                    TimeDelta::seconds(older_than_seconds.extract::<i64>()?);
+            }
 
             p.auto_cleanup = Some(auto_cleanup_params);
         } else {
