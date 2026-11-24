@@ -302,8 +302,8 @@ impl Dataset {
         options: TrackedFilesOptions,
     ) -> SendableRecordBatchStream {
         let uri = self.uri().to_string();
-        let object_store = self.object_store.clone();
-        let base = self.base.clone();
+        let object_store = self.table_state.object_store.clone();
+        let base = self.table_state.base.clone();
 
         // Pipeline architecture:
         //
@@ -432,9 +432,9 @@ impl Dataset {
     /// | `size_bytes`    | `Int64` (non-null)                         | File size in bytes |
     /// | `last_modified` | `Timestamp(Microsecond, "UTC")` (non-null) | Last modification time |
     pub async fn all_files(&self) -> SendableRecordBatchStream {
-        let base = self.base.clone();
+        let base = self.table_state.base.clone();
         let uri = self.uri().to_string();
-        let object_store = self.object_store.clone();
+        let object_store = self.table_state.object_store.clone();
 
         let stream = object_store
             .list(Some(base.clone()))

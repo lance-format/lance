@@ -1897,8 +1897,8 @@ async fn segment_ownership_mask(
     let key = SegmentOwnershipMaskKey {
         uuid: &index.uuid,
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     let loader_dataset = dataset.clone();
     let mask = dataset
@@ -3863,7 +3863,7 @@ mod tests {
             .unwrap();
         let first_index = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let first_version = dataset.manifest.version;
-        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let first_fragments = dataset.table_state.fragment_bitmap.as_ref().clone();
         let field_id = dataset.schema().field("vector").unwrap().id;
 
         let second = lance_datagen::gen_batch()
@@ -3874,7 +3874,7 @@ mod tests {
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
         assert_eq!(second.schema(), first_schema);
         dataset.append(second, None).await.unwrap();
-        let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
+        let appended_fragments = dataset.table_state.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
         let old_segment = IndexMetadata {
             uuid: first_index[0].uuid,
@@ -3938,8 +3938,8 @@ mod tests {
             .get_with_key(&SegmentOwnershipMaskKey {
                 uuid: &old_segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             })
             .await
             .expect("the ownership mask is cached under the segment's key");
@@ -4061,7 +4061,7 @@ mod tests {
         let dataset = Dataset::write(vectors(), "memory://", Some(params))
             .await
             .unwrap();
-        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let first_fragments = dataset.table_state.fragment_bitmap.as_ref().clone();
         let segment = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![dataset.schema().field("vector").unwrap().id],
@@ -4084,8 +4084,8 @@ mod tests {
             SegmentOwnershipMaskKey {
                 uuid: &segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             }
         }
 
@@ -4109,7 +4109,7 @@ mod tests {
         let mut appended = (*dataset).clone();
         appended.append(vectors(), None).await.unwrap();
         let appended = Arc::new(appended);
-        let new_fragment = (appended.fragment_bitmap.as_ref() - &first_fragments)
+        let new_fragment = (appended.table_state.fragment_bitmap.as_ref() - &first_fragments)
             .iter()
             .next()
             .unwrap();

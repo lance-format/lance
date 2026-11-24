@@ -12,6 +12,7 @@ pub mod key_existence;
 mod manifest;
 pub mod overlay;
 mod row_ids;
+pub mod storage_contract;
 mod transaction;
 
 pub use crate::rowids::version::{

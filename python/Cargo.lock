@@ -4127,6 +4127,7 @@ dependencies = [
  "lance-namespace",
  "lance-select",
  "lance-table",
+ "lance-table-runtime",
  "lance-tokenizer",
  "log",
  "moka",
@@ -4686,6 +4687,33 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "lance-table-runtime"
+version = "15.0.0-beta.32"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "chrono",
+ "futures",
+ "itertools 0.14.0",
+ "lance-core",
+ "lance-file",
+ "lance-io",
+ "lance-namespace",
+ "lance-select",
+ "lance-table",
+ "log",
+ "object_store 0.14.2",
+ "prost",
+ "roaring",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "url",

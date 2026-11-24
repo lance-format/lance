@@ -188,7 +188,7 @@ pub async fn can_use_binary_copy_current(
             // check file global buffer
             let object_store = match data_file.base_id {
                 Some(base_id) => dataset.object_store(Some(base_id)).await?,
-                None => dataset.object_store.clone(),
+                None => dataset.table_state.object_store.clone(),
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
@@ -808,8 +808,8 @@ pub(super) async fn rewrite_files(
         let (frags, _) = write_fragments_internal_impl(
             write_version,
             Some(dataset.as_ref()),
-            dataset.object_store.clone(),
-            &dataset.base,
+            dataset.table_state.object_store.clone(),
+            &dataset.table_state.base,
             write_schema,
             stream,
             params,
@@ -865,8 +865,13 @@ pub(super) async fn rewrite_files(
     let row_addrs = match row_addrs_result {
         Ok(v) => v,
         Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
-                .await;
+            cleanup_data_fragments(
+                &dataset.table_state.object_store,
+                &dataset.table_state.base,
+                None,
+                &new_fragments,
+            )
+            .await;
             return Err(e);
         }
     };

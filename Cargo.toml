@@ -21,6 +21,7 @@ members = [
     "rust/lance-select",
     "rust/lance-tokenizer",
     "rust/lance-table",
+    "rust/lance-table-runtime",
     "rust/lance-derive",
     "rust/lance-test-macros",
     "rust/lance-testing",
@@ -80,6 +81,7 @@ lance-namespace-reqwest-client = "0.13.0"
 lance-select = { version = "=15.0.0-beta.32", path = "./rust/lance-select" }
 lance-tokenizer = { version = "=15.0.0-beta.32", path = "./rust/lance-tokenizer" }
 lance-table = { version = "=15.0.0-beta.32", path = "./rust/lance-table" }
+lance-table-runtime = { version = "=15.0.0-beta.32", path = "./rust/lance-table-runtime", default-features = false }
 lance-test-macros = { version = "=15.0.0-beta.32", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=15.0.0-beta.32", path = "./rust/lance-testing" }
 all_asserts = "2.3.1"

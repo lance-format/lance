@@ -1670,11 +1670,17 @@ async fn test_binary_copy_gate_rejects_unrecognized_extra_buffers() {
         // A second data file with one extra global buffer that is not a seed.
         let filename = "doctored.lance".to_string();
         let path = dataset
+            .table_state
             .base
             .clone()
             .join(crate::dataset::DATA_DIR)
             .join(filename.as_str());
-        let object_writer = dataset.object_store.create(&path).await.unwrap();
+        let object_writer = dataset
+            .table_state
+            .object_store
+            .create(&path)
+            .await
+            .unwrap();
         let mut writer = file_versions::create_writer(
             version,
             object_writer,
@@ -1811,11 +1817,12 @@ async fn test_binary_copy_seed_carry_follows_inputs() {
             }
             for file in &fragment.files {
                 let path = dataset
+                    .table_state
                     .base
                     .clone()
                     .join(crate::dataset::DATA_DIR)
                     .join(file.path.as_str());
-                let store = dataset.object_store.clone();
+                let store = dataset.table_state.object_store.clone();
                 let scheduler = lance_io::scheduler::ScanScheduler::new(
                     store.clone(),
                     lance_io::scheduler::SchedulerConfig::max_bandwidth(&store),

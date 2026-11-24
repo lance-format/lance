@@ -219,7 +219,7 @@ async fn do_take_rows(
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
-    let store_parallelism = builder.dataset.object_store.io_parallelism();
+    let store_parallelism = builder.dataset.table_state.object_store.io_parallelism();
     let fragment_concurrency = match io_parallelism {
         Some(io_parallelism) => store_parallelism.min(io_parallelism.get() as usize),
         None => store_parallelism,
@@ -230,7 +230,7 @@ async fn do_take_rows(
                 io_parallelism.get() as usize,
             ));
             read_config.with_scan_scheduler(ScanScheduler::new_with_io_parallelism(
-                builder.dataset.object_store.clone(),
+                builder.dataset.table_state.object_store.clone(),
                 config,
                 io_parallelism,
             ))
@@ -792,7 +792,7 @@ mod test {
             })
             .collect::<Vec<_>>();
         let projection = ProjectionRequest::from_columns(Vec::<&str>::new(), dataset.schema());
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let batch = if by_id {
             dataset.take_rows(&row_ids, projection).await.unwrap()
         } else {
@@ -802,6 +802,7 @@ mod test {
         assert_eq!(batch.num_rows(), expected_rows);
         assert!(
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
@@ -827,6 +828,7 @@ mod test {
         );
         assert!(
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
@@ -1417,13 +1419,13 @@ mod test {
             .into_iter()
             .map(|i| {
                 deletion_file_path(
-                    &dataset.base,
+                    &dataset.table_state.base,
                     fragments[i].id() as u64,
                     fragments[i].metadata().deletion_file.as_ref().unwrap(),
                 )
             })
             .collect();
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         if offsets.is_empty() {
             assert!(
                 row_offsets_to_row_addresses(&fragments, &[])
@@ -1431,7 +1433,14 @@ mod test {
                     .unwrap()
                     .is_empty()
             );
-            assert_eq!(dataset.object_store.io_stats_snapshot().read_iops, 0);
+            assert_eq!(
+                dataset
+                    .table_state
+                    .object_store
+                    .io_stats_snapshot()
+                    .read_iops,
+                0
+            );
         }
         let batch = dataset
             .take(
@@ -1448,6 +1457,7 @@ mod test {
             expected_values
         );
         let deletion_reads: Vec<_> = dataset
+            .table_state
             .object_store
             .io_stats_incremental()
             .requests
@@ -1478,17 +1488,17 @@ mod test {
         // a valid empty fragment here to exercise the mapper's zero-row boundary.
         let mut metadata = fragments[1].metadata().clone();
         metadata.deletion_file = write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             metadata.id,
             dataset.version().version,
             &DeletionVector::from_iter(0..4),
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             0,
         )
         .await
         .unwrap();
         fragments[1] = FileFragment::new(dataset.clone(), metadata);
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let addresses = row_offsets_to_row_addresses(&fragments, &[4, 3, 4, 8])
             .await
             .unwrap();
@@ -1503,6 +1513,7 @@ mod test {
         );
         assert!(
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
@@ -2229,7 +2240,7 @@ mod test {
         );
         let delayed = Arc::new(ThrottledStore::new(
             Arc::new(ProxyObjectStore::new(
-                dataset.object_store.inner.clone(),
+                dataset.table_state.object_store.inner.clone(),
                 Arc::new(Mutex::new(completed_policy)),
             )),
             ThrottleConfig {
@@ -2250,10 +2261,9 @@ mod test {
                 Ok(())
             }),
         );
-        Arc::make_mut(&mut dataset.object_store).inner = Arc::new(ProxyObjectStore::new(
-            delayed,
-            Arc::new(Mutex::new(started_policy)),
-        ));
+        Arc::make_mut(&mut dataset.table_state.object_store).inner = Arc::new(
+            ProxyObjectStore::new(delayed, Arc::new(Mutex::new(started_policy))),
+        );
 
         let projection = Schema::try_from(data.schema().as_ref()).unwrap();
         // Logical offsets touch all ten fragments in reverse order.
@@ -2261,7 +2271,11 @@ mod test {
             .rev()
             .map(|fragment| fragment * 40)
             .collect::<Vec<_>>();
-        let fragment_fanout = dataset.object_store.io_parallelism().min(indices.len());
+        let fragment_fanout = dataset
+            .table_state
+            .object_store
+            .io_parallelism()
+            .min(indices.len());
         let uncapped = dataset.take(&indices, projection.clone()).await.unwrap();
         let uncapped_peak = peak_reads.load(Ordering::SeqCst);
         assert_eq!(active_reads.load(Ordering::SeqCst), 0);
@@ -2362,7 +2376,7 @@ mod test {
         );
         let delayed = Arc::new(ThrottledStore::new(
             Arc::new(ProxyObjectStore::new(
-                dataset.object_store.inner.clone(),
+                dataset.table_state.object_store.inner.clone(),
                 Arc::new(Mutex::new(completed_policy)),
             )),
             ThrottleConfig {
@@ -2383,10 +2397,9 @@ mod test {
                 Ok(())
             }),
         );
-        Arc::make_mut(&mut dataset.object_store).inner = Arc::new(ProxyObjectStore::new(
-            delayed,
-            Arc::new(Mutex::new(started_policy)),
-        ));
+        Arc::make_mut(&mut dataset.table_state.object_store).inner = Arc::new(
+            ProxyObjectStore::new(delayed, Arc::new(Mutex::new(started_policy))),
+        );
 
         let projection = dataset.schema().clone();
         let indices = [20_u64, 0];
@@ -2586,6 +2599,7 @@ mod test {
         };
         let deletion_reads = || {
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
@@ -2595,9 +2609,12 @@ mod test {
                 .collect::<Vec<_>>()
         };
         let last = &dataset.manifest.fragments[7];
-        let expected_path =
-            deletion_file_path(&dataset.base, last.id, last.deletion_file.as_ref().unwrap());
-        dataset.object_store.io_stats_incremental();
+        let expected_path = deletion_file_path(
+            &dataset.table_state.base,
+            last.id,
+            last.deletion_file.as_ref().unwrap(),
+        );
+        dataset.table_state.object_store.io_stats_incremental();
         let take = |ids: &[u64]| dataset.take_builder(ids, dataset.schema().clone()).unwrap();
         assert_eq!(values(take(&[31]).execute().await.unwrap()), [31]);
         assert_eq!(deletion_reads(), [expected_path]);
@@ -2667,18 +2684,24 @@ mod test {
         let mut dataset = Dataset::open(uri).await.unwrap();
         // Snapshot without a shared cache identity. Fragment 0 covers 0..4
         // and fragment 1 now covers 2..6. Both have offset 0 tombstoned.
-        dataset.manifest_location.e_tag = None;
+        dataset.table_state.manifest_location.e_tag = None;
         let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
         fragments[1].row_id_meta = Some(RowIdMeta::Inline(
             write_row_ids(&RowIdSequence::from(2..6)).into(),
         ));
         let mut expected_paths: Vec<_> = fragments[..2]
             .iter()
-            .map(|f| deletion_file_path(&dataset.base, f.id, f.deletion_file.as_ref().unwrap()))
+            .map(|f| {
+                deletion_file_path(
+                    &dataset.table_state.base,
+                    f.id,
+                    f.deletion_file.as_ref().unwrap(),
+                )
+            })
             .collect();
         expected_paths.sort();
         let dataset = Arc::new(dataset);
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let take = |id, ignore| {
             dataset
                 .take_builder(&[id], dataset.schema().clone())
@@ -2693,6 +2716,7 @@ mod test {
             2
         );
         let mut paths: Vec<_> = dataset
+            .table_state
             .object_store
             .io_stats_incremental()
             .requests
@@ -2784,13 +2808,14 @@ mod test {
 
         let reads_deletion_file = |dataset: &Dataset| {
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
                 .iter()
                 .any(|request| request.path.as_ref().contains("_deletions"))
         };
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
 
         let ignored = dataset
             .take_builder(&[0, 1, 7, 4], dataset.schema().clone())

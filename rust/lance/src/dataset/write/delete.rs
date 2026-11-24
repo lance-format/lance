@@ -82,7 +82,7 @@ async fn apply_deletions(
                 }
             }
         })
-        .buffer_unordered(dataset.object_store.io_parallelism());
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
 
     while let Some(res) = stream.next().await.transpose()? {
         match res {

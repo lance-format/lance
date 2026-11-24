@@ -1270,9 +1270,9 @@ mod tests {
         let scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
             .project(&["vector"])
             .unwrap();
-        let _ = base.object_store.io_stats_incremental(); // reset
+        let _ = base.table_state.object_store.io_stats_incremental(); // reset
         let count = scanner.count_rows().await.unwrap();
-        let stats = base.object_store.io_stats_incremental();
+        let stats = base.table_state.object_store.io_stats_incremental();
 
         assert_eq!(count, ROWS as u64, "count must match the base row count");
         assert!(
