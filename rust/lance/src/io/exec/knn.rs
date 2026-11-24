@@ -28,6 +28,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
 };
+use datafusion::prelude::SessionConfig;
 use datafusion::{common::ColumnStatistics, physical_plan::metrics::ExecutionPlanMetricsSet};
 use datafusion::{
     common::stats::Precision,
@@ -47,6 +48,7 @@ use lance_core::{
     ROW_ID_FIELD,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
+use lance_datafusion::exec::DefaultTargetPartitions;
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     INDEX_SEGMENTS_SKIPPED_METRIC, PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
@@ -1861,6 +1863,10 @@ impl PreFilter for SegmentPreFilter {
         self.base.is_empty()
     }
 
+    fn deletions_only(&self) -> bool {
+        self.base.only_deletions()
+    }
+
     fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
         self.base.is_empty() && self.ownership_mask.selects_all(rows)
     }
@@ -1891,8 +1897,8 @@ async fn segment_ownership_mask(
     let key = SegmentOwnershipMaskKey {
         uuid: &index.uuid,
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     let loader_dataset = dataset.clone();
     let mask = dataset
@@ -2061,16 +2067,41 @@ fn quantized_top_k(batch: &RecordBatch, query: &Query) -> Result<RecordBatch> {
 fn effective_query_parallelism(
     query: &Query,
     index: &dyn VectorIndex,
-    target_partitions: usize,
+    target_partitions: Option<usize>,
 ) -> usize {
-    let cpu_pool_size = get_num_compute_intensive_cpus()
-        .min(target_partitions)
-        .max(1);
+    let cpu_pool_size = capped_cpu_pool_size(get_num_compute_intensive_cpus(), target_partitions);
     effective_query_parallelism_for(
         query,
         cpu_pool_size,
         index.auto_query_parallelism(cpu_pool_size),
     )
+}
+
+/// The session's `target_partitions` when a caller set it, `None` when a Lance
+/// session left it at DataFusion's default.
+///
+/// A session Lance did not build carries no marker, so its value counts as set,
+/// and so does a value changed after Lance built the session. A later change
+/// to the default value itself cannot be told apart; set
+/// `LanceExecutionOptions::target_partition` to limit a session reliably.
+fn explicit_target_partitions(config: &SessionConfig) -> Option<usize> {
+    let target = config.target_partitions();
+    let is_default = config
+        .get_extension::<DefaultTargetPartitions>()
+        .is_some_and(|default| default.0 == target);
+    (!is_default).then_some(target)
+}
+
+/// Caps the CPU pool at `target_partitions` only when a caller set it (#7087).
+///
+/// DataFusion's default `target_partitions` is the core count. Capping at that
+/// would undo a `LANCE_CPU_THREADS` set above the core count, which is how callers
+/// oversubscribe partition search: each probed partition is loaded from object
+/// storage, so an 8-CPU container would otherwise load at most 8 at a time.
+fn capped_cpu_pool_size(cpu_pool_size: usize, target_partitions: Option<usize>) -> usize {
+    target_partitions
+        .map_or(cpu_pool_size, |target| cpu_pool_size.min(target))
+        .max(1)
 }
 
 fn effective_query_parallelism_for(
@@ -2267,7 +2298,7 @@ impl ANNIvfSubIndexExec {
         global_prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
-        target_partitions: usize,
+        target_partitions: Option<usize>,
         seg_mask: Option<Arc<RowAddrMask>>,
         quantized_refine_factor: Option<u32>,
         result_cache: Option<Arc<QuantizedRefinementCache>>,
@@ -2459,7 +2490,7 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
-        target_partitions: usize,
+        target_partitions: Option<usize>,
         seg_mask: Option<Arc<RowAddrMask>>,
         quantized_refine_factor: Option<u32>,
         result_cache: Option<Arc<QuantizedRefinementCache>>,
@@ -2616,7 +2647,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
-        let target_partitions = context.session_config().target_partitions();
+        let target_partitions = explicit_target_partitions(context.session_config());
         let query = self.query.clone();
         let quantized_refine_factor = self.quantized_refine_factor;
         let cache_options = self.refinement_cache_options;
@@ -3232,6 +3263,37 @@ mod tests {
         assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
     }
 
+    #[rstest]
+    // An unset target leaves an oversubscribed pool alone.
+    #[case::default_target_oversubscribed(64, None, 64)]
+    // A caller-set target_partitions still caps the pool (#7087).
+    #[case::explicit_lower_target(64, Some(4), 4)]
+    #[case::explicit_higher_target(6, Some(16), 6)]
+    #[case::empty_pool(0, None, 1)]
+    fn test_capped_cpu_pool_size(
+        #[case] cpu_pool_size: usize,
+        #[case] target_partitions: Option<usize>,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(
+            capped_cpu_pool_size(cpu_pool_size, target_partitions),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_explicit_target_partitions() {
+        // A target equal to the core count is still explicit when a caller set it.
+        let cores = SessionConfig::new().target_partitions();
+        let explicit = SessionConfig::new().with_target_partitions(cores);
+        assert_eq!(explicit_target_partitions(&explicit), Some(cores));
+        let default = SessionConfig::new().with_extension(Arc::new(DefaultTargetPartitions(cores)));
+        assert_eq!(explicit_target_partitions(&default), None);
+        // A target changed after the session was built is explicit again.
+        let changed = default.with_target_partitions(cores + 1);
+        assert_eq!(explicit_target_partitions(&changed), Some(cores + 1));
+    }
+
     #[test]
     fn test_effective_query_parallelism_respects_target_partitions() {
         // effective_query_parallelism caps cpu_pool_size at target_partitions before
@@ -3801,7 +3863,7 @@ mod tests {
             .unwrap();
         let first_index = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let first_version = dataset.manifest.version;
-        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let first_fragments = dataset.table_state.fragment_bitmap.as_ref().clone();
         let field_id = dataset.schema().field("vector").unwrap().id;
 
         let second = lance_datagen::gen_batch()
@@ -3812,7 +3874,7 @@ mod tests {
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
         assert_eq!(second.schema(), first_schema);
         dataset.append(second, None).await.unwrap();
-        let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
+        let appended_fragments = dataset.table_state.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
         let old_segment = IndexMetadata {
             uuid: first_index[0].uuid,
@@ -3876,8 +3938,8 @@ mod tests {
             .get_with_key(&SegmentOwnershipMaskKey {
                 uuid: &old_segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             })
             .await
             .expect("the ownership mask is cached under the segment's key");
@@ -3999,7 +4061,7 @@ mod tests {
         let dataset = Dataset::write(vectors(), "memory://", Some(params))
             .await
             .unwrap();
-        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let first_fragments = dataset.table_state.fragment_bitmap.as_ref().clone();
         let segment = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![dataset.schema().field("vector").unwrap().id],
@@ -4022,8 +4084,8 @@ mod tests {
             SegmentOwnershipMaskKey {
                 uuid: &segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             }
         }
 
@@ -4047,7 +4109,7 @@ mod tests {
         let mut appended = (*dataset).clone();
         appended.append(vectors(), None).await.unwrap();
         let appended = Arc::new(appended);
-        let new_fragment = (appended.fragment_bitmap.as_ref() - &first_fragments)
+        let new_fragment = (appended.table_state.fragment_bitmap.as_ref() - &first_fragments)
             .iter()
             .next()
             .unwrap();
@@ -4281,7 +4343,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state,
-            usize::MAX,
+            None,
             None,
             None,
             None,
@@ -4334,7 +4396,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state,
-            usize::MAX,
+            None,
             None,
             None,
             None,
@@ -4400,7 +4462,7 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             None,
             None,
             None,
@@ -4491,7 +4553,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask.clone()),
             None,
             None,
@@ -4526,7 +4588,7 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask),
             None,
             None,
@@ -4590,7 +4652,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask.clone()),
             None,
             None,
@@ -4609,7 +4671,7 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             Some(seg_mask),
             None,
             None,
@@ -4644,7 +4706,7 @@ mod tests {
             prefilter.clone(),
             prepared_metrics(),
             state.clone(),
-            usize::MAX,
+            None,
             None,
             None,
             None,
@@ -4665,7 +4727,7 @@ mod tests {
             prefilter,
             prepared_metrics(),
             state,
-            usize::MAX,
+            None,
             None,
             None,
             None,
@@ -6032,7 +6094,7 @@ mod tests {
                     empty_prefilter().await,
                     metrics.clone(),
                     state,
-                    usize::MAX,
+                    None,
                     None,
                     None,
                     None,

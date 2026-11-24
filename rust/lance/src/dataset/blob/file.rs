@@ -1015,11 +1015,15 @@ mod tests {
         blob.set_buffer_size(buffer_size).await.unwrap();
 
         blob.read_up_to(1024).await.unwrap();
-        let _ = dataset.object_store.io_stats_incremental();
+        let _ = dataset.table_state.object_store.io_stats_incremental();
         let rest = blob.read().await.unwrap();
         assert_eq!(rest.as_ref(), &payload[1024..]);
         assert_eq!(
-            dataset.object_store.io_stats_incremental().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_incremental()
+                .read_bytes,
             fetched
         );
         assert_eq!(blob.range_submission_count(), submissions);

@@ -801,8 +801,15 @@ async fn flat_bm25_preserves_zero_token_list_element_documents() {
     assert_eq!(scorer.num_docs_containing_token("hello"), 1);
 }
 
+#[rstest::rstest]
+#[case::plain("alpha", "alpha", "alpha filler filler filler")]
+#[case::stemming("RUNNING", "run", "runs filler filler filler")]
 #[tokio::test]
-async fn flat_bm25_search_uses_full_document_length_for_normalization() {
+async fn flat_bm25_search_uses_full_document_length_for_normalization(
+    #[case] query: &str,
+    #[case] short: &str,
+    #[case] long: &str,
+) {
     let schema = Arc::new(Schema::new(vec![
         ROW_ID_FIELD.clone(),
         Field::new("text", DataType::Utf8, false),
@@ -810,11 +817,8 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization() {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(UInt64Array::from(vec![0u64, 1])),
-            Arc::new(StringArray::from(vec![
-                "alpha",
-                "alpha filler filler filler filler filler filler filler filler filler",
-            ])),
+            Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            Arc::new(StringArray::from(vec![short, long, "filler filler"])),
         ],
     )
     .unwrap();
@@ -823,14 +827,12 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization() {
         schema.clone(),
         stream::iter(vec![Ok(batch)]),
     ));
-    let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
-        TextAnalyzer::builder(SimpleTokenizer::default()).build(),
-    ));
+    let tokenizer = InvertedIndexParams::default().build().unwrap();
 
     let result_stream = flat_bm25_search_stream_with_metrics(
         input,
         "text".to_string(),
-        "alpha".to_string(),
+        query.to_string(),
         tokenizer,
         None,
         100,
@@ -844,6 +846,14 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization() {
     let scores = scored[SCORE_COL].as_primitive::<Float32Type>();
 
     assert_eq!(row_ids.values(), &[0, 1]);
+    // Three nonempty documents, seven tokens, and two documents containing
+    // the query term. The nonmatching row contributes to both N and avgdl.
+    let idf = (1.0_f32 + 1.5 / 2.5).ln();
+    for (row, length) in [1.0_f32, 4.0].into_iter().enumerate() {
+        let norm = 1.2 * (0.25 + 0.75 * length / (7.0 / 3.0));
+        let expected = idf * 2.2 / (1.0 + norm);
+        assert!((scores.value(row) - expected).abs() < 1e-6);
+    }
     assert!(
         scores.value(0) > scores.value(1),
         "same term frequency should score shorter document higher; short={}, long={}",
@@ -1078,4 +1088,151 @@ async fn flat_bm25_search_code_and_counts_repeated_subwords() {
     let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>().values();
 
     assert_eq!(row_ids, &[0]);
+}
+
+#[tokio::test]
+async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
+    let docs = vec![
+        "aapa foo",
+        "abpa bar",
+        "acpa baz",
+        "alpha beta",
+        "alpa beta",
+        "unrelated doc",
+    ];
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from_iter_values(0..docs.len() as u64)),
+            Arc::new(StringArray::from(docs)),
+        ],
+    )
+    .unwrap();
+
+    // 1. max_expansions = 2 picks lex-smallest ["aapa", "abpa"] for "alpa~1".
+    let run_fuzzy = |query: &str,
+                     fuzziness: Option<u32>,
+                     max_expansions: usize,
+                     prefix_length: u32,
+                     operator: Operator,
+                     prepared: Option<Arc<PreparedBm25Query>>| {
+        let batch = batch.clone();
+        let schema = schema.clone();
+        let query = query.to_string();
+        async move {
+            let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::iter(vec![Ok(batch)]),
+            ));
+            let doc_tok = InvertedIndexParams::default().stem(false).build().unwrap();
+            let query_tok = InvertedIndexParams::default().stem(false).build().unwrap();
+            let (result_stream, scorer, _prepared) = flat_bm25_search_stream_with_fuzzy_and_scorer(
+                input,
+                "text".to_string(),
+                query,
+                doc_tok,
+                query_tok,
+                &[],
+                None,
+                FlatBm25SearchOptions {
+                    target_batch_size: 100,
+                    elapsed_compute: None,
+                    document_granularity: DocumentGranularity::Row,
+                    operator,
+                    boost: 1.0,
+                    phrase_slop: None,
+                },
+                FlatBm25FuzzyOptions {
+                    fuzziness,
+                    max_expansions,
+                    prefix_length,
+                    prepared_query: prepared,
+                },
+            )
+            .await?;
+            let batches = result_stream.try_collect::<Vec<_>>().await?;
+            let scored = if batches.is_empty() {
+                RecordBatch::new_empty(FTS_SCHEMA.clone())
+            } else {
+                arrow::compute::concat_batches(&FTS_SCHEMA, &batches)?
+            };
+            Ok::<_, datafusion_common::DataFusionError>((scored, scorer))
+        }
+    };
+
+    let (capped, scorer) = run_fuzzy("alpa", Some(1), 2, 0, Operator::Or, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        capped[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[0, 1],
+        "max_expansions=2 must keep only lex-smallest ['aapa', 'abpa']"
+    );
+    assert_eq!(scorer.num_docs, 6);
+    assert_eq!(scorer.token_docs.get("aapa"), Some(&1));
+    assert_eq!(scorer.token_docs.get("abpa"), Some(&1));
+    assert_eq!(scorer.token_docs.get("acpa"), None);
+
+    // 2. prefix_length = 2 requires "al" prefix -> ["alpa", "alpha"] (rows 3, 4).
+    let (prefixed, _) = run_fuzzy("alpa", Some(1), 50, 2, Operator::Or, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        prefixed[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[3, 4]
+    );
+
+    // 3. Operator::And satisfied ("alpa betz~1" matches rows 3 and 4) vs unsatisfied.
+    let (and_ok, _) = run_fuzzy("alpa betz", Some(1), 50, 0, Operator::And, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        and_ok[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[3, 4]
+    );
+
+    let (and_empty, _) = run_fuzzy("alpa zzzzz", Some(1), 50, 0, Operator::And, None)
+        .await
+        .unwrap();
+    assert_eq!(and_empty.num_rows(), 0);
+
+    // 4. AUTO fuzziness (`None`) on 4-char token "alpa" uses edit distance 1.
+    let (auto_res, _) = run_fuzzy("alpa", None, 50, 0, Operator::Or, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        auto_res[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[0, 1, 2, 3, 4]
+    );
+
+    // 5. PreparedBm25Query replay matches capped scores identically.
+    let prepared = Arc::new(PreparedBm25Query::from_parts(
+        Arc::new(
+            Tokens::try_from_parts(
+                vec!["aapa".into(), "abpa".into()],
+                vec![0, 0],
+                vec![0, 0],
+                crate::scalar::inverted::document_tokenizer::DocType::Text,
+            )
+            .unwrap(),
+        ),
+        Arc::new(scorer),
+        true,
+    ));
+    let (replayed, _) = run_fuzzy("alpa", Some(1), 2, 0, Operator::Or, Some(prepared))
+        .await
+        .unwrap();
+    assert_eq!(replayed, capped);
+
+    // 6. Excessive fuzziness fails cleanly (5+ char ASCII token with fuzziness=10
+    // exceeds the Levenshtein DFA state budget).
+    assert!(
+        run_fuzzy("quick", Some(10), 50, 0, Operator::Or, None)
+            .await
+            .is_err()
+    );
 }

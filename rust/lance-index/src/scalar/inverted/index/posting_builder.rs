@@ -3,7 +3,9 @@
 
 use smallvec::SmallVec;
 
-use super::super::encoding::{decode_full_posting_block, decode_varint_u32};
+use super::super::encoding::{
+    decode_full_posting_block, decode_position_stream_deltas_into, decode_varint_u32,
+};
 use super::*;
 
 /// Inline capacity, in encoded bytes, of a posting list's unflushed tail.
@@ -63,6 +65,27 @@ const _: () = assert!(std::mem::size_of::<PostingListOverflow>() <= 80);
 pub(super) struct FullBlocks {
     pub(super) encoded_blocks: EncodedBlocks,
     pub(super) encoded_position_blocks: EncodedPositionBlocks,
+    pub(super) max_block_scratch_bytes: u64,
+}
+
+/// Reusable scratch buffers shared across tokens during [`InnerBuilder::merge_from`].
+#[derive(Default)]
+pub(in super::super) struct PostingMergeScratch {
+    doc_ids: Vec<u32>,
+    frequencies: Vec<u32>,
+    flush_doc_ids: Vec<u32>,
+    flush_frequencies: Vec<u32>,
+    deltas: Vec<u32>,
+}
+
+fn block_position_scratch_bytes(frequencies: &[u32]) -> Result<u64> {
+    let positions: u64 = frequencies.iter().map(|&value| u64::from(value)).sum();
+    let largest = u64::from(frequencies.iter().copied().max().unwrap_or(0));
+    positions
+        .checked_mul(3)
+        .and_then(|positions| positions.checked_add(largest))
+        .and_then(|positions| positions.checked_mul(4))
+        .ok_or_else(|| Error::invalid_input("FTS merge position scratch size overflow"))
 }
 
 /// A document whose positions are still streaming in through
@@ -229,6 +252,47 @@ impl PostingListBuilder {
         self.overflow.get_or_insert_with(Box::default)
     }
 
+    /// Estimate scratch retained when merging or decoding a block, before
+    /// decompressing positions. Full blocks track their maximum scratch bound
+    /// incrementally so admission does not re-decode compressed blocks.
+    pub(in super::super) fn merge_scratch_bytes(&self) -> Result<u64> {
+        let block_size = self.block_size();
+        let mut maximum = 0u64;
+        if self.with_positions {
+            if let Some(blocks) = self
+                .overflow
+                .as_deref()
+                .and_then(|overflow| overflow.full_blocks.as_deref())
+            {
+                maximum = maximum.max(blocks.max_block_scratch_bytes);
+            }
+            if self.tail_len > 0 {
+                let mut positions = 0u64;
+                let mut largest = 0u64;
+                for (_, frequency) in self.tail_entries() {
+                    let frequency = u64::from(frequency);
+                    positions += frequency;
+                    largest = largest.max(frequency);
+                }
+                let bytes = positions
+                    .checked_mul(3)
+                    .and_then(|positions| positions.checked_add(largest))
+                    .and_then(|positions| positions.checked_mul(4))
+                    .ok_or_else(|| {
+                        Error::invalid_input("FTS merge position scratch size overflow")
+                    })?;
+                maximum = maximum.max(bytes);
+            }
+        }
+        maximum
+            .checked_add(
+                (block_size as u64)
+                    .checked_mul(8)
+                    .ok_or_else(|| Error::invalid_input("FTS merge block scratch size overflow"))?,
+            )
+            .ok_or_else(|| Error::invalid_input("FTS merge scratch size overflow"))
+    }
+
     pub fn for_each_entry<E>(
         &self,
         mut visit: impl FnMut(u32, u32, Option<Vec<u32>>) -> std::result::Result<(), E>,
@@ -299,20 +363,283 @@ impl PostingListBuilder {
     }
 
     pub fn add(&mut self, doc_id: u32, term_positions: PositionRecorder) {
+        let frequency = term_positions.len();
+        match term_positions {
+            PositionRecorder::Position(positions_in_doc) => {
+                self.add_slice(doc_id, frequency, Some(positions_in_doc.as_slice()));
+            }
+            PositionRecorder::Count(_) => {
+                self.add_slice(doc_id, frequency, None);
+            }
+        }
+    }
+
+    pub(in super::super) fn add_slice(
+        &mut self,
+        doc_id: u32,
+        frequency: u32,
+        positions: Option<&[u32]>,
+    ) {
         debug_assert!(
             self.open_doc().is_none(),
             "cannot add closed doc while a positions doc is still open"
         );
-        let frequency = term_positions.len();
-        if let PositionRecorder::Position(positions_in_doc) = term_positions {
+        if let Some(positions_in_doc) = positions {
             debug_assert!(self.with_positions);
             self.overflow_mut()
                 .tail_positions
-                .append_doc_positions(positions_in_doc.as_slice())
+                .append_doc_positions(positions_in_doc)
                 .expect("position stream encoding should succeed");
         }
         self.push_tail_entry(doc_id, frequency)
             .expect("posting list block compression should succeed");
+    }
+
+    /// Append all postings from `other`, shifting its doc ids by `doc_id_offset`.
+    ///
+    /// Reuses compressed position blocks verbatim when aligned to block
+    /// boundaries, concatenates tail position deltas directly when no boundary
+    /// is crossed, and otherwise streams delta slices through reusable scratch
+    /// buffers without per-document heap allocations.
+    pub(in super::super) fn append_from(
+        &mut self,
+        other: Self,
+        doc_id_offset: u32,
+        scratch: &mut PostingMergeScratch,
+    ) -> Result<()> {
+        debug_assert_eq!(self.with_positions, other.with_positions);
+        debug_assert_eq!(self.posting_tail_codec, other.posting_tail_codec);
+        debug_assert_eq!(self.block_size_log2, other.block_size_log2);
+        debug_assert!(self.open_doc().is_none());
+        debug_assert!(other.open_doc().is_none());
+
+        if other.is_empty() {
+            return Ok(());
+        }
+        if self.is_empty() && doc_id_offset == 0 {
+            *self = other;
+            return Ok(());
+        }
+
+        let block_size = self.block_size();
+        let with_positions = self.with_positions;
+        let Self {
+            tail: other_tail,
+            overflow: other_overflow,
+            tail_len: other_tail_len,
+            ..
+        } = other;
+        let (other_full_blocks, other_tail_positions) = match other_overflow {
+            Some(overflow) => {
+                let overflow = *overflow;
+                (overflow.full_blocks, Some(overflow.tail_positions))
+            }
+            None => (None, None),
+        };
+
+        // Fast path 1: `self` sits on a block boundary (`tail_len == 0`).
+        // Full position blocks depend only on intra-document positions and can
+        // be copied verbatim without decompressing or recompressing positions.
+        if self.tail_len == 0 {
+            debug_assert_eq!(self.last_tail_doc_id, 0);
+            if let Some(other_full) = other_full_blocks {
+                let self_full = self
+                    .overflow_mut()
+                    .full_blocks
+                    .get_or_insert_with(Box::default);
+                self_full.max_block_scratch_bytes = self_full
+                    .max_block_scratch_bytes
+                    .max(other_full.max_block_scratch_bytes);
+                for (block_idx, block) in other_full.encoded_blocks.iter().enumerate() {
+                    scratch.doc_ids.clear();
+                    scratch.frequencies.clear();
+                    decode_full_posting_block(
+                        block,
+                        &mut scratch.doc_ids,
+                        &mut scratch.frequencies,
+                        block_size,
+                    );
+                    for doc_id in &mut scratch.doc_ids {
+                        *doc_id += doc_id_offset;
+                    }
+                    self_full
+                        .encoded_blocks
+                        .push_full_block(&scratch.doc_ids, &scratch.frequencies)?;
+                    if with_positions {
+                        self_full.encoded_position_blocks.push_encoded_block_slice(
+                            other_full.encoded_position_blocks.block(block_idx),
+                        )?;
+                    }
+                }
+            }
+            if other_tail_len > 0 {
+                for (doc_id, frequency) in
+                    TailEntries::new(&other_tail, usize::from(other_tail_len))
+                {
+                    let shifted = doc_id + doc_id_offset;
+                    push_varint(&mut self.tail, shifted.wrapping_sub(self.last_tail_doc_id));
+                    push_varint(&mut self.tail, frequency);
+                    self.last_tail_doc_id = shifted;
+                }
+                self.tail_len = other_tail_len;
+                if with_positions && let Some(other_tp) = other_tail_positions {
+                    let tail_positions = &mut self.overflow_mut().tail_positions;
+                    debug_assert!(tail_positions.is_empty());
+                    *tail_positions = other_tp;
+                }
+            }
+            return Ok(());
+        }
+
+        // Fast path 2: neither side completes a block; append tail entries and
+        // position deltas directly without decoding or flushing.
+        if other_full_blocks.is_none()
+            && usize::from(self.tail_len) + usize::from(other_tail_len) < block_size
+        {
+            for (doc_id, frequency) in TailEntries::new(&other_tail, usize::from(other_tail_len)) {
+                let shifted = doc_id + doc_id_offset;
+                push_varint(&mut self.tail, shifted.wrapping_sub(self.last_tail_doc_id));
+                push_varint(&mut self.tail, frequency);
+                self.last_tail_doc_id = shifted;
+            }
+            self.tail_len += other_tail_len;
+            if with_positions && let Some(other_tp) = other_tail_positions {
+                self.overflow_mut()
+                    .tail_positions
+                    .append_from_builder(other_tp)?;
+            }
+            return Ok(());
+        }
+
+        // General path: stream `other`'s full blocks and tail across block
+        // boundaries using reusable scratch buffers and raw delta slices.
+        if let Some(other_full) = other_full_blocks {
+            for (block_idx, block) in other_full.encoded_blocks.iter().enumerate() {
+                scratch.doc_ids.clear();
+                scratch.frequencies.clear();
+                decode_full_posting_block(
+                    block,
+                    &mut scratch.doc_ids,
+                    &mut scratch.frequencies,
+                    block_size,
+                );
+                if with_positions {
+                    let total_positions =
+                        scratch.frequencies.iter().try_fold(0usize, |sum, &freq| {
+                            sum.checked_add(freq as usize).ok_or_else(|| {
+                                Error::index("position stream length overflow while merging")
+                            })
+                        })?;
+                    scratch.deltas.clear();
+                    decode_position_stream_deltas_into(
+                        other_full.encoded_position_blocks.block(block_idx),
+                        total_positions,
+                        PositionStreamCodec::PackedDelta,
+                        &mut scratch.deltas,
+                    )?;
+                }
+                self.append_chunk_entries(
+                    &scratch.doc_ids,
+                    &scratch.frequencies,
+                    with_positions.then_some(scratch.deltas.as_slice()),
+                    doc_id_offset,
+                    &mut scratch.flush_doc_ids,
+                    &mut scratch.flush_frequencies,
+                )?;
+            }
+        }
+
+        if other_tail_len > 0 {
+            if usize::from(self.tail_len) + usize::from(other_tail_len) < block_size {
+                for (doc_id, frequency) in
+                    TailEntries::new(&other_tail, usize::from(other_tail_len))
+                {
+                    let shifted = doc_id + doc_id_offset;
+                    push_varint(&mut self.tail, shifted.wrapping_sub(self.last_tail_doc_id));
+                    push_varint(&mut self.tail, frequency);
+                    self.last_tail_doc_id = shifted;
+                }
+                self.tail_len += other_tail_len;
+                if with_positions && let Some(other_tp) = other_tail_positions {
+                    self.overflow_mut()
+                        .tail_positions
+                        .append_from_builder(other_tp)?;
+                }
+            } else {
+                scratch.doc_ids.clear();
+                scratch.frequencies.clear();
+                for (doc_id, frequency) in
+                    TailEntries::new(&other_tail, usize::from(other_tail_len))
+                {
+                    scratch.doc_ids.push(doc_id);
+                    scratch.frequencies.push(frequency);
+                }
+                if with_positions {
+                    scratch.deltas.clear();
+                    if let Some(other_tp) = other_tail_positions {
+                        other_tp.decode_deltas_into(&mut scratch.deltas)?;
+                    }
+                }
+                self.append_chunk_entries(
+                    &scratch.doc_ids,
+                    &scratch.frequencies,
+                    with_positions.then_some(scratch.deltas.as_slice()),
+                    doc_id_offset,
+                    &mut scratch.flush_doc_ids,
+                    &mut scratch.flush_frequencies,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn append_chunk_entries(
+        &mut self,
+        doc_ids: &[u32],
+        frequencies: &[u32],
+        deltas: Option<&[u32]>,
+        doc_id_offset: u32,
+        flush_doc_ids: &mut Vec<u32>,
+        flush_frequencies: &mut Vec<u32>,
+    ) -> Result<()> {
+        debug_assert_eq!(doc_ids.len(), frequencies.len());
+        let block_size = self.block_size();
+        let mut entry_offset = 0usize;
+        let mut delta_offset = 0usize;
+        while entry_offset < doc_ids.len() {
+            let need = block_size - usize::from(self.tail_len);
+            let take = need.min(doc_ids.len() - entry_offset);
+            let end = entry_offset + take;
+            let mut delta_count = 0usize;
+            for (&doc_id, &frequency) in doc_ids[entry_offset..end]
+                .iter()
+                .zip(frequencies[entry_offset..end].iter())
+            {
+                let shifted = doc_id + doc_id_offset;
+                push_varint(&mut self.tail, shifted.wrapping_sub(self.last_tail_doc_id));
+                push_varint(&mut self.tail, frequency);
+                self.last_tail_doc_id = shifted;
+                delta_count += frequency as usize;
+            }
+            if let Some(deltas) = deltas {
+                let delta_end = delta_offset + delta_count;
+                self.overflow_mut()
+                    .tail_positions
+                    .append_deltas(&deltas[delta_offset..delta_end])?;
+                delta_offset = delta_end;
+            }
+            let new_tail_len = usize::from(self.tail_len) + take;
+            if new_tail_len == block_size {
+                self.flush_tail_block_with_scratch(flush_doc_ids, flush_frequencies)?;
+            } else {
+                self.tail_len = new_tail_len as u8;
+            }
+            entry_offset = end;
+        }
+        if let Some(deltas) = deltas {
+            debug_assert_eq!(delta_offset, deltas.len());
+        }
+        Ok(())
     }
 
     pub fn add_occurrence(&mut self, doc_id: u32, position: u32) -> Result<bool> {
@@ -387,11 +714,27 @@ impl PostingListBuilder {
         let block_size = self.block_size();
         let mut doc_ids = Vec::with_capacity(block_size);
         let mut frequencies = Vec::with_capacity(block_size);
+        self.flush_tail_block_with_scratch(&mut doc_ids, &mut frequencies)
+    }
+
+    fn flush_tail_block_with_scratch(
+        &mut self,
+        doc_ids: &mut Vec<u32>,
+        frequencies: &mut Vec<u32>,
+    ) -> Result<()> {
+        let block_size = self.block_size();
+        doc_ids.clear();
+        frequencies.clear();
         for (doc_id, frequency) in TailEntries::new(&self.tail, block_size) {
             doc_ids.push(doc_id);
             frequencies.push(frequency);
         }
         let with_positions = self.with_positions;
+        let block_scratch = if with_positions {
+            block_position_scratch_bytes(frequencies)?
+        } else {
+            0
+        };
         let overflow = self.overflow_mut();
         debug_assert!(
             overflow.open_doc.is_none(),
@@ -400,8 +743,10 @@ impl PostingListBuilder {
         let full_blocks = overflow.full_blocks.get_or_insert_with(Box::default);
         full_blocks
             .encoded_blocks
-            .push_full_block(&doc_ids, &frequencies)?;
+            .push_full_block(doc_ids, frequencies)?;
         if with_positions {
+            full_blocks.max_block_scratch_bytes =
+                full_blocks.max_block_scratch_bytes.max(block_scratch);
             let tail_position_block = std::mem::take(&mut overflow.tail_positions).finish();
             full_blocks
                 .encoded_position_blocks

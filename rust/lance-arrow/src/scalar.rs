@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod arrow_scalar;
+mod convert;
+
+pub use arrow_scalar::ArrowScalar;
+
 use arrow_array::{ArrayRef, UInt64Array, make_array};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;

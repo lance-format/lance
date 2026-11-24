@@ -4,7 +4,7 @@
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use chrono::TimeDelta;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::SendableRecordBatchStream as DataFusionRecordBatchStream;
 use futures::{Stream, StreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
@@ -16,7 +16,7 @@ use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_datafusion::utils::StreamingWriteSource;
+use lance_datafusion::utils::{StreamingWriteSource, from_datafusion_stream};
 use lance_file::concat::{
     FileConcatOptions, FileConcatReason, FileConcatResult, FileConcatTarget,
     concat_data_file_parts as concat_parts,
@@ -27,15 +27,15 @@ use lance_file::versions::v1::writer::{
 };
 use lance_file::writer::{self as current_writer, FileWriteSummary};
 use lance_file::{versions as file_versions, writer::FileWriterOptions};
-use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
-};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::stream::SendableRecordBatchStream;
 use lance_io::traits::Writer;
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
+use lance_table_runtime::base::log_unregistered_base_scoped_options;
 use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -47,7 +47,7 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
-use crate::blob::prepared_to_logical_blob_schema;
+use crate::blob::{BlobWriteSources, prepared_to_logical_blob_schema};
 use crate::dataset::blob::{
     BlobPayloadInventory, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     SidecarRewrite, blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
@@ -193,6 +193,60 @@ impl Dataset {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         file_writer_options: FileWriterOptions,
     ) -> Result<DataFilePart> {
+        let data = data.map(|result| result.map(|batch| (batch, None)));
+        self.write_data_file_part_impl(target, blob_ids, data, file_writer_options)
+            .await
+    }
+
+    /// Encode one part with trusted payload sources accompanying its batches.
+    ///
+    /// Each source map belongs to one batch. Use prepared Blob v2 leaves and
+    /// insert the descriptors returned by [`BlobWriteSources`] at the relevant
+    /// slots. Uploaded keys are relative to the base of `target`. On an ordinary
+    /// table every non-empty payload is spilled to sidecars using the target's
+    /// allocated Blob IDs. A Managed-enabled table can reference the completed
+    /// upload directly. The part and its sidecars use the same lifetime and
+    /// concatenation rules as [`Self::write_data_file_part`].
+    ///
+    /// ```
+    /// # use std::ops::Range;
+    /// # use arrow_array::RecordBatch;
+    /// # use lance::{Dataset, Result, blob::BlobWriteSources, dataset::DataFileTarget};
+    /// # use lance_file::writer::FileWriterOptions;
+    /// # async fn example(dataset: &Dataset, target: &DataFileTarget, ids: Option<Range<u32>>,
+    /// #   batch: RecordBatch, sources: BlobWriteSources) -> Result<()> {
+    /// let part = dataset.write_data_file_part_with_blob_sources(
+    ///     target, ids, futures::stream::iter([Ok((batch, sources))]),
+    ///     FileWriterOptions::default(),
+    /// ).await?;
+    /// # let _ = part;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_data_file_part_with_blob_sources(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<(RecordBatch, BlobWriteSources)>> + Send,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<DataFilePart> {
+        if !versions::writes_blob_v2(target.version) {
+            return Err(Error::not_supported(
+                "Part writes with Blob sources require Lance file version 2.2 or later",
+            ));
+        }
+        let data = data.map(|result| result.map(|(batch, sources)| (batch, Some(sources))));
+        self.write_data_file_part_impl(target, blob_ids, data, file_writer_options)
+            .await
+    }
+
+    async fn write_data_file_part_impl(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<(RecordBatch, Option<BlobWriteSources>)>> + Send,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<DataFilePart> {
         self.validate_data_file_target(target)?;
         validate_blob_v2_write_schema(target.schema.as_ref())?;
         let managed = managed_blobs_enabled(target.schema.as_ref())?;
@@ -234,9 +288,9 @@ impl Dataset {
         } else {
             None
         };
+        let root = self.blob_base_path(target.base_id)?;
         if managed && let Some(writer) = preprocessor.take() {
-            let root = self.blob_base_path(target.base_id)?;
-            preprocessor = Some(writer.with_managed_base(target.base_id, root));
+            preprocessor = Some(writer.with_managed_base(target.base_id, root.clone()));
         }
 
         let file_name = format!("{}.part", generate_random_filename());
@@ -258,7 +312,9 @@ impl Dataset {
         let mut data = Box::pin(data);
         let write_result = async {
             while let Some(batch) = data.next().await {
-                writer.write_batch(&batch?).await?;
+                let (batch, sources) = batch?;
+                let sources = sources.as_ref().map(|sources| (&root, sources));
+                writer.write_batch_with_sources(&batch, sources).await?;
             }
             writer.finish_file().await
         }
@@ -400,7 +456,7 @@ impl WriteDestination<'_> {
 
     pub fn uri(&self) -> String {
         match self {
-            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
+            WriteDestination::Dataset(dataset) => dataset.table_state.uri.clone(),
             WriteDestination::Uri(uri) => uri.to_string(),
         }
     }
@@ -693,9 +749,9 @@ pub struct WriteParams {
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 
     /// New base paths to register in the manifest during dataset creation.
-    /// Each BasePath must have a properly assigned ID (non-zero).
+    /// An id of 0 requests an unused id; explicit non-zero ids must not
+    /// collide with existing bases or each other.
     /// Only used in CREATE/OVERWRITE modes for manifest registration.
-    /// IDs should be assigned by the caller before passing to WriteParams.
     pub initial_bases: Option<Vec<BasePath>>,
 
     /// Target base IDs for writing data files.
@@ -823,7 +879,8 @@ impl WriteParams {
     /// Set the initial_bases for this WriteParams.
     ///
     /// This specifies new base paths to register in the manifest during dataset creation.
-    /// Each BasePath must have a properly assigned ID (non-zero) before calling this method.
+    /// An id of 0 requests an unused id; explicit non-zero ids must not collide
+    /// with existing bases or each other.
     /// Only used in CREATE/OVERWRITE modes for manifest registration.
     pub fn with_initial_bases(self, bases: Vec<BasePath>) -> Self {
         Self {
@@ -1396,6 +1453,86 @@ pub(crate) async fn cleanup_data_fragments(
     }
 }
 
+/// Assign IDs to initial bases whose ID is zero.
+///
+/// Zero is both the automatic-assignment marker for `initial_bases` and the
+/// ID that selects primary storage in `target_bases`, so a registered base
+/// must never take it. Explicit IDs are reserved before any automatic ID is
+/// chosen, which keeps the result independent of the order the caller lists
+/// the bases in. Existing manifest bindings are reserved for the same reason.
+///
+/// Automatic IDs start after the highest existing ID, or at 1 when there are
+/// no existing bases, so previously valid requests keep the IDs they received.
+/// That range skips explicit IDs; once it is exhausted, allocation falls back
+/// to the lowest free ID.
+fn assign_initial_base_ids(
+    initial_bases: &mut [BasePath],
+    existing_base_paths: Option<&HashMap<u32, BasePath>>,
+) -> Result<()> {
+    let mut used_ids: BTreeSet<u32> = existing_base_paths
+        .map(|bases| bases.keys().copied().collect())
+        .unwrap_or_default();
+    used_ids.insert(PRIMARY_BASE_ID);
+
+    let mut explicit_ids = BTreeSet::new();
+    for base_path in initial_bases.iter() {
+        if base_path.id == PRIMARY_BASE_ID {
+            continue;
+        }
+        if let Some(existing) = existing_base_paths.and_then(|bases| bases.get(&base_path.id)) {
+            return Err(Error::invalid_input(format!(
+                "Cannot register base ID {} for '{}': it is already bound to '{}'",
+                base_path.id, base_path.path, existing.path
+            )));
+        }
+        if !explicit_ids.insert(base_path.id) {
+            return Err(Error::invalid_input(format!(
+                "Duplicate explicit base ID {} in initial_bases. Base IDs must be unique.",
+                base_path.id
+            )));
+        }
+    }
+
+    used_ids.extend(explicit_ids);
+    let mut next_above_max = existing_base_paths
+        .and_then(|bases| bases.keys().max().copied())
+        .map_or(Some(1), |max_id| max_id.checked_add(1));
+    for base_path in initial_bases.iter_mut() {
+        if base_path.id != PRIMARY_BASE_ID {
+            continue;
+        }
+        let id = match next_above_max.and_then(|start| first_unused_at_or_above(start, &used_ids)) {
+            Some(id) => {
+                next_above_max = id.checked_add(1);
+                id
+            }
+            None => {
+                // No ID above the highest existing one remains, so the free
+                // IDs can only be below that range.
+                next_above_max = None;
+                BasePath::unused_id(used_ids.iter().copied())?
+            }
+        };
+        base_path.id = id;
+        used_ids.insert(id);
+    }
+    Ok(())
+}
+
+/// Find the first ID at or above `start` that is not in `used_ids`.
+///
+/// Returns `None` when every ID from `start` through `u32::MAX` is used.
+fn first_unused_at_or_above(start: u32, used_ids: &BTreeSet<u32>) -> Option<u32> {
+    let mut candidate = start;
+    for &used_id in used_ids.range(start..) {
+        if used_id != candidate {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
+    Some(candidate)
+}
+
 pub async fn validate_and_resolve_target_bases(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
@@ -1423,13 +1560,8 @@ pub async fn validate_and_resolve_target_bases(
     // Step 2: Assign IDs to initial_bases and add them to all_bases
     let mut all_bases: HashMap<u32, BasePath> = existing_base_paths.cloned().unwrap_or_default();
     if let Some(initial_bases) = &mut params.initial_bases {
-        let mut next_id = all_bases.keys().max().map(|&id| id + 1).unwrap_or(1);
-
-        for base_path in initial_bases.iter_mut() {
-            if base_path.id == 0 {
-                base_path.id = next_id;
-                next_id += 1;
-            }
+        assign_initial_base_ids(initial_bases, existing_base_paths)?;
+        for base_path in initial_bases.iter() {
             all_bases.insert(base_path.id, base_path.clone());
         }
     }
@@ -1536,17 +1668,11 @@ pub(crate) async fn validate_and_resolve_target_bases_with_primary(
             .map(|bases| bases.keys().copied().collect())
             .unwrap_or_default();
         // CREATE mode registers initial_bases in the same write; assign their
-        // ids here (the delegate keeps non-zero ids as-is) so they join the
-        // rotation.
+        // ids here (reserving explicit ids before automatic ones) so they join
+        // the rotation.
         if let Some(initial_bases) = &mut params.initial_bases {
-            let mut next_id = ids.iter().max().map(|id| id + 1).unwrap_or(1);
-            for base_path in initial_bases.iter_mut() {
-                if base_path.id == 0 {
-                    base_path.id = next_id;
-                    next_id += 1;
-                }
-                ids.push(base_path.id);
-            }
+            assign_initial_base_ids(initial_bases, existing_base_paths)?;
+            ids.extend(initial_bases.iter().map(|base_path| base_path.id));
         }
         ids.sort_unstable();
         ids.dedup();
@@ -1660,37 +1786,6 @@ fn append_external_base_candidate(
             base_path: extracted_path,
             store_params,
         });
-    }
-}
-
-/// Log base-scoped storage options (`base_<id>.<key>`) whose id does not
-/// match any registered base path. Unregistered entries are ignored during
-/// resolution. The open path logs at debug, since options may legitimately be
-/// vended for bases the loaded version does not register; the write path logs
-/// at warn, since ids are already assigned there and an unmatched id is much
-/// more likely a mistake.
-pub(crate) fn log_unregistered_base_scoped_options(
-    store_params: Option<&ObjectStoreParams>,
-    base_paths: &HashMap<u32, BasePath>,
-    level: log::Level,
-) {
-    if !log::log_enabled!(level) {
-        return;
-    }
-    let Some(options) = store_params.and_then(|params| params.storage_options()) else {
-        return;
-    };
-    let unregistered = options
-        .keys()
-        .filter_map(|key| parse_base_scoped_key(key).map(|(id, _)| id))
-        .filter(|id| !base_paths.contains_key(id))
-        .collect::<BTreeSet<_>>();
-    if !unregistered.is_empty() {
-        log::log!(
-            level,
-            "Ignoring base-scoped storage options for unregistered base path ids: {:?}",
-            unregistered
-        );
     }
 }
 
@@ -1815,9 +1910,7 @@ pub(super) async fn blob_v2_external_base_resolver(
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
 ///
-/// This is a private variant that takes a `SendableRecordBatchStream` instead
-/// of a reader. We don't expose the stream at our interface because it is a
-/// DataFusion type.
+/// Accepts a DataFusion stream and an already resolved write schema.
 ///
 /// The caller must resolve `storage_version` once for the operation. Operations
 /// that also select a commit format must reuse the same value when committing.
@@ -1829,7 +1922,7 @@ pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: Schema,
-    data: SendableRecordBatchStream,
+    data: DataFusionRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
@@ -1839,7 +1932,7 @@ pub async fn write_fragments_internal(
         object_store,
         base_dir,
         schema,
-        data,
+        from_datafusion_stream(data),
         params,
         target_bases_info,
         None,
@@ -2075,6 +2168,22 @@ fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+
+    #[doc(hidden)]
+    async fn write_with_blob_sources(
+        &mut self,
+        batch: &RecordBatch,
+        _root: &Path,
+        sources: &BlobWriteSources,
+    ) -> Result<()> {
+        if !sources.is_empty() {
+            return Err(Error::not_supported(
+                "This writer does not accept Blob sources",
+            ));
+        }
+        self.write(std::slice::from_ref(batch)).await
+    }
+
     /// Mark the next batch as ending the current file page.
     fn prepare_for_flush(&mut self) {}
     /// Get the file path and base ID for the data file being written.
@@ -2220,9 +2329,20 @@ impl V2WriterAdapter {
     }
 
     pub(in crate::dataset) async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_batch_with_sources(batch, None).await
+    }
+
+    async fn write_batch_with_sources(
+        &mut self,
+        batch: &RecordBatch,
+        sources: Option<(&Path, &BlobWriteSources)>,
+    ) -> Result<()> {
         let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch.clone())?;
         let batch = match self.preprocessor.as_mut() {
-            Some(pre) => pre.preprocess_batch(&batch).await?,
+            Some(pre) => pre.preprocess_batch_with_sources(&batch, sources).await?,
+            None if sources.is_some_and(|(_, sources)| !sources.is_empty()) => {
+                return Err(Error::invalid_input("Blob sources require a Blob v2 field"));
+            }
             None => batch,
         };
         self.writer.write_batch(&batch).await
@@ -2269,6 +2389,17 @@ impl GenericWriter for V2WriterAdapter {
         }
         Ok(())
     }
+
+    async fn write_with_blob_sources(
+        &mut self,
+        batch: &RecordBatch,
+        root: &Path,
+        sources: &BlobWriteSources,
+    ) -> Result<()> {
+        self.write_batch_with_sources(batch, Some((root, sources)))
+            .await
+    }
+
     fn prepare_for_flush(&mut self) {
         self.writer.prepare_for_flush();
     }
@@ -2760,6 +2891,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::StorageOptionsAccessor;
+    use lance_io::stream::RecordBatchStreamAdapter as LanceRecordBatchStreamAdapter;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
     use parquet_variant_compute::{
@@ -3046,11 +3178,13 @@ mod tests {
             .map(|&batch_rows| {
                 let batch = data.slice(offset, batch_rows);
                 offset += batch_rows;
-                Ok::<_, DataFusionError>(batch)
+                Ok(batch)
             })
             .collect::<Vec<_>>();
-        let stream =
-            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let stream = LanceRecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(batches),
+        );
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
@@ -3103,10 +3237,12 @@ mod tests {
         let batches = input_batch_sizes.map(|batch_rows| {
             let batch = data.slice(offset, batch_rows);
             offset += batch_rows;
-            Ok::<_, DataFusionError>(batch)
+            Ok(batch)
         });
-        let stream =
-            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let stream = LanceRecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(batches),
+        );
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
@@ -4061,6 +4197,185 @@ mod tests {
                 .to_string()
                 .contains("Cannot specify both target_base_names_or_paths and target_bases")
         );
+    }
+
+    #[rstest]
+    #[case::auto_before_explicit("auto_before_explicit", &[0, 1])]
+    #[case::explicit_before_auto("explicit_before_auto", &[1, 0])]
+    #[tokio::test]
+    async fn test_initial_base_ids_reserve_explicit_ids(
+        #[case] case_name: &str,
+        #[case] initial_ids: &[u32],
+    ) {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = format!("shared-memory://initial_base_ids_{case_name}");
+        let primary_uri = format!("{test_uri}/primary");
+        let auto_uri = format!("{test_uri}/auto");
+        let explicit_uri = format!("{test_uri}/explicit");
+
+        let initial_bases = initial_ids
+            .iter()
+            .map(|id| {
+                if *id == 0 {
+                    BasePath::new(0, auto_uri.clone(), Some("auto".to_string()), true)
+                } else {
+                    BasePath::new(
+                        *id,
+                        explicit_uri.clone(),
+                        Some("explicit".to_string()),
+                        true,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen.batch(2),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 1,
+                initial_bases: Some(initial_bases),
+                target_base_names_or_paths: Some(vec!["auto".to_string(), "explicit".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The automatic base must not take the explicit ID or primary ID 0,
+        // whichever order the caller listed them in.
+        let base_paths = &dataset.manifest.base_paths;
+        assert_eq!(base_paths.len(), 2, "both initial bases must survive");
+        assert!(!base_paths.contains_key(&PRIMARY_BASE_ID));
+        assert_eq!(base_paths[&1].path, explicit_uri);
+        assert_eq!(base_paths[&1].name.as_deref(), Some("explicit"));
+        assert_eq!(base_paths[&2].path, auto_uri);
+        assert_eq!(base_paths[&2].name.as_deref(), Some("auto"));
+
+        // Target resolution follows the assigned ids, and the round-robin
+        // order follows the requested target order.
+        let file_bases = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| fragment.metadata.files.iter().map(|file| file.base_id))
+            .collect::<Vec<_>>();
+        assert_eq!(file_bases, vec![Some(2), Some(1)]);
+
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_initial_base_ids_reject_duplicate_explicit_ids() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = "shared-memory://duplicate_initial_base_ids";
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let error = Dataset::write(
+            data_gen.batch(1),
+            &format!("{test_uri}/primary"),
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath::new(
+                        1,
+                        format!("{test_uri}/base1"),
+                        Some("base1".to_string()),
+                        true,
+                    ),
+                    BasePath::new(
+                        1,
+                        format!("{test_uri}/base2"),
+                        Some("base2".to_string()),
+                        true,
+                    ),
+                ]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("duplicate explicit base IDs must be rejected");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("Duplicate explicit base ID 1"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initial_base_ids_reject_existing_conflicts_and_reserve_existing_ids() {
+        let existing = HashMap::from([(
+            1,
+            BasePath::new(
+                1,
+                "memory://existing".to_string(),
+                Some("existing".to_string()),
+                true,
+            ),
+        )]);
+        let mut params = WriteParams {
+            mode: WriteMode::Create,
+            initial_bases: Some(vec![BasePath::new(
+                1,
+                "memory://conflict".to_string(),
+                Some("conflict".to_string()),
+                true,
+            )]),
+            ..Default::default()
+        };
+
+        let result = validate_and_resolve_target_bases(&mut params, Some(&existing)).await;
+        let Err(error) = result else {
+            panic!("an explicit ID that already exists must be rejected");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("already bound to 'memory://existing'"),
+            "{error}"
+        );
+
+        // Automatic assignment must skip primary ID 0 and existing IDs.
+        params.initial_bases = Some(vec![BasePath::new(
+            0,
+            "memory://auto".to_string(),
+            Some("auto".to_string()),
+            true,
+        )]);
+        let result = validate_and_resolve_target_bases(&mut params, Some(&existing))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(params.initial_bases.as_ref().unwrap()[0].id, 2);
+
+        // Using the highest u32 id must not overflow automatic allocation, and
+        // it must not consume a lower unused id.
+        let high_existing = HashMap::from([(
+            u32::MAX,
+            BasePath::new(
+                u32::MAX,
+                "memory://high".to_string(),
+                Some("high".to_string()),
+                true,
+            ),
+        )]);
+        params.initial_bases = Some(vec![BasePath::new(
+            0,
+            "memory://auto".to_string(),
+            Some("auto".to_string()),
+            true,
+        )]);
+        let result = validate_and_resolve_target_bases(&mut params, Some(&high_existing))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(params.initial_bases.as_ref().unwrap()[0].id, 1);
     }
 
     #[tokio::test]
@@ -5054,11 +5369,13 @@ mod tests {
         .unwrap();
 
         // Build a stream: one good batch, then an error.
-        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
-            Err(DataFusionError::External("injected failure".into())),
+            Err(Error::External {
+                source: "injected failure".into(),
+            }),
         ];
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5116,12 +5433,14 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
         .unwrap();
-        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
             Ok(good_batch.slice(0, 1)),
-            Err(DataFusionError::External("injected failure".into())),
+            Err(Error::External {
+                source: "injected failure".into(),
+            }),
         ];
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5223,7 +5542,7 @@ mod tests {
 
     async fn write_id_batches(
         test_uri: &str,
-        items: Vec<std::result::Result<RecordBatch, DataFusionError>>,
+        items: Vec<Result<RecordBatch>>,
         params: WriteParams,
     ) -> Result<Vec<Fragment>> {
         let arrow_schema = id_batch(0).schema();
@@ -5232,7 +5551,7 @@ mod tests {
             ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
                 .await
                 .unwrap();
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema,
             futures::stream::iter(items),
         ));
@@ -5552,14 +5871,16 @@ mod tests {
 
         // 3 rows per file: the first batch fills and completes a file in the
         // target base, then the stream fails or the hook fails on the last file.
-        let mut items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        let mut items: Vec<Result<RecordBatch>> = vec![
             Ok(good_batch.clone()),
             Ok(good_batch.slice(0, second_batch_rows)),
         ];
         if fail_complete_at.is_none() {
-            items.push(Err(DataFusionError::External("injected failure".into())));
+            items.push(Err(Error::External {
+                source: "injected failure".into(),
+            }));
         }
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(LanceRecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
         ));
@@ -5913,17 +6234,19 @@ mod tests {
                     mode: WriteMode::Create,
                     max_rows_per_file: 3,
                     initial_bases: Some(vec![
-                        BasePath {
-                            id: 0,
-                            name: Some("base1".to_string()),
-                            is_dataset_root: true,
-                            path: format!("{}/base1", create_root),
-                        },
+                        // Listed before the explicit ID 1: the automatic base
+                        // must not take that reserved ID.
                         BasePath {
                             id: 0,
                             name: Some("base2".to_string()),
                             is_dataset_root: false,
                             path: format!("{}/base2", create_root),
+                        },
+                        BasePath {
+                            id: 1,
+                            name: Some("base1".to_string()),
+                            is_dataset_root: true,
+                            path: format!("{}/base1", create_root),
                         },
                     ]),
                     ..Default::default()
@@ -5934,6 +6257,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dataset.manifest.base_paths.len(), 2);
+        assert_eq!(
+            dataset.manifest.base_paths[&1].name.as_deref(),
+            Some("base1")
+        );
+        assert_eq!(
+            dataset.manifest.base_paths[&2].name.as_deref(),
+            Some("base2")
+        );
         let file_bases: Vec<_> = dataset
             .get_fragments()
             .iter()
@@ -5976,14 +6307,15 @@ mod tests {
             .unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
         for fragment in fragments {
             let data_file = fragment.metadata.files.first().unwrap();
             let path = dataset
+                .table_state
                 .base
                 .clone()
                 .join(super::DATA_DIR)
@@ -5996,7 +6328,10 @@ mod tests {
                 file_scheduler,
                 None,
                 Default::default(),
-                &dataset.metadata_cache.file_metadata_cache(&path),
+                &dataset
+                    .table_state
+                    .metadata_cache
+                    .file_metadata_cache(&path),
                 FileReaderOptions::default(),
             )
             .await
@@ -6058,10 +6393,11 @@ mod tests {
         let data_file = new_fragment.files.first().unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let path = dataset
+            .table_state
             .base
             .clone()
             .join(super::DATA_DIR)
@@ -6074,7 +6410,10 @@ mod tests {
             file_scheduler,
             None,
             Default::default(),
-            &dataset.metadata_cache.file_metadata_cache(&path),
+            &dataset
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(&path),
             FileReaderOptions::default(),
         )
         .await

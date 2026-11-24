@@ -317,7 +317,13 @@ async fn discard(dataset: &Dataset, fragment_id: u64, files: Vec<DataFile>) {
         files,
         ..Fragment::new(fragment_id)
     };
-    cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &[partial]).await;
+    cleanup_data_fragments(
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
+        None,
+        &[partial],
+    )
+    .await;
 }
 
 /// Write `columns` of `source` to one new data file.

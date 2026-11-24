@@ -30,9 +30,10 @@ use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
-use crate::dataset::{ManifestWriteConfig, NewColumnTransform, write_manifest_file};
+use crate::dataset::{NewColumnTransform, write_manifest_file};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
+use lance_table::format::ManifestBuildConfig;
 
 const PROVIDER: &str = "org.example.cluster";
 const BUCKET_KEY: &str = "org.example.cluster.bucket";
@@ -94,31 +95,23 @@ async fn commit_edited_manifest(
     edit: impl FnOnce(&mut Manifest, &mut Vec<IndexMetadata>),
 ) -> Dataset {
     let mut manifest = dataset.manifest().clone();
-    let mut indices =
-        read_manifest_indexes(&dataset.object_store, &dataset.manifest_location, &manifest)
-            .await
-            .unwrap();
+    let mut indices = read_manifest_indexes(
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
+        &manifest,
+    )
+    .await
+    .unwrap();
     edit(&mut manifest, &mut indices);
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         Some(indices),
-        &ManifestWriteConfig {
-            auto_set_feature_flags: true,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default(),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         false,
     )
@@ -414,8 +407,8 @@ async fn branch_and_shallow_clone_carry_definitions_and_metadata() {
 
 async fn named_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
     read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         dataset.manifest(),
     )
     .await
@@ -1745,8 +1738,8 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
         .insert_with_key(
             &PriorWriterIndexMetadataKey {
                 version: dataset.manifest().version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             },
             Arc::new(stripped),
         )

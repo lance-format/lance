@@ -8,8 +8,7 @@ use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
     utils::{
-        filter_finite_training_data, infer_vector_dim, maybe_sample_training_data,
-        sample_unseen_training_data,
+        filter_finite_training_data, maybe_sample_ivf_training_data, sample_unseen_training_data,
     },
 };
 use super::{
@@ -17,9 +16,7 @@ use super::{
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
-use crate::dataset::transaction::Operation;
 use crate::index::DatasetIndexExt;
-use crate::index::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
@@ -45,7 +42,7 @@ use arrow_buffer::MutableBuffer;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::{FutureExt, TryFutureExt};
+use futures::TryFutureExt;
 use futures::{
     Stream, TryStreamExt,
     stream::{self, StreamExt},
@@ -111,7 +108,7 @@ use lance_index::{
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::{CachedFileSize, read_last_block, read_version};
+use lance_io::utils::CachedFileSize;
 use lance_io::{
     ReadBatchParams,
     local::to_local_path,
@@ -134,7 +131,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     any::Any,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     future::Future,
     ops::Range,
     pin::Pin,
@@ -145,12 +142,15 @@ use tracing::instrument;
 use uuid::Uuid;
 
 pub mod builder;
+mod compatibility;
 mod coreset_algo;
 pub mod io;
 mod partition_serde;
+mod shape;
 mod streaming_hamming;
 pub mod v2;
 
+pub(crate) use compatibility::{VectorQueryContract, validate_committed_vector_segments};
 use coreset_algo::{FloatCoresetAlgorithm, HammingCoresetAlgorithm, StreamingCoresetAlgorithm};
 
 // Cache wrapper for vector index trait objects
@@ -572,255 +572,6 @@ pub(crate) fn validate_vector_query_compatibility(
     Ok(())
 }
 
-/// What a search ranks a vector segment by: its metric and its index type.
-/// Merging the distances of segments that differ in either ranks part of the
-/// data by the wrong one.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct VectorQueryContract {
-    metric: DistanceType,
-    /// `IndexType::Vector` for an index extension, which names no type this
-    /// build knows; it matches only another such segment.
-    index_type: IndexType,
-}
-
-impl VectorQueryContract {
-    /// The contract of an opened segment, from the two accessors every
-    /// vector index implements, legacy ones included.
-    pub(crate) fn of_index(index: &dyn VectorIndex) -> Self {
-        Self {
-            metric: index.metric_type(),
-            index_type: index.index_type(),
-        }
-    }
-
-    /// The contract an index file of the current format records in its
-    /// schema: the type the opener dispatches on, and the metric the opened
-    /// index ranks by.
-    fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
-        let index_type = IndexType::try_from(metadata.index_type.as_str())?;
-        // The opener opens these files only as one of the IVF types.
-        if !index_type.is_vector() || index_type == IndexType::Vector {
-            return Err(Error::index(format!(
-                "Unsupported index type: {}",
-                metadata.index_type
-            )));
-        }
-        Ok(Self {
-            metric: DistanceType::try_from(metadata.distance_type.as_str())?,
-            index_type,
-        })
-    }
-}
-
-impl std::fmt::Display for VectorQueryContract {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.index_type {
-            // Its `Display` says IVF_PQ.
-            IndexType::Vector => write!(f, "metric {:?}, an index extension's type", self.metric),
-            index_type => write!(f, "metric {:?}, type {index_type}", self.metric),
-        }
-    }
-}
-
-/// Refuses a `CreateIndex` that would leave the segments of one index name
-/// keyed on different columns, or its vector segments under different query
-/// contracts. The index APIs compare the contracts of opened segments with
-/// [`validate_vector_query_compatibility`]; a raw transaction reaches the
-/// commit without them, so each commit attempt compares every segment the new
-/// manifest keeps under each name the transaction adds to, retained ones
-/// included, whatever their details say: a search merges all of them once it
-/// picks the name, and one this build would leave out as too new, a newer
-/// build merges. The caller of a raw transaction sets every field of the
-/// segment metadata, so each contract is read from the segment's own index
-/// file, and a file that cannot be read refuses the commit.
-///
-/// A search opens every segment of the name it picks as a vector segment, so
-/// when some segments of a name have an index file, all of them need one: a
-/// scalar segment on the same column, or a vector segment whose file is gone,
-/// would fail every search. A name none of whose segments has one, such as a
-/// zone map on a vector-typed column, is not a vector index.
-pub(crate) async fn validate_committed_vector_segments(
-    dataset: &Dataset,
-    operation: &Operation,
-    proposed_indices: &[TableIndexMetadata],
-) -> Result<()> {
-    let Operation::CreateIndex { new_indices, .. } = operation else {
-        return Ok(());
-    };
-    let mut segments_by_name: BTreeMap<&str, Vec<&TableIndexMetadata>> = new_indices
-        .iter()
-        .map(|index| (index.name.as_str(), Vec::new()))
-        .collect();
-    for segment in proposed_indices {
-        if let Some(segments) = segments_by_name.get_mut(segment.name.as_str()) {
-            segments.push(segment);
-        }
-    }
-
-    for (name, segments) in segments_by_name {
-        // A search picks a name by a segment keyed on the queried vector
-        // column, then merges the other segments of that name with it.
-        let keyed_on_a_vector_column = segments.iter().any(|segment| {
-            segment
-                .fields
-                .first()
-                .and_then(|&field_id| dataset.schema().field_by_id(field_id))
-                .is_some_and(|field| infer_vector_dim(&field.data_type()).is_ok())
-        });
-        if segments.len() < 2 || !keyed_on_a_vector_column {
-            continue;
-        }
-        let first = segments[0];
-        if let Some(other) = segments
-            .iter()
-            .find(|segment| segment.keyed_fields() != first.keyed_fields())
-        {
-            let columns = |segment: &TableIndexMetadata| {
-                segment
-                    .keyed_fields()
-                    .iter()
-                    .map(|&field_id| {
-                        dataset
-                            .schema()
-                            .field_path(field_id)
-                            .unwrap_or_else(|_| format!("field {field_id}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segments {} (on {}) and {} (on {}) would both remain in index \
-                 '{name}'; a search reads every segment of an index as keyed on the queried \
-                 column, so all of them must be keyed on the same columns",
-                first.uuid,
-                columns(first),
-                other.uuid,
-                columns(other),
-            )));
-        }
-        // Boxed and collected first: reading a segment is a large future, and
-        // mapping these references inside the stream makes rustc report the
-        // commit future's `Send` as "not general enough".
-        let contracts = segments
-            .into_iter()
-            .map(|segment| {
-                async move {
-                    let contract =
-                        vector_segment_contract(dataset, segment)
-                            .await
-                            .map_err(|error| {
-                                Error::io(format!(
-                                    "CreateIndex: cannot read vector segment {} to check that \
-                                     index '{}' keeps one metric and index type: {error}",
-                                    segment.uuid, segment.name
-                                ))
-                            })?;
-                    Ok::<_, Error>((segment, contract))
-                }
-                .boxed()
-            })
-            .collect::<Vec<_>>();
-        let mut contracts = stream::iter(contracts).buffered(dataset.object_store.io_parallelism());
-        let mut reference: Option<(&TableIndexMetadata, VectorQueryContract)> = None;
-        let mut without_index_file = None;
-        while let Some((segment, contract)) = contracts.try_next().await? {
-            match contract {
-                None => {
-                    without_index_file.get_or_insert(segment);
-                }
-                Some(contract) => match &reference {
-                    None => reference = Some((segment, contract)),
-                    Some((first, expected)) if *expected != contract => {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: vector segments {} ({expected}) and {} ({contract}) \
-                             would both remain in index '{name}'; a search ranks every segment \
-                             of an index by one metric and index type, so replace all of its \
-                             segments in one commit",
-                            first.uuid, segment.uuid,
-                        )));
-                    }
-                    Some(_) => {}
-                },
-            }
-            if let (Some((first, expected)), Some(other)) = (&reference, without_index_file) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: vector segment {} ({expected}) and segment {}, which has no \
-                     vector index file, would both remain in index '{name}'; a search opens \
-                     every segment of an index as a vector segment",
-                    first.uuid, other.uuid,
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A vector segment's contract, read from its own index file. A file of the
-/// current format records it in its schema, read the way the opener reads it
-/// before loading any centroid; a file of an older format, or an index
-/// extension's, is opened on the identity plan, since a staged segment is in
-/// no listing a query plan covers, and a plan translates row addresses, never
-/// a metric or a type.
-///
-/// `None` when the segment has no index file: the files it records name
-/// none, or it records no files and the store has none.
-async fn vector_segment_contract(
-    dataset: &Dataset,
-    segment: &TableIndexMetadata,
-) -> Result<Option<VectorQueryContract>> {
-    // Not asked of the store: a missing key costs a request and its retries
-    // per segment, and a store may answer it with a denial instead.
-    if segment
-        .files
-        .as_ref()
-        .is_some_and(|files| !files.iter().any(|file| file.path == INDEX_FILE_NAME))
-    {
-        return Ok(None);
-    }
-    let object_store = dataset.object_store_for_index(segment).await?;
-    let index_file = dataset
-        .indice_files_dir(segment)?
-        .join(segment.uuid.to_string())
-        .join(INDEX_FILE_NAME);
-    let file_sizes = segment.file_size_map();
-    let version = async {
-        let reader = open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?;
-        read_version(&read_last_block(reader.as_ref()).await?)
-    };
-    let version = match version.await {
-        Ok(version) => version,
-        Err(error) if error.is_not_found() => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if matches!(version, (0, 3) | (2, _)) {
-        let metadata = dataset
-            .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
-            .await?;
-        return VectorQueryContract::from_file_metadata(&metadata).map(Some);
-    }
-    let field_id = segment
-        .fields
-        .first()
-        .ok_or_else(|| Error::invalid_input("the segment names no indexed column".to_string()))?;
-    let column = dataset.schema().field_path(*field_id)?;
-    let index = dataset
-        .open_vector_index_from_metadata_with_plan(
-            &column,
-            segment,
-            Some(&SegmentRemappingPlan::Identity),
-            OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
-        )
-        .await?;
-    Ok(Some(VectorQueryContract::of_index(index.as_ref())))
-}
-
 fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
     let first = indices.first()?;
     let first_centroids = first.ivf_model().centroids_array();
@@ -990,8 +741,8 @@ fn existing_index_sources(
         .segments()
         .map(|(metadata, index)| {
             let (Some(effective), Some(deleted)) = (
-                metadata.effective_fragment_bitmap(&dataset.fragment_bitmap),
-                metadata.deleted_fragment_bitmap(&dataset.fragment_bitmap),
+                metadata.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap),
+                metadata.deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap),
             ) else {
                 return ExistingIndex::unfiltered(index.clone());
             };
@@ -1081,7 +832,7 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let index_file = dataset
         .indices_dir()
         .join(new_uuid.to_string())
@@ -2028,7 +1779,7 @@ pub async fn build_ivf_model(
         sample_size_hint
     );
     let training_data =
-        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
+        maybe_sample_ivf_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -2289,7 +2040,7 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     let file = write_ivf_pq_file(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         dataset.indices_dir(),
         column,
         index_name,
@@ -2582,7 +2333,7 @@ pub(crate) async fn remap_index_file(
     column: String,
     transforms: Vec<pb::Transform>,
 ) -> Result<IndexFile> {
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let old_path = dataset
         .indices_dir()
         .join(old_uuid.to_string())
@@ -2730,7 +2481,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
-    let obj_store = dataset.object_store.as_ref();
+    let obj_store = dataset.table_state.object_store.as_ref();
     let path = dataset
         .indices_dir()
         .join(index_id.to_string())
@@ -2772,7 +2523,7 @@ async fn write_ivf_hnsw_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let path = dataset
         .indices_dir()
         .join(uuid.to_string())
@@ -2910,7 +2661,7 @@ pub(crate) async fn merge_segments(
         );
     }
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         Some(row_filters),
@@ -2926,7 +2677,7 @@ pub(crate) async fn merge_remapped_segments(
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         None,
@@ -3725,7 +3476,9 @@ async fn sample_ivf_training_chunk(
             )
             .await?
         }
-        None => maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?,
+        None => {
+            maybe_sample_ivf_training_data(dataset, column, sample_size_hint, fragment_ids).await?
+        }
     };
     let (training_data, mt) = if metric_type == MetricType::Cosine {
         let training_data = normalize_fsl_owned(training_data)?;
@@ -5719,7 +5472,7 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
         generate_fixed_training_ranges(
             selection_rows,
             selection_rows.min(requested_rows),
-            dataset.object_store.as_ref().block_size(),
+            dataset.table_state.object_store.as_ref().block_size(),
             sampler.byte_width,
         )
     });
@@ -6882,7 +6635,7 @@ mod tests {
             fields: vec![field.id],
             covering_fields: vec![],
             name: INDEX_NAME.to_string(),
-            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: Some(dataset.table_state.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -6986,7 +6739,7 @@ mod tests {
             fields: vec![field.id],
             covering_fields: vec![],
             name: format!("{}_remapped", INDEX_NAME),
-            fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: Some(dataset_mut.table_state.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -10499,11 +10252,19 @@ mod tests {
             .unwrap();
 
         // Reset IO stats after index creation
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         // Prewarm should perform IO to load all partitions into cache
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10520,7 +10281,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10530,7 +10295,11 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -10652,11 +10421,19 @@ mod tests {
             .clone();
 
         // Reset IO stats after migration and sampling.
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         // Prewarm should perform IO to load all index deltas into cache.
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10672,7 +10449,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10682,7 +10463,11 @@ mod tests {
 
         // Second prewarm should not need IO (already cached).
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 }

@@ -673,6 +673,7 @@ async fn test_compaction_merges_compatible_vector_segments(
         segment.fragment_bitmap = Some(RoaringBitmap::from_iter([fragment.id() as u32]));
         for file in ["index.idx", "auxiliary.idx"] {
             dataset
+                .table_state
                 .object_store
                 .copy(
                     &dataset
@@ -803,6 +804,7 @@ async fn test_stale_vector_segment_merge_requires_replan() {
         segment.fragment_bitmap = Some(RoaringBitmap::from_iter(fragment_ids));
         for file in template.files.as_ref().unwrap() {
             dataset
+                .table_state
                 .object_store
                 .copy(
                     &dataset
@@ -1596,6 +1598,7 @@ async fn test_ivf_flat_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         10,
+        false,
     ))
     .await;
 }
@@ -1610,8 +1613,198 @@ async fn test_ivf_hnsw_sq_defer_compaction_merge_only() {
     );
     // No deletions: storage positions are stable, so the graph stays aligned.
     // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
-    Box::pin(check_vector_defer_compaction(params, None, 10, 9)).await;
+    Box::pin(check_vector_defer_compaction(params, None, 10, 9, false)).await;
 }
+
+/// Deletions spread through every partition drop rows from the storage as it
+/// loads, so the HNSW graph must be realigned with the shifted positions and
+/// stay connected.
+#[rstest]
+#[case::sq(VectorIndexParams::with_ivf_hnsw_sq_params(
+    DistanceType::L2,
+    small_ivf(),
+    lance_index::vector::hnsw::builder::HnswBuildParams::default(),
+    lance_index::vector::sq::builder::SQBuildParams::default(),
+))]
+#[case::pq(VectorIndexParams::with_ivf_hnsw_pq_params(
+    DistanceType::L2,
+    small_ivf(),
+    lance_index::vector::hnsw::builder::HnswBuildParams::default(),
+    lance_index::vector::pq::PQBuildParams {
+        max_iters: 2,
+        num_sub_vectors: 4,
+        ..Default::default()
+    },
+))]
+#[tokio::test]
+async fn test_ivf_hnsw_defer_compaction_with_deletions(
+    #[case] params: VectorIndexParams,
+    #[values(false, true)] prewarm: bool,
+    // Deleting 95% of rows removes most transit nodes, which strands survivors
+    // unless the realigned graph is repaired.
+    #[values(("id % 3 = 0", 8), ("id % 20 != 0", 5))] deletion: (&str, usize),
+) {
+    let (delete_predicate, min_overlap) = deletion;
+    // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+    Box::pin(check_vector_defer_compaction(
+        params,
+        Some(delete_predicate),
+        10,
+        min_overlap,
+        prewarm,
+    ))
+    .await;
+}
+/// Each indexed row's level-0 HNSW neighbors, keyed and listed by `id`, read
+/// from the graph on disk of the IVF_HNSW_SQ index `vec_idx`.
+async fn hnsw_level0_neighbor_ids(dataset: &Dataset) -> HashMap<i32, Vec<i32>> {
+    use crate::index::vector::ivf::v2::IvfHnswSqIndex;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, UInt32Type, UInt64Type};
+    use lance_index::vector::VectorIndex;
+    use lance_index::vector::storage::VectorStore;
+
+    let mut scanner = dataset.scan();
+    scanner.with_row_address().project(&["id"]).unwrap();
+    let rows = scanner.try_into_batch().await.unwrap();
+    let id_of: HashMap<u64, i32> = rows["_rowaddr"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            rows["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect();
+
+    let uuid = dataset
+        .load_index_by_name("vec_idx")
+        .await
+        .unwrap()
+        .unwrap()
+        .uuid;
+    let index = dataset
+        .open_vector_index("vec", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let hnsw = index.as_any().downcast_ref::<IvfHnswSqIndex>().unwrap();
+    let mut neighbors = HashMap::new();
+    for partition_id in 0..hnsw.ivf_model().num_partitions() {
+        let storage = hnsw
+            .load_partition_storage(partition_id, None)
+            .await
+            .unwrap();
+        let row_addrs: Vec<u64> = storage.row_ids().copied().collect();
+        let graph = hnsw
+            .read_sub_index_batch(partition_id, None, None)
+            .await
+            .unwrap();
+        // Level 0 comes first and holds one row per node, in node order.
+        let lists = graph["__neighbors"].as_list::<i32>();
+        for (node, row_addr) in row_addrs.iter().enumerate() {
+            let mut ids: Vec<i32> = lists
+                .value(node)
+                .as_primitive::<UInt32Type>()
+                .values()
+                .iter()
+                .map(|&neighbor| id_of[&row_addrs[neighbor as usize]])
+                .collect();
+            ids.sort_unstable();
+            neighbors.insert(id_of[row_addr], ids);
+        }
+    }
+    neighbors
+}
+
+/// A physical remap after deferred compaction with deletions opens the index
+/// through the fragment-reuse index, whose storage has already dropped the
+/// deleted rows. The graph must still be repaired rather than rebuilt, keeping
+/// nearly every edge between surviving nodes.
+#[tokio::test]
+async fn test_ivf_hnsw_physical_remap_after_deferred_deletions_repairs_graph() {
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance_datagen::Dimension;
+    use lance_index::vector::{hnsw::builder::HnswBuildParams, sq::builder::SQBuildParams};
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vec",
+            lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(32)),
+        )
+        .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+        .await
+        .unwrap();
+    let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+        DistanceType::L2,
+        small_ivf(),
+        HnswBuildParams::default(),
+        SQBuildParams::default(),
+    );
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some("vec_idx".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let before = hnsw_level0_neighbor_ids(&dataset).await;
+
+    // Sparse deletions leave many nodes with no deleted neighbor.
+    let is_deleted = |id: &i32| id % 50 == 0;
+    dataset.delete("id % 50 = 0").await.unwrap();
+    Box::pin(compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    ))
+    .await
+    .unwrap();
+    remapping::remap_column_index(&mut dataset, &["vec"], Some("vec_idx".into()))
+        .await
+        .unwrap();
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    let after = hnsw_level0_neighbor_ids(&dataset).await;
+
+    let survivors: Vec<i32> = before
+        .keys()
+        .copied()
+        .filter(|id| !is_deleted(id))
+        .collect();
+    assert_eq!(after.len(), survivors.len());
+    // A repair re-selects only the lists of nodes that lost a neighbor, so a
+    // node that lost none keeps its list apart from the few reverse links the
+    // re-selection prunes into it. A rebuild draws new levels and insertion
+    // order and keeps far fewer.
+    let (mut num_edges, mut num_kept_edges) = (0usize, 0usize);
+    for id in &survivors {
+        if before[id].iter().any(is_deleted) {
+            continue;
+        }
+        for neighbor in &before[id] {
+            num_edges += 1;
+            num_kept_edges += usize::from(after[id].binary_search(neighbor).is_ok());
+        }
+    }
+    let kept_fraction = num_kept_edges as f64 / num_edges as f64;
+    assert!(
+        kept_fraction > 0.85,
+        "the remap kept {num_kept_edges} of {num_edges} edges of undamaged nodes ({kept_fraction:.3}), \
+         so the graph was rebuilt rather than repaired"
+    );
+}
+
 #[tokio::test]
 async fn test_ivf_pq_defer_compaction_with_deletions() {
     use lance_index::vector::pq::PQBuildParams;
@@ -1630,6 +1823,7 @@ async fn test_ivf_pq_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         8,
+        false,
     ))
     .await;
 }
@@ -1647,6 +1841,7 @@ async fn test_ivf_sq_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         8,
+        false,
     ))
     .await;
 }
@@ -1661,6 +1856,7 @@ async fn test_ivf_rq_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         8,
+        false,
     ))
     .await;
 }

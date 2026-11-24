@@ -119,8 +119,8 @@ async fn apply_deletion(
             fragment.id,
             deletion_file,
             // Reference deletion file should never enter this apply_deletion. So base path is fine.
-            &dataset.base,
-            dataset.object_store.as_ref(),
+            &dataset.table_state.base,
+            dataset.table_state.object_store.as_ref(),
         )
         .await
         .unwrap()
@@ -131,11 +131,11 @@ async fn apply_deletion(
     current_deletions.extend(delete_rows.iter().copied());
 
     fragment.deletion_file = write_deletion_file(
-        &dataset.base,
+        &dataset.table_state.base,
         fragment.id,
         dataset.manifest.version,
         &current_deletions,
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         0,
     )
     .await
@@ -147,6 +147,7 @@ async fn apply_deletion(
         deletion_file,
     };
     dataset
+        .table_state
         .metadata_cache
         .insert_with_key(&key, Arc::new(current_deletions))
         .await;

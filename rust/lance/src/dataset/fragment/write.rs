@@ -2,17 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
-use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::utils::StreamingWriteSource;
+use lance_datafusion::utils::{StreamingWriteSource, from_datafusion_stream};
 #[cfg(test)]
 use lance_file::version::LanceFileVersion;
 use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_io::object_store::ObjectStore;
+use lance_io::stream::SendableRecordBatchStream;
+use lance_io::stream::chunker::{break_stream, chunk_stream};
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
@@ -318,14 +318,18 @@ impl<'a> FragmentCreateBuilder<'a> {
         &self,
         source: impl StreamingWriteSource,
     ) -> Result<(SendableRecordBatchStream, Schema)> {
-        if let Some(schema) = self.schema {
-            return Ok((source.into_stream(), schema.clone()));
-        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append))
-            && let Some(schema) = self.existing_dataset_schema().await?
-        {
-            return Ok((source.into_stream(), schema));
-        }
-        source.into_stream_and_schema().await
+        let schema = if let Some(schema) = self.schema {
+            Some(schema.clone())
+        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
+            self.existing_dataset_schema().await?
+        } else {
+            None
+        };
+        let (stream, schema) = match schema {
+            Some(schema) => (source.into_stream(), schema),
+            None => source.into_stream_and_schema().await?,
+        };
+        Ok((from_datafusion_stream(stream), schema))
     }
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
@@ -389,6 +393,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::dataset::fragment::FileFragment;
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{CommitBuilder, InsertBuilder};
 
@@ -405,6 +410,36 @@ mod tests {
             ],
         );
         Box::new(RecordBatchIterator::new(vec![batch], schema))
+    }
+
+    /// A dataset whose only registered base has the sparse id 2.
+    async fn dataset_with_sparse_existing_base(
+        primary: &TempStrDir,
+        existing: &TempStrDir,
+    ) -> Dataset {
+        InsertBuilder::new(primary.as_str())
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![BasePath::new(
+                    2,
+                    existing.to_string(),
+                    Some("existing".to_string()),
+                    false,
+                )]),
+                ..Default::default()
+            })
+            .execute_stream(test_data())
+            .await
+            .unwrap()
+    }
+
+    fn assert_data_file_in(base: &TempStrDir, data_file: &DataFile) {
+        let path = std::path::Path::new(base.as_str()).join(data_file.path.as_str());
+        assert!(
+            path.exists(),
+            "data file was not written to the expected base: {}",
+            path.display()
+        );
     }
 
     #[tokio::test]
@@ -779,7 +814,7 @@ mod tests {
             ..Default::default()
         }
         .with_target_base_names_or_paths(vec!["base2".to_string()]);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
@@ -811,7 +846,7 @@ mod tests {
             ..Default::default()
         }
         .with_target_all_bases(false);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
@@ -825,13 +860,100 @@ mod tests {
             ..Default::default()
         }
         .with_target_all_bases(true);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
             .unwrap();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].files[0].base_id, None);
+    }
+
+    #[rstest]
+    #[case::v1(LanceFileVersion::Legacy)]
+    #[case::v2(LanceFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_create_fragments_preserves_sparse_base_ids_for_numeric_target(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let primary = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let dataset = dataset_with_sparse_existing_base(&primary, &existing).await;
+
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            initial_bases: Some(vec![
+                BasePath::new(0, base_a.to_string(), Some("base-a".to_string()), false),
+                BasePath::new(0, base_b.to_string(), Some("base-b".to_string()), false),
+            ]),
+            target_bases: Some(vec![3]),
+            ..Default::default()
+        };
+        let fragments = FileFragment::create_fragments(
+            dataset.table_state.uri.as_str(),
+            test_data(),
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fragments.len(), 3);
+        for fragment in &fragments {
+            let data_file = &fragment.files[0];
+            // Existing base 2 makes the first automatic base 3, not a lower
+            // free id. Numeric target 3 must therefore stay bound to base A.
+            assert_eq!(data_file.base_id, Some(3));
+            assert_data_file_in(&base_a, data_file);
+        }
+    }
+
+    #[rstest]
+    #[case::v1(LanceFileVersion::Legacy)]
+    #[case::v2(LanceFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_create_fragments_all_bases_starts_with_sparse_existing_base(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let primary = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let dataset = dataset_with_sparse_existing_base(&primary, &existing).await;
+
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            initial_bases: Some(vec![
+                BasePath::new(0, base_a.to_string(), Some("base-a".to_string()), false),
+                BasePath::new(0, base_b.to_string(), Some("base-b".to_string()), false),
+            ]),
+            target_all_bases: Some(false),
+            ..Default::default()
+        };
+        let fragments = FileFragment::create_fragments(
+            dataset.table_state.uri.as_str(),
+            test_data(),
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fragments.len(), 3);
+        let expected = [(Some(2), &existing), (Some(3), &base_a), (Some(4), &base_b)];
+        for (fragment, (expected_base_id, base)) in fragments.iter().zip(expected) {
+            let data_file = &fragment.files[0];
+            // Rotation starts at the existing base and keeps the automatic
+            // bases in allocation order after it.
+            assert_eq!(data_file.base_id, expected_base_id);
+            assert_data_file_in(base, data_file);
+        }
     }
 
     #[rstest]
