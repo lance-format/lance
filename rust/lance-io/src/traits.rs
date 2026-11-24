@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -149,6 +150,17 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// TODO: change to read_at()?
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>>;
+
+    /// Read a range while reporting Lance-visible transport attempts.
+    ///
+    /// Readers without transport-level visibility keep the default behavior.
+    fn get_range_with_stats(
+        &self,
+        range: Range<usize>,
+        _stats: Arc<dyn IoStatsRecorder>,
+    ) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        self.get_range(range)
+    }
 
     /// Read all bytes from the object.
     ///

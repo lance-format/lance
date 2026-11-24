@@ -58,7 +58,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{Instrument, debug_span, field::Empty, info, instrument, warn};
 
 pub(crate) mod blob;
 pub(crate) use lance_table_runtime::branch_location;
@@ -1554,7 +1554,29 @@ impl Dataset {
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take(self, row_indices, projection.into()).await
+        let span = debug_span!(
+            "take_io",
+            num_rows = row_indices.len(),
+            fragments_selected = Empty,
+            logical_ranges = Empty,
+            logical_requested_bytes = Empty,
+            logical_union_bytes = Empty,
+            physical_iops = Empty,
+            scheduler_requests = Empty,
+            physical_bytes = Empty,
+            cloud_reader_attempts = Empty,
+            cloud_reader_failed_attempts = Empty,
+            cloud_reader_body_bytes = Empty,
+            peak_active_reads = Empty,
+            max_scheduler_queue_time_ns = Empty,
+            max_child_read_time_ns = Empty,
+            elapsed_ns = Empty,
+            outcome = Empty,
+        );
+        let summary_span = (!span.is_disabled()).then(|| span.clone());
+        take::take(self, row_indices, projection.into(), summary_span)
+            .instrument(span)
+            .await
     }
 
     /// Take rows with a maximum number of active fragment-reader data reads in the primary base.
@@ -1578,15 +1600,43 @@ impl Dataset {
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(skip_all, fields(num_rows=row_indices.len(), io_parallelism))]
+    #[instrument(skip_all, fields(num_rows=row_indices.len(), io_parallelism = io_parallelism))]
     pub async fn take_with_io_parallelism(
         &self,
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
         io_parallelism: u32,
     ) -> Result<RecordBatch> {
-        take::take_with_io_parallelism(self, row_indices, projection.into(), Some(io_parallelism))
-            .await
+        let span = debug_span!(
+            "take_io",
+            num_rows = row_indices.len(),
+            io_parallelism,
+            fragments_selected = Empty,
+            logical_ranges = Empty,
+            logical_requested_bytes = Empty,
+            logical_union_bytes = Empty,
+            physical_iops = Empty,
+            scheduler_requests = Empty,
+            physical_bytes = Empty,
+            cloud_reader_attempts = Empty,
+            cloud_reader_failed_attempts = Empty,
+            cloud_reader_body_bytes = Empty,
+            peak_active_reads = Empty,
+            max_scheduler_queue_time_ns = Empty,
+            max_child_read_time_ns = Empty,
+            elapsed_ns = Empty,
+            outcome = Empty,
+        );
+        let summary_span = (!span.is_disabled()).then(|| span.clone());
+        take::take_with_io_parallelism(
+            self,
+            row_indices,
+            projection.into(),
+            Some(io_parallelism),
+            summary_span,
+        )
+        .instrument(span)
+        .await
     }
 
     /// Take Rows by the internal ROW ids.
