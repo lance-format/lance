@@ -17,7 +17,6 @@
 use super::*;
 use crate::dataset::CommitBuilder;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::optimize::commit::commit_compaction;
 use crate::index::frag_reuse::frag_reuse_entry_appending;
 use crate::index::frag_reuse_reader::tests::prepare_partition;
 use crate::index::vector::IndexFileVersion;

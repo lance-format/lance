@@ -22,9 +22,9 @@
 use std::sync::Arc;
 
 use lance_io::object_store::ObjectStore;
+use lance_table::format::Manifest;
 #[cfg(test)]
 use lance_table::format::ManifestBuildConfig;
-use lance_table::format::{Fragment, Manifest};
 #[cfg(test)]
 use lance_table::io::commit::ManifestNamingScheme;
 use lance_table::io::commit::{CommitHandler, ManifestLocation};
@@ -67,14 +67,6 @@ pub(crate) async fn commit_transaction(
         hook.hooks(),
     ))
     .await
-}
-
-pub(crate) async fn migrate_fragments(
-    dataset: &Dataset,
-    fragments: &[Fragment],
-    recompute_stats: bool,
-) -> Result<Vec<Fragment>> {
-    runtime::migrate_fragments(&dataset.table_view().to_table(), fragments, recompute_stats).await
 }
 
 pub(crate) async fn load_and_sort_new_transactions(

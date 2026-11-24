@@ -6,14 +6,16 @@ use crate::index::frag_reuse_reader::SegmentPlanParts;
 use crate::index::frag_reuse_v0_cache::{
     V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
 };
-use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
+use crate::index::loading::DatasetIndexInternalExt;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
-    FragReuseIndexDetails, FragReuseVersion,
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME,
+    FragReuseIndexDetails,
 };
+#[cfg(test)]
+use lance_index::frag_reuse::{FragReuseGroup, FragReuseVersion};
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
 use lance_table::format::IndexMetadata;
 #[cfg(test)]
@@ -795,53 +797,20 @@ pub(crate) async fn open_frag_reuse_index(
     CompactFragReuseIndex::try_new(uuid, details.clone())
 }
 
-/// `dataset_version` stamps both the new reuse version and the entry, which must agree.
+#[cfg(test)]
 pub(crate) async fn build_new_frag_reuse_index(
-    dataset: &mut Dataset,
+    dataset: &Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
     new_fragment_bitmap: RoaringBitmap,
     dataset_version: u64,
 ) -> lance_core::Result<IndexMetadata> {
-    let new_version = FragReuseVersion {
-        // `finish_rewrite` restamps it if the rewrite publishes on a later version.
+    table_fri::build_new_frag_reuse_index(
+        &dataset.table_view().to_table(),
+        frag_reuse_groups,
+        new_fragment_bitmap,
         dataset_version,
-        groups: frag_reuse_groups,
-    };
-
-    let index_meta = dataset.load_indices().await.map(|indices| {
-        indices
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .cloned()
-    })?;
-
-    let (new_index_details, fragment_bitmap) = match &index_meta {
-        None => (
-            FragReuseIndexDetails {
-                versions: Vec::from([new_version]),
-            },
-            new_fragment_bitmap,
-        ),
-        Some(index_meta) => {
-            let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
-            // Every version's new fragments, as a rebuild in `finish_rewrite` or a cleanup
-            // publishes, so the entry is the same whether or not its commit is restamped.
-            let fragment_bitmap = current_details.new_frag_bitmap() | new_fragment_bitmap;
-            let mut versions = current_details.versions.clone();
-            versions.push(new_version);
-            (FragReuseIndexDetails { versions }, fragment_bitmap)
-        }
-    };
-
-    let mut entry = build_frag_reuse_index_metadata(
-        dataset,
-        index_meta.as_ref(),
-        new_index_details,
-        fragment_bitmap,
     )
-    .await?;
-    entry.dataset_version = dataset_version;
-    Ok(entry)
+    .await
 }
 
 pub(crate) async fn build_frag_reuse_index_metadata(

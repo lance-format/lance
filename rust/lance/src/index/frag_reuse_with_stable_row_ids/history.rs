@@ -559,7 +559,7 @@ pub mod tests {
         groups[0] = recorded;
         let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
         let version = dataset.manifest.version;
-        let mut entry = build_new_frag_reuse_index(&mut dataset, groups, bitmap.clone(), version)
+        let mut entry = build_new_frag_reuse_index(&dataset, groups, bitmap.clone(), version)
             .await
             .unwrap();
         if let Some(extra) = extra_version {
@@ -702,7 +702,7 @@ pub mod tests {
         let (group, recorded) = rewrite_of(&mut dataset, &[6, 7]).await;
         let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
         let version = dataset.manifest.version;
-        let entry = build_new_frag_reuse_index(&mut dataset, vec![recorded], bitmap, version)
+        let entry = build_new_frag_reuse_index(&dataset, vec![recorded], bitmap, version)
             .await
             .unwrap();
         let base = commit(
@@ -838,7 +838,7 @@ pub mod tests {
             groups: vec![moves],
         };
         let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
-        let entry = build_new_frag_reuse_index(&mut dataset, own.groups.clone(), bitmap, own_stamp)
+        let entry = build_new_frag_reuse_index(&dataset, own.groups.clone(), bitmap, own_stamp)
             .await
             .unwrap();
         let versions = recorded.iter().cloned().chain([own]).collect::<Vec<_>>();
@@ -955,7 +955,7 @@ pub mod tests {
         let (group, moves) = rewrite_of(&mut dataset, &[6, 7]).await;
         let stamp = DETACHED_VERSION_MASK | 5;
         let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
-        let entry = build_new_frag_reuse_index(&mut dataset, vec![moves], bitmap, stamp)
+        let entry = build_new_frag_reuse_index(&dataset, vec![moves], bitmap, stamp)
             .await
             .unwrap();
         let rewrite = Operation::Rewrite {
@@ -1059,7 +1059,7 @@ pub mod tests {
         let (group, moves) = rewrite_of(&mut dataset, &[6, 7]).await;
         let stamp = dataset.manifest.version;
         let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
-        let entry = build_new_frag_reuse_index(&mut dataset, vec![moves], bitmap, stamp)
+        let entry = build_new_frag_reuse_index(&dataset, vec![moves], bitmap, stamp)
             .await
             .unwrap();
         let rewrite = Operation::Rewrite {

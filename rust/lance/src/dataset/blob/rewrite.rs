@@ -8,7 +8,6 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use lance_core::{Result, datatypes::Schema};
 use lance_table_runtime::blob::BlobV2BatchRewritePlan as RuntimeRewritePlan;
 
-use super::SidecarRewrite;
 use crate::Dataset;
 
 pub use lance_table_runtime::blob::field_contains_blob_v2;
@@ -35,7 +34,11 @@ impl BlobV2BatchRewritePlan {
         RuntimeRewritePlan::try_new(schema, input_schema, keep_row_addr, preserve_managed).map(Self)
     }
 
-    pub(in crate::dataset) fn with_sidecar_rewrite(self, sidecars: Arc<SidecarRewrite>) -> Self {
+    #[cfg(test)]
+    pub(in crate::dataset) fn with_sidecar_rewrite(
+        self,
+        sidecars: Arc<super::SidecarRewrite>,
+    ) -> Self {
         Self(self.0.with_sidecar_rewrite(sidecars))
     }
 

@@ -21,11 +21,16 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_table::format::{DataFile, Fragment};
 
-use super::{CompactionMetrics, CompactionOptions, RepackedFiles, RewriteResult, TaskData};
-use crate::dataset::fragment::FileFragment;
-use crate::dataset::transaction::{DataReplacementGroup, Operation, TransactionBuilder};
-use crate::dataset::{Dataset, cleanup_data_fragments, versions};
-use crate::{Error, Result};
+use lance_core::{Error, Result};
+use lance_table::transaction::{DataReplacementGroup, Operation, TransactionBuilder};
+
+use super::commit::publish_compaction;
+use super::{
+    CompactionHooks, CompactionMetrics, CompactionOptions, RepackedFiles, RewriteResult, TaskData,
+};
+use crate::fragment::{read_defaults::get_default_batch_size, validate_write_version};
+use crate::write::cleanup_data_fragments;
+use crate::{FileFragment, Table, WriteSeedHook};
 
 /// The ids of the leaf fields at and beneath `field`. The planner places a
 /// column by where its leaves are: a V2.0 file can keep a struct's header
@@ -67,8 +72,9 @@ fn propose(schema: &Schema, fragment: &Fragment, columns: &BTreeSet<i32>) -> Opt
 /// one file is kept when a proposal can leave one: a proposal leaving the
 /// largest file in place wins, then the one leaving the fewest live files.
 ///
-/// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
-pub(super) fn plan_fragment_repack(
+/// [`FragmentColumnLayoutStats::live_file_count`]: super::column_layout::FragmentColumnLayoutStats::live_file_count
+#[doc(hidden)]
+pub fn plan_fragment_repack(
     schema: &Schema,
     fragment: &Fragment,
     live_files: usize,
@@ -225,10 +231,11 @@ pub(super) fn plan_fragment_repack(
 /// for repack task `task`, against `dataset`, which must be at the plan's
 /// read version.
 pub(super) async fn execute_repack(
-    dataset: &Dataset,
+    dataset: &Table,
     task: &TaskData,
     files: &[Vec<i32>],
     options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<RewriteResult> {
     let [fragment] = task.fragments.as_slice() else {
         return Err(Error::invalid_input(format!(
@@ -243,7 +250,7 @@ pub(super) async fn execute_repack(
         ));
     }
     let write_version = options.write_version(dataset);
-    versions::validate_write_version(
+    validate_write_version(
         dataset.manifest.data_storage_format.lance_file_format(),
         write_version,
     )?;
@@ -274,6 +281,7 @@ pub(super) async fn execute_repack(
             batch_size,
             write_version,
             &file_writer_options,
+            hooks.write_seeds.clone(),
         )
         .await;
         match file {
@@ -312,14 +320,14 @@ pub(super) async fn execute_repack(
 
 /// Delete the files a repack task of fragment `fragment_id` wrote before it
 /// failed.
-async fn discard(dataset: &Dataset, fragment_id: u64, files: Vec<DataFile>) {
+async fn discard(dataset: &Table, fragment_id: u64, files: Vec<DataFile>) {
     let partial = Fragment {
         files,
         ..Fragment::new(fragment_id)
     };
     cleanup_data_fragments(
-        &dataset.table_state.object_store,
-        &dataset.table_state.base,
+        &dataset.state.object_store,
+        &dataset.state.base,
         None,
         &[partial],
     )
@@ -334,6 +342,7 @@ async fn write_one_file(
     batch_size: Option<u32>,
     write_version: ConcreteFileVersion,
     file_writer_options: &FileWriterOptions,
+    seed_hook: Option<Arc<dyn WriteSeedHook>>,
 ) -> Result<DataFile> {
     let write_schema = schema.project(columns)?;
     let mut updater = source
@@ -343,8 +352,12 @@ async fn write_one_file(
             batch_size,
             None,
             write_version,
+            || get_default_batch_size().unwrap_or(1024),
         )
         .await?;
+    if let Some(hook) = seed_hook {
+        updater = updater.with_seed_hook(hook);
+    }
     updater.set_file_writer_options(file_writer_options.clone());
     let finished: Result<Fragment> = async {
         while let Some(batch) = updater.next().await?.cloned() {
@@ -373,10 +386,11 @@ async fn write_one_file(
 /// stands at commit. The commit goes through `base`; if it lands, `dataset`
 /// is set to it.
 pub(super) async fn commit_repacked_files(
-    dataset: &mut Dataset,
-    mut base: Dataset,
+    dataset: &mut Table,
+    base: Table,
     results: Vec<RewriteResult>,
     options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<CompactionMetrics> {
     let mut metrics = CompactionMetrics::default();
     let mut read_version = u64::MAX;
@@ -410,8 +424,6 @@ pub(super) async fn commit_repacked_files(
     .build();
     // Like a rewrite's, a repack result can be retried after an ambiguous
     // success, so its files are left for cleanup rather than deleted here.
-    base.apply_commit(transaction, &Default::default(), &Default::default())
-        .await?;
-    *dataset = base;
+    *dataset = publish_compaction(&base, transaction, hooks).await?;
     Ok(metrics)
 }

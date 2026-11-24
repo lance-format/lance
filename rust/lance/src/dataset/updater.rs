@@ -3,7 +3,6 @@
 
 use arrow_array::RecordBatch;
 use lance_core::{Result, datatypes::Schema};
-use lance_file::writer::FileWriterOptions;
 use lance_table::format::Fragment;
 use lance_table_runtime::fragment::Updater as RuntimeUpdater;
 
@@ -44,10 +43,6 @@ impl Updater {
     /// deleted rows unaccounted for and fail the stream at its end.
     pub async fn next(&mut self) -> Result<Option<&RecordBatch>> {
         Box::pin(self.inner.next()).await
-    }
-
-    pub(super) fn set_file_writer_options(&mut self, options: FileWriterOptions) {
-        self.inner.set_file_writer_options(options);
     }
 
     pub(super) fn allow_external_blob_outside_bases(&mut self) {

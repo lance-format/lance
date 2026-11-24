@@ -14,29 +14,32 @@ use std::sync::Arc;
 use super::binary_copy;
 use super::planning::{
     CompactionMode, CompactionOptions, CompactionPlan, CompactionTaskKind, TaskData,
-    has_eager_remappable_index,
+    needs_row_addrs,
 };
-use super::repack;
-use crate::Dataset;
-use crate::dataset::blob::{BlobV2BatchRewritePlan, SidecarRewrite};
-use crate::dataset::index::load_indices_for_remapping;
-use crate::dataset::rowids::{
-    RowLineage, RowLineagePlan, RowLineageSpill, RowVersionKind, inline_row_lineage_max_bytes,
-    load_row_id_sequences, load_row_version_sequence, place_row_lineage, plan_row_lineage_spill,
+use super::reader::{RewriteReader, prepare_reader};
+use super::{CompactionHooks, repack};
+use crate::Table;
+use crate::blob::{BlobV2BatchRewritePlan, SidecarRewrite};
+use crate::commit::migrate_fragments;
+use crate::frag_reuse::live_source_row_addrs;
+use crate::fragment::validate_write_version;
+use crate::io::deletion::read_table_deletion_file;
+use crate::rowids::{
+    CapturedRowIds, RowLineage, RowLineagePlan, RowLineageSpill, RowVersionKind,
+    inline_row_lineage_max_bytes, load_row_id_sequence, load_row_version_sequence,
+    place_row_lineage, plan_row_lineage_spill,
 };
-use crate::dataset::utils::{CapturedRowIds, make_rowid_capture_stream};
-use crate::dataset::versions;
-use crate::dataset::{
-    WriteMode, WriteParams, cleanup_data_fragments, write::write_fragments_internal_impl,
+use crate::write::{
+    FragmentWriteOptions, WriteMode, WriteParams, cleanup_data_fragments, write_fragments,
 };
-use crate::io::commit::migrate_fragments;
-use crate::io::deletion::read_dataset_deletion_file;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::{BlobHandling, Field as LanceField};
+use lance_core::datatypes::Field as LanceField;
 use lance_core::{Error, Result};
+use lance_file::reader::FileReader as LFReader;
 use lance_file::version::ConcreteFileVersion;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{Fragment, RowDatasetVersionSequence};
@@ -44,7 +47,7 @@ use lance_table::rowids::RowIdSequence;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 
-/// Metrics returned by [`crate::dataset::optimize::compact_files`].
+/// Metrics returned by [`crate::optimize::compact_files`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionMetrics {
     /// The number of fragments that have been overwritten.
@@ -72,7 +75,7 @@ impl AddAssign for CompactionMetrics {
 ///
 /// Preconditions:
 /// - Compaction mode is not `Reencode`
-/// - Dataset storage format is non-legacy
+/// - Table storage format is non-legacy
 /// - Fragment list is non-empty and every fragment has at least one data file
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
@@ -80,18 +83,25 @@ impl AddAssign for CompactionMetrics {
 /// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
 ///   order, with the current schema's expected physical-column count
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
-pub(super) async fn can_use_binary_copy(
-    dataset: &Dataset,
+#[doc(hidden)]
+pub async fn can_use_binary_copy(
+    dataset: &Table,
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
     let version = options.write_version(dataset);
-    versions::can_use_binary_copy(version, dataset, options, fragments)
-        .await
-        .unwrap_or_else(|err| {
-            log::warn!("Binary copy disabled due to error: {}", err);
-            false
-        })
+    let check = async {
+        if version == ConcreteFileVersion::V1
+            || first_binary_copy_version_mismatch(fragments, version)?.is_some()
+        {
+            return Ok(false);
+        }
+        can_use_binary_copy_current(dataset, options, fragments).await
+    };
+    check.await.unwrap_or_else(|err| {
+        log::warn!("Binary copy disabled due to error: {}", err);
+        false
+    })
 }
 
 fn first_binary_copy_version_mismatch(
@@ -109,14 +119,11 @@ fn first_binary_copy_version_mismatch(
     Ok(None)
 }
 
-pub async fn can_use_binary_copy_current(
-    dataset: &Dataset,
+async fn can_use_binary_copy_current(
+    dataset: &Table,
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> Result<bool> {
-    use lance_file::reader::FileReader as LFReader;
-    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
         log::debug!("Binary copy disabled: compaction mode is Reencode");
         return Ok(false);
@@ -163,7 +170,7 @@ pub async fn can_use_binary_copy_current(
         .map(|field| lance_file::versions::physical_column_count(version, field))
         .sum();
     for fragment in fragments {
-        // Binary copy only reads base files; overlays must be materialized by the scanner.
+        // Binary copy only reads base files; overlays must be materialized by the fragment reader.
         if !fragment.overlays.is_empty() {
             log::debug!(
                 "Binary copy disabled: fragment {} has data overlays",
@@ -187,7 +194,7 @@ pub async fn can_use_binary_copy_current(
             // check file global buffer
             let object_store = match data_file.base_id {
                 Some(base_id) => dataset.object_store(Some(base_id)).await?,
-                None => dataset.table_state.object_store.clone(),
+                None => dataset.state.object_store.clone(),
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
@@ -238,78 +245,6 @@ pub async fn can_use_binary_copy_current(
     Ok(true)
 }
 
-/// Build a scan reader for rewrite and optionally capture row IDs.
-///
-/// Parameters:
-/// - `dataset`: Dataset handle used to create the scanner.
-/// - `fragments`: When `with_frags` is true, restrict the scan to these old fragments
-///   and preserve insertion order.
-/// - `batch_size`: Optional batch size; if provided, set it on the scanner to control
-///   read batching.
-/// - `io_buffer_size`: Optional I/O buffer size in bytes; if provided, set it on the
-///   scanner to control how much data is queued during reads.
-/// - `with_frags`: Whether to scan only the specified old fragments and force
-///   in-order reading.
-/// - `capture_row_ids`: When index remapping is needed, include and capture the
-///   `_rowid` column from the stream.
-///
-/// Returns:
-/// - `SendableRecordBatchStream`: The batch stream (with `_rowid` removed if captured)
-///   to feed the rewrite path.
-/// - `Option<Receiver<CapturedRowIds>>`: A receiver to obtain captured row IDs after the
-///   stream completes; `None` if not capturing.
-/// - `bool`: Whether the dataset has blob v2 columns and the stream includes `_rowaddr`.
-async fn prepare_reader(
-    dataset: &Dataset,
-    fragments: &[Fragment],
-    batch_size: Option<usize>,
-    io_buffer_size: Option<u64>,
-    with_frags: bool,
-    capture_row_ids: bool,
-) -> Result<(
-    SendableRecordBatchStream,
-    Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
-    bool,
-)> {
-    let mut scanner = dataset.scan();
-    let has_legacy_blob_columns = dataset
-        .schema()
-        .fields_pre_order()
-        .any(|field| field.is_blob() && !field.is_blob_v2());
-    if has_legacy_blob_columns {
-        scanner.blob_handling(BlobHandling::AllBinary);
-    }
-    let has_blob_v2_columns = dataset
-        .schema()
-        .fields_pre_order()
-        .any(|field| field.is_blob_v2());
-    if has_blob_v2_columns {
-        scanner.with_row_address();
-    }
-    if let Some(bs) = batch_size {
-        scanner.batch_size(bs);
-    }
-    if let Some(io_buffer_size) = io_buffer_size {
-        scanner.io_buffer_size(io_buffer_size);
-    }
-    if with_frags {
-        scanner
-            .with_fragments(fragments.to_vec())
-            .scan_in_order(true);
-    }
-    if capture_row_ids {
-        scanner.with_row_id();
-    }
-    let data = Box::pin(scanner.try_into_stream().await?);
-    if capture_row_ids {
-        let (data_no_row_ids, rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
-        Ok((data_no_row_ids, Some(rx), has_blob_v2_columns))
-    } else {
-        Ok((data, None, has_blob_v2_columns))
-    }
-}
-
 /// A standalone task that can be serialized and sent to another machine for
 /// execution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -326,25 +261,44 @@ impl CompactionTask {
     /// data files for its fragment.
     ///
     /// This result should be later passed to
-    /// [`crate::dataset::optimize::commit_compaction`] to commit
+    /// [`crate::optimize::commit_compaction`] to commit
     /// the changes to the dataset.
     ///
     /// Note: you should pass the version of the dataset that is the same as
     /// the read version for this task (the same version from which the
     /// compaction was planned).
-    pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
-        let dataset = if dataset.manifest.version == self.read_version {
-            Cow::Borrowed(dataset)
-        } else {
-            Cow::Owned(dataset.checkout_version(self.read_version).await?)
-        };
-        match &self.task.kind {
-            CompactionTaskKind::RewriteFragments => {
-                rewrite_files(dataset, self.task.clone(), &self.options).await
-            }
-            CompactionTaskKind::RepackColumns { files } => {
-                repack::execute_repack(&dataset, &self.task, files, &self.options).await
-            }
+    pub async fn execute(&self, dataset: &Table) -> Result<RewriteResult> {
+        self.execute_with_hooks(dataset, &CompactionHooks::default())
+            .await
+    }
+
+    /// Execute on the task's read snapshot with locally bound index and seed hooks.
+    pub async fn execute_with_hooks(
+        &self,
+        dataset: &Table,
+        hooks: &CompactionHooks<'_>,
+    ) -> Result<RewriteResult> {
+        execute_task(dataset, self.read_version, &self.task, &self.options, hooks).await
+    }
+}
+
+#[doc(hidden)]
+pub async fn execute_task(
+    dataset: &Table,
+    read_version: u64,
+    task: &TaskData,
+    options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
+) -> Result<RewriteResult> {
+    let dataset = if dataset.manifest.version == read_version {
+        Cow::Borrowed(dataset)
+    } else {
+        Cow::Owned(dataset.checkout_version(read_version).await?)
+    };
+    match &task.kind {
+        CompactionTaskKind::RewriteFragments => rewrite_files(&dataset, task, options, hooks).await,
+        CompactionTaskKind::RepackColumns { files } => {
+            repack::execute_repack(&dataset, task, files, options, hooks).await
         }
     }
 }
@@ -379,7 +333,7 @@ impl CompactionPlan {
 
 /// The result of a single compaction task.
 ///
-/// This should be passed to [`crate::dataset::optimize::commit_compaction`] to
+/// This should be passed to [`crate::optimize::commit_compaction`] to
 /// commit the operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RewriteResult {
@@ -418,8 +372,9 @@ pub struct RepackedFiles {
 /// (the deferred/FRI path and the eager address-domain remap path) pair these
 /// addresses, sorted, with the rewritten rows, which keep task order, so the
 /// task's fragments must be in ascending id order.
-pub(super) async fn live_row_addrs(
-    dataset: &Dataset,
+#[doc(hidden)]
+pub async fn live_row_addrs(
+    dataset: &Table,
     fragments: &[Fragment],
     new_fragments: &[Fragment],
 ) -> Result<RoaringTreemap> {
@@ -447,19 +402,6 @@ pub(super) async fn live_row_addrs(
         )));
     }
     Ok(addrs)
-}
-
-/// Every live row address of `fragments`: their physical rows minus deletions,
-/// read from fragment metadata and deletion files.
-pub async fn live_source_row_addrs(
-    dataset: &Dataset,
-    fragments: &[Fragment],
-) -> Result<RoaringTreemap> {
-    lance_table_runtime::frag_reuse::live_source_row_addrs(
-        &dataset.table_view().to_table(),
-        fragments,
-    )
-    .await
 }
 
 /// Refuse a task whose output clustering id can never resolve, before the
@@ -494,25 +436,26 @@ pub(super) fn refuse_stale_output_clustering(
 /// Rewrite the files in a single task.
 ///
 /// This assumes that the dataset is the correct read version to be compacted.
-pub(super) async fn rewrite_files(
-    dataset: Cow<'_, Dataset>,
-    task: TaskData,
+async fn rewrite_files(
+    dataset: &Table,
+    task: &TaskData,
     options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
-    let write_version = options.write_version(dataset.as_ref());
-    versions::validate_write_version(
+    let write_version = options.write_version(dataset);
+    validate_write_version(
         dataset.manifest.data_storage_format.lance_file_format(),
         write_version,
     )?;
-    refuse_stale_output_clustering(&dataset.manifest, &task)?;
+    refuse_stale_output_clustering(&dataset.manifest, task)?;
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
             metrics,
             new_fragments: Vec::new(),
             read_version: dataset.manifest.version,
-            original_fragments: task.fragments,
+            original_fragments: Vec::new(),
             row_addrs: None,
             repacked_files: None,
         });
@@ -528,7 +471,7 @@ pub(super) async fn rewrite_files(
     // It's possible the fragments are old and don't have physical rows or
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
-    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
+    let fragments = migrate_fragments(dataset, &task.fragments, recompute_stats).await?;
     let num_rows = fragments
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
@@ -543,16 +486,13 @@ pub(super) async fn rewrite_files(
             // loading it here for options built outside the planner.
             match options.has_eager_remappable_index {
                 Some(value) => value,
-                None => has_eager_remappable_index(dataset.as_ref()).await?,
+                None => needs_row_addrs(dataset, hooks).await?,
             }
         });
     // Capturing row addresses is only useful if something will consume them:
     // an index to remap now, or a deferred remap through the FRI.
     let capture_row_addrs = !uses_stable_row_ids
-        && (options.defer_index_remap
-            || load_indices_for_remapping(dataset.as_ref())
-                .await?
-                .is_some());
+        && (options.defer_index_remap || needs_row_addrs(dataset, hooks).await?);
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -562,7 +502,7 @@ pub(super) async fn rewrite_files(
         fragments.len()
     );
     let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    let can_binary_copy = can_use_binary_copy(dataset, options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         if let Some((path, actual)) = first_binary_copy_version_mismatch(&fragments, write_version)?
         {
@@ -582,20 +522,22 @@ pub(super) async fn rewrite_files(
 
     let mut sidecars = None;
     if !can_binary_copy {
-        let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
-            dataset.as_ref(),
+        let RewriteReader {
+            batches,
+            row_ids,
+            has_blob_v2,
+        } = prepare_reader(
+            dataset,
             &fragments,
             options.batch_size,
             options.io_buffer_size,
-            true,
             capture_row_addrs,
-        )
-        .await?;
-        row_ids_rx = rx_initial;
+        )?;
+        row_ids_rx = row_ids;
 
         let mut rows_read = 0;
-        let schema = prepared_reader.schema();
-        let reader_with_progress = prepared_reader.inspect_ok(move |batch| {
+        let schema = batches.schema();
+        let reader_with_progress = batches.inspect_ok(move |batch| {
             rows_read += batch.num_rows();
             log::info!(
                 "Compaction task {}: Read progress {}/{}",
@@ -605,8 +547,8 @@ pub(super) async fn rewrite_files(
             );
         });
 
-        if has_blob_v2_columns {
-            let dataset_arc = Arc::new(dataset.as_ref().clone());
+        if has_blob_v2 {
+            let dataset_arc = Arc::new(dataset.clone());
             let supports_prepared = matches!(
                 write_version,
                 ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
@@ -709,12 +651,13 @@ pub(super) async fn rewrite_files(
     }
 
     let lineage_plan = if can_binary_copy {
-        new_fragments = versions::rewrite_files_binary_copy(
+        new_fragments = binary_copy::rewrite_files_binary_copy(
             write_version,
-            dataset.as_ref(),
+            dataset,
             &fragments,
             &params,
             options.binary_copy_read_batch_bytes,
+            hooks.write_seeds.as_deref(),
         )
         .await?;
 
@@ -755,7 +698,7 @@ pub(super) async fn rewrite_files(
         // writing. Binary copy cannot add columns to the files it copies, so
         // it always takes that path.
         let spill_budget = if dataset.manifest.uses_stable_row_ids() {
-            inline_row_lineage_max_bytes(dataset.as_ref())?
+            inline_row_lineage_max_bytes(dataset)?
         } else {
             None
         };
@@ -765,8 +708,7 @@ pub(super) async fn rewrite_files(
                     .iter()
                     .map(|rows| *rows as u64)
                     .collect::<Vec<_>>();
-                let mut lineages =
-                    compute_row_lineage(dataset.as_ref(), &fragments, &planned_rows).await?;
+                let mut lineages = compute_row_lineage(dataset, &fragments, &planned_rows).await?;
                 let plan = plan_row_lineage_spill(limit, &lineages);
                 if let RowLineagePlan::InFile(spill) = plan
                     && spill.any()
@@ -785,21 +727,20 @@ pub(super) async fn rewrite_files(
             }
             None => None,
         };
-        let (frags, _) = write_fragments_internal_impl(
+        let (frags, _) = write_fragments(
             write_version,
-            Some(dataset.as_ref()),
-            dataset.table_state.object_store.clone(),
-            &dataset.table_state.base,
+            Some(dataset),
+            dataset.state.object_store.clone(),
+            &dataset.state.base,
             write_schema,
             stream,
             params,
-            None,
-            Some(file_row_counts),
-            None,
-            false,
-            false,
-            None,
-            sidecars.clone(),
+            FragmentWriteOptions {
+                file_row_counts: Some(file_row_counts),
+                sidecar_rewrite: sidecars,
+                seed_hook: hooks.write_seeds.as_deref(),
+                ..Default::default()
+            },
         )
         .await?;
         new_fragments = frags;
@@ -815,11 +756,9 @@ pub(super) async fn rewrite_files(
             log::info!("Compaction task {}: rechunking stable row ids", task_id);
             match lineage_plan {
                 Some(planned) => {
-                    place_planned_row_lineage(dataset.as_ref(), &mut new_fragments, planned).await?
+                    place_planned_row_lineage(dataset, &mut new_fragments, planned).await?
                 }
-                None => {
-                    rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &fragments).await?
-                }
+                None => rechunk_row_lineage(dataset, &mut new_fragments, &fragments).await?,
             }
         }
         let mut row_addrs = if let Some(row_ids_rx) = row_ids_rx {
@@ -828,7 +767,7 @@ pub(super) async fn rewrite_files(
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
             captured_ids.row_addrs(None)?.into_owned()
         } else if records_from_fragment_metadata {
-            live_row_addrs(dataset.as_ref(), &fragments, &new_fragments).await?
+            live_row_addrs(dataset, &fragments, &new_fragments).await?
         } else {
             return Ok(None);
         };
@@ -846,8 +785,8 @@ pub(super) async fn rewrite_files(
         Ok(v) => v,
         Err(e) => {
             cleanup_data_fragments(
-                &dataset.table_state.object_store,
-                &dataset.table_state.base,
+                &dataset.state.object_store,
+                &dataset.state.base,
                 None,
                 &new_fragments,
             )
@@ -889,26 +828,21 @@ pub(super) async fn rewrite_files(
 /// output fragments of `chunk_sizes` rows each, in order, which hold the same
 /// live rows in the same order.
 async fn compute_row_lineage(
-    dataset: &Dataset,
+    dataset: &Table,
     old_fragments: &[Fragment],
     chunk_sizes: &[u64],
 ) -> Result<Vec<RowLineage>> {
-    let mut old_sequences = load_row_id_sequences(dataset, old_fragments)
+    let mut old_sequences = futures::stream::iter(0..old_fragments.len())
+        .map(|index| async move { load_row_id_sequence(dataset, &old_fragments[index]).await })
+        .buffered(dataset.state.object_store.io_parallelism())
         .try_collect::<Vec<_>>()
         .await?;
-    // Should sort them back into original order.
-    old_sequences.sort_by_key(|(frag_id, _)| {
-        old_fragments
-            .iter()
-            .position(|frag| frag.id as u32 == *frag_id)
-            .expect("Fragment not found")
-    });
 
     // Load old per-row version sequences, defaulting the way readers do:
     // created-at to version 1, last-updated-at to created-at.
     let mut old_created_at_sequences = Vec::with_capacity(old_fragments.len());
     let mut old_last_updated_sequences = Vec::with_capacity(old_fragments.len());
-    for (frag, (_, row_ids)) in old_fragments.iter().zip(old_sequences.iter()) {
+    for (frag, row_ids) in old_fragments.iter().zip(old_sequences.iter()) {
         let created_at =
             match load_row_version_sequence(dataset, frag, RowVersionKind::CreatedAt).await? {
                 Some(sequence) => sequence.as_ref().clone(),
@@ -926,27 +860,25 @@ async fn compute_row_lineage(
     // Need to remove deleted rows
     for (index, frag) in old_fragments.iter().enumerate() {
         if let Some(deletion_file) = &frag.deletion_file {
-            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+            let deletions = read_table_deletion_file(dataset, frag.id, deletion_file).await?;
 
-            let mut new_seq = old_sequences[index].1.as_ref().clone();
+            let mut new_seq = old_sequences[index].as_ref().clone();
             new_seq.mask(deletions.to_sorted_iter())?;
-            old_sequences[index].1 = Arc::new(new_seq);
+            old_sequences[index] = Arc::new(new_seq);
             old_created_at_sequences[index].mask(deletions.to_sorted_iter())?;
             old_last_updated_sequences[index].mask(deletions.to_sorted_iter())?;
         }
     }
 
     debug_assert_eq!(
-        { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },
+        { old_sequences.iter().map(|seq| seq.len()).sum::<u64>() },
         { chunk_sizes.iter().sum::<u64>() },
         "{:?}",
         old_sequences
     );
 
     let new_row_ids = lance_table::rowids::rechunk_sequences(
-        old_sequences
-            .into_iter()
-            .map(|(_, seq)| seq.as_ref().clone()),
+        old_sequences.into_iter().map(Arc::unwrap_or_clone),
         chunk_sizes.iter().copied(),
         false,
     )?;
@@ -979,11 +911,12 @@ async fn compute_row_lineage(
 /// the path for tables that cannot spill, and for binary copy, whose output
 /// files cannot take the lineage as extra columns.
 ///
-/// Visible to the crate so tests that assemble an
-/// [`crate::dataset::transaction::Operation::Rewrite`] by hand
+/// Tests that assemble an
+/// [`lance_table::transaction::Operation::Rewrite`] by hand
 /// can transfer row lineage the way compaction does, rather than reimplementing it.
+#[doc(hidden)]
 pub async fn rechunk_row_lineage(
-    dataset: &Dataset,
+    dataset: &Table,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
 ) -> Result<()> {
@@ -1000,21 +933,23 @@ pub async fn rechunk_row_lineage(
 
 /// The row lineage a compaction task computed for its planned output
 /// fragments before writing them, and how the task places it.
-pub(super) struct PlannedRowLineage {
+#[doc(hidden)]
+pub struct PlannedRowLineage {
     /// Each planned output fragment's lineage, in order. The sequences the
     /// plan writes into the data files are empty: their values went into the
     /// written columns.
-    pub(super) lineages: Vec<RowLineage>,
+    pub lineages: Vec<RowLineage>,
     /// Each planned output fragment's row count, which the writer only
     /// follows until a byte limit closes a file early.
-    pub(super) planned_rows: Vec<u64>,
-    pub(super) plan: RowLineagePlan,
+    pub planned_rows: Vec<u64>,
+    pub plan: RowLineagePlan,
 }
 
 /// Place the lineage compaction planned before the write on the fragments it
 /// wrote.
-pub(super) async fn place_planned_row_lineage(
-    dataset: &Dataset,
+#[doc(hidden)]
+pub async fn place_planned_row_lineage(
+    dataset: &Table,
     new_fragments: &mut [Fragment],
     planned: PlannedRowLineage,
 ) -> Result<()> {
@@ -1045,7 +980,8 @@ pub(super) async fn place_planned_row_lineage(
 /// Mark each written fragment's spilled sequences as living in its own data
 /// file, which was written with them as hidden columns, and place the rest
 /// inline.
-pub(super) fn place_row_lineage_in_files(
+#[doc(hidden)]
+pub fn place_row_lineage_in_files(
     new_fragments: &mut [Fragment],
     lineages: Vec<RowLineage>,
     planned_rows: &[u64],
@@ -1208,7 +1144,8 @@ fn fit_row_lineage_to_written(
 /// Append the hidden row lineage columns, `fields` with the matching entry of
 /// `columns` as each one's values, to the batches of `stream`, in row order,
 /// so the file writer stores them next to the user columns.
-pub(super) fn append_row_lineage_columns(
+#[doc(hidden)]
+pub fn append_row_lineage_columns(
     stream: SendableRecordBatchStream,
     fields: &[LanceField],
     columns: Vec<Vec<u64>>,

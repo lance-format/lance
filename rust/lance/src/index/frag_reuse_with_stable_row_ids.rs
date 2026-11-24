@@ -8,10 +8,8 @@
 use lance_core::{Error, Result};
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::registry::display_type_from_url;
-use lance_table::feature_flags::frag_reuse_with_stable_row_ids_enabled;
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
-use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
-use lance_table::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
+use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
 use prost::Name;
 use prost_types::Any;
 
@@ -138,41 +136,21 @@ pub fn validate_stable_row_id_user_indices(
     )))
 }
 
-pub fn ensure_frag_reuse_recording_allowed(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-) -> Result<()> {
-    ensure_frag_reuse_recording_allowed_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
+#[cfg(test)]
 fn ensure_frag_reuse_recording_allowed_when(
     manifest: &Manifest,
     indices: &[IndexMetadata],
     is_supported: bool,
 ) -> Result<()> {
-    if !is_supported {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
-             recording their row-address moves in a fragment reuse index is not supported by \
-             this build of Lance",
-        ));
-    }
-    // The tagged-history flag is sticky, so it can outlive a trim and a
-    // migration to stable row ids.
-    let frag_reuse_entry = indices
-        .iter()
-        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
-    if uses_tagged_fri(manifest, frag_reuse_entry) {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
-             manifest requires a tagged fragment reuse history, which stable row IDs do not \
-             support",
-        ));
-    }
+    lance_table_runtime::frag_reuse::validate_stable_row_id_recording_format(
+        manifest,
+        indices,
+        is_supported,
+    )?;
+    validate_compaction_index_recording(indices)
+}
+
+pub fn validate_compaction_index_recording(indices: &[IndexMetadata]) -> Result<()> {
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());

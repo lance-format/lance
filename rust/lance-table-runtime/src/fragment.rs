@@ -7,6 +7,8 @@ mod columns;
 mod deletions;
 mod file_reader;
 mod read_config;
+#[doc(hidden)]
+pub mod read_defaults;
 mod reader;
 pub mod session;
 mod updater;

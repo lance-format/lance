@@ -11,63 +11,68 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::sync::Arc;
 
 use super::execution::{CompactionMetrics, RewriteResult};
 use super::planning::{
-    CompactionOptions, IndexRemapMode, has_eager_remappable_index,
+    CompactionOptions, IndexRemapMode, ensure_frag_reuse_recording_allowed, needs_row_addrs,
     reject_eager_remap_over_undrained_fri, reject_unremappable_rewrite,
     validate_fragment_groups_preserve_index_boundaries,
 };
-use super::remapping::{self, IndexRemapperOptions};
-use crate::Dataset;
-use crate::dataset::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+use super::{CompactionHooks, remapping};
+use crate::frag_reuse::{
+    build_new_frag_reuse_index, frag_reuse_entry_appending, normalize_source_fragments,
 };
-use crate::index::frag_reuse::build_new_frag_reuse_index;
-use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
-use crate::index::loading::load_all_indices;
-use crate::io::commit::{CommitTransactionOptions, commit_transaction};
+use crate::{CommitBuilder, Table};
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, pb::fragment_reuse_index_details as pb_fri};
+use lance_table::system_index::frag_reuse::{
+    FRAG_REUSE_INDEX_NAME, FragDigest, FragReuseGroup,
+    metadata::{is_tagged, uses_tagged_fri},
+};
+use lance_table::transaction::{
+    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+};
 use roaring::{RoaringBitmap, RoaringTreemap};
 
-/// Returns the version the reservation committed at; `dataset` is not moved to it.
-pub(super) async fn reserve_fragment_ids(
-    dataset: &Dataset,
+pub(super) async fn publish_compaction(
+    table: &Table,
+    transaction: Transaction,
+    hooks: &CompactionHooks<'_>,
+) -> Result<Table> {
+    let mut builder = CommitBuilder::new(table).with_timeout(None);
+    if let Some(hook) = &hooks.commit_index {
+        builder = builder.with_index_hook(hook.clone());
+    }
+    builder
+        .execute_with_lifecycle(transaction, hooks.commit_lifecycle)
+        .await
+}
+
+/// Reserve IDs without advancing the supplied snapshot. Returns the reservation version.
+#[doc(hidden)]
+pub async fn reserve_fragment_ids(
+    dataset: &Table,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<u64> {
+    let num_fragments = u32::try_from(fragments.len()).map_err(|_| {
+        Error::invalid_input(format!("Cannot reserve {} fragment IDs", fragments.len()))
+    })?;
     let transaction = Transaction::new(
         dataset.manifest.version,
-        Operation::ReserveFragments {
-            num_fragments: fragments.len() as u32,
-        },
+        Operation::ReserveFragments { num_fragments },
         None,
     );
-
-    let build_config = Default::default();
-    let commit_config = Default::default();
-    let (manifest, _) = commit_transaction(
-        dataset,
-        dataset.table_state.object_store.as_ref(),
-        dataset.table_state.commit_handler.as_ref(),
-        &transaction,
-        CommitTransactionOptions::new(
-            &build_config,
-            &commit_config,
-            dataset.table_state.manifest_location.naming_scheme,
-        ),
-    )
-    .await?;
+    let committed = publish_compaction(dataset, transaction, hooks).await?;
+    let manifest = &committed.manifest;
 
     // Need +1 since max_fragment_id is inclusive in this case and ranges are exclusive
-    let new_max_exclusive = manifest.max_fragment_id.unwrap_or(0) + 1;
-    let reserved_ids = (new_max_exclusive - fragments.len() as u32)..(new_max_exclusive);
+    let new_max_exclusive = u64::from(manifest.max_fragment_id.unwrap_or(0)) + 1;
+    let reserved_ids = (new_max_exclusive - u64::from(num_fragments))..new_max_exclusive;
 
     for (fragment, new_id) in fragments.zip(reserved_ids) {
-        fragment.id = new_id as u64;
+        fragment.id = new_id;
     }
 
     Ok(manifest.version)
@@ -82,10 +87,11 @@ pub(super) async fn reserve_fragment_ids(
 /// reuse index, so it is kept out of the FRI-with-stable-row-ids gate, and
 /// the caller never folds it into a fragment-reuse record.
 async fn records_stable_row_id_moves(
-    dataset: &Dataset,
+    dataset: &Table,
     completed_tasks: &[RewriteResult],
     options: &CompactionOptions,
     remapping_eagerly: bool,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<bool> {
     let recorded = completed_tasks
         .iter()
@@ -110,7 +116,7 @@ async fn records_stable_row_id_moves(
              moves; run the compaction with defer_index_remap",
         ));
     }
-    ensure_frag_reuse_recording_allowed(&dataset.manifest, &load_all_indices(dataset).await?)?;
+    ensure_frag_reuse_recording_allowed(dataset, hooks).await?;
     Ok(true)
 }
 
@@ -134,10 +140,25 @@ async fn records_stable_row_id_moves(
 /// recorded them. Results that did not record commit without recording, also
 /// on a table that has a fragment reuse index.
 pub async fn commit_compaction(
-    dataset: &mut Dataset,
+    dataset: &mut Table,
     completed_tasks: Vec<RewriteResult>,
-    remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
+) -> Result<CompactionMetrics> {
+    commit_compaction_with_hooks(
+        dataset,
+        completed_tasks,
+        options,
+        &CompactionHooks::default(),
+    )
+    .await
+}
+
+/// Commit rewrite and repack results with the coordinator's index bindings.
+pub async fn commit_compaction_with_hooks(
+    dataset: &mut Table,
+    completed_tasks: Vec<RewriteResult>,
+    options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<CompactionMetrics> {
     let (repacks, rewrites): (Vec<_>, Vec<_>) = completed_tasks
         .into_iter()
@@ -163,44 +184,26 @@ pub async fn commit_compaction(
     // committing from it would load that version's manifest back, and it may
     // have been expired since.
     let repack_base = dataset.clone();
-    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, remap_options, options)).await?;
-    metrics += super::repack::commit_repacked_files(dataset, repack_base, repacks, options).await?;
+    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, options, hooks)).await?;
+    metrics +=
+        super::repack::commit_repacked_files(dataset, repack_base, repacks, options, hooks).await?;
     Ok(metrics)
 }
 
 async fn commit_rewrites(
-    dataset: &mut Dataset,
+    dataset: &mut Table,
     completed_tasks: Vec<RewriteResult>,
-    remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
 
-    // A tagged FRI history stores row translation in the manifest entry and
-    // depends on index bitmaps keeping their retired provenance, so a
-    // compaction on a tagged table can only commit by appending transitions
-    // (the deferred path below). Refuse the eager path up front, before any
-    // remapping work runs into the commit gate.
-    let tagged_fri = load_all_indices(dataset)
-        .await?
-        .iter()
-        .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
-    if tagged_fri && !options.defer_index_remap {
-        return Err(Error::not_supported(
-            "Compacting a table with a tagged fragment reuse history requires \
-             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
-             remaps tagged histories eagerly",
-        ));
-    }
-
-    // Before anything is written or committed. The condition mirrors the
-    // planner's: see `unremappable_index_coverage` for why this only applies
-    // without stable row ids.
     let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
-    if !uses_stable_row_ids && !options.defer_index_remap {
-        reject_unremappable_rewrite(dataset, &completed_tasks).await?;
+    if !options.defer_index_remap {
+        reject_eager_remap_on_tagged_fri(dataset).await?;
+        reject_unremappable_rewrite(dataset, &completed_tasks, hooks).await?;
     }
 
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
@@ -220,27 +223,28 @@ async fn commit_rewrites(
     // to the fragment-reuse index below instead of being silently discarded.
     let needs_remapping = !options.defer_index_remap
         && has_address_style
-        && (!uses_stable_row_ids || has_eager_remappable_index(dataset).await?);
+        && (!uses_stable_row_ids || needs_row_addrs(dataset, hooks).await?);
 
     if needs_remapping {
         reject_eager_remap_over_undrained_fri(dataset).await?;
     }
 
     let records_row_addrs = if uses_stable_row_ids {
-        records_stable_row_id_moves(dataset, &completed_tasks, options, needs_remapping).await?
+        records_stable_row_id_moves(dataset, &completed_tasks, options, needs_remapping, hooks)
+            .await?
     } else {
         options.defer_index_remap
     };
 
     // Confirm there is a remapper before materializing the potentially very large row address map.
-    let index_remapper = if needs_remapping {
-        remap_options.create_remapper(dataset).await?
+    let index_remapper = if needs_remapping && let Some(factory) = hooks.remapper {
+        factory.create_remapper(dataset).await?
     } else {
         None
     };
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
-    // In distributed mode (e.g. Spark) the caller opens *two separate* Dataset
+    // In distributed mode (e.g. Spark) the caller opens *two separate* Table
     // handles: one for `plan_compaction` (at version V) and a fresh one for
     // `commit_compaction` (at the latest version V+N).  Using `dataset.manifest.version`
     // (= V+N) as the transaction's `read_version` would cause the conflict checker to
@@ -257,7 +261,11 @@ async fn commit_rewrites(
         .min()
         .unwrap_or(dataset.manifest.version);
 
-    if index_remapper.is_none() || !remap_options.supports_vector_segment_replacement() {
+    if index_remapper.is_none()
+        || !hooks
+            .remapper
+            .is_some_and(|factory| factory.supports_vector_segment_replacement())
+    {
         let read_snapshot = if dataset.manifest.version == tasks_read_version {
             Cow::Borrowed(&*dataset)
         } else {
@@ -268,6 +276,7 @@ async fn commit_rewrites(
             completed_tasks
                 .iter()
                 .map(|task| task.original_fragments.as_slice()),
+            hooks,
         )
         .await?;
     }
@@ -286,7 +295,7 @@ async fn commit_rewrites(
             .collect();
         // A replayed result shares file paths with its earlier commit, so a failed
         // reservation cannot prove the files are unreferenced. Leave them for GC.
-        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter()).await?);
+        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter(), hooks).await?);
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -389,9 +398,8 @@ async fn commit_rewrites(
             // tasks may be replayed results planned elsewhere); the counts
             // were materialized by `normalize_source_fragments` above, from
             // the same list the rewrite group carries.
-            let digest =
-                |frag: &Fragment| -> Result<lance_table::system_index::frag_reuse::FragDigest> {
-                    Ok(lance_table::system_index::frag_reuse::FragDigest {
+            let digest = |frag: &Fragment| -> Result<FragDigest> {
+                Ok(FragDigest {
                         id: frag.id,
                         physical_rows: frag.physical_rows.ok_or_else(|| {
                             Error::invalid_input(format!(
@@ -413,7 +421,7 @@ async fn commit_rewrites(
                             .transpose()?
                             .unwrap_or(0),
                     })
-                };
+            };
             frag_reuse_groups.push(FragReuseGroup {
                 changed_row_addrs,
                 old_frags: old_fragments.iter().map(digest).collect::<Result<_>>()?,
@@ -467,7 +475,7 @@ async fn commit_rewrites(
             .flat_map(|group| group.new_fragments.iter_mut())
             .collect::<Vec<_>>();
         // As above, reservation failure does not make replayed files safe to delete.
-        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
+        reserve_fragment_ids(dataset, new_fragments.into_iter(), hooks).await?;
         Vec::new()
     } else {
         Vec::new()
@@ -508,8 +516,8 @@ async fn commit_rewrites(
         // extending it in place. A table that never was tagged has neither
         // flag nor tagged entry, and keeps creating the v0 entry byte
         // identically.
-        let stored = load_all_indices(dataset).await?;
-        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+        let stored = dataset.load_index_metadata().await?;
+        let tagged_at_commit = uses_tagged_fri(
             &dataset.manifest,
             stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
         );
@@ -534,7 +542,6 @@ async fn commit_rewrites(
                     overlaid.id
                 )));
             }
-            use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
             let transitions = frag_reuse_groups
                 .into_iter()
                 .map(|group| pb_fri::Transition {
@@ -566,10 +573,7 @@ async fn commit_rewrites(
                 // than guessing the base from a later snapshot.
                 Cow::Owned(dataset.checkout_version(tasks_read_version).await?)
             };
-            Some(
-                crate::index::frag_reuse::frag_reuse_entry_appending(&read_snapshot, transitions)
-                    .await?,
-            )
+            Some(frag_reuse_entry_appending(&read_snapshot, transitions).await?)
         } else {
             // The rewrite publishes right after the reservation unless another commit
             // lands in between, in which case `finish_rewrite` restamps it.
@@ -611,38 +615,32 @@ async fn commit_rewrites(
     .transaction_properties(options.transaction_properties.clone())
     .build();
 
-    if let Err(e) = dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-    {
-        // RewriteResult is serializable and may be retried after an earlier
-        // ambiguous success. A conflict on this call therefore does not prove
-        // that the rewritten files are unreferenced. Leave them for dataset GC.
-        log::warn!(
-            "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
-            new_fragment_count,
-            e
-        );
-        return Err(e);
+    match publish_compaction(dataset, transaction, hooks).await {
+        Ok(committed) => *dataset = committed,
+        Err(e) => {
+            // RewriteResult is serializable and may be retried after an earlier
+            // ambiguous success. A conflict on this call therefore does not prove
+            // that the rewritten files are unreferenced. Leave them for dataset GC.
+            log::warn!(
+                "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
+                new_fragment_count,
+                e
+            );
+            return Err(e);
+        }
     }
 
     Ok(metrics)
 }
 
-/// Materialize the counts the fragment reuse digests and conservation
-/// validation depend on, without changing the fragment list. Unlike
-/// `migrate_fragments`, fully-deleted fragments are KEPT: the rewrite
-/// group must still remove them from the manifest and the recorded
-/// transition must still consume them (they contribute zero live rows), so
-/// a silently shortened list would desynchronize the digests, the group and
-/// the manifest.
-pub async fn normalize_source_fragments(
-    dataset: &Dataset,
-    fragments: &[Fragment],
-) -> Result<Vec<Fragment>> {
-    lance_table_runtime::frag_reuse::normalize_source_fragments(
-        &dataset.table_view().to_table(),
-        fragments,
-    )
-    .await
+/// An eager rewrite cannot maintain an existing tagged fragment reuse history.
+pub(super) async fn reject_eager_remap_on_tagged_fri(dataset: &Table) -> Result<()> {
+    if dataset.load_index_metadata().await?.iter().any(is_tagged) {
+        return Err(Error::not_supported(
+            "Compacting a table with a tagged fragment reuse history requires \
+             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
+             remaps tagged histories eagerly",
+        ));
+    }
+    Ok(())
 }

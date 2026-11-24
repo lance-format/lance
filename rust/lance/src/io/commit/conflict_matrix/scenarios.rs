@@ -646,8 +646,8 @@ async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged
         // A rewrite carries the old rows' identities onto the new fragment.
         // Reuse compaction's own transfer rather than reimplementing it, or the
         // new fragment arrives with no row ids and the commit is rejected.
-        crate::dataset::optimize::execution::rechunk_row_lineage(
-            dataset.as_ref(),
+        lance_table_runtime::optimize::execution::rechunk_row_lineage(
+            &dataset.table_view().to_table(),
             &mut fragments,
             std::slice::from_ref(&old),
         )

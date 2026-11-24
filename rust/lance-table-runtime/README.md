@@ -5,7 +5,9 @@ deletions, and overlays. Point takes select rows by offset, stable ID, or
 physical address. The runtime can return lazy blob handles or plan payload
 reads. Stream Arrow batches into `InsertBuilder` to create, append to, or
 overwrite a table. Publish prewritten fragments and staged deletions or
-overlays with `CommitBuilder`. Enable the Cargo feature for your cloud backend.
+overlays with `CommitBuilder`. Compact fragments or repack columns locally
+with `optimize::compact_files`, or serialize compaction tasks and execute
+them on separate workers. Enable the Cargo feature for your cloud backend.
 
 ```rust,no_run
 use lance_table_runtime::{FragReadConfig, Table};
@@ -70,5 +72,20 @@ async fn append_batches(
         .with_params(&params)
         .execute_stream(data)
         .await
+}
+```
+
+```rust,no_run
+use lance_table_runtime::Table;
+use lance_table_runtime::optimize::{CompactionMetrics, commit_compaction, plan_compaction};
+
+async fn compact(uri: &str) -> lance_core::Result<CompactionMetrics> {
+    let mut table = Table::open(uri).await?;
+    let plan = plan_compaction(&table, &Default::default()).await?;
+    let mut results = Vec::with_capacity(plan.num_tasks());
+    for task in plan.compaction_tasks() {
+        results.push(task.execute(&table).await?);
+    }
+    commit_compaction(&mut table, results, plan.options()).await
 }
 ```

@@ -134,6 +134,20 @@ pub async fn load_all_indices(
     Ok(indices)
 }
 
+pub async fn open_v0_frag_reuse_index(
+    table: &Table,
+    entry: &IndexMetadata,
+) -> Result<Arc<CompactFragReuseIndex>> {
+    let identity = v0_cache_identity(&table.manifest, entry);
+    table
+        .index_cache()
+        .get_or_insert_with_key(FragReuseIndexKey { uuid: &identity }, || async {
+            let details = load_frag_reuse_index_details(table, entry).await?;
+            CompactFragReuseIndex::try_new(entry.uuid, Arc::unwrap_or_clone(details))
+        })
+        .await
+}
+
 async fn listing_with_v0_coverage(
     table: &Table,
     raw: Arc<Vec<IndexMetadata>>,
@@ -157,14 +171,7 @@ async fn listing_with_v0_coverage(
     if let Some(cached) = table.index_cache().get_with_key(&key).await {
         return Ok(cached);
     }
-    let identity = v0_cache_identity(&table.manifest, fri);
-    let history = table
-        .index_cache()
-        .get_or_insert_with_key(FragReuseIndexKey { uuid: &identity }, || async {
-            let details = load_frag_reuse_index_details(table, fri).await?;
-            CompactFragReuseIndex::try_new(fri.uuid, Arc::unwrap_or_clone(details))
-        })
-        .await?;
+    let history = open_v0_frag_reuse_index(table, fri).await?;
     let mut remapped = raw.as_ref().clone();
     for index in &mut remapped {
         if let Some(bitmap) = &mut index.fragment_bitmap {
