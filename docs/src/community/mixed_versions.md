@@ -29,8 +29,7 @@ readers already in the field cannot read.
 ## Breaking Format Changes Ship Opt-In First
 
 A change is a **breaking format change** when data written with it cannot be
-read, or cannot be correctly maintained, by the previous stable release. The
-common cases are:
+read by the previous stable release. The common cases are:
 
 - A new file format version or a new encoding in an existing one.
 - A new index format version, or a new on-disk layout for an existing index.
