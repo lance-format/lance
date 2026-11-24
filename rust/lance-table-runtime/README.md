@@ -3,8 +3,9 @@
 Open Lance table snapshots and read fragments with projections, row IDs,
 deletions, and overlays. Point takes select rows by offset, stable ID, or
 physical address. The runtime can return lazy blob handles or plan payload
-reads. It also resolves refs, version history, and transactions. Enable the
-Cargo feature for the cloud backend you use.
+reads. It also resolves refs and version history, and commits transactions
+over prewritten fragments. Enable the Cargo feature for the cloud backend
+you use.
 
 ```rust,no_run
 use lance_table_runtime::{FragReadConfig, Table};
@@ -37,5 +38,18 @@ async fn take_rows_and_blobs(uri: &str) -> lance_core::Result<()> {
         println!("Read {} bytes", bytes.len());
     }
     Ok(())
+}
+```
+
+```rust,no_run
+use std::sync::Arc;
+
+use lance_table::format::Fragment;
+use lance_table::transaction::{Operation, Transaction};
+use lance_table_runtime::{CommitBuilder, Table};
+
+async fn append(table: Table, fragments: Vec<Fragment>) -> lance_core::Result<Table> {
+    let transaction = Transaction::new(table.version_id(), Operation::Append { fragments }, None);
+    CommitBuilder::new(Arc::new(table)).execute(transaction).await
 }
 ```

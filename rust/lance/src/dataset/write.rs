@@ -32,10 +32,11 @@ use lance_io::stream::SendableRecordBatchStream;
 use lance_io::traits::Writer;
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{BasePath, DataFile, Fragment};
-use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
+use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
 use lance_table_runtime::base::log_unregistered_base_scoped_options;
+use lance_table_runtime::commit::resolve_commit_handler;
 use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -2024,15 +2025,7 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
-/// Give a new table its field IDs. `inherited` IDs are an existing table's,
-/// such as a MemWAL generation's, and may exceed the new-table limit.
-pub(crate) fn assign_new_table_field_ids(schema: &mut Schema, inherited: bool) -> Result<()> {
-    if inherited {
-        schema.try_keep_field_ids()
-    } else {
-        schema.try_assign_new_table_field_ids()
-    }
-}
+pub(crate) use lance_table_runtime::commit::assign_new_table_field_ids;
 
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
@@ -2832,37 +2825,6 @@ where
 }
 
 // Given input options resolve what the commit handler should be.
-async fn resolve_commit_handler(
-    uri: &str,
-    commit_handler: Option<Arc<dyn CommitHandler>>,
-    store_options: &Option<ObjectStoreParams>,
-) -> Result<Arc<dyn CommitHandler>> {
-    match commit_handler {
-        None => {
-            #[allow(deprecated)]
-            if store_options
-                .as_ref()
-                .map(|opts| opts.object_store.is_some())
-                .unwrap_or_default()
-            {
-                return Err(Error::invalid_input(
-                    "when creating a dataset with a custom object store the commit_handler must also be specified",
-                ));
-            }
-            commit_handler_from_url(uri, store_options).await
-        }
-        Some(commit_handler) => {
-            if uri.starts_with("s3+ddb") {
-                Err(Error::invalid_input(
-                    "`s3+ddb://` scheme and custom commit handler are mutually exclusive",
-                ))
-            } else {
-                Ok(commit_handler)
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

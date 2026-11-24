@@ -2,11 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use crate::index::provenance::revives_rows;
+use crate::io::deletion::{inline_deletions_max_bytes, revives_rows};
 
 impl<'a> TransactionRebase<'a> {
-    /// Writes
-    pub async fn finish(self, dataset: &Dataset) -> Result<Transaction> {
+    /// Finish the rebase, writing merged deletion vectors when required.
+    pub async fn finish(self, dataset: &Table) -> Result<Transaction> {
         Ok(self.finish_with_tagged_rewrite(dataset).await?.0)
     }
 
@@ -18,20 +18,33 @@ impl<'a> TransactionRebase<'a> {
     /// intent again instead of treating this assembly as its own.
     pub async fn finish_with_tagged_rewrite(
         self,
-        dataset: &Dataset,
+        dataset: &Table,
+    ) -> Result<(Transaction, Option<Arc<TaggedRewriteAssembly>>)> {
+        self.finish_with_index_hook(dataset, None).await
+    }
+
+    /// Finish the rebase with an index implementation for file inspection.
+    pub async fn finish_with_index_hook(
+        self,
+        dataset: &Table,
+        index_hook: Option<&dyn CommitIndexHook>,
     ) -> Result<(Transaction, Option<Arc<TaggedRewriteAssembly>>)> {
         match &self.transaction.operation {
-            Operation::Rewrite { .. } => self.finish_rewrite(dataset).await,
-            _ => Ok((self.finish_other(dataset).await?, None)),
+            Operation::Rewrite { .. } => self.finish_rewrite(dataset, index_hook).await,
+            _ => Ok((self.finish_other(dataset, index_hook).await?, None)),
         }
     }
 
-    async fn finish_other(self, dataset: &Dataset) -> Result<Transaction> {
+    async fn finish_other(
+        self,
+        dataset: &Table,
+        index_hook: Option<&dyn CommitIndexHook>,
+    ) -> Result<Transaction> {
         match &self.transaction.operation {
             Operation::Delete { .. } | Operation::Update { .. } => {
                 self.finish_delete_update(dataset).await
             }
-            Operation::CreateIndex { .. } => self.finish_create_index(dataset).await,
+            Operation::CreateIndex { .. } => self.finish_create_index(dataset, index_hook).await,
             Operation::Rewrite { .. } => unreachable!("finish_with_tagged_rewrite handles Rewrite"),
             Operation::DataOverlay { .. } => self.finish_data_overlay(dataset).await,
             Operation::Append { .. }
@@ -58,7 +71,7 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    async fn finish_delete_update(mut self, dataset: &Dataset) -> Result<Transaction> {
+    async fn finish_delete_update(mut self, dataset: &Table) -> Result<Transaction> {
         if self
             .initial_fragments
             .iter()
@@ -98,7 +111,7 @@ impl<'a> TransactionRebase<'a> {
                     .collect::<Vec<_>>();
                 let existing_deletion_vecs = futures::stream::iter(files_to_rewrite)
                     .map(|(fragment_id, deletion_file)| async move {
-                        read_dataset_deletion_file(
+                        read_table_deletion_file(
                             dataset,
                             fragment_id,
                             &deletion_file.expect("there should be a deletion file"),
@@ -106,7 +119,7 @@ impl<'a> TransactionRebase<'a> {
                         .await
                         .map(|dv| (fragment_id, dv))
                     })
-                    .buffered(dataset.table_state.object_store.as_ref().io_parallelism())
+                    .buffered(dataset.state.object_store.as_ref().io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -123,7 +136,7 @@ impl<'a> TransactionRebase<'a> {
                         .unwrap()
                         .take(5)
                         .collect::<Vec<_>>();
-                    return Err(crate::Error::retryable_commit_conflict_source(dataset.manifest.version, format!(
+                    return Err(Error::retryable_commit_conflict_source(dataset.manifest.version, format!(
                         "This {} transaction was preempted by concurrent transaction {} (both modified rows at addresses {:?}). Please retry",
                         self.transaction.uuid,
                         dataset.manifest.version,
@@ -158,23 +171,23 @@ impl<'a> TransactionRebase<'a> {
                     }
 
                     let new_deletion_file = write_deletion_file(
-                        &dataset.table_state.base,
+                        &dataset.state.base,
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
-                        dataset.table_state.object_store.as_ref(),
-                        dataset.inline_deletions_max_bytes()?,
+                        dataset.state.object_store.as_ref(),
+                        inline_deletions_max_bytes(&dataset.manifest)?,
                     )
                     .await?;
 
                     // Make sure this is available in the cache for future conflict resolution.
                     let deletion_file = new_deletion_file.as_ref().unwrap();
-                    let key = crate::session::caches::DeletionFileKey {
+                    let key = crate::caches::DeletionFileKey {
                         fragment_id: *fragment_id,
                         deletion_file,
                     };
                     dataset
-                        .table_state
+                        .state
                         .metadata_cache
                         .insert_with_key(&key, Arc::new(dv))
                         .await;
@@ -210,7 +223,7 @@ impl<'a> TransactionRebase<'a> {
                 })
             } else {
                 // We shouldn't hit this.
-                Err(crate::Error::internal(
+                Err(Error::internal(
                     "We have a transaction that needs to be rebased, but we don't have any affected rows.",
                 ))
             }
@@ -234,7 +247,7 @@ impl<'a> TransactionRebase<'a> {
     /// concurrent Update touched the same flagged fragment, the Delete's rows are
     /// also counted and may trigger an unnecessary retry — never data loss. Pure
     /// concurrent deletes leave the fragment unflagged and are not examined here.
-    async fn finish_data_overlay(self, dataset: &Dataset) -> Result<Transaction> {
+    async fn finish_data_overlay(self, dataset: &Table) -> Result<Transaction> {
         let fragments_to_check: HashSet<u64> = self
             .initial_fragments
             .iter()
@@ -268,7 +281,7 @@ impl<'a> TransactionRebase<'a> {
                 .find(|f| f.id == fragment_id)
             else {
                 // The fragment is gone entirely; the overlay is orphaned.
-                return Err(crate::Error::retryable_commit_conflict_source(
+                return Err(Error::retryable_commit_conflict_source(
                     dataset.manifest.version,
                     format!(
                         "This {} transaction was preempted: overlaid fragment {} was removed by a concurrent transaction. Please retry.",
@@ -289,7 +302,7 @@ impl<'a> TransactionRebase<'a> {
             let conflicting = &moved_rows & &coverage;
             if !conflicting.is_empty() {
                 let sample: Vec<u32> = conflicting.iter().take(5).collect();
-                return Err(crate::Error::retryable_commit_conflict_source(
+                return Err(Error::retryable_commit_conflict_source(
                     dataset.manifest.version,
                     format!(
                         "This {} transaction was preempted by a concurrent update that moved overlaid rows on fragment {} (offsets {:?}). Please retry.",
@@ -306,7 +319,11 @@ impl<'a> TransactionRebase<'a> {
         })
     }
 
-    async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
+    async fn finish_create_index(
+        mut self,
+        dataset: &Table,
+        index_hook: Option<&dyn CommitIndexHook>,
+    ) -> Result<Transaction> {
         // Computed before the operation is borrowed mutably below.
         let self_is_superseded_prune = is_superseded_prune_transaction(&self.transaction);
         if let Operation::CreateIndex {
@@ -328,11 +345,11 @@ impl<'a> TransactionRebase<'a> {
             if is_tagged_trim_operation(new_indices, removed_indices)
                 && dataset.manifest.version != self.transaction.read_version
             {
-                match derive_tagged_trim(dataset).await? {
+                match derive_tagged_trim(dataset, index_hook).await? {
                     TaggedTrimOutcome::NothingToTrim => {
                         return Err(Error::retryable_commit_conflict_source(
                             dataset.manifest.version,
-                            crate::dataset::index::frag_reuse::TAGGED_TRIM_REBASED_TO_NOOP.into(),
+                            TAGGED_TRIM_REBASED_TO_NOOP.into(),
                         ));
                     }
                     TaggedTrimOutcome::Replace {
@@ -365,11 +382,18 @@ impl<'a> TransactionRebase<'a> {
             // that conflict as success.
             if self_is_superseded_prune && dataset.manifest.version != self.transaction.read_version
             {
-                let rederived = derive_superseded_segments(dataset).await?;
+                let rederived = index_hook
+                    .ok_or_else(|| {
+                        Error::not_supported(
+                            "Cannot rederive superseded index segments without a commit index hook",
+                        )
+                    })?
+                    .superseded_segments(dataset)
+                    .await?;
                 if rederived.is_empty() {
                     return Err(Error::retryable_commit_conflict_source(
                         dataset.manifest.version,
-                        crate::dataset::index::frag_reuse::SUPERSEDED_PRUNE_REBASED_TO_NOOP.into(),
+                        SUPERSEDED_PRUNE_REBASED_TO_NOOP.into(),
                     ));
                 }
                 *removed_indices = rederived;
@@ -404,7 +428,7 @@ impl<'a> TransactionRebase<'a> {
                     new_indices,
                     rewrites,
                     dataset.schema(),
-                    dataset.table_state.fragment_bitmap.as_ref(),
+                    dataset.state.fragment_bitmap.as_ref(),
                     self.current_lineage.as_ref(),
                 );
 
@@ -424,7 +448,13 @@ impl<'a> TransactionRebase<'a> {
                 for current in dataset.fragments().iter() {
                     if covered_fragments.contains(current.id as u32)
                         && let Some(previous) = previously_deleted_fragments.get(&current.id)
-                        && revives_rows(dataset, dataset, previous, current).await?
+                        && revives_rows(
+                            previous,
+                            current,
+                            |deletion| read_table_deletion_file(dataset, previous.id, deletion),
+                            |deletion| read_table_deletion_file(dataset, current.id, deletion),
+                        )
+                        .await?
                     {
                         revived_fragments.insert(current.id as u32);
                     }
@@ -496,12 +526,13 @@ impl<'a> TransactionRebase<'a> {
                     }
                     None => live.clone(),
                 };
-                let undeferrable = crate::index::frag_reuse::undeferrable_segments_covering(
+                let undeferrable = crate::frag_reuse::undeferrable_segments_covering(
                     dataset,
                     new_indices.iter(),
                     &retired,
                     Some(lineage),
                     &pre_rewrite_live,
+                    index_hook,
                 )
                 .await?;
                 Transaction::withdraw_undeferrable_rewrite_coverage(
@@ -550,7 +581,7 @@ impl<'a> TransactionRebase<'a> {
             for singleton_name in [FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
                 if new_indices.iter().any(|idx| idx.name == singleton_name) {
                     for existing_idx in dataset
-                        .load_indices()
+                        .load_index_metadata()
                         .await?
                         .iter()
                         .filter(|idx| idx.name == singleton_name)
@@ -574,7 +605,8 @@ impl<'a> TransactionRebase<'a> {
 
     async fn finish_rewrite(
         mut self,
-        dataset: &Dataset,
+        dataset: &Table,
+        index_hook: Option<&dyn CommitIndexHook>,
     ) -> Result<(Transaction, Option<Arc<TaggedRewriteAssembly>>)> {
         if let Operation::Rewrite {
             groups,
@@ -609,7 +641,7 @@ impl<'a> TransactionRebase<'a> {
             // tagged support are fenced off by the writer feature flag
             // before this point.
             if self.reuse.added_transitions.is_none() && proposed.index_version == 0 {
-                let stored = crate::index::loading::load_all_indices(dataset).await?;
+                let stored = load_all_indices(dataset, index_hook).await?;
                 let current_uses_tagged =
                     lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
                         &dataset.manifest,
@@ -672,7 +704,8 @@ impl<'a> TransactionRebase<'a> {
                 // longer in the manifest. What remains at this point is
                 // proven disjoint, and disjoint transitions merge.
                 let (entry, base_entry_version) =
-                    build_frag_reuse_rewrite_entry(dataset, transitions, groups).await?;
+                    build_frag_reuse_rewrite_entry(dataset, transitions, groups, index_hook)
+                        .await?;
                 // Established here, against the manifest THIS attempt builds
                 // on, for the same reason the entry is: a concurrent
                 // CreateIndex may have added a segment that cannot translate
@@ -682,9 +715,10 @@ impl<'a> TransactionRebase<'a> {
                     .flat_map(|group| group.old_fragments.iter())
                     .filter_map(|fragment| u32::try_from(fragment.id).ok())
                     .collect();
-                let undeferrable_segments =
-                    crate::index::frag_reuse::undeferrable_rewrite_segments(dataset, &rewritten)
-                        .await?;
+                let undeferrable_segments = crate::frag_reuse::undeferrable_rewrite_segments(
+                    dataset, &rewritten, index_hook,
+                )
+                .await?;
                 let assembly = TaggedRewriteAssembly::new(
                     entry,
                     base_entry_version,
@@ -788,12 +822,12 @@ impl<'a> TransactionRebase<'a> {
 /// Read a fragment's deletion vector as a bitmap of physical offsets, or an
 /// empty bitmap when the fragment has no deletion file.
 async fn read_fragment_deletion_bitmap(
-    dataset: &Dataset,
+    dataset: &Table,
     fragment: &Fragment,
 ) -> Result<RoaringBitmap> {
     match &fragment.deletion_file {
         Some(deletion_file) => {
-            let dv = read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?;
+            let dv = read_table_deletion_file(dataset, fragment.id, deletion_file).await?;
             Ok(RoaringBitmap::from(dv.as_ref()))
         }
         None => Ok(RoaringBitmap::new()),

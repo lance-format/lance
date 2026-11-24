@@ -7,13 +7,12 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use chrono::Duration;
 use futures::future::BoxFuture;
-use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
-use crate::session::caches::TransactionKey;
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
@@ -36,20 +35,16 @@ use lance_io::utils::CachedFileSize;
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
-    storage_contract::finalize_manifest_storage_version,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
-    VERSIONS_DIR, external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
-    write_manifest_file_to_path,
+    CommitConfig, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
+    external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use lance_table_runtime::base::has_any_entry;
-pub(crate) use lance_table_runtime::paths::{
-    BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR,
-};
+pub(crate) use lance_table_runtime::paths::{BLOBS_DIR, DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use lance_table_runtime::{Table, TableState, TableView};
 pub use lance_table_runtime::{Version, VersionRef, VersionTransaction};
 use object_store::path::Path;
@@ -146,11 +141,10 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
-    CommitTransactionOptions, commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, fix_schema,
+    CommitTransactionOptions, commit_transaction, detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
-use crate::utils::temporal::{timestamp_to_nanos, utc_now};
+use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 pub use blob::{
     BlobFile, BlobRangeRequest, BlobReadRange, BlobV2BatchRewritePlan, ReadBlob, ReadBlobRange,
@@ -162,10 +156,7 @@ pub use lance_core::ROW_ID;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{
-    apply_feature_flags, apply_index_object_metadata_flag, ensure_can_write_manifest,
-    validate_non_reusable_field_id_flags, validate_paired_feature_flags,
-};
+use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use overlay::writer::{OverlayWriter, WriteOverlayError};
@@ -526,7 +517,12 @@ impl Dataset {
         Self::from_table_with_index_cache(table, session, index_cache)
     }
 
-    fn from_table_with_index_cache(
+    pub(crate) fn from_committed_table(table: Table, session: Arc<Session>) -> Self {
+        let index_cache = Arc::new(DSIndexCache(table.index_cache().clone()));
+        Self::from_table_with_index_cache(table, session, index_cache)
+    }
+
+    pub(crate) fn from_table_with_index_cache(
         table: Table,
         session: Arc<Session>,
         index_cache: Arc<DSIndexCache>,
@@ -779,6 +775,7 @@ impl Dataset {
         self.branches().list().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
@@ -786,46 +783,6 @@ impl Dataset {
         session: &Session,
     ) -> Result<Manifest> {
         Table::load_manifest(object_store, manifest_location, uri, &session.table_session).await
-    }
-
-    /// Fetch the manifest for `manifest_location` from the session metadata
-    /// cache, loading and caching it on a miss.
-    pub(crate) async fn get_manifest(
-        object_store: &ObjectStore,
-        manifest_location: &ManifestLocation,
-        uri: &str,
-        session: &Session,
-    ) -> Result<Arc<Manifest>> {
-        Table::get_manifest(object_store, manifest_location, uri, &session.table_session).await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn checkout_manifest(
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        uri: String,
-        manifest: Arc<Manifest>,
-        manifest_location: ManifestLocation,
-        session: Arc<Session>,
-        commit_handler: Arc<dyn CommitHandler>,
-        file_reader_options: Option<FileReaderOptions>,
-        store_params: Option<ObjectStoreParams>,
-        base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
-    ) -> Result<Self> {
-        let table = Table::checkout_manifest(
-            object_store,
-            base_path,
-            uri,
-            manifest,
-            manifest_location,
-            session.table_session.clone(),
-            commit_handler,
-            file_reader_options,
-            store_params,
-            base_store_params,
-        )
-        .await?;
-        Ok(Self::from_table(table, session))
     }
 
     /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
@@ -1094,10 +1051,6 @@ impl Dataset {
 
     pub async fn branch_identifier(&self) -> Result<BranchIdentifier> {
         self.table_view().branch_identifier().await
-    }
-
-    pub(crate) async fn ensure_branch_exists(&self) -> Result<()> {
-        self.table_view().ensure_branch_exists().await
     }
 
     /// Get the full manifest of the dataset version.
@@ -3661,142 +3614,8 @@ impl Dataset {
     }
 }
 
-pub(crate) struct NewTransactionResult<'a> {
-    pub dataset: BoxFuture<'a, Result<Dataset>>,
-    pub new_transactions: BoxStream<'a, Result<(u64, Arc<Transaction>)>>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum TransactionReadSource {
-    SessionCache,
-    /// Read the transaction from its manifest or the file it references.
-    /// A version-only cache entry may belong to a previous table at the URI.
-    Storage,
-}
-
-pub(crate) fn load_new_transactions(
-    dataset: &Dataset,
-    source: TransactionReadSource,
-) -> NewTransactionResult<'_> {
-    // Resolve every manifest with version > our current version (the latest plus
-    // the ones in between). On non-lexically-ordered stores this uses the version
-    // hint to avoid an O(n) listing.
-    let io_parallelism = dataset.table_state.object_store.as_ref().io_parallelism();
-    // Both stages must poll their input even when the store permits only one I/O.
-    let stage_parallelism = (io_parallelism / 2).max(1);
-    let locations = dataset
-        .table_state
-        .commit_handler
-        .list_manifest_locations_since(
-            &dataset.table_state.base,
-            dataset.table_state.object_store.as_ref(),
-            dataset.manifest.version,
-        );
-
-    // Will send the latest manifest via a channel.
-    let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();
-    let mut latest_tx = Some(latest_tx);
-
-    let manifests = locations
-        .map_ok(move |location| {
-            let latest_tx = latest_tx.take();
-            async move {
-                let manifest = match source {
-                    TransactionReadSource::SessionCache => {
-                        Dataset::get_manifest(
-                            dataset.table_state.object_store.as_ref(),
-                            &location,
-                            &dataset.table_state.uri,
-                            dataset.session.as_ref(),
-                        )
-                        .await?
-                    }
-                    TransactionReadSource::Storage => Arc::new(
-                        Dataset::load_manifest(
-                            dataset.table_state.object_store.as_ref(),
-                            &location,
-                            &dataset.table_state.uri,
-                            dataset.session.as_ref(),
-                        )
-                        .await?,
-                    ),
-                };
-
-                if let Some(latest_tx) = latest_tx {
-                    // We ignore the error, since we don't care if the receiver is dropped.
-                    let _ = latest_tx.send((manifest.clone(), location.clone()));
-                }
-
-                Ok((manifest, location))
-            }
-        })
-        .try_buffer_unordered(stage_parallelism);
-    let transactions = manifests
-        .map_ok(move |(manifest, location)| async move {
-            let version = manifest.version;
-            let missing_transaction = || {
-                Error::internal(format!(
-                    "Dataset version {version} does not have a transaction file"
-                ))
-            };
-            if let TransactionReadSource::Storage = source {
-                let transaction = dataset
-                    .table_state
-                    .read_transaction_from_storage(&manifest, &location)
-                    .await?
-                    .ok_or_else(missing_transaction)?;
-                return Ok((version, Arc::new(transaction)));
-            }
-
-            let tx_key = TransactionKey { version };
-            let transaction = if let Some(cached) = dataset
-                .table_state
-                .metadata_cache
-                .get_with_key(&tx_key)
-                .await
-            {
-                cached
-            } else {
-                let mut dataset_version = dataset.clone();
-                dataset_version.set_manifest(manifest, location);
-                let loaded = Arc::new(
-                    dataset_version
-                        .read_transaction()
-                        .await?
-                        .ok_or_else(missing_transaction)?,
-                );
-                dataset
-                    .table_state
-                    .metadata_cache
-                    .insert_with_key(&tx_key, loaded.clone())
-                    .await;
-                loaded
-            };
-            Ok((version, transaction))
-        })
-        .try_buffer_unordered(stage_parallelism);
-
-    let dataset = async move {
-        if let Ok((latest_manifest, location)) = latest_rx.await {
-            // Advancing a retry must preserve the handle's branch incarnation.
-            let mut latest = dataset.clone();
-            latest.set_manifest(latest_manifest, location);
-            Ok(latest)
-        } else {
-            // If we didn't get the latest manifest, we can still return the dataset
-            // with the current manifest.
-            Ok(dataset.clone())
-        }
-    }
-    .boxed();
-
-    let new_transactions = transactions.boxed();
-
-    NewTransactionResult {
-        dataset,
-        new_transactions,
-    }
-}
+#[cfg(test)]
+pub(crate) use lance_table_runtime::commit::TransactionReadSource;
 
 /// # Schema Evolution
 ///
@@ -4238,7 +4057,7 @@ impl DatasetTakeRows for Dataset {
     }
 }
 
-/// Commit a manifest file and create a copy at the latest manifest path.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
@@ -4250,96 +4069,21 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
     may_change_schema: bool,
-) -> std::result::Result<ManifestLocation, CommitError> {
-    manifest.update_max_field_id();
-    validate_paired_feature_flags(manifest)?;
-    if let Some(indices) = &indices {
-        lance_table::system_index::frag_reuse::metadata::validate_flags(manifest, indices)?;
-    }
-    // Every manifest write funnels through here, including restore and clone,
-    // which rebuild a manifest from a stored one rather than from an Arrow
-    // schema. Validate names and primary keys at this boundary so all write
-    // paths enforce them.
-    //
-    // Only for transactions that can change the schema. Released versions could
-    // install a key on a nullable column through the metadata path, and
-    // validating every write would make such a table read-only on upgrade --
-    // including through the delete that removes the offending rows, which is
-    // the first step of repairing it. A repair still has to pass: it changes
-    // the schema, and the schema it produces is valid.
-    //
-    // The caller classifies the operation, rather than this reading it off
-    // `transaction`, which is None whenever the encoded bytes were too large
-    // to inline. Deriving it here would make the verdict depend on payload
-    // size, so the same operation would be exempt while small and validated
-    // once it spilled -- and a MemWAL table spills routinely, since its
-    // transactions carry mem-table state.
-    if may_change_schema {
-        manifest
-            .schema
-            .validate_writable()
-            .map_err(CommitError::OtherError)?;
-        manifest
-            .schema
-            .verify_primary_key()
-            .map_err(CommitError::OtherError)?;
-        blob::validate_blob_threshold_metadata(&manifest.schema)
-            .map_err(CommitError::OtherError)?;
-    }
-    if config.auto_set_feature_flags() {
-        // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
-        // Preserve it here so this second apply_feature_flags call does not clear it
-        // when config.use_stable_row_ids() is false (the ManifestBuildConfig default).
-        let use_stable_row_ids = config.use_stable_row_ids() || manifest.uses_stable_row_ids();
-        apply_feature_flags(
-            manifest,
-            use_stable_row_ids,
-            config.disable_transaction_file(),
-        )?;
-        crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag(
-            manifest,
-            indices.as_deref().unwrap_or_default(),
-        );
-        // Here as well as in `build_manifest`: the clone and restore paths reach
-        // this write with their index section but without a build, and a clone
-        // starts from a masked writer word.
-        apply_index_object_metadata_flag(manifest, indices.as_deref().unwrap_or_default());
-    }
-    // Restore and clone bypass build_manifest and may copy an older snapshot
-    // that predates the writer fence.
-    if let Some(indices) = &indices {
-        lance_table::feature_flags::apply_row_addr_index_feature_flag(manifest, indices);
-    }
-    // After the flag reset, so it judges the flags being published. Here rather
-    // than in `build_manifest`, which restore and clone bypass.
-    crate::index::frag_reuse_with_stable_row_ids::validate_frag_reuse_with_stable_row_ids(
+) -> std::result::Result<ManifestLocation, lance_table::io::commit::CommitError> {
+    let hook = crate::io::commit::LanceCommitHook::new(Arc::default());
+    lance_table_runtime::commit::write_manifest_file(
+        object_store,
+        commit_handler,
+        base_path,
         manifest,
-        indices.as_deref().unwrap_or_default(),
-    )?;
-    lance_table::feature_flags::validate_data_overlay_files(manifest)?;
-
-    validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
-    finalize_manifest_storage_version(manifest)?;
-
-    manifest.set_timestamp(
-        config
-            .timestamp_nanos()
-            .unwrap_or_else(|| timestamp_to_nanos(None)),
-    );
-
-    manifest.update_max_fragment_id();
-
-    commit_handler
-        .commit(
-            manifest,
-            indices,
-            base_path,
-            object_store,
-            write_manifest_file_to_path,
-            naming_scheme,
-            transaction,
-        )
-        .await
+        indices,
+        config,
+        naming_scheme,
+        transaction,
+        may_change_schema,
+        hook.hooks(),
+    )
+    .await
 }
 
 impl Projectable for Dataset {

@@ -152,7 +152,7 @@ impl FragmentReuseIndex {
 /// Whether this build can translate `index`'s stored addresses in batches:
 /// `Some(true)` when its type has a batch remapper, `Some(false)` when it
 /// does not, `None` when its details are missing or cannot be interpreted.
-pub(super) async fn segment_supports_batch_remapping(
+pub(crate) async fn segment_supports_batch_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> Result<Option<bool>> {

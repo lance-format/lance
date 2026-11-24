@@ -165,7 +165,7 @@ impl Table {
                 e_tag: manifest_location.e_tag.as_deref(),
             };
             session
-                .cache_index_metadata(uri, &metadata_key, indices)
+                .cache_index_metadata(uri, &metadata_key, &manifest, indices)
                 .await;
         }
 

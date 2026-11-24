@@ -35,7 +35,6 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{BlobHandling, Field as LanceField};
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
@@ -456,30 +455,11 @@ pub async fn live_source_row_addrs(
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<RoaringTreemap> {
-    let mut addrs = RoaringTreemap::new();
-    for fragment in fragments {
-        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
-            Error::internal(format!(
-                "Fragment id {} is outside the row-address range",
-                fragment.id
-            ))
-        })?;
-        let physical_rows = fragment.physical_rows.ok_or_else(|| {
-            Error::internal(format!(
-                "Fragment {} is missing physical_rows after migration",
-                fragment.id
-            ))
-        })?;
-        let start = u64::from(RowAddress::first_row(fragment_id));
-        addrs.insert_range(start..start + physical_rows as u64);
-        if let Some(deletion_file) = &fragment.deletion_file {
-            let deletions = read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?;
-            for offset in deletions.to_sorted_iter() {
-                addrs.remove(u64::from(RowAddress::new_from_parts(fragment_id, offset)));
-            }
-        }
-    }
-    Ok(addrs)
+    lance_table_runtime::frag_reuse::live_source_row_addrs(
+        &dataset.table_view().to_table(),
+        fragments,
+    )
+    .await
 }
 
 /// Refuse a task whose output clustering id can never resolve, before the

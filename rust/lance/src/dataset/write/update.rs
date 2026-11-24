@@ -866,7 +866,7 @@ impl UpdateJob {
     }
 }
 
-impl RetryExecutor for UpdateJob {
+impl RetryExecutor<Dataset> for UpdateJob {
     type Data = UpdateData;
     type Result = UpdateResult;
 

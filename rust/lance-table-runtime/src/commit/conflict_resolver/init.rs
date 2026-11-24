@@ -7,7 +7,7 @@ use super::*;
 
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
-        dataset: &Dataset,
+        dataset: &Table,
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
@@ -251,7 +251,7 @@ impl<'a> TransactionRebase<'a> {
     /// durable evidence that a rewrite appended a transition (see the Rewrite
     /// arm of `check_create_index_txn`). A no-op for every other operation.
     /// Mark this rebase as the staged-segment replay; see `staged_replay`.
-    pub(crate) fn for_staged_replay(mut self) -> Self {
+    pub fn for_staged_replay(mut self) -> Self {
         self.staged_replay = true;
         self
     }
@@ -260,7 +260,7 @@ impl<'a> TransactionRebase<'a> {
     /// an action set's footprints. The submitting handle may already be newer,
     /// hiding rewritten columns or removed fields when compared with the latest
     /// version.
-    pub(crate) fn with_read_version_dataset(mut self, dataset: &Dataset) -> Self {
+    pub(crate) fn with_read_version_dataset(mut self, dataset: &Table) -> Self {
         match self.transaction.operation {
             Operation::CreateIndex { .. } => {
                 self.read_fragments = Some(ReadFragments {
@@ -277,7 +277,7 @@ impl<'a> TransactionRebase<'a> {
         self
     }
 
-    pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
+    pub async fn load_current_lineage(&mut self, dataset: &Table) -> Result<()> {
         if matches!(self.transaction.operation, Operation::CompositeOperation(_)) {
             self.current_schema = Some(dataset.schema().clone());
             return Ok(());
@@ -285,7 +285,7 @@ impl<'a> TransactionRebase<'a> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }
-        let indices = crate::index::loading::load_all_indices(dataset).await?;
+        let indices = load_all_indices(dataset, None).await?;
         let Some(entry) = indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -293,9 +293,9 @@ impl<'a> TransactionRebase<'a> {
             self.load_untagged_reuse(dataset, &indices).await?;
             return Ok(());
         };
-        let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?;
+        let ledger = crate::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?;
         self.current_lineage = Some(TaggedLineage::new(entry, Some(Arc::new(ledger))));
-        self.current_live = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
+        self.current_live = Some(dataset.state.fragment_bitmap.as_ref().clone());
         self.current_schema = Some(dataset.schema().clone());
         Ok(())
     }
@@ -306,7 +306,7 @@ impl<'a> TransactionRebase<'a> {
     /// fragments.
     async fn load_untagged_reuse(
         &mut self,
-        dataset: &Dataset,
+        dataset: &Table,
         indices: &[IndexMetadata],
     ) -> Result<()> {
         let Operation::CreateIndex { new_indices, .. } = &self.transaction.operation else {
@@ -515,7 +515,7 @@ fn conflicts_with_unseen_schema_change(
 /// See `RewriteReuseState`. `dataset` is the handle the transaction is committed
 /// through, not its read version.
 async fn rewrite_reuse_state(
-    dataset: &Dataset,
+    dataset: &Table,
     transaction: &Transaction,
 ) -> Result<RewriteReuseState> {
     let Operation::Rewrite {
@@ -532,7 +532,7 @@ async fn rewrite_reuse_state(
     } else {
         Cow::Borrowed(dataset)
     };
-    let read_entry = crate::index::loading::load_all_indices(&read_version)
+    let read_entry = load_all_indices(&read_version, None)
         .await?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -576,7 +576,7 @@ async fn rewrite_reuse_state(
 }
 
 async fn initial_fragments_for_rebase(
-    dataset: &Dataset,
+    dataset: &Table,
     transaction: &Transaction,
     modified_fragment_ids: &HashSet<u64>,
 ) -> Result<HashMap<u64, (Fragment, bool)>> {

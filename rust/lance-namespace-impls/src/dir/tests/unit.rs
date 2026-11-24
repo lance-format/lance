@@ -515,37 +515,21 @@ fn test_map_open_error() {
     );
 }
 
-/// The shared parser must decode both naming schemes; this is the cheap
-/// V1 no-regression guard (creating a real V1 table is not exposed here).
-#[test]
-fn test_manifest_version_from_filename() {
-    // V1: the plain version number.
+#[rstest]
+#[case::v1("5.manifest", Some(5))]
+#[case::v1_zero("0.manifest", Some(0))]
+#[case::v2("18446744073709551610.manifest", Some(5))]
+#[case::v2_zero("18446744073709551615.manifest", Some(0))]
+#[case::data("data.lance", None)]
+#[case::detached("d9223372036854775809.manifest", None)]
+#[case::leading_zero("05.manifest", None)]
+#[case::backup("5.backup.manifest", None)]
+#[case::nested("staging/5.manifest", None)]
+fn test_committed_manifest(#[case] entry: &str, #[case] expected: Option<u64>) {
+    let table = Path::from("example.lance");
+    let path = Path::parse(format!("{table}/{VERSIONS_DIR}/{entry}")).unwrap();
     assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("5.manifest"),
-        Some(5)
-    );
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("0.manifest"),
-        Some(0)
-    );
-    // V2: version stored as u64::MAX - version, zero-padded to 20 digits.
-    let v2_five = format!("{:020}.manifest", u64::MAX - 5);
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename(&v2_five),
-        Some(5)
-    );
-    let v2_zero = format!("{:020}.manifest", u64::MAX);
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename(&v2_zero),
-        Some(0)
-    );
-    // Non-manifest and detached (`d`-prefixed) entries are ignored.
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("data.lance"),
-        None
-    );
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("d5.manifest"),
-        None
+        DirectoryNamespace::committed_manifest(&table, &path).map(|(_, version)| version),
+        expected
     );
 }

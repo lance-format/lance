@@ -2517,7 +2517,7 @@ struct MergeInsertJobWithProvider {
     attempt_count: Arc<AtomicU32>,
 }
 
-impl RetryExecutor for MergeInsertJobWithProvider {
+impl RetryExecutor<Dataset> for MergeInsertJobWithProvider {
     type Data = UncommittedMergeInsert;
     type Result = (Arc<Dataset>, MergeStats);
 

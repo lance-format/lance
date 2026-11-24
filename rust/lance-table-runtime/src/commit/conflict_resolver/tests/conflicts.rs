@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn test_conflicts() {
-    use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
+    use ConflictResult::*;
 
     let index0 = IndexMetadata {
         uuid: uuid::Uuid::new_v4(),
@@ -525,9 +525,9 @@ fn test_conflicts() {
 
 #[test]
 fn test_data_overlay_conflicts() {
-    use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
     use ConflictResult::*;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use lance_table::transaction::{DataOverlayGroup, UpdateMode};
     use roaring::RoaringBitmap;
 
     // Our transaction overlays fragment 1.
@@ -747,8 +747,8 @@ fn test_rewrite_conflicts_with_data_overlay() {
     // changes the physical row addresses of the fragments it touches, so an
     // overlay on one of those fragments is invalidated (retryable); an
     // overlay on any other fragment is unaffected.
-    use crate::dataset::transaction::DataOverlayGroup;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use lance_table::transaction::DataOverlayGroup;
     use roaring::RoaringBitmap;
 
     let overlay_on = |fragment_id: u64| Operation::DataOverlay {
@@ -813,8 +813,8 @@ fn test_update_conflicts_with_data_overlay() {
     // fragment is compatible. An in-place column rewrite preserves rows but
     // replaces the whole column from its own snapshot, so it conflicts
     // whenever the overlay covers a fragment and field it rewrote.
-    use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use lance_table::transaction::{DataOverlayGroup, UpdateMode};
     use roaring::RoaringBitmap;
 
     let overlay_on_field = |fragment_id: u64, field: i32| Operation::DataOverlay {
@@ -1050,8 +1050,8 @@ fn test_schema_change_blocks_stale_append(
 /// A claim conflicts with any write that can supply values, either order.
 #[test]
 fn test_non_null_claim_barrier() {
-    use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use lance_table::transaction::{DataOverlayGroup, UpdateMode};
     use roaring::RoaringBitmap;
 
     let file = || DataFile::new_legacy_from_fields("w.lance", vec![0], None);
@@ -1151,7 +1151,7 @@ fn test_column_rewrite_conflicts_with_a_projection_that_dropped_its_field(
     #[case] field_modified: u32,
     #[case] expect_conflict: bool,
 ) {
-    use crate::dataset::transaction::UpdateMode;
+    use lance_table::transaction::UpdateMode;
 
     let rewrite = Operation::Update {
         removed_fragment_ids: vec![],
@@ -1208,8 +1208,8 @@ async fn test_data_overlay_finish_conflicts_with_row_moving_update(
     // to a new fragment (deleting it from fragment 0). Our overlay on fragment
     // 0 conflicts only when its coverage includes the moved row; the decision
     // is made in finish, which reads the deletion vectors.
-    use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use lance_table::transaction::{DataOverlayGroup, UpdateMode};
     use roaring::RoaringBitmap;
 
     let dataset = test_dataset(5, 1).await;
@@ -1273,7 +1273,7 @@ async fn test_data_overlay_finish_conflicts_with_row_moving_update(
     let res = rebase.finish(&latest_dataset).await;
     if expect_conflict {
         assert!(
-            matches!(res, Err(crate::Error::RetryableCommitConflict { .. })),
+            matches!(res, Err(Error::RetryableCommitConflict { .. })),
             "overlay covering the moved row should conflict, got {res:?}"
         );
     } else {
@@ -1657,7 +1657,7 @@ fn index_on_fields(fields: Vec<i32>) -> IndexMetadata {
 
 #[tokio::test]
 async fn test_conflicts_data_replacement() {
-    use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
+    use ConflictResult::*;
 
     let fragment0 = Fragment::new(0);
     let fragment1 = Fragment::new(1);

@@ -15,30 +15,12 @@ use super::write::CommitBuilder;
 use crate::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 
-/// Table config key: the largest bitmap encoding, in bytes, of a deletion
-/// vector that writers keep in the manifest rather than in a file under
-/// `_deletions/`. Unset or `0` always writes a file.
-///
-/// A reader pays one request per deletion file it needs, so a table whose
-/// fragments each lost a few rows pays one request per fragment on its first
-/// take; inline vectors come with the manifest instead.
-pub const INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY: &str = "lance.deletions.inline_max_bytes";
+pub use lance_table_runtime::io::deletion::INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY;
 
 impl Dataset {
     /// The inline budget from [`INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY`], `0` when unset.
     pub fn inline_deletions_max_bytes(&self) -> Result<usize> {
-        let Some(value) = self
-            .manifest
-            .config
-            .get(INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY)
-        else {
-            return Ok(0);
-        };
-        value.trim().parse().map_err(|err| {
-            Error::invalid_input(format!(
-                "table config {INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY} must be a number of bytes, got `{value}`: {err}"
-            ))
-        })
+        lance_table_runtime::io::deletion::inline_deletions_max_bytes(&self.manifest)
     }
 
     /// Moves every deletion vector that fits the inline budget from its file

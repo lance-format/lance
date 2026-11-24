@@ -48,6 +48,6 @@ pub use write::BlobPayloadInventory;
 pub use write::BlobPreprocessor;
 pub(super) use write::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
-    blob_pack_file_threshold_from_metadata, validate_blob_threshold_metadata,
+    blob_pack_file_threshold_from_metadata,
 };
 pub use write_sources::BlobWriteSources;
