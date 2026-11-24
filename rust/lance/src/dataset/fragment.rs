@@ -3921,21 +3921,20 @@ fn data_file_projection(projection: &Schema, file_schema: &Schema) -> Result<Sch
         if file_field.children.is_empty() {
             return Ok(());
         }
-        let path =
-            crate::io::exec::filtered_read::validity_leaf_path(file_field).unwrap_or_else(|| {
-                // No fixed-width leaf: any leaf carries the validity.
-                let mut path = vec![];
-                let mut node = file_field;
-                while !(node.is_blob()
-                    || node.is_packed_struct()
-                    || matches!(node.data_type(), DataType::Map(..)))
-                    && let Some(child) = node.children.first()
-                {
-                    path.push(child.name.as_str());
-                    node = child;
-                }
-                path
-            });
+        let path = file_field.validity_leaf_path().unwrap_or_else(|| {
+            // No fixed-width leaf: any leaf carries the validity.
+            let mut path = vec![];
+            let mut node = file_field;
+            while !(node.is_blob()
+                || node.is_packed_struct()
+                || matches!(node.data_type(), DataType::Map(..)))
+                && let Some(child) = node.children.first()
+            {
+                path.push(child.name.as_str());
+                node = child;
+            }
+            path
+        });
         *field = file_field.project(&path)?;
         Ok(())
     }
@@ -4544,7 +4543,7 @@ impl FragmentReader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, UInt64Type};
@@ -8703,7 +8702,7 @@ mod tests {
         Ok(())
     }
 
-    mod demand_row_ids {
+    pub mod demand_row_ids {
         use super::*;
         use arrow_array::types::Int32Type;
         use lance_datagen::ArrayGeneratorExt;
@@ -8718,17 +8717,12 @@ mod tests {
             INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
         };
         use crate::index::DatasetIndexExt;
-        use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
         use crate::utils::test::FailingProxyStore;
-        use datafusion::execution::TaskContext;
-        use datafusion_physical_plan::ExecutionPlan;
-        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-        use lance_datafusion::exec::OneShotExec;
         use lance_index::{IndexType, scalar::ScalarIndexParams};
 
         // Binary-copy compaction gives each output a separate lineage-only file,
         // so its reads cannot be confused with user-column or footer reads.
-        async fn fixture(spill: bool) -> (TempStrDir, Dataset) {
+        pub async fn fixture(spill: bool) -> (TempStrDir, Dataset) {
             let dir = TempStrDir::default();
             // Normalize the file URL first so Windows drive letters remain in
             // the path, rather than being parsed as the custom scheme's host.
@@ -8798,7 +8792,7 @@ mod tests {
             (dir, dataset)
         }
 
-        fn lineage_reads(stats: &IoStats, fragment: &FileFragment) -> usize {
+        pub fn lineage_reads(stats: &IoStats, fragment: &FileFragment) -> usize {
             let file = fragment
                 .metadata()
                 .row_lineage_file(ROW_ID_FIELD_ID)
@@ -8976,67 +8970,6 @@ mod tests {
                 batch[ROW_ID].as_primitive::<UInt64Type>().values().as_ref(),
                 expected
             );
-        }
-
-        #[rstest]
-        #[case::row_ids(true)]
-        #[case::row_addresses(false)]
-        #[tokio::test]
-        async fn row_stream_loads_only_for_id_mapping(#[case] stable_ids: bool) {
-            let (_dir, dataset) = fixture(true).await;
-            let dataset = Arc::new(dataset);
-            let fragments = dataset.get_fragments();
-            let keys = [Some(14_u64), None, Some(2), Some(13), Some(2)].map(|id| {
-                id.map(|id| {
-                    if stable_ids {
-                        id
-                    } else {
-                        RowAddress::new_from_parts(
-                            fragments[id as usize / 12].id() as u32,
-                            id as u32 % 12,
-                        )
-                        .into()
-                    }
-                })
-            });
-            let key_column = if stable_ids { ROW_ID } else { ROW_ADDR };
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                key_column,
-                DataType::UInt64,
-                true,
-            )]));
-            let input = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(UInt64Array::from(keys.to_vec()))],
-            )
-            .unwrap();
-            let input = OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                stream::iter([Ok(input)]),
-            )));
-            let options = FilteredReadOptions::basic_full_read(&dataset);
-            let plan =
-                FilteredReadExec::try_new(dataset.clone(), options, Some(Arc::new(input))).unwrap();
-            dataset.object_store.io_stats_incremental();
-            let batches = plan
-                .execute(0, Arc::new(TaskContext::default()))
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            let batch = concat_batches(&plan.schema(), &batches).unwrap();
-            assert_eq!(
-                batch["i"].as_primitive::<Int32Type>().values().as_ref(),
-                [14, 2, 2]
-            );
-            let stats = dataset.object_store.io_stats_incremental();
-            for fragment in fragments {
-                assert_eq!(
-                    lineage_reads(&stats, &fragment) > 0,
-                    stable_ids,
-                    "{stats:?}"
-                );
-            }
         }
 
         #[tokio::test]

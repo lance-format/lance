@@ -9,6 +9,7 @@ use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
+use lance_table::system_index::mem_wal::is_mem_wal_dir_name;
 use object_store::{
     Error as ObjectStoreError,
     path::{Path, PathPart},
@@ -17,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use crate::utils::temporal::utc_now;
