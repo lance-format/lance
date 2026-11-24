@@ -138,6 +138,12 @@ Before using an index segment, engines must verify they support it:
 When an engine cannot use an index segment, it should fall back to scanning the
 fragments that would have been covered by that segment.
 
+This fallback makes an unsupported index version a performance cost rather than an
+error, but it protects readers only. A writer that does not recognize the version may
+still mis-maintain the segment, which is why a new index version that older writers
+would damage also needs a writer feature flag. See
+[Guidelines for Mixed Version Support](../../community/mixed_versions.md).
+
 ### Covering-field contracts
 
 A manifest that uses independent key and covering declarations must set

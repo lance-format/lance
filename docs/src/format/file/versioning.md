@@ -13,6 +13,10 @@ upcoming features.
 The `stable` and `next` aliases are resolved by the specific Lance release you are using. During a format rollout
 (for example, 2.3), prefer explicit version pinning for deterministic behavior across environments.
 
+A new version becomes the default only after it has been readable by a stable release for long enough that a mixed
+version deployment can absorb it. See
+[Guidelines for Mixed Version Support](../../community/mixed_versions.md).
+
 The following values are supported:
 
 | Version        | Minimal Lance Version | Maximum Lance Version | Description |

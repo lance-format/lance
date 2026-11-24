@@ -9,6 +9,9 @@ Readers should check the `reader_feature_flags` to see if there are any flag it 
 Writers should check `writer_feature_flags`. If either sees a flag they don't know,
 they should return an "unsupported" error on any read or write operation.
 
+Because an unknown flag fails the operation outright, a capability that introduces one stays opt-in until readers
+have had time to catch up. See [Guidelines for Mixed Version Support](../../community/mixed_versions.md).
+
 ## Current Feature Flags
 
 <style>

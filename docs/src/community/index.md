@@ -49,8 +49,8 @@ This section details the projects maintained in the Lance community.
 which hosts most of the development on the table and file format, Rust SDK, Python and Java binding SDKs, documentation and discussions.
 
 The core project is maintained by the Lance community with strict quality and release standards.
-[Contributing Guidelines](./contributing.md), [Community Voting Process](./voting.md) and [Release Guidelines](./release.md)
-are all applicable to the core project.
+[Contributing Guidelines](./contributing.md), [Community Voting Process](./voting.md), [Release Guidelines](./release.md)
+and [Mixed Version Support Guidelines](./mixed_versions.md) are all applicable to the core project.
 
 ### Subprojects
 
