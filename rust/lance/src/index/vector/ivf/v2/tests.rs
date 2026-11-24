@@ -1285,6 +1285,63 @@ fn make_seeded_vector_batch(num_rows: usize) -> (RecordBatch, SchemaRef) {
 }
 
 #[rstest]
+#[tokio::test]
+async fn refined_ivf_flat_keeps_nearest_live_rows(#[values(false, true)] stable_row_ids: bool) {
+    const K: usize = 5;
+    let (batch, schema) = make_seeded_vector_batch(240);
+    let query = batch["vector"].as_fixed_size_list().value(0);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            max_rows_per_file: 40,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(4, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // The same physical index outlives both partial and whole-fragment deletes.
+    for deleted_prefix in [1, 12, 72, 204] {
+        dataset
+            .delete(&format!("id < {deleted_prefix}"))
+            .await
+            .unwrap();
+        let expected = ground_truth(&dataset, "vector", query.as_ref(), K, DistanceType::L2).await;
+        let indexed = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .nprobes(4)
+            .refine(3)
+            .fast_search()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let actual: HashSet<u64> = indexed[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(indexed.num_rows(), K);
+        assert_eq!(actual, expected, "deleted prefix {deleted_prefix}");
+    }
+}
+
+#[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
 #[case::pq8(Some(8))]
@@ -4229,6 +4286,120 @@ async fn test_vector_segment_contract_read_from_file_metadata(
     assert_eq!(read, VectorQueryContract::of_index(opened.as_ref()));
     assert_eq!(opened.index_type(), index_type);
     assert_eq!(opened.metric_type(), params.metric_type);
+}
+
+#[tokio::test]
+async fn test_vector_index_types_use_physical_files_and_cache_only_types() {
+    use crate::index::vector::details::vector_index_details;
+
+    let mut dataset = write_small_vector_dataset("memory://").await;
+    let flat = VectorIndexParams::ivf_flat(2, DistanceType::Cosine);
+    let rq = VectorIndexParams::ivf_rq(2, 1, DistanceType::Cosine);
+    let mut rq_segment = build_vector_segment(&mut dataset, &rq, vec![0, 1]).await;
+    let flat_segment = build_vector_segment(&mut dataset, &flat, vec![2, 3]).await;
+    // A single-segment raw commit may supply syntactically valid details
+    // copied from another index. A query still searches the actual RQ file.
+    rq_segment.index_details = Some(Arc::new(vector_index_details(&flat, Some(64))));
+    let (rq_uuid, flat_uuid) = (rq_segment.uuid, flat_segment.uuid);
+    let mut dataset = commit_raw_index_segments(
+        &dataset,
+        vec![("rq", rq_segment), ("flat", flat_segment)],
+        vec![],
+        false,
+    )
+    .await
+    .unwrap();
+    dataset.load_indices().await.unwrap();
+    let _ = dataset.object_store.io_stats_incremental();
+    let uuids = [flat_uuid, rq_uuid, flat_uuid];
+    let expected = vec![IndexType::IvfFlat, IndexType::IvfRq, IndexType::IvfFlat];
+    assert_eq!(
+        dataset.vector_index_types("vector", &uuids).await.unwrap(),
+        expected
+    );
+    let cold = dataset.object_store.io_stats_incremental();
+    assert!(!cold.requests.is_empty());
+    for uuid in [flat_uuid, rq_uuid] {
+        let path = format!("/{uuid}/{}", lance_index::INDEX_FILE_NAME);
+        assert!(
+            cold.requests
+                .iter()
+                .any(|r| r.path.as_ref().ends_with(&path))
+        );
+    }
+    assert!(
+        cold.requests
+            .iter()
+            .all(|r| !r.path.as_ref().ends_with(INDEX_AUXILIARY_FILE_NAME))
+    );
+    assert_eq!(
+        dataset.vector_index_types("vector", &uuids).await.unwrap(),
+        expected
+    );
+    assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+    assert!(dataset.vector_index_types("vector2", &uuids).await.is_err());
+
+    dataset.drop_index("rq").await.unwrap();
+    assert!(matches!(
+        dataset.vector_index_types("vector", &[rq_uuid]).await,
+        Err(lance_core::Error::IndexNotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_ivf_partition_shape_per_segment_only_reads_index_file() {
+    let mut dataset = write_small_vector_dataset("memory://").await;
+    let mut entries = Vec::new();
+    let mut expected = Vec::new();
+    for (count, ids) in [(2, vec![0, 1]), (4, vec![2, 3])] {
+        let params = VectorIndexParams::ivf_flat(count, DistanceType::L2);
+        let segment = build_vector_segment(&mut dataset, &params, ids).await;
+        expected.push((segment.uuid, (count, 16)));
+        entries.push(("vector_idx", segment));
+    }
+    let mut dataset = commit_raw_index_segments(&dataset, entries, vec![], false)
+        .await
+        .unwrap();
+    dataset.load_indices().await.unwrap();
+    let _ = dataset.object_store.io_stats_incremental();
+    for (uuid, shape) in &expected {
+        assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
+        let cold = dataset.object_store.io_stats_incremental();
+        let filename = format!("/{uuid}/{}", lance_index::INDEX_FILE_NAME);
+        assert!(!cold.requests.is_empty());
+        assert!(
+            cold.requests
+                .iter()
+                .all(|request| request.path.as_ref().ends_with(&filename))
+        );
+        assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
+        assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+    }
+    dataset.drop_index("vector_idx").await.unwrap();
+    assert!(matches!(
+        dataset.ivf_partition_shape(&expected[0].0).await,
+        Err(lance_core::Error::IndexNotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_vector_index_types_use_legacy_query_opener() {
+    let dataset = write_legacy_v1_dataset("memory://").await;
+    let segment = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0, 1]).await;
+    let uuid = segment.uuid;
+    let dataset = commit_raw_index_segments(&dataset, vec![("legacy", segment)], vec![], false)
+        .await
+        .unwrap();
+    // The (0, 2) index-file format supports several index types and extensions.
+    let opened = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(opened.index_type(), IndexType::IvfHnswPq);
+    assert_eq!(
+        dataset.vector_index_types("vector", &[uuid]).await.unwrap(),
+        [opened.index_type()]
+    );
 }
 
 /// The format version in the footer of a segment's index file, which decides
@@ -9173,6 +9344,14 @@ async fn test_shallow_clone_ivf_rq_uses_resolved_index_directory() {
         .load()
         .await
         .unwrap();
+
+    assert_eq!(
+        cloned
+            .vector_index_types("vector", &[index_meta.uuid])
+            .await
+            .unwrap(),
+        [IndexType::IvfRq]
+    );
 
     let results = cloned
         .scan()

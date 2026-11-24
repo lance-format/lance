@@ -60,7 +60,8 @@ use crate::index::frag_reuse_with_stable_row_ids::warn_about_indices_hidden_by_f
 use crate::index::mem_wal::open_mem_wal_index;
 use crate::index::scalar::{self, IndexDetails, fetch_index_details, list_element};
 use crate::index::segment::{
-    index_is_usable, index_type_is_known, segment_has_vector_details, unsupported_index_version,
+    index_has_supported_field_dependencies, index_is_usable, index_type_is_known,
+    segment_has_vector_details, unsupported_index_version,
 };
 use crate::index::vector;
 use crate::index::vector::{
@@ -330,7 +331,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
                 idx.index_version,
                 max_supported_version,
             );
-        } else if !index_is_usable(idx) {
+        } else if !index_has_supported_field_dependencies(idx) {
             log::warn!(
                 "Index {} has unsupported field dependencies {:?}, ignoring it",
                 idx.name,
@@ -851,9 +852,8 @@ impl Dataset {
             .await
     }
 
-    // Production passes `IndexDetails::get_plugin`. Tests pass a lookup that
-    // adds plugins the process-wide registry lacks, so `plugin_for` stays until
-    // a registration API replaces `SCALAR_INDEX_PLUGIN_REGISTRY`.
+    // Production passes `IndexDetails::get_plugin`. Tests can inject a lookup
+    // while keeping the process-wide registry shared across tests.
     pub(crate) async fn scalar_index_info_with_plugins(
         &self,
         indices: &[IndexMetadata],

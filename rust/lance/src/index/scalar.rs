@@ -15,6 +15,7 @@ pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
 pub(crate) mod rtree;
+pub(crate) mod segment_merge;
 pub(crate) mod zonemap;
 
 use super::frag_reuse::ResolvedRemapping;
@@ -50,7 +51,6 @@ use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pb::{
     BloomFilterIndexDetails, FmIndexDetails, MinHashLshIndexDetails, RTreeIndexDetails,
-    VectorIndexDetails,
 };
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
@@ -80,7 +80,7 @@ use lance_index::scalar::{
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
-use prost::{Message, Name};
+use prost::Message;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
@@ -411,23 +411,6 @@ impl IndexDetails {
     /// Returns the plugin for the index
     pub fn get_plugin(&self) -> Result<&dyn ScalarIndexPlugin> {
         SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(self.0.as_ref())
-    }
-
-    /// Returns whether this build has a reader for the complete declared type.
-    pub(crate) fn has_reader(&self) -> bool {
-        let Some((_, details_type_name)) = self.0.type_url.rsplit_once('/') else {
-            return false;
-        };
-        if details_type_name.is_empty() || details_type_name.starts_with('.') {
-            return false;
-        }
-
-        details_type_name.eq_ignore_ascii_case(&VectorIndexDetails::full_name())
-            // MemWAL flush briefly wrote this pre-`pb` package name. Keep that
-            // exact historical native identity readable without accepting any
-            // other message that merely shares the VectorIndexDetails suffix.
-            || details_type_name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
-            || SCALAR_INDEX_PLUGIN_REGISTRY.supports_details(self.0.as_ref())
     }
 
     /// Returns the index version
@@ -1388,34 +1371,6 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
-        }
-    }
-
-    #[test]
-    fn test_has_reader_matches_complete_type_name_case_insensitively() {
-        let has_reader = |type_url: &str| {
-            IndexDetails(Arc::new(prost_types::Any {
-                type_url: type_url.to_string(),
-                value: Vec::new(),
-            }))
-            .has_reader()
-        };
-
-        for type_url in [
-            "/lance.index.pb.VectorIndexDetails",
-            "type.googleapis.com/LANCE.INDEX.PB.VECTORINDEXDETAILS",
-            "type.googleapis.com/lance.index.VectorIndexDetails",
-            "type.googleapis.com/LANCE.TABLE.BTREEINDEXDETAILS",
-        ] {
-            assert!(has_reader(type_url), "expected a reader for {type_url}");
-        }
-
-        for type_url in [
-            "type.googleapis.com/example.MyVectorIndexDetails",
-            "type.googleapis.com/example.BTreeIndexDetails",
-            "VectorIndexDetails",
-        ] {
-            assert!(!has_reader(type_url), "unexpected reader for {type_url}");
         }
     }
 

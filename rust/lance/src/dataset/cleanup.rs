@@ -52,7 +52,6 @@ use file_verdict::{FileReference, ListedFile, Verdict as FileVerdict};
 pub use retention::{CleanupRule, RetentionPolicy, parse_cleanup_policy};
 use retention::{MIN_THINNING_AGE, validate_retention_policy};
 
-use super::mem_wal::util::is_mem_wal_dir_name;
 use super::refs::{REFS_DIR, TagContents, normalize_branch};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
@@ -80,6 +79,7 @@ use lance_table::{
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
+    system_index::mem_wal::is_mem_wal_dir_name,
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;
@@ -931,6 +931,10 @@ impl<'a> CleanupTask<'a> {
 
     async fn run(self) -> Result<CleanupRunResult> {
         let now = utc_now();
+        // Measure unverified file age at the start of manifest discovery so
+        // files cannot age into eligibility while this run inspects manifests.
+        let verification_threshold =
+            now - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
         let has_keep_one = self.retention_policy.as_ref().is_some_and(|rules| {
             rules
                 .iter()
@@ -1022,7 +1026,8 @@ impl<'a> CleanupTask<'a> {
         }
 
         final_result.merge(
-            self.delete_unreferenced_files(inspection).await?,
+            self.delete_unreferenced_files(inspection, verification_threshold)
+                .await?,
             candidate_file_limit,
         );
         Ok(final_result)
@@ -1552,6 +1557,7 @@ impl<'a> CleanupTask<'a> {
     async fn delete_unreferenced_files(
         &self,
         mut inspection: CleanupInspection,
+        verification_threshold: DateTime<Utc>,
     ) -> Result<CleanupRunResult> {
         let collect_frag_reuse_maps = !inspection.skip_frag_reuse_gc
             && self.resolve_frag_reuse_map_ids(&mut inspection).await;
@@ -1589,8 +1595,6 @@ impl<'a> CleanupTask<'a> {
         // cleanup, but a manifest outliving its record is a lost version.
         let undeleted_manifest_versions = Mutex::new(HashSet::new());
         let candidate_file_limit = self.action.candidate_file_limit();
-        let verification_threshold = utc_now()
-            - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
         // Build stream for a managed subtree
         let build_listing_stream = |dir: Path, unmodified_since| {
@@ -1623,10 +1627,10 @@ impl<'a> CleanupTask<'a> {
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
         // Files owned by no manifest, such as those of a failed commit, can be
-        // newer than the retained manifest floor. List through the moving
-        // verification threshold so they become candidates once old enough, or
-        // list everything when the caller explicitly permits deleting unverified
-        // files.
+        // newer than the retained manifest floor. List through the run's
+        // verification threshold to include unverified files that were already
+        // old enough at the start, or list everything when the caller explicitly
+        // permits deleting unverified files.
         let unmodified_since = if self.policy.delete_unverified {
             None
         } else {

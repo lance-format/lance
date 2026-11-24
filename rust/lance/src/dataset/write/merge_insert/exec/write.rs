@@ -27,6 +27,7 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_datafusion::utils::from_datafusion_stream;
 use lance_table::format::{Fragment, RowDatasetVersionSequence, RowIdMeta};
 use lance_table::rowids::version::rechunk_version_sequences;
 use lance_table::rowids::{RowIdSequence, rechunk_sequences, write_row_ids};
@@ -732,7 +733,7 @@ impl FullSchemaMergeInsertExec {
                         dataset.object_store.clone(),
                         &dataset.base,
                         dataset.schema().clone(),
-                        stream,
+                        from_datafusion_stream(stream),
                         write_params.clone(),
                         target_bases,
                         None,

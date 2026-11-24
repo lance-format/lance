@@ -33,13 +33,12 @@ use crate::io::commit::migrate_fragments;
 use crate::io::deletion::read_dataset_deletion_file;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{BlobHandling, Field as LanceField};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{Fragment, RowDatasetVersionSequence};
 use lance_table::rowids::RowIdSequence;
@@ -301,16 +300,14 @@ async fn prepare_reader(
     }
     if capture_row_ids {
         scanner.with_row_id();
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    }
+    let data = Box::pin(scanner.try_into_stream().await?);
+    if capture_row_ids {
         let (data_no_row_ids, rx) =
             make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
         Ok((data_no_row_ids, Some(rx), has_blob_v2_columns))
     } else {
-        Ok((
-            SendableRecordBatchStream::from(scanner.try_into_stream().await?),
-            None,
-            has_blob_v2_columns,
-        ))
+        Ok((data, None, has_blob_v2_columns))
     }
 }
 
@@ -647,16 +644,10 @@ pub(super) async fn rewrite_files(
             }
             let rewrite_plan = Arc::new(rewrite_plan);
             let transformed_schema = rewrite_plan.output_schema().clone();
-            let transformed = reader_with_progress.then(move |batch_result| {
+            let transformed = reader_with_progress.and_then(move |batch| {
                 let dataset = dataset_arc.clone();
                 let rewrite_plan = rewrite_plan.clone();
-                async move {
-                    let batch = batch_result?;
-                    rewrite_plan
-                        .transform_batch(&dataset, batch)
-                        .await
-                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
-                }
+                async move { rewrite_plan.transform_batch(&dataset, batch).await }
             });
             reader = Some(Box::pin(RecordBatchStreamAdapter::new(
                 transformed_schema,
@@ -1247,10 +1238,8 @@ pub(super) fn append_row_lineage_columns(
         let batch = batch?;
         let rows = batch.num_rows();
         if offset + rows > total_rows {
-            return Err(datafusion::error::DataFusionError::External(Box::new(
-                Error::internal(format!(
-                    "compaction read more rows than its row lineage covers ({total_rows})"
-                )),
+            return Err(Error::internal(format!(
+                "compaction read more rows than its row lineage covers ({total_rows})"
             )));
         }
         let mut arrays = batch.columns().to_vec();
@@ -1262,8 +1251,7 @@ pub(super) fn append_row_lineage_columns(
             arrays.push(Arc::new(arrow_array::UInt64Array::from(batch_values)) as ArrayRef);
         }
         offset += rows;
-        RecordBatch::try_new(batch_schema.clone(), arrays)
-            .map_err(datafusion::error::DataFusionError::from)
+        Ok(RecordBatch::try_new(batch_schema.clone(), arrays)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, batches))
 }

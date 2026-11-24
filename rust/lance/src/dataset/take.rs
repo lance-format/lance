@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::rowids::get_row_id_index_with;
+use crate::dataset::rowids::resolve_take_row_ids;
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
@@ -649,10 +649,9 @@ impl TakeBuilder {
                 .row_ids
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
-            let addrs = if let Some(row_id_index) =
-                get_row_id_index_with(&self.dataset, !self.ignore_deletions).await?
+            let addrs = if let Some(resolved) =
+                resolve_take_row_ids(&self.dataset, row_ids, !self.ignore_deletions).await?
             {
-                let resolved = row_id_index.get_many(row_ids)?;
                 if self.missing_row_policy == MissingRowPolicy::Error
                     && let Some(first_missing_index) =
                         resolved.iter().position(|address| address.is_none())
@@ -2560,6 +2559,160 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn test_stable_point_take_reads_candidate_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = test_batch(0..32);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let original_version = dataset.manifest.version;
+        dataset.delete("i % 4 = 0").await.unwrap();
+        let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+        let values = |batch: RecordBatch| {
+            batch["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .to_vec()
+        };
+        let deletion_reads = || {
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .into_iter()
+                .map(|request| request.path)
+                .filter(|path| path.parts().any(|part| part.as_ref() == "_deletions"))
+                .collect::<Vec<_>>()
+        };
+        let last = &dataset.manifest.fragments[7];
+        let expected_path =
+            deletion_file_path(&dataset.base, last.id, last.deletion_file.as_ref().unwrap());
+        dataset.object_store.io_stats_incremental();
+        let take = |ids: &[u64]| dataset.take_builder(ids, dataset.schema().clone()).unwrap();
+        assert_eq!(values(take(&[31]).execute().await.unwrap()), [31]);
+        assert_eq!(deletion_reads(), [expected_path]);
+        assert_eq!(values(take(&[31]).execute().await.unwrap()), [31]);
+        assert!(deletion_reads().is_empty());
+        for missing in [28, u64::MAX] {
+            assert!(values(take(&[missing]).execute().await.unwrap()).is_empty());
+            let error = take(&[missing])
+                .with_missing_row_policy(MissingRowPolicy::Error)
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("first missing row ID {missing}"))
+            );
+        }
+        assert!(deletion_reads().is_empty());
+        assert_eq!(
+            values(
+                take(&[28])
+                    .with_ignore_deletions(true)
+                    .execute()
+                    .await
+                    .unwrap()
+            ),
+            [28]
+        );
+        assert_eq!(
+            values(take(&[31, 28, 2, 31]).execute().await.unwrap()),
+            [31, 2, 31]
+        );
+
+        let original = dataset.checkout_version(original_version).await.unwrap();
+        assert_eq!(
+            values(
+                original
+                    .take_rows(&[28], original.schema().clone())
+                    .await
+                    .unwrap()
+            ),
+            [28]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stable_point_take_checks_each_candidate_copy() {
+        use lance_table::format::RowIdMeta;
+        use lance_table::rowids::{RowIdSequence, write_row_ids};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = test_batch(0..16);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("i % 4 = 0").await.unwrap();
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        // Snapshot without a shared cache identity. Fragment 0 covers 0..4
+        // and fragment 1 now covers 2..6. Both have offset 0 tombstoned.
+        dataset.manifest_location.e_tag = None;
+        let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
+        fragments[1].row_id_meta = Some(RowIdMeta::Inline(
+            write_row_ids(&RowIdSequence::from(2..6)).into(),
+        ));
+        let mut expected_paths: Vec<_> = fragments[..2]
+            .iter()
+            .map(|f| deletion_file_path(&dataset.base, f.id, f.deletion_file.as_ref().unwrap()))
+            .collect();
+        expected_paths.sort();
+        let dataset = Arc::new(dataset);
+        dataset.object_store.io_stats_incremental();
+        let take = |id, ignore| {
+            dataset
+                .take_builder(&[id], dataset.schema().clone())
+                .unwrap()
+                .with_ignore_deletions(ignore)
+        };
+        let batch = take(2, true).execute().await.unwrap();
+        assert_eq!(
+            batch["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(0),
+            2
+        );
+        let mut paths: Vec<_> = dataset
+            .object_store
+            .io_stats_incremental()
+            .requests
+            .into_iter()
+            .map(|request| request.path)
+            .filter(|path| path.parts().any(|part| part.as_ref() == "_deletions"))
+            .collect();
+        paths.sort();
+        assert_eq!(paths, expected_paths);
+        assert_eq!(take(0, true).execute().await.unwrap().num_rows(), 0);
+        for ignore in [false, true] {
+            let err = take(3, ignore).execute().await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("stable row id 3 is live in multiple fragments"),
+                "{err}"
+            );
+        }
+    }
+
     /// An update keeps the old copy of a row under a deletion vector and writes
     /// its id again in a new fragment. Ignoring deletions must still resolve
     /// the id to the live copy, which takes that fragment's deletion vector.
@@ -2585,6 +2738,17 @@ mod test {
             .await
             .unwrap()
             .new_dataset;
+
+        for ignore_deletions in [false, true] {
+            let point = dataset
+                .take_builder(&[1], dataset.schema().clone())
+                .unwrap()
+                .with_ignore_deletions(ignore_deletions)
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(point["s"].as_string::<i32>().value(0), "updated");
+        }
 
         let checked = dataset
             .take_rows(&[1, 2], dataset.schema().clone())

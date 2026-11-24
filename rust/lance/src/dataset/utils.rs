@@ -6,15 +6,15 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader,
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use datafusion::error::Result as DFResult;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::SendableRecordBatchStream as DataFusionRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DataFusionStreamAdapter;
 use futures::StreamExt;
 use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
     has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
-use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_core::{Error, ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 use lance_table::format::{RowDatasetVersionRun, RowDatasetVersionSequence};
 use lance_table::rowids::segment::U64Segment;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
@@ -38,7 +38,7 @@ fn extract_row_ids(
     row_id_idx: usize,
     created_at_idx: Option<usize>,
     data_projection: &[usize],
-) -> DFResult<RecordBatch> {
+) -> Result<RecordBatch> {
     row_ids.capture(u64_values(&batch, row_id_idx, "Row ids"))?;
     if let Some(created_at_idx) = created_at_idx {
         row_ids.capture_created_at(u64_values(&batch, created_at_idx, "Created-at versions"));
@@ -121,12 +121,12 @@ impl CapturedRowIds {
         }
     }
 
-    pub fn capture(&mut self, row_ids: &[u64]) -> DFResult<()> {
+    pub fn capture(&mut self, row_ids: &[u64]) -> Result<()> {
         match self {
             Self::AddressStyle(ids) => {
                 // Assume they are sorted
                 ids.append(row_ids.iter().cloned())
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                    .map_err(|e| Error::execution(e.to_string()))?;
             }
             Self::SequenceStyle {
                 row_ids: sequence, ..
@@ -365,8 +365,8 @@ impl SchemaAdapter {
     /// Convert a physical stream into a logical stream.
     pub fn to_logical_stream(
         &self,
-        stream: SendableRecordBatchStream,
-    ) -> SendableRecordBatchStream {
+        stream: DataFusionRecordBatchStream,
+    ) -> DataFusionRecordBatchStream {
         if !Self::requires_logical_conversion(&stream.schema()) {
             return stream;
         }
@@ -398,7 +398,7 @@ impl SchemaAdapter {
             })
         });
 
-        Box::pin(RecordBatchStreamAdapter::new(
+        Box::pin(DataFusionStreamAdapter::new(
             converted_schema,
             converted_stream,
         ))

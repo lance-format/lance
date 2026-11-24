@@ -2,17 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
-use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::utils::StreamingWriteSource;
+use lance_datafusion::utils::{StreamingWriteSource, from_datafusion_stream};
 #[cfg(test)]
 use lance_file::version::LanceFileVersion;
 use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_io::object_store::ObjectStore;
+use lance_io::stream::SendableRecordBatchStream;
+use lance_io::stream::chunker::{break_stream, chunk_stream};
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
@@ -318,14 +318,18 @@ impl<'a> FragmentCreateBuilder<'a> {
         &self,
         source: impl StreamingWriteSource,
     ) -> Result<(SendableRecordBatchStream, Schema)> {
-        if let Some(schema) = self.schema {
-            return Ok((source.into_stream(), schema.clone()));
-        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append))
-            && let Some(schema) = self.existing_dataset_schema().await?
-        {
-            return Ok((source.into_stream(), schema));
-        }
-        source.into_stream_and_schema().await
+        let schema = if let Some(schema) = self.schema {
+            Some(schema.clone())
+        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
+            self.existing_dataset_schema().await?
+        } else {
+            None
+        };
+        let (stream, schema) = match schema {
+            Some(schema) => (source.into_stream(), schema),
+            None => source.into_stream_and_schema().await?,
+        };
+        Ok((from_datafusion_stream(stream), schema))
     }
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {

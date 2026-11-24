@@ -3,6 +3,8 @@
 
 //! Compaction tests for the lineage contract area.
 
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
+
 use super::*;
 use crate::dataset::optimize::execution::{
     PlannedRowLineage, append_row_lineage_columns, can_use_binary_copy, place_planned_row_lineage,
@@ -172,9 +174,7 @@ async fn per_fragment_plan_spills_only_the_fragments_over_budget() {
 async fn append_row_lineage_columns_gives_each_batch_its_own_buffer() {
     let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
     let schema = batch.schema();
-    let batches = vec![batch; 3]
-        .into_iter()
-        .map(Ok::<_, datafusion::error::DataFusionError>);
+    let batches = [batch.clone(), batch.clone(), batch].into_iter().map(Ok);
     let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
         schema,
         futures::stream::iter(batches),

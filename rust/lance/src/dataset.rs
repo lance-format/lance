@@ -4612,7 +4612,18 @@ pub(crate) struct NewTransactionResult<'a> {
     pub new_transactions: BoxStream<'a, Result<(u64, Arc<Transaction>)>>,
 }
 
-pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'_> {
+#[derive(Clone, Copy)]
+pub(crate) enum TransactionReadSource {
+    SessionCache,
+    /// Read the transaction from its manifest or the file it references.
+    /// A version-only cache entry may belong to a previous table at the URI.
+    Storage,
+}
+
+pub(crate) fn load_new_transactions(
+    dataset: &Dataset,
+    source: TransactionReadSource,
+) -> NewTransactionResult<'_> {
     // Resolve every manifest with version > our current version (the latest plus
     // the ones in between). On non-lexically-ordered stores this uses the version
     // hint to avoid an O(n) listing.
@@ -4633,13 +4644,26 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let manifest = Dataset::get_manifest(
-                    dataset.object_store.as_ref(),
-                    &location,
-                    &dataset.uri,
-                    dataset.session.as_ref(),
-                )
-                .await?;
+                let manifest = match source {
+                    TransactionReadSource::SessionCache => {
+                        Dataset::get_manifest(
+                            dataset.object_store.as_ref(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?
+                    }
+                    TransactionReadSource::Storage => Arc::new(
+                        Dataset::load_manifest(
+                            dataset.object_store.as_ref(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?,
+                    ),
+                };
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.
@@ -4652,30 +4676,40 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .try_buffer_unordered(stage_parallelism);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
-            let manifest_copy = manifest.clone();
-            let tx_key = TransactionKey {
-                version: manifest.version,
+            let version = manifest.version;
+            let missing_transaction = || {
+                Error::internal(format!(
+                    "Dataset version {version} does not have a transaction file"
+                ))
             };
+            if let TransactionReadSource::Storage = source {
+                let transaction = dataset
+                    .read_transaction_from_storage(&manifest, &location)
+                    .await?
+                    .ok_or_else(missing_transaction)?;
+                return Ok((version, Arc::new(transaction)));
+            }
+
+            let tx_key = TransactionKey { version };
             let transaction =
                 if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
                     cached
                 } else {
                     let mut dataset_version = dataset.clone();
-                    dataset_version.set_manifest(manifest_copy.clone(), location);
-                    let loaded =
-                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::internal(format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ))
-                        })?);
+                    dataset_version.set_manifest(manifest, location);
+                    let loaded = Arc::new(
+                        dataset_version
+                            .read_transaction()
+                            .await?
+                            .ok_or_else(missing_transaction)?,
+                    );
                     dataset
                         .metadata_cache
                         .insert_with_key(&tx_key, loaded.clone())
                         .await;
                     loaded
                 };
-            Ok((manifest.version, transaction))
+            Ok((version, transaction))
         })
         .try_buffer_unordered(stage_parallelism);
 

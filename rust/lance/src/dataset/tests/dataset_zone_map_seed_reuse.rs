@@ -29,6 +29,7 @@ use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::utils::tracking_store::IoStats;
+use lance_table::feature_flags::ZONE_WRITE_SEEDS_VERSION_KEY;
 use lance_table::format::{DataFile, IndexMetadata};
 use roaring::RoaringBitmap;
 
@@ -1244,11 +1245,23 @@ async fn test_rebuild_keeps_boundaries_past_a_deleted_tail() {
 async fn test_float_nan_queries_match_scan_after_seed_reuse() {
     let dir = TempStrDir::default();
     let mut dataset = write(dir.as_str(), 0..N).await;
+    dataset
+        .update_config([(ZONE_WRITE_SEEDS_VERSION_KEY, "1")])
+        .await
+        .unwrap();
     create_index(&mut dataset, "x", &zone_map_params(8, true, true), None).await;
     append(&mut dataset, N..2 * N).await;
     append(&mut dataset, 2 * N..3 * N).await;
     dataset.drop_index(&index_name("x")).await.unwrap();
-    create_index(&mut dataset, "x", &zone_map_params(20000, true, true), None).await;
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "x",
+        &zone_map_params(20000, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![1, 2]);
     assert_index_matches_scan(
         &dataset,
         &[
@@ -1866,6 +1879,10 @@ async fn test_binary_copy_bitmap_provenance(
 ) {
     let dir = TempStrDir::default();
     let mut dataset = write(dir.as_str(), 0..N).await;
+    dataset
+        .update_config([(ZONE_WRITE_SEEDS_VERSION_KEY, "1")])
+        .await
+        .unwrap();
     create_index(
         &mut dataset,
         "val",

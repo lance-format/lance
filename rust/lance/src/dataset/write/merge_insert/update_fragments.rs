@@ -44,7 +44,7 @@ use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::BatchStreamGrouper,
     exec::{HardCapBatchSizeExec, LanceExecutionOptions, provider_to_stream},
-    utils::reader_to_stream,
+    utils::{from_datafusion_stream, reader_to_stream},
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::Fragment;
@@ -591,7 +591,7 @@ impl MergeInsertJob {
                         dataset.object_store.clone(),
                         &dataset.base,
                         write_schema,
-                        stream,
+                        from_datafusion_stream(stream),
                         write_params.as_ref().clone(),
                         (*target_bases_info).clone(),
                         None,
