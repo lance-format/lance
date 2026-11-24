@@ -77,6 +77,14 @@ pub trait IndexRemapper: Send + Sync {
     ) -> Result<Vec<RemappedIndex>> {
         self.remap_indices(index_map, affected_fragment_ids).await
     }
+
+    /// Whether every ID in the [`RemappedIndex`]es this remapper reports is
+    /// generated inside the call that reports them. When true, compaction
+    /// removes those index directories once its commit is verified not to
+    /// have landed, so return true only if a retry never reuses an ID.
+    fn creates_fresh_index_ids(&self) -> bool {
+        false
+    }
 }
 
 /// Options for creating an [IndexRemapper]

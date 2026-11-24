@@ -278,6 +278,10 @@ impl DatasetIndexRemapper {
 
 #[async_trait]
 impl IndexRemapper for DatasetIndexRemapper {
+    fn creates_fresh_index_ids(&self) -> bool {
+        true
+    }
+
     async fn remap_indices(
         &self,
         mapping: RowAddrRemap,

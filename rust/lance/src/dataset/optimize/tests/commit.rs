@@ -4,6 +4,7 @@
 //! Compaction tests for the commit contract area.
 
 use super::*;
+use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
 
 /// Distributed compaction on a tagged table: the tasks are planned at V,
 /// another writer's disjoint deferred compaction lands at V+1, and the
@@ -1225,5 +1226,632 @@ async fn test_commit_compaction_leaves_blob_v2_sidecars_for_gc_on_commit_failure
     assert!(
         count_data_files_in(test_uri) > baseline_files,
         "Blob v2 sidecars should be retained for GC after the Rewrite commit fails"
+    );
+}
+
+/// A small dataset with one BTree index and four fragments, so that an eager
+/// compaction rewrites the index and therefore mints an `_indices/{uuid}`
+/// directory before committing.
+async fn reclaim_fixture(uri: &str, handler: Arc<dyn CommitHandler>) -> Dataset {
+    let mut data_gen =
+        BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+    let mut dataset = Dataset::write(
+        data_gen.batch(200),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 50,
+            commit_handler: Some(handler),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_scalar_index(&mut dataset, "i", false).await;
+    dataset
+}
+
+fn reclaim_options() -> CompactionOptions {
+    CompactionOptions {
+        target_rows_per_fragment: 1000,
+        ..Default::default()
+    }
+}
+
+/// Asserts the reopened dataset answers `filter` the same way with and
+/// without the index, and that the answer is non-empty.
+async fn assert_indexed_query_matches(uri: &str, filter: &str) {
+    let dataset = Dataset::open(uri).await.unwrap();
+    let indexed = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(true)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let plain = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(false)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(indexed, plain, "indexed and plain scans must agree");
+    assert!(indexed.num_rows() > 0, "the filter must match some rows");
+}
+
+/// The shape reported in #7207: a concurrent DELETE lands before the rewrite
+/// publishes, the retry's conflict check rejects the rewrite, and the index
+/// directory the remap minted is reclaimed while the original index survives.
+#[tokio::test]
+async fn test_delete_conflict_reclaims_remapped_index_dir() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+    assert_eq!(before.len(), 1);
+
+    handler.arm(&dataset, vec![Race::Delete]);
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the DELETE must preempt the rewrite commit");
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "expected a retryable conflict, got: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(
+        index_dir_names(&dataset).await,
+        before,
+        "the remapped directory of the rejected rewrite must be reclaimed, \
+         and the original index directory must survive"
+    );
+    assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+}
+
+/// A remapper whose answers are fixed by the caller, standing in for a
+/// caller-managed remapper that decides its own index ids.
+#[derive(Debug)]
+struct FixedAnswerRemapper {
+    answers: Vec<RemappedIndex>,
+}
+
+#[async_trait]
+impl IndexRemapper for FixedAnswerRemapper {
+    async fn remap_indices(&self, _: RowAddrRemap, _: &[u64]) -> Result<Vec<RemappedIndex>> {
+        Ok(self.answers.clone())
+    }
+}
+
+#[derive(Debug)]
+struct FixedAnswerRemapperOptions {
+    answers: Vec<RemappedIndex>,
+}
+
+#[async_trait]
+impl IndexRemapperOptions for FixedAnswerRemapperOptions {
+    async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+        Ok(Some(Box::new(FixedAnswerRemapper {
+            answers: self.answers.clone(),
+        })))
+    }
+}
+
+/// A caller-supplied remapper owns the ids it reports, so its directory
+/// survives a commit verified not to have landed. A replay may reuse the very
+/// same id, and the directory may hold files written outside the compaction.
+#[tokio::test]
+async fn test_custom_remapper_index_dir_survives_preemption() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let original = stored_index(&dataset, "scalar").await;
+
+    let owned_uuid = Uuid::new_v4();
+    let owned_dir = std::path::Path::new(uri)
+        .join("_indices")
+        .join(owned_uuid.to_string());
+    std::fs::create_dir_all(&owned_dir).unwrap();
+    std::fs::write(owned_dir.join("payload"), b"owned by the caller's remapper").unwrap();
+
+    let remapper = Arc::new(FixedAnswerRemapperOptions {
+        answers: vec![RemappedIndex {
+            old_id: original.uuid,
+            new_id: owned_uuid,
+            index_details: original.index_details.as_ref().unwrap().as_ref().clone(),
+            index_version: original.index_version as u32,
+            files: original.files.clone(),
+        }],
+    });
+    let before = index_dir_names(&dataset).await;
+    assert!(before.contains(&owned_uuid.to_string()));
+
+    handler.arm(&dataset, vec![Race::Delete]);
+    let error = compact_files(&mut dataset, reclaim_options(), Some(remapper))
+        .await
+        .expect_err("the DELETE must preempt the rewrite commit");
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "expected a retryable conflict, got: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(
+        index_dir_names(&dataset).await,
+        before,
+        "a directory behind a caller-supplied remapper's id must survive a failed commit"
+    );
+    assert!(
+        owned_dir.join("payload").exists(),
+        "the caller-owned file must not be removed"
+    );
+    assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+}
+
+/// The failure injected into the Rewrite commit for
+/// `test_rewrite_commit_failure_preserves_or_reclaims_index_dirs`.
+#[derive(Debug, Clone, Copy)]
+enum RewriteFailure {
+    /// The manifest write fails and verification finds no manifest at the
+    /// target version.
+    VerifiedAbsent,
+    /// The manifest lands, but the handler reports an error and asks for it
+    /// to be propagated even though verification proves the commit landed.
+    LandedThenPropagatedError,
+    /// The manifest lands, but verification cannot run.
+    LandedWithoutVerification,
+    /// The manifest lands and a later version drops the index it published
+    /// before the handler reports the error. The latest manifest therefore
+    /// does not reference the minted directory: only the unverified-write
+    /// flag protects it.
+    LandedThenIndexDropped,
+    /// As [`Self::LandedThenIndexDropped`], with verification unavailable.
+    UnknownThenIndexDropped,
+}
+
+/// Lands the Rewrite commit, then commits a later version that drops the index
+/// name it published, and only then reports the failure. Used to show that
+/// cleanup cannot rely on the latest manifest alone: an earlier version still
+/// references the directory, so deleting it would corrupt that version.
+#[derive(Debug)]
+struct LandDropThenFail {
+    uri: String,
+    fail_resolve: std::sync::atomic::AtomicBool,
+}
+
+impl LandDropThenFail {
+    fn new(uri: &str) -> Self {
+        Self {
+            uri: uri.to_string(),
+            fail_resolve: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl CommitHandler for LandDropThenFail {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        true
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &object_store::path::Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let is_rewrite = transaction
+            .as_ref()
+            .and_then(|transaction| transaction.as_pb().operation.as_ref())
+            .is_some_and(|operation| matches!(operation, PbOperation::Rewrite(_)));
+        let location = ConditionalPutCommitHandler
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+            )
+            .await?;
+        if is_rewrite {
+            // A later writer drops the very index this rewrite published.
+            let mut latest = Dataset::open(&self.uri).await.unwrap();
+            latest.drop_index("scalar").await.unwrap();
+            return Err(CommitError::OtherError(Error::io(
+                "simulated ambiguous commit failure",
+            )));
+        }
+        Ok(location)
+    }
+
+    async fn resolve_version_location(
+        &self,
+        base_path: &object_store::path::Path,
+        version: u64,
+        object_store: &dyn object_store::ObjectStore,
+    ) -> lance_core::Result<ManifestLocation> {
+        if self.fail_resolve.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::io("simulated verification outage"));
+        }
+        ConditionalPutCommitHandler
+            .resolve_version_location(base_path, version, object_store)
+            .await
+    }
+}
+
+/// Whether the remapped index directory survives depends only on
+/// whether verification proved the commit did not land.
+#[rstest]
+#[case::verified_absent(RewriteFailure::VerifiedAbsent)]
+#[case::landed_then_propagated_error(RewriteFailure::LandedThenPropagatedError)]
+#[case::landed_without_verification(RewriteFailure::LandedWithoutVerification)]
+#[case::landed_then_index_dropped(RewriteFailure::LandedThenIndexDropped)]
+#[case::unknown_then_index_dropped(RewriteFailure::UnknownThenIndexDropped)]
+#[tokio::test]
+async fn test_rewrite_commit_failure_preserves_or_reclaims_index_dirs(
+    #[case] failure: RewriteFailure,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let ambiguous = Arc::new(AmbiguousCommitHandler::default());
+    let dropping = Arc::new(LandDropThenFail::new(uri));
+    let mut dataset = match failure {
+        RewriteFailure::LandedThenIndexDropped | RewriteFailure::UnknownThenIndexDropped => {
+            reclaim_fixture(uri, dropping.clone()).await
+        }
+        _ => reclaim_fixture(uri, ambiguous.clone()).await,
+    };
+    let before = index_dir_names(&dataset).await;
+    assert_eq!(before.len(), 1);
+
+    match failure {
+        RewriteFailure::VerifiedAbsent => {
+            ambiguous.fail_next_rewrite(AmbiguousFailure::FailOutright);
+        }
+        RewriteFailure::LandedThenPropagatedError => {
+            ambiguous.fail_next_rewrite(AmbiguousFailure::LandAndError);
+            ambiguous
+                .propagate_error_after_success
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        RewriteFailure::LandedWithoutVerification => {
+            ambiguous.fail_next_rewrite(AmbiguousFailure::LandAndErrorWithoutVerification);
+        }
+        RewriteFailure::LandedThenIndexDropped => {}
+        RewriteFailure::UnknownThenIndexDropped => dropping
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst),
+    }
+
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the injected commit failure must surface");
+    let after = index_dir_names(&dataset).await;
+
+    match failure {
+        RewriteFailure::VerifiedAbsent => {
+            // The original commit error is preserved, not replaced by a
+            // cleanup error.
+            assert!(
+                error
+                    .to_string()
+                    .contains("simulated outright commit failure"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "an absent manifest must leave the minted directory in place"
+            );
+            assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+        }
+        RewriteFailure::LandedThenPropagatedError => {
+            assert!(
+                error
+                    .to_string()
+                    .contains("simulated ambiguous commit failure"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "a commit that landed must keep the directory its manifest references"
+            );
+            assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+        }
+        RewriteFailure::LandedWithoutVerification => {
+            assert!(
+                error.is_commit_status_unknown(),
+                "unverifiable outcome must be CommitStatusUnknown, got: {error:?}"
+            );
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "an unknown commit outcome must keep every index directory"
+            );
+            assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+        }
+        RewriteFailure::LandedThenIndexDropped | RewriteFailure::UnknownThenIndexDropped => {
+            if matches!(failure, RewriteFailure::UnknownThenIndexDropped) {
+                assert!(
+                    error.is_commit_status_unknown(),
+                    "unverifiable outcome must be CommitStatusUnknown, got: {error:?}"
+                );
+            } else {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("simulated ambiguous commit failure"),
+                    "unexpected error: {error}"
+                );
+            }
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "a minted directory referenced by any version must survive, even when the                  latest manifest dropped the index"
+            );
+            // The dropped index is gone from the latest version, but the
+            // version the commit published still references the directory and
+            // must remain queryable.
+            let latest = Dataset::open(uri).await.unwrap();
+            let committed_version = latest.version().version - 1;
+            let committed = latest.checkout_version(committed_version).await.unwrap();
+            let indexed = committed
+                .scan()
+                .filter("i >= 20 AND i < 40")
+                .unwrap()
+                .use_scalar_index(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            let plain = committed
+                .scan()
+                .filter("i >= 20 AND i < 40")
+                .unwrap()
+                .use_scalar_index(false)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(indexed, plain);
+            assert!(indexed.num_rows() > 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_rewrite_manifest_landing_after_verification_keeps_index_dir() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+    let resolve_calls_before = handler.resolve_calls();
+    handler.fail_next_rewrite(AmbiguousFailure::LandAfterError);
+
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the simulated timeout must surface");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated manifest write timeout")
+    );
+    assert!(!error.is_commit_status_unknown());
+    assert!(handler.resolve_calls() > resolve_calls_before);
+    let before_landing = Dataset::open(uri).await.unwrap();
+    let location = handler.land_delayed_write().await;
+    assert_eq!(location.version, before_landing.version().version + 1);
+
+    let latest = Dataset::open(uri).await.unwrap();
+    assert_eq!(latest.version().version, location.version);
+    let filter = "i >= 20 AND i < 40";
+    let plan = latest
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_indexed_query_matches(uri, filter).await;
+    let after = index_dir_names(&latest).await;
+    assert!(after.is_superset(&before));
+    assert_eq!(after.len(), before.len() + 1);
+}
+
+/// Between retries the directories must survive, because the retry reuses
+/// the same UUIDs. The second attempt succeeds after a non-conflicting append
+/// preempted the first.
+#[tokio::test]
+async fn test_retry_after_concurrent_append_keeps_index_dirs() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+    assert_eq!(before.len(), 1);
+    let version_before = dataset.manifest.version;
+
+    handler.arm(&dataset, vec![Race::Append]);
+    compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect("the second attempt must commit");
+
+    assert!(dataset.manifest.version >= version_before + 2);
+    let after = index_dir_names(&dataset).await;
+    assert!(
+        after.is_superset(&before) && after.len() == before.len() + 1,
+        "the committed recipe's index directory must exist"
+    );
+    assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+}
+
+/// Gives the table a tagged history whose details exceed the inline limit, so
+/// the installed entry already lives in its own `_indices/{uuid}` directory
+/// and every entry assembled on a rebase spills to a fresh one.
+async fn install_external_tagged_history(dataset: &mut Dataset) {
+    use crate::index::frag_reuse::{
+        FRAG_REUSE_INLINE_DETAILS_LIMIT, build_tagged_frag_reuse_entry,
+    };
+    use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+    use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion};
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use prost::Message;
+
+    // One version holding every group: a tagged history rejects repeated
+    // history stamps. The count clears the limit on the wrapped content, not
+    // on the per-version form `inline_padding_capacity` measures.
+    let groups = padding_reuse_versions(inline_padding_capacity() as u64 + 1_000)
+        .into_iter()
+        .flat_map(|version| version.groups)
+        .collect();
+    let details = FragReuseIndexDetails {
+        versions: vec![FragReuseVersion {
+            dataset_version: 1,
+            groups,
+        }],
+    };
+    let content = InlineContent::from(&details).encode_to_vec();
+    assert!(content.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT);
+    let tagged = build_tagged_frag_reuse_entry(dataset, content, details.new_frag_bitmap())
+        .await
+        .unwrap();
+    assert!(stores_reuse_details_externally(&tagged));
+
+    let mut indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
+    indices.push(tagged);
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+    manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+    crate::index::frag_reuse_reader::tests::persist_fixture(dataset, indices).await;
+}
+
+/// A tagged deferred compaction whose first attempt loses to a non-conflicting
+/// append: the rebase assembles an entry whose details spill to a new
+/// directory. A concurrent Delete takes the retry's target version. Only the
+/// rebased directory should be reclaimed.
+#[tokio::test]
+async fn test_tagged_rebase_details_dir_reclaimed_after_verified_loss() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    install_external_tagged_history(&mut dataset).await;
+    let before = index_dir_names(&dataset).await;
+    let before_details = reuse_details_dirs(uri);
+    assert_eq!(before_details.len(), 1);
+
+    handler.arm(&dataset, vec![Race::Append, Race::DeleteThenError]);
+    let error = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1000,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect_err("the retry's injected commit failure must surface");
+    assert!(
+        error
+            .to_string()
+            .contains("injected rewrite commit failure"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        handler.races.lock().unwrap().is_empty(),
+        "the append must preempt the first attempt and the second must fail"
+    );
+
+    assert_eq!(
+        index_dir_names(&dataset).await,
+        before,
+        "the directory the rebase spilled must be reclaimed, and the installed \
+         history's directory must survive"
+    );
+    assert_eq!(
+        reuse_details_dirs(uri),
+        before_details,
+        "only the installed history may keep its details file"
+    );
+}
+
+#[tokio::test]
+async fn test_v0_rebase_reclaims_restamped_details_dir() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let history = commit_padding_reuse_history(&mut dataset, inline_padding_capacity() + 1).await;
+    assert_eq!(history.index_version, 0);
+    assert!(stores_reuse_details_externally(&history));
+    let before = reuse_details_dirs(uri);
+    assert_eq!(before, HashSet::from([history.uuid.to_string()]));
+
+    handler.arm(&dataset, vec![Race::Append, Race::Delete]);
+    let error = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..reclaim_options()
+        },
+        None,
+    )
+    .await
+    .expect_err("the Delete must preempt the rebased rewrite");
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "unexpected error: {error}"
+    );
+    assert!(handler.races.lock().unwrap().is_empty());
+    assert_eq!(reuse_details_dirs(uri), before, "restamped details leaked");
+}
+
+#[tokio::test]
+async fn test_foreign_rewrite_retry_preserves_dirs_after_absent_conflict() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+
+    handler.arm(&dataset, vec![Race::ConflictWithoutWrite, Race::Delete]);
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the Delete must preempt the retry");
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "{error}"
+    );
+    assert!(handler.races.lock().unwrap().is_empty());
+    let after = index_dir_names(&dataset).await;
+    assert!(
+        after.is_superset(&before) && after.len() == before.len() + 1,
+        "the unresolved first attempt must keep its index directory"
     );
 }

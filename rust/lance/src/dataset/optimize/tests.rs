@@ -437,6 +437,19 @@ async fn frag_reuse_watermarks(dataset: &Dataset) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// Names of the immediate children of `_indices`, i.e. one entry per stored
+/// index directory.
+async fn index_dir_names(dataset: &Dataset) -> HashSet<String> {
+    dataset
+        .table_state
+        .object_store
+        .read_dir(dataset.indices_dir())
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
 async fn stored_index(dataset: &Dataset, name: &str) -> IndexMetadata {
     read_manifest_indexes(
         &dataset.table_state.object_store,
@@ -460,6 +473,9 @@ async fn rows_found_through_index(dataset: &Dataset) -> usize {
 #[derive(Clone, Copy, Debug)]
 enum Race {
     Append,
+    /// Deletes rows from a fragment the rewrite is about to publish, so the
+    /// retry's conflict check rejects the rewrite.
+    Delete,
     BuildIndex,
     /// From another session, so the rebase reads its rewrite from the transaction file.
     CompactElsewhere {
@@ -469,6 +485,8 @@ enum Race {
     CompactEagerlyElsewhere {
         excluded: &'static [u32],
     },
+    DeleteThenError,
+    ConflictWithoutWrite,
 }
 
 #[derive(Debug, Default)]
@@ -487,6 +505,12 @@ impl RaceBeforeRewrite {
 
 #[async_trait]
 impl CommitHandler for RaceBeforeRewrite {
+    // Every real write goes through the built-in conditional put handler, whose
+    // "version not found" is definitive.
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -520,6 +544,9 @@ impl CommitHandler for RaceBeforeRewrite {
                         .await
                         .unwrap();
                 }
+                Race::Delete => {
+                    handle.delete("i < 10").await.unwrap();
+                }
                 Race::BuildIndex => {
                     let index = handle
                         .create_index_builder(
@@ -548,6 +575,13 @@ impl CommitHandler for RaceBeforeRewrite {
                     compact_files(&mut elsewhere, eager_compaction_excluding(excluded), None)
                         .await
                         .unwrap();
+                }
+                Race::ConflictWithoutWrite => return Err(CommitError::CommitConflict),
+                Race::DeleteThenError => {
+                    handle.delete("i < 10").await.unwrap();
+                    return Err(CommitError::OtherError(Error::io(
+                        "injected rewrite commit failure",
+                    )));
                 }
             }
         }

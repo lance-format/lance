@@ -1737,4 +1737,98 @@ mod tests {
             io_stats.read_iops
         );
     }
+
+    /// A caller that built an index segment and commits it itself owns
+    /// the directory. A failed commit must leave it in place so the same
+    /// segment can be committed again.
+    #[tokio::test]
+    async fn test_failed_commit_keeps_caller_owned_index_segment() {
+        use crate::index::DatasetIndexExt;
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let batch = record_batch!(("a", Int32, [1, 2, 3, 4])).unwrap();
+        let mut dataset = InsertBuilder::new(uri).execute(vec![batch]).await.unwrap();
+        let segment = dataset
+            .create_index_builder(
+                &["a"],
+                lance_index::IndexType::Scalar,
+                &lance_index::scalar::ScalarIndexParams::default(),
+            )
+            .name("a_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
+        assert!(
+            !dataset
+                .table_state
+                .object_store
+                .read_dir(index_dir.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let transaction = Transaction::new(
+            segment.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        handler.fail_next(AmbiguousFailure::FailOutright);
+        let error = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+            .with_commit_handler(handler)
+            .execute(transaction.clone())
+            .await
+            .expect_err("the injected commit failure must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated outright commit failure"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !dataset
+                .table_state
+                .object_store
+                .read_dir(index_dir.clone())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a caller-owned segment directory must survive a failed commit"
+        );
+
+        // The caller still holds the same segment, so committing it again must
+        // succeed and find the files where the build left them.
+        CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+            .execute(transaction)
+            .await
+            .expect("replaying the caller-owned segment must succeed");
+        dataset.checkout_latest().await.unwrap();
+
+        let indexed = dataset
+            .scan()
+            .filter("a >= 2")
+            .unwrap()
+            .use_scalar_index(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let plain = dataset
+            .scan()
+            .filter("a >= 2")
+            .unwrap()
+            .use_scalar_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed, plain);
+        assert_eq!(indexed.num_rows(), 3);
+    }
 }

@@ -758,6 +758,7 @@ impl<'a> CreateIndexBuilder<'a> {
             return self.execute_multi_segment_fmindex(num_segments).await;
         }
 
+        let caller_named_index_dir = self.index_uuid.is_some();
         let (new_idx, observed) = self
             .execute_uncommitted_impl()
             .instrument(tracing::info_span!("execute_uncommitted"))
@@ -783,9 +784,20 @@ impl<'a> CreateIndexBuilder<'a> {
         .transaction_properties(self.transaction_properties.clone())
         .build();
 
-        self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
+        // A caller-named directory may hold files written outside this call.
+        if caller_named_index_dir {
+            self.dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await?;
+        } else {
+            self.dataset
+                .apply_commit_reclaiming_minted_index_dirs(
+                    transaction,
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await?;
+        }
 
         // Rebasing may withdraw all query coverage while keeping the committed
         // segment's definition for rebuilding. Include that stored metadata.
@@ -948,7 +960,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .build();
 
             self.dataset
-                .apply_commit(transaction, &Default::default(), &Default::default())
+                .apply_commit_reclaiming_minted_index_dirs(
+                    transaction,
+                    &Default::default(),
+                    &Default::default(),
+                )
                 .await?;
 
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
@@ -1035,7 +1051,11 @@ impl<'a> CreateIndexBuilder<'a> {
         .build();
 
         self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
+            .apply_commit_reclaiming_minted_index_dirs(
+                transaction,
+                &Default::default(),
+                &Default::default(),
+            )
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
@@ -1246,11 +1266,28 @@ mod tests {
     use lance_linalg::distance::{DistanceType, MetricType};
     use roaring::RoaringBitmap;
     use rstest::rstest;
-    use std::{collections::BTreeSet, ops::Bound, sync::Arc};
+    use std::{
+        collections::{BTreeSet, HashSet},
+        ops::Bound,
+        sync::Arc,
+    };
     use tracing_subscriber::{Layer, layer::SubscriberExt};
     use uuid::Uuid;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    /// Names of the immediate children of `_indices`, i.e. one entry per
+    /// stored index directory.
+    async fn index_dir_names(dataset: &Dataset) -> HashSet<String> {
+        dataset
+            .table_state
+            .object_store
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
 
     #[test]
     fn test_inverted_training_params_include_build_only_fields() {
@@ -1705,6 +1742,8 @@ mod tests {
             first.is_ok(),
             "first create_index should succeed: {first:?}"
         );
+        let dirs_before = index_dir_names(&reader1).await;
+        assert_eq!(dirs_before.len(), 1);
 
         let second = CreateIndexBuilder::new(&mut reader2, &["a"], IndexType::BTree, &params)
             .name("a_idx".to_string())
@@ -1714,22 +1753,88 @@ mod tests {
             matches!(second, Err(Error::RetryableCommitConflict { .. })),
             "second concurrent create_index should be retryable, got {second:?}"
         );
+        assert_eq!(
+            index_dir_names(&reader1).await,
+            dirs_before,
+            "the index directory of the rejected CreateIndex must be reclaimed"
+        );
 
         let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
         assert_eq!(latest_indices.len(), 1);
     }
 
+    /// A multi-segment FM-Index build that loses to a concurrent CreateIndex of
+    /// the same name must reclaim the segment directories it minted, and the
+    /// winner's directories must survive.
+    #[tokio::test]
+    async fn test_concurrent_multi_segment_fmindex_reclaims_segment_dirs() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let read_version = dataset.manifest.version;
+        let mut winner = dataset.checkout_version(read_version).await.unwrap();
+        let mut loser = dataset.checkout_version(read_version).await.unwrap();
+        let params = ScalarIndexParams {
+            index_type: "fm".to_string(),
+            params: Some(r#"{"num_segments": 2}"#.to_string()),
+        };
+        CreateIndexBuilder::new(&mut winner, &["text"], IndexType::Fm, &params)
+            .name("text_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+        let dirs_before = index_dir_names(&winner).await;
+        assert_eq!(dirs_before.len(), 2);
+
+        let error = CreateIndexBuilder::new(&mut loser, &["text"], IndexType::Fm, &params)
+            .name("text_idx".to_string())
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(
+                "CreateIndex transaction was preempted by concurrent transaction CreateIndex"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            index_dir_names(&winner).await,
+            dirs_before,
+            "the segment directories of the rejected multi-segment build must be reclaimed"
+        );
+        let committed = winner.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(committed.len(), 2);
+    }
+
     #[rstest]
-    #[case::drop_indexed("drop", "value", true)]
-    #[case::drop_unrelated("drop", "other", false)]
-    #[case::cast_indexed("cast", "value", true)]
-    #[case::cast_unrelated("cast", "other", false)]
-    #[case::rename_indexed("rename", "value", false)]
+    #[case::drop_indexed("drop", "value", true, false)]
+    #[case::drop_unrelated("drop", "other", false, false)]
+    #[case::cast_indexed("cast", "value", true, false)]
+    #[case::cast_unrelated("cast", "other", false, false)]
+    #[case::rename_indexed("rename", "value", false, false)]
+    #[case::drop_caller_named_uuid("drop", "value", true, true)]
     #[tokio::test]
     async fn test_create_index_after_concurrent_schema_change(
         #[case] change: &str,
         #[case] column: &str,
         #[case] expect_conflict: bool,
+        #[case] caller_index_uuid: bool,
     ) {
         let batch = arrow_array::record_batch!(
             ("id", Int32, [1, 2, 3]),
@@ -1772,10 +1877,15 @@ mod tests {
             .unwrap();
 
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
-        let result = CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
-            .name("value_idx".to_string())
-            .execute()
-            .await;
+        let caller_uuid = caller_index_uuid.then(Uuid::new_v4);
+        let dirs_before = index_dir_names(&writer).await;
+        let mut builder =
+            CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
+                .name("value_idx".to_string());
+        if let Some(uuid) = caller_uuid {
+            builder = builder.index_uuid(uuid);
+        }
+        let result = builder.execute().await;
         if expect_conflict {
             let error = result.unwrap_err();
             assert!(
@@ -1789,6 +1899,22 @@ mod tests {
                 )),
                 "{error}"
             );
+            if let Some(uuid) = caller_uuid {
+                let mut expected_dirs = dirs_before.clone();
+                expected_dirs.insert(uuid.to_string());
+                assert_eq!(
+                    index_dir_names(&writer).await,
+                    expected_dirs,
+                    "the caller-named index directory must be kept after the preempted \
+                     CreateIndex"
+                );
+            } else {
+                assert_eq!(
+                    index_dir_names(&writer).await,
+                    dirs_before,
+                    "the index directory of the preempted CreateIndex must be reclaimed"
+                );
+            }
         } else {
             result.unwrap();
         }
