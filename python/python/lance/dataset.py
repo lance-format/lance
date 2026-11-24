@@ -1531,8 +1531,10 @@ class LanceDataset(pa.dataset.Dataset):
         """Get candidate fragments in manifest order.
 
         If supplied, a SQL predicate or PyArrow expression can rule out
-        fragments using scalar index metadata. Apply the same filter when
-        reading the returned fragments. With no filter, return all fragments.
+        fragments using scalar index metadata. Read the returned fragments at
+        the same dataset version with the same resolved filter. Bind
+        query-scoped values such as ``now()`` once before planning and reuse
+        that filter on workers. With no filter, return all fragments.
 
         Examples
         --------
@@ -1557,8 +1559,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         If supplied, a SQL predicate or PyArrow expression can rule out
         fragments using scalar index metadata. Fragments with incomplete index
-        coverage or inconclusive statistics are retained. Apply the original
-        filter at the same dataset version when reading or updating candidates.
+        coverage or inconclusive statistics are retained. Apply the same
+        resolved filter at the same dataset version when reading or updating
+        candidates. Bind query-scoped values such as ``now()`` once before
+        planning and reuse that filter on workers.
         With no filter, return all fragment IDs.
 
         Examples

@@ -7,9 +7,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion_expr::{Expr, ExprSchemable, Operator, Volatility};
+use datafusion_expr::{Expr, ExprSchemable, Operator};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_datafusion::planner::Planner;
@@ -34,11 +32,13 @@ impl Dataset {
     ///
     /// This reads index and dataset metadata without scanning data files. It
     /// retains fragments that lack usable index coverage or cannot be ruled out.
-    /// Apply the original filter to the candidates using the same snapshot.
+    /// Apply the same resolved predicate to the candidates using the same
+    /// snapshot. Bind query-scoped values such as `now()` once before passing
+    /// the predicate to this method and to any workers that will evaluate it.
     /// Equality and IN predicates on `_rowaddr` can also prune using physical
     /// fragment IDs without accessing an index.
-    /// Predicates with query-scoped or volatile functions and segments that
-    /// require row-level address translation are handled conservatively.
+    /// Segments that require row-level address translation retain their
+    /// covered fragments for the worker to filter.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -56,7 +56,7 @@ impl Dataset {
     pub async fn candidate_fragment_ids(&self, filter: ExprFilter) -> Result<RoaringBitmap> {
         let filter_schema = self.scan().filterable_schema()?;
         let schema = Arc::new(ArrowSchema::from(filter_schema.as_ref()));
-        let expr = filter.to_unoptimized_datafusion(self.schema(), &filter_schema)?;
+        let expr = filter.to_datafusion(self.schema(), &filter_schema)?;
         let df_schema = DFSchema::try_from(schema.clone())?;
         if expr.get_type(&df_schema)? != DataType::Boolean {
             return Err(Error::invalid_input(format!(
@@ -70,17 +70,6 @@ impl Dataset {
             return Ok(all_fragments.clone());
         }
 
-        // Query-scoped functions such as now() may be evaluated again on workers.
-        // Discard their conjuncts before the optimizer can turn them into literals.
-        let mut immutable_conjuncts = Vec::new();
-        for conjunct in split_conjunction_owned(expr) {
-            if is_immutable(&conjunct)? {
-                immutable_conjuncts.push(conjunct);
-            }
-        }
-        let Some(expr) = conjunction(immutable_conjuncts) else {
-            return Ok(all_fragments.clone());
-        };
         let expr = Planner::new(schema).optimize_expr(expr)?;
         self.evaluate_fragment_filter(&expr, &OnceCell::new()).await
     }
@@ -247,25 +236,11 @@ impl Dataset {
     }
 }
 
-fn is_immutable(expr: &Expr) -> Result<bool> {
-    let mut immutable = true;
-    expr.apply(|node| {
-        if let Expr::ScalarFunction(call) = node
-            && call.func.signature().volatility != Volatility::Immutable
-        {
-            immutable = false;
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(immutable)
-}
-
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, TimestampMillisecondArray,
-        UInt64Array, record_batch,
+        ArrayRef, RecordBatch, RecordBatchIterator, TimestampMillisecondArray, UInt64Array,
+        record_batch,
     };
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
@@ -500,17 +475,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fragment_pruning_skips_query_scoped_and_volatile_predicates() {
-        let batch = RecordBatch::try_from_iter([
-            ("price", Arc::new(Int32Array::from(vec![0, 10])) as ArrayRef),
-            (
-                "event_ts",
-                Arc::new(TimestampMillisecondArray::from(vec![
-                    4_102_444_800_000,
-                    4_102_531_200_000,
-                ])) as ArrayRef,
-            ),
-        ])
+    async fn test_fragment_pruning_uses_bound_timestamp() {
+        let batch = RecordBatch::try_from_iter([(
+            "event_ts",
+            Arc::new(TimestampMillisecondArray::from(vec![
+                4_102_444_800_000,
+                4_102_531_200_000,
+            ])) as ArrayRef,
+        )])
         .unwrap();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
@@ -523,7 +495,6 @@ mod tests {
         )
         .await
         .unwrap();
-        build_segments(&mut dataset, "price", BuiltinIndexType::ZoneMap, &[&[0, 1]]).await;
         build_segments(
             &mut dataset,
             "event_ts",
@@ -532,8 +503,6 @@ mod tests {
         )
         .await;
 
-        // A literal time permits pruning. A query-scoped time can differ across
-        // the driver and workers, so only the independent price conjunct can prune.
         assert_candidates(&dataset, "event_ts <= TIMESTAMP '2099-12-31 00:00:00'", &[]).await;
         assert_candidates(
             &dataset,
@@ -541,22 +510,6 @@ mod tests {
             &[0],
         )
         .await;
-        for (filter, expected) in [
-            ("event_ts <= now()", &[0, 1][..]),
-            ("price >= 10 AND event_ts <= now()", &[1]),
-            ("price >= 10 OR event_ts <= now()", &[0, 1]),
-            ("price >= 10 AND random() < 0.5", &[1]),
-        ] {
-            let candidates = dataset
-                .candidate_fragment_ids(ExprFilter::Sql(filter.into()))
-                .await
-                .unwrap();
-            assert_eq!(
-                candidates,
-                RoaringBitmap::from_iter(expected.iter().copied()),
-                "{filter}"
-            );
-        }
     }
 
     #[tokio::test]
