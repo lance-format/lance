@@ -123,6 +123,58 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     );
     assert_eq!(fixture.count_rows().await.unwrap(), num_rows);
 }
+
+#[tokio::test]
+async fn cleanup_explanation_uses_run_start_for_unverified_age() {
+    MockClock::set_system_time(Duration::ZERO);
+    let fixture = MockDatasetFixture::try_new().unwrap();
+    fixture.create_some_data().await.unwrap();
+    let dataset = fixture.open().await.unwrap();
+
+    let run_start = TimeDelta::days(10);
+    let cutoff = run_start - TimeDelta::days(7);
+    let second = TimeDelta::seconds(1);
+    for (name, modified_at) in [
+        ("before-cutoff.lance", cutoff - second),
+        ("at-cutoff.lance", cutoff),
+        ("after-cutoff.lance", cutoff + second),
+    ] {
+        MockClock::set_system_time(modified_at.to_std().unwrap());
+        dataset
+            .object_store
+            .put(&dataset.data_dir().join(name), b"orphan")
+            .await
+            .unwrap();
+    }
+
+    // Advance only the mock clock while the read-only explanation reads manifests.
+    let manifest_scan_time = run_start + TimeDelta::seconds(2);
+    fixture.mock_store.policy.lock().unwrap().set_before_policy(
+        "advance_clock_on_manifest_read",
+        Arc::new(move |operation, path| {
+            if operation == "get_opts" && path.extension() == Some("manifest") {
+                MockClock::set_system_time(manifest_scan_time.to_std().unwrap());
+            }
+            Ok(())
+        }),
+    );
+    MockClock::set_system_time(run_start.to_std().unwrap());
+    let explanation = dataset
+        .cleanup(CleanupPolicy::default())
+        .explain()
+        .await
+        .unwrap();
+
+    assert_eq!(utc_now(), DateTime::UNIX_EPOCH + manifest_scan_time);
+    let candidates: Vec<_> = explanation
+        .candidate_files
+        .iter()
+        .map(|file| (file.path.as_str(), file.unverified))
+        .collect();
+    let older_file = dataset.data_dir().join("before-cutoff.lance");
+    assert_eq!(candidates, [(older_file.as_ref(), true)]);
+}
+
 #[tokio::test]
 async fn auto_cleanup_old_versions() {
     // Every n commits, all versions older than T should be deleted.
