@@ -58,14 +58,14 @@ pub(crate) async fn commit_transaction(
     options: CommitTransactionOptions<'_>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let hook = LanceCommitHook::new(dataset.session.clone());
-    runtime::commit_transaction(
+    Box::pin(runtime::commit_transaction(
         &dataset.table_view().to_table(),
         object_store,
         commit_handler,
         transaction,
         options,
         hook.hooks(),
-    )
+    ))
     .await
 }
 

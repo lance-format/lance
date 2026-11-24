@@ -374,9 +374,8 @@ impl<'a> CommitBuilder<'a> {
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let (inner, hook, session) = self.into_runtime();
-        let table = inner
-            .execute_with_lifecycle(transaction, Some(hook.as_ref()))
-            .await?;
+        let table =
+            Box::pin(inner.execute_with_lifecycle(transaction, Some(hook.as_ref()))).await?;
         Ok(Dataset::from_committed_table(table, session))
     }
 
@@ -404,9 +403,8 @@ impl<'a> CommitBuilder<'a> {
     /// </div>
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
         let (inner, hook, session) = self.into_runtime();
-        let result = inner
-            .execute_batch_with_lifecycle(transactions, Some(hook.as_ref()))
-            .await?;
+        let result =
+            Box::pin(inner.execute_batch_with_lifecycle(transactions, Some(hook.as_ref()))).await?;
         let dataset = Dataset::from_committed_table(result.table, session);
         Ok(BatchCommitResult {
             dataset,
