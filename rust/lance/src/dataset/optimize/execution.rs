@@ -33,13 +33,11 @@ use crate::io::commit::migrate_fragments;
 use crate::io::deletion::read_dataset_deletion_file;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{BlobHandling, Field as LanceField};
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{Fragment, RowDatasetVersionSequence};
 use lance_table::rowids::RowIdSequence;
@@ -189,7 +187,7 @@ pub async fn can_use_binary_copy_current(
             // check file global buffer
             let object_store = match data_file.base_id {
                 Some(base_id) => dataset.object_store(Some(base_id)).await?,
-                None => dataset.object_store.clone(),
+                None => dataset.table_state.object_store.clone(),
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
@@ -301,16 +299,14 @@ async fn prepare_reader(
     }
     if capture_row_ids {
         scanner.with_row_id();
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    }
+    let data = Box::pin(scanner.try_into_stream().await?);
+    if capture_row_ids {
         let (data_no_row_ids, rx) =
             make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
         Ok((data_no_row_ids, Some(rx), has_blob_v2_columns))
     } else {
-        Ok((
-            SendableRecordBatchStream::from(scanner.try_into_stream().await?),
-            None,
-            has_blob_v2_columns,
-        ))
+        Ok((data, None, has_blob_v2_columns))
     }
 }
 
@@ -459,30 +455,11 @@ pub async fn live_source_row_addrs(
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<RoaringTreemap> {
-    let mut addrs = RoaringTreemap::new();
-    for fragment in fragments {
-        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
-            Error::internal(format!(
-                "Fragment id {} is outside the row-address range",
-                fragment.id
-            ))
-        })?;
-        let physical_rows = fragment.physical_rows.ok_or_else(|| {
-            Error::internal(format!(
-                "Fragment {} is missing physical_rows after migration",
-                fragment.id
-            ))
-        })?;
-        let start = u64::from(RowAddress::first_row(fragment_id));
-        addrs.insert_range(start..start + physical_rows as u64);
-        if let Some(deletion_file) = &fragment.deletion_file {
-            let deletions = read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?;
-            for offset in deletions.to_sorted_iter() {
-                addrs.remove(u64::from(RowAddress::new_from_parts(fragment_id, offset)));
-            }
-        }
-    }
-    Ok(addrs)
+    lance_table_runtime::frag_reuse::live_source_row_addrs(
+        &dataset.table_view().to_table(),
+        fragments,
+    )
+    .await
 }
 
 /// Refuse a task whose output clustering id can never resolve, before the
@@ -647,16 +624,10 @@ pub(super) async fn rewrite_files(
             }
             let rewrite_plan = Arc::new(rewrite_plan);
             let transformed_schema = rewrite_plan.output_schema().clone();
-            let transformed = reader_with_progress.then(move |batch_result| {
+            let transformed = reader_with_progress.and_then(move |batch| {
                 let dataset = dataset_arc.clone();
                 let rewrite_plan = rewrite_plan.clone();
-                async move {
-                    let batch = batch_result?;
-                    rewrite_plan
-                        .transform_batch(&dataset, batch)
-                        .await
-                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
-                }
+                async move { rewrite_plan.transform_batch(&dataset, batch).await }
             });
             reader = Some(Box::pin(RecordBatchStreamAdapter::new(
                 transformed_schema,
@@ -817,8 +788,8 @@ pub(super) async fn rewrite_files(
         let (frags, _) = write_fragments_internal_impl(
             write_version,
             Some(dataset.as_ref()),
-            dataset.object_store.clone(),
-            &dataset.base,
+            dataset.table_state.object_store.clone(),
+            &dataset.table_state.base,
             write_schema,
             stream,
             params,
@@ -874,8 +845,13 @@ pub(super) async fn rewrite_files(
     let row_addrs = match row_addrs_result {
         Ok(v) => v,
         Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
-                .await;
+            cleanup_data_fragments(
+                &dataset.table_state.object_store,
+                &dataset.table_state.base,
+                None,
+                &new_fragments,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -1247,10 +1223,8 @@ pub(super) fn append_row_lineage_columns(
         let batch = batch?;
         let rows = batch.num_rows();
         if offset + rows > total_rows {
-            return Err(datafusion::error::DataFusionError::External(Box::new(
-                Error::internal(format!(
-                    "compaction read more rows than its row lineage covers ({total_rows})"
-                )),
+            return Err(Error::internal(format!(
+                "compaction read more rows than its row lineage covers ({total_rows})"
             )));
         }
         let mut arrays = batch.columns().to_vec();
@@ -1262,8 +1236,7 @@ pub(super) fn append_row_lineage_columns(
             arrays.push(Arc::new(arrow_array::UInt64Array::from(batch_values)) as ArrayRef);
         }
         offset += rows;
-        RecordBatch::try_new(batch_schema.clone(), arrays)
-            .map_err(datafusion::error::DataFusionError::from)
+        Ok(RecordBatch::try_new(batch_schema.clone(), arrays)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, batches))
 }

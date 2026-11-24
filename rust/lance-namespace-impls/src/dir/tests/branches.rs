@@ -242,12 +242,15 @@ async fn test_describe_table_snapshot_selectors_discovered_branch() {
         .await
         .unwrap();
     request.version = Some(1);
-    let error = listing.describe_table(request).await.unwrap_err();
-    assert_eq!(
-        namespace_code(&error),
-        Some(ErrorCode::TableBranchNotFound),
-        "{error}"
-    );
+    for branch in [None, Some("dev.lance".into())] {
+        request.branch = branch;
+        let error = listing.describe_table(request.clone()).await.unwrap_err();
+        assert_eq!(
+            namespace_code(&error),
+            Some(ErrorCode::TableBranchNotFound),
+            "{error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -315,7 +318,7 @@ async fn test_describe_table_snapshot_selectors_in_tree_named_directory() {
 }
 
 #[tokio::test]
-async fn test_list_table_versions_on_branch() {
+async fn test_list_table_versions_pagination_on_branch() {
     let (namespace, _temp_dir) = create_test_namespace().await;
     create_scalar_table(&namespace, "users").await;
     create_branch_with_commits(&namespace, "users", "exp", 2).await;
@@ -333,6 +336,27 @@ async fn test_list_table_versions_on_branch() {
         "branch versions must resolve to branch manifests: {:?}",
         branch_versions
     );
+
+    let mut request = ListTableVersionsRequest {
+        id: Some(vec!["users".into()]),
+        branch: Some("exp".into()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let first = namespace
+        .list_table_versions(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.versions, branch_versions[..1]);
+    request.page_token = Some(
+        first
+            .page_token
+            .expect("non-final page needs a continuation"),
+    );
+    request.limit = None;
+    let rest = namespace.list_table_versions(request).await.unwrap();
+    assert_eq!(rest.versions, branch_versions[1..]);
+    assert!(rest.page_token.is_none());
 
     // Unset and "main" behave identically and never see the tree path.
     let main_versions = list_versions(&namespace, "users", None).await.unwrap();

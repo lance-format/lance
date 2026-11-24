@@ -1058,7 +1058,12 @@ async fn test_optimize_reports_segment_open_errors(
             .indices_dir()
             .join(segment.uuid.to_string())
             .join(file.path.as_str());
-        dataset.object_store.delete(&path).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .delete(&path)
+            .await
+            .unwrap();
     }
 
     let result = dataset.optimize_indices(&OptimizeOptions::default()).await;
@@ -1367,7 +1372,7 @@ async fn test_optimize_trains_vector_definition_under_tagged_history() {
     assert_ne!(after[0].uuid, before[0].uuid);
     assert_eq!(
         after[0].fragment_bitmap.as_ref().unwrap(),
-        dataset.fragment_bitmap.as_ref()
+        dataset.table_state.fragment_bitmap.as_ref()
     );
     dataset.validate().await.unwrap();
 
@@ -1736,7 +1741,7 @@ async fn test_optimize_rebuilds_dormant_vector_index_instead_of_merging_stale_ro
     assert_eq!(retained.len(), 1);
     assert!(
         retained[0]
-            .effective_fragment_bitmap(&updated.fragment_bitmap)
+            .effective_fragment_bitmap(&updated.table_state.fragment_bitmap)
             .unwrap()
             .is_empty()
     );
@@ -1748,7 +1753,7 @@ async fn test_optimize_rebuilds_dormant_vector_index_instead_of_merging_stale_ro
     assert_eq!(rebuilt.len(), 1);
     assert!(
         !rebuilt[0]
-            .effective_fragment_bitmap(&updated.fragment_bitmap)
+            .effective_fragment_bitmap(&updated.table_state.fragment_bitmap)
             .unwrap()
             .is_empty()
     );

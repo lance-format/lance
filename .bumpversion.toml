@@ -1,5 +1,5 @@
 [tool.bumpversion]
-current_version = "15.0.0-beta.27"
+current_version = "15.0.0-beta.33"
 parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)(-(?P<prerelease>(beta|rc))\\.(?P<prerelease_num>\\d+))?"
 serialize = [
     "{major}.{minor}.{patch}-{prerelease}.{prerelease_num}",
@@ -124,6 +124,11 @@ replace = 'lance-select = {{ version = "={new_version}"'
 filename = "Cargo.toml"
 search = 'lance-table = {{ version = "={current_version}"'
 replace = 'lance-table = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'lance-table-runtime = {{ version = "={current_version}"'
+replace = 'lance-table-runtime = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"

@@ -706,7 +706,7 @@ impl Dataset {
                         "fragment_ids contains duplicate fragment IDs: {fragment_ids:?}"
                     )));
                 }
-                let unknown = &fragment_set - self.fragment_bitmap.as_ref();
+                let unknown = &fragment_set - self.table_state.fragment_bitmap.as_ref();
                 if !unknown.is_empty() {
                     return Err(Error::invalid_input(format!(
                         "fragment_ids contains unknown fragment IDs: {:?}",
@@ -782,7 +782,7 @@ impl Dataset {
                             "Scalar index '{index_name}' segment {segment_uuid} is missing fragment coverage"
                         ))
                     })?;
-                let current_coverage = coverage & self.fragment_bitmap.as_ref();
+                let current_coverage = coverage & self.table_state.fragment_bitmap.as_ref();
                 if current_coverage.is_empty() {
                     return Err(Error::invalid_input(format!(
                         "Scalar index '{index_name}' segment {segment_uuid} does not cover any current dataset fragments"

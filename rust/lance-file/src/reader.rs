@@ -18,11 +18,12 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream::BoxStream};
 use lance_core::deepsize::{Context, DeepSizeOf};
+pub use lance_encoding::decoder::FilterExpression;
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
-        RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
+        ColumnInfo, DecoderConfig, DecoderPlugins, PageEncoding, ReadBatchTask, RequestedRows,
+        SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
 };
@@ -1288,39 +1289,84 @@ impl FileReader {
         })
     }
 
+    async fn read_schema_buffer(
+        scheduler: &FileScheduler,
+        tail: &Bytes,
+        file_len: u64,
+        buffer: &BufferDescriptor,
+    ) -> Result<(u64, Schema)> {
+        let bytes = Self::read_range_from_tail_or_scheduler(
+            tail,
+            file_len - tail.len() as u64,
+            scheduler,
+            buffer.checked_range(0, file_len)?,
+        )
+        .await?;
+        Self::decode_schema(bytes)
+    }
+
+    async fn read_current_footer(
+        scheduler: &FileScheduler,
+        tail: &Bytes,
+        file_len: u64,
+    ) -> Result<(Footer, ConcreteFileVersion, Vec<BufferDescriptor>)> {
+        let footer = Self::decode_footer(tail).map_err(|error| {
+            Error::corrupt_file(scheduler.reader().path().clone(), error.to_string())
+        })?;
+        let version = Self::current_file_version(&footer)?;
+        Self::validate_footer(&footer, file_len)?;
+        let buffers = Self::decode_gbo_table(tail, file_len, scheduler, &footer, version).await?;
+        if buffers.is_empty() {
+            return Err(Error::internal(
+                "File did not contain any global buffers, schema expected".to_string(),
+            ));
+        }
+        Ok((footer, version, buffers))
+    }
+
+    /// Reads only the file schema, without loading column metadata or user global
+    /// buffers. Returns a version conflict for a legacy file.
+    pub async fn read_schema(scheduler: &FileScheduler) -> Result<Schema> {
+        Ok(Self::read_schema_and_global_buffers(scheduler).await?.0)
+    }
+
+    /// Reads the schema and the validated locations of the global buffers in one
+    /// footer lookup. A caller can range-read part of a buffer without opening
+    /// the file's columns. Buffer zero describes the schema itself.
+    pub async fn read_schema_and_global_buffers(
+        scheduler: &FileScheduler,
+    ) -> Result<(Schema, Vec<BufferDescriptor>)> {
+        let (tail, file_len) = Self::read_tail(scheduler).await?;
+        // A short legacy file may not even have room for a current-format footer.
+        if tail.len() < FOOTER_LEN
+            && tail.ends_with(MAGIC)
+            && let (0, minor @ 0..=2) = lance_io::utils::read_version(&tail)?
+        {
+            return Err(Error::version_conflict(
+                "Cannot read a legacy file schema with the current-format reader".to_string(),
+                0,
+                minor,
+            ));
+        }
+        let (_, _, buffers) = Self::read_current_footer(scheduler, &tail, file_len).await?;
+        let (_, schema) = Self::read_schema_buffer(scheduler, &tail, file_len, &buffers[0]).await?;
+        Ok((schema, buffers))
+    }
+
     async fn read_raw_metadata_index_with_known_schema(
         scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
     ) -> Result<FileMetadataIndex> {
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
         let tail_offset = file_len - tail_bytes.len() as u64;
-        let footer = Self::decode_footer(&tail_bytes).map_err(|error| {
-            Error::corrupt_file(scheduler.reader().path().clone(), error.to_string())
-        })?;
-
-        let file_version = Self::current_file_version(&footer)?;
-        Self::validate_footer(&footer, file_len)?;
-
-        let gbo_table =
-            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
-        if gbo_table.is_empty() {
-            return Err(Error::internal(
-                "File did not contain any global buffers, schema expected".to_string(),
-            ));
-        }
+        let (footer, file_version, gbo_table) =
+            Self::read_current_footer(scheduler, &tail_bytes, file_len).await?;
         let (file_schema, num_rows) = match known_schema {
             Some((file_schema, num_rows)) => (file_schema, num_rows),
             None => {
-                let schema_buffer = &gbo_table[0];
-                let schema_range = schema_buffer.checked_range(0, file_len)?;
-                let schema_bytes = Self::read_range_from_tail_or_scheduler(
-                    &tail_bytes,
-                    tail_offset,
-                    scheduler,
-                    schema_range,
-                )
-                .await?;
-                let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
+                let (num_rows, schema) =
+                    Self::read_schema_buffer(scheduler, &tail_bytes, file_len, &gbo_table[0])
+                        .await?;
                 (Arc::new(schema), num_rows)
             }
         };
@@ -6370,6 +6416,7 @@ mod tests {
     enum MetadataReadPath {
         Full,
         Indexed,
+        Schema,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -6380,6 +6427,11 @@ mod tests {
     }
 
     #[rstest]
+    #[case::schema_past_eof(
+        MetadataReadPath::Schema,
+        InvalidGboDescriptor::PastEof,
+        "outside file"
+    )]
     #[case::full_unaligned(MetadataReadPath::Full, InvalidGboDescriptor::Unaligned, "not aligned")]
     #[case::full_past_eof(MetadataReadPath::Full, InvalidGboDescriptor::PastEof, "outside file")]
     #[case::full_overflowing(
@@ -6439,6 +6491,7 @@ mod tests {
             .await
             .unwrap();
         let error = match read_path {
+            MetadataReadPath::Schema => FileReader::read_schema(&scheduler).await.map(|_| ()),
             MetadataReadPath::Full => FileReader::read_all_metadata(&scheduler).await.map(|_| ()),
             MetadataReadPath::Indexed => FileReader::read_metadata_index(&scheduler)
                 .await

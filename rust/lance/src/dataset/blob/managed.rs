@@ -19,6 +19,7 @@ use crate::dataset::Dataset;
 use lance_core::datatypes::{BlobV2Layout, Field as LanceField};
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
+use lance_table_runtime::Table;
 
 pub(in crate::dataset) fn field_contains_blob(field: &LanceField) -> bool {
     field.is_blob_v2() || field.children.iter().any(field_contains_blob)
@@ -26,7 +27,7 @@ pub(in crate::dataset) fn field_contains_blob(field: &LanceField) -> bool {
 
 /// The objects referenced by Blob descriptors, collected one row at a time.
 struct ManagedReferenceScan<'a> {
-    dataset: &'a Dataset,
+    table: &'a Table,
     include_registered_sidecars: bool,
     locators: HashMap<u32, BlobLocator<'a>>,
     references: HashSet<(Option<u32>, String)>,
@@ -47,11 +48,11 @@ fn visit_managed_row(
             Error::internal("Expected Blob descriptor array during reference scan")
         })?;
         let field_id = field.id as u32;
-        let dataset = scan.dataset;
+        let table = scan.table;
         let locator = scan
             .locators
             .entry(field_id)
-            .or_insert_with(|| BlobLocator::new(dataset, field_id));
+            .or_insert_with(|| BlobLocator::new(table, field_id));
         match StoredBlob::parse(values, row)? {
             Some(StoredBlob::Managed { base_id, uri, .. }) => {
                 let base_id = locator.managed_base(base_id, row_addr)?;
@@ -146,8 +147,9 @@ pub(super) async fn managed_references(
     scan.project(&names)?;
     scan.with_row_address();
     let mut stream = scan.try_into_stream().await?;
+    let table = dataset.table_view().to_table();
     let mut reference_scan = ManagedReferenceScan {
-        dataset,
+        table: &table,
         include_registered_sidecars,
         locators: HashMap::new(),
         references: HashSet::new(),
@@ -207,7 +209,7 @@ pub(in crate::dataset) async fn managed_paths(
         match &root {
             BaseResolution::Resolved(root) => {
                 let path = join_base_and_relative_path(root, &uri)?;
-                if crate::dataset::cleanup::in_blob_deletion_scope(&owner.base, &path) {
+                if crate::dataset::cleanup::in_blob_deletion_scope(&owner.table_state.base, &path) {
                     paths.insert(path);
                     continue;
                 }
@@ -216,7 +218,7 @@ pub(in crate::dataset) async fn managed_paths(
             BaseResolution::Unresolved => {}
         }
         if owner_base_ids.contains(&base_id) {
-            paths.insert(join_base_and_relative_path(&owner.base, &uri)?);
+            paths.insert(join_base_and_relative_path(&owner.table_state.base, &uri)?);
         }
     }
     Ok(paths)
@@ -226,11 +228,11 @@ fn primary_root(dataset: &Dataset, owner: &Dataset) -> BaseResolution {
     let registry = dataset.session.store_registry();
     if may_be_same_store(
         registry.as_ref(),
-        &owner.object_store,
-        dataset.object_store.scheme(),
-        &dataset.object_store.store_prefix,
+        &owner.table_state.object_store,
+        dataset.table_state.object_store.scheme(),
+        &dataset.table_state.object_store.store_prefix,
     ) {
-        BaseResolution::Resolved(dataset.base.clone())
+        BaseResolution::Resolved(dataset.table_state.base.clone())
     } else {
         BaseResolution::Foreign
     }
@@ -251,7 +253,7 @@ async fn registered_root(
         Ok(base_store) => {
             if !may_be_same_store(
                 registry.as_ref(),
-                &owner.object_store,
+                &owner.table_state.object_store,
                 base_store.scheme(),
                 &base_store.store_prefix,
             ) {
@@ -385,7 +387,7 @@ pub async fn preserve_managed_descriptors(
         .manifest
         .base_paths
         .values()
-        .find(|base| base.path == dataset.uri)
+        .find(|base| base.path == dataset.table_state.uri)
         .map(|base| base.id);
     let preserve_base = |source_base_id: Option<u32>| -> Result<Option<u32>> {
         match (source_base_id, target_base_id) {
@@ -393,7 +395,7 @@ pub async fn preserve_managed_descriptors(
                 Error::invalid_input(format!(
                     "Cannot preserve primary-storage blob references in target base {target}: \
                      dataset URI '{}' has no registered base",
-                    dataset.uri
+                    dataset.table_state.uri
                 ))
             }),
             _ => Ok(source_base_id),
@@ -404,7 +406,8 @@ pub async fn preserve_managed_descriptors(
         field.is_nullable(),
         field.metadata().clone(),
     );
-    let mut locator = BlobLocator::new(dataset, field_id);
+    let table = dataset.table_view().to_table();
+    let mut locator = BlobLocator::new(&table, field_id);
     for (row, row_addr) in row_addrs.iter().copied().enumerate() {
         let Some(blob) = StoredBlob::parse(values, row)? else {
             builder.push_null()?;
@@ -473,8 +476,7 @@ pub async fn preserve_managed_descriptors(
 mod tests {
     use super::*;
 
-    use crate::dataset::blob::file::{BlobFile, BlobSource};
-    use crate::dataset::blob::test_util::{managed_blob_schema, recording_range_store};
+    use crate::dataset::blob::test_util::managed_blob_schema;
     use crate::{
         Dataset,
         blob::{BlobArrayBuilder, blob_field},
@@ -483,7 +485,6 @@ mod tests {
     use arrow_array::RecordBatch;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::Schema;
-    use bytes::Bytes;
     use lance_arrow::{
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
         BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME,
@@ -495,10 +496,9 @@ mod tests {
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_table::feature_flags::FLAG_MANAGED_BLOBS;
     use lance_table::format::BasePath;
-    use object_store::path::Path;
     use rstest::rstest;
     use std::collections::HashMap;
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[rstest]
@@ -576,7 +576,7 @@ mod tests {
             usize::from(maximum_base_id)
         );
         for fragment in dataset.get_fragments() {
-            assert_eq!(fragment.metadata.files[0].base_id, id);
+            assert_eq!(fragment.metadata().files[0].base_id, id);
         }
         let values = dataset
             .take_blobs_by_indices(&[0, 1, 2], "blob")
@@ -618,17 +618,6 @@ mod tests {
                 "{error}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn managed_empty_range_does_not_discover_object_length() {
-        let (store, recording) = recording_range_store(Bytes::from_static(b"not empty"));
-        let source = Arc::new(BlobSource::new(store, Path::from("data/a/payload.blob")));
-        let blob = BlobFile::with_source(source, 4, 0, BlobKind::Managed, None);
-        assert!(blob.read().await.unwrap().is_empty());
-        assert!(blob.read_range(0..0).await.unwrap().is_empty());
-        assert_eq!(recording.head_requests.load(Ordering::Relaxed), 0);
-        assert!(recording.requested_ranges().is_empty());
     }
 
     async fn opened_store(uri: &str, options: &[(&str, &str)]) -> Arc<ObjectStore> {

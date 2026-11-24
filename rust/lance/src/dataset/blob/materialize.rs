@@ -20,11 +20,12 @@ use lance_arrow::ARROW_EXT_NAME_KEY;
 use tokio::sync::Notify;
 
 use super::locate::{BlobLocator, StoredBlob, blob_version_from_descriptions};
-use super::read::BlobEntry;
-use super::read::{ReadBlobsExecution, execute_blob_entries_with_execution};
 use crate::dataset::Dataset;
 use lance_core::datatypes::{BlobVersion, Field as LanceField, Schema};
 use lance_core::{Error, ROW_ADDR, Result};
+use lance_table_runtime::blob::execution::{
+    BlobEntry, ReadBlobsExecution, execute_blob_entries_with_execution,
+};
 
 #[derive(Debug)]
 pub(super) struct BlobMaterializationBudget {
@@ -549,7 +550,8 @@ fn estimate_blob_v2_materialized_array_bytes<'a>(
                     row_addrs.len()
                 )));
             }
-            let mut locator = BlobLocator::new(dataset, field.id as u32);
+            let table = dataset.table_view().to_table();
+            let mut locator = BlobLocator::new(&table, field.id as u32);
             let mut payload_bytes = 0_u64;
             for (idx, row_addr) in row_addrs.iter().copied().enumerate() {
                 let blob = match StoredBlob::parse(descriptions, idx)? {
@@ -557,7 +559,7 @@ fn estimate_blob_v2_materialized_array_bytes<'a>(
                     Some(blob) => blob,
                 };
                 let file = locator.locate(&blob, row_addr).await?;
-                payload_bytes = payload_bytes.saturating_add(file.size);
+                payload_bytes = payload_bytes.saturating_add(file.size());
             }
             let offsets_bytes =
                 u64::try_from((descriptions.len() + 1).saturating_mul(std::mem::size_of::<i64>()))
@@ -791,7 +793,8 @@ async fn materialize_blob_v2_descriptors(
         BlobVersion::V2 => {}
     }
 
-    let mut locator = BlobLocator::new(dataset, blob_field_id);
+    let table = dataset.table_view().to_table();
+    let mut locator = BlobLocator::new(&table, blob_field_id);
     let mut entries = Vec::with_capacity(descriptions.len());
     let mut payloads = vec![None; descriptions.len()];
     let mut null_blobs = vec![false; descriptions.len()];
@@ -818,7 +821,7 @@ async fn materialize_blob_v2_descriptors(
 
     let blobs = execute_blob_entries_with_execution(
         entries,
-        dataset.object_store.io_parallelism(),
+        dataset.table_state.object_store.io_parallelism(),
         context.execution.clone(),
     )
     .await?;

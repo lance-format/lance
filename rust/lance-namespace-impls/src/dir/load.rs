@@ -3,7 +3,7 @@
 
 use lance::dataset::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::{BranchIdentifier, BranchLocation, Refs};
+use lance::dataset::refs::{BRANCH_DIR, BranchIdentifier, BranchLocation, Refs};
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -22,20 +22,18 @@ impl DirectoryNamespace {
     ) -> Result<DescribeTableResponse> {
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
-        let skip_manifest_for_root = self.dir_listing_enabled
-            && is_root_level
-            && !self.dir_listing_to_manifest_migration_enabled;
+        let probe_manifest_for_root = self.table_discovery_mode.uses_manifest_for_root();
+        let skip_manifest_for_root = is_root_level
+            && self.table_discovery_mode.has_directory_listing()
+            && !probe_manifest_for_root;
         // Self-heal the manifest wherever it can be authoritative: a child table
         // (no dir-listing fallback), a manifest-only namespace, or migration mode
         // (manifest-first -- it can hold registered_table -> external .lance
         // aliases that dir-listing cannot resolve, so a reader built before
         // __manifest must re-probe to see them). The bypass -- skipping the probe
-        // -- applies ONLY to migration-disabled directory-backed root reads,
+        // -- applies ONLY to directory-backed root reads without migration,
         // which are served entirely from the directory listing.
-        if is_child_table
-            || !self.dir_listing_enabled
-            || self.dir_listing_to_manifest_migration_enabled
-        {
+        if is_child_table || probe_manifest_for_root {
             self.ensure_read_manifest().await?;
         }
         if let Some(manifest_ns) = self.manifest_ns_for_read()
@@ -62,7 +60,7 @@ impl DirectoryNamespace {
                     // rather than degrading to a directory-listing view.
                     return Err(e);
                 }
-                Err(e) if self.dir_listing_enabled && is_root_level => {
+                Err(e) if self.table_discovery_mode.has_directory_listing() && is_root_level => {
                     // Only a genuinely-absent table (e.g. an unmigrated on-disk
                     // table) may fall through to the directory check; any other
                     // manifest error must propagate rather than be read as missing.
@@ -79,7 +77,7 @@ impl DirectoryNamespace {
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
-        if !self.dir_listing_enabled {
+        if !self.table_discovery_mode.has_directory_listing() {
             return Err(NamespaceError::TableNotFound { message: table_id }.into());
         }
 
@@ -188,15 +186,25 @@ impl DirectoryNamespace {
                 let dataset = self
                     .open_directory_version(&table_uri, version, None, None)
                     .await?;
-                if request.branch.is_some() && dataset.manifest().branch.is_some() {
-                    return Err(NamespaceError::Unsupported {
-                        message: format!(
-                            "The main branch is outside the directory-listed table '{table_uri}'"
-                        ),
+                match dataset.manifest().branch.as_deref() {
+                    Some(_) if request.branch.is_some() => {
+                        return Err(NamespaceError::Unsupported {
+                            message: format!(
+                                "The main branch is outside the directory-listed table '{table_uri}'"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
+                    Some(name) => {
+                        let expected = dataset
+                            .branch_identifier()
+                            .await
+                            .map_err(|err| Self::describe_branch_error(err, name, &table_uri))?;
+                        self.open_verified_directory_branch(&table_uri, name, version, &expected)
+                            .await?
+                    }
+                    None => dataset,
                 }
-                dataset
             }
         };
         let version_info = dataset.version();
@@ -251,31 +259,28 @@ impl DirectoryNamespace {
         identifier: Option<&BranchIdentifier>,
     ) -> Result<Dataset> {
         let mut builder = self.configured_builder(uri);
-        if branch.is_some()
-            && let Some(session) = &self.session
+        if let Some(session) = &self.session
+            && (branch.is_some()
+                || self
+                    .base_path
+                    .parts()
+                    .any(|part| part.as_ref() == BRANCH_DIR))
         {
-            // A branch URI and version can be reused after deletion. Modern branch
-            // refs end in a generation UUID. A legacy ref (parent version zero)
-            // or a manifest opened to discover its branch has no such guarantee.
-            let prefix = match identifier.and_then(|id| id.version_mapping.last()) {
-                Some((version, uuid)) if *version > 0 => std::borrow::Cow::Borrowed(uuid.as_str()),
-                _ => std::borrow::Cow::Owned(uuid::Uuid::new_v4().simple().to_string()),
-            };
-            builder = builder.with_session(session.with_cache_key_prefix(&prefix).into());
+            // An ordinary table and a branch can successively occupy the same
+            // path below a tree directory. Until the manifest establishes its
+            // owner, a cached schema from an earlier occupant cannot be trusted.
+            // Legacy refs (parent version zero) also lack a generation UUID.
+            let generation = identifier
+                .and_then(|id| id.version_mapping.last())
+                .filter(|(version, _)| *version > 0)
+                .map(|(_, uuid)| uuid.as_str());
+            builder = builder.with_session(session.with_cache_identity(generation).into());
         }
         let builder = match version {
             Some(version) => builder.with_version(version),
             None => builder,
         };
         builder.load().await.map_err(|err| {
-            if let Some(branch) = branch
-                && matches!(err.find_root(), Error::RefNotFound { .. })
-            {
-                return NamespaceError::TableBranchNotFound {
-                    message: format!("Branch '{branch}' for table at '{uri}': {err}"),
-                }
-                .into();
-            }
             let message = format!("Failed to open table '{uri}' with version {version:?}: {err}");
             Self::describe_version_error(err, message)
         })
@@ -299,10 +304,7 @@ impl DirectoryNamespace {
             branch: None,
         };
         let refs = Refs::new(store, handler, root.clone());
-        let map_error = |err| match err {
-            Error::IO { .. } => Self::classify_storage_error(err),
-            _ => Self::map_branch_error(err, branch, table_uri),
-        };
+        let map_error = |err| Self::describe_branch_error(err, branch, table_uri);
         let (location, expected) = match refs.branches().get_identifier(Some(branch)).await {
             Ok(identifier) => (root.find_branch(Some(branch))?, identifier),
             Err(err @ Error::RefNotFound { .. }) => {
@@ -327,21 +329,43 @@ impl DirectoryNamespace {
             }
             Err(err) => return Err(map_error(err)),
         };
+        self.open_verified_directory_branch(&location.uri, branch, version, &expected)
+            .await
+    }
+
+    async fn open_verified_directory_branch(
+        &self,
+        uri: &str,
+        branch: &str,
+        version: Option<u64>,
+        expected: &BranchIdentifier,
+    ) -> Result<Dataset> {
         let dataset = self
-            .open_directory_version(&location.uri, version, Some(branch), Some(&expected))
+            .open_directory_version(uri, version, Some(branch), Some(expected))
             .await?;
-        let actual = dataset.branch_identifier().await.map_err(map_error)?;
-        if dataset.manifest().branch.as_deref() != Some(branch) || actual != expected {
+        let actual = dataset
+            .branch_identifier()
+            .await
+            .map_err(|err| Self::describe_branch_error(err, branch, uri))?;
+        if dataset.manifest().branch.as_deref() != Some(branch) || &actual != expected {
             return Err(NamespaceError::ConcurrentModification {
-                message: format!("Branch '{branch}' changed while describing '{table_uri}'"),
+                message: format!("Branch '{branch}' changed while describing '{uri}'"),
             }
             .into());
         }
         Ok(dataset)
     }
 
+    fn describe_branch_error(err: Error, branch: &str, uri: &str) -> Error {
+        match err {
+            Error::IO { .. } => Self::classify_storage_error(err),
+            _ => Self::map_branch_error(err, branch, uri),
+        }
+    }
+
     fn describe_version_error(err: Error, message: String) -> Error {
         match err.find_root() {
+            Error::RefNotFound { .. } => NamespaceError::TableBranchNotFound { message }.into(),
             Error::VersionNotFound { .. } | Error::DatasetNotFound { .. } => {
                 NamespaceError::TableVersionNotFound { message }.into()
             }
