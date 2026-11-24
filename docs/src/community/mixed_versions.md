@@ -1,11 +1,11 @@
 # Guidelines for Mixed Version Support
 
-Lance ships as a library, so one table is normally read and written by several
-processes that upgrade independently: a batch writer, a query service, a
-compaction job, a notebook. Those processes are rarely on the same release at
-the same moment, and during a rollout they are guaranteed not to be. A format
-change that makes newly written data unreadable by the rest of the deployment
-breaks the deployment, not just the component that upgraded.
+Lance ships as a library, and one table is often read and written by several
+processes that upgrade independently. These could be separate users or services.
+They are rarely on the same release at the same moment, and during a rollout they
+are guaranteed not to be. A format change that makes newly written data unreadable
+by the rest of the deployment breaks the deployment, not just the component that
+upgraded.
 
 These guidelines describe how such a change is rolled out so that a mixed
 version deployment keeps working.
@@ -33,10 +33,7 @@ read, or cannot be correctly maintained, by the previous stable release. The
 common cases are:
 
 - A new file format version or a new encoding in an existing one.
-- A new reader feature flag in the manifest.
 - A new index format version, or a new on-disk layout for an existing index.
-- Any new structure that requires an unsupported-operation error from an
-  implementation that does not understand it.
 
 Such a change ships **opt-in, default off, for at least three months** after the
 first stable release that can *read* it. The clock starts at the release that
@@ -47,9 +44,8 @@ has not started the clock.
 During that period:
 
 - The new form is produced only on explicit request: an index or write
-  parameter, a table config key, a schema metadata opt-in, or an environment
-  variable for a deployment-wide rollout. `LANCE_FTS_FORMAT_VERSION` is an
-  example of the last form.
+  parameter, or an environment variable for a deployment-wide rollout.
+  `LANCE_FTS_FORMAT_VERSION` is an example of the latter.
 - No default changes to produce it, in the Rust core or in any binding. A
   binding default that diverges from the core default is the same violation.
 - Maintenance operations preserve the existing form rather than upgrading it.
@@ -91,18 +87,7 @@ a new change should use the one that matches it rather than inventing another.
 | Surface | Fence | How a user opts in |
 | ------- | ----- | ------------------ |
 | [File format](../format/file/versioning.md) | The data file version number. Older readers reject a version they do not know. | `data_storage_version` on the table, pinned to an exact version rather than the `stable` or `next` alias. |
-| [Table format](../format/table/versioning.md) | Reader and writer feature flags in the manifest. An implementation that does not know a flag refuses the matching operation. | A table config key or schema metadata, which is what causes the flag to be set. |
 | [Index formats](../format/index/index.md#index-compatibility) | `IndexMetadata.version`. A reader that does not support the version skips the segment and falls back to scanning the covered fragments. | An index creation parameter, or an environment variable for a rollout-wide default. |
-
-Index versions degrade gracefully on the read side, which is why an index format
-can often be rolled out without a feature flag. The write side does not degrade
-gracefully: a writer that does not recognize an index version may extend that
-index's `fragment_bitmap` without indexing the new rows, which silently returns
-wrong results. When an older writer would mis-maintain the new index rather than
-ignore it, the change also needs a **writer** feature flag, so those writers
-refuse the table instead. The BTree
-[key layout](../format/index/scalar/btree.md#compatibility-with-released-versions)
-is the worked example.
 
 Pair the fence with a test in `python/python/tests/compat` so the contract is
 checked against released versions rather than asserted in prose.
