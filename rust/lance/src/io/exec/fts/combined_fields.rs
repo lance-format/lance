@@ -44,8 +44,8 @@ use tracing::instrument;
 use super::corpus::SharedFtsScorer;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
 use super::segments::{
-    combined_columns_the_prefilter_may_match, fts_row_addr_to_row_id,
-    fts_segments_are_address_domain, open_fts_segments, translate_row_ids_and_scores,
+    combined_columns_the_prefilter_may_match, finalize_row_ids_and_scores, fts_row_addr_to_row_id,
+    fts_segments_are_address_domain, open_fts_segments, widen_limit_for_tie_rerank,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -700,18 +700,33 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 &metrics,
             )
             .await;
+            // Hold a tie group at the cutoff whole so it can be ordered by
+            // row id after translation; see `finalize_row_ids_and_scores`.
+            let search_params =
+                match widen_limit_for_tie_rerank(params.limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != params.limit => {
+                        let mut widened_params = params.clone();
+                        widened_params.limit = widened;
+                        widened_params
+                    }
+                    _ => params.clone(),
+                };
             let (doc_ids, scores) = combined_fields_search(
                 &columns,
                 &tokens,
-                &params,
+                &search_params,
                 query.operator(),
                 scorer.as_ref(),
                 pre_filter,
                 metrics.as_ref(),
             )
             .await?;
-            let (doc_ids, scores) =
-                translate_row_ids_and_scores(doc_ids, scores, row_addr_to_row_id.as_deref());
+            let (doc_ids, scores) = finalize_row_ids_and_scores(
+                doc_ids,
+                scores,
+                row_addr_to_row_id.as_deref(),
+                params.limit,
+            );
             metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(

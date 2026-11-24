@@ -63,8 +63,9 @@ use super::query_tokens::{
     tokenize_cross_column_compound_query, tokenizer_for_match_query,
 };
 use super::segments::{
-    fts_row_addr_to_row_id, fts_segments_are_address_domain, open_fts_segments,
-    search_prepared_segments, segments_the_prefilter_may_match, translate_row_ids_and_scores,
+    finalize_row_ids_and_scores, fts_row_addr_to_row_id, fts_segments_are_address_domain,
+    open_fts_segments, search_prepared_segments, segments_the_prefilter_may_match,
+    widen_limit_for_tie_rerank,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -748,6 +749,18 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     .await?;
             let address_domain = fts_segments_are_address_domain(&dataset, segments_to_open)?;
             let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, address_domain).await?;
+            // Hold a tie group at the cutoff whole so it survives to be ordered by
+            // row id after translation; see `finalize_row_ids_and_scores`.
+            let requested_limit = params.limit;
+            let params =
+                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != requested_limit => {
+                        let mut widened_params = params.clone();
+                        widened_params.limit = widened;
+                        widened_params
+                    }
+                    _ => params.clone(),
+                };
             let first_index = indices.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {column} has no committed segments"
@@ -834,10 +847,11 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 )
                 .await
                 .map_err(DataFusionError::from)?;
-                DataFusionResult::Ok(translate_row_ids_and_scores(
+                DataFusionResult::Ok(finalize_row_ids_and_scores(
                     row_ids,
                     scores,
                     row_addr_to_row_id.as_deref(),
+                    requested_limit,
                 ))
             };
             let residual_query = query.clone();
@@ -1164,6 +1178,18 @@ impl ExecutionPlan for CompoundQueryExec {
             let address_domain = fts_segments_are_address_domain(&dataset_for_scope, &segments)?;
             let row_addr_to_row_id =
                 fts_row_addr_to_row_id(&dataset_for_scope, address_domain).await?;
+            // Hold a tie group at the cutoff whole so it survives to be ordered by
+            // row id after translation; see `finalize_row_ids_and_scores`.
+            let requested_limit = params.limit;
+            let params =
+                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != requested_limit => {
+                        let mut widened_params = params.clone();
+                        widened_params.limit = widened;
+                        widened_params
+                    }
+                    _ => params.clone(),
+                };
             if let Some(first_index) = indices.first() {
                 let snapshot = tokenize_compound_query(&query, first_index.as_ref())?;
                 tokenized_query.get_or_init(|| snapshot);
@@ -1470,8 +1496,12 @@ impl ExecutionPlan for CompoundQueryExec {
                     }
                 }
             };
-            let (row_ids, scores) =
-                translate_row_ids_and_scores(row_ids, scores, row_addr_to_row_id.as_deref());
+            let (row_ids, scores) = finalize_row_ids_and_scores(
+                row_ids,
+                scores,
+                row_addr_to_row_id.as_deref(),
+                requested_limit,
+            );
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -1831,6 +1861,18 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             }))
             .await?;
             let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, address_domain).await?;
+            // Hold a tie group at the cutoff whole so it survives to be ordered by
+            // row id after translation; see `finalize_row_ids_and_scores`.
+            let requested_limit = params.limit;
+            let params =
+                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != requested_limit => {
+                        let mut widened_params = params.clone();
+                        widened_params.limit = widened;
+                        widened_params
+                    }
+                    _ => params.clone(),
+                };
 
             let mut tokenizer_indices = HashMap::with_capacity(opened_columns.len());
             let mut partition_counts = HashMap::with_capacity(opened_columns.len());
@@ -1893,8 +1935,12 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 metrics.clone(),
             )
             .await?;
-            let (row_ids, scores) =
-                translate_row_ids_and_scores(row_ids, scores, row_addr_to_row_id.as_deref());
+            let (row_ids, scores) = finalize_row_ids_and_scores(
+                row_ids,
+                scores,
+                row_addr_to_row_id.as_deref(),
+                requested_limit,
+            );
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),

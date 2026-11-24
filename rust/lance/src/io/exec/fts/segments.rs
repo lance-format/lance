@@ -227,6 +227,70 @@ pub(super) async fn fts_row_addr_to_row_id(
     Ok(Some(Arc::new(lookup)))
 }
 
+/// Extra candidates to retain past a query's own `limit` so that a tie
+/// straddling the top-k cutoff survives long enough to be re-ranked on row id.
+///
+/// Mirrors `WAND_TIE_COMPLETION_BUDGET`: it bounds how large a tie group can
+/// be and still be resolved exactly, rather than promising to resolve one of
+/// any size.
+pub(super) const FTS_TIE_RERANK_BUDGET: usize = 128;
+
+/// The limit a search should actually run with, given the one the query asked
+/// for. Widened only when results will be translated afterward, so a query
+/// that needs no translation pays nothing.
+pub(super) fn widen_limit_for_tie_rerank(limit: Option<usize>, translating: bool) -> Option<usize> {
+    match limit {
+        Some(limit) if translating => Some(limit.saturating_add(FTS_TIE_RERANK_BUDGET)),
+        other => other,
+    }
+}
+
+/// Translate a final `(row_ids, scores)` pair out of the index's stored domain
+/// and put it back into the order a caller sees, dropping unresolvable rows
+/// and keeping the two vectors aligned.
+///
+/// Selection ranks by `(score DESC, stored identifier ASC)` and cannot do
+/// otherwise: `combined_maxscore` discovers candidates in ascending stored-id
+/// order (`.min()` over the cursor heads), and its pruning is only sound
+/// because a candidate that ties the threshold arrives after -- and so loses
+/// to -- every incumbent. Once that stored identifier is a row address, the
+/// order selection imposes among tied scores is physical, while the plan above
+/// sorts by `(score DESC, _rowid ASC)`. Paging through a tie would then skip
+/// and repeat rows, because each page's selection keeps the lowest *address*
+/// while the sort reorders by *row id*.
+///
+/// Re-ranking the survivors here settles it: with [`FTS_TIE_RERANK_BUDGET`]
+/// extra candidates retained (see [`widen_limit_for_tie_rerank`]), a tie group
+/// at the cutoff is held whole, translated, and ordered by row id before
+/// `limit` is applied -- so the rows that survive are the ones the plan's own
+/// ordering would have picked. Translating earlier, inside selection, is not
+/// an option: it would key the heap on row ids while candidates still arrive
+/// in address order, breaking the invariant the pruning rests on.
+pub(super) fn finalize_row_ids_and_scores(
+    row_ids: Vec<u64>,
+    scores: Vec<f32>,
+    row_addr_to_row_id: Option<&RowAddrToRowId>,
+    limit: Option<usize>,
+) -> (Vec<u64>, Vec<f32>) {
+    if row_addr_to_row_id.is_none() {
+        // Stored identifiers are already row ids, so selection ordered by the
+        // same key the plan sorts on and the limit was never widened.
+        return (row_ids, scores);
+    }
+    let (row_ids, scores) = translate_row_ids_and_scores(row_ids, scores, row_addr_to_row_id);
+    let mut ranked = row_ids.into_iter().zip(scores).collect::<Vec<_>>();
+    ranked.sort_by(|(left_row, left_score), (right_row, right_score)| {
+        right_score
+            .partial_cmp(left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left_row.cmp(right_row))
+    });
+    if let Some(limit) = limit {
+        ranked.truncate(limit);
+    }
+    ranked.into_iter().unzip()
+}
+
 /// Translate and drop unresolvable rows from a final `(row_ids, scores)`
 /// result pair, keeping the two aligned. A `None` translator is a no-op.
 pub(super) fn translate_row_ids_and_scores(

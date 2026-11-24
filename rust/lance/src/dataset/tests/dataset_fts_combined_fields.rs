@@ -2867,3 +2867,78 @@ async fn test_fts_mixed_domain_within_one_index_is_rejected_at_commit() {
         "unexpected error: {error}"
     );
 }
+
+/// Top-k selection ranks ties by the identifier the index stores, which is now
+/// a row address, while the plan above sorts by `_rowid`. An update moves a
+/// row's address without moving its row id, so the two orders disagree and
+/// paging through a tie skipped row 0 and returned row 1 twice. Each page must
+/// be the page the plan's own `(score DESC, _rowid ASC)` order implies.
+#[tokio::test]
+async fn test_fts_combined_fields_tied_pagination_follows_row_id_order() {
+    let dir = TempStrDir::default();
+    let ds = write_fts_dataset(
+        &dir,
+        combined_fields_batch(vec![0, 1], vec!["alpha", "alpha"], vec!["beta", "beta"]),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    // Rewrites row id 0 into a new fragment, so its address now sorts after
+    // row id 1's while its row id still sorts before.
+    let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
+        .update_where("id = 0")
+        .unwrap()
+        .set("title", "'alpha'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    let mut ds = updated.new_dataset.as_ref().clone();
+    create_inverted_indices(&mut ds, &["title", "body"], &combined_fields_test_params()).await;
+    let ds = append_fts_dataset(
+        &dir,
+        combined_fields_batch(vec![2], vec!["alpha"], vec!["beta"]),
+        None,
+    )
+    .await;
+
+    let page = async |offset: i64| -> Vec<i32> {
+        let batch = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(combined_query(
+                "alpha beta",
+                Operator::And,
+            )))
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        batch["id"].as_primitive::<Int32Type>().values().to_vec()
+    };
+
+    let mut pages = Vec::new();
+    for offset in 0..3 {
+        pages.extend(page(offset).await);
+    }
+    assert_eq!(
+        pages,
+        vec![0, 1, 2],
+        "one-row pages over a tie must walk every row once, in row-id order"
+    );
+
+    // The same rows, unpaginated, in the same order.
+    let all = fts_result_id_scores(&ds, combined_query("alpha beta", Operator::And), Some(10))
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(all, vec![0, 1, 2]);
+}
