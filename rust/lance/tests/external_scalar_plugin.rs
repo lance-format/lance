@@ -28,7 +28,7 @@ use lance_index::{
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
-        zonemap::{ZoneMapIndexPlugin, ZoneMapSeedWriter},
+        zonemap::{ZoneMapIndexPlugin, ZoneMapSeedVersion, ZoneMapSeedWriter},
     },
 };
 use lance_io::{
@@ -143,11 +143,10 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
         index_details: &prost_types::Any,
     ) -> Result<Option<Box<dyn IndexSeedWriter>>> {
         index_details.to_msg::<ExampleIndexDetails>()?;
-        Ok(Some(Box::new(ZoneMapSeedWriter::new(
-            field_path,
-            ROWS_PER_ZONE,
-            data_type.clone(),
-        )?)))
+        Ok(Some(Box::new(
+            ZoneMapSeedWriter::new(field_path, ROWS_PER_ZONE, data_type.clone())?
+                .with_version(ZoneMapSeedVersion::V0),
+        )))
     }
 }
 

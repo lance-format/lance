@@ -12,10 +12,11 @@
 
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
-    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
-    ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
-    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS,
+    ZONE_WRITE_SEEDS_VERSION_KEY, apply_feature_flags, apply_index_object_metadata_flag,
+    apply_row_addr_index_feature_flag, apply_zone_write_seeds_version_config,
+    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    managed_blobs_enabled, validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -136,6 +137,26 @@ fn changes_auto_cleanup_config(operation: &Operation) -> bool {
                     .update_entries
                     .iter()
                     .any(|entry| is_auto_cleanup_key(&entry.key))
+        }
+        _ => false,
+    }
+}
+
+fn writes_zone_write_seeds_version_config(operation: &Operation) -> bool {
+    match operation {
+        Operation::Overwrite {
+            config_upsert_values: Some(values),
+            ..
+        } => values.contains_key(ZONE_WRITE_SEEDS_VERSION_KEY),
+        Operation::UpdateConfig {
+            config_updates: Some(update),
+            ..
+        } => {
+            update.replace
+                || update
+                    .update_entries
+                    .iter()
+                    .any(|entry| entry.key == ZONE_WRITE_SEEDS_VERSION_KEY)
         }
         _ => false,
     }
@@ -2120,6 +2141,11 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
 
+        apply_zone_write_seeds_version_config(
+            &mut manifest,
+            writes_zone_write_seeds_version_config(&self.operation),
+        )?;
+
         apply_index_object_metadata_flag(&mut manifest, &final_indices);
         #[cfg(test)]
         LAST_CLUSTERING_VISITS.with(|cell| cell.set(changed_clustering_references.visits()));
@@ -2499,7 +2525,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FLAG_OBJECT_METADATA;
+    use crate::feature_flags::{FLAG_OBJECT_METADATA, FLAG_ZONE_WRITE_SEEDS};
     use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::pb;
     use crate::format::{
@@ -4232,6 +4258,114 @@ mod tests {
             activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
             0
         );
+    }
+
+    #[test]
+    fn zone_write_seeds_version_config_validates_and_activates_flag() {
+        let manifest = sample_manifest();
+        let make_update = |key: &str, value: Option<&str>| {
+            Transaction::new(
+                manifest.version,
+                Operation::UpdateConfig {
+                    config_updates: Some(crate::transaction::UpdateMap {
+                        update_entries: vec![crate::transaction::update_map::UpdateMapEntry {
+                            key: key.to_string(),
+                            value: value.map(ToString::to_string),
+                        }],
+                        replace: false,
+                    }),
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                None,
+            )
+        };
+
+        // Explicit "0" leaves FLAG_ZONE_WRITE_SEEDS clear.
+        let (v0_manifest, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("0"))
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(!v0_manifest.has_zone_write_seeds());
+
+        // Invalid value is rejected when modified.
+        let error = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("2"))
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(ZONE_WRITE_SEEDS_VERSION_KEY),
+            "{error}"
+        );
+
+        // Explicit "1" atomically activates both reader and writer bits.
+        let (v1_manifest, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(v1_manifest.has_zone_write_seeds());
+        assert_ne!(v1_manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+        assert_ne!(v1_manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+
+        // Once activated, resetting back to "0" or deleting the key keeps the flag sticky.
+        let (pinned_v0, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("0"))
+            .build_manifest(Some(&v1_manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(pinned_v0.has_zone_write_seeds());
+        assert!(!crate::feature_flags::write_v1_zone_write_seeds(&pinned_v0));
+
+        // An inherited "1" is not an opt-in: an ordinary Append must not activate
+        // the flag for a table a v14 writer configured without knowing it.
+        let mut inherited_v1 = sample_manifest();
+        inherited_v1
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "1".into());
+        let (ordinary_manifest, _) = Transaction::new(
+            inherited_v1.version,
+            Operation::Append { fragments: vec![] },
+            None,
+        )
+        .build_manifest(Some(&inherited_v1), vec![], "txn", &default_build_config())
+        .unwrap();
+        assert!(
+            !ordinary_manifest.has_zone_write_seeds(),
+            "inherited config must not activate the flag"
+        );
+
+        // Writing the same "1" again is an explicit opt-in.
+        let (same_value_manifest, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))
+            .build_manifest(Some(&inherited_v1), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(same_value_manifest.has_zone_write_seeds());
+
+        // An explicit attempt to rewrite an inherited invalid value is rejected,
+        // even though the value did not change.
+        let mut inherited_invalid_for_write = sample_manifest();
+        inherited_invalid_for_write
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "future".into());
+        let error = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("future"))
+            .build_manifest(
+                Some(&inherited_invalid_for_write),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+
+        // An inherited invalid value does not block an unrelated config commit.
+        let mut legacy_invalid = sample_manifest();
+        legacy_invalid
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "future".into());
+        make_update("unrelated", Some("1"))
+            .build_manifest(
+                Some(&legacy_invalid),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
     }
 
     fn covered_index(name: &str, fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {

@@ -28,6 +28,7 @@ use lance_index::scalar::zonemap::{
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
+use lance_table::feature_flags::ZONE_WRITE_SEEDS_VERSION_KEY;
 use lance_table::format::{DataFile, Fragment};
 
 use crate::Dataset;
@@ -65,9 +66,8 @@ fn rows(start: i64, count: i64) -> RecordBatch {
     .unwrap()
 }
 
-/// A table whose ZoneMap indices on `columns` request seeds; the index
-/// commits activate the seed feature flags, so later writes carry version 1
-/// seeds.
+/// A table opted into version 1 zone write seeds whose ZoneMap indices on
+/// `columns` request seeds, so later writes carry version 1 seeds.
 async fn seeded_dataset(uri: &str, columns: &[&str]) -> Dataset {
     let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(rows(0, TRAINING_ROWS))], schema()),
@@ -76,6 +76,10 @@ async fn seeded_dataset(uri: &str, columns: &[&str]) -> Dataset {
     )
     .await
     .unwrap();
+    dataset
+        .update_config([(ZONE_WRITE_SEEDS_VERSION_KEY, "1")])
+        .await
+        .unwrap();
     for column in columns {
         dataset
             .create_index(
