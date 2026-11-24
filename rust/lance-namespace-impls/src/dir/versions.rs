@@ -44,11 +44,15 @@ pub(super) struct TableDeleteEntry {
 }
 
 impl DirectoryNamespace {
-    /// Logical table version parsed from a manifest filename, or `None` for
-    /// non-manifest / detached entries. Delegates to lance's scheme detection so
-    /// version listing and deletion stay consistent with the on-disk format.
-    pub(super) fn manifest_version_from_filename(filename: &str) -> Option<u64> {
-        ManifestNamingScheme::detect_scheme(filename)?.parse_version(filename)
+    /// Recursive listings also contain staging files, backups and nested manifests.
+    pub(super) fn committed_manifest(
+        table_path: &Path,
+        location: &Path,
+    ) -> Option<(ManifestNamingScheme, u64)> {
+        let filename = location.filename()?;
+        let scheme = ManifestNamingScheme::detect_scheme(filename)?;
+        let version = scheme.parse_version(filename)?;
+        (scheme.manifest_path(table_path, version) == *location).then_some((scheme, version))
     }
 
     /// Build a successful `CreateTableVersionResponse` from an existing final manifest.
@@ -325,19 +329,10 @@ impl DirectoryNamespace {
                     message: format!("Failed to list manifest files under '{versions_dir}': {err}"),
                 })?
         {
-            let Some(filename) = meta.location.filename() else {
+            let Some((_, version)) = Self::committed_manifest(&table_path, &meta.location) else {
                 continue;
             };
-            let Some(scheme) = ManifestNamingScheme::detect_scheme(filename) else {
-                continue;
-            };
-            let Some(version) = scheme.parse_version(filename) else {
-                continue;
-            };
-            // A recursive listing can include staged, nested and detached objects.
-            if scheme.manifest_path(&table_path, version) != meta.location
-                || after.is_some_and(|after| version <= after as u64)
-            {
+            if after.is_some_and(|after| version <= after as u64) {
                 continue;
             }
             versions.push(table_version(version, meta));
@@ -390,8 +385,19 @@ impl DirectoryNamespace {
         descending: bool,
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
+        let limit = limit.and_then(|limit| usize::try_from(limit).ok());
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let versions_dir = table_path.clone().join(VERSIONS_DIR);
-        let mut stream = self.object_store.read_dir_all(&versions_dir, None);
+        let mut stream = self
+            .object_store
+            .read_dir_all(&versions_dir, None)
+            .try_filter_map(|meta| {
+                let manifest = Self::committed_manifest(table_path, &meta.location)
+                    .map(|(scheme, version)| (scheme, table_version(version, meta)));
+                std::future::ready(Ok(manifest))
+            });
         let list_err = |e: lance_core::Error| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!(
@@ -401,39 +407,10 @@ impl DirectoryNamespace {
             })
         };
 
-        let limit = limit
-            .filter(|limit| *limit >= 0)
-            .map(|limit| limit as usize);
-
-        let mut table_versions: Vec<TableVersion> = Vec::new();
-        let push_meta = |meta: ObjectMeta, out: &mut Vec<TableVersion>| -> bool {
-            let Some(filename) = meta.location.filename() else {
-                return false;
-            };
-            let Some(actual_version) = Self::manifest_version_from_filename(filename) else {
-                return false;
-            };
-            out.push(table_version(actual_version, meta));
-            true
+        let Some((scheme, first)) = stream.try_next().await.map_err(list_err)? else {
+            return Ok(Vec::new());
         };
-
-        // Detect the naming scheme from the first committed manifest, not the
-        // first raw entry: retained staging blobs (`{manifest}-<uuid>`) sort
-        // ahead of it and would misclassify the stream as non-V2. V2 filenames
-        // are a fixed 29 chars (`{u64::MAX - version:020}.manifest`).
-        let mut first_manifest_filename_len = None;
-        while first_manifest_filename_len.is_none() {
-            match stream.try_next().await.map_err(list_err)? {
-                Some(meta) => {
-                    let filename_len = meta.location.filename().map(|f| f.len());
-                    if push_meta(meta, &mut table_versions) {
-                        first_manifest_filename_len = filename_len;
-                    }
-                }
-                None => break,
-            }
-        }
-        let is_v2_naming = first_manifest_filename_len == Some(29);
+        let mut table_versions = vec![first];
 
         // Only V2 names may be trusted to match stream order: V2 filenames
         // invert and zero-pad the version, so a lexically-ordered stream
@@ -444,23 +421,18 @@ impl DirectoryNamespace {
         // digit widths (`10.manifest` sorts before `2.manifest`); V1
         // listings are always collected and sorted numerically.
         let list_is_ordered = self.object_store.list_is_lexically_ordered;
-        let stream_matches_request = list_is_ordered && is_v2_naming && descending;
+        let stream_matches_request =
+            list_is_ordered && scheme == ManifestNamingScheme::V2 && descending;
         let early_stop_at = limit.filter(|_| stream_matches_request);
 
         while early_stop_at.is_none_or(|n| table_versions.len() < n) {
             match stream.try_next().await.map_err(list_err)? {
-                Some(meta) => {
-                    push_meta(meta, &mut table_versions);
-                }
+                Some((_, manifest)) => table_versions.push(manifest),
                 None => break,
             }
         }
 
-        // Scheme detection pushes the first manifest regardless of the limit,
-        // so re-enforce the limit on both paths (covers limit=0).
-        if let Some(n) = early_stop_at {
-            table_versions.truncate(n);
-        } else {
+        if early_stop_at.is_none() {
             if descending {
                 table_versions.sort_by_key(|v| std::cmp::Reverse(v.version));
             } else {
@@ -513,7 +485,7 @@ impl DirectoryNamespace {
             let location_by_version: HashMap<u64, Path> = manifest_metas
                 .into_iter()
                 .filter_map(|meta| {
-                    let version = Self::manifest_version_from_filename(meta.location.filename()?)?;
+                    let (_, version) = Self::committed_manifest(&table_path, &meta.location)?;
                     Some((version, meta.location))
                 })
                 .collect();

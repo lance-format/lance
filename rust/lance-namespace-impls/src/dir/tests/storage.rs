@@ -129,6 +129,7 @@ async fn test_list_versions_under_ordering_and_limit() {
 
 #[tokio::test]
 async fn test_list_table_versions_pagination_mixed_manifests_and_cleanup() {
+    use lance_namespace::models::VersionRange;
     use lance_table::io::commit::{
         ManifestNamingScheme::{V1, V2},
         VERSIONS_DIR,
@@ -156,6 +157,7 @@ async fn test_list_table_versions_pagination_mixed_manifests_and_cleanup() {
     }
     let dir = table.clone().join(VERSIONS_DIR);
     for filename in [
+        "02.manifest",
         "1.manifest-staging",
         "1.backup.manifest",
         "d9223372036854775809.manifest",
@@ -165,19 +167,40 @@ async fn test_list_table_versions_pagination_mixed_manifests_and_cleanup() {
             .await
             .unwrap();
     }
-    ns.object_store
-        .put(&dir.join("staging").join("1.manifest"), b"other")
-        .await
-        .unwrap();
+    let nested = dir.clone().join("staging").join("1.manifest");
+    ns.object_store.put(&nested, b"other").await.unwrap();
 
     let mut request = ListTableVersionsRequest {
         id: Some(vec!["events".into()]),
         limit: Some(2),
         ..Default::default()
     };
-    let first = ns.list_table_versions(request.clone()).await.unwrap();
     let numbers = |rows: &[TableVersion]| rows.iter().map(|row| row.version).collect::<Vec<_>>();
+    let descending = |limit| ListTableVersionsRequest {
+        descending: Some(true),
+        limit,
+        ..request.clone()
+    };
+    let history = ns.list_table_versions(descending(None)).await.unwrap();
+    assert_eq!(numbers(&history.versions), [20, 12, 11, 10, 7, 5, 2]);
+    let latest = ns.list_table_versions(descending(Some(1))).await.unwrap();
+    assert_eq!(numbers(&latest.versions), [20]);
+    let first = ns.list_table_versions(request.clone()).await.unwrap();
     assert_eq!(numbers(&first.versions), [2, 5]);
+    let deleted = ns
+        .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
+            id: request.id.clone(),
+            ranges: vec![VersionRange::new(1, 2)],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted_count, Some(0));
+    ns.object_store.stat(&nested).await.unwrap();
+    ns.object_store
+        .stat(&dir.join("1.backup.manifest"))
+        .await
+        .unwrap();
     request.page_token = Some(first.page_token.expect("expected a continuation"));
     for (scheme, version) in [(V2, 5), (V1, 7)] {
         ns.object_store
