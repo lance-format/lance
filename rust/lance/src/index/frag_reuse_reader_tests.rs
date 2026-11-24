@@ -4726,6 +4726,16 @@ async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
         )
         .await
         .unwrap();
+    let uuid = dataset
+        .load_index_by_name("vector_idx")
+        .await
+        .unwrap()
+        .unwrap()
+        .uuid;
+    assert_eq!(
+        dataset.vector_index_types("vector", &[uuid]).await.unwrap(),
+        [IndexType::IvfPq]
+    );
     let original = dataset
         .scan()
         .filter("i = 6")
@@ -4746,6 +4756,10 @@ async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
+    assert!(matches!(
+        dataset.vector_index_types("vector", &[uuid]).await,
+        Err(Error::IndexNotFound { .. })
+    ));
     // Excluded from the query listing: no coverage the reader can honor.
     assert!(
         !dataset
