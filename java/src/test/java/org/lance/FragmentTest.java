@@ -67,6 +67,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -692,6 +693,55 @@ public class FragmentTest {
           assertTrue(names.isNull(2));
         }
       }
+    }
+  }
+
+  @Test
+  void testWriteOverlayWithIndependentAllocator(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("independent_overlay_allocator").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 3).close();
+
+      try (Dataset dataset = Dataset.open().uri(datasetPath).build()) {
+        assertNotSame(allocator, dataset.allocator().getRoot());
+        Fragment fragment = dataset.getFragments().get(0);
+        SourcedTransaction.Builder transaction = dataset.newTransactionBuilder();
+        DataOverlay.DataOverlayGroup group;
+        try (LanceScanner scanner =
+                fragment.newScan(new ScanOptions.Builder().withRowAddress(true).build());
+            OverlayWriter writer = fragment.writeOverlay(List.of("id"));
+            ArrowReader reader = scanner.scanBatches();
+            VectorSchemaRoot batch =
+                VectorSchemaRoot.of(
+                    new UInt8Vector(MetadataColumns.ROWADDR, allocator),
+                    new IntVector("id", allocator))) {
+          assertTrue(reader.loadNextBatch());
+          UInt8Vector rowAddresses =
+              (UInt8Vector) reader.getVectorSchemaRoot().getVector(MetadataColumns.ROWADDR);
+          batch.allocateNew();
+          ((UInt8Vector) batch.getVector(0)).setSafe(0, rowAddresses.get(1));
+          ((IntVector) batch.getVector(1)).setSafe(0, 42);
+          batch.setRowCount(1);
+          writer.writeBatch(batch);
+          group = writer.finish().orElseThrow();
+        }
+
+        try (SourcedTransaction staged =
+                transaction
+                    .operation(DataOverlay.builder().groups(List.of(group)).build())
+                    .build();
+            Dataset committed = staged.commit()) {
+          assertEquals(dataset.version() + 1, committed.version());
+        }
+      }
+    }
+
+    try (Dataset reopened = Dataset.open().uri(datasetPath).build()) {
+      assertEquals(3, reopened.countRows());
+      assertEquals(1, reopened.countRows("id = 42 AND name = 'Person 1'"));
     }
   }
 

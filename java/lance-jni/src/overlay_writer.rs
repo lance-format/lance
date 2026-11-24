@@ -6,7 +6,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow_schema::DataType;
 use jni::{
     JNIEnv,
-    objects::{JClass, JObject, JValue},
+    objects::{JClass, JObject},
     sys::{jint, jlong},
 };
 use lance::dataset::OverlayWriter;
@@ -22,15 +22,14 @@ const NATIVE_WRITER: &str = "nativeOverlayWriterHandle";
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Fragment_nativeWriteOverlay<'local>(
     mut env: JNIEnv<'local>,
-    _class: JClass,     // Fragment.class
-    jdataset: JObject,  // Dataset
-    fragment_id: jint,  // Fragment ID, interpreted as u32
-    columns: JObject,   // List<String>
-    allocator: JObject, // BufferAllocator
+    _class: JClass,    // Fragment.class
+    jdataset: JObject, // Dataset
+    fragment_id: jint, // Fragment ID, interpreted as u32
+    columns: JObject,  // List<String>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        open_overlay_writer(&mut env, &jdataset, fragment_id, &columns, &allocator)
+        open_overlay_writer(&mut env, &jdataset, fragment_id, &columns)
     )
 }
 
@@ -39,7 +38,6 @@ fn open_overlay_writer<'local>(
     jdataset: &JObject,
     fragment_id: jint,
     columns: &JObject,
-    allocator: &JObject,
 ) -> Result<JObject<'local>> {
     let columns = env.get_strings(columns)?;
     if columns.is_empty() {
@@ -77,11 +75,7 @@ fn open_overlay_writer<'local>(
         fields,
         metadata: dataset_schema.metadata.clone(),
     };
-    let jwriter = env.new_object(
-        "org/lance/fragment/OverlayWriter",
-        "(Lorg/apache/arrow/memory/BufferAllocator;)V",
-        &[JValue::Object(allocator)],
-    )?;
+    let jwriter = env.new_object("org/lance/fragment/OverlayWriter", "()V", &[])?;
     let writer = block_on(fragment.write_overlay(&schema)).map_err(lance::Error::from)?;
     unsafe { env.set_rust_field(&jwriter, NATIVE_WRITER, writer) }?;
     Ok(jwriter)

@@ -247,8 +247,7 @@ public class Fragment {
    * while capturing the read version and opening the scanner and writer.
    *
    * <p>Release builds require the {@code LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES} environment
-   * variable to be set to commit or read overlays. Keep the dataset open until the writer is
-   * closed.
+   * variable to be set to commit or read overlays.
    *
    * <p>This example sets up to ten values of an Int32 column named {@code value} to zero.
    *
@@ -298,14 +297,12 @@ public class Fragment {
   public OverlayWriter writeOverlay(List<String> columns) throws IOException {
     List<String> selectedColumns = List.copyOf(columns);
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
-      return nativeWriteOverlay(
-          dataset, fragmentMetadata.getId(), selectedColumns, dataset.allocator());
+      return nativeWriteOverlay(dataset, fragmentMetadata.getId(), selectedColumns);
     }
   }
 
   private static native OverlayWriter nativeWriteOverlay(
-      Dataset dataset, int fragmentId, List<String> columns, BufferAllocator allocator)
-      throws IOException;
+      Dataset dataset, int fragmentId, List<String> columns) throws IOException;
 
   /**
    * Create a new fragment writer builder.

@@ -21,10 +21,12 @@ import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -32,12 +34,9 @@ import java.util.Optional;
  * file becomes visible only when its group is committed with {@link DataOverlay}.
  */
 public final class OverlayWriter implements AutoCloseable {
-  private final BufferAllocator allocator;
   private long nativeOverlayWriterHandle;
 
-  private OverlayWriter(BufferAllocator allocator) {
-    this.allocator = allocator;
-  }
+  private OverlayWriter() {}
 
   /**
    * Stage a batch with no dictionary-encoded vectors. See {@link #writeBatch(VectorSchemaRoot,
@@ -57,6 +56,9 @@ public final class OverlayWriter implements AutoCloseable {
    * null value replaces the previous cell with null. Omit a row or column from the batch to leave
    * its cells untouched.
    *
+   * <p>All batch vectors must share a root allocator. The batch can use its own root allocator,
+   * independent of the dataset.
+   *
    * <p>If {@code writeBatch} throws, some values from the failed batch may already be staged. Call
    * {@link #abort()} or {@link #close()} to discard the staged overlay. Do not call {@link
    * #finish()} after a write failure.
@@ -68,6 +70,13 @@ public final class OverlayWriter implements AutoCloseable {
   public synchronized void writeBatch(VectorSchemaRoot batch, DictionaryProvider dictionaryProvider)
       throws IOException {
     checkOpen();
+    List<FieldVector> vectors = batch.getFieldVectors();
+    if (vectors.isEmpty()) {
+      throw new IllegalArgumentException("Overlay batch must contain a '_rowaddr' column");
+    }
+    // Arrow retains the batch buffers during export. Allocate temporary buffers at their root
+    // to avoid charging the export to a child allocator.
+    BufferAllocator allocator = vectors.get(0).getAllocator().getRoot();
     try (ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
       try {
