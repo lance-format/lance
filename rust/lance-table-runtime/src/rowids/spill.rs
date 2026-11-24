@@ -3,6 +3,8 @@
 
 //! Read row lineage stored as reserved columns in data files.
 
+pub(super) mod write;
+
 use std::sync::Arc;
 
 use arrow_array::{Array, UInt64Array};

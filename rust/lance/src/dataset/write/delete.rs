@@ -262,7 +262,7 @@ impl DeleteJob {
     }
 }
 
-impl RetryExecutor for DeleteJob {
+impl RetryExecutor<Dataset> for DeleteJob {
     type Data = DeleteData;
     type Result = DeleteResult;
 

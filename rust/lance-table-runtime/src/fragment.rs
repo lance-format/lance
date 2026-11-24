@@ -3,10 +3,16 @@
 
 //! Read the files and row metadata that make up a table fragment.
 
+mod columns;
+mod deletions;
 mod file_reader;
 mod read_config;
+#[doc(hidden)]
+pub mod read_defaults;
 mod reader;
 pub mod session;
+mod updater;
+pub(crate) mod write;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -25,12 +31,20 @@ use lance_table::io::deletion::deletion_file_path;
 use crate::Table;
 use crate::io::deletion::read_table_deletion_file;
 
+pub(crate) use columns::discard_staged_file;
+#[doc(hidden)]
+pub use columns::{duplicate_field_path, relax_nullability, validate_write_version};
 pub use file_reader::GenericFileReader;
 #[doc(hidden)]
 pub use file_reader::V1FragmentReader;
 pub use read_config::{BaseSchedulers, FragReadConfig};
 pub use reader::FragmentReader;
 pub use session::FragmentSession;
+#[doc(hidden)]
+pub use updater::Updater;
+pub use write::FragmentCreateBuilder;
+#[doc(hidden)]
+pub use write::generate_random_filename;
 
 /// A fragment bound to the table snapshot that supplies its schema and storage.
 #[derive(Debug, Clone)]
