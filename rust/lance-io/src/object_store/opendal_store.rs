@@ -194,6 +194,19 @@ impl OSObjectStore for OpendalStore {
             .map_err(|error| {
                 maybe_mark_huggingface_rate_limit(self.marks_huggingface_rate_limit, error)
             })?;
+        if let Some(prefix) = prefix
+            && let Some(first) = result.objects.first()
+            && !first.location.prefix_matches(prefix)
+        {
+            // OpenDAL falls back to the literal request path on invalid UTF-8.
+            let encode_for_read = !matches!(
+                Path::from_url_path(prefix),
+                Err(object_store::path::Error::NonUnicode { .. })
+            );
+            result
+                .extensions
+                .insert(super::DecodedFileNames { encode_for_read });
+        }
         for object in &mut result.objects {
             object.location = normalize_location(&object.location, prefix)?;
         }
@@ -224,13 +237,65 @@ impl OSObjectStore for OpendalStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
+    use object_store::prefix::PrefixStore;
     use opendal::services::Memory;
     use rstest::rstest;
 
     use super::*;
+    use crate::object_store::ObjectStore;
+
+    #[rstest]
+    #[case::plain("tables/plain")]
+    #[case::reserved("tables/run~1")]
+    #[case::mixed("tables/run~1/hash%2523/t.lance")]
+    #[case::encoded_separator("tables/run%252F%252Fone/t.lance")]
+    #[case::invalid_utf8_escape("tables/%25FF")]
+    #[case::root("")]
+    #[tokio::test]
+    async fn test_delimited_location_reopens_listed_key(
+        #[case] base_url: &str,
+        #[values(false, true)] native: bool,
+        #[values(0, 1, 2)] mounts: u8,
+    ) {
+        let mut store: Arc<dyn OSObjectStore> = if native {
+            Arc::new(object_store::memory::InMemory::new())
+        } else {
+            Arc::new(OpendalStore::new(Operator::new(Memory::default()).unwrap()))
+        };
+        for mount in ["mount~1", "part%23one"].into_iter().take(mounts.into()) {
+            store = Arc::new(PrefixStore::new(store, Path::parse(mount).unwrap()));
+        }
+        let store = ObjectStore {
+            inner: store,
+            ..ObjectStore::memory()
+        };
+        let base = Path::from_url_path(base_url).unwrap();
+        let report = base.clone().join("July%20report.json");
+        store.put(&report, b"monthly totals").await.unwrap();
+
+        let prefix = (!base.as_ref().is_empty()).then_some(&base);
+        let listed = store.list_with_delimiter(prefix).await.unwrap();
+        assert_eq!(listed.objects.len(), 1);
+        let selected = &listed.objects[0].location;
+
+        assert_eq!(selected, &report, "listed location must reopen the report");
+        assert_eq!(
+            store
+                .inner
+                .get(selected)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            &b"monthly totals"[..]
+        );
+    }
 
     #[rstest]
     #[case::raw_reserved_character("tables/run~1/t.lance")]

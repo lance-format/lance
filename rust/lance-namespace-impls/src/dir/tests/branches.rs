@@ -2064,24 +2064,41 @@ async fn test_create_branch_nonexistent_from_version() {
 
 #[tokio::test]
 async fn test_create_and_list_tags() {
-    let (namespace, _temp_dir, table_id) = create_tagged_test_table(3).await;
+    let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
 
-    let mut req = CreateTableTagRequest::new("v1".to_string(), 1);
+    let mut req = CreateTableTagRequest::new("release".to_string(), 1);
     req.id = Some(table_id.clone());
     namespace.create_table_tag(req).await.unwrap();
 
-    let mut req = CreateTableTagRequest::new("v2".to_string(), 2);
+    let mut req = CreateTableTagRequest::new("é".to_string(), 2);
     req.id = Some(table_id.clone());
     namespace.create_table_tag(req).await.unwrap();
 
     let mut list_req = ListTableTagsRequest::new();
-    list_req.id = Some(table_id);
-    let resp = namespace.list_table_tags(list_req).await.unwrap();
+    list_req.id = Some(table_id.clone());
+    let resp = namespace.list_table_tags(list_req.clone()).await.unwrap();
 
     assert_eq!(resp.tags.len(), 2, "expected 2 tags, got: {:?}", resp.tags);
-    assert_eq!(resp.tags.get("v1").unwrap().version, 1);
-    assert_eq!(resp.tags.get("v2").unwrap().version, 2);
+    assert_eq!(resp.tags["release"].version, 1);
+    assert_eq!(resp.tags["é"].version, 2);
     assert!(resp.page_token.is_none());
+
+    let mut delete_req = DeleteTableTagRequest::new("é".to_string());
+    delete_req.id = Some(table_id.clone());
+    namespace.delete_table_tag(delete_req).await.unwrap();
+    let remaining = namespace.list_table_tags(list_req).await.unwrap().tags;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining["release"].version, 1);
+    let mut get_req = GetTableTagVersionRequest::new("release".to_string());
+    get_req.id = Some(table_id);
+    assert_eq!(
+        namespace
+            .get_table_tag_version(get_req)
+            .await
+            .unwrap()
+            .version,
+        1
+    );
 }
 
 #[tokio::test]

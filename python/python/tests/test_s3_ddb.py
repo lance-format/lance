@@ -388,6 +388,41 @@ def test_file_session_upload_download(s3_bucket: str, tmp_path):
 
 
 @pytest.mark.integration
+def test_opendal_session_lists_nested_unicode_path(s3_bucket: str, tmp_path):
+    session = LanceFileSession(
+        f"s3://{s3_bucket}/run~1",
+        storage_options={**CONFIG, "use_opendal": "true"},
+    )
+    local = tmp_path / "note.txt"
+    local.write_bytes(b"July report")
+    session.upload_file(str(local), "café/note.txt")
+
+    listed = session.list_with_delimiter("café").objects
+    assert listed == ["café/note.txt"]
+    assert session.contains(listed[0])
+    assert session.read_range(listed[0], 0, 11) == b"July report"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("writer,reader", [("true", "false"), ("false", "true")])
+@pytest.mark.parametrize("prefix", ["plain", "run~1"])
+def test_list_unicode_tags_across_s3_adapters(s3_bucket, writer, reader, prefix):
+    uri = f"s3://{s3_bucket}/{prefix}/tags-{writer}.lance"
+    table = pa.table({"id": [1]})
+    write_options = {**CONFIG, "use_opendal": writer}
+    ds = lance.write_dataset(table, uri, storage_options=write_options)
+    ds.tags.create("release", 1)
+    ds = lance.write_dataset(table, uri, mode="append", storage_options=write_options)
+    ds.tags.create("é", 2)
+
+    reopened = lance.dataset(uri, storage_options={**CONFIG, "use_opendal": reader})
+    assert {name: tag["version"] for name, tag in reopened.tags.list().items()} == {
+        "release": 1,
+        "é": 2,
+    }
+
+
+@pytest.mark.integration
 def test_append_fragment(s3_bucket: str):
     storage_options = copy.deepcopy(CONFIG)
     table = pa.table({"a": [1, 2], "b": ["a", "b"]})
