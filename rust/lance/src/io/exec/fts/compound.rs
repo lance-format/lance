@@ -63,7 +63,7 @@ use super::query_tokens::{
     tokenize_cross_column_compound_query, tokenizer_for_match_query,
 };
 use super::segments::{
-    cutoff_tie_unresolved, finalize_row_ids_and_scores, fts_row_addr_to_row_id,
+    cutoff_tie_unresolved, exhaustive_limit, finalize_row_ids_and_scores, fts_row_addr_to_row_id,
     fts_segments_are_address_domain, open_fts_segments, search_prepared_segments,
     segments_the_prefilter_may_match, widen_limit_for_tie_rerank,
 };
@@ -778,7 +778,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             let terms = residual_seed.exact_query_terms(&query)?;
             if terms.is_empty() {
                 metrics.baseline_metrics.record_output(0);
-                return scored_documents_batch(schema, Vec::new(), None)
+                return scored_documents_batch(schema, Vec::new(), None, None)
                     .map_err(DataFusionError::from);
             }
             let allowed_terms = Arc::new(terms.iter().cloned().collect::<FxHashSet<_>>());
@@ -906,7 +906,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             });
             documents.truncate(limit);
             metrics.baseline_metrics.record_output(documents.len());
-            scored_documents_batch(schema, documents, None).map_err(DataFusionError::from)
+            scored_documents_batch(schema, documents, None, None).map_err(DataFusionError::from)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -1963,7 +1963,9 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             let (row_ids, scores) = if cutoff_tie_unresolved(&scores, requested_limit, params.limit)
             {
                 let mut exact_params = params.clone();
-                exact_params.limit = None;
+                // This collector rejects an unbounded limit, so bound the
+                // replay by every row the dataset holds instead.
+                exact_params.limit = Some(exhaustive_limit(&dataset));
                 cross_column_compound_search(
                     &search_columns,
                     &query,

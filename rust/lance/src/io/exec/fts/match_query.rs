@@ -39,8 +39,9 @@ use super::query_tokens::{
     TokenizedQuery, fmt_tokenized_query, record_tokenized_query, tokenizer_for_match_query,
 };
 use super::segments::{
-    fts_row_addr_to_row_id, fts_segments_are_address_domain, open_fts_segments,
-    search_prepared_segments, segments_the_prefilter_may_match,
+    cutoff_tie_unresolved, fts_row_addr_to_row_id, fts_segments_are_address_domain,
+    open_fts_segments, search_prepared_segments, segments_the_prefilter_may_match,
+    widen_limit_for_tie_rerank,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -717,15 +718,61 @@ impl ExecutionPlan for MatchQueryExec {
             )
             .await;
             let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
-            let mut documents =
-                search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
-                    .await?;
+            // Selection ranks ties by stored row address, so any tie at the
+            // cutoff has to survive translation intact before `_rowid` order is
+            // restored; see `finalize_row_ids_and_scores`.
+            let requested_limit = prepared.params.limit;
+            let prepared =
+                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
+                    widened if widened != requested_limit => {
+                        let mut widened_params = prepared.params.as_ref().clone();
+                        widened_params.limit = widened;
+                        Arc::new(PreparedMatch {
+                            query: prepared.query.clone(),
+                            params: Arc::new(widened_params),
+                            operator: prepared.operator,
+                        })
+                    }
+                    _ => prepared,
+                };
+            let mut documents = search_prepared_segments(
+                &indices,
+                prepared.clone(),
+                pre_filter.clone(),
+                metrics.clone(),
+                None,
+            )
+            .await?;
+            // A tie larger than the widened cap cannot be ordered from what came
+            // back, so complete it exactly rather than cutting it at an
+            // arbitrary address.
+            let scores = documents
+                .iter()
+                .map(|document| document.score.0)
+                .collect::<Vec<_>>();
+            if cutoff_tie_unresolved(&scores, requested_limit, prepared.params.limit) {
+                let mut exact_params = prepared.params.as_ref().clone();
+                exact_params.limit = None;
+                let exact = Arc::new(PreparedMatch {
+                    query: prepared.query.clone(),
+                    params: Arc::new(exact_params),
+                    operator: prepared.operator,
+                });
+                documents =
+                    search_prepared_segments(&indices, exact, pre_filter, metrics.clone(), None)
+                        .await?;
+            }
             documents.iter_mut().for_each(|document| {
                 document.score.0 *= query.boost;
             });
             metrics.baseline_metrics.record_output(documents.len());
 
-            let batch = scored_documents_batch(schema, documents, row_addr_to_row_id.as_deref())?;
+            let batch = scored_documents_batch(
+                schema,
+                documents,
+                row_addr_to_row_id.as_deref(),
+                requested_limit,
+            )?;
             Ok::<_, DataFusionError>(batch)
         });
 

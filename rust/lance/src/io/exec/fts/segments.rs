@@ -276,6 +276,28 @@ pub(super) fn cutoff_tie_unresolved(
         .is_some_and(|(cutoff, last)| cutoff == last)
 }
 
+/// An upper bound on how many rows any query over `dataset` could match:
+/// every row it physically stores.
+///
+/// Completing a cutoff tie needs a search that sees every match, but not every
+/// collector accepts an unbounded limit -- `cross_column_compound_search`
+/// rejects `None` outright -- so the replay passes a bound no result set can
+/// exceed instead. Read from the manifest, with no per-fragment I/O; a legacy
+/// fragment that does not record its row count falls back to no bound at all
+/// rather than to an undercount that would silently truncate the tie again.
+pub(super) fn exhaustive_limit(dataset: &Dataset) -> usize {
+    let mut total: usize = 0;
+    for fragment in dataset.manifest.fragments.iter() {
+        let Some(physical_rows) = fragment.physical_rows else {
+            return usize::MAX;
+        };
+        total = total.saturating_add(physical_rows);
+    }
+    // A zero limit means "no results"; a dataset with no rows has none to
+    // return anyway, and the collectors reject 0.
+    total.max(1)
+}
+
 /// Translate a final `(row_ids, scores)` pair out of the index's stored domain
 /// and put it back into the order a caller sees, dropping unresolvable rows
 /// and keeping the two vectors aligned.

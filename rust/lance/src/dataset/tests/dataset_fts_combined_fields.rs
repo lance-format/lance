@@ -3018,3 +3018,84 @@ async fn test_fts_combined_fields_tied_pagination_follows_row_id_order() {
         .collect::<Vec<_>>();
     assert_eq!(all, vec![0, 1, 2]);
 }
+
+/// The same large-tie guarantee for the query shapes that do not go through
+/// `combined_fields`: a cross-column MUST query, a single-column boolean, and
+/// a bare Match. Each reaches a different collector, and `cross_column`'s
+/// rejects an unbounded limit outright -- so completing its cutoff tie needs a
+/// bound no result set can exceed rather than "no limit".
+#[rstest]
+#[case::cross_column_must(true, false)]
+#[case::single_column_boolean(false, true)]
+#[case::bare_match(false, false)]
+#[tokio::test]
+async fn test_fts_large_tie_pagination_across_query_shapes(
+    #[case] cross_column: bool,
+    #[case] single_boolean: bool,
+) {
+    use lance_index::scalar::inverted::query::{BooleanQuery, Occur};
+    let dir = TempStrDir::default();
+    let ds = write_fts_dataset(
+        &dir,
+        combined_fields_batch((0..131).collect(), vec!["alpha"; 131], vec!["beta"; 131]),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
+        .update_where("id = 0")
+        .unwrap()
+        .set("title", "'alpha'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    let mut ds = updated.new_dataset.as_ref().clone();
+    create_inverted_indices(&mut ds, &["title", "body"], &combined_fields_test_params()).await;
+
+    let mut pages = Vec::new();
+    for offset in 0..3 {
+        let title: FtsQuery = MatchQuery::new("alpha".into())
+            .with_column(Some("title".into()))
+            .into();
+        let query: FtsQuery = if cross_column {
+            BooleanQuery::new([
+                (Occur::Must, title),
+                (
+                    Occur::Must,
+                    MatchQuery::new("beta".into())
+                        .with_column(Some("body".into()))
+                        .into(),
+                ),
+            ])
+            .into()
+        } else if single_boolean {
+            BooleanQuery::new([(Occur::Must, title.clone()), (Occur::Should, title)]).into()
+        } else {
+            title
+        };
+        let batch = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        pages.extend(
+            batch["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    assert_eq!(pages, vec![0, 1, 2]);
+}
