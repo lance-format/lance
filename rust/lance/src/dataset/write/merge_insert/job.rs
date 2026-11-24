@@ -105,6 +105,37 @@ fn subtree_has_blob(field: &lance_core::datatypes::Field) -> bool {
     field.is_blob() || field.children.iter().any(subtree_has_blob)
 }
 
+/// List children share offsets and validity, so they must be replaced together.
+fn check_complete_list_fields(
+    source: &lance_core::datatypes::Field,
+    target: &lance_core::datatypes::Field,
+    path: &str,
+    options: &SchemaCompareOptions,
+) -> Result<()> {
+    if (source.logical_type.is_list()
+        || source.logical_type.is_large_list()
+        || source.logical_type.is_fixed_size_list_struct())
+        && !source.compare_with_options(target, options)
+    {
+        return Err(Error::invalid_input(format!(
+            "merge_insert source partially supplies list field '{path}'. \
+             Supply all item fields to replace the list; partial list updates \
+             can produce inconsistent offsets or validity."
+        )));
+    }
+    for source_child in &source.children {
+        if let Some(target_child) = target.child(&source_child.name) {
+            check_complete_list_fields(
+                source_child,
+                target_child,
+                &format!("{path}.{}", source_child.name),
+                options,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl MergeInsertJob {
     /// Clone one execution attempt while preserving the spill manager owned by
     /// the surrounding retry loop.
@@ -145,8 +176,21 @@ impl MergeInsertJob {
         // If full match fails, try subschema match.
         options.allow_subschema = true;
 
-        check_source_schema(&lance_schema, target_schema, &options)
-            .map(|_| SchemaComparison::Subschema)
+        check_source_schema(&lance_schema, target_schema, &options)?;
+        options.allow_subschema = false;
+        let lance_schema = super::super::promote_legacy_blob_schema(&lance_schema)?;
+        let target_schema = super::super::promote_legacy_blob_schema(target_schema)?;
+        for source_field in &lance_schema.fields {
+            if let Some(target_field) = target_schema.field(&source_field.name) {
+                check_complete_list_fields(
+                    source_field,
+                    target_field,
+                    &source_field.name,
+                    &options,
+                )?;
+            }
+        }
+        Ok(SchemaComparison::Subschema)
     }
 
     /// Collect every join column that has a scalar index supporting exact
@@ -1455,6 +1499,15 @@ impl MergeInsertJob {
         provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,
     ) -> Result<UncommittedMergeInsert> {
+        // Validate list completeness before either plan can write fragment data.
+        if self.params.insert_not_matched
+            || matches!(
+                self.params.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            )
+        {
+            self.check_compatible_schema(provider.schema().as_ref())?;
+        }
         // Resolve the write mode before the path fork. The v2 plan resolves it
         // again in `create_plan`, but the legacy path below does not go through
         // that, and its partial-schema branch patches columns whatever the mode
