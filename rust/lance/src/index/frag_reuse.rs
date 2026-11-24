@@ -556,6 +556,111 @@ pub(crate) async fn segment_coverage_reason(
     })
 }
 
+/// What an optimize pass that merges committed segments may commit for them
+/// under a tagged history.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MergeClaim {
+    /// The live fragments the selected segments answer for (their derived
+    /// coverage, without the unindexed fragments): the merged file is written
+    /// for exactly these plus the unindexed fragments.
+    Admitted(RoaringBitmap),
+    /// The selected set cannot be merged as a whole; its segments stay as
+    /// they are.
+    Declined,
+}
+
+/// Whether optimize may merge the committed segments `selected` of index
+/// `index_name` with the `unindexed` fragments into one segment whose bitmap
+/// is the live coverage its file is written for.
+///
+/// Coverage is the one the snapshot's [`FriQueryPlan`] derives per segment of
+/// the logical index. The set is admitted only if:
+/// (i) every selected segment is registered in the plan; one it derives
+///     coverage (or identity) for has a stored bitmap, one the reader
+///     derives nothing for (withdrawn, superseded, or missing contributors)
+///     contributes no coverage and is replaced as before, and one this build
+///     cannot translate or interpret declines the set (the merge entry point
+///     has already opened every old segment, so such a segment fails there
+///     first);
+/// (ii) no unselected segment of the index derives coverage of a fragment a
+///      selected segment covers, so merging neither takes coverage from nor
+///      leaves a hole for a segment that stays;
+/// (iii) no unindexed fragment is covered by a selected segment.
+/// An unverifiable segment of the index declines too: its coverage, and so
+/// (ii), is unknown. The decision is for the whole set: members are never
+/// dropped or added to make it pass.
+///
+/// `None` on a table without a tagged history, where the merge commits what
+/// it did before.
+pub(crate) async fn tagged_merge_claim(
+    dataset: &Dataset,
+    index_name: &str,
+    selected: &[Uuid],
+    unindexed: &RoaringBitmap,
+) -> lance_core::Result<Option<MergeClaim>> {
+    let stored = super::loading::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+        .filter(|entry| entry.index_version != 0)
+    else {
+        return Ok(None);
+    };
+    if fri.index_version != 1 {
+        return Err(Error::not_supported(format!(
+            "FRI index_version {} is unsupported. Please upgrade to a newer version",
+            fri.index_version
+        )));
+    }
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
+    let mut claim = RoaringBitmap::new();
+    let mut retained = RoaringBitmap::new();
+    let mut found = 0;
+    for entry in stored.iter().filter(|entry| entry.name == index_name) {
+        let is_selected = selected.contains(&entry.uuid);
+        let mut dormant = false;
+        let coverage = match plan.segments.get(&entry.uuid) {
+            Some(SegmentRemappingPlan::Identity) => entry
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref()),
+            Some(SegmentRemappingPlan::Translate { coverage, .. }) => Some(coverage.clone()),
+            Some(SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)) => {
+                return Ok(Some(MergeClaim::Declined));
+            }
+            Some(SegmentRemappingPlan::MissingCoverage(
+                MissingCoverageReason::Withdrawn | MissingCoverageReason::NoDerivedCoverage,
+            )) => {
+                dormant = true;
+                None
+            }
+            Some(SegmentRemappingPlan::MissingCoverage(_)) => None,
+            None => None,
+        };
+        match (is_selected, coverage) {
+            (true, Some(coverage)) if entry.fragment_bitmap.is_some() => {
+                found += 1;
+                claim |= coverage;
+            }
+            // An empty translation: the merge reads nothing from it and
+            // replaces it.
+            (true, None) if dormant => found += 1,
+            (true, _) => return Ok(Some(MergeClaim::Declined)),
+            (false, Some(coverage)) => retained |= coverage,
+            // The reader derives nothing for it, so it covers nothing.
+            (false, None) => {}
+        }
+    }
+    let admitted =
+        found == selected.len() && claim.is_disjoint(&retained) && claim.is_disjoint(unindexed);
+    Ok(Some(if admitted {
+        MergeClaim::Admitted(claim)
+    } else {
+        MergeClaim::Declined
+    }))
+}
+
 /// Why the reader derives no coverage for `source`, from what it can see of
 /// the segment without opening its files.
 async fn missing_coverage_reason(

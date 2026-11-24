@@ -4328,11 +4328,11 @@ async fn vector_rebalance_keeps_translated_coverage_on_tagged_tables() {
 }
 
 // Inverted append then merge on a tagged table: the merged segment's old
-// data is the coverage the reader derives for the translated segment and it
-// keeps the stored provenance, so the full-text index still covers the
-// partition's destinations after both optimizations.
+// data is the coverage the reader derives for the translated segment and its
+// bitmap is that live coverage plus the appended fragment, so the full-text
+// index still covers the partition's destinations after both optimizations.
 #[tokio::test]
-async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
+async fn inverted_merge_commits_live_coverage_on_tagged_tables() {
     use arrow_array::{ArrayRef, Int32Array, StringArray};
     use lance_index::optimize::OptimizeOptions;
 
@@ -4427,10 +4427,10 @@ async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
         .cloned()
         .collect();
     assert_eq!(stored.len(), 1, "{stored:?}");
-    let provenance = stored[0].fragment_bitmap.clone().unwrap();
-    assert!(
-        provenance.contains(0) && provenance.contains(1),
-        "the merge keeps the provenance: {provenance:?}"
+    assert_eq!(
+        stored[0].fragment_bitmap.clone().unwrap(),
+        dataset.fragment_bitmap.as_ref().clone(),
+        "the merge commits the live coverage its file is written for"
     );
     assert_eq!(
         derived(&dataset).await,

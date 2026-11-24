@@ -46,6 +46,7 @@ use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
+use crate::index::frag_reuse::{MergeClaim, tagged_merge_claim};
 use crate::index::scalar::{
     IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, list_element,
     load_fts_training_data, load_training_data, scan_training_data,
@@ -987,6 +988,37 @@ async fn merge_scalar_indices<'a>(
         }
     }
 
+    // On a tagged history the merged segment commits the live coverage its
+    // file is written for. A selection that cannot claim it as a whole is
+    // left untouched and only the unindexed fragments are indexed, as in
+    // append mode.
+    let selected_uuids: Vec<Uuid> = selected_old_indices.iter().map(|idx| idx.uuid).collect();
+    let live_claim = match tagged_merge_claim(
+        dataset.as_ref(),
+        &old_indices[0].name,
+        &selected_uuids,
+        &base_unindexed_bitmap,
+    )
+    .await?
+    {
+        None => None,
+        Some(MergeClaim::Admitted(claim)) => Some(claim),
+        Some(MergeClaim::Declined) => {
+            if unindexed.is_empty() {
+                return Ok(None);
+            }
+            selected_old_indices.clear();
+            Some(RoaringBitmap::new())
+        }
+    };
+    // The stable-row-id fold-in above must never meet a tagged history.
+    if live_claim.is_some() && dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::internal(
+            "merge_scalar_indices: a tagged fragment reuse history on a stable-row-id table"
+                .to_string(),
+        ));
+    }
+
     // For the delta case (`selected` empty) the reference is purely
     // for reading params; fall back to the last old index then.
     let reference_idx = selected_old_indices
@@ -1076,10 +1108,10 @@ async fn merge_scalar_indices<'a>(
         )
     };
 
-    // The fragments a from-scratch rebuild must scan: everything the merged
-    // segment will answer for, all of it live.
+    // Everything the merged segment will answer for, all of it live: the
+    // fragments a from-scratch rebuild scans and the bitmap it commits.
     let mut rebuild_frags = base_unindexed_bitmap.clone();
-    rebuild_frags |= &effective_old_frags;
+    rebuild_frags |= live_claim.as_ref().unwrap_or(&effective_old_frags);
     let new_uuid = Uuid::new_v4();
 
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
@@ -1162,19 +1194,10 @@ async fn merge_scalar_indices<'a>(
             || is_bloomfilter_mergeable
             || selected_old_indices.len() == 1);
 
-    // The bitmap the merged segment commits, decided by how its content is
-    // produced:
-    //   - rebuilt from a scan: exactly the live fragments scanned (direct
-    //     coverage of every row it holds);
-    //   - merged from the old segments' pages: on a tagged table the union of
-    //     the selected segments' STORED bitmaps, i.e. provenance, retired
-    //     sources included. The pages were translated to live addresses when
-    //     the segments were opened, and the tagged reader stops translating
-    //     at a live fragment, so provenance keeps deriving coverage for this
-    //     segment and for any unselected sibling that shares a destination,
-    //     and keeps the mapping they need retained until they are rebuilt;
-    //     elsewhere the effective (live) coverage, as before.
-    let mut frag_bitmap = rebuild_frags.clone();
+    // Rebuilt or merged, the file holds live addresses in exactly these
+    // fragments (merged pages were translated when their segments were
+    // opened), so the bitmap is the same live set either way.
+    let frag_bitmap = rebuild_frags.clone();
     let (created_index, new_dataset_version) = if !can_merge_segments {
         (
             rebuild_scalar_segment(
@@ -1188,14 +1211,6 @@ async fn merge_scalar_indices<'a>(
             dataset.manifest.version,
         )
     } else {
-        if tagged_coverage.is_some() {
-            frag_bitmap = base_unindexed_bitmap.clone();
-            for index in &selected_old_indices {
-                if let Some(stored) = &index.fragment_bitmap {
-                    frag_bitmap |= stored;
-                }
-            }
-        }
         let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
 
         // Try a seed-based update before falling back to a full column scan.
@@ -2181,7 +2196,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let index_type = indices[0].index_type();
             match index_type {
                 IndexType::Inverted => {
-                    let selected_old_indices =
+                    let mut selected_old_indices =
                         select_segments_to_merge(dataset.as_ref(), old_indices, options);
                     if unindexed.is_empty() && selected_old_indices.len() <= 1 {
                         return Ok(None);
@@ -2244,6 +2259,52 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         }));
                     }
 
+                    // As in `merge_scalar_indices`: a selection that cannot
+                    // claim its live coverage as a whole is left untouched.
+                    let selected_uuids: Vec<Uuid> =
+                        selected_old_indices.iter().map(|idx| idx.uuid).collect();
+                    let live_claim = match tagged_merge_claim(
+                        dataset.as_ref(),
+                        &old_indices[0].name,
+                        &selected_uuids,
+                        &base_unindexed_bitmap,
+                    )
+                    .await?
+                    {
+                        None => None,
+                        Some(MergeClaim::Admitted(claim)) => Some(claim),
+                        Some(MergeClaim::Declined) => {
+                            if unindexed.is_empty() {
+                                return Ok(None);
+                            }
+                            selected_old_indices.clear();
+                            Some(RoaringBitmap::new())
+                        }
+                    };
+                    // A declined selection reads its params from the last old
+                    // index, exactly as append mode does.
+                    let (reference_index, update_criteria) = if selected_old_indices.is_empty()
+                        && reference_idx.uuid != old_indices[old_indices.len() - 1].uuid
+                    {
+                        let index = dataset
+                            .open_scalar_index_for_maintenance(
+                                &field_path,
+                                &old_indices[old_indices.len() - 1].uuid,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?;
+                        let criteria = index.update_criteria();
+                        (index, criteria)
+                    } else {
+                        (reference_index, update_criteria)
+                    };
+                    let reference_inverted_index = reference_index
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                        .ok_or_else(|| {
+                            Error::index("expected inverted index training parameters")
+                        })?;
+
                     let fragments = Some(unindexed.to_vec());
                     let resolved = resolved_fts.as_ref().ok_or_else(|| {
                         Error::internal(
@@ -2271,20 +2332,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let mut old_data_filters = Vec::with_capacity(selected_old_indices.len());
                     // On a tagged table a selected segment's old data is the
                     // coverage the reader derives for it (translated, live)
-                    // and the merged segment keeps the stored provenance,
+                    // and the merged segment commits the admitted live claim,
                     // exactly as the scalar merge does; stored ∩ live would
                     // be empty for retired sources and drop indexed rows.
                     let tagged_coverage =
                         tagged_segment_coverage(dataset.as_ref(), &selected_old_indices, None)
                             .await?;
+                    if let Some(claim) = &live_claim {
+                        frag_bitmap |= claim;
+                    }
                     for idx in &selected_old_indices {
                         let effective_old_frags = match &tagged_coverage {
-                            Some(coverage) => {
-                                if let Some(stored) = &idx.fragment_bitmap {
-                                    frag_bitmap |= stored;
-                                }
-                                coverage.get(&idx.uuid).cloned().unwrap_or_default()
-                            }
+                            Some(coverage) => coverage.get(&idx.uuid).cloned().unwrap_or_default(),
                             None => {
                                 let effective = idx
                                     .effective_fragment_bitmap(&dataset.fragment_bitmap)

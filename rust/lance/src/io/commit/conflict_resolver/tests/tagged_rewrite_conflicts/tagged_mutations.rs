@@ -2186,8 +2186,8 @@ async fn tagged_table_refuses_committing_a_staged_index_after_a_cast_of_its_colu
     assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
 }
 
-/// A merged segment's bitmap is the union of its sources' provenance, so a
-/// segment can name a destination directly (F10) and, through retired
+/// A segment merged by an earlier release carries the union of its sources'
+/// provenance, so it can name a destination directly (F10) and, through retired
 /// sources (F0, F1), reach it as well. The rewrite commits and both go: the
 /// direct id and the whole transition's sources, so the segment claims
 /// nothing; `optimize_indices` rebuilds the coverage afterwards.
@@ -2226,7 +2226,7 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
         .optimize_indices(&OptimizeOptions::merge(2))
         .await
         .unwrap();
-    let dataset = fresh_session(dir.as_str()).await;
+    let mut dataset = fresh_session(dir.as_str()).await;
     let merged: Vec<_> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
@@ -2237,8 +2237,37 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
     assert_eq!(merged.len(), 1, "{merged:?}");
     assert_eq!(
         merged[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32, 11]),
+        "the merge commits its live coverage"
+    );
+
+    // Earlier releases committed the union of the sources' provenance for
+    // such a merge; that layout must keep working.
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    indices
+        .iter_mut()
+        .find(|idx| idx.name == "v_idx")
+        .unwrap()
+        .fragment_bitmap = Some(RoaringBitmap::from_iter([0u32, 1, 10]));
+    persist_fixture(&mut dataset, indices).await;
+    let dataset = fresh_session(dir.as_str()).await;
+    let fixture: Vec<_> = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == "v_idx")
+        .cloned()
+        .collect();
+    assert_eq!(fixture.len(), 1, "fixture: {fixture:?}");
+    assert_eq!(fixture[0].uuid, merged[0].uuid, "fixture: same segment");
+    assert_eq!(
+        fixture[0].fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter([0u32, 1, 10]),
-        "mixed provenance"
+        "fixture: mixed provenance"
     );
 
     // Row i = 2 lives in F10, the fragment the segment names directly.

@@ -11,6 +11,7 @@
 //! live coverage the reader derives for the group (the destinations it covers
 //! completely), never a destination the group cannot serve.
 
+mod merge_claim;
 mod released_in_place;
 
 use super::*;
@@ -1718,8 +1719,8 @@ async fn assert_scalar_queries_match(dataset: &Dataset) {
 /// segment with a newer one. The merge translates the addresses: the
 /// merged FILE holds live addresses (the old file's source addresses are
 /// gone) and indexed queries equal the scan after a fresh reopen. The
-/// merged segment is stamped with the manifest it was built from and keeps
-/// the union of the stored bitmaps, so the trim that follows releases the
+/// merged segment is stamped with the manifest it was built from and commits
+/// the live coverage of both sources, so the trim that follows releases the
 /// legacy version: the merged stamp is past it and its retired sources are
 /// in no segment's bitmap.
 #[tokio::test]
@@ -1785,9 +1786,9 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
         "the merge is stamped with the manifest it was built from"
     );
     assert!(merged.dataset_version > legacy_versions(&dataset).await[0].dataset_version);
-    // Provenance union: the old segment's listed bitmap {0, 1, destination}
-    // and the newer segment's fragments (the two partition destinations and
-    // the appended fragment).
+    // Live coverage: the old segment's listed bitmap {0, 1, destination}
+    // (all live) and the newer segment's fragments (the two partition
+    // destinations and the appended fragment), i.e. every live fragment.
     assert_eq!(
         old.fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter([0u32, 1, destination])
@@ -1795,7 +1796,13 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
     assert_eq!(
         merged.fragment_bitmap.as_ref().unwrap(),
         &(old.fragment_bitmap.clone().unwrap() | newer.fragment_bitmap.clone().unwrap()),
-        "the merge keeps the provenance union"
+        "the merge commits the live coverage of both sources"
+    );
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &fragment_ids(&dataset)
+            .into_iter()
+            .collect::<RoaringBitmap>()
     );
     assert_scalar_queries_match(&dataset).await;
 
@@ -1916,7 +1923,7 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
     assert_eq!(
         merged.fragment_bitmap.as_ref().unwrap(),
         &(old_listed.fragment_bitmap.clone().unwrap() | newer.fragment_bitmap.clone().unwrap()),
-        "the merge keeps the provenance union"
+        "the merge commits the live coverage of both sources"
     );
     assert_scalar_queries_match(&dataset).await;
 
@@ -1935,8 +1942,8 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
 /// select the caught-up segment (the trim, and a merge that selects only
 /// the trailing segment with nothing new to add) leaves its uuid, bitmap
 /// and dataset version alone; the legacy version stays pinned by the old
-/// segment meanwhile. The full merge then covers both provenances and the
-/// index answers from a fresh session.
+/// segment meanwhile. The full merge then covers both segments' coverage and
+/// the index answers from a fresh session.
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn upgrade_merge_leaves_the_caught_up_segment_alone() {
@@ -1996,7 +2003,7 @@ async fn upgrade_merge_leaves_the_caught_up_segment_alone() {
         vec![old.uuid, caught_up.uuid]
     );
 
-    // The full merge consumes both: the merged provenance covers the old
+    // The full merge consumes both: the merged bitmap covers the old
     // segment's live coverage and the caught-up segment's fragments.
     dataset
         .optimize_indices(&OptimizeOptions::merge(2))
@@ -2246,14 +2253,14 @@ async fn bloom_filter_optimize_drops_rewritten_null_rows_on_a_tagged_history() {
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
     assert_eq!(stored_segments(&dataset, "value_idx").await.len(), 1);
-    // Merged rather than rebuilt: the segment keeps the provenance it was
-    // stored with, where a rebuild would claim the live fragments.
+    // The segment commits the live fragments its file is written for: the
+    // translated coverage {2, 10, 11} and the re-indexed fragment 1.
     assert_eq!(
         stored_segment(&dataset, "value_idx")
             .await
             .fragment_bitmap
             .unwrap(),
-        RoaringBitmap::from_iter([0u32, 1, 2])
+        RoaringBitmap::from_iter([1u32, 2, 10, 11])
     );
     let plan = dataset
         .scan()

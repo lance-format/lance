@@ -8850,14 +8850,11 @@ mod tests {
         /// Draining through `optimize_indices` merge on a tagged table. A
         /// provenance-only segment still owning translated coverage is opened
         /// through the translating loader, so the merged file holds live
-        /// addresses. The merged segment commits the UNION of the selected
-        /// segments' stored bitmaps (provenance, retired sources included):
-        /// the tagged reader treats a segment's bitmap as provenance, stops
-        /// translating at a live fragment, and derives coverage of a
-        /// destination whenever every contributing source is present, so the
-        /// merged segment keeps the translated destination coverage instead
-        /// of degrading to scan fallback, and the transition it still names
-        /// stays retained.
+        /// addresses. The merged segment commits the live coverage its file
+        /// is written for (both destinations), so every holder of the
+        /// transition is merged into a segment that covers its destinations
+        /// directly, and the trim releases the transition while queries keep
+        /// answering through the index.
         ///
         /// A provenance-only segment whose translated coverage is fully taken
         /// over by siblings is excluded from the query listing by
@@ -8866,7 +8863,7 @@ mod tests {
         /// (`delta_drain_stages_partial_then_full`).
         #[tokio::test]
         #[serial_test::serial(frag_reuse_maintenance)]
-        async fn merge_keeps_translated_coverage_on_tagged_tables() {
+        async fn merge_commits_live_coverage_on_tagged_tables() {
             use lance_index::optimize::OptimizeOptions;
 
             let fixture = MockDatasetFixture::try_new().unwrap();
@@ -8883,18 +8880,17 @@ mod tests {
                 .await
                 .unwrap();
 
-            // One merged segment; its stored bitmap is provenance: the retired
-            // sources of the old segment plus the delta's direct coverage.
+            // One merged segment; its stored bitmap is the live coverage of
+            // the old segment (11) plus the delta's direct coverage (10).
             let merged = stored_segments(&dataset, "i_idx").await;
             assert_eq!(merged.len(), 1, "{merged:?}");
-            let stored = merged[0].fragment_bitmap.clone().unwrap();
-            assert!(
-                stored.contains(0) && stored.contains(1) && stored.contains(10),
-                "{stored:?}"
+            assert_eq!(
+                merged[0].fragment_bitmap.clone().unwrap(),
+                roaring::RoaringBitmap::from_iter([10u32, 11]),
             );
 
-            // The reader derives coverage of BOTH destinations from that
-            // provenance, so nothing falls back to scan.
+            // The reader derives coverage of BOTH destinations, so nothing
+            // falls back to scan.
             let derived = derived_coverage(&dataset, "i_idx").await;
             assert_eq!(
                 derived,
@@ -8905,18 +8901,19 @@ mod tests {
             assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
             assert_eq!(counts_with_index(&dataset).await, scan_counts);
 
-            // Trim keeps the transition: the merged segment's provenance still
-            // names its sources and destination 11 has no direct coverage.
+            // Trim releases the transition: no segment names its sources and
+            // both destinations are covered directly.
             cleanup_frag_reuse_index(&mut dataset).await.unwrap();
             assert!(
                 dataset
                     .load_index_by_name(FRAG_REUSE_INDEX_NAME)
                     .await
                     .unwrap()
-                    .is_some(),
-                "the merged segment still depends on the transition"
+                    .is_none(),
+                "every holder of the transition was merged, so nothing needs it"
             );
             assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 1);
+            assert_index_used(&dataset).await;
             assert_eq!(counts_with_index(&dataset).await, scan_counts);
         }
 
@@ -8924,13 +8921,13 @@ mod tests {
         /// destination must not strip the unselected sibling of its coverage.
         /// Two per-fragment segments S1 (fragment 0) and S2 (fragment 1) both
         /// contribute to destinations 10 and 11 after the recluster. Merging
-        /// S2 with newly appended data produces M whose provenance still names
-        /// fragment 1, so the reader keeps resolving 10 and 11 from {S1, M}.
-        /// With a `stored ∩ live` bitmap M would drop fragment 1 and S1 would
-        /// lose both destinations.
+        /// S2 alone would take its share of 10 and 11 from S1, so the merge
+        /// is declined: S1 and S2 stay as committed, the newly appended data
+        /// is indexed as its own segment, and the reader keeps resolving 10
+        /// and 11 from {S1, S2}.
         #[tokio::test]
         #[serial_test::serial(frag_reuse_maintenance)]
-        async fn merge_keeps_unselected_sibling_coverage_on_tagged_tables() {
+        async fn partial_merge_keeps_unselected_sibling_coverage_on_tagged_tables() {
             use lance_index::optimize::OptimizeOptions;
 
             let fixture = MockDatasetFixture::try_new().unwrap();
@@ -8942,6 +8939,10 @@ mod tests {
                 .find(|s| s.fragment_bitmap.as_ref().unwrap().contains(0))
                 .unwrap()
                 .uuid;
+            let before: Vec<(uuid::Uuid, Option<roaring::RoaringBitmap>)> = segments
+                .iter()
+                .map(|s| (s.uuid, s.fragment_bitmap.clone()))
+                .collect();
 
             // New data so a one-segment merge has something to fold in.
             let appended = arrow_array::record_batch!(("i", Int32, [8, 9, 10, 11])).unwrap();
@@ -8965,12 +8966,38 @@ mod tests {
                 .unwrap();
 
             let after = stored_segments(&dataset, "i_idx").await;
-            assert_eq!(after.len(), 2, "{after:?}");
+            assert_eq!(after.len(), 3, "{after:?}");
             assert!(after.iter().any(|s| s.uuid == s1), "S1 was not selected");
-            // Both destinations are still derived for S1 and for the merged
-            // segment, and every live fragment is covered.
+            for (uuid, bitmap) in &before {
+                let kept = after.iter().find(|s| s.uuid == *uuid);
+                assert_eq!(
+                    kept.map(|s| &s.fragment_bitmap),
+                    Some(bitmap),
+                    "S1 and S2 stay as committed"
+                );
+            }
+            let added = after
+                .iter()
+                .find(|s| before.iter().all(|(uuid, _)| *uuid != s.uuid))
+                .unwrap();
+            let appended_fragments: roaring::RoaringBitmap = dataset
+                .fragments()
+                .iter()
+                .map(|f| f.id as u32)
+                .filter(|id| !(10..=11).contains(id))
+                .collect();
+            assert_eq!(
+                added.fragment_bitmap.as_ref(),
+                Some(&appended_fragments),
+                "the new segment covers the appended data alone"
+            );
+            // Both destinations are still derived for S1 and S2, and every
+            // live fragment is covered.
             let derived = dataset.load_indices().await.unwrap();
-            for segment in derived.iter().filter(|s| s.name == "i_idx") {
+            for segment in derived
+                .iter()
+                .filter(|s| s.name == "i_idx" && s.uuid != added.uuid)
+            {
                 let coverage = segment.fragment_bitmap.as_ref().unwrap();
                 assert!(
                     coverage.contains(10) && coverage.contains(11),
