@@ -23,7 +23,7 @@ use crate::scalar::{
     BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,
     compute_next_prefix,
 };
-use lance_arrow_stats::StatisticsAccumulator;
+use lance_arrow::stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
