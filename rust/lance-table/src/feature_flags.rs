@@ -126,10 +126,12 @@ pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 ///
 /// Valid values are `"0"` and `"1"`. When absent or `"0"`, writers continue to
 /// emit version 0 zone write seeds without setting [`FLAG_ZONE_WRITE_SEEDS`],
-/// keeping the table readable and writable by Lance `< 15`. Committing `"1"`
-/// atomically activates [`FLAG_ZONE_WRITE_SEEDS`] in both feature flag words;
-/// once activated, the capability is sticky and later writes emit version 1
-/// seeds unless this key explicitly pins the table back to `"0"`.
+/// keeping the table readable and writable by Lance `< 15`. A commit that
+/// itself writes this key as `"1"` atomically activates
+/// [`FLAG_ZONE_WRITE_SEEDS`] in both feature flag words; an inherited `"1"`
+/// alone does not, because a writer that did not know the flag could have
+/// stored it. Once activated, the capability is sticky and later writes emit
+/// version 1 seeds unless this key explicitly pins the table back to `"0"`.
 pub const ZONE_WRITE_SEEDS_VERSION_KEY: &str = "lance.zone_write_seeds.version";
 /// Writer-only protection for clustering definitions, ID allocation, references,
 /// and generic fragment/index segment metadata maintenance.
