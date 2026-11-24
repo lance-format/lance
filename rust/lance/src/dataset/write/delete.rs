@@ -82,7 +82,7 @@ async fn apply_deletions(
                 }
             }
         })
-        .buffer_unordered(dataset.object_store.io_parallelism());
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
 
     while let Some(res) = stream.next().await.transpose()? {
         match res {
@@ -308,7 +308,7 @@ impl RetryExecutor for DeleteJob {
                     (Vec::new(), deleted_fragment_ids, None, num_deleted_rows)
                 } else {
                     // Regular predicate - scan and collect row addresses to delete
-                    let stream = scanner.try_into_stream().await?.into();
+                    let stream = Box::pin(scanner.try_into_stream().await?);
                     let (stream, row_id_rx) = make_rowid_capture_stream(
                         stream,
                         self.dataset.manifest.uses_stable_row_ids(),

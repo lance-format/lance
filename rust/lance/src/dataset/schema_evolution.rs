@@ -747,8 +747,8 @@ pub(super) async fn cleanup_new_column_data_files(
 
     let dataset = first_fragment.dataset();
     cleanup_data_fragments(
-        &dataset.object_store,
-        &dataset.base,
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
         None,
         &fragments_to_cleanup,
     )
@@ -804,7 +804,7 @@ fn checkpoint_context(
         "version": 1,
         "dataset": dataset.uri(),
         "read_version": dataset.version_id(),
-        "branch": dataset.branch_identifier.as_ref(),
+        "branch": dataset.table_state.branch_identifier.as_ref(),
         "transaction_file": dataset.manifest.transaction_file,
         "base_paths": base_paths,
         "schemas": schemas,
@@ -7071,7 +7071,7 @@ mod test {
                 fields: fields.iter().map(|name| field_id(name)).collect(),
                 covering_fields: vec![field_id("carried")],
                 dataset_version: dataset.manifest.version,
-                fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+                fragment_bitmap: Some(dataset.table_state.fragment_bitmap.as_ref().clone()),
                 index_details: None,
                 index_version: 0,
                 created_at: None,
@@ -7082,8 +7082,8 @@ mod test {
             };
             let metadata_key = IndexMetadataKey {
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             };
             dataset
                 .index_cache

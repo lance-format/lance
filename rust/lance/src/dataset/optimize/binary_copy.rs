@@ -31,8 +31,13 @@ async fn init_writer_if_necessary(
 ) -> Result<bool> {
     if current_writer.is_none() {
         let filename = format!("{}.lance", generate_random_filename());
-        let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
-        let object_writer = dataset.object_store.create(&path).await?;
+        let path = dataset
+            .table_state
+            .base
+            .clone()
+            .join(DATA_DIR)
+            .join(filename.as_str());
+        let object_writer = dataset.table_state.object_store.create(&path).await?;
         *current_writer = Some(file_versions::create_lazy_writer(
             version,
             object_writer,
@@ -176,6 +181,7 @@ pub async fn rewrite_files_binary_copy(
     let max_rows_per_file = params.max_rows_per_file as u64;
     // Seeds of the inputs feeding the current output file, in copy order.
     let mut seed_acc = OutputSeedAccumulator::default();
+    let carry_v1_seeds = lance_table::feature_flags::write_v1_zone_write_seeds(&dataset.manifest);
     let index_rows_per_zone = seed_carry::index_rows_per_zone(dataset).await?;
 
     // Visit each fragment and all of its data files (a fragment may contain multiple files)
@@ -184,7 +190,7 @@ pub async fn rewrite_files_binary_copy(
             let object_store = if let Some(base_id) = df.base_id {
                 dataset.object_store(Some(base_id)).await?
             } else {
-                dataset.object_store.clone()
+                dataset.table_state.object_store.clone()
             };
             let full_path = dataset.data_file_dir(df)?.clone().join(df.path.as_str());
             let scan_scheduler = ScanScheduler::new(
@@ -387,7 +393,12 @@ pub async fn rewrite_files_binary_copy(
             // Accumulate rows for the current output file and flush when reaching the threshold
             total_rows_in_current += file_meta.num_rows;
             if total_rows_in_current >= max_rows_per_file {
-                let output_seeds = seed_acc.finish(&schema, &index_rows_per_zone)?;
+                let output_seeds = if carry_v1_seeds {
+                    seed_acc.finish(&schema, &index_rows_per_zone)?
+                } else {
+                    seed_acc.clear();
+                    Vec::new()
+                };
                 let fragment_out = finalize_current_output_file(
                     &schema,
                     version,
@@ -420,7 +431,12 @@ pub async fn rewrite_files_binary_copy(
         // Flush remaining rows as a final output file
         init_writer_if_necessary(dataset, version, &mut current_writer, &mut current_filename)
             .await?;
-        let output_seeds = seed_acc.finish(&schema, &index_rows_per_zone)?;
+        let output_seeds = if carry_v1_seeds {
+            seed_acc.finish(&schema, &index_rows_per_zone)?
+        } else {
+            seed_acc.clear();
+            Vec::new()
+        };
         let frag = finalize_current_output_file(
             &schema,
             version,

@@ -1493,6 +1493,7 @@ mod tests {
         );
         assert!(
             addresses.iter().all(|&address| dataset
+                .table_state
                 .fragment_bitmap
                 .contains(RowAddress::from(address).fragment_id())),
             "FTS must not return retired row addresses"
@@ -1638,8 +1639,8 @@ mod tests {
         .await
         .unwrap();
         let stored = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -1679,8 +1680,8 @@ mod tests {
             .unwrap();
         dataset = build_snapshot;
         let raw = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -1723,8 +1724,8 @@ mod tests {
         // postings. Warm the index while the original FRI mapping still exists.
         dataset.delete("false").await.unwrap();
         let stored = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await

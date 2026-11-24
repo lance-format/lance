@@ -15,6 +15,15 @@ use tokio::task::JoinHandle;
 /// blocking thread.
 ///
 /// The size hint is preserved, but the stream is not fused.
+///
+/// ```
+/// # use futures::StreamExt;
+/// # use lance_io::stream::background_iterator::BackgroundIterator;
+/// # async fn example() {
+/// let values = BackgroundIterator::new(0..3).collect::<Vec<_>>().await;
+/// assert_eq!(values, vec![0, 1, 2]);
+/// # }
+/// ```
 #[pin_project::pin_project]
 pub struct BackgroundIterator<I: Iterator + Send + 'static> {
     #[pin]
@@ -22,6 +31,7 @@ pub struct BackgroundIterator<I: Iterator + Send + 'static> {
 }
 
 impl<I: Iterator + Send + 'static> BackgroundIterator<I> {
+    /// Wrap an iterator, deferring iteration until the stream is polled.
     pub fn new(iter: I) -> Self {
         Self {
             state: BackgroundIterState::Current { iter },

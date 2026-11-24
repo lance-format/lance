@@ -2427,7 +2427,7 @@ pub async fn initialize_vector_index(
         ))
     })?;
 
-    let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
+    let fragment_bitmap = Some(target_dataset.table_state.fragment_bitmap.as_ref().clone());
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,
@@ -2720,11 +2720,11 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 16);
 
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let counted = count_trainable_vectors(&dataset, "vec", ROWS, 256)
             .await
             .unwrap();
-        let bounded_reads = dataset.object_store.io_stats_incremental();
+        let bounded_reads = dataset.table_state.object_store.io_stats_incremental();
         assert!((256..ROWS).contains(&counted), "counted {counted}");
 
         assert_eq!(
@@ -2733,7 +2733,7 @@ mod tests {
                 .unwrap(),
             ROWS
         );
-        let full_reads = dataset.object_store.io_stats_incremental();
+        let full_reads = dataset.table_state.object_store.io_stats_incremental();
         assert!(
             bounded_reads.read_bytes < full_reads.read_bytes / 2,
             "threshold check read {} bytes; full count read {} bytes",
@@ -3889,6 +3889,7 @@ mod tests {
         let training_path = out_base.clone().join("global_training.idx");
 
         let writer = dataset
+            .table_state
             .object_store
             .as_ref()
             .create(&training_path)

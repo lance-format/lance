@@ -499,7 +499,7 @@ async fn write_lineage_file(
             .collect::<Vec<_>>(),
     ));
     let schema = Schema::try_from(arrow_schema.as_ref())?;
-    let object_writer = dataset.object_store.create(&full_path).await?;
+    let object_writer = dataset.table_state.object_store.create(&full_path).await?;
     let mut writer = versions::create_writer(
         file_version,
         object_writer,
@@ -566,7 +566,7 @@ async fn read_spilled_column(
 ) -> Result<Vec<u64>> {
     let data_file = fragment.row_lineage_file(field_id)?.ok_or_else(|| {
         Error::corrupt_file(
-            dataset.base.clone(),
+            dataset.table_state.base.clone(),
             format!(
                 "fragment {} marks row lineage field {field_id} as spilled but none of its \
                  data files carries it",
@@ -621,11 +621,15 @@ async fn read_spilled_column(
         .open_file(&path, &data_file.file_size_bytes)
         .await?;
     let options = dataset
+        .table_state
         .file_reader_options
         .as_deref()
         .cloned()
         .unwrap_or_default();
-    let cache = dataset.metadata_cache.file_metadata_cache(&path);
+    let cache = dataset
+        .table_state
+        .metadata_cache
+        .file_metadata_cache(&path);
     let io =
         Arc::new(LanceEncodingsIo::new(file.clone()).with_read_chunk_size(options.read_chunk_size));
     // An index past the file's columns means the data file entry and the file

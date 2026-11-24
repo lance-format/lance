@@ -126,7 +126,12 @@ async fn cleanup_with_a_detached_version_only_keeps_more(
         dataset.deletions_dir().join("0-9-99.arrow"),
         dataset.transactions_dir().join("9-orphan.txn"),
     ] {
-        dataset.object_store.put(&path, b"orphan").await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .put(&path, b"orphan")
+            .await
+            .unwrap();
     }
 
     MockClock::set_system_time(day(10.0));
@@ -150,8 +155,9 @@ async fn cleanup_with_a_detached_version_only_keeps_more(
     };
     let with_detached = candidates().await;
     dataset
+        .table_state
         .object_store
-        .delete(&ManifestNamingScheme::V2.manifest_path(&dataset.base, detached))
+        .delete(&ManifestNamingScheme::V2.manifest_path(&dataset.table_state.base, detached))
         .await
         .unwrap();
     let without_detached = candidates().await;
@@ -208,6 +214,7 @@ async fn managed_cleanup_with_missing_files(#[case] detached: bool, #[case] shar
     }
     .unwrap();
     dataset
+        .table_state
         .object_store
         .delete(&dataset.data_dir().join(fragment.files[0].path.as_str()))
         .await
@@ -282,11 +289,12 @@ async fn managed_cleanup_with_split_blob_files(
     let detached_dataset = Arc::new(dataset.checkout_version(detached).await.unwrap());
     let fragment = &detached_dataset.manifest.fragments[0];
     let deletion_file = deletion_file_path(
-        &dataset.base,
+        &dataset.table_state.base,
         fragment.id,
         fragment.deletion_file.as_ref().unwrap(),
     );
     let deletion = dataset
+        .table_state
         .object_store
         .read_one_all(&deletion_file)
         .await
@@ -296,13 +304,19 @@ async fn managed_cleanup_with_split_blob_files(
     assert!(dataset.manifest.fragments.is_empty());
     for index in removed {
         dataset
+            .table_state
             .object_store
             .delete(&dataset.data_dir().join(files[*index].path.as_str()))
             .await
             .unwrap();
     }
     if removes_deletion_file {
-        dataset.object_store.delete(&deletion_file).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .delete(&deletion_file)
+            .await
+            .unwrap();
     }
 
     // Every attached version but the latest expires.
@@ -319,6 +333,7 @@ async fn managed_cleanup_with_split_blob_files(
     if removes_deletion_file {
         // The blobs are kept, so restoring the deletion file restores the version.
         dataset
+            .table_state
             .object_store
             .put(&deletion_file, &deletion)
             .await
@@ -346,6 +361,7 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
             .files
             .push(DataFile::new_legacy_from_fields(path, vec![field], None));
         dataset
+            .table_state
             .object_store
             .put(&dataset.data_dir().join(path), b"data")
             .await
@@ -353,7 +369,7 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
     }
     async fn removed(dataset: &Dataset, fragment: &Fragment) -> bool {
         BlobDescriptorFiles::new(dataset, fragment, &[1, 2])
-            .removed(&dataset.object_store)
+            .removed(&dataset.table_state.object_store)
             .await
             .unwrap()
     }
@@ -361,6 +377,7 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
 
     // One blob column's file is gone and the other's is not.
     dataset
+        .table_state
         .object_store
         .delete(&data_path("first.lance"))
         .await
@@ -370,6 +387,7 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
     let mut external = fragment.clone();
     external.files[1].base_id = Some(1);
     dataset
+        .table_state
         .object_store
         .delete(&data_path("second.lance"))
         .await
@@ -395,6 +413,7 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
     });
     assert!(!removed(&dataset, &deleted).await);
     dataset
+        .table_state
         .object_store
         .delete(&data_path("other.lance"))
         .await
@@ -408,18 +427,26 @@ async fn cleanup_skips_staging_detached_manifests() {
     fixture.create_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
     let committed = ManifestNamingScheme::V2.manifest_path(
-        &dataset.base,
+        &dataset.table_state.base,
         lance_table::format::DETACHED_VERSION_MASK | 7,
     );
     let partial = Path::from(format!("{committed}-0b6e3c2a-1d8f-4f0e-9a51-3c7d2e8b4f10"));
     dataset
+        .table_state
         .object_store
         .put(&partial, b"partial")
         .await
         .unwrap();
 
     fixture.run_cleanup(utc_now()).await.unwrap();
-    assert!(dataset.object_store.exists(&partial).await.unwrap());
+    assert!(
+        dataset
+            .table_state
+            .object_store
+            .exists(&partial)
+            .await
+            .unwrap()
+    );
 }
 
 /// A detached version whose external store record names its staging copy, as
@@ -467,15 +494,26 @@ async fn cleanup_keeps_files_of_a_detached_version_recorded_at_its_staging_copy(
         .unwrap()
         .version_id();
 
-    let canonical = ManifestNamingScheme::V2.manifest_path(&dataset.base, detached);
+    let canonical = ManifestNamingScheme::V2.manifest_path(&dataset.table_state.base, detached);
     let staging = Path::parse(format!("{canonical}-{}", Uuid::new_v4())).unwrap();
     dataset
+        .table_state
         .object_store
         .copy(&canonical, &staging)
         .await
         .unwrap();
-    dataset.object_store.delete(&canonical).await.unwrap();
-    let size = dataset.object_store.size(&staging).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .delete(&canonical)
+        .await
+        .unwrap();
+    let size = dataset
+        .table_state
+        .object_store
+        .size(&staging)
+        .await
+        .unwrap();
     store
         .put_if_exists("", detached, staging.as_ref(), size, None)
         .await
@@ -489,8 +527,11 @@ async fn cleanup_keeps_files_of_a_detached_version_recorded_at_its_staging_copy(
         .await
         .unwrap();
     if finalized_after_lookup.is_some() {
-        *store.finalize_on_lookup.lock().unwrap() =
-            Some((detached, dataset.object_store.clone(), canonical.clone()));
+        *store.finalize_on_lookup.lock().unwrap() = Some((
+            detached,
+            dataset.table_state.object_store.clone(),
+            canonical.clone(),
+        ));
     }
     cleanup_old_versions(
         &latest,
@@ -508,7 +549,7 @@ async fn cleanup_keeps_files_of_a_detached_version_recorded_at_its_staging_copy(
     } else {
         &staging
     };
-    assert!(dataset.object_store.exists(kept).await.unwrap());
+    assert!(dataset.table_state.object_store.exists(kept).await.unwrap());
     assert_eq!(scanned_rows(&latest, detached).await, 200);
 }
 
@@ -576,12 +617,13 @@ async fn cleanup_skips_removed_detached_manifests(#[values(false, true)] on_bran
         .unwrap();
     fixture.overwrite_some_data().await.unwrap();
     let base = if on_branch {
-        &branch.base
+        &branch.table_state.base
     } else {
-        &dataset.base
+        &dataset.table_state.base
     };
     let placeholder = base.clone().join("_versions").join("removed");
     dataset
+        .table_state
         .object_store
         .put(&placeholder, b"removed")
         .await
@@ -605,8 +647,9 @@ async fn cleanup_skips_removed_detached_manifests(#[values(false, true)] on_bran
             }),
         );
     let listed = dataset
+        .table_state
         .commit_handler
-        .list_detached_manifest_locations(base, &dataset.object_store)
+        .list_detached_manifest_locations(base, &dataset.table_state.object_store)
         .map_ok(|location| location.version)
         .try_collect::<Vec<_>>()
         .await

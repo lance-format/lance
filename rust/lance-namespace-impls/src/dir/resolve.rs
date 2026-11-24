@@ -31,7 +31,7 @@ impl DirectoryNamespace {
     pub(super) async fn manifest_ns_for_write(
         &self,
     ) -> Result<Option<Arc<manifest::ManifestNamespace>>> {
-        if !self.manifest_enabled {
+        if !self.table_discovery_mode.has_manifest() {
             return Ok(None);
         }
 
@@ -44,7 +44,7 @@ impl DirectoryNamespace {
                     self.session.clone(),
                     self.object_store.clone(),
                     self.base_path.clone(),
-                    self.dir_listing_enabled,
+                    self.table_discovery_mode.has_directory_listing(),
                     self.inline_optimization_enabled,
                     self.commit_retries,
                 )
@@ -67,7 +67,7 @@ impl DirectoryNamespace {
     /// once the cell is populated; unlike `manifest_ns_for_write` it never
     /// creates the manifest.
     pub(super) async fn ensure_read_manifest(&self) -> Result<()> {
-        if !self.manifest_enabled
+        if !self.table_discovery_mode.has_manifest()
             || self.manifest_ns.get().is_some()
             || self.write_manifest_ns.get().is_some()
         {
@@ -82,7 +82,7 @@ impl DirectoryNamespace {
                     self.session.clone(),
                     self.object_store.clone(),
                     self.base_path.clone(),
-                    self.dir_listing_enabled,
+                    self.table_discovery_mode.has_directory_listing(),
                     self.inline_optimization_enabled,
                     self.commit_retries,
                 )
@@ -102,7 +102,7 @@ impl DirectoryNamespace {
     }
 
     pub(super) fn child_namespace_requires_manifest_error(&self) -> Error {
-        if self.manifest_enabled {
+        if self.table_discovery_mode.has_manifest() {
             NamespaceError::NamespaceNotFound {
                 message: "Child namespace reads require an existing __manifest dataset".to_string(),
             }

@@ -49,10 +49,9 @@ pub trait IndexSeedWriter: Send + std::fmt::Debug {
     /// this writer produces, as bits of both `reader_feature_flags` and
     /// `writer_feature_flags`.
     ///
-    /// The write path embeds a seed only when the dataset already carries
-    /// these bits, and the commit path sets them for every index that
-    /// requests such a writer, so a manifest never references a seed its bits
-    /// do not announce. Zero (the default) means the format needs no flag.
+    /// The write path embeds a seed only when the dataset snapshot already
+    /// carries these bits, so a manifest never references a seed its bits do
+    /// not announce. Zero (the default) means the format needs no flag.
     fn required_feature_flags(&self) -> u64 {
         0
     }

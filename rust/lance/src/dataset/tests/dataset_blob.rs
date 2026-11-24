@@ -601,8 +601,9 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     };
     assert_eq!(dataset.manifest.fragments.len(), 2);
     let before = dataset
+        .table_state
         .object_store
-        .read_dir_all(&dataset.base, None)
+        .read_dir_all(&dataset.table_state.base, None)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -639,8 +640,9 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     .await
     .unwrap();
     let after = dataset
+        .table_state
         .object_store
-        .read_dir_all(&dataset.base, None)
+        .read_dir_all(&dataset.table_state.base, None)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -2244,6 +2246,7 @@ async fn test_read_legacy_and_v2_blob_layouts_from_one_file() {
     .unwrap();
     let data_file_name = format!("{}.lance", Uuid::new_v4());
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&dataset.data_dir().join(data_file_name.as_str()))
         .await
@@ -2413,7 +2416,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     let packed_path = blob_path(&dataset.data_dir(), &file_id, blob_id);
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.table_state.object_store.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2437,7 +2440,12 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     )
     .unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(append_schema.as_ref()).unwrap(),
@@ -2588,7 +2596,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let blob_id = 1;
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.table_state.object_store.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2619,7 +2627,12 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -2724,7 +2737,12 @@ async fn test_create_data_file_skips_blob_orphans_with_top_level_name_collision(
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -3178,12 +3196,12 @@ async fn test_read_blob_files_issue_only_payload_requests(#[case] kind: BlobKind
         .map(|row| handles[*row].as_ref())
         .collect::<Vec<_>>();
     requests.insert(1, None);
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     let blobs = crate::blob::read_blob_files(requests)
         .execute()
         .await
         .unwrap();
-    let handle_stats = dataset.object_store.io_stats_incremental();
+    let handle_stats = dataset.table_state.object_store.io_stats_incremental();
 
     let mut expected = request_rows
         .iter()
@@ -3226,7 +3244,7 @@ async fn test_read_blob_files_issue_only_payload_requests(#[case] kind: BlobKind
         .execute()
         .await
         .unwrap();
-    let row_stats = dataset.object_store.io_stats_incremental();
+    let row_stats = dataset.table_state.object_store.io_stats_incremental();
     assert_eq!(
         rows.iter()
             .map(|blob| blob.data.as_deref())
@@ -3271,7 +3289,7 @@ async fn test_read_blob_file_ranges_coalesce_requests_across_handles() {
         (Some(first_handle), 0, 1000),
     ];
 
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     let results = crate::blob::read_blob_file_ranges(
         requests
             .iter()
@@ -3280,7 +3298,7 @@ async fn test_read_blob_file_ranges_coalesce_requests_across_handles() {
     .execute()
     .await
     .unwrap();
-    let stats = dataset.object_store.io_stats_incremental();
+    let stats = dataset.table_state.object_store.io_stats_incremental();
 
     let expected = requests
         .iter()

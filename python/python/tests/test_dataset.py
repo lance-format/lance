@@ -1941,6 +1941,26 @@ def test_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter="a < 50") == 50
 
 
+@pytest.mark.parametrize(
+    ("predicate", "expected"),
+    [(None, [3, 3]), ("a < 4", [3, 1]), (pc.field("a") < 4, [3, 1])],
+    ids=["unfiltered", "sql", "arrow"],
+)
+def test_count_rows_selected_fragments(tmp_path: Path, predicate, expected):
+    ds = lance.write_dataset(pa.table({"a": range(6)}), tmp_path, max_rows_per_file=3)
+    fragments = ds.get_fragments()
+    with pytest.raises(TypeError, match=r"LanceFragment\.count_rows"):
+        ds.count_rows(filter=predicate, fragments=fragments[:1])
+    assert [fragment.count_rows(filter=predicate) for fragment in fragments] == expected
+
+
+def test_count_rows_selected_fragments_empty(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": range(3)}), tmp_path)
+    with pytest.raises(TypeError, match=r"LanceFragment\.count_rows"):
+        ds.count_rows(fragments=[])
+    assert ds.count_rows(fragments=None, use_threads=False) == 3
+
+
 def test_count_rows_via_scanner(tmp_path: Path):
     ds = lance.write_dataset(pa.table({"a": range(100), "b": range(100)}), tmp_path)
 
