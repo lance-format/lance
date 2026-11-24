@@ -59,6 +59,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -2268,6 +2269,54 @@ public class DatasetTest {
       }
       allocator.assertOpen();
       assertFalse(session.isClosed());
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+  void testCreateBranchFromCheckout(
+      boolean closeBranchFirst, boolean callerOwnsAllocator, @TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        suite.write(empty.version(), 2).close();
+      }
+      OpenDatasetBuilder open = Dataset.open().uri(path);
+      if (callerOwnsAllocator) {
+        open.allocator(allocator);
+      }
+      try (Dataset parent = open.build();
+          Dataset checkout = parent.checkoutVersion(parent.version());
+          Dataset branch = checkout.createBranch("dev", Ref.ofMain())) {
+        BufferAllocator checkoutAllocator = checkout.allocator();
+        BufferAllocator branchAllocator = branch.allocator();
+        Dataset readerSource = closeBranchFirst ? checkout : branch;
+        try (LanceScanner scanner = readerSource.newScan();
+            ArrowReader reader = scanner.scanBatches()) {
+          parent.close();
+          (closeBranchFirst ? branch : checkout).close();
+          if (callerOwnsAllocator) {
+            readerSource.close();
+          }
+          assertTrue(reader.loadNextBatch());
+          assertEquals(2, reader.getVectorSchemaRoot().getRowCount());
+          IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("id");
+          assertEquals(0, ids.get(0));
+          assertEquals(1, ids.get(1));
+          assertFalse(reader.loadNextBatch());
+        }
+        readerSource.close();
+        if (callerOwnsAllocator) {
+          assertSame(allocator, checkoutAllocator);
+          assertSame(allocator, branchAllocator);
+          allocator.assertOpen();
+        } else {
+          assertThrows(IllegalStateException.class, checkoutAllocator::assertOpen);
+          assertThrows(IllegalStateException.class, branchAllocator::assertOpen);
+        }
+      }
     }
   }
 
