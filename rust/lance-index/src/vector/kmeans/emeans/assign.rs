@@ -8,6 +8,14 @@
 //! vectors against a block of centroids come from a single GEMM instead of one
 //! kernel call per vector-centroid pair. Other element types score each pair
 //! with the L2 kernel.
+//!
+//! The expansion rounds in proportion to the norms, so it can lose the gap
+//! between two nearby centroids far from the origin. Vectors and centroids are
+//! scored relative to the centroids' mean, which leaves distances unchanged
+//! and shrinks the norms. That alone is not enough when centroids are close to
+//! each other but spread around the mean, so a vector whose two best scores
+//! are within the rounding bound of each other is reassigned with the direct
+//! L2 kernel. Reported distances always come from the direct kernel.
 
 use lance_linalg::distance::{dot::dot, l2::L2, l2::l2_distance_batch_into};
 use lance_linalg::kernels::argmin_value_float;
@@ -33,10 +41,10 @@ pub(in crate::vector::kmeans) trait NearestCentroid:
     Float + L2 + Send + Sync
 {
     /// Per-centroid data that [`Self::assign_rows`] reuses across calls with
-    /// the same centroids. Empty unless an implementation needs it.
-    fn prepare_centroids(_centroids: &[Self], _dimension: usize) -> Vec<f32> {
-        Vec::new()
-    }
+    /// the same centroids.
+    type Prepared: Sync;
+
+    fn prepare_centroids(centroids: &[Self], dimension: usize) -> Self::Prepared;
 
     /// Vectors [`Self::assign_rows`] scores together against `k` centroids;
     /// fewer rows per call leave its kernels partly idle.
@@ -51,7 +59,7 @@ pub(in crate::vector::kmeans) trait NearestCentroid:
         values: &[Self],
         dimension: usize,
         centroids: &[Self],
-        _prepared: &[f32],
+        _prepared: &Self::Prepared,
         rows: &[usize],
         assignments: &mut Vec<Assignment>,
     ) {
@@ -59,16 +67,48 @@ pub(in crate::vector::kmeans) trait NearestCentroid:
     }
 }
 
-impl NearestCentroid for half::f16 {}
-impl NearestCentroid for f64 {}
+impl NearestCentroid for half::f16 {
+    type Prepared = ();
+
+    fn prepare_centroids(_centroids: &[Self], _dimension: usize) {}
+}
+
+impl NearestCentroid for f64 {
+    type Prepared = ();
+
+    fn prepare_centroids(_centroids: &[Self], _dimension: usize) {}
+}
+
+/// Centroids relative to their mean, as the GEMM path scores them.
+pub(in crate::vector::kmeans) struct CenteredCentroids {
+    center: Vec<f32>,
+    centroids: Vec<f32>,
+    /// The squared norm of every centered centroid.
+    norms: Vec<f32>,
+    /// The largest norm of a centered centroid.
+    max_norm: f32,
+}
 
 impl NearestCentroid for f32 {
-    /// The squared norm of every centroid.
-    fn prepare_centroids(centroids: &[Self], dimension: usize) -> Vec<f32> {
-        centroids
+    type Prepared = CenteredCentroids;
+
+    fn prepare_centroids(centroids: &[Self], dimension: usize) -> CenteredCentroids {
+        let center = centroid_mean(centroids, dimension);
+        let centroids: Vec<Self> = centroids
+            .chunks_exact(dimension)
+            .flat_map(|centroid| centroid.iter().zip(&center).map(|(c, m)| c - m))
+            .collect();
+        let norms: Vec<Self> = centroids
             .chunks_exact(dimension)
             .map(|centroid| dot(centroid, centroid))
-            .collect()
+            .collect();
+        let max_norm = norms.iter().copied().fold(0.0, Self::max).sqrt();
+        CenteredCentroids {
+            center,
+            centroids,
+            norms,
+            max_norm,
+        }
     }
 
     fn tile_rows(k: usize, dimension: usize) -> usize {
@@ -79,16 +119,16 @@ impl NearestCentroid for f32 {
         values: &[Self],
         dimension: usize,
         centroids: &[Self],
-        centroid_norms: &[f32],
+        centered: &CenteredCentroids,
         rows: &[usize],
         assignments: &mut Vec<Assignment>,
     ) {
-        match GemmTiles::new(rows.len(), centroid_norms.len(), dimension) {
+        match GemmTiles::new(rows.len(), centered.norms.len(), dimension) {
             Some(tiles) => assign_rows_gemm(
                 values,
                 dimension,
                 centroids,
-                centroid_norms,
+                centered,
                 rows,
                 tiles,
                 assignments,
@@ -111,6 +151,42 @@ fn assign_rows_pairwise<N: Float + L2>(
         l2_distance_batch_into(vector, centroids, dimension, &mut distances);
         argmin_value_float(distances.iter().copied())
     }));
+}
+
+/// The mean of `centroids`, or the origin if it is not finite, so that one
+/// non-finite centroid cannot leave every vector unassigned.
+fn centroid_mean(centroids: &[f32], dimension: usize) -> Vec<f32> {
+    let mut sum = vec![0.0f64; dimension];
+    for centroid in centroids.chunks_exact(dimension) {
+        for (total, &value) in sum.iter_mut().zip(centroid) {
+            *total += value as f64;
+        }
+    }
+    let num_centroids = (centroids.len() / dimension).max(1) as f64;
+    let mean: Vec<f32> = sum
+        .iter()
+        .map(|total| (total / num_centroids) as f32)
+        .collect();
+    if mean.iter().all(|value| value.is_finite()) {
+        mean
+    } else {
+        vec![0.0; dimension]
+    }
+}
+
+/// How far apart two GEMM scores `||c||^2 - 2 x.c` of one vector must be for
+/// rounding to be unable to swap them, given the norms of the centered vector
+/// and of the largest centered centroid.
+///
+/// A dot product or squared norm of `dimension` terms is within
+/// `dimension * u * (sum of |term|)` of its exact value for any summation
+/// order, where `u` is the unit roundoff, and centering rounds every component
+/// by at most `u` of itself. All of these are below
+/// `(dimension + 4) * u * (|x| + |c|)^2` per score. `f32::EPSILON` is `2u`,
+/// which covers the two scores being compared.
+fn ambiguity_margin(dimension: usize, vector_norm: f32, max_centroid_norm: f32) -> f32 {
+    let scale = vector_norm + max_centroid_norm;
+    (dimension + 4) as f32 * f32::EPSILON * scale * scale
 }
 
 /// Vectors and centroids per GEMM tile, sized so that a tile's product stays
@@ -146,27 +222,36 @@ fn assign_rows_gemm(
     values: &[f32],
     dimension: usize,
     centroids: &[f32],
-    centroid_norms: &[f32],
+    centered: &CenteredCentroids,
     rows: &[usize],
     tiles: GemmTiles,
     assignments: &mut Vec<Assignment>,
 ) {
     let mut vectors = vec![0.0f32; tiles.rows * dimension];
     let mut products = vec![0.0f32; tiles.rows * tiles.centroids];
-    // Per vector of the tile: the smallest `||c||^2 - 2 x.c` so far and its
-    // centroid. `||x||^2` is the same for every centroid and is added after.
-    let mut nearest: Vec<(f32, Option<u32>)> = Vec::with_capacity(tiles.rows);
+    // Per vector of the tile: the two smallest `||c||^2 - 2 x.c` so far and
+    // the centroid of the smallest. `||x||^2` is the same for every centroid.
+    let mut nearest: Vec<(f32, f32, Option<u32>)> = Vec::with_capacity(tiles.rows);
+    let mut distances = Vec::new();
     assignments.reserve(rows.len());
     for tile_rows in rows.chunks(tiles.rows) {
         let num_vectors = tile_rows.len();
         for (vector, &row) in vectors.chunks_exact_mut(dimension).zip(tile_rows) {
-            vector.copy_from_slice(&values[row * dimension..(row + 1) * dimension]);
+            let original = &values[row * dimension..(row + 1) * dimension];
+            for ((value, &original), &mean) in vector.iter_mut().zip(original).zip(&centered.center)
+            {
+                *value = original - mean;
+            }
         }
         let vectors = &vectors[..num_vectors * dimension];
         nearest.clear();
-        nearest.resize(num_vectors, (f32::INFINITY, None));
+        nearest.resize(num_vectors, (f32::INFINITY, f32::INFINITY, None));
 
-        for (block_index, block) in centroids.chunks(tiles.centroids * dimension).enumerate() {
+        for (block_index, block) in centered
+            .centroids
+            .chunks(tiles.centroids * dimension)
+            .enumerate()
+        {
             let first_centroid = block_index * tiles.centroids;
             let num_centroids = block.len() / dimension;
             let products = &mut products[..num_vectors * num_centroids];
@@ -185,25 +270,40 @@ fn assign_rows_gemm(
             {
                 for (offset, (&product, &norm)) in row_products
                     .iter()
-                    .zip(&centroid_norms[first_centroid..first_centroid + num_centroids])
+                    .zip(&centered.norms[first_centroid..first_centroid + num_centroids])
                     .enumerate()
                 {
                     let score = norm - 2.0 * product;
                     // A NaN score never compares less, so a vector with NaN
                     // components stays unassigned, as in the pairwise path.
                     if score < best.0 {
-                        *best = (score, Some((first_centroid + offset) as u32));
+                        *best = (score, best.0, Some((first_centroid + offset) as u32));
+                    } else if score < best.1 {
+                        best.1 = score;
                     }
                 }
             }
         }
 
-        assignments.extend(vectors.chunks_exact(dimension).zip(&nearest).map(
-            |(vector, &(score, centroid))| {
-                // The expansion can round a tiny distance below zero.
-                centroid.map(|centroid| (centroid, (dot(vector, vector) + score).max(0.0)))
-            },
-        ));
+        for ((vector, &row), &(score, runner_up, centroid)) in
+            vectors.chunks_exact(dimension).zip(tile_rows).zip(&nearest)
+        {
+            let original = &values[row * dimension..(row + 1) * dimension];
+            let Some(centroid) = centroid else {
+                assignments.push(None);
+                continue;
+            };
+            let margin = ambiguity_margin(dimension, dot(vector, vector).sqrt(), centered.max_norm);
+            // An infinite runner-up means a single centroid, nothing to swap.
+            if runner_up - score > margin || runner_up.is_infinite() {
+                let chosen = &centroids[centroid as usize * dimension..][..dimension];
+                assignments.push(Some((centroid, f32::l2(original, chosen))));
+            } else {
+                distances.resize(centered.norms.len(), 0.0);
+                l2_distance_batch_into(original, centroids, dimension, &mut distances);
+                assignments.push(argmin_value_float(distances.iter().copied()));
+            }
+        }
     }
 }
 
@@ -218,28 +318,32 @@ mod tests {
         (0..len).map(|_| rng.random_range(-1.0..1.0)).collect()
     }
 
-    /// The GEMM path picks the same centroid as the pairwise path for every
-    /// vector, except where two centroids are within float rounding of each
-    /// other, and reports the same distance up to rounding.
+    /// The GEMM path picks the centroid the pairwise path picks for every
+    /// vector and reports the same distance up to rounding.
     #[rstest]
-    #[case::hierarchy_node(500, 16, 128)]
-    #[case::many_centroid_blocks(300, 700, 96)]
-    #[case::tiny_dimension(100, 8, 3)]
-    #[case::high_dimension(64, 16, 4096)]
+    #[case::hierarchy_node(500, 16, 128, 0.0)]
+    #[case::many_centroid_blocks(300, 700, 96, 0.0)]
+    #[case::tiny_dimension(100, 8, 3, 0.0)]
+    #[case::high_dimension(64, 16, 4096, 0.0)]
+    #[case::far_from_origin(500, 16, 128, 1000.0)]
     fn test_gemm_assignment_matches_pairwise(
         #[case] num_rows: usize,
         #[case] k: usize,
         #[case] dimension: usize,
+        #[case] offset: f32,
     ) {
         let mut rng = SmallRng::seed_from_u64(3);
-        let values = random_values(&mut rng, num_rows * dimension);
-        let centroids = random_values(&mut rng, k * dimension);
+        let mut values = random_values(&mut rng, num_rows * dimension);
+        let mut centroids = random_values(&mut rng, k * dimension);
+        for value in values.iter_mut().chain(&mut centroids) {
+            *value += offset;
+        }
         let mut rows: Vec<usize> = (0..num_rows).collect();
         rows.shuffle(&mut rng);
 
-        let norms = f32::prepare_centroids(&centroids, dimension);
+        let prepared = f32::prepare_centroids(&centroids, dimension);
         let mut gemm = Vec::new();
-        f32::assign_rows(&values, dimension, &centroids, &norms, &rows, &mut gemm);
+        f32::assign_rows(&values, dimension, &centroids, &prepared, &rows, &mut gemm);
         let mut pairwise = Vec::new();
         assign_rows_pairwise(&values, dimension, &centroids, &rows, &mut pairwise);
 
@@ -247,21 +351,12 @@ mod tests {
         for (&row, (gemm, pairwise)) in rows.iter().zip(gemm.iter().zip(&pairwise)) {
             let (gemm_centroid, gemm_distance) = gemm.unwrap();
             let (pairwise_centroid, pairwise_distance) = pairwise.unwrap();
-            let tolerance = 1e-3 * pairwise_distance.max(1.0);
+            assert_eq!(gemm_centroid, pairwise_centroid, "row {row}");
+            let tolerance = 1e-5 * pairwise_distance.max(1.0);
             assert!(
                 (gemm_distance - pairwise_distance).abs() <= tolerance,
                 "row {row}: distance {gemm_distance} vs {pairwise_distance}"
             );
-            if gemm_centroid != pairwise_centroid {
-                let vector = &values[row * dimension..(row + 1) * dimension];
-                let chosen = &centroids[gemm_centroid as usize * dimension..][..dimension];
-                let chosen_distance = f32::l2(vector, chosen);
-                assert!(
-                    (chosen_distance - pairwise_distance).abs() <= tolerance,
-                    "row {row}: centroid {gemm_centroid} at {chosen_distance} is not tied with \
-                     {pairwise_centroid} at {pairwise_distance}"
-                );
-            }
         }
     }
 
@@ -270,13 +365,13 @@ mod tests {
         let dimension = 4;
         let values = vec![1.0, 2.0, 3.0, 4.0, f32::NAN, 0.0, 0.0, 0.0];
         let centroids = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0];
-        let norms = f32::prepare_centroids(&centroids, dimension);
+        let prepared = f32::prepare_centroids(&centroids, dimension);
         let mut assignments = Vec::new();
         f32::assign_rows(
             &values,
             dimension,
             &centroids,
-            &norms,
+            &prepared,
             &[0, 1],
             &mut assignments,
         );

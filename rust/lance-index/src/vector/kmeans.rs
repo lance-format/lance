@@ -514,26 +514,12 @@ fn fits_l2_prepared(num_values: usize, dimension: usize) -> bool {
 
 /// The nearest centroid of every `f32` vector of `data` under L2 and the
 /// squared distance to it, with the tiled GEMM of e-means assignment.
-///
-/// The GEMM scores `||x||^2 - 2 x.c + ||c||^2`, which rounds away the gaps
-/// between nearby centroids when the norms dwarf them, as when a partition
-/// split clusters rows far from the origin and close together. L2 distance
-/// does not change when vectors and centroids move by the same offset, so both
-/// are centered on the centroids' mean first, one task's rows at a time.
 fn gemm_membership_and_dist(
     centroids: &[f32],
     data: &[f32],
     dimension: usize,
 ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
-    let center = centroid_mean(centroids, dimension);
-    let centered = |vectors: &[f32]| -> Vec<f32> {
-        vectors
-            .chunks_exact(dimension)
-            .flat_map(|vector| vector.iter().zip(&center).map(|(v, c)| v - c))
-            .collect()
-    };
-    let centroids = centered(centroids);
-    let norms = f32::prepare_centroids(&centroids, dimension);
+    let prepared = f32::prepare_centroids(centroids, dimension);
     let num_rows = data.len() / dimension;
     let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<f32>()))
         .min(num_rows.div_ceil(MEMBERSHIP_MIN_TASKS))
@@ -542,41 +528,19 @@ fn gemm_membership_and_dist(
         .par_chunks(chunk_rows * dimension)
         .flat_map_iter(|vectors| {
             let _busy = profile::work(Work::Assign);
-            let vectors = centered(vectors);
             let rows: Vec<usize> = (0..vectors.len() / dimension).collect();
             let mut assignments = Vec::with_capacity(rows.len());
             f32::assign_rows(
-                &vectors,
+                vectors,
                 dimension,
-                &centroids,
-                &norms,
+                centroids,
+                &prepared,
                 &rows,
                 &mut assignments,
             );
             assignments.into_iter().map(Option::unzip)
         })
         .unzip()
-}
-
-/// The mean of `centroids`, or the origin if it is not finite, so that one
-/// non-finite centroid cannot leave every vector unassigned.
-fn centroid_mean(centroids: &[f32], dimension: usize) -> Vec<f32> {
-    let mut sum = vec![0.0f64; dimension];
-    for centroid in centroids.chunks_exact(dimension) {
-        for (total, &value) in sum.iter_mut().zip(centroid) {
-            *total += value as f64;
-        }
-    }
-    let num_centroids = (centroids.len() / dimension).max(1) as f64;
-    let mean: Vec<f32> = sum
-        .iter()
-        .map(|total| (total / num_centroids) as f32)
-        .collect();
-    if mean.iter().all(|value| value.is_finite()) {
-        mean
-    } else {
-        vec![0.0; dimension]
-    }
 }
 
 /// [`KMeansAlgo::membership_of_rows`] for `f32` vectors under L2: every task
@@ -590,7 +554,7 @@ fn gemm_membership_of_rows(
     dimension: usize,
     indices: &[usize],
 ) -> Vec<Option<u32>> {
-    let norms = f32::prepare_centroids(centroids, dimension);
+    let prepared = f32::prepare_centroids(centroids, dimension);
     let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<f32>()))
         .min(indices.len().div_ceil(MEMBERSHIP_MIN_TASKS))
         .max(MEMBERSHIP_MIN_TASK_ROWS);
@@ -599,7 +563,14 @@ fn gemm_membership_of_rows(
         .flat_map_iter(|rows| {
             let _busy = profile::work(Work::Assign);
             let mut assignments = Vec::with_capacity(rows.len());
-            f32::assign_rows(data, dimension, centroids, &norms, rows, &mut assignments);
+            f32::assign_rows(
+                data,
+                dimension,
+                centroids,
+                &prepared,
+                rows,
+                &mut assignments,
+            );
             assignments
                 .into_iter()
                 .map(|assignment| assignment.map(|(centroid, _)| centroid))
@@ -2923,6 +2894,64 @@ mod tests {
         }
     }
 
+    /// Pairs of centroids close to each other but far from their common
+    /// mean, which centering alone leaves under the expansion's rounding,
+    /// each keep their own vectors.
+    #[test]
+    fn test_flat_l2_gemm_assignment_close_pairs_spread_around_mean() {
+        let dimension = 32;
+        let centroids: Vec<f32> = [1000.0, 1000.01, -1000.0, -1000.01]
+            .into_iter()
+            .flat_map(|x| (0..dimension).map(move |j| if j == 0 { x } else { 0.0 }))
+            .collect();
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &centroids,
+            &centroids,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+        assert_eq!(membership, vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(distances, vec![Some(0.0); 4]);
+    }
+
+    /// Hierarchical e-means separates groups of identical vectors that are far
+    /// from the origin and closer to each other than the GEMM expansion can
+    /// resolve there.
+    #[test]
+    fn test_hierarchical_emeans_separates_close_groups_far_from_origin() {
+        const DIM: usize = 8;
+        const NUM_GROUPS: usize = 257;
+        let values: Vec<f32> = (0..4)
+            .flat_map(|_| 0..NUM_GROUPS)
+            .flat_map(|group| [1000.0 + group as f32 * 0.001; DIM])
+            .collect();
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+            .unwrap();
+        let params = KMeansParams {
+            seed: Some(42),
+            hierarchical_k: 2,
+            ..Default::default()
+        }
+        .with_hierarchical_node_algorithm(HierarchicalNodeAlgorithm::EMeans(
+            EMeansParams::default(),
+        ));
+
+        let kmeans = KMeans::new_with_params(&data, NUM_GROUPS, &params).unwrap();
+        let mut first_components: Vec<f32> = kmeans
+            .centroids
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks_exact(DIM)
+            .map(|centroid| centroid[0])
+            .collect();
+        first_components.sort_by(f32::total_cmp);
+        first_components.dedup();
+        assert_eq!(first_components.len(), NUM_GROUPS);
+    }
+
     /// With no centroids, flat L2 assignment of vectors too wide for
     /// `L2Prepared`, as a partition split can request, leaves every row
     /// unassigned instead of panicking in the GEMM path.
@@ -2943,27 +2972,32 @@ mod tests {
         assert_eq!(distances, vec![None; 3]);
     }
 
-    /// The GEMM membership of hierarchical nodes picks the child the gathered
-    /// per-vector path picks for every row, up to rounding on exact ties, and
-    /// leaves NaN rows unassigned.
+    /// The GEMM membership of hierarchical nodes picks the child that the
+    /// gathered per-vector path and direct L2 pick for every row, and leaves
+    /// NaN rows unassigned.
     #[rstest]
-    #[case::small_node(100, 16, 64)]
-    #[case::many_tasks(20_000, 16, 128)]
-    #[case::high_dimension(600, 16, 1024)]
-    #[case::many_centroids(3_000, 300, 32)]
+    #[case::small_node(100, 16, 64, 0.0, 1.0)]
+    #[case::many_tasks(20_000, 16, 128, 0.0, 1.0)]
+    #[case::high_dimension(600, 16, 1024, 0.0, 1.0)]
+    #[case::many_centroids(3_000, 300, 32, 0.0, 1.0)]
+    // A deep node: rows within 0.001 of each other at 1000 from the origin,
+    // where an uncentered expansion rounds by more than their gaps.
+    #[case::far_from_origin(3_000, 16, 128, 1000.0, 0.001)]
     fn test_gemm_membership_matches_gathered_path(
         #[case] num_rows: usize,
         #[case] k: usize,
         #[case] dimension: usize,
+        #[case] offset: f32,
+        #[case] spread: f32,
     ) {
         let mut rng = SmallRng::seed_from_u64(11);
         let mut data: Vec<f32> = (0..2 * num_rows * dimension)
-            .map(|_| rng.random_range(-1.0..1.0))
+            .map(|_| offset + rng.random_range(-spread..spread))
             .collect();
         data[dimension..2 * dimension].fill(f32::NAN);
         let centroids: Vec<f32> = data[..k * dimension]
             .iter()
-            .map(|value| value + 0.1)
+            .map(|value| value + 0.1 * spread)
             .collect();
         // A shuffled subset of the rows, as a node of the hierarchy holds.
         let mut indices: Vec<usize> = (0..2 * num_rows).collect();
@@ -2988,22 +3022,21 @@ mod tests {
 
         assert_eq!(gemm.len(), indices.len());
         assert_eq!(gemm[num_rows - 1], None);
-        for ((&row, gemm), gathered) in indices.iter().zip(&gemm).zip(&gathered) {
-            if gemm == gathered {
-                continue;
-            }
-            let (Some(gemm), Some(gathered)) = (gemm, gathered) else {
-                panic!("row {row}: {gemm:?} vs {gathered:?}");
-            };
-            let vector = &data[row * dimension..(row + 1) * dimension];
-            let distance =
-                |c: &u32| l2::l2(vector, &centroids[*c as usize * dimension..][..dimension]);
-            let (a, b) = (distance(gemm), distance(gathered));
-            assert!(
-                (a - b).abs() <= 1e-4 * b.max(1.0),
-                "row {row}: centroid {gemm} at {a} is not tied with {gathered} at {b}"
-            );
-        }
+        assert_eq!(gemm, gathered);
+        // The gathered path shares the GEMM for wide vectors, so check against
+        // direct L2 as well.
+        let direct: Vec<Option<u32>> = indices
+            .iter()
+            .map(|&row| {
+                let vector = &data[row * dimension..(row + 1) * dimension];
+                argmin(
+                    centroids
+                        .chunks_exact(dimension)
+                        .map(|centroid| l2::l2(vector, centroid)),
+                )
+            })
+            .collect();
+        assert_eq!(gemm, direct);
     }
 
     /// Training a node on this thread only regroups chunks into jobs, so it

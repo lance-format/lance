@@ -779,13 +779,13 @@ mod tests {
 
         let stats = assign_batch(&values, dimension, &centroids, k, &batch);
 
-        let norms = f32::prepare_centroids(&centroids, dimension);
+        let prepared = f32::prepare_centroids(&centroids, dimension);
         let mut assignments = Vec::new();
         f32::assign_rows(
             &values,
             dimension,
             &centroids,
-            &norms,
+            &prepared,
             &batch,
             &mut assignments,
         );
