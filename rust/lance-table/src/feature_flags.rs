@@ -322,8 +322,8 @@ pub fn validate_auto_cleanup_config(manifest: &Manifest) -> Result<()> {
 /// Validate a change to [`ZONE_WRITE_SEEDS_VERSION_KEY`].
 ///
 /// Accepts absent, `"0"`, or `"1"`. Call before publishing a commit that
-/// modifies this key, not when carrying inherited configuration across an
-/// unrelated commit.
+/// writes or deletes this key, not when carrying inherited configuration
+/// across an unrelated commit.
 ///
 /// ```
 /// # use lance_table::{feature_flags::validate_zone_write_seeds_version_config, format::Manifest};
@@ -346,13 +346,39 @@ pub fn validate_zone_write_seeds_version_config(manifest: &Manifest) -> Result<(
     Ok(())
 }
 
-/// Whether the manifest's config explicitly opts into version 1 zone write
-/// seeds (`lance.zone_write_seeds.version = "1"`).
+/// Whether the manifest's config asks for version 1 zone write seeds
+/// (`lance.zone_write_seeds.version = "1"`).
+///
+/// This only reads the resulting config. It does not activate
+/// [`FLAG_ZONE_WRITE_SEEDS`]: a table can inherit `"1"` from a build that did
+/// not know the flag (for example, a v14 `update_config`), and that inherited
+/// value must not turn an ordinary commit into an opt-in.
 pub fn zone_write_seeds_v1_enabled(manifest: &Manifest) -> bool {
     manifest
         .config
         .get(ZONE_WRITE_SEEDS_VERSION_KEY)
         .is_some_and(|value| value == "1")
+}
+
+/// Validate and apply an explicit commit write of
+/// [`ZONE_WRITE_SEEDS_VERSION_KEY`].
+///
+/// `written` must be true only when this commit itself sets or deletes the key,
+/// even if the resulting value equals the inherited one. An explicit `"1"`
+/// activates [`FLAG_ZONE_WRITE_SEEDS`] in both feature words; explicit `"0"` or
+/// deletion leaves the flag alone, so an activated table stays sticky while
+/// future writes use version 0. When `written` is false, inherited config is
+/// left untouched and never activates the flag.
+pub fn apply_zone_write_seeds_version_config(manifest: &mut Manifest, written: bool) -> Result<()> {
+    if !written {
+        return Ok(());
+    }
+    validate_zone_write_seeds_version_config(manifest)?;
+    if zone_write_seeds_v1_enabled(manifest) {
+        manifest.reader_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+        manifest.writer_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+    }
+    Ok(())
 }
 
 /// Whether writers targeting `manifest` should emit version 1 zone write seeds

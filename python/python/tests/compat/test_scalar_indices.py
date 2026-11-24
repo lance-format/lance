@@ -974,20 +974,17 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
 
         # Test ZONEMAP IS NULL — two nulls were inserted at rows 0 and 500.
         # Older versions without a null bitmap fall back to a zone scan, which
-        # is still correct; newer versions may return an exact result.
+        # is still correct; newer versions may return an exact result. Derive
+        # the expected count from a full scan so a stale index that misses the
+        # appended row cannot pass by also changing the condition below.
+        expected_nulls = (
+            3 if 1000 in ds.to_table(columns=["idx"]).column("idx").to_pylist() else 2
+        )
         table = ds.to_table(filter="zonemap IS NULL")
-        if 1000 in table.column("idx").to_pylist():
-            # After write, there are 3 NULLs
-            assert table.num_rows == 3
-        else:
-            # Before write, there are 2 NULLs
-            assert table.num_rows == 2
+        assert table.num_rows == expected_nulls
 
         table = ds.to_table(filter="zonemap_str IS NULL")
-        if 1000 in table.column("idx").to_pylist():
-            assert table.num_rows == 3
-        else:
-            assert table.num_rows == 2
+        assert table.num_rows == expected_nulls
 
         # Test BLOOMFILTER
         table = ds.to_table(filter="bloomfilter == 7")
@@ -995,8 +992,11 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         assert table.column("idx").to_pylist() == [7]
 
     def check_write(self):
-        """Verify can insert data and optimize indices."""
+        """Verify can insert data and let the other version optimize."""
         ds = lance.dataset(self.path)
+        before = ds.to_table(
+            filter="zonemap_str IS NULL", use_scalar_index=False
+        ).num_rows
         data = pa.table(
             {
                 "idx": pa.array([1000]),
@@ -1005,17 +1005,55 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
                 "bloomfilter": pa.array([1000]),
             }
         )
-        ds.insert(data)
-        ds.optimize.optimize_indices()
-        ds.optimize.compact_files()
+        if self._running_in_old_venv:
+            # The previous version owns the index update over the candidate
+            # append, which deliberately did not optimize. Verify that update
+            # before adding this version's own row.
+            ds.optimize.optimize_indices()
+            assert ds.to_table(filter="zonemap_str IS NULL").num_rows == before
+            assert (
+                ds.to_table(
+                    filter="zonemap_str IS NULL", use_scalar_index=False
+                ).num_rows
+                == before
+            )
+            assert ds.to_table(filter="zonemap IS NULL").num_rows == before
 
-        # IS NULL must still return results after the index is updated and
-        # files are compacted.  The newly inserted null must be found
-        # regardless of which version handles the seed-based index update.
-        table = ds.to_table(filter="zonemap IS NULL")
-        assert table.num_rows >= 1
-        table = ds.to_table(filter="zonemap_str IS NULL")
-        assert table.num_rows >= 1
+        ds.insert(data)
+        expected = before + 1
+
+        # The append alone must be exact. Do not optimize here: when this runs
+        # in the candidate version, rebuilding the index first would let the
+        # previous-version read skip its index instead of testing that a
+        # previous-version optimization can consume candidate v0 seeds.
+        assert ds.to_table(filter="zonemap_str IS NULL").num_rows == expected
+        assert (
+            ds.to_table(filter="zonemap_str IS NULL", use_scalar_index=False).num_rows
+            == expected
+        )
+        assert ds.to_table(filter="zonemap IS NULL").num_rows == expected
+        assert (
+            ds.to_table(filter="zonemap IS NULL", use_scalar_index=False).num_rows
+            == expected
+        )
+
+        if self._running_in_old_venv:
+            # The old version owns the index update over the candidate-version
+            # append. Both indexed and unindexed results must see every row.
+            ds.optimize.optimize_indices()
+            ds.optimize.compact_files()
+            assert ds.to_table(filter="zonemap_str IS NULL").num_rows == expected
+            assert (
+                ds.to_table(
+                    filter="zonemap_str IS NULL", use_scalar_index=False
+                ).num_rows
+                == expected
+            )
+            assert ds.to_table(filter="zonemap IS NULL").num_rows == expected
+            assert (
+                ds.to_table(filter="zonemap IS NULL", use_scalar_index=False).num_rows
+                == expected
+            )
 
     def skip_downgrade(self, version: str) -> bool:
         # In 0.X the zonemap index did not properly handle NULL in filters

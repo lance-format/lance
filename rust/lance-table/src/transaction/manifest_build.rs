@@ -12,12 +12,11 @@
 
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
-    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, FLAG_ZONE_WRITE_SEEDS,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS,
     ZONE_WRITE_SEEDS_VERSION_KEY, apply_feature_flags, apply_index_object_metadata_flag,
-    apply_row_addr_index_feature_flag, ensure_can_read_manifest, ensure_can_write_manifest,
-    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
-    validate_non_reusable_field_id_flags, validate_zone_write_seeds_version_config,
-    zone_write_seeds_v1_enabled,
+    apply_row_addr_index_feature_flag, apply_zone_write_seeds_version_config,
+    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    managed_blobs_enabled, validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -143,7 +142,7 @@ fn changes_auto_cleanup_config(operation: &Operation) -> bool {
     }
 }
 
-fn changes_zone_write_seeds_version_config(operation: &Operation) -> bool {
+fn writes_zone_write_seeds_version_config(operation: &Operation) -> bool {
     match operation {
         Operation::Overwrite {
             config_upsert_values: Some(values),
@@ -2080,9 +2079,6 @@ impl Transaction {
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;
         }
-        if changes_zone_write_seeds_version_config(&self.operation) {
-            validate_zone_write_seeds_version_config(&manifest)?;
-        }
 
         apply_range_segments(&mut manifest, current_manifest)?;
 
@@ -2145,10 +2141,10 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
 
-        if zone_write_seeds_v1_enabled(&manifest) {
-            manifest.reader_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
-            manifest.writer_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
-        }
+        apply_zone_write_seeds_version_config(
+            &mut manifest,
+            writes_zone_write_seeds_version_config(&self.operation),
+        )?;
 
         apply_index_object_metadata_flag(&mut manifest, &final_indices);
         #[cfg(test)]
@@ -2529,7 +2525,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FLAG_OBJECT_METADATA;
+    use crate::feature_flags::{FLAG_OBJECT_METADATA, FLAG_ZONE_WRITE_SEEDS};
     use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::pb;
     use crate::format::{
@@ -4316,6 +4312,46 @@ mod tests {
             .unwrap();
         assert!(pinned_v0.has_zone_write_seeds());
         assert!(!crate::feature_flags::write_v1_zone_write_seeds(&pinned_v0));
+
+        // An inherited "1" is not an opt-in: an ordinary Append must not activate
+        // the flag for a table a v14 writer configured without knowing it.
+        let mut inherited_v1 = sample_manifest();
+        inherited_v1
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "1".into());
+        let (ordinary_manifest, _) = Transaction::new(
+            inherited_v1.version,
+            Operation::Append { fragments: vec![] },
+            None,
+        )
+        .build_manifest(Some(&inherited_v1), vec![], "txn", &default_build_config())
+        .unwrap();
+        assert!(
+            !ordinary_manifest.has_zone_write_seeds(),
+            "inherited config must not activate the flag"
+        );
+
+        // Writing the same "1" again is an explicit opt-in.
+        let (same_value_manifest, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))
+            .build_manifest(Some(&inherited_v1), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(same_value_manifest.has_zone_write_seeds());
+
+        // An explicit attempt to rewrite an inherited invalid value is rejected,
+        // even though the value did not change.
+        let mut inherited_invalid_for_write = sample_manifest();
+        inherited_invalid_for_write
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "future".into());
+        let error = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("future"))
+            .build_manifest(
+                Some(&inherited_invalid_for_write),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
 
         // An inherited invalid value does not block an unrelated config commit.
         let mut legacy_invalid = sample_manifest();
