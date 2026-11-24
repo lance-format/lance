@@ -19,7 +19,7 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
 ## Concurrency
 
-- The closure passed to `spawn_cpu()` must only consume CPU and return — it must **never** wait on anything: **no channels** (blocking send/recv), **no I/O**, **no locks**, and no `block_on`/`.blocking_*`. The CPU pool can collapse to a single worker in resource-constrained environments (`<= 3` CPUs), so a parked closure can deadlock the whole pool with a silent 0% hang. Keep the waiting in surrounding async code and hand only the pure-CPU work to `spawn_cpu()`. Only dispatch substantial work (rule of thumb: ~100µs+ of CPU); below that the pool overhead outweighs the benefit and the work is better left inline. See the doc comment on `spawn_cpu` for the rationale.
+- The closure passed to `spawn_cpu()` must only consume CPU and return — it must **never** wait on anything: **no channels** (blocking send/recv), **no I/O**, **no locks**, and no `block_on`/`.blocking_*`. The CPU pool can collapse to a single worker in resource-constrained environments (a 1-vCPU machine, or `LANCE_CPU_THREADS=1`), so a parked closure can deadlock the whole pool with a silent 0% hang. Keep the waiting in surrounding async code and hand only the pure-CPU work to `spawn_cpu()`. Only dispatch substantial work (rule of thumb: ~100µs+ of CPU); below that the pool overhead outweighs the benefit and the work is better left inline. See the doc comment on `spawn_cpu` for the rationale.
 
 ## API Design
 
