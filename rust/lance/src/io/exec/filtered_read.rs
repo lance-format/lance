@@ -66,6 +66,7 @@ use lance_select::{
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
+use lance_table_runtime::{Table, rowids::load_row_id_sequence};
 use roaring::RoaringBitmap;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{Instrument, instrument};
@@ -74,7 +75,6 @@ use crate::Dataset;
 use crate::dataset::blob::{BlobMaterializationContext, MaterializedBlobBatch};
 use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig};
 use crate::dataset::fragment_slice::validate_physical_rows;
-use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
     get_default_io_buffer_size_override,
@@ -730,6 +730,7 @@ impl FilteredReadStream {
     ) -> Result<Vec<LoadedFragment>> {
         let io_parallelism = dataset.table_state.object_store.io_parallelism();
         let fragments = options.selected_fragments(dataset.as_ref());
+        let table = Arc::new(dataset.table_view().to_table());
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
         let frag_futs = fragments
@@ -737,6 +738,7 @@ impl FilteredReadStream {
             .map(|frag| {
                 Result::Ok(Self::load_fragment(
                     dataset.clone(),
+                    table.clone(),
                     frag.clone(),
                     options.with_deleted_rows,
                     true,
@@ -779,11 +781,13 @@ impl FilteredReadStream {
 
     async fn load_fragment(
         dataset: Arc<Dataset>,
+        table: Arc<Table>,
         frag: Fragment,
         include_deleted_rows: bool,
         needs_row_ids: bool,
     ) -> Result<LoadedFragment> {
-        let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
+        let file_fragment = FileFragment::from_table(dataset.clone(), table.clone(), frag);
+        let frag = file_fragment.metadata();
         let deletion_vector = if include_deleted_rows {
             None
         } else {
@@ -814,7 +818,7 @@ impl FilteredReadStream {
         let row_id_sequence = if !needs_row_ids {
             None
         } else if dataset.manifest.uses_stable_row_ids() {
-            Some(load_row_id_sequence(dataset.as_ref(), &frag).await?)
+            Some(load_row_id_sequence(&table, frag).await?)
         } else {
             let row_ids_start = frag.id << 32;
             let row_ids_end = row_ids_start + num_physical_rows;
@@ -1051,6 +1055,7 @@ impl FilteredReadStream {
         });
         let projection = Arc::new(options.projection.clone());
         let mut scoped_fragments = Vec::new();
+        let table = Arc::new(dataset.table_view().to_table());
         // Read projection and physical filter for each distinct filter, keyed by
         // `Arc` identity since fragments share their filter's `Arc`
         let mut planned_filters: HashMap<*const Expr, (Arc<Projection>, Arc<dyn PhysicalExpr>)> =
@@ -1082,7 +1087,11 @@ impl FilteredReadStream {
                 };
 
                 scoped_fragments.push(ScopedFragmentRead {
-                    fragment: Arc::new(FileFragment::new(dataset.clone(), fragment.clone())),
+                    fragment: Arc::new(FileFragment::from_table(
+                        dataset.clone(),
+                        table.clone(),
+                        fragment.clone(),
+                    )),
                     ranges: ranges.clone(),
                     projection: projection.clone(),
                     read_projection,
@@ -2898,6 +2907,7 @@ impl FilteredReadExec {
                 // Load fragments to compute the plan
                 let io_parallelism = dataset.table_state.object_store.io_parallelism();
                 let fragments = options.selected_fragments(dataset.as_ref());
+                let table = Arc::new(dataset.table_view().to_table());
 
                 let with_deleted_rows = options.with_deleted_rows;
                 // A range before filtering is expressed in dataset/fragment order. Planning it
@@ -2911,6 +2921,7 @@ impl FilteredReadExec {
                     .map(|fragment| {
                         let dataset = dataset.clone();
                         let evaluated_index = evaluated_index.clone();
+                        let table = table.clone();
                         let fragment = fragment.clone();
                         async move {
                             let metadata_load = if needs_fragment_offsets {
@@ -2930,6 +2941,7 @@ impl FilteredReadExec {
                                     // `LoadedFragment::row_id_sequence`).
                                     FilteredReadStream::load_fragment(
                                         dataset,
+                                        table,
                                         fragment,
                                         with_deleted_rows,
                                         false,
@@ -3255,6 +3267,7 @@ impl RowStreamRead {
         addrs: &RowAddrTreeMap,
     ) -> Result<(FilteredReadInternalPlan, Vec<Fragment>)> {
         let options = &self.source.read_options;
+        let table = Arc::new(self.dataset.table_view().to_table());
         let fragment_futures = addrs
             .iter()
             .filter_map(|(&fragment_id, requested)| {
@@ -3274,10 +3287,11 @@ impl RowStreamRead {
                     RowAddrSelection::Partial(bitmap) => Some(bitmap_to_ranges(bitmap)),
                 };
                 let dataset = self.dataset.clone();
+                let table = table.clone();
                 let descriptor = descriptor.clone();
                 Some(async move {
                     let fragment =
-                        FilteredReadStream::load_fragment(dataset, descriptor, false, false)
+                        FilteredReadStream::load_fragment(dataset, table, descriptor, false, false)
                             .await?;
                     let requested =
                         requested.unwrap_or_else(|| vec![0..fragment.num_physical_rows]);
@@ -7454,7 +7468,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            assert_eq!(base_schedulers.len(), 1);
+            assert_eq!(base_schedulers.num_cached_bases(), 1);
         }
 
         /// Output preserves the input's row order, duplicates, and payload

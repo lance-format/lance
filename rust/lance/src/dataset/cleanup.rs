@@ -1182,7 +1182,7 @@ impl<'a> CleanupTask<'a> {
                     data_dir: dataset.data_dir(),
                     bases: bases.clone(),
                     owner_base_ids: owner_base_ids.clone(),
-                    fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
+                    fragment: lance_table::format::pb::DataFragment::from(fragment.metadata())
                         .encode_to_vec(),
                     fields: fields.clone(),
                     field_ids: field_ids.clone(),
@@ -1198,7 +1198,7 @@ impl<'a> CleanupTask<'a> {
                 let scan_owner_base_ids = owner_base_ids.clone();
                 let descriptor_files = detached_manifest
                     .is_some()
-                    .then(|| BlobDescriptorFiles::new(dataset, &fragment.metadata, &field_ids));
+                    .then(|| BlobDescriptorFiles::new(dataset, fragment.metadata(), &field_ids));
                 let detached_manifest = detached_manifest.clone();
                 let version = dataset.manifest.version;
                 let fragment_id = fragment.id();

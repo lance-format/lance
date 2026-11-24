@@ -12,7 +12,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptions, StorageOptionsAccessor, WrappingObjectStore,
 };
 use lance_table::feature_flags::ensure_can_read_manifest;
-use lance_table::format::{BasePath, Fragment, Manifest};
+use lance_table::format::{BasePath, DataFile, Fragment, Manifest};
 use lance_table::io::{
     commit::{CommitHandler, ManifestLocation, VERSIONS_DIR},
     manifest::read_manifest,
@@ -23,11 +23,11 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 
-use crate::TableSession;
 use crate::base::{has_any_entry, log_unregistered_base_scoped_options};
 use crate::branch_location::BranchLocation;
 use crate::caches::DSMetadataCache;
 use crate::refs::{self, BranchIdentifier, BranchReservation, Branches, Refs, Tags};
+use crate::{FileFragment, TableBuilder, TableSession};
 
 /// A loaded Lance table snapshot with its manifest and reference handles.
 ///
@@ -152,7 +152,8 @@ impl<'a> TableView<'a> {
         }
     }
 
-    pub(crate) fn to_table(&self) -> Table {
+    /// Materialize an owned snapshot with the same storage and cache bindings.
+    pub fn to_table(&self) -> Table {
         Table::from_parts(self.state.clone(), self.manifest.clone(), self.refs.clone())
     }
 
@@ -725,6 +726,21 @@ pub struct VersionTransaction {
 }
 
 impl Table {
+    /// Open the latest snapshot at `uri` with the default reader options.
+    ///
+    /// Use [`TableBuilder`] to select a version or set storage options.
+    ///
+    /// ```no_run
+    /// # async fn example() -> lance_core::Result<()> {
+    /// let table = lance_table_runtime::Table::open("table.lance").await?;
+    /// println!("{}", table.version_id());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open(uri: &str) -> Result<Self> {
+        TableBuilder::from_uri(uri).load().await
+    }
+
     /// Assemble a snapshot using the matching parts returned by into_parts.
     #[doc(hidden)]
     pub fn from_parts(state: TableState, manifest: Arc<Manifest>, refs: Refs) -> Self {
@@ -741,7 +757,7 @@ impl Table {
         (self.state, self.manifest, self.refs)
     }
 
-    fn view(&self) -> TableView<'_> {
+    pub(crate) fn view(&self) -> TableView<'_> {
         TableView::new(&self.state, &self.manifest, &self.refs)
     }
 
@@ -924,6 +940,58 @@ impl Table {
     /// Iterate over manifest fragments without allocating data readers.
     pub fn iter_fragments(&self) -> impl Iterator<Item = &Fragment> {
         self.view().iter_fragments()
+    }
+
+    /// Get readable fragments in manifest order. They share this snapshot.
+    ///
+    /// ```
+    /// # use lance_table_runtime::{FragReadConfig, Table};
+    /// # async fn example(table: &Table) -> lance_core::Result<()> {
+    /// for fragment in table.get_fragments() {
+    ///     let _reader = fragment.open(table.schema(), FragReadConfig::default()).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_fragments(&self) -> Vec<FileFragment> {
+        let table = Arc::new(self.clone());
+        self.iter_fragments()
+            .map(|fragment| FileFragment::new(table.clone(), fragment.clone()))
+            .collect()
+    }
+
+    /// Get a readable fragment by its persisted id.
+    ///
+    /// Returns `None` when the id is absent from this snapshot.
+    pub fn get_fragment(&self, id: usize) -> Option<FileFragment> {
+        let fragment = self.view().find_fragment(id as u64)?.clone();
+        Some(FileFragment::new(Arc::new(self.clone()), fragment))
+    }
+
+    /// Count live rows in this snapshot.
+    ///
+    /// Persisted counts are used when available and trustworthy. Older
+    /// fragments can require I/O to read file metadata and deletions.
+    pub async fn count_rows(&self) -> Result<usize> {
+        let trust_metadata = self.manifest.writer_version.is_some();
+        let table = Arc::new(self.clone());
+        let mut num_rows = 0;
+        let mut need_io = Vec::new();
+        for fragment in self.iter_fragments() {
+            if trust_metadata
+                && !fragment.files.is_empty()
+                && let Some(rows) = fragment.num_rows()
+            {
+                num_rows += rows;
+            } else {
+                need_io.push(FileFragment::new(table.clone(), fragment.clone()));
+            }
+        }
+        stream::iter(need_io)
+            .map(|fragment| async move { fragment.live_rows().await })
+            .buffer_unordered(16)
+            .try_fold(num_rows, |total, rows| async move { Ok(total + rows) })
+            .await
     }
 
     /// Ids of the fragments in this version.
@@ -1150,6 +1218,10 @@ impl Table {
 
     pub fn data_dir(&self) -> Path {
         self.state.data_dir()
+    }
+
+    pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
+        self.view().data_file_dir_for_base(data_file.base_id)
     }
 
     pub fn indices_dir(&self) -> Path {

@@ -48,7 +48,7 @@ async fn test_compaction_balances_non_divisible_stable_task() {
         dataset
             .get_fragments()
             .iter()
-            .map(|fragment| fragment.metadata.physical_rows.unwrap())
+            .map(|fragment| fragment.metadata().physical_rows.unwrap())
             .collect::<Vec<_>>(),
         [vec![11], vec![10; 9]].concat()
     );

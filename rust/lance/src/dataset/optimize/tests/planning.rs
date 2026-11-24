@@ -2898,7 +2898,7 @@ async fn test_max_source_bytes() {
 
     let first_task_base_bytes: u64 = dataset.get_fragments()[..3]
         .iter()
-        .flat_map(|f| f.metadata.files.iter())
+        .flat_map(|f| f.metadata().files.iter())
         .map(|df| df.file_size_bytes.get().unwrap().get())
         .sum();
     let overlay_bytes = dataset.get_fragment(0).unwrap().metadata().overlays[0]

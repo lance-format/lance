@@ -994,7 +994,8 @@ async fn data_file_part_rejects_non_empty_file_relative_inline_blob() {
     blobs.push_bytes(b"ordinary-inline").unwrap();
     let batch = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
     let dataset = dataset_of(batch, LanceFileVersion::V2_2).await;
-    let data_file = &only_fragment(&dataset).metadata.files[0];
+    let fragment = only_fragment(&dataset);
+    let data_file = &fragment.metadata().files[0];
     let scheduler = ScanScheduler::new(
         dataset.table_state.object_store.clone(),
         SchedulerConfig::default_for_testing(),

@@ -576,7 +576,7 @@ mod tests {
             usize::from(maximum_base_id)
         );
         for fragment in dataset.get_fragments() {
-            assert_eq!(fragment.metadata.files[0].base_id, id);
+            assert_eq!(fragment.metadata().files[0].base_id, id);
         }
         let values = dataset
             .take_blobs_by_indices(&[0, 1, 2], "blob")

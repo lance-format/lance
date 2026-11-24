@@ -1922,7 +1922,7 @@ mod tests {
             .unwrap();
         let cloned = Arc::new(Dataset::open(clone_dir.as_ref()).await.unwrap());
         assert_eq!(cloned.get_fragments().len(), 3);
-        let data_file = cloned.get_fragments()[0].metadata.files[0].clone();
+        let data_file = cloned.get_fragments()[0].metadata().files[0].clone();
         assert!(
             data_file.base_id.is_some(),
             "shallow clone data file must reference the source base"

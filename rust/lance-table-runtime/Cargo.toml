@@ -6,18 +6,24 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-description = "Open and inspect Lance table snapshots"
+description = "Open and read Lance table snapshots"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+lance-arrow.workspace = true
 lance-core.workspace = true
+lance-encoding.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
 lance-namespace.workspace = true
 lance-select.workspace = true
 lance-table.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
 async-trait.workspace = true
 byteorder.workspace = true
 chrono.workspace = true
@@ -35,8 +41,6 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-arrow-array.workspace = true
-arrow-schema.workspace = true
 prost-types.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
