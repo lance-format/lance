@@ -117,7 +117,8 @@ public final class VectorTrainer {
    * @param distanceType distance metric of the IVF index
    * @param centroids Float32 IVF centers laid out as [numPartitions][dimension]
    * @return the flattened PQ codebook for {@link PQBuildParams.Builder#setCodebook(float[])}
-   * @throws IllegalArgumentException if the centroid array is null or has an invalid shape
+   * @throws IllegalArgumentException if the centroid array is null, has an invalid shape, or is
+   *     empty when training with L2 or cosine
    */
   public static float[] trainPqCodebook(
       Dataset dataset,
