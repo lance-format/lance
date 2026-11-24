@@ -11093,3 +11093,22 @@ class TestLanceScannerTake:
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner(filter="id >= 4")
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
+
+
+@pytest.mark.parametrize(
+    "method,keyword,error_type",
+    [
+        ("cleanup_old_versions", "older_than", OSError),
+        ("explain_cleanup_old_versions", "older_than", OSError),
+        ("expire_versions", "before", ValueError),
+        ("explain_expire_versions", "before", ValueError),
+    ],
+)
+def test_cleanup_rejects_negative_age(tmp_path: Path, method, keyword, error_type):
+    # A negative age puts the cutoff in the future, which would delete all history
+    # without any error. It must be rejected like every other negative duration.
+    ds = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
+
+    with pytest.raises(error_type, match=f"{keyword} must be non-negative"):
+        getattr(ds, method)(**{keyword: timedelta(days=-1)})
+    assert len(ds.versions()) == 1

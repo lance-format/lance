@@ -330,6 +330,13 @@ impl Dataset {
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
+            if v < 0 {
+                // A negative age moves the cutoff into the future and would delete
+                // every version, including the current one.
+                return Err(lance::Error::invalid_input(format!(
+                    "older_than must be non-negative, got {v} microseconds"
+                )));
+            }
             let older_than = Duration::microseconds(v);
             builder = builder.before_timestamp(Utc::now() - older_than);
         }
@@ -397,6 +404,13 @@ fn expire_versions_policy(
 ) -> PyResult<lance::dataset::expire::ExpireVersionsPolicy> {
     let mut builder = lance::dataset::expire::ExpireVersionsPolicyBuilder::default();
     if let Some(micros) = before_micros {
+        if micros < 0 {
+            // A negative age moves the cutoff into the future and would expire
+            // every version, including the current one.
+            return Err(PyValueError::new_err(format!(
+                "before must be non-negative, got {micros} microseconds"
+            )));
+        }
         // A duration, not an absolute time, matching `cleanup_policy`: the caller says
         // "older than this" and the cutoff is computed here against one clock.
         builder = builder.before_timestamp(Utc::now() - Duration::microseconds(micros));
