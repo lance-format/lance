@@ -67,6 +67,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
+#[cfg(feature = "huggingface")]
+use lance_io::object_store::{
+    ObjectStoreProvider, ObjectStoreRegistry, StorageOptionsAccessor,
+    providers::huggingface::HuggingfaceStoreProvider,
+};
+#[cfg(feature = "huggingface")]
+use wiremock::matchers::{method, path_regex};
+#[cfg(feature = "huggingface")]
+use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
+
 #[rstest]
 #[case::inline("blob.kind = 0", vec![Some(1), None, Some(2)])]
 #[case::null("blob.kind IS NULL", vec![Some(1), Some(0), Some(0), Some(2), Some(0)])]
@@ -591,8 +601,9 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     };
     assert_eq!(dataset.manifest.fragments.len(), 2);
     let before = dataset
+        .table_state
         .object_store
-        .read_dir_all(&dataset.base, None)
+        .read_dir_all(&dataset.table_state.base, None)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -629,8 +640,9 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     .await
     .unwrap();
     let after = dataset
+        .table_state
         .object_store
-        .read_dir_all(&dataset.base, None)
+        .read_dir_all(&dataset.table_state.base, None)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -2234,6 +2246,7 @@ async fn test_read_legacy_and_v2_blob_layouts_from_one_file() {
     .unwrap();
     let data_file_name = format!("{}.lance", Uuid::new_v4());
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&dataset.data_dir().join(data_file_name.as_str()))
         .await
@@ -2403,7 +2416,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     let packed_path = blob_path(&dataset.data_dir(), &file_id, blob_id);
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.table_state.object_store.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2427,7 +2440,12 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     )
     .unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(append_schema.as_ref()).unwrap(),
@@ -2578,7 +2596,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let blob_id = 1;
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.table_state.object_store.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2609,7 +2627,12 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -2714,7 +2737,12 @@ async fn test_create_data_file_skips_blob_orphans_with_top_level_name_collision(
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -3168,12 +3196,12 @@ async fn test_read_blob_files_issue_only_payload_requests(#[case] kind: BlobKind
         .map(|row| handles[*row].as_ref())
         .collect::<Vec<_>>();
     requests.insert(1, None);
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     let blobs = crate::blob::read_blob_files(requests)
         .execute()
         .await
         .unwrap();
-    let handle_stats = dataset.object_store.io_stats_incremental();
+    let handle_stats = dataset.table_state.object_store.io_stats_incremental();
 
     let mut expected = request_rows
         .iter()
@@ -3216,7 +3244,7 @@ async fn test_read_blob_files_issue_only_payload_requests(#[case] kind: BlobKind
         .execute()
         .await
         .unwrap();
-    let row_stats = dataset.object_store.io_stats_incremental();
+    let row_stats = dataset.table_state.object_store.io_stats_incremental();
     assert_eq!(
         rows.iter()
             .map(|blob| blob.data.as_deref())
@@ -3261,7 +3289,7 @@ async fn test_read_blob_file_ranges_coalesce_requests_across_handles() {
         (Some(first_handle), 0, 1000),
     ];
 
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     let results = crate::blob::read_blob_file_ranges(
         requests
             .iter()
@@ -3270,7 +3298,7 @@ async fn test_read_blob_file_ranges_coalesce_requests_across_handles() {
     .execute()
     .await
     .unwrap();
-    let stats = dataset.object_store.io_stats_incremental();
+    let stats = dataset.table_state.object_store.io_stats_incremental();
 
     let expected = requests
         .iter()
@@ -3455,6 +3483,253 @@ async fn test_take_blob_v2_from_non_default_base_dedicated() {
     assert_eq!(
         blob.read().await.unwrap().as_ref(),
         fixture.expected.as_slice()
+    );
+}
+
+#[cfg(feature = "huggingface")]
+#[derive(Debug)]
+struct TestHfStoreProvider {
+    endpoint: String,
+}
+
+#[cfg(feature = "huggingface")]
+#[async_trait::async_trait]
+impl ObjectStoreProvider for TestHfStoreProvider {
+    async fn new_store(
+        &self,
+        base_path: url::Url,
+        params: &ObjectStoreParams,
+    ) -> Result<ObjectStore> {
+        HuggingfaceStoreProvider
+            .new_store_with_test_endpoint(base_path, params, &self.endpoint)
+            .await
+    }
+
+    fn extract_path(&self, url: &url::Url) -> Result<object_store::path::Path> {
+        HuggingfaceStoreProvider.extract_path(url)
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &url::Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        HuggingfaceStoreProvider.calculate_object_store_prefix(url, storage_options)
+    }
+
+    fn calculate_object_store_prefix_for_match(
+        &self,
+        url: &url::Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Option<String>> {
+        HuggingfaceStoreProvider.calculate_object_store_prefix_for_match(url, storage_options)
+    }
+}
+
+#[cfg(feature = "huggingface")]
+fn hf_range_response(body: &[u8], request: &MockRequest) -> ResponseTemplate {
+    let Some(range) = request
+        .headers
+        .get("range")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    let Some((start, end)) = range
+        .strip_prefix("bytes=")
+        .and_then(|range| range.split_once('-'))
+    else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    let Ok(start) = start.parse::<usize>() else {
+        return ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    };
+    if start >= body.len() {
+        return ResponseTemplate::new(416);
+    }
+    let end = end
+        .parse::<usize>()
+        .unwrap_or(body.len() - 1)
+        .min(body.len() - 1);
+    ResponseTemplate::new(206)
+        .insert_header(
+            "content-range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        )
+        .set_body_bytes(body[start..=end].to_vec())
+}
+
+/// Absolute blob URIs for two commit-pinned bases of one Hugging Face
+/// repository resolve through their per-base revision options to different
+/// base IDs while keeping the same relative descriptor path. A reader
+/// interleaves ranges from both bases in one session and sees each commit's
+/// bytes.
+#[cfg(feature = "huggingface")]
+#[tokio::test]
+async fn test_blob_v2_revision_pinned_hf_bases_isolate_reads() {
+    const COMMIT_A: &str = "1111111111111111111111111111111111111111";
+    const COMMIT_B: &str = "2222222222222222222222222222222222222222";
+    const TEST_AUTH: &str = "Bearer synthetic-test-token";
+    let body_a = Bytes::from_static(b"AAAA-1111-ZZZZ");
+    let body_b = Bytes::from_static(b"BBBB-2222-YYYY");
+
+    let server = MockServer::start().await;
+    let auth = Arc::new(std::sync::Mutex::new(Vec::new()));
+    for (commit, body) in [(COMMIT_A, body_a.clone()), (COMMIT_B, body_b.clone())] {
+        let auth = auth.clone();
+        let expected_path = format!(r"^/datasets/acme/repo/resolve/{commit}/data/payload\.bin$");
+        Mock::given(method("GET"))
+            .and(path_regex(expected_path))
+            .respond_with(move |request: &MockRequest| {
+                auth.lock().unwrap().push(
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(TEST_AUTH),
+                );
+                hf_range_response(&body, request)
+            })
+            .mount(&server)
+            .await;
+    }
+
+    let registry = ObjectStoreRegistry::default();
+    registry.insert(
+        "hf",
+        Arc::new(TestHfStoreProvider {
+            endpoint: server.uri(),
+        }),
+    );
+    let session = Arc::new(crate::session::Session::new(0, 0, Arc::new(registry)));
+
+    let dataset_dir = TempStrDir::default();
+    let base_a = format!("hf://datasets/acme/repo@{COMMIT_A}/data");
+    let base_b = format!("hf://datasets/acme/repo@{COMMIT_B}/data");
+    let uri_a = format!("hf://datasets/acme/repo@{COMMIT_A}/data/payload.bin");
+    let uri_b = format!("hf://datasets/acme/repo@{COMMIT_B}/data/payload.bin");
+    let blob_array = complete_blob_v2_array(
+        vec![None, None],
+        vec![Some(uri_a), Some(uri_b)],
+        vec![Some(0), Some(0)],
+        vec![Some(body_a.len() as u64), Some(body_b.len() as u64)],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        complete_blob_v2_field("blob", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from(vec![0, 1])), blob_array],
+    )
+    .unwrap();
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([
+                ("hf_token".to_string(), "synthetic-test-token".to_string()),
+                ("hf_download_mode".to_string(), "http".to_string()),
+                ("base_1.hf_revision".to_string(), COMMIT_A.to_string()),
+                ("base_2.hf_revision".to_string(), COMMIT_B.to_string()),
+            ]),
+        ))),
+        ..Default::default()
+    };
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dataset_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![
+                BasePath::new(1, base_a, None, false),
+                BasePath::new(2, base_b, None, false),
+            ]),
+            store_params: Some(store_params.clone()),
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let descriptors = dataset
+        .scan()
+        .project(&["blob"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let descriptor = descriptors.column(0).as_struct();
+    let kinds = descriptor
+        .column_by_name("kind")
+        .unwrap()
+        .as_primitive::<UInt8Type>();
+    let base_ids = descriptor
+        .column_by_name("blob_id")
+        .unwrap()
+        .as_primitive::<UInt32Type>();
+    let uris = descriptor
+        .column_by_name("blob_uri")
+        .unwrap()
+        .as_string::<i32>();
+    assert_eq!(kinds.value(0), BlobKind::External as u8);
+    assert_eq!(kinds.value(1), BlobKind::External as u8);
+    assert_eq!((base_ids.value(0), base_ids.value(1)), (1, 2));
+    assert_eq!(
+        (uris.value(0), uris.value(1)),
+        ("payload.bin", "payload.bin")
+    );
+
+    let dataset = Arc::new(
+        DatasetBuilder::from_uri(&dataset_dir)
+            .with_session(session)
+            .with_store_params(store_params)
+            .load()
+            .await
+            .unwrap(),
+    );
+    let store_a = dataset.object_store(Some(1)).await.unwrap();
+    let store_b = dataset.object_store(Some(2)).await.unwrap();
+    assert_eq!(
+        store_a.store_prefix,
+        format!("hf$datasets@acme/repo@{COMMIT_A}")
+    );
+    assert_eq!(
+        store_b.store_prefix,
+        format!("hf$datasets@acme/repo@{COMMIT_B}")
+    );
+    assert!(
+        !Arc::ptr_eq(&store_a, &store_b),
+        "commit-pinned bases of one repository must not share a cached store"
+    );
+
+    let blobs = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    let blob_a = blobs[0].as_ref().unwrap();
+    let blob_b = blobs[1].as_ref().unwrap();
+    assert_eq!(blob_a.data_path().to_string(), "data/payload.bin");
+    assert_eq!(blob_b.data_path().to_string(), "data/payload.bin");
+
+    for (range, expected_a, expected_b) in [
+        (0..4, &body_a[0..4], &body_b[0..4]),
+        (5..9, &body_a[5..9], &body_b[5..9]),
+        (10..14, &body_a[10..14], &body_b[10..14]),
+        (0..4, &body_a[0..4], &body_b[0..4]),
+    ] {
+        assert_eq!(
+            blob_a.read_range(range.clone()).await.unwrap().as_ref(),
+            expected_a
+        );
+        assert_eq!(blob_b.read_range(range).await.unwrap().as_ref(), expected_b);
+    }
+
+    let auth = auth.lock().unwrap();
+    assert!(!auth.is_empty(), "mock received no range request");
+    assert!(
+        auth.iter().all(|is_synthetic| *is_synthetic),
+        "mock request did not carry the synthetic test token"
     );
 }
 

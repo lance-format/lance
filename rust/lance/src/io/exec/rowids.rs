@@ -438,7 +438,7 @@ impl AddRowOffsetExec {
                 let num_rows = frag.count_rows(None).await?;
                 Ok::<_, LanceError>((frag.id() as u32, deletion_vector, num_rows))
             })
-            .buffered(dataset.object_store.io_parallelism())
+            .buffered(dataset.table_state.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
 

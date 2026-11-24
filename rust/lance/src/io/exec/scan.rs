@@ -222,7 +222,7 @@ impl LanceStream {
         } else {
             projection.clone()
         };
-        let io_parallelism = dataset.object_store.io_parallelism();
+        let io_parallelism = dataset.table_state.object_store.io_parallelism();
         // First, use the value specified by the user in the call
         // Second, use the default from the environment variable, if specified
         // Finally, use a default based on the io_parallelism
@@ -298,7 +298,7 @@ impl LanceStream {
         }
 
         let scan_scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
+            dataset.table_state.object_store.clone(),
             SchedulerConfig::new(config.io_buffer_size),
         );
         // Shared for this scan so every base file reuses one scheduler per base
@@ -863,9 +863,10 @@ impl ExecutionPlan for LanceScanExec {
             && !self.config.with_make_deletions_null;
         let measured_stream = column_width::measuring(
             lance_stream.boxed(),
-            self.dataset.metadata_cache.clone(),
+            self.dataset.table_state.metadata_cache.clone(),
             self.dataset.manifest().version,
             self.dataset
+                .table_state
                 .manifest_location
                 .e_tag
                 .clone()
@@ -1337,6 +1338,7 @@ mod tests {
         let name: &arrow_schema::Schema = &schema;
         let name = name.field_with_name("name").unwrap();
         let generation = dataset
+            .table_state
             .manifest_location
             .e_tag
             .as_deref()
@@ -1349,7 +1351,12 @@ mod tests {
         };
 
         assert!(
-            dataset.metadata_cache.get_with_key(&key).await.is_none(),
+            dataset
+                .table_state
+                .metadata_cache
+                .get_with_key(&key)
+                .await
+                .is_none(),
             "nothing is measured before the scan runs"
         );
 
@@ -1365,7 +1372,7 @@ mod tests {
         let emitted: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(emitted, 100, "fixture no longer emits what it claims");
 
-        let measured = dataset.metadata_cache.get_with_key(&key).await;
+        let measured = dataset.table_state.metadata_cache.get_with_key(&key).await;
         let width = measured.expect("the drained scan must record a width").0;
         assert!(
             width > 0.0,
@@ -1415,9 +1422,9 @@ mod tests {
         };
         let resolve = || {
             column_width::resolve(
-                &dataset.metadata_cache,
+                &dataset.table_state.metadata_cache,
                 dataset.version().version,
-                dataset.manifest_location.e_tag.as_deref(),
+                dataset.table_state.manifest_location.e_tag.as_deref(),
                 [name].into_iter(),
             )
         };
@@ -1508,9 +1515,9 @@ mod tests {
         let _: Vec<_> = stream.try_collect().await.unwrap();
 
         let measured = column_width::resolve(
-            &dataset.metadata_cache,
+            &dataset.table_state.metadata_cache,
             version,
-            dataset.manifest_location.e_tag.as_deref(),
+            dataset.table_state.manifest_location.e_tag.as_deref(),
             build().schema().fields().iter().map(|f| f.as_ref()),
         )
         .await;

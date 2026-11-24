@@ -23,6 +23,7 @@ use futures::{
     stream::{self},
 };
 use lance_arrow::SchemaExt;
+use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD, Result};
 use roaring::RoaringTreemap;
 use std::sync::{Arc, Mutex};
@@ -31,11 +32,22 @@ use std::sync::{Arc, Mutex};
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
 // we wrap the left side and the right side in a struct and make a single "combined schema"
 fn combined_schema(source: &Schema, target: &Schema) -> Schema {
+    // The fields become nullable children of a struct, which a primary key may
+    // not be, so the primary-key markers are dropped; the planner otherwise
+    // rejects the schema when it converts it to a Lance schema.
     let nullable = |schema: &Schema| -> Fields {
         schema
             .fields
             .iter()
-            .map(|f| f.as_ref().clone().with_nullable(true))
+            .map(|f| {
+                let mut metadata = f.metadata().clone();
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+                f.as_ref()
+                    .clone()
+                    .with_nullable(true)
+                    .with_metadata(metadata)
+            })
             .collect()
     };
     Schema::new(vec![

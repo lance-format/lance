@@ -132,8 +132,18 @@ pub(super) async fn commit_overlay(
     // "data/foo.lance" would resolve to /data/foo.lance (root fs). With
     // base we get e.g. tmp/lance-bench/data/foo.lance → /tmp/lance-bench/data/foo.lance.
     // For memory:// stores base is empty so the result is the same as before.
-    let path = dataset.base.clone().join("data").join(filename.as_str());
-    let obj_writer = dataset.object_store.create(&path).await.unwrap();
+    let path = dataset
+        .table_state
+        .base
+        .clone()
+        .join("data")
+        .join(filename.as_str());
+    let obj_writer = dataset
+        .table_state
+        .object_store
+        .create(&path)
+        .await
+        .unwrap();
     let file_version = dataset.manifest.data_storage_format.lance_file_format();
     let mut writer = lance_file::versions::create_writer(
         file_version,
@@ -2762,9 +2772,14 @@ async fn test_remapping_merge_reads_only_overlaid_rows() {
         .expect("the writer records the data file size")
         .get();
     let appended_file = dataset.get_fragment(1).unwrap().metadata().files[0].clone();
-    dataset.object_store.as_ref().io_stats_incremental(); // Reset
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // Reset
     optimize_into_one_segment(&mut dataset, "age_idx", &OptimizeOptions::merge(2), &[0, 1]).await;
     let requests = dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()
@@ -5300,7 +5315,7 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         .unwrap();
     assert_eq!(plan.tasks.len(), task_count);
     let single_task = task_count == 1;
-    dataset.object_store.io_stats_incremental();
+    dataset.table_state.object_store.io_stats_incremental();
     dataset.optimize_indices(&options).await.unwrap();
     let merged = dataset.load_indices_by_name(index_name).await.unwrap();
     assert_eq!(merged.len(), 1);
@@ -5313,7 +5328,11 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         }
     );
     if !single_task {
-        let requests = dataset.object_store.io_stats_incremental().requests;
+        let requests = dataset
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .requests;
         assert!(
             !requests
                 .iter()

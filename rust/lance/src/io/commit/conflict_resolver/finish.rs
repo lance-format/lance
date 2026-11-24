@@ -106,7 +106,7 @@ impl<'a> TransactionRebase<'a> {
                         .await
                         .map(|dv| (fragment_id, dv))
                     })
-                    .buffered(dataset.object_store.as_ref().io_parallelism())
+                    .buffered(dataset.table_state.object_store.as_ref().io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -158,11 +158,11 @@ impl<'a> TransactionRebase<'a> {
                     }
 
                     let new_deletion_file = write_deletion_file(
-                        &dataset.base,
+                        &dataset.table_state.base,
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
-                        dataset.object_store.as_ref(),
+                        dataset.table_state.object_store.as_ref(),
                         dataset.inline_deletions_max_bytes()?,
                     )
                     .await?;
@@ -174,6 +174,7 @@ impl<'a> TransactionRebase<'a> {
                         deletion_file,
                     };
                     dataset
+                        .table_state
                         .metadata_cache
                         .insert_with_key(&key, Arc::new(dv))
                         .await;
@@ -403,7 +404,7 @@ impl<'a> TransactionRebase<'a> {
                     new_indices,
                     rewrites,
                     dataset.schema(),
-                    dataset.fragment_bitmap.as_ref(),
+                    dataset.table_state.fragment_bitmap.as_ref(),
                     self.current_lineage.as_ref(),
                 );
 

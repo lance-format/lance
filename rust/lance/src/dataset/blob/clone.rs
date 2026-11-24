@@ -223,10 +223,10 @@ pub async fn copy_blob_columns(
     manifest: &mut Manifest,
 ) -> Result<()> {
     let mut target = source.as_ref().clone();
-    target.object_store = store;
-    target.base = base;
-    target.uri = uri.to_string();
-    target.base_object_stores = Default::default();
+    target.table_state.object_store = store;
+    target.table_state.base = base;
+    target.table_state.uri = uri.to_string();
+    target.table_state.clear_base_object_stores();
     target.manifest = Arc::new(manifest.clone());
     let target = Arc::new(target);
     let mut copies = HashMap::new();
@@ -239,11 +239,11 @@ pub async fn copy_blob_columns(
         } else {
             format!("{BLOBS_DIR}/{}.blob", Uuid::new_v4())
         };
-        let target_path = join_base_and_relative_path(&target.base, &target_uri)?;
+        let target_path = join_base_and_relative_path(&target.table_state.base, &target_uri)?;
         source
             .object_store(id)
             .await?
-            .copy_bulk(&path, &target.object_store, &target_path)
+            .copy_bulk(&path, &target.table_state.object_store, &target_path)
             .await?;
         if id.is_some() {
             copies.insert((id, uri), target_uri);

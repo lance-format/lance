@@ -367,8 +367,13 @@ impl ExecutionPlan for VectorIndexExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        let visible_rows = self
+            .batch_store
+            .max_visible_row(self.readable_count)
+            .map_or(0, |row| row as usize + 1);
         Ok(Arc::new(Statistics {
-            num_rows: Precision::Exact(self.query.k),
+            // Visibility and filtering may leave fewer than k results.
+            num_rows: Precision::Inexact(self.query.k.min(visible_rows)),
             total_byte_size: Precision::Absent,
             column_statistics: Statistics::unknown_column(&self.schema()),
         }))

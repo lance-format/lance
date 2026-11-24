@@ -2,6 +2,79 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::context::{DynamicContextProvider, OperationInfo};
+
+/// The builder's three flags have supported combinations that must resolve to
+/// the same discovery behavior they had before the internal mode existed.
+/// Migration is intentionally ignored unless both sources are enabled.
+#[rstest]
+#[case::neither(false, false, false, TableDiscoveryMode::NoDiscovery)]
+#[case::neither_ignores_migration(false, false, true, TableDiscoveryMode::NoDiscovery)]
+#[case::directory(false, true, false, TableDiscoveryMode::DirectoryOnly)]
+#[case::directory_ignores_migration(false, true, true, TableDiscoveryMode::DirectoryOnly)]
+#[case::manifest(true, false, false, TableDiscoveryMode::ManifestOnly)]
+#[case::manifest_ignores_migration(true, false, true, TableDiscoveryMode::ManifestOnly)]
+#[case::directory_first(true, true, false, TableDiscoveryMode::DirectoryFirst)]
+#[case::manifest_first(true, true, true, TableDiscoveryMode::ManifestFirst)]
+fn test_table_discovery_mode_resolution(
+    #[case] manifest_enabled: bool,
+    #[case] dir_listing_enabled: bool,
+    #[case] migration_enabled: bool,
+    #[case] expected_mode: TableDiscoveryMode,
+) {
+    let mode =
+        TableDiscoveryMode::from_flags(manifest_enabled, dir_listing_enabled, migration_enabled);
+    assert_eq!(mode, expected_mode);
+
+    let (has_manifest, has_directory_listing, uses_manifest_for_root, merges_manifest_listing) =
+        match expected_mode {
+            TableDiscoveryMode::NoDiscovery => (false, false, false, false),
+            TableDiscoveryMode::DirectoryOnly => (false, true, false, false),
+            TableDiscoveryMode::ManifestOnly => (true, false, true, false),
+            TableDiscoveryMode::DirectoryFirst => (true, true, false, false),
+            TableDiscoveryMode::ManifestFirst => (true, true, true, true),
+        };
+    assert_eq!(mode.has_manifest(), has_manifest);
+    assert_eq!(mode.has_directory_listing(), has_directory_listing);
+    assert_eq!(mode.uses_manifest_for_root(), uses_manifest_for_root);
+    assert_eq!(mode.merges_manifest_listing(), merges_manifest_listing);
+}
+
+#[tokio::test]
+async fn test_context_provider_retained_for_namespace_lifetime() {
+    #[derive(Debug)]
+    struct Provider;
+
+    impl DynamicContextProvider for Provider {
+        fn provide_context(
+            &self,
+            _info: &OperationInfo,
+        ) -> std::collections::HashMap<String, String> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    let temp_dir = TempStdDir::default();
+    let provider = Arc::new(Provider);
+    let provider_ref = Arc::downgrade(&provider);
+    let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+        .context_provider(provider.clone())
+        .build()
+        .await
+        .unwrap();
+
+    drop(provider);
+    assert!(
+        provider_ref.upgrade().is_some(),
+        "the namespace must keep the context provider alive after build"
+    );
+
+    drop(namespace);
+    assert!(
+        provider_ref.upgrade().is_none(),
+        "dropping the namespace must release the context provider"
+    );
+}
 
 fn build_rq_num_bits(index_type: &str, num_bits: Option<i32>) -> Result<u8> {
     let mut request = CreateTableIndexRequest::new("vector".to_string(), index_type.to_string());

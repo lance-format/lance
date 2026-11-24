@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
-use super::{CommitBuilder, WriteParams, write_fragments_internal};
+use super::{CommitBuilder, WriteParams, write_fragments_internal_with_file_row_counts};
 use crate::dataset::rowids::{
     get_row_id_index, inline_row_lineage_max_bytes, place_carried_row_lineage,
 };
@@ -24,10 +24,9 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::Expr;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::FieldExt;
 use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_TYPE, BlobHandling};
@@ -35,7 +34,9 @@ use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_datafusion::utils::from_datafusion_stream;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowDatasetVersionSequence, RowIdMeta};
 use lance_table::rowids::version::rechunk_version_sequences;
@@ -458,8 +459,10 @@ impl UpdateJob {
 
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
-        let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+        let (stream, row_id_rx) = make_rowid_capture_stream(
+            from_datafusion_stream(stream),
+            self.dataset.manifest.uses_stable_row_ids(),
+        )?;
 
         let scan_schema = stream.schema();
         let expected_schema: ArrowSchema = (&plan.scan_schema).into();
@@ -479,16 +482,10 @@ impl UpdateJob {
             )?);
             let output_schema = rewrite_plan.output_schema().clone();
             let dataset = self.dataset.clone();
-            let transformed = stream.then(move |batch_result| {
+            let transformed = stream.and_then(move |batch| {
                 let dataset = dataset.clone();
                 let rewrite_plan = rewrite_plan.clone();
-                async move {
-                    let batch = batch_result?;
-                    rewrite_plan
-                        .transform_batch(&dataset, batch)
-                        .await
-                        .map_err(|error| DataFusionError::External(Box::new(error)))
-                }
+                async move { rewrite_plan.transform_batch(&dataset, batch).await }
             });
             Box::pin(RecordBatchStreamAdapter::new(output_schema, transformed))
                 as SendableRecordBatchStream
@@ -550,19 +547,19 @@ impl UpdateJob {
                 let output_schema = output_schema.clone();
                 tokio::task::spawn_blocking(move || {
                     Self::apply_updates(batch?, &updates, &blob_columns, &output_schema)
+                        .map_err(Error::from)
                 })
             })
             .buffered(get_num_compute_intensive_cpus())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
-                Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
+                Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e)).into()),
             })
-            .then(move |batch_result| {
+            .and_then(move |batch| {
                 let external_base_resolver = external_base_resolver.clone();
                 let updated_blob_column_indices = updated_blob_column_indices.clone();
                 async move {
-                    let batch = batch_result?;
                     if let Some(resolver) = external_base_resolver.as_deref() {
                         let updated_blob_batch = batch.project(&updated_blob_column_indices)?;
                         let selected_rows = vec![true; batch.num_rows()];
@@ -571,23 +568,23 @@ impl UpdateJob {
                             &updated_blob_batch,
                             &selected_rows,
                         )
-                        .await
-                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                        .await?;
                     }
                     Ok(batch)
                 }
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let (mut new_fragments, _) = write_fragments_internal(
+        let (mut new_fragments, _) = write_fragments_internal_with_file_row_counts(
             self.write_version,
             Some(&self.dataset),
-            self.dataset.object_store.clone(),
-            &self.dataset.base,
+            self.dataset.table_state.object_store.clone(),
+            &self.dataset.table_state.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
             write_params,
             None, // TODO: support multiple bases for update
+            None,
         )
         .await?;
 
@@ -606,8 +603,8 @@ impl UpdateJob {
                 .await;
             if let Err(e) = placed {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
-                    &self.dataset.base,
+                    &self.dataset.table_state.object_store,
+                    &self.dataset.table_state.base,
                     None,
                     &new_fragments,
                 )
@@ -624,8 +621,8 @@ impl UpdateJob {
             Ok(v) => v,
             Err(e) => {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
-                    &self.dataset.base,
+                    &self.dataset.table_state.object_store,
+                    &self.dataset.table_state.base,
                     None,
                     &new_fragments,
                 )
@@ -855,7 +852,7 @@ impl UpdateJob {
                     }
                 }
             })
-            .buffer_unordered(self.dataset.object_store.io_parallelism());
+            .buffer_unordered(self.dataset.table_state.object_store.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -3333,7 +3330,7 @@ mod tests {
         )
         .await
         .unwrap();
-        ds.object_store.io_stats_incremental();
+        ds.table_state.object_store.io_stats_incremental();
         Arc::new(ds)
     }
 
@@ -3359,7 +3356,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows_updated, 32);
-        let read_bytes = ds.object_store.io_stats_incremental().read_bytes;
+        let read_bytes = ds
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_bytes;
         assert_eq!(
             read_bytes >= MATCHED_PAYLOAD_BYTES,
             reads_payload,
