@@ -259,7 +259,7 @@ fn write_base_identity(
         builder.write_str(&base.path);
         builder.write_u64(base.is_dataset_root as u64);
     } else {
-        builder.write_str(&dataset.uri);
+        builder.write_str(&dataset.table_state.uri);
         builder.write_u64(1);
     }
     Ok(())
@@ -288,7 +288,7 @@ pub(super) fn sequence_identity(
     if let RowIdMeta::Column = row_id_meta {
         let file = file.ok_or_else(|| {
             Error::corrupt_file_named(
-                &dataset.uri,
+                &dataset.table_state.uri,
                 format!("fragment {} has no spilled row id file", fragment.id),
             )
         })?;
@@ -616,7 +616,7 @@ pub(super) mod tests {
                 *expected
             );
         }
-        let before = current.object_store.io_stats_snapshot();
+        let before = current.table_state.object_store.io_stats_snapshot();
         for _ in 0..3 {
             for (snapshot, expected) in snapshots.iter().zip(&oracles) {
                 assert_eq!(
@@ -629,7 +629,11 @@ pub(super) mod tests {
             }
         }
         assert_eq!(
-            current.object_store.io_stats_snapshot().read_bytes,
+            current
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes,
             "resident snapshots must share unchanged fragment lookups without rereading sources"
         );
@@ -640,7 +644,7 @@ pub(super) mod tests {
                     .get_with_key(&crate::session::index_caches::RowIdIndexKey {
                         version: snapshot.manifest.version,
                         with_deletions: true,
-                        e_tag: snapshot.manifest_location.e_tag.as_deref(),
+                        e_tag: snapshot.table_state.manifest_location.e_tag.as_deref(),
                     })
                     .await
                     .is_none(),

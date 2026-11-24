@@ -687,8 +687,13 @@ async fn write_value_file(
     // only a human-readable hint: two stagings of the same scenario must not
     // collide, or the second silently overwrites the first's contents.
     let filename = format!("{name}-{}.lance", uuid::Uuid::new_v4());
-    let path = dataset.base.clone().join("data").join(filename.as_str());
-    let writer = dataset.object_store.create(&path).await?;
+    let path = dataset
+        .table_state
+        .base
+        .clone()
+        .join("data")
+        .join(filename.as_str());
+    let writer = dataset.table_state.object_store.create(&path).await?;
     let file_version = dataset.manifest.data_storage_format.lance_file_format();
     let mut writer = lance_file::versions::create_writer(
         file_version,

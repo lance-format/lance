@@ -159,7 +159,7 @@ pub async fn resolve_row_ids(
     if with_deletions && row_ids.iter().all(|id| *id >= dataset.manifest.next_row_id) {
         return Ok(Some(vec![None; row_ids.len()]));
     }
-    if !with_deletions || dataset.manifest_location.e_tag.is_none() {
+    if !with_deletions || dataset.table_state.manifest_location.e_tag.is_none() {
         return get_row_id_index_with(dataset, with_deletions)
             .await?
             .map(|index| index.get_many(row_ids))
@@ -240,7 +240,12 @@ pub(super) async fn resolve_fragments(
             continue;
         }
         let span_key = RowIdFragmentSpanKey { source: key.source };
-        if let Some(span) = dataset.metadata_cache.get_with_key(&span_key).await {
+        if let Some(span) = dataset
+            .table_state
+            .metadata_cache
+            .get_with_key(&span_key)
+            .await
+        {
             range = candidate_range(&span.0, unique_ids);
             if range.is_empty() {
                 excluded_fragments += 1;
@@ -261,7 +266,7 @@ pub(super) async fn resolve_fragments(
         });
     }
     let mut resident_loads = futures::stream::iter(resident_queries)
-        .buffer_unordered(dataset.object_store.io_parallelism());
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
     while let Some((range, addresses)) = resident_loads.try_next().await? {
         record_matches(
             &unique_ids[range.clone()],
@@ -330,7 +335,7 @@ fn preparation_parallelism(dataset: &Dataset, rows: impl Iterator<Item = Option<
         .max(1);
     (PREPARE_ROW_BUDGET / largest)
         .max(1)
-        .min(dataset.object_store.io_parallelism())
+        .min(dataset.table_state.object_store.io_parallelism())
 }
 
 async fn prepare_shared(
@@ -346,7 +351,7 @@ async fn prepare_shared(
     let build = dataset
         .session()
         .row_id_fragment_registry
-        .for_fragment(&dataset.uri, &source_key)?;
+        .for_fragment(&dataset.table_state.uri, &source_key)?;
     let mut slot = build.lock().await;
     if let Some(active) = slot.as_ref()
         && active.usable_without_validation(fragment, key.deletion)
@@ -424,10 +429,11 @@ async fn prepare_shared(
                 .await;
         }
     }
-    dataset
-        .session()
-        .row_id_fragment_registry
-        .prepared(&dataset.uri, &source_key, &active)?;
+    dataset.session().row_id_fragment_registry.prepared(
+        &dataset.table_state.uri,
+        &source_key,
+        &active,
+    )?;
     *slot = Some(active.clone());
     Ok(active)
 }
@@ -508,6 +514,7 @@ async fn prepare_fragment(
         .iter()
         .all(|segment| matches!(segment, U64Segment::Range(_)));
     dataset
+        .table_state
         .metadata_cache
         .insert_with_key(
             &RowIdFragmentSpanKey { source: key.source },
@@ -657,8 +664,15 @@ mod tests {
             metadata_capacity,
             dataset.session().store_registry(),
         ));
-        dataset.index_cache = Arc::new(session.index_cache.for_dataset(&dataset.uri));
-        dataset.metadata_cache = Arc::new(session.metadata_cache.for_dataset(&dataset.uri));
+        dataset.index_cache = Arc::new(session.index_cache.for_dataset(&dataset.table_state.uri));
+        dataset.table_state.metadata_cache = Arc::new(
+            session
+                .metadata_cache()
+                .for_dataset(&dataset.table_state.uri),
+        );
+        dataset
+            .table_state
+            .set_session(session.table_session.clone());
         dataset.session = session;
         dataset
     }
@@ -807,7 +821,7 @@ mod tests {
         .await
         .unwrap();
         let charged_before = dataset.index_cache.size_bytes().await;
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&dataset, &ids, true)
                 .await
@@ -817,7 +831,11 @@ mod tests {
                 .map(|offset| offset.map(|offset| RowAddress::new_from_parts(fragment_id, offset)))
         );
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes,
             "one more deletion must not reread the source after a major rebuild"
         );
@@ -850,7 +868,7 @@ mod tests {
         let final_map = dataset.index_cache.get_with_key(&final_key).await.unwrap();
         assert!(!Arc::ptr_eq(&compacted, &final_map));
         assert_eq!(final_map.retained.as_ref().unwrap().len(), 128);
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&lightly_deleted, &[2053], true)
                 .await
@@ -859,7 +877,11 @@ mod tests {
             vec![Some(RowAddress::new_from_parts(fragment_id, 1))]
         );
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes,
             "an older snapshot must reuse a compatible resident source mapping"
         );
@@ -904,7 +926,7 @@ mod tests {
                 .unwrap(),
             expected
         );
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         for _ in 0..3 {
             assert_eq!(
                 resolve_row_ids(&dataset, &ids, true)
@@ -915,7 +937,11 @@ mod tests {
             );
         }
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes,
             "a cold deleted fragment must retain its live lookup in the small cache"
         );
@@ -991,7 +1017,7 @@ mod tests {
         let dataset = cold_dataset(shuffled_dataset(spilled, false).await, 1 << 20, 1 << 20);
         let expected_7 = scan_address(&dataset, 9).await;
         let expected_31 = scan_address(&dataset, 37).await;
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&dataset, &[7], true)
                 .await
@@ -999,7 +1025,7 @@ mod tests {
                 .unwrap(),
             vec![Some(expected_7)]
         );
-        let after = dataset.object_store.io_stats_snapshot();
+        let after = dataset.table_state.object_store.io_stats_snapshot();
         if spilled {
             assert!(after.read_bytes > before.read_bytes);
         }
@@ -1023,7 +1049,11 @@ mod tests {
             &dataset.index_cache.get_with_key(&first_key).await.unwrap()
         ));
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             after.read_bytes
         );
         assert_eq!(
@@ -1039,7 +1069,7 @@ mod tests {
                 .get_with_key(&crate::session::index_caches::RowIdIndexKey {
                     version: dataset.manifest.version,
                     with_deletions: true,
-                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                    e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
                 })
                 .await
                 .is_none()
@@ -1061,7 +1091,7 @@ mod tests {
                 .get_with_key(&crate::session::index_caches::RowIdIndexKey {
                     version: dataset.manifest.version,
                     with_deletions: true,
-                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                    e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
                 })
                 .await
                 .is_none(),
@@ -1122,7 +1152,7 @@ mod tests {
         );
         // Repeated batches reuse the prepared fragment working set.
         // Subsequent requests must reuse either that view or fragment state.
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&dataset, &ids, true)
                 .await
@@ -1131,7 +1161,11 @@ mod tests {
             expected
         );
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes
         );
         let batch = dataset
@@ -1249,7 +1283,7 @@ mod tests {
                 expected
             );
         }
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&dataset, &ids, true)
                 .await
@@ -1258,7 +1292,11 @@ mod tests {
             expected
         );
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes,
             "a complete view that cannot enter the cache must not cause repeated source reconstruction"
         );
@@ -1295,19 +1333,23 @@ mod tests {
                 .get_with_key(&crate::session::index_caches::RowIdIndexKey {
                     version: dataset.manifest.version,
                     with_deletions: true,
-                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                    e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
                 })
                 .await
                 .is_none()
         );
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         let results =
             futures::future::join_all((0..4).map(|_| resolve_row_ids(&dataset, &ids, true))).await;
         for result in results {
             assert_eq!(result.unwrap().unwrap(), expected);
         }
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes
         );
     }
@@ -1345,12 +1387,12 @@ mod tests {
                 .get_with_key(&crate::session::index_caches::RowIdIndexKey {
                     version: dataset.manifest.version,
                     with_deletions: true,
-                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                    e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
                 })
                 .await
                 .is_none()
         );
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&dataset, &[9, 4, 2], true)
                 .await
@@ -1359,7 +1401,11 @@ mod tests {
             vec![expected[3], expected[1], expected[5]]
         );
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes
         );
     }
@@ -1391,6 +1437,7 @@ mod tests {
             spans.push((
                 span_key,
                 dataset
+                    .table_state
                     .metadata_cache
                     .get_with_key(&span_key)
                     .await
@@ -1400,19 +1447,28 @@ mod tests {
         // Measure the next fragment with no cached file footers, then retain
         // only bounds. Small spilled arrays can otherwise hide in footers.
         let uncached = cold_dataset(dataset.clone(), 0, 0);
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         read_row_id_sequence(&uncached, &dataset.manifest.fragments[3])
             .await
             .unwrap();
-        let source_bytes = dataset.object_store.io_stats_snapshot().read_bytes - before.read_bytes;
+        let source_bytes = dataset
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_bytes
+            - before.read_bytes;
         assert!(source_bytes > 0);
-        dataset.metadata_cache.clear().await;
+        dataset.table_state.metadata_cache.clear().await;
         for (key, span) in spans {
-            dataset.metadata_cache.insert_with_key(&key, span).await;
+            dataset
+                .table_state
+                .metadata_cache
+                .insert_with_key(&key, span)
+                .await;
         }
         dataset.index_cache.clear().await;
         assert!(view.upgrade().is_none());
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         // ID31 is in another fragment; immutable bounds rule out fragment0
         // even after its prepared lookup has been reclaimed.
         let result = resolve_row_ids(&dataset, &[31, 34, 31], true)
@@ -1428,7 +1484,12 @@ mod tests {
         );
         assert!(dataset.index_cache.get_with_key(&key).await.is_none());
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes - before.read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes
+                - before.read_bytes,
             source_bytes
         );
     }
@@ -1460,7 +1521,9 @@ mod tests {
         });
         // Measure the real cache charge, including the current entry overhead.
         let sizing_session = Session::new(1 << 20, 0, dataset.session().store_registry());
-        let sizing_cache = sizing_session.index_cache.for_dataset(&dataset.uri);
+        let sizing_cache = sizing_session
+            .index_cache
+            .for_dataset(&dataset.table_state.uri);
         sizing_cache.insert_with_key(&key, prepared.clone()).await;
         assert!(sizing_cache.get_with_key(&key).await.is_some());
         let weight = sizing_cache.size_bytes().await;
@@ -1474,15 +1537,20 @@ mod tests {
         let expected_31 = scan_address(&dataset, 33).await;
         // Measure the three source misses independently of the resolver. The
         // zero-capacity metadata cache keeps this the same physical read path.
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         for fragment in &dataset.manifest.fragments[..3] {
             read_row_id_sequence(&dataset, fragment).await.unwrap();
         }
-        let source_bytes = dataset.object_store.io_stats_snapshot().read_bytes - before.read_bytes;
+        let source_bytes = dataset
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_bytes
+            - before.read_bytes;
         assert!(source_bytes > 0);
         dataset.index_cache.insert_with_key(&key, prepared).await;
         assert!(dataset.index_cache.get_with_key(&key).await.is_some());
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&dataset, &[31, 7, 31], true)
                 .await
@@ -1491,7 +1559,12 @@ mod tests {
             vec![Some(expected_31), Some(expected_7), Some(expected_31)]
         );
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes - before.read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes
+                - before.read_bytes,
             source_bytes
         );
         assert!(dataset.index_cache.size_bytes().await <= capacity);
@@ -1599,7 +1672,7 @@ mod tests {
         let mut current = cold_dataset(old.clone(), 1 << 20, 1 << 20);
         current.delete("i = 7").await.unwrap();
         current.index_cache = old.index_cache.clone();
-        current.metadata_cache = old.metadata_cache.clone();
+        current.table_state.metadata_cache = old.table_state.metadata_cache.clone();
         current.session = old.session();
         assert!(7 < current.manifest.next_row_id);
         assert_eq!(
@@ -1609,7 +1682,7 @@ mod tests {
                 .unwrap(),
             vec![None, Some(expected_31), None, None]
         );
-        let before = current.object_store.io_stats_snapshot();
+        let before = current.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&current, &[31], true)
                 .await
@@ -1617,7 +1690,7 @@ mod tests {
                 .unwrap(),
             vec![Some(expected_31)]
         );
-        let after_distinct = current.object_store.io_stats_snapshot();
+        let after_distinct = current.table_state.object_store.io_stats_snapshot();
         assert_eq!(after_distinct.read_bytes, before.read_bytes);
         assert_eq!(
             resolve_row_ids(&current, &[31], true)
@@ -1631,7 +1704,11 @@ mod tests {
             vec![Some(expected_7)]
         );
         assert_eq!(
-            current.object_store.io_stats_snapshot().read_bytes,
+            current
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             after_distinct.read_bytes
         );
         let batch = current
@@ -1652,12 +1729,17 @@ mod tests {
         let dataset = cold_dataset(shuffled_dataset(true, true).await, 1 << 20, 1 << 20);
         let expected_7 = scan_address(&dataset, 1).await;
         let expected_31 = scan_address(&dataset, 33).await;
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         for fragment in dataset.manifest.fragments.iter() {
             read_row_id_sequence(&dataset, fragment).await.unwrap();
         }
-        let source_bytes = dataset.object_store.io_stats_snapshot().read_bytes - before.read_bytes;
-        let before = dataset.object_store.io_stats_snapshot();
+        let source_bytes = dataset
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_bytes
+            - before.read_bytes;
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         let (first, other) = tokio::join!(
             resolve_row_ids(&dataset, &[7], true),
             resolve_row_ids(&dataset, &[31], true)
@@ -1665,7 +1747,12 @@ mod tests {
         assert_eq!(first.unwrap().unwrap(), vec![Some(expected_7)]);
         assert_eq!(other.unwrap().unwrap(), vec![Some(expected_31)]);
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes - before.read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes
+                - before.read_bytes,
             source_bytes
         );
         let fragment = dataset
@@ -1721,7 +1808,9 @@ mod tests {
             source: sequence_identity(&dataset, fragment).unwrap(),
             deletion: deletion_identity(&dataset, fragment, true).unwrap(),
         };
-        let cold = registry.for_fragment(&dataset.uri, &key).unwrap();
+        let cold = registry
+            .for_fragment(&dataset.table_state.uri, &key)
+            .unwrap();
         let _cold_guard = cold.lock().await;
         let pending = resolve_row_ids(&dataset, &[31], true);
         tokio::pin!(pending);
@@ -1729,7 +1818,7 @@ mod tests {
             result = &mut pending => panic!("cold query unexpectedly completed: {result:?}"),
             _ = tokio::task::yield_now() => {}
         }
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             resolve_row_ids(&dataset, &[7], true),
@@ -1740,7 +1829,11 @@ mod tests {
         .unwrap();
         assert_eq!(result, vec![Some(expected)]);
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes
         );
     }
@@ -1767,17 +1860,21 @@ mod tests {
                 dataset
                     .session
                     .row_id_fragment_registry
-                    .for_fragment(&dataset.uri, &unrelated)
+                    .for_fragment(&dataset.table_state.uri, &unrelated)
                     .unwrap(),
             );
         }
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         let other = prepare_shared(&dataset, fragment, &key, &[7])
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&held, &other));
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes
         );
         let weak = Arc::downgrade(&held);
@@ -1812,7 +1909,7 @@ mod tests {
     async fn allocation_bound_rejects_only_out_of_range_requests_without_io() {
         let dataset = super::super::cache::tests::dataset(true).await;
         let bound = dataset.manifest.next_row_id;
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         for ids in [vec![bound, bound], vec![bound, u64::MAX], vec![]] {
             assert_eq!(
                 resolve_row_ids(&dataset, &ids, true)
@@ -1823,7 +1920,11 @@ mod tests {
             );
         }
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_iops,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_iops,
             before.read_iops
         );
         let expected = scan_address(&dataset, 7).await;
@@ -1903,7 +2004,7 @@ mod tests {
                 load_deletions(&dataset, fragment, identity).await.unwrap();
             }
         }
-        let before = dataset.object_store.io_stats_snapshot();
+        let before = dataset.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&dataset, &[0], true)
                 .await
@@ -1912,7 +2013,11 @@ mod tests {
             [Some(RowAddress::new_from_parts(0, 0))]
         );
         assert_eq!(
-            dataset.object_store.io_stats_snapshot().read_bytes,
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes,
             "preparing inline mappings must reuse the already cached deletion vectors"
         );
@@ -1946,7 +2051,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let before = current.object_store.io_stats_snapshot();
+        let before = current.table_state.object_store.io_stats_snapshot();
         assert_eq!(
             resolve_row_ids(&current, &ids, true)
                 .await
@@ -1955,7 +2060,11 @@ mod tests {
             expected
         );
         assert_eq!(
-            current.object_store.io_stats_snapshot().read_bytes,
+            current
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes,
             "append must preserve prepared shuffled fragment lookups"
         );
@@ -1977,7 +2086,7 @@ mod tests {
             .iter()
             .find(|f| f.deletion_file.is_some())
             .unwrap();
-        let before = current.object_store.io_stats_snapshot();
+        let before = current.table_state.object_store.io_stats_snapshot();
         let file = changed.deletion_file.as_ref().unwrap();
         lance_table::io::deletion::read_deletion_file(
             changed.id,
@@ -1991,9 +2100,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let deletion_bytes =
-            current.object_store.io_stats_snapshot().read_bytes - before.read_bytes;
-        let before = current.object_store.io_stats_snapshot();
+        let deletion_bytes = current
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_bytes
+            - before.read_bytes;
+        let before = current.table_state.object_store.io_stats_snapshot();
         let deleted = [None, expected[1], None, None];
         assert_eq!(
             resolve_row_ids(&current, &ids, true)
@@ -2003,11 +2116,16 @@ mod tests {
             deleted
         );
         assert_eq!(
-            current.object_store.io_stats_snapshot().read_bytes - before.read_bytes,
+            current
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes
+                - before.read_bytes,
             deletion_bytes,
             "a deletion must read only visibility, never the unchanged row-ID source"
         );
-        let before = current.object_store.io_stats_snapshot();
+        let before = current.table_state.object_store.io_stats_snapshot();
         for _ in 0..3 {
             assert_eq!(
                 resolve_row_ids(&old, &ids, true).await.unwrap().unwrap(),
@@ -2022,7 +2140,11 @@ mod tests {
             );
         }
         assert_eq!(
-            current.object_store.io_stats_snapshot().read_bytes,
+            current
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_bytes,
             before.read_bytes
         );
     }

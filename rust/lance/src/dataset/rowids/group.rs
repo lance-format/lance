@@ -149,7 +149,7 @@ async fn try_resolve_with_threshold(
     min_candidates: usize,
     sample_overlap_trigger: usize,
 ) -> Result<Option<Vec<Option<RowAddress>>>> {
-    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+    let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref() else {
         return Ok(None);
     };
     let route_key = SnapshotRowIdRouteKey {
@@ -233,7 +233,7 @@ async fn find_reusable_group(
     let live = dataset
         .session()
         .row_id_fragment_registry
-        .live_groups(&dataset.uri)?;
+        .live_groups(&dataset.table_state.uri)?;
     if live.is_empty() {
         return Ok(None);
     }
@@ -390,6 +390,7 @@ async fn maybe_build_group(
                 let seq = Arc::new(read_row_id_sequence(dataset, fragment).await?);
                 let span = seq.row_id_range();
                 dataset
+                    .table_state
                     .metadata_cache
                     .insert_with_key(
                         &RowIdFragmentSpanKey { source },
@@ -398,7 +399,7 @@ async fn maybe_build_group(
                     .await;
                 Ok::<_, Error>((frag_idx, source, seq))
             })
-            .buffer_unordered(dataset.object_store.io_parallelism())
+            .buffer_unordered(dataset.table_state.object_store.io_parallelism())
             .try_collect()
             .await?;
 
@@ -422,7 +423,7 @@ async fn maybe_build_group(
     let build_lock = dataset
         .session()
         .row_id_fragment_registry
-        .for_group(&dataset.uri, group_key)?;
+        .for_group(&dataset.table_state.uri, group_key)?;
     let mut slot = build_lock.lock().await;
     if let Some(resident) = dataset
         .index_cache
@@ -466,7 +467,7 @@ async fn maybe_build_group(
         .is_some()
     {
         dataset.session().row_id_fragment_registry.register_group(
-            &dataset.uri,
+            &dataset.table_state.uri,
             group_key,
             &group,
         )?;
@@ -516,7 +517,7 @@ async fn build_dense_lookup(
         .await?;
     }
 
-    let io_par = dataset.object_store.io_parallelism();
+    let io_par = dataset.table_state.object_store.io_parallelism();
     let batch_size = io_par.clamp(1, 32);
     let mut stream = futures::stream::iter(remaining)
         .map(|(frag_idx, source)| async move {
@@ -527,6 +528,7 @@ async fn build_dense_lookup(
             let seq = read_row_id_sequence(dataset, fragment).await?;
             let span = seq.row_id_range();
             dataset
+                .table_state
                 .metadata_cache
                 .insert_with_key(
                     &RowIdFragmentSpanKey { source },
@@ -659,7 +661,7 @@ async fn build_sparse_lookup(
         }
     }
 
-    let io_par = dataset.object_store.io_parallelism();
+    let io_par = dataset.table_state.object_store.io_parallelism();
     let mut stream = futures::stream::iter(remaining)
         .map(|(frag_idx, source)| async move {
             let fragment = &dataset.manifest.fragments[frag_idx];
@@ -669,6 +671,7 @@ async fn build_sparse_lookup(
             let seq = read_row_id_sequence(dataset, fragment).await?;
             let span = seq.row_id_range();
             dataset
+                .table_state
                 .metadata_cache
                 .insert_with_key(
                     &RowIdFragmentSpanKey { source },
@@ -899,7 +902,7 @@ async fn resolve_with_route(
                     Ok::<_, Error>((frag_id, dv))
                 }
             })
-            .buffer_unordered(dataset.object_store.io_parallelism())
+            .buffer_unordered(dataset.table_state.object_store.io_parallelism())
             .try_collect()
             .await?
     };
@@ -1118,8 +1121,10 @@ mod tests {
             16 * 1024 * 1024,
             ds.session().store_registry(),
         ));
-        ds.index_cache = Arc::new(session.index_cache.for_dataset(&ds.uri));
-        ds.metadata_cache = Arc::new(session.metadata_cache.for_dataset(&ds.uri));
+        ds.index_cache = Arc::new(session.index_cache.for_dataset(&ds.table_state.uri));
+        ds.table_state.metadata_cache =
+            Arc::new(session.metadata_cache().for_dataset(&ds.table_state.uri));
+        ds.table_state.set_session(session.table_session.clone());
         ds.session = session;
         ds
     }
@@ -1142,7 +1147,7 @@ mod tests {
         let groups_v0 = ds0
             .session()
             .row_id_fragment_registry
-            .live_groups(&ds0.uri)
+            .live_groups(&ds0.table_state.uri)
             .unwrap();
         assert_eq!(groups_v0.len(), 1);
         let group_ptr = Arc::as_ptr(&groups_v0[0].1);
@@ -1176,7 +1181,7 @@ mod tests {
         let groups_v1 = ds1
             .session()
             .row_id_fragment_registry
-            .live_groups(&ds1.uri)
+            .live_groups(&ds1.table_state.uri)
             .unwrap();
         assert_eq!(groups_v1.len(), 1);
         assert_eq!(Arc::as_ptr(&groups_v1[0].1), group_ptr);
@@ -1196,7 +1201,7 @@ mod tests {
         let groups = ds
             .session()
             .row_id_fragment_registry
-            .live_groups(&ds.uri)
+            .live_groups(&ds.table_state.uri)
             .unwrap();
         assert!(
             groups.is_empty(),
@@ -1216,7 +1221,7 @@ mod tests {
         let groups = ds
             .session()
             .row_id_fragment_registry
-            .live_groups(&ds.uri)
+            .live_groups(&ds.table_state.uri)
             .unwrap();
         assert!(
             groups.is_empty(),
@@ -1231,7 +1236,7 @@ mod tests {
         let groups = ds
             .session()
             .row_id_fragment_registry
-            .live_groups(&ds.uri)
+            .live_groups(&ds.table_state.uri)
             .unwrap();
         assert_eq!(groups.len(), 1);
         let weak = Arc::downgrade(&groups[0].1);

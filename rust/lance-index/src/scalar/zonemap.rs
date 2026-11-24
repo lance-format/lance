@@ -2377,20 +2377,34 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     }
 }
 
+/// Format version emitted by [`ZoneMapSeedWriter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZoneMapSeedVersion {
+    /// Legacy version 0 seed: omits the `"version"` schema metadata and
+    /// `negative_nan_count` column, and marks NaN-bearing float zones with
+    /// `max = +NaN`. Readable by Lance `< 15` without setting
+    /// `FLAG_ZONE_WRITE_SEEDS`.
+    V0,
+    /// Version 1 seed: records `"version" = "1"` metadata and
+    /// `negative_nan_count`, and excludes NaNs from `min`/`max`. Requires
+    /// `FLAG_ZONE_WRITE_SEEDS` on the dataset manifest.
+    #[default]
+    V1,
+}
+
 /// A seed writer that observes column values during data file writes and
 /// accumulates zone map statistics for later harvest during index updates.
 ///
 /// Zone statistics are serialized as Arrow IPC bytes and embedded in the data
 /// file footer as a global buffer, keyed by `"lance.seed.<column_name>"`.
-/// It has one output contract, seed format version 1; a target version, if
-/// one is ever added, must be refused when the writer is created, before any
-/// data file is written. Existing files' seeds are never read on the write
-/// path, so files carrying other seed versions neither block nor slow a write.
+/// Existing files' seeds are never read on the write path, so files carrying
+/// other seed versions neither block nor slow a write.
 #[derive(Debug)]
 pub struct ZoneMapSeedWriter {
     column_name: String,
     rows_per_zone: u64,
     data_type: DataType,
+    version: ZoneMapSeedVersion,
     completed_zones: Vec<ZoneMapStatistics>,
     processor: ZoneMapProcessor,
     rows_in_current_zone: u64,
@@ -2404,6 +2418,10 @@ pub struct ZoneMapSeedWriter {
 
 impl ZoneMapSeedWriter {
     /// Create a new `ZoneMapSeedWriter` for the given column.
+    ///
+    /// Defaults to [`ZoneMapSeedVersion::V1`]; call [`Self::with_version`] to
+    /// emit legacy version 0 seeds for tables that have not activated
+    /// `FLAG_ZONE_WRITE_SEEDS`.
     pub fn new(
         column_name: impl Into<String>,
         rows_per_zone: u64,
@@ -2419,6 +2437,7 @@ impl ZoneMapSeedWriter {
             column_name: column_name.into(),
             rows_per_zone,
             data_type,
+            version: ZoneMapSeedVersion::V1,
             completed_zones: Vec::new(),
             processor,
             rows_in_current_zone: 0,
@@ -2426,6 +2445,12 @@ impl ZoneMapSeedWriter {
             null_offsets: RoaringBitmap::new(),
             collect_null_positions: true,
         })
+    }
+
+    /// Select the seed format version this writer emits.
+    pub fn with_version(mut self, version: ZoneMapSeedVersion) -> Self {
+        self.version = version;
+        self
     }
 
     /// Record exact null positions in the seed (the default) or only counts.
@@ -2437,6 +2462,7 @@ impl ZoneMapSeedWriter {
     fn seed_batch_from_zones(
         zones: &[ZoneMapStatistics],
         data_type: &DataType,
+        version: ZoneMapSeedVersion,
     ) -> Result<arrow_array::RecordBatch> {
         let mins = if zones.is_empty() {
             arrow_array::new_empty_array(data_type)
@@ -2445,6 +2471,18 @@ impl ZoneMapSeedWriter {
         };
         let maxs = if zones.is_empty() {
             arrow_array::new_empty_array(data_type)
+        } else if version == ZoneMapSeedVersion::V0 {
+            // Version 0 consumers expect `max = +NaN` whenever `nan_count > 0`
+            // and ignore any extra columns or version metadata.
+            datafusion_common::ScalarValue::iter_to_array(zones.iter().map(|s| {
+                if s.nan_count > 0
+                    && let Some(nan) = nan_scalar(data_type)
+                {
+                    nan
+                } else {
+                    s.max.clone()
+                }
+            }))?
         } else {
             datafusion_common::ScalarValue::iter_to_array(zones.iter().map(|s| s.max.clone()))?
         };
@@ -2452,40 +2490,60 @@ impl ZoneMapSeedWriter {
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.null_count));
         let nan_counts =
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.nan_count));
-        let negative_nan_counts = arrow_array::UInt32Array::from_iter_values(
-            zones
-                .iter()
-                .map(|s| {
-                    s.negative_nan_count.ok_or_else(|| {
-                        lance_core::Error::invalid_input(
-                            "version 1 seeds require the exact NaN sign split; a zone \
-                             without one cannot be serialized as a seed",
-                        )
-                    })
-                })
-                .collect::<Result<Vec<u32>>>()?,
-        );
         let zone_lengths =
             arrow_array::UInt64Array::from_iter_values(zones.iter().map(|s| s.bound.length as u64));
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("min", data_type.clone(), true),
-            Field::new("max", data_type.clone(), true),
-            Field::new("null_count", DataType::UInt32, false),
-            Field::new("nan_count", DataType::UInt32, false),
-            Field::new("negative_nan_count", DataType::UInt32, false),
-            Field::new("zone_length", DataType::UInt64, false),
-        ]));
-
-        let columns: Vec<ArrayRef> = vec![
-            mins,
-            maxs,
-            Arc::new(null_counts) as ArrayRef,
-            Arc::new(nan_counts) as ArrayRef,
-            Arc::new(negative_nan_counts) as ArrayRef,
-            Arc::new(zone_lengths) as ArrayRef,
-        ];
-        Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
+        match version {
+            ZoneMapSeedVersion::V0 => {
+                let schema = Arc::new(arrow_schema::Schema::new(vec![
+                    Field::new("min", data_type.clone(), true),
+                    Field::new("max", data_type.clone(), true),
+                    Field::new("null_count", DataType::UInt32, false),
+                    Field::new("nan_count", DataType::UInt32, false),
+                    Field::new("zone_length", DataType::UInt64, false),
+                ]));
+                let columns: Vec<ArrayRef> = vec![
+                    mins,
+                    maxs,
+                    Arc::new(null_counts) as ArrayRef,
+                    Arc::new(nan_counts) as ArrayRef,
+                    Arc::new(zone_lengths) as ArrayRef,
+                ];
+                Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
+            }
+            ZoneMapSeedVersion::V1 => {
+                let negative_nan_counts = arrow_array::UInt32Array::from_iter_values(
+                    zones
+                        .iter()
+                        .map(|s| {
+                            s.negative_nan_count.ok_or_else(|| {
+                                lance_core::Error::invalid_input(
+                                    "version 1 seeds require the exact NaN sign split; a zone \
+                                     without one cannot be serialized as a seed",
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<u32>>>()?,
+                );
+                let schema = Arc::new(arrow_schema::Schema::new(vec![
+                    Field::new("min", data_type.clone(), true),
+                    Field::new("max", data_type.clone(), true),
+                    Field::new("null_count", DataType::UInt32, false),
+                    Field::new("nan_count", DataType::UInt32, false),
+                    Field::new("negative_nan_count", DataType::UInt32, false),
+                    Field::new("zone_length", DataType::UInt64, false),
+                ]));
+                let columns: Vec<ArrayRef> = vec![
+                    mins,
+                    maxs,
+                    Arc::new(null_counts) as ArrayRef,
+                    Arc::new(nan_counts) as ArrayRef,
+                    Arc::new(negative_nan_counts) as ArrayRef,
+                    Arc::new(zone_lengths) as ArrayRef,
+                ];
+                Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
+            }
+        }
     }
 
     /// Deserialize zone map seed bytes (Arrow IPC) into zone statistics and a null bitmap.
@@ -2802,19 +2860,25 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
             return Ok(None);
         }
 
-        let batch = Self::seed_batch_from_zones(&self.completed_zones, &self.data_type)?;
+        let batch =
+            Self::seed_batch_from_zones(&self.completed_zones, &self.data_type, self.version)?;
 
         let batch = if self.collect_null_positions {
             Self::with_null_positions_metadata(batch, std::mem::take(&mut self.null_offsets))?
         } else {
             batch
         };
-        let mut schema = batch.schema().as_ref().clone();
-        schema.metadata.insert(
-            SEED_VERSION_META_KEY.to_string(),
-            SEED_FORMAT_VERSION.to_string(),
-        );
-        let batch = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec())?;
+        let batch = match self.version {
+            ZoneMapSeedVersion::V0 => batch,
+            ZoneMapSeedVersion::V1 => {
+                let mut schema = batch.schema().as_ref().clone();
+                schema.metadata.insert(
+                    SEED_VERSION_META_KEY.to_string(),
+                    SEED_FORMAT_VERSION.to_string(),
+                );
+                RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec())?
+            }
+        };
 
         // Serialize to Arrow IPC
         let mut buf = Cursor::new(Vec::new());
@@ -2851,9 +2915,12 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
     }
 
     /// Version 1 seeds change how `max` and zone positions are read, so a
-    /// reader must declare support for them.
+    /// reader must declare support for them. Version 0 seeds require no flag.
     fn required_feature_flags(&self) -> u64 {
-        lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS
+        match self.version {
+            ZoneMapSeedVersion::V0 => 0,
+            ZoneMapSeedVersion::V1 => lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS,
+        }
     }
 }
 

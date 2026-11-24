@@ -516,8 +516,8 @@ async fn test_list_structure_omits_image_payload(
     let mut found = 0;
     let mut actual_layouts = BTreeSet::new();
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     for fragment in dataset.get_fragments() {
         for file in &fragment.metadata().files {
@@ -525,7 +525,12 @@ async fn test_list_structure_omits_image_payload(
                 .data_file_dir(file)
                 .unwrap()
                 .join(file.path.as_str());
-            let bytes = dataset.object_store.read_one_all(&path).await.unwrap();
+            let bytes = dataset
+                .table_state
+                .object_store
+                .read_one_all(&path)
+                .await
+                .unwrap();
             let reader = FileReader::try_open(
                 scheduler
                     .open_file(&path, &file.file_size_bytes)
@@ -586,7 +591,7 @@ async fn test_list_structure_omits_image_payload(
         format!("array_length({column}, 1)"),
     ] {
         let dataset = Dataset::open(&dir).await.unwrap();
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let lengths = dataset
             .scan()
             .project_with_transform(&[("length", expression.as_str())])
@@ -603,7 +608,7 @@ async fn test_list_structure_omits_image_payload(
                 .collect::<Vec<_>>(),
             vec![None, Some(0), Some(1), Some(1), Some(1), Some(2), Some(2)]
         );
-        let stats = dataset.object_store.io_stats_incremental();
+        let stats = dataset.table_state.object_store.io_stats_incremental();
         assert!(stats.read_iops > 0);
         for request in &stats.requests {
             if let Some(payloads) = forbidden.get(&request.path) {
@@ -645,7 +650,7 @@ async fn test_list_structure_omits_image_payload(
         )
         .await
         .unwrap();
-    dataset.object_store.io_stats_incremental();
+    dataset.table_state.object_store.io_stats_incremental();
     let count = dataset
         .count_rows(Some(format!(
             "id >= 2 AND {column} IS NOT NULL AND array_length({column}) > 0"
@@ -653,7 +658,12 @@ async fn test_list_structure_omits_image_payload(
         .await
         .unwrap();
     assert_eq!(count, 4);
-    for request in &dataset.object_store.io_stats_incremental().requests {
+    for request in &dataset
+        .table_state
+        .object_store
+        .io_stats_incremental()
+        .requests
+    {
         if let (Some(payloads), Some(range)) = (forbidden.get(&request.path), &request.range) {
             assert!(
                 !payloads

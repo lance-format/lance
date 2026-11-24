@@ -461,11 +461,7 @@ impl IvfSubIndex for FlatIndex {
         // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
         let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
-        if !prefilter.is_empty() && prefilter.deletions_only() {
-            // A blocked row can only displace a row that every row left in the
-            // heap also beats, so a heap holding no blocked row is exact.
-            // Otherwise this partition is rescanned through the mask.
-            let before = res.clone();
+        if prefilter.is_empty() {
             dist_calc.accumulate_topk_with_scratch(
                 k,
                 params.lower_bound,
@@ -477,52 +473,46 @@ impl IvfSubIndex for FlatIndex {
                 &mut scratch.u8,
                 &mut scratch.u32,
             );
+        } else if prefilter.deletions_only() {
+            // A full heap rejects most distances before they need a mask lookup.
+            // Keep dense scoring even when many rows are deleted.
             let mask = prefilter.mask();
-            if res.iter().all(|candidate| mask.selected(candidate.id)) {
-                return Ok(());
+            dist_calc.accumulate_topk_with_mask(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                |id| storage.row_id(id),
+                Some(&mask),
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+        } else {
+            // The selection and the calculator's candidate buffer share the
+            // u32 scratch: take it for the selection and keep the larger of
+            // the two afterwards.
+            prefilter
+                .mask()
+                .selected_offsets_into(row_ids, &mut scratch.u32);
+            let selected = std::mem::take(&mut scratch.u32);
+            dist_calc.accumulate_filtered_topk_with_scratch(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                selected.iter().map(|&id| (id, storage.row_id(id))),
+                |_| true,
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+            if selected.capacity() > scratch.u32.capacity() {
+                scratch.u32 = selected;
             }
-            *res = before;
         }
-
-        match prefilter.is_empty() {
-            true => {
-                dist_calc.accumulate_topk_with_scratch(
-                    k,
-                    params.lower_bound,
-                    params.upper_bound,
-                    |id| storage.row_id(id),
-                    res,
-                    &mut scratch.distances,
-                    &mut scratch.u16,
-                    &mut scratch.u8,
-                    &mut scratch.u32,
-                );
-            }
-            false => {
-                // The selection and the calculator's candidate buffer share the
-                // u32 scratch: take it for the selection and keep the larger of
-                // the two afterwards.
-                prefilter
-                    .mask()
-                    .selected_offsets_into(row_ids, &mut scratch.u32);
-                let selected = std::mem::take(&mut scratch.u32);
-                dist_calc.accumulate_filtered_topk_with_scratch(
-                    k,
-                    params.lower_bound,
-                    params.upper_bound,
-                    selected.iter().map(|&id| (id, storage.row_id(id))),
-                    |_| true,
-                    res,
-                    &mut scratch.distances,
-                    &mut scratch.u16,
-                    &mut scratch.u8,
-                    &mut scratch.u32,
-                );
-                if selected.capacity() > scratch.u32.capacity() {
-                    scratch.u32 = selected;
-                }
-            }
-        };
         drop(distance_timer);
         Ok(())
     }
@@ -735,7 +725,7 @@ impl TryFrom<Quantizer> for FlatBinQuantizer {
 mod tests {
     use super::*;
 
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, UInt32Array};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
@@ -743,6 +733,15 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+    use crate::vector::bq::RQRotationType;
+    use crate::vector::bq::builder::RabitQuantizer;
+    use crate::vector::bq::storage::{
+        RabitQuantizationMetadata, RabitQuantizationStorage, RabitQueryEstimator,
+    };
+    use crate::vector::bq::transform::RQTransformer;
+    use crate::vector::quantizer::QuantizerStorage;
+    use crate::vector::transform::Transformer;
+    use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
     #[test]
     fn test_schema_is_initialized_once() {
@@ -944,6 +943,95 @@ mod tests {
         assert_eq!(past_deletions, topk(false));
         let row_ids = past_deletions.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         assert_eq!(row_ids, expected);
+    }
+
+    /// A temporary deleted heap winner used to prune the nearest live row
+    /// before a third row evicted it, leaving a clean but incorrect heap.
+    #[test]
+    fn test_deleted_row_cannot_tighten_rabit_pruning_threshold() {
+        const DIM: usize = 64;
+        let identity = Float32Array::from_iter_values(
+            (0..DIM * DIM).map(|i| if i / DIM == i % DIM { 1.0 } else { 0.0 }),
+        );
+        let metadata = RabitQuantizationMetadata {
+            rotate_mat: Some(
+                FixedSizeListArray::try_new_from_values(identity, DIM as i32).unwrap(),
+            ),
+            rotate_mat_position: None,
+            fast_rotation_signs: None,
+            rotation_type: RQRotationType::Matrix,
+            code_dim: DIM as u32,
+            num_bits: 4,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let metric = DistanceType::L2;
+        let Quantizer::Rabit(rq) = RabitQuantizer::from_metadata(&metadata, metric).unwrap() else {
+            unreachable!()
+        };
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap();
+        let mut values = vec![0.0; 3 * DIM];
+        values[DIM..2 * DIM].fill(1.0);
+        values[DIM] = 15.0;
+        values[2 * DIM..].fill(0.25);
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("vector", Arc::new(vectors) as ArrayRef),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(vec![0; 3])) as ArrayRef,
+            ),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0, 288.0, 4.0])) as ArrayRef,
+            ),
+            (
+                ROW_ID_FIELD.name().as_str(),
+                Arc::new(UInt64Array::from(vec![100, 101, 102])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let batch = RQTransformer::new(rq, metric, centroids, "vector")
+            .unwrap()
+            .transform(&batch)
+            .unwrap();
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, metric, None).unwrap();
+        let mut query = vec![0.0; DIM];
+        query[0] = 15.0;
+        let query = Arc::new(Float32Array::from(query)) as ArrayRef;
+
+        // The full-code distances in index order are 225, 63, and 221.5.
+        // Row 101's sign-only lower estimate (~228.6) loses to the deleted
+        // row's 225, even though its full-code distance is the smallest.
+        for deletions_only in [false, true] {
+            let filter = Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter([100]))),
+                deletions_only,
+            });
+            let mut heap = BinaryHeap::new();
+            FlatIndex::default()
+                .accumulate_topk(
+                    query.clone(),
+                    1,
+                    FlatQueryParams {
+                        dist_q_c: 225.0,
+                        ..Default::default()
+                    },
+                    &storage,
+                    filter,
+                    &mut heap,
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            let winner = heap.pop().unwrap();
+            assert_eq!(winner.id, 101);
+            assert!((winner.dist.0 - 63.0).abs() < 0.001);
+        }
     }
 
     #[test]

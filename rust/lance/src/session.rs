@@ -23,6 +23,7 @@ use crate::index::vector::ivf::v2::rabit_scan::RabitScanFactory;
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
 use crate::session::index_caches::GlobalIndexCache;
+use lance_table_runtime::TableSession;
 
 use self::index_extension::IndexExtension;
 
@@ -30,7 +31,7 @@ use self::index_extension::IndexExtension;
 /// a small number of large, unequal partition entries.
 const AUTOMATIC_INDEX_CACHE_SHARD_POLICY: QuickCacheShardPolicy = QuickCacheShardPolicy::Single;
 
-pub(crate) mod caches;
+pub(crate) use lance_table_runtime::caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
 
@@ -62,19 +63,7 @@ pub struct SessionCacheDiagnostics {
     pub metadata: CacheDiagnostics,
 }
 
-/// Access policy for external blob descriptors that do not name a registered base.
-///
-/// This policy also prevents dataset writers from accepting unregistered URI
-/// references and gives controlled services an error without local opt-in advice.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum UnregisteredExternalBlobPolicy {
-    /// Resolve absolute URIs using this session's providers and credentials.
-    #[default]
-    Allow,
-    /// Reject `base_id == 0` before parsing its URI or accessing storage.
-    /// Registered bases remain available under their configured credentials.
-    Deny,
-}
+pub use lance_table_runtime::session::UnregisteredExternalBlobPolicy;
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
@@ -99,20 +88,11 @@ pub struct Session {
     /// datasets and indices.
     pub(crate) index_cache: GlobalIndexCache,
 
-    /// Global cache for file metadata.
-    ///
-    /// Sub-caches are created from this cache for each dataset by adding the
-    /// URI as a key prefix. See the [`LanceDataset::metadata_cache`] field.
-    /// This prevents collisions between different datasets.
-    pub(crate) metadata_cache: caches::GlobalMetadataCache,
+    pub(crate) table_session: Arc<TableSession>,
 
     pub(crate) row_id_fragment_registry: Arc<crate::dataset::rowids::cache::RowIdFragmentRegistry>,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
-
-    store_registry: Arc<ObjectStoreRegistry>,
-
-    unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
 
     spill_store: Arc<dyn SpillStore>,
 
@@ -137,7 +117,7 @@ impl DeepSizeOf for Session {
         let mut size = 0;
         // Measure the actual cache contents through the wrapper types
         size += self.index_cache.deep_size_of_children(context);
-        size += self.metadata_cache.deep_size_of_children(context);
+        size += self.metadata_cache().deep_size_of_children(context);
         size += self.row_id_fragment_registry.deep_size_of_children(context);
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
@@ -155,7 +135,10 @@ impl std::fmt::Debug for Session {
             )
             .field(
                 "file_metadata_cache",
-                &format!("LanceCache(items={})", self.metadata_cache.0.approx_size(),),
+                &format!(
+                    "LanceCache(items={})",
+                    self.file_metadata_cache().approx_size(),
+                ),
             )
             .field(
                 "index_extensions",
@@ -163,7 +146,7 @@ impl std::fmt::Debug for Session {
             )
             .field(
                 "unregistered_external_blob_policy",
-                &self.unregistered_external_blob_policy,
+                &self.unregistered_external_blob_policy(),
             )
             .field("index_origin_latency", &self.index_origin_latency)
             .field("index_resident_columns", &self.index_resident_columns)
@@ -191,27 +174,11 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        Self {
-            index_cache: GlobalIndexCache(Self::build_automatic_quick_cache(
-                index_cache_size,
-                AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
-                CacheMetricsKind::Index,
-            )),
-            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
-                metadata_cache_size,
-                QuickCacheShardPolicy::Recommended,
-                CacheMetricsKind::Metadata,
-            )),
-            row_id_fragment_registry: Default::default(),
-            index_extensions: HashMap::new(),
+        Self::with_cache_backends(
+            CacheSpec::Size(index_cache_size),
+            CacheSpec::Size(metadata_cache_size),
             store_registry,
-            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
-            spill_store: Arc::new(LocalSpillStore::default()),
-            index_origin_latency: None,
-            index_resident_columns: ResidentColumnsSetting::Auto,
-            rabit_scan_factory: None,
-            datafusion_session: None,
-        }
+        )
     }
 
     /// Create a session with a custom index cache backend.
@@ -223,26 +190,11 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        Self {
-            index_cache: GlobalIndexCache(LanceCache::with_backend_and_metrics_kind(
-                index_cache_backend,
-                CacheMetricsKind::Index,
-            )),
-            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
-                metadata_cache_size,
-                QuickCacheShardPolicy::Recommended,
-                CacheMetricsKind::Metadata,
-            )),
-            row_id_fragment_registry: Default::default(),
-            index_extensions: HashMap::new(),
+        Self::with_cache_backends(
+            CacheSpec::Backend(index_cache_backend),
+            CacheSpec::Size(metadata_cache_size),
             store_registry,
-            spill_store: Arc::new(LocalSpillStore::default()),
-            index_origin_latency: None,
-            index_resident_columns: ResidentColumnsSetting::Auto,
-            rabit_scan_factory: None,
-            datafusion_session: None,
-            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
-        }
+        )
     }
 
     /// Set the policy for external blobs without a registered storage base.
@@ -262,7 +214,12 @@ impl Session {
         mut self,
         policy: UnregisteredExternalBlobPolicy,
     ) -> Self {
-        self.unregistered_external_blob_policy = policy;
+        self.table_session = Arc::new(
+            self.table_session
+                .as_ref()
+                .clone()
+                .with_unregistered_external_blob_policy(policy),
+        );
         self
     }
 
@@ -272,7 +229,7 @@ impl Session {
     /// [`Self::with_unregistered_external_blob_policy`] on the replacement.
     /// New sessions default to allowing unregistered references.
     pub fn unregistered_external_blob_policy(&self) -> UnregisteredExternalBlobPolicy {
-        self.unregistered_external_blob_policy
+        self.table_session.unregistered_external_blob_policy()
     }
 
     /// Replace the spill store used by this session.
@@ -456,13 +413,17 @@ impl Session {
             QuickCacheShardPolicy::Recommended,
             CacheMetricsKind::Metadata,
         );
+        let index_cache = GlobalIndexCache(index_cache);
+        let table_session =
+            TableSession::with_caches(index_cache.0.clone(), metadata_cache, store_registry)
+                .with_index_metadata_observer(
+                    crate::index::loading::warn_about_unsupported_indices,
+                );
         Self {
-            index_cache: GlobalIndexCache(index_cache),
-            metadata_cache: GlobalMetadataCache(metadata_cache),
+            index_cache,
+            table_session: Arc::new(table_session),
             row_id_fragment_registry: Default::default(),
             index_extensions: HashMap::new(),
-            store_registry,
-            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
@@ -560,23 +521,27 @@ impl Session {
     /// exact and is not guaranteed to be accurate.
     pub fn approx_num_items(&self) -> usize {
         self.index_cache.0.approx_size()
-            + self.metadata_cache.0.approx_size()
+            + self.file_metadata_cache().approx_size()
             + self.index_extensions.len()
     }
 
     /// Get the object store registry.
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
-        self.store_registry.clone()
+        self.table_session.store_registry()
+    }
+
+    pub(crate) fn metadata_cache(&self) -> &GlobalMetadataCache {
+        self.table_session.metadata_cache()
     }
 
     /// Get a reference to the raw metadata cache (for use in index reconstruction).
     pub fn file_metadata_cache(&self) -> &LanceCache {
-        &self.metadata_cache.0
+        self.metadata_cache().cache()
     }
 
     /// Fetch statistics for the metadata cache
     pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
-        self.metadata_cache.0.stats().await
+        self.file_metadata_cache().stats().await
     }
 
     /// Fetch statistics for the index cache
@@ -595,7 +560,7 @@ impl Session {
     pub fn cache_diagnostics(&self) -> SessionCacheDiagnostics {
         SessionCacheDiagnostics {
             index: self.index_cache.0.diagnostics(),
-            metadata: self.metadata_cache.0.diagnostics(),
+            metadata: self.file_metadata_cache().diagnostics(),
         }
     }
 
@@ -607,7 +572,7 @@ impl Session {
     ) -> SessionCacheDiagnostics {
         let (index, metadata) = futures::join!(
             self.index_cache.0.diagnostics_with_mode(mode),
-            self.metadata_cache.0.diagnostics_with_mode(mode),
+            self.file_metadata_cache().diagnostics_with_mode(mode),
         );
         SessionCacheDiagnostics { index, metadata }
     }
@@ -634,7 +599,7 @@ impl Session {
     ) -> SessionCacheDiagnostics {
         let (index, metadata) = futures::join!(
             self.index_cache.0.diagnostics_by_type(mode),
-            self.metadata_cache.0.diagnostics_by_type(mode),
+            self.file_metadata_cache().diagnostics_by_type(mode),
         );
         SessionCacheDiagnostics { index, metadata }
     }
@@ -656,7 +621,7 @@ impl Session {
     /// Resize the metadata cache, evicting entries as needed to fit the new
     /// weighted capacity; see [`Self::set_index_cache_capacity`].
     pub fn set_metadata_cache_capacity(&self, capacity: usize) -> Result<()> {
-        self.metadata_cache.0.set_capacity(capacity)
+        self.file_metadata_cache().set_capacity(capacity)
     }
 }
 
@@ -768,8 +733,7 @@ mod tests {
                 );
                 assert!(
                     session
-                        .metadata_cache
-                        .0
+                        .file_metadata_cache()
                         .get_with_key(&TestKey("metrics-metadata"))
                         .await
                         .is_none()
@@ -935,7 +899,7 @@ mod tests {
         );
         // Metadata cache fell back to a size-based default. We can only
         // sanity-check that the session was constructed without panicking.
-        let stats = session.metadata_cache.0.stats().await;
+        let stats = session.file_metadata_cache().stats().await;
         assert_eq!(stats.num_entries, 0);
     }
 
@@ -960,14 +924,12 @@ mod tests {
         );
 
         session
-            .metadata_cache
-            .0
+            .file_metadata_cache()
             .insert_with_key(&TestKey("metadata-cache"), Arc::new(vec![4, 5, 6]))
             .await;
         assert!(
             session
-                .metadata_cache
-                .0
+                .file_metadata_cache()
                 .get_with_key(&TestKey("metadata-cache"))
                 .await
                 .is_some()
@@ -1078,14 +1040,16 @@ mod tests {
                 .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
                 .await;
             session
-                .metadata_cache
-                .0
+                .file_metadata_cache()
                 .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
                 .await;
         }
         let entry_bytes = session.index_cache.size_bytes().await / 4;
         assert!(entry_bytes > 0);
-        assert_eq!(session.metadata_cache.0.size_bytes().await, 4 * entry_bytes);
+        assert_eq!(
+            session.file_metadata_cache().size_bytes().await,
+            4 * entry_bytes
+        );
 
         // Clones share the cache, so every handle observes the new capacity.
         let clone = session.clone();
@@ -1099,10 +1063,10 @@ mod tests {
             assert!(cache.size().await <= 2);
         }
         assert_eq!(
-            session.metadata_cache.0.capacity_bytes(),
+            session.file_metadata_cache().capacity_bytes(),
             Some(2 * entry_bytes)
         );
-        assert!(session.metadata_cache.0.size_bytes().await <= 2 * entry_bytes);
+        assert!(session.file_metadata_cache().size_bytes().await <= 2 * entry_bytes);
     }
 
     #[tokio::test]
@@ -1120,7 +1084,7 @@ mod tests {
 
         // The default metadata backend supports resizing.
         session.set_metadata_cache_capacity(1024).unwrap();
-        assert_eq!(session.metadata_cache.0.capacity_bytes(), Some(1024));
+        assert_eq!(session.file_metadata_cache().capacity_bytes(), Some(1024));
     }
 
     #[tokio::test]

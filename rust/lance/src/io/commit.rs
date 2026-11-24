@@ -88,7 +88,7 @@ pub mod conflict_resolver;
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
-pub mod namespace_manifest;
+pub use lance_table_runtime::namespace_manifest;
 #[cfg(all(feature = "dynamodb", test))]
 mod s3_ddb_profile_test;
 #[cfg(all(feature = "dynamodb_tests", test))]
@@ -886,7 +886,7 @@ async fn migrate_manifest(
 
 #[cfg(test)]
 fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
-    crate::dataset::versions::check_manifest_storage_version(manifest)
+    lance_table::format::storage_contract::check_manifest_storage_version(manifest)
 }
 
 /// Reject a manifest in which two fragments share an id. Per-fragment state is
@@ -911,7 +911,7 @@ fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
 
 #[cfg(test)]
 fn check_column_indices(manifest: &Manifest) -> Result<()> {
-    crate::dataset::versions::validate_column_indices(manifest)
+    lance_table::format::storage_contract::validate_column_indices(manifest)
 }
 
 /// Fix schema in case of duplicate field ids.
@@ -1121,7 +1121,7 @@ pub(crate) async fn migrate_fragments(
                 ..fragment.clone()
             })
         })
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.table_state.object_store.io_parallelism())
         // Filter out empty fragments
         .try_filter(|frag| futures::future::ready(frag.num_rows().map(|n| n > 0).unwrap_or(false)))
         .boxed();
@@ -1384,7 +1384,13 @@ pub(crate) async fn do_commit_detached_transaction(
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = if !build_config.disable_transaction_file() {
-        write_transaction_file(object_store, &dataset.base, &pb_transaction, None).await?
+        write_transaction_file(
+            object_store,
+            &dataset.table_state.base,
+            &pb_transaction,
+            None,
+        )
+        .await?
     } else {
         String::new()
     };
@@ -1408,7 +1414,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     version,
                     &attempt_build_config,
                     &transaction_file,
@@ -1427,14 +1433,14 @@ pub(crate) async fn do_commit_detached_transaction(
                     FragReuseUpdate::None,
                 )
                 .await?;
-                let (mut manifest, mut indices) = transaction.build_manifest_prepared(
+                let (manifest, mut indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
                     &attempt_build_config,
                     None,
                 )?;
-                finish_built_manifest(dataset, transaction, &mut manifest, &mut indices).await?;
+                finish_built_manifest(dataset, transaction, &mut indices).await?;
                 (manifest, indices)
             }
         };
@@ -1450,7 +1456,12 @@ pub(crate) async fn do_commit_detached_transaction(
             )
             .await;
             if checked.is_err() {
-                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &transaction_file,
+                )
+                .await;
             }
             checked
         })
@@ -1469,7 +1480,9 @@ pub(crate) async fn do_commit_detached_transaction(
             &manifest,
             &transaction.operation,
         )?;
-        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
+        lance_table::format::storage_contract::check_manifest_storage_version_for_commit(
+            &mut manifest,
+        )?;
         check_fragment_ids(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
@@ -1494,7 +1507,8 @@ pub(crate) async fn do_commit_detached_transaction(
         )
         .await
         {
-            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            cleanup_transaction_file(object_store, &dataset.table_state.base, &transaction_file)
+                .await;
             return Err(error);
         }
 
@@ -1503,7 +1517,7 @@ pub(crate) async fn do_commit_detached_transaction(
         let result = write_manifest_file(
             object_store,
             commit_handler,
-            &dataset.base,
+            &dataset.table_state.base,
             &mut manifest,
             if indices.is_empty() {
                 None
@@ -1528,7 +1542,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     manifest.version,
                     transaction,
                     None,
@@ -1553,14 +1567,24 @@ pub(crate) async fn do_commit_detached_transaction(
                     }
                 }
                 if start.elapsed() > retry_timeout {
-                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.table_state.base,
+                        &transaction_file,
+                    )
+                    .await;
                     return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
                 }
                 let sleep_fut = tokio::time::sleep(backoff.next_backoff());
                 if let Err(error) =
                     maybe_timeout(backoff.attempt(), start, retry_timeout, sleep_fut).await
                 {
-                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.table_state.base,
+                        &transaction_file,
+                    )
+                    .await;
                     return Err(error);
                 }
                 // The inline copy was moved into the failed attempt; rebuild
@@ -1575,7 +1599,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     manifest.version,
                     transaction,
                     None,
@@ -1599,7 +1623,12 @@ pub(crate) async fn do_commit_detached_transaction(
                         ));
                     }
                 }
-                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &transaction_file,
+                )
+                .await;
                 return Err(err);
             }
         }
@@ -1607,7 +1636,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+    cleanup_transaction_file(object_store, &dataset.table_state.base, &transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -1700,19 +1729,17 @@ async fn composite_frag_reuse_update(
 }
 
 /// The IO a freshly built manifest still needs: an action-based history that
-/// outgrew the inline limit moves to an external file, and the seed feature
-/// flags follow the final index list. One await point, rather than one per
-/// step, keeps the commit loop's future under the `large_futures` limit.
+/// outgrew the inline limit moves to an external file. Keeping this behind one
+/// await point keeps the commit loop's future under the `large_futures` limit.
 async fn finish_built_manifest(
     dataset: &Dataset,
     transaction: &Transaction,
-    manifest: &mut Manifest,
     indices: &mut [IndexMetadata],
 ) -> Result<()> {
     if matches!(transaction.operation, Operation::CompositeOperation(_)) {
         crate::index::frag_reuse::spill_frag_reuse_history(dataset, indices).await?;
     }
-    crate::dataset::write::seeds::apply_seed_feature_flags(manifest, indices, dataset).await
+    Ok(())
 }
 
 /// Step one of a commit attempt (`Transaction::prepare_indices`): the index
@@ -1805,6 +1832,7 @@ async fn record_successful_commit(
         version: manifest.version,
     };
     dataset
+        .table_state
         .metadata_cache
         .insert_with_key(&tx_key, Arc::new(transaction.clone()))
         .await;
@@ -1814,13 +1842,14 @@ async fn record_successful_commit(
         e_tag: location.e_tag.as_deref(),
     };
     dataset
+        .table_state
         .metadata_cache
         .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
         .await;
     if !indices.is_empty() {
         let key = IndexMetadataKey {
             version: manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
+            store_identity: &dataset.table_state.object_store.store_prefix,
             e_tag: location.e_tag.as_deref(),
         };
         let contract = CoveringContract::of(manifest);
@@ -2146,7 +2175,13 @@ pub(crate) async fn commit_transaction(
             // keyed attempt must own its file so a loser cannot delete the
             // winner's transaction record during conflict cleanup.
             let attempt_id = append_idempotency_key.map(|_| uuid::Uuid::new_v4());
-            write_transaction_file(object_store, &dataset.base, &pb_transaction, attempt_id).await?
+            write_transaction_file(
+                object_store,
+                &dataset.table_state.base,
+                &pb_transaction,
+                attempt_id,
+            )
+            .await?
         } else {
             String::new()
         };
@@ -2170,7 +2205,7 @@ pub(crate) async fn commit_transaction(
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     version,
                     &attempt_build_config,
                     transaction_file,
@@ -2191,15 +2226,14 @@ pub(crate) async fn commit_transaction(
                     frag_reuse,
                 )
                 .await?;
-                let (mut manifest, mut indices) = attempt_transaction.build_manifest_prepared(
+                let (manifest, mut indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &attempt_build_config,
                     read_version_state,
                 )?;
-                finish_built_manifest(&dataset, &attempt_transaction, &mut manifest, &mut indices)
-                    .await?;
+                finish_built_manifest(&dataset, &attempt_transaction, &mut indices).await?;
                 (manifest, indices)
             }
         };
@@ -2215,8 +2249,12 @@ pub(crate) async fn commit_transaction(
             )
             .await;
             if checked.is_err() {
-                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
-                    .await;
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &current_transaction_file,
+                )
+                .await;
             }
             checked
         })
@@ -2240,7 +2278,9 @@ pub(crate) async fn commit_transaction(
             &attempt_transaction.operation,
         )?;
 
-        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
+        lance_table::format::storage_contract::check_manifest_storage_version_for_commit(
+            &mut manifest,
+        )?;
         check_fragment_ids(&manifest)?;
 
         // Runs after the coverage derivation and can replace a fragment bitmap
@@ -2266,7 +2306,12 @@ pub(crate) async fn commit_transaction(
         )
         .await
         {
-            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+            cleanup_transaction_file(
+                object_store,
+                &dataset.table_state.base,
+                &current_transaction_file,
+            )
+            .await;
             return Err(error);
         }
 
@@ -2275,7 +2320,7 @@ pub(crate) async fn commit_transaction(
         let result = write_manifest_file(
             object_store,
             commit_handler,
-            &dataset.base,
+            &dataset.table_state.base,
             &mut manifest,
             if indices.is_empty() {
                 None
@@ -2316,7 +2361,7 @@ pub(crate) async fn commit_transaction(
                 let duplicate_append = match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     target_version,
                     &attempt_transaction,
                     keyed_append,
@@ -2368,8 +2413,12 @@ pub(crate) async fn commit_transaction(
                 }
 
                 // The attempt lost, so no committed manifest references its file.
-                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
-                    .await;
+                cleanup_transaction_file(
+                    object_store,
+                    &dataset.table_state.base,
+                    &current_transaction_file,
+                )
+                .await;
                 if duplicate_append {
                     return Err(Error::append_already_committed(target_version));
                 }
@@ -2388,7 +2437,7 @@ pub(crate) async fn commit_transaction(
                 match verify_commit_outcome(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    &dataset.table_state.base,
                     target_version,
                     &attempt_transaction,
                     keyed_append,
@@ -2425,7 +2474,7 @@ pub(crate) async fn commit_transaction(
                         // transaction file is orphaned.
                         cleanup_transaction_file(
                             object_store,
-                            &dataset.base,
+                            &dataset.table_state.base,
                             &current_transaction_file,
                         )
                         .await;
@@ -3283,11 +3332,12 @@ mod tests {
 
         let published = dataset.manifest_location();
         let resolved = dataset
+            .table_state
             .commit_handler
             .resolve_version_location(
-                &dataset.base,
+                &dataset.table_state.base,
                 dataset.manifest.version,
-                &dataset.object_store.inner,
+                &dataset.table_state.object_store.inner,
             )
             .await
             .unwrap();
@@ -3707,6 +3757,7 @@ mod tests {
 
         let broken = dataset.load_index_by_name("id_idx").await.unwrap().unwrap();
         dataset
+            .table_state
             .object_store
             .remove_dir_all(dataset.indices_dir().join(broken.uuid.to_string()))
             .await
@@ -3727,8 +3778,8 @@ mod tests {
         // emits one - untrained indices get an empty bitmap, not none at all - so
         // the state an old manifest arrives in is set here by hand.
         let indices = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -3758,8 +3809,8 @@ mod tests {
         dataset.delete("false").await.unwrap();
 
         let migrated = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -4730,8 +4781,9 @@ mod tests {
         let other = stage_append(dataset.clone(), 2, "job-b").await;
         assert_eq!(builder.execute(other).await.unwrap().version().version, 3);
         dataset
+            .table_state
             .object_store
-            .delete(&winner.manifest_location.path)
+            .delete(&winner.table_state.manifest_location.path)
             .await
             .unwrap();
 
@@ -4914,13 +4966,13 @@ mod tests {
         handler.fail_next(AmbiguousFailure::LandAndConflict);
         let (manifest, _) = commit_transaction(
             &dataset,
-            dataset.object_store.as_ref(),
+            dataset.table_state.object_store.as_ref(),
             handler.as_ref(),
             &transaction,
             CommitTransactionOptions::new(
                 &build_config,
                 &commit_config,
-                dataset.manifest_location.naming_scheme,
+                dataset.table_state.manifest_location.naming_scheme,
             )
             .with_retry_timeout(DEFAULT_COMMIT_RETRY_TIMEOUT),
         )
@@ -5169,7 +5221,8 @@ mod tests {
             &[ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_2],
         );
 
-        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+        lance_table::format::storage_contract::finalize_manifest_storage_version(&mut manifest)
+            .unwrap();
 
         assert_ne!(
             manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
@@ -5188,7 +5241,8 @@ mod tests {
             make_storage_contract_manifest(ConcreteFileVersion::V2_1, &[ConcreteFileVersion::V1]);
 
         let err =
-            crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap_err();
+            lance_table::format::storage_contract::finalize_manifest_storage_version(&mut manifest)
+                .unwrap_err();
 
         assert!(err.to_string().contains("cannot be mixed"), "{err}");
         assert_eq!(
@@ -5265,7 +5319,8 @@ mod tests {
             ConcreteFileVersion::V1
         );
 
-        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+        lance_table::format::storage_contract::finalize_manifest_storage_version(&mut manifest)
+            .unwrap();
 
         assert_eq!(
             manifest.data_storage_format.lance_file_format(),
@@ -5866,6 +5921,7 @@ mod tests {
     async fn committed_manifest_message(dataset: &Dataset) -> Vec<u8> {
         let location = dataset.manifest_location();
         let file = dataset
+            .table_state
             .object_store
             .read_one_all(&location.path)
             .await

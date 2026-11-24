@@ -36,7 +36,7 @@ use crate::{
     Dataset, Error, Result,
     dataset::index::LanceIndexStoreExt,
     index::{DatasetIndexExt, scalar::fetch_index_details},
-    session::caches::InvertedIndexParamsKey,
+    session::index_caches::InvertedIndexParamsKey,
 };
 
 #[derive(Debug, Clone)]
@@ -918,7 +918,13 @@ pub(crate) async fn finalize_segment_files_if_needed(
     let metadata_path = index_dir
         .clone()
         .join(lance_index::scalar::inverted::METADATA_FILE);
-    if dataset.object_store.as_ref().exists(&metadata_path).await? {
+    if dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .exists(&metadata_path)
+        .await?
+    {
         return Ok(None);
     }
 
@@ -927,7 +933,7 @@ pub(crate) async fn finalize_segment_files_if_needed(
         &segment.uuid,
     )?);
     let files = lance_index::scalar::inverted::builder::merge_index_files_with_options(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &index_dir,
         store,
         lance_index::scalar::inverted::builder::FinalizeOptions::default(),
@@ -1202,6 +1208,7 @@ pub async fn load_segment_params(
     segment: &IndexMetadata,
 ) -> Result<InvertedIndexParams> {
     let params = dataset
+        .table_state
         .metadata_cache
         .get_or_insert_with_key(
             InvertedIndexParamsKey {
@@ -1266,12 +1273,20 @@ mod tests {
         let old_segment = dataset.load_indices().await.unwrap()[0].clone();
         let old_snapshot = dataset.clone();
         dataset.index_cache.clear().await;
-        dataset.metadata_cache.clear().await;
+        dataset.table_state.metadata_cache.clear().await;
         let index_entries_before = dataset.index_cache_entry_count().await;
 
-        let before = dataset.object_store.io_stats_snapshot().read_iops;
+        let before = dataset
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_iops;
         let first = load_segment_params(&dataset, &old_segment).await.unwrap();
-        let after_first = dataset.object_store.io_stats_snapshot().read_iops;
+        let after_first = dataset
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_iops;
         assert!(after_first > before);
         assert!(first.same_tokenization(&json_params));
         assert_eq!(
@@ -1281,20 +1296,35 @@ mod tests {
         );
         let repeated = load_segment_params(&dataset, &old_segment).await.unwrap();
         assert_eq!(first, repeated);
-        let after_repeat = dataset.object_store.io_stats_snapshot().read_iops;
+        let after_repeat = dataset
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_iops;
         if cache_bytes <= 1024 {
             assert!(after_repeat > after_first);
         } else {
             assert_eq!(after_repeat, after_first);
         }
 
-        dataset.metadata_cache.clear().await;
-        let before_reload = dataset.object_store.io_stats_snapshot().read_iops;
+        dataset.table_state.metadata_cache.clear().await;
+        let before_reload = dataset
+            .table_state
+            .object_store
+            .io_stats_snapshot()
+            .read_iops;
         assert_eq!(
             load_segment_params(&dataset, &old_segment).await.unwrap(),
             first
         );
-        assert!(dataset.object_store.io_stats_snapshot().read_iops > before_reload);
+        assert!(
+            dataset
+                .table_state
+                .object_store
+                .io_stats_snapshot()
+                .read_iops
+                > before_reload
+        );
 
         // Replacing the index changes its tokenizer but must not invalidate the
         // immutable old snapshot or reuse its cached parameters for the new one.
@@ -1649,6 +1679,7 @@ mod tests {
             .unwrap();
         let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
         let staged_paths = dataset
+            .table_state
             .object_store
             .read_dir_all(&index_dir, None)
             .try_collect::<Vec<_>>()
@@ -1662,6 +1693,7 @@ mod tests {
         );
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .exists(&index_dir.clone().join(METADATA_FILE))
                 .await
@@ -1676,6 +1708,7 @@ mod tests {
         assert_eq!(merged.fragment_bitmap, segment.fragment_bitmap);
         assert!(
             dataset
+                .table_state
                 .object_store
                 .exists(&index_dir.clone().join(METADATA_FILE))
                 .await
@@ -1683,6 +1716,7 @@ mod tests {
             "finalize publishes the root metadata"
         );
         let final_paths = dataset
+            .table_state
             .object_store
             .read_dir_all(&index_dir, None)
             .try_collect::<Vec<_>>()
@@ -1707,6 +1741,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(listed, reported, "metadata lists exactly the final files");
         let index_dirs = dataset
+            .table_state
             .object_store
             .read_dir(dataset.indices_dir())
             .await
@@ -1874,6 +1909,7 @@ mod tests {
                 .await
                 .unwrap();
             let index_dirs = dataset
+                .table_state
                 .object_store
                 .read_dir(dataset.indices_dir())
                 .await

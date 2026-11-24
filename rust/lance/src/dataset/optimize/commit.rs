@@ -53,13 +53,13 @@ pub(super) async fn reserve_fragment_ids(
     let commit_config = Default::default();
     let (manifest, _) = commit_transaction(
         dataset,
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
         &transaction,
         CommitTransactionOptions::new(
             &build_config,
             &commit_config,
-            dataset.manifest_location.naming_scheme,
+            dataset.table_state.manifest_location.naming_scheme,
         ),
     )
     .await?;

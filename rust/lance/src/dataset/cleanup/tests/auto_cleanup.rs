@@ -25,6 +25,7 @@ async fn write_orphans(dataset: &Dataset, read_version: u64) -> Vec<Path> {
     ];
     for orphan in &orphans {
         dataset
+            .table_state
             .object_store
             .put(orphan, &[0u8; 1024])
             .await
@@ -106,7 +107,12 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     assert_eq!(removed.deletion_files_removed, orphans_removed);
     for orphan in &orphans {
         assert_eq!(
-            dataset.object_store.exists(orphan).await.unwrap(),
+            dataset
+                .table_state
+                .object_store
+                .exists(orphan)
+                .await
+                .unwrap(),
             !removes_orphans,
             "{orphan}"
         );
@@ -141,6 +147,7 @@ async fn cleanup_explanation_uses_run_start_for_unverified_age() {
     ] {
         MockClock::set_system_time(modified_at.to_std().unwrap());
         dataset
+            .table_state
             .object_store
             .put(&dataset.data_dir().join(name), b"orphan")
             .await
@@ -339,18 +346,25 @@ async fn dont_cleanup_recent_unverified_files() {
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
         let dataset = fixture.open().await.unwrap();
-        let blob_path = dataset.base.clone().join("_blobs").join("orphan.blob");
+        let blob_path = dataset
+            .table_state
+            .base
+            .clone()
+            .join("_blobs")
+            .join("orphan.blob");
         dataset
+            .table_state
             .object_store
             .put(&blob_path, b"orphan")
             .await
             .unwrap();
 
         let staging_manifests = dataset
+            .table_state
             .object_store
             .read_dir_all(&dataset.versions_dir(), None)
             .try_filter_map(|meta| {
-                let relative_path = remove_prefix(&meta.location, &dataset.base);
+                let relative_path = remove_prefix(&meta.location, &dataset.table_state.base);
                 future::ready(Ok(staging_manifest_version(&relative_path)
                     .is_some()
                     .then_some(meta.location)))
@@ -386,7 +400,12 @@ async fn dont_cleanup_recent_unverified_files() {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(
-            dataset.object_store.exists(&blob_path).await.unwrap(),
+            dataset
+                .table_state
+                .object_store
+                .exists(&blob_path)
+                .await
+                .unwrap(),
             !should_delete,
             "override={override_opt:?}, old_files={old_files}"
         );
@@ -402,7 +421,12 @@ async fn dont_cleanup_recent_unverified_files() {
             assert_eq!(removed.bytes_removed, 0);
         }
         assert_eq!(
-            dataset.object_store.exists(staging_manifest).await.unwrap(),
+            dataset
+                .table_state
+                .object_store
+                .exists(staging_manifest)
+                .await
+                .unwrap(),
             !should_delete
         );
     }

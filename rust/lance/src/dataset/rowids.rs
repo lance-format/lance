@@ -57,6 +57,7 @@ pub async fn load_row_id_sequence(
         lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
     };
     dataset
+        .table_state
         .metadata_cache
         .get_or_insert_with_key(key, || read_row_id_sequence(dataset, fragment))
         .await
@@ -122,7 +123,7 @@ pub async fn load_row_version_sequence(
         RowDatasetVersionMeta::Column => {
             let data_file = fragment.row_lineage_file(kind.field_id())?.ok_or_else(|| {
                 Error::corrupt_file(
-                    dataset.base.clone(),
+                    dataset.table_state.base.clone(),
                     format!(
                         "fragment {} marks its {kind:?} versions as spilled but none of its \
                          data files carries field {}",
@@ -137,6 +138,7 @@ pub async fn load_row_version_sequence(
                 data_file,
             };
             dataset
+                .table_state
                 .metadata_cache
                 .get_or_insert_with_key(key, || {
                     spill::read_spilled_versions(dataset, fragment, kind.field_id())
@@ -170,7 +172,7 @@ pub async fn load_spilled_row_lineage<'a>(
         }
     }
     let loaded: SpilledRowLineage = futures::stream::iter(loads)
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
     Ok(Arc::new(loaded))
@@ -217,7 +219,7 @@ pub fn load_row_id_sequences<'a>(
         .map(|fragment| {
             load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
 }
 
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
@@ -243,7 +245,7 @@ pub(crate) async fn get_row_id_index_with(
     // and recreated there restarts at version 1. Without a token for this
     // manifest generation a cached index could be the old generation's, so
     // build a private one instead of sharing.
-    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+    let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref() else {
         return Ok(Some(Arc::new(
             load_row_id_index(dataset, with_deletions).await?,
         )));
@@ -346,7 +348,7 @@ async fn lookup_inline_row_id(
     row_id: u64,
     with_deletions: bool,
 ) -> Result<Option<Option<RowAddress>>> {
-    let ranges = if let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() {
+    let ranges = if let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref() {
         let key = InlineRowIdRangesKey {
             version: dataset.manifest.version,
             e_tag,
@@ -392,8 +394,8 @@ async fn lookup_inline_row_id(
         });
     }
     let mut live = None;
-    let mut candidates =
-        futures::stream::iter(lookups).buffer_unordered(dataset.object_store.io_parallelism());
+    let mut candidates = futures::stream::iter(lookups)
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
     while let Some(candidate) = candidates.try_next().await? {
         if let Some(address) = candidate
             && live.replace(address).is_some()
@@ -415,7 +417,7 @@ pub(super) async fn resolve_take_row_ids(
         return Ok(None);
     }
     if let [id] = row_ids {
-        if let Some(e_tag) = dataset.manifest_location.e_tag.as_deref()
+        if let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref()
             && let Some(index) = dataset
                 .index_cache
                 .get_with_key(&RowIdIndexKey {
@@ -698,7 +700,7 @@ pub(crate) async fn live_row_addr_to_row_id_lookup(
             let deletion_vector = fragment.get_deletion_vector().await?;
             Result::Ok((fragment_id, sequence, deletion_vector))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
     let fragments: std::collections::HashMap<_, _> = loaded
@@ -750,7 +752,7 @@ pub(crate) async fn load_row_id_index_for_fragments(
         loads.push(read_row_id_sequence(dataset, fragment).map_ok(Arc::new));
     }
     let sequences: Vec<Arc<RowIdSequence>> = futures::stream::iter(loads)
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
 
@@ -783,7 +785,7 @@ pub(crate) async fn load_row_id_index_for_fragments(
         });
     }
     let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
     RowIdIndex::new(&fragment_indices)
@@ -1130,7 +1132,7 @@ mod test {
             .unwrap();
         // Without an e-tag the version-only key could alias a dataset recreated
         // at the same URI, so the index must be built privately, never cached.
-        dataset.manifest_location.e_tag = None;
+        dataset.table_state.manifest_location.e_tag = None;
         let session = dataset.session();
         let entries_before = session.index_cache_stats().await.num_entries;
         let first = get_row_id_index(&dataset).await.unwrap().unwrap();

@@ -18,7 +18,7 @@ use prost::Name;
 use prost_types::Any;
 
 use super::scalar::IndexDetails;
-use super::{segment::index_is_usable, segment::unsupported_index_version};
+use super::segment::{index_details_have_reader, index_is_usable, unsupported_index_version};
 
 pub mod history;
 
@@ -51,8 +51,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
     };
     let type_name = details_type_name(details);
     let display_type = display_type_from_url(&details.type_url);
-    let details = IndexDetails(details.clone());
-    if !details.has_reader() {
+    if !index_details_have_reader(&details.type_url) {
         return Some(format!(
             "an index of type `{type_name}`, which is not known to this build of Lance"
         ));
@@ -72,7 +71,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
             "a {display_type} index, which stores stable row IDs"
         ));
     }
-    let applies_frag_reuse = details
+    let applies_frag_reuse = IndexDetails(details.clone())
         .get_plugin()
         .is_ok_and(|plugin| plugin.supports_batch_row_id_remapping());
     if !applies_frag_reuse {
@@ -658,14 +657,15 @@ mod tests {
         manifest.transaction_section = None;
         apply_frag_reuse_with_stable_row_ids_flag(&mut manifest, &indices);
         let location = dataset
+            .table_state
             .commit_handler
             .commit(
                 &mut manifest,
                 Some(indices),
-                &dataset.base,
-                &dataset.object_store,
+                &dataset.table_state.base,
+                &dataset.table_state.object_store,
                 write_manifest_file_to_path,
-                dataset.manifest_location.naming_scheme,
+                dataset.table_state.manifest_location.naming_scheme,
                 None,
             )
             .await

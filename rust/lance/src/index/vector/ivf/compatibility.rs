@@ -203,7 +203,8 @@ pub async fn validate_committed_vector_segments(
                 .boxed()
             })
             .collect::<Vec<_>>();
-        let mut contracts = stream::iter(contracts).buffered(dataset.object_store.io_parallelism());
+        let mut contracts =
+            stream::iter(contracts).buffered(dataset.table_state.object_store.io_parallelism());
         let mut reference: Option<(&TableIndexMetadata, VectorQueryContract)> = None;
         let mut without_index_file = None;
         while let Some((segment, contract)) = contracts.try_next().await? {
@@ -293,7 +294,7 @@ impl Dataset {
         // single query can construct concurrently even on a high-parallelism store.
         stream::iter(uuids.iter().copied())
             .map(read)
-            .buffered(self.object_store.io_parallelism().min(8))
+            .buffered(self.table_state.object_store.io_parallelism().min(8))
             .try_collect()
             .await
     }
@@ -309,6 +310,7 @@ impl Dataset {
             .join(segment.uuid.to_string())
             .join(INDEX_FILE_NAME);
         let cache = self
+            .table_state
             .metadata_cache
             .file_metadata_cache(&path)
             .with_key_prefix(&store.store_prefix);

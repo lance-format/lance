@@ -46,7 +46,7 @@ pub(in crate::index) async fn merge_segments(
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let has_retired_coverage = merge.segments().iter().any(|segment| {
         segment
-            .deleted_fragment_bitmap(&dataset.fragment_bitmap)
+            .deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .is_some_and(|retired| !retired.is_empty())
     });
     let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
@@ -69,7 +69,7 @@ pub(in crate::index) async fn merge_segments(
             .as_ref()
             .expect("requires_rebuild implies a fragment-reuse index")
             .remap_fragment_bitmap(&mut fragment_bitmap)?;
-        fragment_bitmap &= dataset.fragment_bitmap.as_ref();
+        fragment_bitmap &= dataset.table_state.fragment_bitmap.as_ref();
         let new_uuid = Uuid::new_v4();
         (
             new_uuid,
@@ -139,10 +139,9 @@ pub(in crate::index) async fn open_and_merge_segments(
                 // coverage; the plan says whether its rows translate.
                 Some(SegmentRemappingPlan::Translate { .. }) => true,
                 Some(_) => false,
-                None => segment
-                    .fragment_bitmap
-                    .as_ref()
-                    .is_none_or(|bitmap| !bitmap.is_subset(dataset.fragment_bitmap.as_ref())),
+                None => segment.fragment_bitmap.as_ref().is_none_or(|bitmap| {
+                    !bitmap.is_subset(dataset.table_state.fragment_bitmap.as_ref())
+                }),
             }
         })
     {

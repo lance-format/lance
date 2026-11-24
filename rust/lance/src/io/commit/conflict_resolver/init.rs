@@ -295,7 +295,7 @@ impl<'a> TransactionRebase<'a> {
         };
         let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?;
         self.current_lineage = Some(TaggedLineage::new(entry, Some(Arc::new(ledger))));
-        self.current_live = Some(dataset.fragment_bitmap.as_ref().clone());
+        self.current_live = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
         self.current_schema = Some(dataset.schema().clone());
         Ok(())
     }

@@ -340,7 +340,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
         parts.push(write_part(&dataset, &target, None, batch).await);
     }
 
-    assert_eq!(dataset.object_store.block_size(), block_size);
+    assert_eq!(dataset.table_state.object_store.block_size(), block_size);
     assert!(parts.iter().all(|part| if block_size == 64 {
         part.size_bytes() > block_size as u64
     } else {
@@ -376,7 +376,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
     );
     let delayed = Arc::new(ThrottledStore::new(
         Arc::new(ProxyObjectStore::new(
-            dataset.object_store.inner.clone(),
+            dataset.table_state.object_store.inner.clone(),
             Arc::new(Mutex::new(completed_policy)),
         )),
         ThrottleConfig::default(),
@@ -410,7 +410,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
             Ok(())
         }),
     );
-    Arc::make_mut(&mut dataset.object_store).inner =
+    Arc::make_mut(&mut dataset.table_state.object_store).inner =
         Arc::new(ProxyObjectStore::new(delayed, Arc::new(Mutex::new(policy))));
 
     let opened = DataFilePart::open_all(&dataset, &target, &parts)
@@ -432,7 +432,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
     }
     let peak = peak_opens.load(Ordering::SeqCst);
     assert!(
-        peak > 1 || dataset.object_store.io_parallelism() == 1,
+        peak > 1 || dataset.table_state.object_store.io_parallelism() == 1,
         "independent part opens stayed serial"
     );
     assert!(
@@ -574,6 +574,7 @@ async fn managed_part_checks_real_file_before_creating_output(
     assert!(error.to_string().contains(message), "{error}");
     assert!(
         !dataset
+            .table_state
             .object_store
             .exists(&dataset.data_dir().join(target.file_name.as_str()))
             .await
@@ -639,6 +640,7 @@ async fn managed_part_rejects_invalid_descriptions_and_duplicate_inputs() {
     assert!(error.to_string().contains("duplicate part"), "{error}");
     assert!(
         !dataset
+            .table_state
             .object_store
             .exists(&dataset.data_dir().join(target.file_name.as_str()))
             .await
@@ -994,7 +996,7 @@ async fn data_file_part_rejects_non_empty_file_relative_inline_blob() {
     let dataset = dataset_of(batch, LanceFileVersion::V2_2).await;
     let data_file = &only_fragment(&dataset).metadata.files[0];
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
+        dataset.table_state.object_store.clone(),
         SchedulerConfig::default_for_testing(),
     );
     let file = scheduler
@@ -1165,6 +1167,7 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
     assert!(error.to_string().contains("belongs to target"), "{error}");
     assert!(
         !dataset
+            .table_state
             .object_store
             .exists(&dataset.data_dir().join(other_target.file_name.as_str()))
             .await
@@ -1542,7 +1545,7 @@ async fn part_page_count(
         .parts_dir(&dataset.data_file_dir_for_base(target.base_id).unwrap())
         .join(part.file_name.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
+        dataset.table_state.object_store.clone(),
         SchedulerConfig::default_for_testing(),
     );
     let file = scheduler
@@ -1553,7 +1556,10 @@ async fn part_page_count(
         file,
         None,
         Default::default(),
-        &dataset.metadata_cache.file_metadata_cache(&path),
+        &dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&path),
         FileReaderOptions::default(),
     )
     .await

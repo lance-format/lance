@@ -464,23 +464,23 @@ impl HNSW {
         )
     }
 
-    /// Returns the top-`k` results and the number of distances computed.
-    /// Searches unfiltered and applies a deletions-only mask to the candidates,
-    /// instead of walking every row of the partition to build a bitset first.
-    /// Returns no results unless they are as complete as the masked search's:
-    /// `top_k` survivors, or every row the graph could reach.
+    /// Uses the deletion sample to size a speculative traversal. The caller
+    /// supplies the number of live candidates needed before any reranking.
     fn search_past_deletions(
         &self,
         query: &ArrayRef,
         k: usize,
-        top_k: usize,
         params: &HnswQueryParams,
         storage: &impl VectorStore,
         prefilter: &dyn PreFilter,
     ) -> Result<(Option<Vec<OrderedNode>>, usize)> {
-        // A range bound can leave the beam short for reasons other than an
-        // exhausted graph, so completeness cannot be told from its length.
-        if params.lower_bound.is_some() || params.upper_bound.is_some() {
+        // A bounded search needs its range predicate during traversal. Also
+        // keep the masked path when a sparse flat scan can reach storage rows
+        // outside the graph (or the graph and storage are misaligned).
+        if params.lower_bound.is_some()
+            || params.upper_bound.is_some()
+            || self.len() != storage.len()
+        {
             return Ok((None, 0));
         }
         let mask = prefilter.mask();
@@ -494,21 +494,29 @@ impl HNSW {
         // as they would if the mask were applied during traversal.
         let widen = 1.0 / (1.0 - deleted_share);
         let beam = HnswQueryParams {
-            ef: (params.ef as f64 * widen).ceil() as usize,
+            ef: ((params.ef as f64 * widen).ceil() as usize).min(storage.len()),
             ..*params
         };
-        let fetch = (k as f64 * widen).ceil() as usize + MIN_DELETION_OVERFETCH;
+        let fetch = ((k as f64 * widen).ceil() as usize).saturating_add(MIN_DELETION_OVERFETCH);
         let (mut results, comparisons) =
             self.search_basic(query.clone(), fetch, &beam, None, storage)?;
-        let found = results.len();
-        results.retain(|node| mask.selected(storage.row_id(node.id)));
-        let exhausted = found < fetch.min(beam.ef);
-        // The sample undershot if the mask took over a quarter of the
-        // candidates the search was sized to keep.
-        let is_thinned = results.len() * 4 < k.min(found) * 3;
-        if (results.len() < top_k && !exhausted) || is_thinned {
+        // Unfiltered traversal also admits NaN, infinities and f32::MAX.
+        // Let the regular dispatch decide whether this partition's mask
+        // restricts any row before applying its score predicate.
+        if results
+            .iter()
+            .any(|node| !(f32::MIN..f32::MAX).contains(&node.dist.0))
+        {
             return Ok((None, comparisons));
         }
+        let examined_all = results.len() == storage.len();
+        results.retain(|node| mask.selected(storage.row_id(node.id)));
+        // Exhausting the entry component does not exhaust all candidates:
+        // masked ACORN can seed other components, and flat search scans storage.
+        if results.len() < k && !examined_all {
+            return Ok((None, comparisons));
+        }
+        results.truncate(k);
         Ok((Some(results), comparisons))
     }
 
@@ -1842,7 +1850,7 @@ impl IvfSubIndex for HNSW {
         let (top_k, k) = (k, if params.reranks() { params.ef } else { k });
         let (past_deletions, deletion_comparisons) =
             if !prefilter.is_empty() && prefilter.deletions_only() {
-                self.search_past_deletions(&query, k, top_k, &params, storage, prefilter.as_ref())?
+                self.search_past_deletions(&query, k, &params, storage, prefilter.as_ref())?
             } else {
                 (None, 0)
             };
@@ -2984,6 +2992,7 @@ mod tests {
     struct CountingStorage {
         inner: FlatFloatStorage,
         calls: Arc<AtomicUsize>,
+        reranked: Arc<AtomicUsize>,
     }
 
     impl CountingStorage {
@@ -2991,6 +3000,7 @@ mod tests {
             Self {
                 inner,
                 calls: Arc::new(AtomicUsize::new(0)),
+                reranked: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -3061,6 +3071,7 @@ mod tests {
             Ok(Self {
                 inner: self.inner.append_batch(batch, vector_column)?,
                 calls: self.calls.clone(),
+                reranked: self.reranked.clone(),
             })
         }
 
@@ -3069,6 +3080,11 @@ mod tests {
                 inner: self.inner.dist_calculator(query, dist_q_c),
                 calls: self.calls.clone(),
             }
+        }
+
+        fn rerank(&self, query: ArrayRef, dist_q_c: f32, results: &mut [OrderedNode]) -> bool {
+            self.reranked.store(results.len(), Ordering::Relaxed);
+            self.inner.rerank(query, dist_q_c, results)
         }
 
         fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
@@ -3347,6 +3363,141 @@ mod tests {
         assert!(
             reported(deletion_prefilter(nearest), false) > reported(masked_prefilter(rest), false)
         );
+    }
+
+    // A directed line with monotonically increasing vector values gives a known
+    // candidate order and lets tests choose exactly which nodes are reachable.
+    fn line_graph(rows: u32, reachable: u32) -> HNSW {
+        let nodes = (0..rows)
+            .map(|id| {
+                let mut node = GraphBuilderNode::new(id, 1);
+                if id + 1 < reachable {
+                    node.add_neighbor(id + 1, 1.0.into(), 0);
+                    node.update_from_ranked_neighbors(0);
+                }
+                node
+            })
+            .collect();
+        HNSW::from_parts(HnswBuildParams::default(), nodes, vec![rows as usize], 0)
+    }
+
+    fn scalar_storage(values: Vec<f32>, metric: DistanceType) -> FlatFloatStorage {
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), 1).unwrap();
+        FlatFloatStorage::new(vectors, metric)
+    }
+
+    #[test]
+    fn deletion_search_seeds_beyond_the_entry_component() {
+        let hnsw = line_graph(100, 9);
+        let store = scalar_storage((0..100).map(|id| id as f32).collect(), DistanceType::L2);
+        let query = query_with(10, Some(10), None);
+        let params = HnswQueryParams {
+            use_acorn: true,
+            ..(&query).into()
+        };
+        let batch = hnsw
+            .search(
+                Arc::new(Float32Array::from(vec![0.0])),
+                10,
+                params,
+                &store,
+                deletion_prefilter(vec![99]),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let ids = batch[lance_core::ROW_ID].as_primitive::<UInt64Type>();
+        assert_eq!(ids.values().len(), 10);
+        assert!(ids.values().iter().any(|&id| id >= 9));
+        assert!(ids.values().iter().all(|&id| id < 99));
+    }
+
+    #[test]
+    fn deletion_search_finds_live_storage_tail_outside_graph() {
+        const NODES: u32 = 1024;
+        let hnsw = line_graph(NODES, NODES);
+        let values = (1..=NODES).map(|id| id as f32).chain([0.0]).collect();
+        let store = scalar_storage(values, DistanceType::L2);
+        // Keep every sample and row 0 so a speculative traversal would find
+        // a complete-looking top-1. The sparse masked scan also sees the tail.
+        let mut keep = std::collections::HashSet::from([0, u64::from(NODES)]);
+        for sample in 0..64_u64 {
+            let offset = (sample.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % store.len() as u64;
+            keep.insert(offset);
+        }
+        let deleted = (0..store.len() as u64)
+            .filter(|id| !keep.contains(id))
+            .collect();
+        let batch = hnsw
+            .search(
+                Arc::new(Float32Array::from(vec![0.0])),
+                1,
+                (&query_with(1, Some(8), None)).into(),
+                &store,
+                deletion_prefilter(deleted),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(
+            batch[lance_core::ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[u64::from(NODES)]
+        );
+    }
+
+    #[rstest]
+    #[case::finite_l2_overflow(2.0e20, DistanceType::L2)]
+    #[case::positive_infinity(f32::INFINITY, DistanceType::Dot)]
+    #[case::negative_infinity(f32::NEG_INFINITY, DistanceType::Dot)]
+    #[case::nan(f32::NAN, DistanceType::L2)]
+    #[case::excluded_upper_endpoint(-f32::MAX, DistanceType::Dot)]
+    fn deletion_search_preserves_masked_score_range(
+        #[case] key: f32,
+        #[case] metric: DistanceType,
+    ) {
+        let hnsw = line_graph(32, 32);
+        let store = scalar_storage(vec![1.0; 32], metric);
+        let batch = hnsw
+            .search(
+                Arc::new(Float32Array::from(vec![key])),
+                2,
+                (&query_with(2, Some(8), None)).into(),
+                &store,
+                deletion_prefilter(vec![31]),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    #[rstest]
+    #[case::deleted_near_query((1..7).collect())]
+    #[case::deleted_far_from_query((256..512).collect())]
+    fn deletion_search_preserves_rerank_finalists(#[case] deleted: Vec<u64>) {
+        const EF: usize = 32;
+        let hnsw = line_graph(512, 512);
+        let store = CountingStorage::new(scalar_storage(
+            (0..512).map(|id| id as f32).collect(),
+            DistanceType::L2,
+        ));
+        let params = HnswQueryParams {
+            rq_graph_scoring: crate::vector::RqGraphScoring::OneBitRerank,
+            ..(&query_with(2, Some(EF), None)).into()
+        };
+        let batch = hnsw
+            .search(
+                Arc::new(Float32Array::from(vec![0.0])),
+                2,
+                params,
+                &store,
+                deletion_prefilter(deleted),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(store.reranked.load(Ordering::Relaxed), EF);
+        assert_eq!(batch.num_rows(), 2);
     }
 
     /// Deleting candidates the sample misses must not shorten the result: the

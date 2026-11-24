@@ -51,8 +51,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_arrow::{BLOB_META_KEY, FixedSizeListArrayExt};
 use lance_core::Error;
 use lance_core::ROW_ID;
@@ -441,8 +439,8 @@ async fn frag_reuse_watermarks(dataset: &Dataset) -> Vec<u64> {
 
 async fn stored_index(dataset: &Dataset, name: &str) -> IndexMetadata {
     read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -1153,10 +1151,11 @@ enum FirstCommitSeenAs {
 
 async fn listed_manifest(rebasing: &Dataset, version: u64) -> ManifestLocation {
     let listed = rebasing
+        .table_state
         .commit_handler
         .list_manifest_locations_since(
-            &rebasing.base,
-            rebasing.object_store.as_ref(),
+            &rebasing.table_state.base,
+            rebasing.table_state.object_store.as_ref(),
             rebasing.manifest.version,
         )
         .try_filter(|location| std::future::ready(location.version == version))
@@ -1816,8 +1815,18 @@ async fn commit_overlay(
     let read_version = dataset.version().version;
     let overlay_schema = dataset.schema().project_by_ids(fields, true);
     let filename = format!("{}.lance", Uuid::new_v4());
-    let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
-    let obj_writer = dataset.object_store.create(&path).await.unwrap();
+    let path = dataset
+        .table_state
+        .base
+        .clone()
+        .join(DATA_DIR)
+        .join(filename.as_str());
+    let obj_writer = dataset
+        .table_state
+        .object_store
+        .create(&path)
+        .await
+        .unwrap();
     let file_version = LanceFileVersion::Stable.resolve();
     let mut writer = lance_file::versions::create_writer(
         file_version,

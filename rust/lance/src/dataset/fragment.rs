@@ -1128,11 +1128,15 @@ pub(crate) async fn discard_staged_file(dataset: &Dataset, path: &Path) {
         .filename()
         .and_then(|name| name.strip_suffix(".lance"))
         .map(|stem| dataset.data_dir().join(stem))
-        && let Err(delete_error) = dataset.object_store.remove_dir_all(stem.clone()).await
+        && let Err(delete_error) = dataset
+            .table_state
+            .object_store
+            .remove_dir_all(stem.clone())
+            .await
     {
         log::warn!("failed to delete staged blob sidecars '{stem}': {delete_error}");
     }
-    if let Err(delete_error) = dataset.object_store.delete(path).await {
+    if let Err(delete_error) = dataset.table_state.object_store.delete(path).await {
         log::warn!("failed to delete staged column file '{path}': {delete_error}");
     }
 }
@@ -1217,7 +1221,8 @@ impl FileFragment {
     ) -> Result<Fragment> {
         let filepath = dataset.data_dir().join(filename);
         let file_version =
-            determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
+            determine_file_version(dataset.table_state.object_store.as_ref(), &filepath, None)
+                .await?;
 
         super::versions::create_fragment_from_file(
             file_version,
@@ -1254,8 +1259,8 @@ impl FileFragment {
         // determine the column offsets
         let mut frag = Fragment::new(fragment_id as u64);
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let file_scheduler = scheduler
             .open_file(&filepath, &CachedFileSize::unknown())
@@ -1264,8 +1269,12 @@ impl FileFragment {
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &dataset.metadata_cache.file_metadata_cache(&filepath),
+            &dataset
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(&filepath),
             dataset
+                .table_state
                 .file_reader_options
                 .as_deref()
                 .cloned()
@@ -1630,7 +1639,13 @@ impl FileFragment {
             self.id() as u32,
             field_id_offset as i32,
             *max_field_id,
-            Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
+            Some(
+                &self
+                    .dataset
+                    .table_state
+                    .metadata_cache
+                    .file_metadata_cache(&path),
+            ),
         )
         .await?;
         let initialized_schema = reader.schema().project_by_schema(
@@ -1683,8 +1698,8 @@ impl FileFragment {
         } else {
             (
                 ScanScheduler::new(
-                    self.dataset.object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                    self.dataset.table_state.object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&self.dataset.table_state.object_store),
                 ),
                 0,
             )
@@ -1692,7 +1707,13 @@ impl FileFragment {
         let file_reader_options = read_config
             .file_reader_options
             .clone()
-            .or_else(|| self.dataset.file_reader_options.as_deref().cloned())
+            .or_else(|| {
+                self.dataset
+                    .table_state
+                    .file_reader_options
+                    .as_deref()
+                    .cloned()
+            })
             .unwrap_or_default();
         let file_scheduler = if file_reader_options.decoder_config.list_structure.is_empty() {
             store_scheduler
@@ -1716,7 +1737,11 @@ impl FileFragment {
                 .with_metadata_read_size(lance_file::reader::FOOTER_LEN)?
         };
         let path = file_scheduler.reader().path().clone();
-        let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
+        let metadata_cache = self
+            .dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&path);
         let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
             data_file
                 .fields
@@ -2246,7 +2271,7 @@ impl FileFragment {
                 && physical_rows != *first_length
             {
                 return Err(Error::corrupt_file(
-                    self.dataset.base.clone(),
+                    self.dataset.table_state.base.clone(),
                     format!(
                         "Fragment metadata has incorrect physical_rows. Fragment: {} Actual: {} Metadata: {}",
                         self.id(),
@@ -2261,7 +2286,7 @@ impl FileFragment {
             // trustworthy persisted count, including when only lineage remains.
             if self.dataset.manifest.writer_version.is_none() {
                 return Err(Error::corrupt_file(
-                    self.dataset.base.clone(),
+                    self.dataset.table_state.base.clone(),
                     format!(
                         "Fragment {} has no user data files; physical_rows={:?} cannot be trusted because manifest.writer_version is missing",
                         self.id(),
@@ -2271,7 +2296,7 @@ impl FileFragment {
             }
             self.metadata.physical_rows.ok_or_else(|| {
                 Error::corrupt_file(
-                    self.dataset.base.clone(),
+                    self.dataset.table_state.base.clone(),
                     format!(
                         "Fragment {} has no user data files and is missing physical_rows",
                         self.id()
@@ -2291,7 +2316,7 @@ impl FileFragment {
             {
                 return Err(Error::corrupt_file(
                     deletion_file_path(
-                        &self.dataset.base,
+                        &self.dataset.table_state.base,
                         self.metadata.id,
                         self.metadata.deletion_file.as_ref().unwrap(),
                     ),
@@ -2308,7 +2333,7 @@ impl FileFragment {
                     let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
                     return Err(Error::corrupt_file(
                         deletion_file_path(
-                            &self.dataset.base,
+                            &self.dataset.table_state.base,
                             self.metadata.id,
                             deletion_file_meta,
                         ),
@@ -2540,7 +2565,11 @@ impl FileFragment {
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
         let path = file_scheduler.reader().path();
-        let cache = self.dataset.metadata_cache.file_metadata_cache(path);
+        let cache = self
+            .dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(path);
 
         let file_metadata = cache
             .get_or_insert_with_key(FileMetadataCacheKey, || async {
@@ -2558,7 +2587,11 @@ impl FileFragment {
         known_schema: Option<(Arc<Schema>, u64)>,
     ) -> Result<Arc<FileMetadataIndex>> {
         let path = file_scheduler.reader().path();
-        let cache = self.dataset.metadata_cache.file_metadata_cache(path);
+        let cache = self
+            .dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(path);
 
         let metadata_index = cache
             .get_or_insert_with_key(FileMetadataIndexCacheKey, || async {
@@ -3203,7 +3236,7 @@ impl FileFragment {
                     .map_err(|err| self.schema_mismatch(err))?;
                 if let Some(sources) = sources.as_ref() {
                     writer
-                        .write_with_blob_sources(&batch, &self.dataset.base, sources)
+                        .write_with_blob_sources(&batch, &self.dataset.table_state.base, sources)
                         .await?;
                 } else {
                     writer.write(std::slice::from_ref(&batch)).await?;
@@ -3490,11 +3523,11 @@ impl FileFragment {
         }
 
         self.metadata.deletion_file = write_deletion_file(
-            &self.dataset.base,
+            &self.dataset.table_state.base,
             self.metadata.id,
             self.dataset.version_id(),
             &deletion_vector,
-            self.dataset.object_store.as_ref(),
+            self.dataset.table_state.object_store.as_ref(),
             self.dataset.inline_deletions_max_bytes()?,
         )
         .await?;
@@ -3921,21 +3954,20 @@ fn data_file_projection(projection: &Schema, file_schema: &Schema) -> Result<Sch
         if file_field.children.is_empty() {
             return Ok(());
         }
-        let path =
-            crate::io::exec::filtered_read::validity_leaf_path(file_field).unwrap_or_else(|| {
-                // No fixed-width leaf: any leaf carries the validity.
-                let mut path = vec![];
-                let mut node = file_field;
-                while !(node.is_blob()
-                    || node.is_packed_struct()
-                    || matches!(node.data_type(), DataType::Map(..)))
-                    && let Some(child) = node.children.first()
-                {
-                    path.push(child.name.as_str());
-                    node = child;
-                }
-                path
-            });
+        let path = file_field.validity_leaf_path().unwrap_or_else(|| {
+            // No fixed-width leaf: any leaf carries the validity.
+            let mut path = vec![];
+            let mut node = file_field;
+            while !(node.is_blob()
+                || node.is_packed_struct()
+                || matches!(node.data_type(), DataType::Map(..)))
+                && let Some(child) = node.children.first()
+            {
+                path.push(child.name.as_str());
+                node = child;
+            }
+            path
+        });
         *field = file_field.project(&path)?;
         Ok(())
     }
@@ -4544,7 +4576,7 @@ impl FragmentReader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, UInt64Type};
@@ -4729,7 +4761,12 @@ mod tests {
             // The manifest records the bare filename; only the physical write is
             // data-dir qualified.
             let path = dataset.data_dir().join(filename.as_str());
-            let obj_writer = dataset.object_store.create(&path).await.unwrap();
+            let obj_writer = dataset
+                .table_state
+                .object_store
+                .create(&path)
+                .await
+                .unwrap();
             let file_version = version.resolve();
             let mut writer = lance_file::versions::create_writer(
                 file_version,
@@ -5271,9 +5308,9 @@ mod tests {
             let val_only = dataset.schema().project_by_ids(&[1], true);
 
             // Measure only the reads that resolve the take.
-            dataset.object_store.io_stats_incremental();
+            dataset.table_state.object_store.io_stats_incremental();
             let batch = frag.take(&[0, 1], &val_only).await.unwrap();
-            let io = dataset.object_store.io_stats_incremental();
+            let io = dataset.table_state.object_store.io_stats_incremental();
 
             // The overlay's `val` column alone is N*4 bytes; resolving two adjacent
             // offsets must read only a small fraction of it.
@@ -5317,6 +5354,7 @@ mod tests {
 
             // Delete the overlay's data file: opening it now fails.
             dataset
+                .table_state
                 .object_store
                 .delete(&Path::from("data/miss.lance"))
                 .await
@@ -5781,6 +5819,7 @@ mod tests {
 
             // Delete the overlay's data file: opening it now fails.
             dataset
+                .table_state
                 .object_store
                 .delete(&Path::from("data/valov.lance"))
                 .await
@@ -6647,12 +6686,13 @@ mod tests {
         }
         let fragment = dataset.get_fragment(0).unwrap();
         let projection = dataset.schema().project::<&str>(&[]).unwrap();
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let batch = fragment.take(indices, &projection).await.unwrap();
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), indices.len());
         assert!(
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
@@ -6765,7 +6805,7 @@ mod tests {
         let added_file = fragment.metadata().files[1].path.clone();
 
         let projection = dataset.schema().project(&["col1"]).unwrap();
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let reader = fragment
             .open(&projection, FragReadConfig::default())
             .await
@@ -6773,6 +6813,7 @@ mod tests {
         let rows = reader.take_as_batch(&[1, 5], None).await.unwrap();
         assert_eq!(rows.num_rows(), 2);
         let data_files_read: HashSet<String> = dataset
+            .table_state
             .object_store
             .io_stats_incremental()
             .requests
@@ -8038,11 +8079,11 @@ mod tests {
 
         let deletion_vector = DeletionVector::from_iter([2, 9]);
         let deletion_file = write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             99,
             dataset.version().version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             0,
         )
         .await
@@ -8079,11 +8120,11 @@ mod tests {
 
         let deletion_vector = DeletionVector::from_iter([2, 10]);
         let deletion_file = write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             99,
             dataset.version().version,
             &deletion_vector,
-            &dataset.object_store,
+            &dataset.table_state.object_store,
             0,
         )
         .await
@@ -8246,11 +8287,11 @@ mod tests {
         let fragment_id = dataset.manifest.fragments[fragment_index].id;
         assert_ne!(fragment_id, 0, "need a non-zero fragment id");
         let deletion_file = write_deletion_file(
-            &dataset.base,
+            &dataset.table_state.base,
             fragment_id,
             dataset.version().version,
             &deletion_vector,
-            dataset.object_store.as_ref(),
+            dataset.table_state.object_store.as_ref(),
             0,
         )
         .await
@@ -8703,7 +8744,7 @@ mod tests {
         Ok(())
     }
 
-    mod demand_row_ids {
+    pub mod demand_row_ids {
         use super::*;
         use arrow_array::types::Int32Type;
         use lance_datagen::ArrayGeneratorExt;
@@ -8718,17 +8759,12 @@ mod tests {
             INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
         };
         use crate::index::DatasetIndexExt;
-        use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
         use crate::utils::test::FailingProxyStore;
-        use datafusion::execution::TaskContext;
-        use datafusion_physical_plan::ExecutionPlan;
-        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-        use lance_datafusion::exec::OneShotExec;
         use lance_index::{IndexType, scalar::ScalarIndexParams};
 
         // Binary-copy compaction gives each output a separate lineage-only file,
         // so its reads cannot be confused with user-column or footer reads.
-        async fn fixture(spill: bool) -> (TempStrDir, Dataset) {
+        pub async fn fixture(spill: bool) -> (TempStrDir, Dataset) {
             let dir = TempStrDir::default();
             // Normalize the file URL first so Windows drive letters remain in
             // the path, rather than being parsed as the custom scheme's host.
@@ -8798,7 +8834,7 @@ mod tests {
             (dir, dataset)
         }
 
-        fn lineage_reads(stats: &IoStats, fragment: &FileFragment) -> usize {
+        pub fn lineage_reads(stats: &IoStats, fragment: &FileFragment) -> usize {
             let file = fragment
                 .metadata()
                 .row_lineage_file(ROW_ID_FIELD_ID)
@@ -8823,7 +8859,7 @@ mod tests {
             } else {
                 dataset.schema().clone()
             };
-            dataset.object_store.io_stats_incremental();
+            dataset.table_state.object_store.io_stats_incremental();
             let reader = fragment
                 .open(
                     &projection,
@@ -8833,7 +8869,7 @@ mod tests {
                 .unwrap();
             let batch = reader.read_range_as_batch(0..12).await.unwrap();
             assert_eq!(batch.num_rows(), 10);
-            let stats = dataset.object_store.io_stats_incremental();
+            let stats = dataset.table_state.object_store.io_stats_incremental();
             assert_eq!(lineage_reads(&stats, &fragment), 0, "{stats:?}");
             if addresses_only {
                 let expected: Vec<u64> = (0..12)
@@ -8866,10 +8902,10 @@ mod tests {
             if addresses_only {
                 scanner.project::<&str>(&[]).unwrap().with_row_address();
             }
-            dataset.object_store.io_stats_incremental();
+            dataset.table_state.object_store.io_stats_incremental();
             let batch = scanner.try_into_batch().await.unwrap();
             assert_eq!(batch.num_rows(), 20);
-            let stats = dataset.object_store.io_stats_incremental();
+            let stats = dataset.table_state.object_store.io_stats_incremental();
             for fragment in dataset.get_fragments() {
                 assert_eq!(lineage_reads(&stats, &fragment), 0, "{stats:?}");
             }
@@ -8978,67 +9014,6 @@ mod tests {
             );
         }
 
-        #[rstest]
-        #[case::row_ids(true)]
-        #[case::row_addresses(false)]
-        #[tokio::test]
-        async fn row_stream_loads_only_for_id_mapping(#[case] stable_ids: bool) {
-            let (_dir, dataset) = fixture(true).await;
-            let dataset = Arc::new(dataset);
-            let fragments = dataset.get_fragments();
-            let keys = [Some(14_u64), None, Some(2), Some(13), Some(2)].map(|id| {
-                id.map(|id| {
-                    if stable_ids {
-                        id
-                    } else {
-                        RowAddress::new_from_parts(
-                            fragments[id as usize / 12].id() as u32,
-                            id as u32 % 12,
-                        )
-                        .into()
-                    }
-                })
-            });
-            let key_column = if stable_ids { ROW_ID } else { ROW_ADDR };
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                key_column,
-                DataType::UInt64,
-                true,
-            )]));
-            let input = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(UInt64Array::from(keys.to_vec()))],
-            )
-            .unwrap();
-            let input = OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                stream::iter([Ok(input)]),
-            )));
-            let options = FilteredReadOptions::basic_full_read(&dataset);
-            let plan =
-                FilteredReadExec::try_new(dataset.clone(), options, Some(Arc::new(input))).unwrap();
-            dataset.object_store.io_stats_incremental();
-            let batches = plan
-                .execute(0, Arc::new(TaskContext::default()))
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            let batch = concat_batches(&plan.schema(), &batches).unwrap();
-            assert_eq!(
-                batch["i"].as_primitive::<Int32Type>().values().as_ref(),
-                [14, 2, 2]
-            );
-            let stats = dataset.object_store.io_stats_incremental();
-            for fragment in fragments {
-                assert_eq!(
-                    lineage_reads(&stats, &fragment) > 0,
-                    stable_ids,
-                    "{stats:?}"
-                );
-            }
-        }
-
         #[tokio::test]
         async fn indexed_scan_skips_stable_id_mapping_for_a_fresh_index() {
             // A freshly built scalar index is address-domain, even on a
@@ -9064,13 +9039,13 @@ mod tests {
                 .unwrap();
             let plan = scanner.explain_plan(false).await.unwrap();
             assert!(plan.contains("ScalarIndex"), "{plan}");
-            dataset.object_store.io_stats_incremental();
+            dataset.table_state.object_store.io_stats_incremental();
             let batch = scanner.try_into_batch().await.unwrap();
             assert_eq!(
                 batch["i"].as_primitive::<Int32Type>().values().as_ref(),
                 [10, 11, 12, 14, 15, 16]
             );
-            let stats = dataset.object_store.io_stats_incremental();
+            let stats = dataset.table_state.object_store.io_stats_incremental();
             for fragment in dataset.get_fragments() {
                 assert_eq!(
                     lineage_reads(&stats, &fragment),
@@ -9306,14 +9281,22 @@ mod tests {
         let projection = dataset.schema().project(&["col_0"]).unwrap();
         let fragment = dataset.get_fragment(0).unwrap();
 
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         let narrow_reader = fragment
             .open(&projection, FragReadConfig::default())
             .await
             .unwrap();
         let mut empty_narrow_stream = narrow_reader.take_range(0..0, 1024).await.unwrap();
         assert!(empty_narrow_stream.next().await.is_none());
-        let narrow_metadata_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let narrow_metadata_stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             narrow_metadata_stats.read_iops <= 3,
             "expected lazy metadata open to skip the schema buffer read, iops={}, bytes={}",
@@ -9328,7 +9311,11 @@ mod tests {
             .unwrap();
         let mut empty_full_stream = full_reader.take_range(0..0, 1024).await.unwrap();
         assert!(empty_full_stream.next().await.is_none());
-        let full_metadata_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let full_metadata_stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         assert!(
             full_metadata_stats.read_bytes > narrow_metadata_stats.read_bytes * 4,
@@ -9452,7 +9439,11 @@ mod tests {
 
         // Assert file is small (< 4300 bytes)
         {
-            let stats = dataset.object_store.as_ref().io_stats_incremental();
+            let stats = dataset
+                .table_state
+                .object_store
+                .as_ref()
+                .io_stats_incremental();
             assert_io_eq!(stats, write_iops, 3);
             assert_io_lt!(stats, written_bytes, 4300);
         }
@@ -9478,7 +9469,11 @@ mod tests {
         assert_eq!(data.num_rows(), 1);
         assert_eq!(data.num_columns(), 7);
 
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
     }
