@@ -570,10 +570,7 @@ async fn test_commit_refuses_recording_mismatch_before_reserving_fragments(
         .execute_uncommitted()
         .await
         .unwrap();
-        let legacy_segment = IndexMetadata {
-            index_version: 0,
-            ..segment
-        };
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
         dataset
             .commit_existing_index_segments("i_idx", "cat", vec![legacy_segment])
             .await

@@ -510,16 +510,26 @@ pub(crate) fn build_prefilter(
 }
 
 /// Translates one treemap's entries from row-id domain to row-address
-/// domain. A "whole fragment" entry can't be enumerated one id at a time; it
-/// is vanishingly unlikely to appear in a row-id-domain mask (it would
-/// require 2^32 contiguous ids), so it is left untranslated rather than
-/// failing the query.
+/// domain.
+///
+/// A "whole fragment" entry cannot be enumerated one id at a time, and in a
+/// row-id-domain mask it should not exist: it would mean 2^32 contiguous row
+/// ids, so in practice it means a fragment-shaped (already address-domain)
+/// mask was labelled as row-id domain somewhere upstream. Returning the
+/// treemap untranslated would hand the caller a mask it then ANDs into an
+/// address-domain one, silently selecting unrelated rows -- and would drop
+/// the translation of every `Partial` entry alongside it. It is reported
+/// instead.
 pub(crate) async fn translate_treemap_to_row_addr_domain(
     dataset: &Dataset,
     treemap: &RowAddrTreeMap,
 ) -> Result<RowAddrTreeMap> {
     let Some(row_ids) = treemap.row_addrs() else {
-        return Ok(treemap.clone());
+        return Err(Error::internal(
+            "a row-id-domain mask cannot hold a whole-fragment entry; it would mean 2^32 \
+             contiguous row ids, so this mask is really address-domain and was mislabelled \
+             before it reached the FTS prefilter",
+        ));
     };
     let row_ids: Vec<u64> = row_ids.map(u64::from).collect();
     let addrs = row_ids_to_row_addrs(dataset, &row_ids).await?;

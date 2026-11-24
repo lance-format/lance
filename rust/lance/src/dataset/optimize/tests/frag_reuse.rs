@@ -2866,21 +2866,13 @@ async fn test_compact_ngram_with_stable_row_ids(#[values(false, true)] defer_ind
 #[tokio::test]
 async fn test_defer_index_remap_rejected_while_row_id_index_present() {
     let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
-    // A fresh Inverted index always trains in row-address domain, so a
-    // row-id-domain one (as every segment predating
-    // `INVERTED_ROW_ADDR_DOMAIN_VERSION` is) has to be simulated by relabeling
-    // a freshly built segment's `index_version` down -- the same trick
-    // `results_are_row_addrs` itself relies on to tell the two apart.
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
     let segment = CreateIndexBuilder::new(&mut dataset, &["cat"], IndexType::Inverted, &params)
         .name("id_idx".into())
         .execute_uncommitted()
         .await
         .unwrap();
-    let legacy_segment = IndexMetadata {
-        index_version: 0,
-        ..segment
-    };
+    let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
     dataset
         .commit_existing_index_segments("id_idx", "cat", vec![legacy_segment])
         .await
@@ -3131,10 +3123,7 @@ async fn test_defer_index_remap_racing_row_id_index_creation() {
         .execute_uncommitted()
         .await
         .unwrap();
-    let legacy_segment = IndexMetadata {
-        index_version: 0,
-        ..segment
-    };
+    let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
     concurrent
         .commit_existing_index_segments("id_idx", "cat", vec![legacy_segment])
         .await
@@ -3368,10 +3357,7 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
             // segment this race specifically exercises (same trick as
             // `test_defer_index_remap_racing_row_id_index_creation`).
             let segment = builder.execute_uncommitted().await?;
-            let legacy_segment = IndexMetadata {
-                index_version: 0,
-                ..segment
-            };
+            let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
             dataset
                 .commit_existing_index_segments("i_idx", index_column, vec![legacy_segment])
                 .await

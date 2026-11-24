@@ -4965,10 +4965,7 @@ mod tests {
         // legacy segments on disk differ from a fresh one only in that label
         // (each plugin's `load_index` derives domain purely from the version
         // its caller passes in, never from the file itself).
-        let legacy_segment = IndexMetadata {
-            index_version: 0,
-            ..segment
-        };
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
         dataset
             .commit_existing_index_segments("id_idx", "id", vec![legacy_segment])
             .await
@@ -5252,10 +5249,7 @@ mod tests {
         assert!(legacy_segment.results_are_row_addrs());
         // Relabel as pre-migration row-id domain, simulating a segment built
         // before stable row ids were enabled for this dataset.
-        let legacy_segment = IndexMetadata {
-            index_version: 0,
-            ..legacy_segment
-        };
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(legacy_segment);
         dataset
             .commit_existing_index_segments("value_idx", "value", vec![legacy_segment])
             .await
@@ -6725,10 +6719,6 @@ mod tests {
         // Exercise the stable-row-id allow-list and address-domain deletion
         // filtering paths. Both must propagate unreadable deletion vectors.
         if index_type == IndexType::Inverted {
-            // A fresh Inverted index always trains in row-address domain, so
-            // the row-id-domain allow-list path is simulated by relabeling a
-            // freshly built segment's `index_version` down -- the same trick
-            // `results_are_row_addrs` itself relies on to tell the two apart.
             let segment = CreateIndexBuilder::new(
                 &mut dataset,
                 &["cat"],
@@ -6738,10 +6728,7 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
-            let legacy_segment = IndexMetadata {
-                index_version: 0,
-                ..segment
-            };
+            let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
             let name = legacy_segment.name.clone();
             dataset
                 .commit_existing_index_segments(&name, "cat", vec![legacy_segment])

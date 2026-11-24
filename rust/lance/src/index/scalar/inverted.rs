@@ -876,8 +876,11 @@ pub(crate) fn transform_fts_document_stream(
 /// `index_version` 4 ([`lance_index::scalar::inverted::INVERTED_ROW_ADDR_DOMAIN_VERSION`])
 /// marks row-address-domain segments; it is independent of the posting-list
 /// format, which every such segment already carries explicitly in
-/// `details.posting_format_version` (see `InvertedIndexPlugin::train_inverted_index`),
-/// so the fallback below never needs to synthesize one for it.
+/// `details.posting_format_version` (see `InvertedIndexPlugin::train_inverted_index`).
+/// The fallback below still maps version 4 to posting format V3, the newest
+/// format and the only one a version-4 segment is ever written with, so that a
+/// segment reaching here without the field -- which a correct writer never
+/// produces -- is read rather than rejected.
 pub(crate) fn normalize_inverted_details(
     index: &IndexMetadata,
     mut details: InvertedIndexDetails,

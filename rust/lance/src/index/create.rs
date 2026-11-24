@@ -242,10 +242,6 @@ impl<'a> CreateIndexBuilder<'a> {
         // handing that name out again commits two indices under it.
         let indices = load_all_indices(self.dataset).await?;
         // Vector indices always store row ids, so refuse them before training.
-        // Inverted used to as well, but it now trains in row-address domain
-        // like every other scalar index type (see
-        // `INVERTED_ROW_ADDR_DOMAIN_VERSION`), so it is no longer refused
-        // here.
         let index_kind = if self.index_type.is_vector() {
             Some("vector")
         } else {

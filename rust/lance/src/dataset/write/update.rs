@@ -1022,7 +1022,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
-    use lance_table::format::{IndexMetadata, ROW_CREATED_AT_VERSION_FIELD_ID};
+    use lance_table::format::ROW_CREATED_AT_VERSION_FIELD_ID;
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tokio::sync::Barrier;
@@ -1880,10 +1880,6 @@ mod tests {
             .await
             .unwrap();
 
-        // A fresh Inverted index always trains in row-address domain, so a
-        // row-id-domain one is simulated by relabeling a freshly built
-        // segment's `index_version` down -- the same trick
-        // `results_are_row_addrs` itself relies on to tell the two apart.
         let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
         let segment =
             CreateIndexBuilder::new(&mut dataset, &["str"], IndexType::Inverted, &scalar_params)
@@ -1891,10 +1887,7 @@ mod tests {
                 .execute_uncommitted()
                 .await
                 .unwrap();
-        let legacy_segment = IndexMetadata {
-            index_version: 0,
-            ..segment
-        };
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
         dataset
             .commit_existing_index_segments("str_idx", "str", vec![legacy_segment])
             .await

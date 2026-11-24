@@ -808,10 +808,7 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
-        let legacy_segment = IndexMetadata {
-            index_version: 0,
-            ..segment
-        };
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
         dataset
             .commit_existing_index_segments("category_idx", "category", vec![legacy_segment])
             .await
@@ -999,10 +996,7 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
-        let legacy_segment = IndexMetadata {
-            index_version: 0,
-            ..segment
-        };
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
         dataset
             .commit_existing_index_segments("category_idx", "category", vec![legacy_segment])
             .await
@@ -1102,10 +1096,6 @@ mod tests {
     #[tokio::test]
     async fn test_incompatible_indices_are_hidden_from_readers() {
         let mut dataset = stable_row_id_dataset("memory://").await;
-        // A fresh Inverted index always trains in row-address domain, so the
-        // collision this test demonstrates is simulated by relabeling a
-        // freshly built segment's `index_version` down -- the same trick
-        // `results_are_row_addrs` itself relies on to tell the two apart.
         let segment = dataset
             .create_index_builder(
                 &["category"],
@@ -1115,10 +1105,7 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
-        let legacy_segment = IndexMetadata {
-            index_version: 0,
-            ..segment
-        };
+        let legacy_segment = crate::utils::test::as_legacy_row_id_segment(segment);
         let name = legacy_segment.name.clone();
         dataset
             .commit_existing_index_segments(&name, "category", vec![legacy_segment])
@@ -1352,11 +1339,6 @@ mod tests {
         let mut dataset = stable_row_id_dataset(dir.as_str()).await;
         let mut other = Dataset::open(dir.as_str()).await.unwrap();
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
-        // A fresh Inverted index always trains in row-address domain, so the
-        // race this test exercises (a row-id-domain index and an FRI racing
-        // each other) is simulated by relabeling a freshly built segment's
-        // `index_version` down -- the same trick `results_are_row_addrs`
-        // itself relies on to tell the two apart.
         let inverted_index = other
             .create_index_builder(
                 &["category"],
@@ -1368,10 +1350,7 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
-        let inverted_index = IndexMetadata {
-            index_version: 0,
-            ..inverted_index
-        };
+        let inverted_index = crate::utils::test::as_legacy_row_id_segment(inverted_index);
 
         let result = if frag_reuse_first {
             commit_new_indices(&mut dataset, vec![frag_reuse])
